@@ -10,12 +10,15 @@
 // a file this table has never heard of fails, which is precisely the "new
 // module bypasses the core" case the scan exists for.
 //
-// HONESTY ABOUT WHAT THIS IS. Several rules are currently allowed in a
-// consumer (install-cmd.ts, doctor-cmd.ts, import-cmd.ts, try-cmd.ts) because
-// that consumer still carries its own walk. Those entries say so, and each is
-// a line to DELETE as its consumer adopts the core -- the table is a ratchet,
-// not a claim that the migration is finished. R10, the one that makes the
-// verification unskippable, is already tight: `client-config.ts` alone.
+// HONESTY ABOUT WHAT THIS IS. Some rules are still allowed in a consumer
+// because that consumer carries its own walk. Those entries say so in as many
+// words, and each is a line to DELETE as its consumer adopts the core -- the
+// table is a ratchet, not a claim that the migration is finished. Read the
+// reasons, not this paragraph, for which consumers those are today: the
+// "allow-listed but no longer matches" assertion below fails on a stale entry,
+// so the table cannot describe a consumer that has already migrated. R10, the
+// one that makes the verification unskippable, is tight: `client-config.ts`
+// alone.
 //
 // It is TEXTUAL, so it is a net under the behavioural tests, not a proof. It
 // cannot follow a container object handed in by a caller, nor an adapter
@@ -83,7 +86,6 @@ const RULES: Rule[] = [
       "src/doctor-cmd.ts": NOT_YET_MIGRATED,
       "src/import-cmd.ts": NOT_YET_MIGRATED,
       "src/install-cmd.ts": NOT_YET_MIGRATED,
-      "src/try-cmd.ts": NOT_YET_MIGRATED,
     },
     positive: [
       "const c = readNested(root, path);",
@@ -107,7 +109,6 @@ const RULES: Rule[] = [
       "src/local-set-cmd.ts": "bundles.json, edited through editJsoncPath by design",
       "src/doctor-cmd.ts": NOT_YET_MIGRATED,
       "src/import-cmd.ts": NOT_YET_MIGRATED,
-      "src/try-cmd.ts": NOT_YET_MIGRATED,
     },
     positive: ["const v = parseJsonc(raw);", "editJsoncPath(src, ['servers', 3], v)"],
     negative: ["/* parseJsonc( */", "const parseJsoncish = 1;"],
@@ -136,7 +137,10 @@ const RULES: Rule[] = [
       "src/doctor-cmd.ts": NOT_YET_MIGRATED,
       "src/import-cmd.ts": NOT_YET_MIGRATED,
       "src/install-cmd.ts": NOT_YET_MIGRATED,
-      "src/try-cmd.ts": NOT_YET_MIGRATED,
+      "src/try-cmd.ts":
+        "a TRIAL MARKER records the container path it wrote at, on disk, in a versioned schema -- so try " +
+        "reads that field back and hands it to `markerSite`, which is the only way a sweep can delete the " +
+        "key the trial wrote and no other. Not a walk: every read and write goes through the core",
     },
     allowedPaths: [
       {
@@ -210,7 +214,6 @@ const RULES: Rule[] = [
     allowed: {
       "src/doctor-cmd.ts": NOT_YET_MIGRATED,
       "src/import-cmd.ts": NOT_YET_MIGRATED,
-      "src/try-cmd.ts": NOT_YET_MIGRATED,
     },
     positive: ["await readFile(resolved.absolute, 'utf8')", "existsSync(site.resolved.absolute)"],
     negative: ["await readFile(path, 'utf8')", "atomicWriteFile(resolved.absolute, next)"],

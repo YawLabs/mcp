@@ -457,16 +457,13 @@ const EXPECTED_WALKS: Record<string, Walk[]> = {
         "import cycle -- and every caller hands it a path it must NOT fold",
     },
   ],
-  "src/try-cmd.ts": [
-    {
-      shape: "LOOP for (const segment of containerPath)",
-      why: "peelEntryFromConfig: the path a trial MARKER recorded -- must delete that entry and no other",
-    },
-    {
-      shape: "LOOP for (const segment of containerPath)",
-      why: "configHasEntry: will the write at THIS path replace something -- the write goes to one path",
-    },
-  ],
+  // `src/try-cmd.ts` used to sit here with two walks -- peelEntryFromConfig's
+  // and configHasEntry's. Both are gone: every `try` read and write goes
+  // through the client-config core, which asks its own adapter for the entries
+  // at the address it was handed. The path a trial MARKER recorded is still
+  // read verbatim and handed to `markerSite`, and is still deliberately NOT
+  // folded through claudeCodeContainerPaths -- a sweep must delete the key the
+  // trial wrote and no other -- but that is now an address, not a walk.
 };
 
 function scanContainerWalks(): Record<string, string[]> {
