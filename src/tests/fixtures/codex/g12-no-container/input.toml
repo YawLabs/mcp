@@ -1,0 +1,5 @@
+# no servers here at all
+model = "gpt-5"
+
+[tui]
+theme = "dark"
