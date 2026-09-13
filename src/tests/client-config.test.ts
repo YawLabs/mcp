@@ -16,6 +16,7 @@ import {
   applyClientConfigEdits,
   CLIENT_ENV_VARS,
   type ClientConfigView,
+  type ClientEnv,
   CONFIG_FORMATS,
   type ConfigAdapter,
   type ConfigRead,
@@ -48,6 +49,7 @@ import {
   syntaxNameFor,
   terminateWithNewline,
 } from "../client-config.js";
+import type { ClientEnvValues } from "../install-target-model.js";
 import { findLegacyEntry, INSTALL_TARGETS, resolveInstallPath } from "../install-targets.js";
 
 const ENTRY: Record<string, unknown> = { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] };
@@ -134,8 +136,11 @@ describe("the env reader", () => {
       CLINE_MCP_SETTINGS_PATH: "/w/cline/settings.json",
       CODEX_HOME: "/w/codex",
       CONTINUE_GLOBAL_DIR: "/w/continue",
+      TYPED_CLI_BUNDLE: "/w/typed/cli.mjs",
       XDG_CONFIG_HOME: "/w/xdg",
     };
+    // Every declared variable, so this case cannot fall behind the list.
+    expect(Object.keys(env)).toEqual([...CLIENT_ENV_VARS]);
     expect(readClientEnv(env)).toEqual({
       appData: "C:/Users/u/AppData/Roaming",
       claudeConfigDir: "/w/claude",
@@ -144,8 +149,18 @@ describe("the env reader", () => {
       clineMcpSettingsPath: "/w/cline/settings.json",
       codexHome: "/w/codex",
       continueGlobalDir: "/w/continue",
+      typedCliBundle: "/w/typed/cli.mjs",
       xdgConfigHome: "/w/xdg",
     });
+  });
+
+  it("keeps the leaf model's ClientEnvValues field-for-field equal to ClientEnv", () => {
+    // install-target-model.ts restates the fields rather than importing the
+    // type, to stay a leaf. A field added to one and not the other is a value
+    // a row can never see; tsc fails this assignment when they differ.
+    type Same<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
+    const same: Same<Required<ClientEnv>, Required<ClientEnvValues>> = true;
+    expect(same).toBe(true);
   });
 
   it("treats an EMPTY value as unset, one variable at a time", () => {

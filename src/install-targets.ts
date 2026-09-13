@@ -378,8 +378,27 @@ export function resolveInstallSites(opts: ResolvePathOptions): ConfigSite[] {
   ];
 }
 
+/** The program file a row's `programProbe` looks at for one (client, scope),
+ *  the markers that mean it can read the file install writes, and the warning
+ *  to print when it cannot -- or null for a row with no probe.
+ *
+ *  Resolved against the same PathBase as the row's paths, so the program's
+ *  location honours exactly the env values `readClientEnv` reported. Reads no
+ *  file: install-cmd owns the read, like every other read of a path this
+ *  module resolves. */
+export function resolveProgramProbe(
+  opts: ResolvePathOptions,
+): { file: string; markers: readonly string[]; warning: string } | null {
+  const { target, base } = resolveTargetBase(opts);
+  const probe = target.programProbe;
+  if (probe === undefined) return null;
+  const file = probe.programFile(base);
+  return { file, markers: probe.markers, warning: probe.warning(file, base) };
+}
+
 /** The target, its scope spec and the `PathBase` one resolve runs against --
- *  the shared first half of `resolveInstallPath` and `resolveInstallSites`.
+ *  the shared first half of `resolveInstallPath`, `resolveInstallSites` and
+ *  `resolveProgramProbe`.
  *
  *  Shared rather than copied because every refusal in it is a CONTRACT: the
  *  unknown-client, unsupported-scope, unavailable-OS and missing-project-dir

@@ -86,7 +86,8 @@ export const LEGACY_ENTRY_NAMES = ["mcp.hosting", "mcph", "yaw-mcp"] as const;
 /** What a target's own `resolvePath` / `sites` hooks are handed: the resolved
  *  directories, already defaulted, plus the client env-var values read through
  *  `readClientEnv`. A row NEVER reads `process.env` itself -- the boundary
- *  test's R7 confines those seven names to this module's neighbourhood. */
+ *  test's R7 flags a read of any name in CLIENT_ENV_VARS outside its short
+ *  allowlist. */
 export interface PathBase {
   home: string;
   /** Windows `%APPDATA%`, chosen by the caller via `resolveAppDataDir`. */
@@ -111,7 +112,28 @@ export interface ClientEnvValues {
   clineMcpSettingsPath?: string;
   codexHome?: string;
   continueGlobalDir?: string;
+  typedCliBundle?: string;
   xdgConfigHome?: string;
+}
+
+/** How install tells that the client's own INSTALLED PROGRAM is too old to read
+ *  the entry install writes: by probing that program's bytes for a literal the
+ *  capability brings with it, never by comparing a version string -- a build
+ *  can carry a version number without the feature, and the other way round.
+ *
+ *  A function-valued field like `resolvePath`, handed the same PathBase, so the
+ *  program's location comes from the env values `readClientEnv` reported and
+ *  never from a read of `process.env` in the row. */
+export interface ProgramCapabilityProbe {
+  /** The program file to probe. */
+  programFile: (base: PathBase) => string;
+  /** Literal strings; the program HAS the capability when any one of them
+   *  occurs in its bytes. */
+  markers: readonly string[];
+  /** The one warning install prints when the file exists and carries none of
+   *  the markers. Nothing is printed when the file is absent or unreadable --
+   *  there is no program there to judge. */
+  warning: (programFile: string, base: PathBase) => string;
 }
 
 /** One copy of a target's config file. A target with no `sites` hook has
@@ -187,6 +209,11 @@ export interface InstallTargetBase {
    *  the file the entry left, since the unscoped claim would be false. Absent
    *  on every row whose client only ever launches what its config names. */
   uninstallNote?: string;
+  /** For a client whose installed program may predate the file this row
+   *  writes: how install probes for that, and what it warns. See
+   *  ProgramCapabilityProbe. Absent on every row whose client has read its
+   *  file for as long as yaw-mcp has written it. */
+  programProbe?: ProgramCapabilityProbe;
   /** Every copy of the file for one (client, scope) -- a fan-out only Cline
    *  needs. Absent means one site at `resolvePath`/`pathFor`, `detectDir: null`. */
   sites?: (base: PathBase) => SiteSpec[];

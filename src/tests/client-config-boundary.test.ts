@@ -192,7 +192,7 @@ const RULES: Rule[] = [
   {
     what: "a client env var read outside the one reader",
     pattern:
-      /env(?:\?\.|\.|\[")(?:CLAUDE_CONFIG_DIR|CODEX_HOME|CLINE_MCP_SETTINGS_PATH|CLINE_DATA_DIR|CLINE_DIR|CONTINUE_GLOBAL_DIR|XDG_CONFIG_HOME|APPDATA)\b/,
+      /env(?:\?\.|\.|\[")(?:CLAUDE_CONFIG_DIR|CODEX_HOME|CLINE_MCP_SETTINGS_PATH|CLINE_DATA_DIR|CLINE_DIR|CONTINUE_GLOBAL_DIR|TYPED_CLI_BUNDLE|XDG_CONFIG_HOME|APPDATA)\b/,
     allowed: {
       "src/install-target-model.ts": "resolveAppDataDir -- the one place %APPDATA% is chosen for a client path",
       "src/doctor-cmd.ts":
@@ -263,6 +263,16 @@ describe("the client-config boundary", () => {
       for (const line of rule.negative) {
         expect(rule.pattern.test(codeOf(line)), `${rule.what}: should NOT match ${line}`).toBe(false);
       }
+    }
+  });
+
+  it("flags a direct read of EVERY name in CLIENT_ENV_VARS, so a new variable cannot slip past the one reader", () => {
+    // The env-var rule spells its names in a regex; this is what keeps that
+    // list from falling behind CLIENT_ENV_VARS when a variable is added.
+    const rule = RULES.find((r) => r.what === "a client env var read outside the one reader");
+    expect(rule).toBeDefined();
+    for (const name of CLIENT_ENV_VARS) {
+      expect(rule?.pattern.test(`process.env.${name}`), name).toBe(true);
     }
   });
 

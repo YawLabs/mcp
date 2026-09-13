@@ -617,6 +617,12 @@ if (subcommand === "compliance") {
                                Codex requires the directory to EXIST and be a
                                directory; an empty value counts as unset. It
                                does not move a project's .codex/config.toml.
+    TYPED_CLI_BUNDLE              The typed CLI bundle typed's launcher runs
+                               (default ~/.config/typed/typed-cli/cli.mjs).
+                               \`install typed\` reads that file and warns once
+                               when it predates ~/.config/typed/mcp.json; it
+                               says nothing when no bundle is there. It does
+                               not move typed's mcp.json.
     LOG_LEVEL                     Verbosity of yaw-mcp's own JSON log lines on
                                stderr: \`debug\` | \`info\` | \`warn\` | \`error\`
                                (default info). \`debug\` is what to set when

@@ -55,10 +55,11 @@
 //                                                  the entry's own carried-over
 //                                                  env prints keys only.
 
-// `stat` only: the client config's BYTES are read by the client-config core
-// now (readClientConfigFile), and this module's own read is the fingerprint
-// that brackets the write.
-import { stat } from "node:fs/promises";
+// `stat` for the fingerprint that brackets a write: the client config's BYTES
+// are read by the client-config core (readClientConfigFile). `readFile` reads
+// no client config -- only the client PROGRAM a row's `programProbe` names,
+// see staleProgramWarning.
+import { readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
@@ -102,9 +103,11 @@ import {
   isProjectLocalEntry,
   type LaunchEntry,
   LEGACY_ENTRY_NAMES,
+  type ResolvePathOptions,
   resolveAppDataDir,
   type resolveInstallPath,
   resolveInstallSites,
+  resolveProgramProbe,
   unloadableConfigFix,
   unparseableConfigFix,
 } from "./install-targets.js";
@@ -1440,6 +1443,24 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     );
   }
 
+  // A client whose installed program can predate the file this row writes --
+  // typed's CLI before ~/.config/typed/mcp.json, which ignores the file without
+  // a word -- gets one warning. Here, after every refusal, like the bundles
+  // read below: the dry-run preview, the already-configured no-op and a real
+  // write all reach it, and each of them leaves an entry that program would
+  // not load. Keyed on the row's `programProbe`, never on its id.
+  const staleProgram = await staleProgramWarning({
+    clientId: target.clientId,
+    scope,
+    os,
+    home,
+    appData: resolveAppData(opts),
+    projectDir,
+    claudeConfigDir: opts.claudeConfigDir,
+    clientEnv: opts.clientEnv,
+  });
+  if (staleProgram !== null) err(`yaw-mcp install: warning -- ${staleProgram}`);
+
   // Read AFTER every refusal above, for the same reason the oam probe is: a
   // malformed client config, a non-TTY collision and `--skip` all return before
   // this point, and a "Servers: none configured yet -- add one before you
@@ -1761,6 +1782,25 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
  *  `prepareClaudeCodeSettingsPatch` is imported, not re-exported: nothing
  *  outside this file calls it. */
 export { mergePermissionsAllow, removePermissionsAllow } from "./claude-code-settings.js";
+
+/** The warning a row's `programProbe` asks for, or null when it asks for none:
+ *  the row has no probe, the program file is absent or cannot be read (there
+ *  is no program there to judge, so nothing is said), or its bytes carry one of
+ *  the capability markers.
+ *
+ *  The BYTES, searched for a literal -- never a version string parsed out of
+ *  them. See ProgramCapabilityProbe. */
+async function staleProgramWarning(opts: ResolvePathOptions): Promise<string | null> {
+  const probe = resolveProgramProbe(opts);
+  if (probe === null) return null;
+  let bytes: Buffer;
+  try {
+    bytes = await readFile(probe.file);
+  } catch {
+    return null;
+  }
+  return probe.markers.some((marker) => bytes.includes(marker)) ? null : probe.warning;
+}
 
 /** The fields a concurrent writer moves; null when the file is absent. Used
  *  to detect a write that lands between install's read of a file and its

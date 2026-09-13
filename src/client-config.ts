@@ -1173,8 +1173,10 @@ function verifyEdits(
 // The one reader of the env vars that relocate a client config
 // ---------------------------------------------------------------------------
 
-/** Every environment variable that moves a client's config file, as DATA, so a
- *  test can assert the CLI's Environment help block names all of them.
+/** Every environment variable that moves a client's config file -- or a file
+ *  of the client's own that install reads about it (typed's CLI bundle) -- as
+ *  DATA, so a test can assert the CLI's Environment help block names all of
+ *  them.
  *
  *  Before this, `CLAUDE_CONFIG_DIR` was read in six hand-rolled places in
  *  src/. Adding more variables to six sites is exactly the one-adopter trap
@@ -1188,6 +1190,7 @@ export const CLIENT_ENV_VARS = [
   "CLINE_MCP_SETTINGS_PATH",
   "CODEX_HOME",
   "CONTINUE_GLOBAL_DIR",
+  "TYPED_CLI_BUNDLE",
   "XDG_CONFIG_HOME",
 ] as const;
 
@@ -1206,6 +1209,11 @@ export interface ClientEnv {
   /** Codex: the directory its `config.toml` lives in. */
   codexHome?: string;
   continueGlobalDir?: string;
+  /** typed's launcher: the typed CLI bundle it runs instead of
+   *  `~/.config/typed/typed-cli/cli.mjs`. Not a config location -- install
+   *  probes that bundle's bytes to tell whether the typed CLI can read the file
+   *  `install typed` writes. */
+  typedCliBundle?: string;
   /** XDG config root. Reported VERBATIM: whether a relative value is usable is
    *  the resolver's call -- each client's own resolver is the reference for
    *  its files -- and a reader that silently dropped one would make "why is my
@@ -1241,6 +1249,8 @@ export function readClientEnv(env: NodeJS.ProcessEnv = process.env): ClientEnv {
   if (codexHome !== undefined) out.codexHome = codexHome;
   const continueGlobalDir = value("CONTINUE_GLOBAL_DIR");
   if (continueGlobalDir !== undefined) out.continueGlobalDir = continueGlobalDir;
+  const typedCliBundle = value("TYPED_CLI_BUNDLE");
+  if (typedCliBundle !== undefined) out.typedCliBundle = typedCliBundle;
   const xdgConfigHome = value("XDG_CONFIG_HOME");
   if (xdgConfigHome !== undefined) out.xdgConfigHome = xdgConfigHome;
   return out;

@@ -42,6 +42,7 @@ import {
 } from "../install-cmd.js";
 import {
   CLAUDE_CODE_ALLOW_PATTERN,
+  type ClientEnvValues,
   ENTRY_NAME,
   INSTALL_TARGETS,
   type InstallOS,
@@ -153,6 +154,7 @@ async function install(
     dryRun?: boolean;
     projectDir?: string;
     scope?: "user" | "project";
+    clientEnv?: ClientEnvValues;
   } = {},
 ) {
   const cap = captureIo();
@@ -164,6 +166,7 @@ async function install(
     cwd,
     projectDir: opts.projectDir,
     claudeConfigDir: opts.claudeConfigDir,
+    clientEnv: opts.clientEnv,
     dryRun: opts.dryRun,
     io: cap.io,
     oamProbe: OAM_ABSENT,
@@ -174,7 +177,13 @@ async function install(
 
 async function uninstall(
   clientId: Client,
-  opts: { claudeConfigDir?: string; dryRun?: boolean; projectDir?: string; scope?: "user" | "project" } = {},
+  opts: {
+    claudeConfigDir?: string;
+    dryRun?: boolean;
+    projectDir?: string;
+    scope?: "user" | "project";
+    clientEnv?: ClientEnvValues;
+  } = {},
 ) {
   const cap = captureIo();
   const result = await runUninstall({
@@ -185,6 +194,7 @@ async function uninstall(
     cwd,
     projectDir: opts.projectDir,
     claudeConfigDir: opts.claudeConfigDir,
+    clientEnv: opts.clientEnv,
     dryRun: opts.dryRun,
     force: true,
     io: cap.io,
@@ -536,6 +546,90 @@ describe("uninstall and the SHARED grant", () => {
     expect(result.exitCode).toBe(0);
     expect(allowOf(userSettings())).toEqual([CLAUDE_CODE_ALLOW_PATTERN]);
     expect(stdout).toContain(keepLine("Claude Code (user)", claudeJson()));
+  });
+});
+
+describe("a typed CLI too old to read ~/.config/typed/mcp.json", () => {
+  /** Where typed's installer puts the bundle its launcher runs by default. */
+  const defaultBundle = (): string => join(home, ".config", "typed", "typed-cli", "cli.mjs");
+
+  /** A bundle as esbuild prints the typed branch that ADDS the file:
+   *  `path9.join(homedirFn(), ".config", "typed", "mcp.json")` -- the line
+   *  measured in that build -- beside the `.mcp.json` every typed CLI names. */
+  const NEW_BUNDLE = [
+    "#!/usr/bin/env node",
+    'function a(configDir) { return path9.join(configDir, ".mcp.json"); }',
+    "function typedUserMcpConfigFile(homedirFn = os4.homedir) {",
+    '  return path9.join(homedirFn(), ".config", "typed", "mcp.json");',
+    "}",
+    "",
+  ].join(LF);
+
+  /** A bundle from before the file: `.mcp.json` everywhere, and no quoted
+   *  `mcp.json` segment -- which is why the marker carries its quotes. */
+  const OLD_BUNDLE = [
+    "#!/usr/bin/env node",
+    'function a(configDir) { return path9.join(configDir, ".mcp.json"); }',
+    'function b(home) { return path9.join(home, ".claude.json"); }',
+    "",
+  ].join(LF);
+
+  const staleLine = (bundle: string): string =>
+    `yaw-mcp install: warning -- the typed CLI at ${bundle} predates ~/.config/typed/mcp.json, so it will not load this entry until it updates -- run \`typed update\`.`;
+
+  const staleLines = (stderr: string): string[] => stderr.split(LF).filter((l) => l.includes("predates"));
+
+  it("warns ONCE, naming the bundle and `typed update`, when the installed bundle lacks the marker -- and still installs", async () => {
+    seed(defaultBundle(), OLD_BUNDLE);
+    const { result, stderr } = await install("typed");
+    expect(result.exitCode).toBe(0);
+    expect(read(typedFile())).toBe(FRESH);
+    expect(staleLines(stderr)).toEqual([staleLine(defaultBundle())]);
+  });
+
+  it("says nothing when the bundle carries the marker, in either quote style", async () => {
+    seed(defaultBundle(), NEW_BUNDLE);
+    expect(staleLines((await install("typed")).stderr)).toEqual([]);
+    rmSync(join(home, ".config"), { recursive: true, force: true });
+    seed(defaultBundle(), `${OLD_BUNDLE}const p = join(h, '.config', 'typed', 'mcp.json');${LF}`);
+    expect(staleLines((await install("typed")).stderr)).toEqual([]);
+  });
+
+  it("says nothing when there is no bundle to probe", async () => {
+    const { result, stderr } = await install("typed");
+    expect(result.exitCode).toBe(0);
+    expect(staleLines(stderr)).toEqual([]);
+  });
+
+  it("probes TYPED_CLI_BUNDLE when it is set, not the default install", async () => {
+    const override = join(home, "dev", "cli.mjs");
+    // The default install is old; the bundle the launcher actually runs is not.
+    seed(defaultBundle(), OLD_BUNDLE);
+    seed(override, NEW_BUNDLE);
+    expect(staleLines((await install("typed", { clientEnv: { typedCliBundle: override } })).stderr)).toEqual([]);
+    // And the other way round, where `typed update` would not help, so the
+    // warning says what would.
+    seed(defaultBundle(), NEW_BUNDLE);
+    seed(override, OLD_BUNDLE);
+    rmSync(typedFile(), { force: true });
+    expect(staleLines((await install("typed", { clientEnv: { typedCliBundle: override } })).stderr)).toEqual([
+      `yaw-mcp install: warning -- the typed CLI bundle at ${override} (TYPED_CLI_BUNDLE) predates ~/.config/typed/mcp.json, so that typed will not load this entry until the bundle is rebuilt or replaced -- \`typed update\` updates only the default ~/.config/typed/typed-cli/cli.mjs.`,
+    ]);
+  });
+
+  it("warns on the --dry-run preview and on an already-configured re-run too", async () => {
+    seed(defaultBundle(), OLD_BUNDLE);
+    expect(staleLines((await install("typed", { dryRun: true })).stderr)).toEqual([staleLine(defaultBundle())]);
+    await install("typed");
+    const again = await install("typed");
+    expect(again.result.written).toEqual([]);
+    expect(staleLines(again.stderr)).toEqual([staleLine(defaultBundle())]);
+  });
+
+  it("is typed's alone: no other row probes anything, old typed bundle or not", async () => {
+    seed(defaultBundle(), OLD_BUNDLE);
+    expect(staleLines((await install("claude-code")).stderr)).toEqual([]);
+    expect(INSTALL_TARGETS.filter((t) => t.programProbe !== undefined).map((t) => t.clientId)).toEqual(["typed"]);
   });
 });
 
