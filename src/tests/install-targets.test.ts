@@ -1189,6 +1189,41 @@ describe("claudeCodeProjectKey (projects[] key spelling)", () => {
     expect(claudeCodeProjectKey("/home/alice/c:/repo")).toBe("/home/alice/c:/repo");
   });
 
+  // Claude Code and typed's CLI both look the key up under the session's
+  // working directory, which never ends in a separator below a root -- and
+  // typed's matcher folds separators and (on win32) case but NOT a trailing
+  // slash. So a key that kept one is a key neither of them reads.
+  it("drops a trailing separator on every shape, but never below a root", () => {
+    expect(claudeCodeProjectKey("C:/Users/me/repo/")).toBe("C:/Users/me/repo");
+    expect(claudeCodeProjectKey("c:\\Users\\me\\repo\\")).toBe("C:/Users/me/repo");
+    expect(claudeCodeProjectKey("C:\\Users\\me\\repo\\\\")).toBe("C:/Users/me/repo");
+    expect(claudeCodeProjectKey("/home/alice/repo/")).toBe("/home/alice/repo");
+    expect(claudeCodeProjectKey("/home/alice/repo//")).toBe("/home/alice/repo");
+    expect(claudeCodeProjectKey("\\\\server\\share\\repo\\")).toBe("//server/share/repo");
+    // Roots keep theirs: "C:/", "/" and a UNC share root are what a session
+    // started AT a root reports.
+    expect(claudeCodeProjectKey("C:\\")).toBe("C:/");
+    expect(claudeCodeProjectKey("/")).toBe("/");
+    expect(claudeCodeProjectKey("\\\\server\\share\\")).toBe("//server/share/");
+    // A POSIX name may end in a backslash; only "/" is a separator there.
+    expect(claudeCodeProjectKey("/home/alice/weird\\")).toBe("/home/alice/weird\\");
+  });
+
+  it("keys a trailing-slash absolute projectDir without the slash through resolveInstallPath", () => {
+    // resolveInstallPath passes an ALREADY-absolute projectDir through
+    // unchanged -- it does not resolve() it -- so this is the route on which a
+    // trailing slash reaches the key at all. A POSIX-rooted fixture is absolute
+    // on every runner (isAbsolute("/x") is true on win32 too).
+    const r = resolveInstallPath({
+      clientId: "claude-code",
+      scope: "local",
+      os: "linux",
+      home: "/synth/home",
+      projectDir: "/synth/home/repo/",
+    });
+    expect(r.containerPath).toEqual(["projects", "/synth/home/repo", "mcpServers"]);
+  });
+
   // Through the resolver every caller funnels through. Windows-only: on a
   // POSIX runner "c:..." is not absolute, so resolve() turns it into a POSIX
   // path under the cwd before the key is built.

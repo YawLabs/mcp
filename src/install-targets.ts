@@ -513,14 +513,45 @@ function resolveTargetBase(opts: ResolvePathOptions): {
  *  whose name legitimately contains a backslash is not mangled. A UNC path has
  *  no drive letter, so only its separators change.
  *
+ *  A TRAILING separator is dropped too, on every shape, unless the path is a
+ *  root ("/", "C:/", "//server/share/"). Both readers of this key look it up
+ *  under the session's working directory, which never ends in a separator
+ *  below a root: Claude Code byte-exactly, and typed's CLI -- which reads the
+ *  same `projects[...]` entries -- after folding separators (and, on win32,
+ *  case) but NOT a trailing slash (typed apps/cli/src/mcp/config.ts,
+ *  collectClaudeJson's `normalizeKey`). So "C:/repo/" is a key neither reads.
+ *  The CLI's own `--project-dir C:/repo/` never reaches here with one --
+ *  resolveInstallSite, `install --list` and `try` all pass the directory
+ *  through `resolve()`, which drops it -- but `resolveInstallPath` passes an
+ *  already-absolute `projectDir` through unchanged and doctor's probe hands it
+ *  its `cwd` option as given, so the key is where the guarantee has to live.
+ *
  *  Exported for tests: the Windows-shape branch is unreachable through
  *  resolveInstallPath on a POSIX runner (isAbsolute("C:\\...") is false
  *  there, so resolve() rewrites the fixture first). */
 export function claudeCodeProjectKey(projectDir: string): string {
   if (WINDOWS_DRIVE_PATH.test(projectDir)) {
-    return projectDir[0].toUpperCase() + projectDir.slice(1).replace(/\\/g, "/");
+    // "C:/" is the drive root, and keeps its separator.
+    return withoutTrailingSlash(projectDir[0].toUpperCase() + projectDir.slice(1).replace(/\\/g, "/"), 3);
   }
-  return projectDir.startsWith("\\\\") ? projectDir.replace(/\\/g, "/") : projectDir;
+  if (projectDir.startsWith("\\\\")) {
+    const key = projectDir.replace(/\\/g, "/");
+    // "//server/share/" is a UNC root. A spelling too short to have one is
+    // left exactly as it came.
+    const root = /^\/\/[^/]+\/[^/]+\//.exec(key);
+    return root ? withoutTrailingSlash(key, root[0].length) : key;
+  }
+  // POSIX: "/" is the root, and only "/" is a separator -- a trailing backslash
+  // is part of a directory NAME there.
+  return withoutTrailingSlash(projectDir, 1);
+}
+
+/** `key` with its trailing "/" run removed, never shortening it below
+ *  `rootLength` characters. */
+function withoutTrailingSlash(key: string, rootLength: number): string {
+  let end = key.length;
+  while (end > rootLength && key[end - 1] === "/") end--;
+  return key.slice(0, end);
 }
 
 /** A path (or a `projects[...]` key, which is the same string) that starts
