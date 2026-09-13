@@ -360,8 +360,6 @@ if (subcommand === "compliance") {
                              poll it. \`--json\` is the machine-readable form.
     doctor                   Diagnose setup: config, token, clients, learning,
                              upgrade, flaky-namespace reliability rollup.
-    servers [<filter>]       DEPRECATED -- account mode is gone; this always
-                             fails. Use \`list\` instead.
     bundles [list|match]     Browse curated multi-server bundles. \`list\` shows
                              all; \`match\` partitions against your enabled
                              local servers (ready vs. partially installed).
