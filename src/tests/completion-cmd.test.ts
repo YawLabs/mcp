@@ -58,11 +58,9 @@ describe("the derived client word list", () => {
 // table -- not a hand-maintained mirror -- makes the drift guard REAL: a
 // new dispatched subcommand that forgets a SUBCOMMAND_SPEC entry fails
 // this test.
-// `servers` is the one DELIBERATE exemption: still dispatched (Yaw Terminal
-// shells out to `yaw-mcp servers --json` and reads signedIn:false from its
-// always-non-zero exit), but a deprecation stub, and completing a deprecated
-// thing teaches it -- the rule that already hides `--token`. The dedicated
-// test below pins that it stays dispatched AND stays uncompleted.
+// `servers` needs no exemption: it was deleted in 1.0.0, so it is in neither
+// KNOWN_SUBCOMMANDS nor SUBCOMMAND_SPEC, and the dedicated test below pins it
+// out of both.
 const DISPATCHED_SUBCOMMANDS = KNOWN_SUBCOMMANDS.filter(
   (s) => !(FLAG_ALIASES as readonly string[]).includes(s) && s !== "help",
 );
