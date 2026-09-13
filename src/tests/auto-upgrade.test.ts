@@ -1570,9 +1570,13 @@ describe("acquireUpgradeLock", () => {
     };
     /** openSync calls against the lock path, ignoring any other file. */
     const lockOpens = (): number => mockOpenSync.mock.calls.filter(([p]) => p === lockFile()).length;
+    /** The real openSync the mock was built around, for an implementation
+     *  that fails only some calls and passes the rest through. */
+    const realOpenSync = mockOpenSync.getMockImplementation() as typeof openSync;
 
     afterEach(() => {
       mockOpenSync.mockReset();
+      mockRenameSync.mockReset();
     });
 
     it("retries it on win32 and takes a REAL lock, not the no-op release", () => {
@@ -1597,6 +1601,36 @@ describe("acquireUpgradeLock", () => {
       expect(existsSync(lockFile())).toBe(false);
       // One attempt per backoff step plus the final one.
       expect(lockOpens()).toBe(4);
+    });
+
+    it("retries it on the steal's restore too, so a live holder's lock is put back", () => {
+      // The steal's rename caught another stealer's FRESH retake (see "gives
+      // the lock back and yields" above), so the lock goes back O_EXCL under
+      // that holder's pid. The restore's create is a second place a release in
+      // flight can answer EPERM, and without the retry there the restore
+      // failed quietly: the live holder's lock was simply gone, and the next
+      // caller took the path beside it.
+      acquireUpgradeLock(dir);
+      const stale = new Date(Date.now() - 11 * 60 * 1000);
+      utimesSync(lockFile(), stale, stale);
+      const otherPid = `${process.pid + 1}\n`;
+      mockRenameSync.mockImplementationOnce((from, to) => {
+        unlinkSync(String(from));
+        writeFileSync(String(from), otherPid); // the other stealer's retake
+        renameSync(from, to); // ...which our real rename now moves
+      });
+      mockOpenSync.mockClear();
+      // Lock-path creates, in order: our take (EEXIST, real), the restore
+      // (EPERM, injected), the restore's retry (real).
+      let lockCreates = 0;
+      mockOpenSync.mockImplementation(((...args: Parameters<typeof openSync>) => {
+        if (args[0] === lockFile() && ++lockCreates === 2) throw eperm();
+        return realOpenSync(...args);
+      }) as typeof openSync);
+
+      expect(onPlatform("win32", () => acquireUpgradeLock(dir))).toBeNull();
+      expect(readFileSync(lockFile(), "utf8")).toBe(otherPid);
+      expect(lockOpens()).toBe(3);
     });
 
     it("does not retry on POSIX, where EPERM is a real permission failure", () => {

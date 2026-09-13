@@ -51,8 +51,12 @@ const RENAME_RETRY_DELAYS_MS = [10, 50, 100];
  *  The second is a path whose previous file is still being DELETED: an
  *  O_EXCL create that lands inside another thread's or process's unlink fails
  *  EPERM instead of succeeding or answering EEXIST. Measured on Windows 11,
- *  Node 22.22.2 (libuv 1.51.0): 3 async `open(p, "wx")` loops racing one
- *  `rm(p)` hit it 225 times in 2000 races. The lock takes in grades-cache.ts
+ *  Node 22.22.2 (libuv 1.51.0), with 3 async `open(p, "wx")` loops racing one
+ *  `rm(p)` 2000 times per run: every one of 20 runs saw it, 20 to 225 failed
+ *  opens per run, and most runs fell between 40 and 110. Those are failed
+ *  opens, not races -- one race can fail several opens across its three
+ *  loops. It reproduces across processes too, with sync openSync against
+ *  unlinkSync. The lock takes in grades-cache.ts
  *  and auto-upgrade.ts retry on it for that reason. POSIX has neither cause. */
 export function isWin32TransientFsError(err: unknown): boolean {
   if (process.platform !== "win32") return false;

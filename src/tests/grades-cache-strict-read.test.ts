@@ -37,11 +37,13 @@ const failNextRename = vi.hoisted(() => ({ code: null as string | null }));
 const failNextHandleWrite = vi.hoisted(() => ({ code: null as string | null }));
 // Scripted answers for the lock's O_EXCL take (`open(path, "wx")` -- no other
 // open in writeGrade passes that flag). Each take shifts one entry off
-// `script`: an errno is thrown, null runs the real open. Once the script is
-// empty, `thenAlways` (when set) is thrown on every take. `attempts` counts
-// every "wx" open either way.
+// `script`: an errno is thrown, null runs the real open, and a function is
+// called first and its answer used the same way -- so a test can change the
+// filesystem in the same step as the answer, with no take able to land in
+// between. Once the script is empty, `thenAlways` (when set) is thrown on
+// every take. `attempts` counts every "wx" open either way.
 const exclOpen = vi.hoisted(() => ({
-  script: [] as Array<string | null>,
+  script: [] as Array<string | null | (() => string | null)>,
   thenAlways: null as string | null,
   attempts: 0,
 }));
@@ -74,7 +76,8 @@ vi.mock("node:fs/promises", async (importOriginal) => {
     open: (async (...args: Parameters<typeof real.open>) => {
       if (args[1] === "wx") {
         exclOpen.attempts++;
-        const code = exclOpen.script.length > 0 ? exclOpen.script.shift() : exclOpen.thenAlways;
+        const next = exclOpen.script.length > 0 ? exclOpen.script.shift() : exclOpen.thenAlways;
+        const code = typeof next === "function" ? next() : next;
         if (code) throw injected(code);
       }
       const handle = await real.open(...args);
@@ -271,15 +274,39 @@ describe("writeGrade -- the O_EXCL take fails with a transient win32 errno", () 
     // transient budget, then hits EPERM again on THAT release. The second
     // EPERM starts a new run; charging it to the first one's clock would fail
     // a write that is one poll from landing.
+    //
+    // Nothing here races the scheduler. The budget is passed in rather than
+    // read off the private constant, and the gap between the two EPERMs is a
+    // setTimeout, which never fires early -- so it is at least three budgets
+    // however loaded the machine is. The second holder's release and our
+    // EPERM happen in one scripted step inside the mocked open: a real rmSync
+    // run from the test body could let an open already in flight create the
+    // lock after the unlink, and the second EPERM would never be thrown.
+    const TRANSIENT_MS = 100;
     mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
     writeFileSync(lockPath(), "second-holder\n");
     exclOpen.script = ["EPERM"];
-    const ours = onPlatform("win32", () => writeGrade("gh", ENTRY_A, synthHome, { lockWaitMs: 10_000 }));
-    await new Promise((resolve) => setTimeout(resolve, 1_300));
-    expect(exclOpen.script).toEqual([]);
-    exclOpen.script = ["EPERM"];
-    rmSync(lockPath());
+    const ours = onPlatform("win32", () =>
+      writeGrade("gh", ENTRY_A, synthHome, {
+        lockWaitMs: 60_000,
+        lockStaleMs: 120_000,
+        lockTransientMs: TRANSIENT_MS,
+      }),
+    );
+    // Takes run one at a time, so a third take means the first EPERM is spent
+    // and the second take has already come back EEXIST from the second
+    // holder's lock -- the normal answer that must restart the budget.
+    await vi.waitFor(() => expect(exclOpen.attempts).toBeGreaterThanOrEqual(3), { timeout: 20_000, interval: 5 });
+    await new Promise((resolve) => setTimeout(resolve, TRANSIENT_MS * 3));
+    exclOpen.script = [
+      () => {
+        rmSync(lockPath());
+        return "EPERM";
+      },
+    ];
     await ours;
+    // The scripted release-and-EPERM really ran.
+    expect(exclOpen.script).toEqual([]);
     expect(JSON.parse(readFileSync(gradesCachePath(synthHome), "utf8")).gh).toEqual(ENTRY_A);
     expect(existsSync(lockPath())).toBe(false);
   });
