@@ -77,8 +77,8 @@ export function resolveClaudeCodeSettingsPath(
  *      (HARDLINK_ROOT_FILES), but Yaw's own writeOverlayPermissions unlinks
  *      that hardlink to write its per-pane allow-list, and install's atomic
  *      write replaces the file either way -- so a grant written there lands in
- *      a copy the pane's teardown discards. syncOverlayBack carries only
- *      `.claude.json` home.
+ *      a copy the pane's teardown discards. settings.json is not among the
+ *      files Yaw carries home when the pane closes.
  *    * fresh never links it at all.
  *  So an augment run patches `~/.claude/settings.json` as well, and a fresh one
  *  says what goes with the pane (the grant, and an entry written inside the
