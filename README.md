@@ -166,7 +166,9 @@ To override, in `~/.yaw-mcp/bundles.json`:
 
 ```bash
 yaw-mcp install <client>       # connect a client to yaw-mcp (see above)
+yaw-mcp uninstall <client>     # unwire a client; leaves servers in bundles.json untouched
 yaw-mcp doctor [--json]        # diagnose config, clients, learning, reliability, upgrade
+yaw-mcp status [--json]        # read-only snapshot of loaded servers, activity, vault state, and call counts
 ```
 
 **Servers** -- managed in `~/.yaw-mcp/bundles.json`, browse the catalog at [yaw.sh/mcp/catalog](https://yaw.sh/mcp/catalog/):
