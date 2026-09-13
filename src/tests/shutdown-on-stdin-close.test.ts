@@ -2,8 +2,8 @@ import { spawn } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { BROKER_BUNDLE_HOOK_TIMEOUT_MS, useBrokerBundle } from "./broker-bundle.js";
 
 // The broker used to register SIGTERM and SIGINT and nothing else. That is a
 // POSIX assumption: on Windows an MCP client ends the broker by closing the
@@ -25,9 +25,6 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 // listed in TIMING_SENSITIVE in vitest.config.ts and runs in the sequential
 // project rather than against a 4x-oversubscribed box.
 
-const INDEX_SRC = fileURLToPath(new URL("../index.ts", import.meta.url));
-const PROJECT_ROOT = fileURLToPath(new URL("../..", import.meta.url));
-
 /** Generous: the broker tears down each upstream in turn, and the box may be
  *  loaded. Standalone the whole settle is ~2s; the budget is for contention,
  *  not for the work. It still has to be a BUDGET rather than "eventually",
@@ -36,6 +33,7 @@ const SETTLE_BUDGET_MS = 20_000;
 
 let workDir: string;
 let bundlePath: string;
+let releaseBundle: () => Promise<void> = async () => {};
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
@@ -103,30 +101,18 @@ setInterval(() => {}, 1 << 30);
 
 describe("closing stdin shuts the broker down and reaps its upstreams", () => {
   beforeAll(async () => {
-    const { build } = await import("esbuild");
-    workDir = await mkdtemp(join(tmpdir(), "yaw-mcp-shutdown-"));
-    bundlePath = join(workDir, "entry.mjs");
-    await build({
-      entryPoints: [INDEX_SRC],
-      absWorkingDir: PROJECT_ROOT,
-      outfile: bundlePath,
-      bundle: true,
-      platform: "node",
-      format: "esm",
-      target: "node20",
-      mainFields: ["module", "main"],
-      banner: {
-        js: 'import { createRequire as __yawCreateRequire } from "node:module";\nconst require = __yawCreateRequire(import.meta.url);',
-      },
-      define: { __VERSION__: JSON.stringify("0.0.0-test") },
-      logLevel: "silent",
-    });
-    // Same reasoning as index-dispatch.test.ts: bundling the whole dependency
-    // graph is ~1s standalone but shares the box with every other file.
-  }, 180_000);
+    // The run's global setup builds the bundle once, has node write the file,
+    // and runs it before any test file starts. In the release run that
+    // failed, the bundle's first execution happened inside SETTLE_BUDGET_MS
+    // below and outlasted it -- see broker-bundle.ts. This suite's own files
+    // go in its own temp dir, never the shared bundle's.
+    ({ path: bundlePath, release: releaseBundle } = await useBrokerBundle("yaw-mcp-shutdown-"));
+    workDir = await mkdtemp(join(tmpdir(), "yaw-mcp-shutdown-home-"));
+  }, BROKER_BUNDLE_HOOK_TIMEOUT_MS);
 
   afterAll(async () => {
     if (workDir) await rm(workDir, { recursive: true, force: true });
+    await releaseBundle();
   });
 
   it("runs shutdown(), exits, and takes the upstream server with it", async () => {

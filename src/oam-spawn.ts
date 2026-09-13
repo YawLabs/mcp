@@ -26,7 +26,8 @@
 // initialize + tools/list + tools/call hosted on `oam run`); the full
 // per-server matrix below was last run against 0.11.0 on 2026-08-22
 // (first 0.9.0 on 2026-08-08). Re-run at least the mechanism check for
-// each floor move, so nobody re-derives it: the
+// each floor move -- release.sh moves the floor on its own and does not run
+// it -- so nobody re-derives it: the
 // pure-JS/SDK tier (memory, tailscale, lemonsqueezy, redis, postgres, ctxlint)
 // completes an MCP initialize handshake hosted on oam, AND so do both
 // bundled-browser servers -- @modelcontextprotocol/server-puppeteer and
@@ -222,6 +223,12 @@ export function npxSpec(args: readonly string[]): string | null {
  * the current release, and hosting sidecars on a runtime older than that means
  * debugging against a build nobody else is running. There is no support
  * commitment for older builds, so there is no reason to admit them.
+ *
+ * release.sh does the bump. It reads the latest oam release from GitHub before
+ * its confirm prompt and, when this is behind and the version being released is
+ * not yet tagged or on npm, moves it -- with the ratchet literal in
+ * oam-spawn.test.ts and a CHANGELOG block -- in a commit made before its lint,
+ * typecheck and test gates run.
  *
  * Below-min is treated the same as oam-absent: the spawn falls back to
  * node/npx with one warn log naming both versions. That is a safe outcome --

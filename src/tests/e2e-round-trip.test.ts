@@ -2,8 +2,8 @@ import { spawn } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { BROKER_BUNDLE_HOOK_TIMEOUT_MS, useBrokerBundle } from "./broker-bundle.js";
 
 // The product's central claim, exercised against real processes for the first
 // time: a client asks the broker for a tool, the broker routes the call to an
@@ -50,9 +50,6 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 // registration. No other test in this repo spawns a real upstream AND
 // completes a tool call through it, so nothing else would fail.
 
-const INDEX_SRC = fileURLToPath(new URL("../index.ts", import.meta.url));
-const PROJECT_ROOT = fileURLToPath(new URL("../..", import.meta.url));
-
 /** Generous on purpose. Nothing here is a wall-clock BUDGET -- the assertions
  *  are all on values -- so this is only "how long before we call it hung".
  *  A spawn plus a handshake plus an inventory is ~2s standalone; the rest is
@@ -61,6 +58,7 @@ const DEADLINE_MS = 30_000;
 
 let workDir: string;
 let bundlePath: string;
+let releaseBundle: () => Promise<void> = async () => {};
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
@@ -138,30 +136,22 @@ process.stdin.resume();
 describe("a real client, a real broker and a real upstream complete a tool call", () => {
   beforeAll(async () => {
     // Bundled from source rather than read from dist/, so the test does not
-    // depend on a build step having run first -- same reasoning, and the same
-    // esbuild call, as shutdown-on-stdin-close.test.ts.
-    const { build } = await import("esbuild");
-    workDir = await mkdtemp(join(tmpdir(), "yaw-mcp-e2e-"));
-    bundlePath = join(workDir, "entry.mjs");
-    await build({
-      entryPoints: [INDEX_SRC],
-      absWorkingDir: PROJECT_ROOT,
-      outfile: bundlePath,
-      bundle: true,
-      platform: "node",
-      format: "esm",
-      target: "node20",
-      mainFields: ["module", "main"],
-      banner: {
-        js: 'import { createRequire as __yawCreateRequire } from "node:module";\nconst require = __yawCreateRequire(import.meta.url);',
-      },
-      define: { __VERSION__: JSON.stringify("0.0.0-test") },
-      logLevel: "silent",
-    });
-  }, 180_000);
+    // depend on a build step having run first. The run's global setup builds
+    // it once, has node write the file, and runs it before any test file
+    // starts. Without that, a full-suite release run failed both tests below:
+    // the pipe test -- the bundle's first execution -- outlived its 120s
+    // timeout, and the round trip, spawned after it, got no answer to
+    // `initialize` within DEADLINE_MS and an empty stderr tail. That the
+    // second failure was the same first-run cost is inferred from that shape,
+    // not measured -- see broker-bundle.ts. The files this suite writes go in
+    // its own temp dir, never the shared bundle's.
+    ({ path: bundlePath, release: releaseBundle } = await useBrokerBundle("yaw-mcp-e2e-"));
+    workDir = await mkdtemp(join(tmpdir(), "yaw-mcp-e2e-home-"));
+  }, BROKER_BUNDLE_HOOK_TIMEOUT_MS);
 
   afterAll(async () => {
     if (workDir) await rm(workDir, { recursive: true, force: true });
+    await releaseBundle();
   });
 
   it("survives a reader that stops reading, and keeps the exit code it computed", async () => {
