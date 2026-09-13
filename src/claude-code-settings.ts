@@ -24,10 +24,11 @@
 // instead, so every other element, and every comment, survives byte for byte.
 
 import { readFile, stat } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { describeValueShape } from "./client-config.js";
 import type { InstallScope } from "./install-target-model.js";
 import { addJsoncArrayElement, parseJsonc, removeJsoncArrayElements } from "./jsonc.js";
+import { normalizeForCompare } from "./paths.js";
 
 /** Pattern added to Claude Code's `permissions.allow` on install so the
  *  user isn't re-prompted for each yaw-mcp MCP tool call. Only matters for
@@ -63,6 +64,40 @@ export function resolveClaudeCodeSettingsPath(
   if (scope === "project" && projectDir) return join(projectDir, ".claude", "settings.json");
   if (scope === "local" && projectDir) return join(projectDir, ".claude", "settings.local.json");
   return null;
+}
+
+/** Which Yaw Mode overlay this run's Claude Code config lives in, or null for
+ *  none.
+ *
+ *  Yaw Terminal runs Claude Code in a Yaw Mode pane with `YAW_MODE` set to
+ *  `augment` or `fresh` and `CLAUDE_CONFIG_DIR` pointed at a per-pane overlay
+ *  directory it builds from `<os.homedir()>/.claude` (yaw src/pty-manager.ts,
+ *  `userClaudeDir`; src/yaw-mode.ts, buildOverlayInto). The overlay's
+ *  settings.json does not outlive the pane, in either mode:
+ *    * augment HARDLINKS it to `~/.claude/settings.json`
+ *      (HARDLINK_ROOT_FILES), but Yaw's own writeOverlayPermissions unlinks
+ *      that hardlink to write its per-pane allow-list, and install's atomic
+ *      write replaces the file either way -- so a grant written there lands in
+ *      a copy the pane's teardown discards. syncOverlayBack carries only
+ *      `.claude.json` home.
+ *    * fresh never links it at all.
+ *  So an augment run patches `~/.claude/settings.json` as well, and a fresh one
+ *  says the grant goes with the pane.
+ *
+ *  Both conditions are required, and a CLAUDE_CONFIG_DIR that IS
+ *  `<home>/.claude` is not an overlay whatever YAW_MODE says: there is no
+ *  second file to reach. `home` is compared the way paths.ts compares a home,
+ *  resolved and case-folded where the filesystem folds case. */
+export function yawModeOverlay(opts: {
+  yawMode: string | undefined;
+  claudeConfigDir: string | undefined;
+  home: string;
+}): "augment" | "fresh" | null {
+  if (opts.yawMode !== "augment" && opts.yawMode !== "fresh") return null;
+  const dir = opts.claudeConfigDir;
+  if (dir === undefined || dir.length === 0) return null;
+  const same = normalizeForCompare(resolve(dir)) === normalizeForCompare(resolve(opts.home, ".claude"));
+  return same ? null : opts.yawMode;
 }
 
 /** Union `patterns` into `existing.permissions.allow`, preserving every

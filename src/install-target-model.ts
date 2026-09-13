@@ -114,6 +114,7 @@ export interface ClientEnvValues {
   continueGlobalDir?: string;
   typedCliBundle?: string;
   xdgConfigHome?: string;
+  yawMode?: string;
 }
 
 /** How install tells that the client's own INSTALLED PROGRAM is too old to read

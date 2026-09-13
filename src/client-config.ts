@@ -1173,10 +1173,10 @@ function verifyEdits(
 // The one reader of the env vars that relocate a client config
 // ---------------------------------------------------------------------------
 
-/** Every environment variable that moves a client's config file -- or a file
- *  of the client's own that install reads about it (typed's CLI bundle) -- as
- *  DATA, so a test can assert the CLI's Environment help block names all of
- *  them.
+/** Every environment variable that moves a client's config file -- or says
+ *  something install needs about where the client runs (typed's CLI bundle,
+ *  a Yaw Mode pane) -- as DATA, so a test can assert the CLI's Environment
+ *  help block names all of them.
  *
  *  Before this, `CLAUDE_CONFIG_DIR` was read in six hand-rolled places in
  *  src/. Adding more variables to six sites is exactly the one-adopter trap
@@ -1192,6 +1192,7 @@ export const CLIENT_ENV_VARS = [
   "CONTINUE_GLOBAL_DIR",
   "TYPED_CLI_BUNDLE",
   "XDG_CONFIG_HOME",
+  "YAW_MODE",
 ] as const;
 
 /** The overrides one environment carries. A variable that is unset -- or set
@@ -1219,6 +1220,11 @@ export interface ClientEnv {
    *  its files -- and a reader that silently dropped one would make "why is my
    *  XDG_CONFIG_HOME ignored" invisible. */
   xdgConfigHome?: string;
+  /** Yaw Terminal's marker for a Yaw Mode pane: `augment` or `fresh`, where
+   *  CLAUDE_CONFIG_DIR is a per-pane overlay whose settings.json does not
+   *  outlive the pane. Reported verbatim; `yawModeOverlay` in
+   *  claude-code-settings.ts decides what a value means. */
+  yawMode?: string;
 }
 
 /** Read every client-config override from one environment.
@@ -1253,5 +1259,7 @@ export function readClientEnv(env: NodeJS.ProcessEnv = process.env): ClientEnv {
   if (typedCliBundle !== undefined) out.typedCliBundle = typedCliBundle;
   const xdgConfigHome = value("XDG_CONFIG_HOME");
   if (xdgConfigHome !== undefined) out.xdgConfigHome = xdgConfigHome;
+  const yawMode = value("YAW_MODE");
+  if (yawMode !== undefined) out.yawMode = yawMode;
   return out;
 }

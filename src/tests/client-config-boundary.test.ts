@@ -192,7 +192,7 @@ const RULES: Rule[] = [
   {
     what: "a client env var read outside the one reader",
     pattern:
-      /env(?:\?\.|\.|\[")(?:CLAUDE_CONFIG_DIR|CODEX_HOME|CLINE_MCP_SETTINGS_PATH|CLINE_DATA_DIR|CLINE_DIR|CONTINUE_GLOBAL_DIR|TYPED_CLI_BUNDLE|XDG_CONFIG_HOME|APPDATA)\b/,
+      /env(?:\?\.|\.|\[")(?:CLAUDE_CONFIG_DIR|CODEX_HOME|CLINE_MCP_SETTINGS_PATH|CLINE_DATA_DIR|CLINE_DIR|CONTINUE_GLOBAL_DIR|TYPED_CLI_BUNDLE|XDG_CONFIG_HOME|YAW_MODE|APPDATA)\b/,
     allowed: {
       "src/install-target-model.ts": "resolveAppDataDir -- the one place %APPDATA% is chosen for a client path",
       "src/doctor-cmd.ts":

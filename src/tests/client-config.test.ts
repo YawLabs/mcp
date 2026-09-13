@@ -138,6 +138,7 @@ describe("the env reader", () => {
       CONTINUE_GLOBAL_DIR: "/w/continue",
       TYPED_CLI_BUNDLE: "/w/typed/cli.mjs",
       XDG_CONFIG_HOME: "/w/xdg",
+      YAW_MODE: "augment",
     };
     // Every declared variable, so this case cannot fall behind the list.
     expect(Object.keys(env)).toEqual([...CLIENT_ENV_VARS]);
@@ -151,6 +152,7 @@ describe("the env reader", () => {
       continueGlobalDir: "/w/continue",
       typedCliBundle: "/w/typed/cli.mjs",
       xdgConfigHome: "/w/xdg",
+      yawMode: "augment",
     });
   });
 

@@ -66,8 +66,10 @@ import { createInterface } from "node:readline/promises";
 import { atomicWriteFile } from "./atomic-write.js";
 import {
   CLAUDE_CODE_ALLOW_PATTERN,
+  type ClaudeCodeSettingsPatch,
   prepareClaudeCodeSettingsPatch,
   resolveClaudeCodeSettingsPath,
+  yawModeOverlay,
 } from "./claude-code-settings.js";
 import { clientChoices, resolveClientArg } from "./client-aliases.js";
 import {
@@ -1422,22 +1424,27 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   // Desktop / Cursor / VS Code have their own permission models). Preserves
   // all existing settings — we only union the pattern into
   // `permissions.allow` and write the file back verbatim otherwise.
-  const settingsPatch =
-    target.hooks?.permissionsPatch === "claude-code"
-      ? await prepareClaudeCodeSettingsPatch({
-          scope,
-          home,
-          projectDir,
-          claudeConfigDir: opts.claudeConfigDir,
-        })
-      : null;
+  //
+  // ONE patch everywhere but a Yaw Mode augment pane at user scope, which gets
+  // a second for `~/.claude/settings.json` -- see prepareGrantPatches.
+  const grant = await prepareGrantPatches({
+    target,
+    scope,
+    home,
+    projectDir,
+    claudeConfigDir: opts.claudeConfigDir,
+    yawMode: opts.clientEnv?.yawMode,
+    op: "add",
+  });
+  const settingsPatches = grant.patches;
 
   // Surface a malformed/non-object settings.json rather than silently
   // skipping the permissions patch (the patch itself is best-effort, so
   // this never fails the install -- but the user needs to know the file
   // was left unpatched, distinct from the "already present" no-op which
   // stays silent).
-  if (settingsPatch?.malformed) {
+  for (const settingsPatch of settingsPatches) {
+    if (!settingsPatch.malformed) continue;
     err(
       `yaw-mcp install: warning -- could not patch ${settingsPatch.path} (${settingsPatch.malformedReason}); left unchanged. Add "${CLAUDE_CODE_ALLOW_PATTERN}" to permissions.allow by hand, or you may be re-prompted for each yaw-mcp tool call.`,
     );
@@ -1539,7 +1546,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     // `extraWouldWrite.length === 0` is the same test applied to the copies,
     // and it is the live path's own: there, extras are pushed into `written`
     // before the `written.length === 0` check decides the run was a no-op.
-    if (clientJson === null && !settingsPatch?.changed && extraWouldWrite.length === 0) {
+    if (clientJson === null && !settingsPatches.some((p) => p.changed) && extraWouldWrite.length === 0) {
       // The copies still get their say -- "already correct" for each, and the
       // --repair warning for one that differs without authorisation. Both are
       // exactly what the live run prints over this same state before it too
@@ -1565,9 +1572,13 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
         `\n# ${resolved.absolute}\n${view.adapter.renderPreview(view.address, ENTRY_NAME, previewEntry, read.kind === "absent")}`,
       );
     }
-    if (settingsPatch?.changed) {
-      log(`# ${settingsPatch.path}\npermissions.allow += ${JSON.stringify(settingsPatch.added)}`);
+    for (const settingsPatch of settingsPatches) {
+      if (settingsPatch.changed) {
+        log(`# ${settingsPatch.path}\npermissions.allow += ${JSON.stringify(settingsPatch.added)}`);
+      }
     }
+    const freshNote = yawFreshGrantNote(grant, target.clientId);
+    if (freshNote !== null) log(freshNote);
     if (legacyEntry) {
       log(
         trimLegacy
@@ -1603,7 +1614,9 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     // rather than logging where it runs.
     flushExtraPreview();
     wouldWrite.push(...extraWouldWrite);
-    if (settingsPatch?.changed) wouldWrite.push(settingsPatch.path);
+    for (const settingsPatch of settingsPatches) {
+      if (settingsPatch.changed) wouldWrite.push(settingsPatch.path);
+    }
     return { written: [], wouldWrite, messages, exitCode: 0 };
   }
 
@@ -1679,7 +1692,8 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   // Claude Code: merge permissions.allow into settings.json so tool
   // calls don't prompt. Best-effort: any failure here is logged but does
   // NOT fail the overall install — the launch entry is already written.
-  if (settingsPatch?.changed) {
+  for (const settingsPatch of settingsPatches) {
+    if (!settingsPatch.changed) continue;
     // The same read-modify-write race the client config is guarded against
     // above, on the file Claude Code rewrites MOST during a session: every
     // permission approval lands in settings.json. The window is narrower --
@@ -1697,7 +1711,9 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     } else {
       try {
         await atomicWriteFile(settingsPatch.path, settingsPatch.nextJson);
-        log(`Wrote ${settingsPatch.path} (added ${CLAUDE_CODE_ALLOW_PATTERN} to permissions.allow)`);
+        log(
+          `Wrote ${settingsPatch.path} (added ${CLAUDE_CODE_ALLOW_PATTERN} to permissions.allow${settingsPatch.yawHome ? YAW_HOME_GRANT_REASON : ""})`,
+        );
         written.push(settingsPatch.path);
       } catch (e) {
         err(
@@ -1706,6 +1722,9 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
       }
     }
   }
+  // Only over a grant this run actually wrote: the note is about THAT write.
+  const freshNote = yawFreshGrantNote(grant, target.clientId);
+  if (freshNote !== null && written.includes(settingsPatches[0].path)) log(freshNote);
 
   // Nothing changed on disk: the entry already matched and no legacy trim or
   // permissions patch was pending. "Restart it to pick up the new MCP server"
@@ -1782,6 +1801,80 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
  *  `prepareClaudeCodeSettingsPatch` is imported, not re-exported: nothing
  *  outside this file calls it. */
 export { mergePermissionsAllow, removePermissionsAllow } from "./claude-code-settings.js";
+
+/** One `permissions.allow` patch, with the CLAUDE_CONFIG_DIR its file was
+ *  resolved under -- which is also the one uninstall's shared-grant check has
+ *  to resolve the other clients' files under -- and whether it is the second,
+ *  home-side patch of a Yaw Mode augment pane. */
+type GrantPatch = ClaudeCodeSettingsPatch & { claudeConfigDir: string | undefined; yawHome: boolean };
+
+/** The patches one install or uninstall makes to Claude Code's
+ *  `permissions.allow`, and the Yaw Mode overlay the run is in (null outside
+ *  one, and for any run the overlay does not concern).
+ *
+ *  None for a row without `hooks.permissionsPatch`. Otherwise the one file the
+ *  scope names -- `<CLAUDE_CONFIG_DIR>/settings.json` at user scope when that is
+ *  set -- exactly as before. The ONLY addition is a Yaw Mode AUGMENT pane at
+ *  USER scope (see yawModeOverlay), whose overlay settings.json is discarded
+ *  with the pane: it gets a second patch for `<home>/.claude/settings.json`, so
+ *  the grant is there for every session after this one. A fresh pane gets no
+ *  second patch -- it reads nothing from home, and install says so instead
+ *  (yawFreshGrantNote). Project and local scope are project-relative files
+ *  CLAUDE_CONFIG_DIR never moves, so no overlay reaches them.
+ *
+ *  Outside a Yaw Mode pane this returns what the single inline patch did, and
+ *  every caller prints what it always printed. */
+async function prepareGrantPatches(args: {
+  target: InstallTarget;
+  scope: InstallScope;
+  home: string;
+  projectDir: string | undefined;
+  claudeConfigDir: string | undefined;
+  yawMode: string | undefined;
+  op: "add" | "remove";
+}): Promise<{ patches: GrantPatch[]; overlay: "augment" | "fresh" | null }> {
+  if (args.target.hooks?.permissionsPatch !== "claude-code") return { patches: [], overlay: null };
+  const overlay =
+    args.scope === "user"
+      ? yawModeOverlay({ yawMode: args.yawMode, claudeConfigDir: args.claudeConfigDir, home: args.home })
+      : null;
+  const patches: GrantPatch[] = [];
+  const dirs: Array<{ claudeConfigDir: string | undefined; yawHome: boolean }> = [
+    { claudeConfigDir: args.claudeConfigDir, yawHome: false },
+  ];
+  if (overlay === "augment") dirs.push({ claudeConfigDir: undefined, yawHome: true });
+  for (const { claudeConfigDir, yawHome } of dirs) {
+    const patch = await prepareClaudeCodeSettingsPatch({
+      scope: args.scope,
+      home: args.home,
+      projectDir: args.projectDir,
+      claudeConfigDir,
+      op: args.op,
+    });
+    if (patch !== null) patches.push({ ...patch, claudeConfigDir, yawHome });
+  }
+  return { patches, overlay };
+}
+
+/** The clause the home-side write of a Yaw Mode augment pane adds to its
+ *  "Wrote" line, so a write outside CLAUDE_CONFIG_DIR says why it happened. */
+const YAW_HOME_GRANT_REASON = " -- a Yaw Mode pane's own settings.json does not outlive the pane";
+
+/** The one note a FRESH Yaw Mode pane gets when install writes (or would
+ *  write) the grant into its overlay settings.json: the pane keeps no settings,
+ *  so the grant goes with it, and a normal shell is where the install sticks.
+ *  null for any other run, and when the overlay patch changes nothing. */
+function yawFreshGrantNote(
+  grant: { patches: GrantPatch[]; overlay: "augment" | "fresh" | null },
+  clientId: InstallClientId,
+): string | null {
+  const overlayPatch = grant.patches[0];
+  if (grant.overlay !== "fresh" || overlayPatch === undefined || !overlayPatch.changed) return null;
+  return (
+    `Note: a fresh Yaw Mode pane does not keep its settings.json, so the ${CLAUDE_CODE_ALLOW_PATTERN} grant in ` +
+    `${overlayPatch.path} goes when this pane closes. Run \`yaw-mcp install ${clientId}\` from a normal shell to keep it.`
+  );
+}
 
 /** The warning a row's `programProbe` asks for, or null when it asks for none:
  *  the row has no probe, the program file is absent or cannot be read (there
@@ -3187,18 +3280,20 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
   // precisely the leftover this subcommand exists to clean up.
   //
   // Keyed on the row's `hooks.permissionsPatch`, like install's patch, never
-  // on the client id.
-  let settingsPatch =
-    target.hooks?.permissionsPatch === "claude-code"
-      ? await prepareClaudeCodeSettingsPatch({
-          scope,
-          home,
-          projectDir,
-          claudeConfigDir: opts.claudeConfigDir,
-          op: "remove",
-        })
-      : null;
-  if (settingsPatch?.malformed) {
+  // on the client id. A Yaw Mode augment pane at user scope removes from
+  // `~/.claude/settings.json` as well -- the same pair install writes, see
+  // prepareGrantPatches.
+  const grant = await prepareGrantPatches({
+    target,
+    scope,
+    home,
+    projectDir,
+    claudeConfigDir: opts.claudeConfigDir,
+    yawMode: opts.clientEnv?.yawMode,
+    op: "remove",
+  });
+  for (const settingsPatch of grant.patches) {
+    if (!settingsPatch.malformed) continue;
     err(
       `yaw-mcp uninstall: warning -- could not patch ${settingsPatch.path} (${settingsPatch.malformedReason}); left unchanged. Remove "${CLAUDE_CODE_ALLOW_PATTERN}" from permissions.allow by hand.`,
     );
@@ -3210,25 +3305,65 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
   // reads, and that client would re-prompt on every yaw-mcp tool call -- so
   // the grant stays, and the run says which client is keeping it. Only a
   // patch that would actually change something is worth asking about.
-  if (settingsPatch?.changed) {
-    const holder = await sharedGrantHolder({
-      self: { clientId: target.clientId, scope },
-      settingsPath: settingsPatch.path,
-      os,
-      home,
-      appData: resolveAppDataDir({ appData: opts.appData, home: opts.home }),
-      projectDir,
-      claudeConfigDir: opts.claudeConfigDir,
-      clientEnv: opts.clientEnv,
-    });
-    if (holder !== null) {
-      log(
-        holder.unreadable
-          ? `Keeping ${CLAUDE_CODE_ALLOW_PATTERN} in ${settingsPatch.path}: could not read ${holder.file} to tell whether ${holder.label} (${holder.scope}) still uses it.`
-          : `Keeping ${CLAUDE_CODE_ALLOW_PATTERN} in ${settingsPatch.path}: ${holder.label} (${holder.scope}) still launches yaw-mcp from ${holder.file} and reads that grant.`,
-      );
-      settingsPatch = null;
+  //
+  // Asked PER FILE. The overlay's settings.json is read by this pane's clients,
+  // whose configs are the overlay's, so it is asked under CLAUDE_CONFIG_DIR as
+  // it stands. `~/.claude/settings.json` is read by the sessions after this
+  // pane, whose configs are home's -- AND, in an augment pane, by whatever the
+  // overlay's `.claude.json` holds, since Yaw carries that file home when the
+  // pane closes (syncOverlayBack). So the home-side question is asked with the
+  // variable unset -- in `clientEnv` too, where Claude Code's own path would
+  // otherwise still find the overlay -- and then as the overlay's own question
+  // (the overlay's settings file, under the overlay), and either holder keeps
+  // the grant.
+  const settingsPatches: GrantPatch[] = [];
+  for (const settingsPatch of grant.patches) {
+    if (settingsPatch.changed) {
+      const overlaySettings = grant.patches[0].path;
+      const askUnder: Array<{
+        settingsPath: string;
+        claudeConfigDir: string | undefined;
+        clientEnv: ClientEnvValues | undefined;
+      }> = settingsPatch.yawHome
+        ? [
+            {
+              settingsPath: settingsPatch.path,
+              claudeConfigDir: undefined,
+              clientEnv: { ...opts.clientEnv, claudeConfigDir: undefined },
+            },
+            { settingsPath: overlaySettings, claudeConfigDir: opts.claudeConfigDir, clientEnv: opts.clientEnv },
+          ]
+        : [
+            {
+              settingsPath: settingsPatch.path,
+              claudeConfigDir: settingsPatch.claudeConfigDir,
+              clientEnv: opts.clientEnv,
+            },
+          ];
+      let holder: Awaited<ReturnType<typeof sharedGrantHolder>> = null;
+      for (const under of askUnder) {
+        holder = await sharedGrantHolder({
+          self: { clientId: target.clientId, scope },
+          settingsPath: under.settingsPath,
+          os,
+          home,
+          appData: resolveAppDataDir({ appData: opts.appData, home: opts.home }),
+          projectDir,
+          claudeConfigDir: under.claudeConfigDir,
+          clientEnv: under.clientEnv,
+        });
+        if (holder !== null) break;
+      }
+      if (holder !== null) {
+        log(
+          holder.unreadable
+            ? `Keeping ${CLAUDE_CODE_ALLOW_PATTERN} in ${settingsPatch.path}: could not read ${holder.file} to tell whether ${holder.label} (${holder.scope}) still uses it.`
+            : `Keeping ${CLAUDE_CODE_ALLOW_PATTERN} in ${settingsPatch.path}: ${holder.label} (${holder.scope}) still launches yaw-mcp from ${holder.file} and reads that grant.`,
+        );
+        continue;
+      }
     }
+    settingsPatches.push(settingsPatch);
   }
 
   // The editor copies, consulted BEFORE the "Nothing to do" gate below:
@@ -3239,7 +3374,7 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
   // outright -- and a detected editor copy still keyed "mcp", uninstall
   // printed "Nothing to do: Cline (user) has no yaw-mcp entry", exited 0 with
   // `written: []`, and left that copy launching yaw-mcp; --dry-run reported
-  // `wouldWrite: []` over the same state. The `settingsPatch?.changed` escape
+  // `wouldWrite: []` over the same state. The settings-patch escape
   // beside it does not cover the case: that patch exists only for a row with
   // `hooks.permissionsPatch`, and no such row has extra sites.
   //
@@ -3274,7 +3409,7 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
     }
   };
 
-  if (removals.length === 0 && extraWouldRemove.length === 0 && !settingsPatch?.changed) {
+  if (removals.length === 0 && extraWouldRemove.length === 0 && !settingsPatches.some((p) => p.changed)) {
     // Exit 0, not an error: a subtract that cannot no-op cannot be scripted,
     // and re-running uninstall is the shape a cleanup script takes.
     //
@@ -3319,7 +3454,9 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
       preview.push(`legacy:   "${s.legacyEntry}"${where(s)} (also removed; --keep-legacy leaves it)`);
     }
   }
-  if (settingsPatch?.changed) preview.push(`grant:    ${CLAUDE_CODE_ALLOW_PATTERN} from ${settingsPatch.path}`);
+  for (const settingsPatch of settingsPatches) {
+    if (settingsPatch.changed) preview.push(`grant:    ${CLAUDE_CODE_ALLOW_PATTERN} from ${settingsPatch.path}`);
+  }
 
   if (opts.dryRun) {
     log(`\n--- dry run: would remove the following (the rest of each file is left as-is) ---`);
@@ -3331,7 +3468,9 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
     const wouldWrite: string[] = [];
     if (removals.length > 0) wouldWrite.push(resolved.absolute);
     wouldWrite.push(...extraWouldRemove);
-    if (settingsPatch?.changed) wouldWrite.push(settingsPatch.path);
+    for (const settingsPatch of settingsPatches) {
+      if (settingsPatch.changed) wouldWrite.push(settingsPatch.path);
+    }
     return { written: [], wouldWrite, messages, exitCode: 0 };
   }
 
@@ -3460,7 +3599,8 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
 
   // Best-effort, exactly like install's patch: the entry is already gone, and a
   // stale allow-pattern costs the user nothing but a dead line in a config.
-  if (settingsPatch?.changed) {
+  for (const settingsPatch of settingsPatches) {
+    if (!settingsPatch.changed) continue;
     if (!sameFingerprint(settingsPatch.fingerprint, await fileFingerprint(settingsPatch.path))) {
       err(
         `yaw-mcp uninstall: warning -- ${settingsPatch.path} changed while uninstall was running (another process wrote it); left unchanged. Remove "${CLAUDE_CODE_ALLOW_PATTERN}" from permissions.allow by hand.`,

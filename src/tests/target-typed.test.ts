@@ -29,6 +29,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { yawModeOverlay } from "../claude-code-settings.js";
 import { clientChoices } from "../client-aliases.js";
 import { reloadDoneClause, reloadRemovalClause } from "../client-config.js";
 import { runDoctor } from "../doctor-cmd.js";
@@ -546,6 +547,197 @@ describe("uninstall and the SHARED grant", () => {
     expect(result.exitCode).toBe(0);
     expect(allowOf(userSettings())).toEqual([CLAUDE_CODE_ALLOW_PATTERN]);
     expect(stdout).toContain(keepLine("Claude Code (user)", claudeJson()));
+  });
+});
+
+describe("a Yaw Mode pane: the grant outlives the pane", () => {
+  // Yaw Terminal runs a pane with YAW_MODE=augment|fresh and CLAUDE_CONFIG_DIR
+  // pointed at a per-pane overlay built from <home>/.claude, whose settings.json
+  // is discarded with the pane. The dispatcher hands both variables in through
+  // `clientEnv` -- CLAUDE_CONFIG_DIR as `claudeConfigDir` as well -- so every
+  // run here passes them the same way.
+  const overlay = (): string => join(home, "yaw-overlay");
+  const overlaySettings = (): string => join(overlay(), "settings.json");
+  const overlayClaudeJson = (): string => join(overlay(), ".claude.json");
+  const pane = (yawMode: string) => ({
+    claudeConfigDir: overlay(),
+    clientEnv: { claudeConfigDir: overlay(), yawMode },
+  });
+
+  it("recognises an overlay only with YAW_MODE augment|fresh AND a CLAUDE_CONFIG_DIR that is not <home>/.claude", () => {
+    const dir = join(home, "yaw-overlay");
+    expect(yawModeOverlay({ yawMode: "augment", claudeConfigDir: dir, home })).toBe("augment");
+    expect(yawModeOverlay({ yawMode: "fresh", claudeConfigDir: dir, home })).toBe("fresh");
+    expect(yawModeOverlay({ yawMode: undefined, claudeConfigDir: dir, home })).toBeNull();
+    expect(yawModeOverlay({ yawMode: "off", claudeConfigDir: dir, home })).toBeNull();
+    expect(yawModeOverlay({ yawMode: "augment", claudeConfigDir: undefined, home })).toBeNull();
+    expect(yawModeOverlay({ yawMode: "augment", claudeConfigDir: "", home })).toBeNull();
+    // The home's own config dir is no overlay, however it is spelled.
+    expect(yawModeOverlay({ yawMode: "augment", claudeConfigDir: join(home, ".claude"), home })).toBeNull();
+    expect(yawModeOverlay({ yawMode: "augment", claudeConfigDir: `${join(home, ".claude")}/`, home })).toBeNull();
+    expect(yawModeOverlay({ yawMode: "augment", claudeConfigDir: join(home, "x", "..", ".claude"), home })).toBeNull();
+  });
+
+  describe("augment", () => {
+    it("install typed writes the grant to the overlay AND ~/.claude/settings.json, saying why for the second", async () => {
+      const { result, stdout } = await install("typed", pane("augment"));
+      expect(result.exitCode).toBe(0);
+      expect(result.written).toEqual([typedFile(), overlaySettings(), userSettings()]);
+      expect(allowOf(overlaySettings())).toEqual([CLAUDE_CODE_ALLOW_PATTERN]);
+      expect(allowOf(userSettings())).toEqual([CLAUDE_CODE_ALLOW_PATTERN]);
+      expect(stdout).toContain(
+        `Wrote ${overlaySettings()} (added ${CLAUDE_CODE_ALLOW_PATTERN} to permissions.allow)${LF}`,
+      );
+      expect(stdout).toContain(
+        `Wrote ${userSettings()} (added ${CLAUDE_CODE_ALLOW_PATTERN} to permissions.allow -- a Yaw Mode pane's own settings.json does not outlive the pane)${LF}`,
+      );
+      expect(stdout).not.toContain("fresh Yaw Mode pane");
+    });
+
+    it("install claude-code at user scope does the same beside the overlay's .claude.json", async () => {
+      const { result } = await install("claude-code", pane("augment"));
+      expect(result.exitCode).toBe(0);
+      expect(result.written).toEqual([overlayClaudeJson(), overlaySettings(), userSettings()]);
+      expect(allowOf(userSettings())).toEqual([CLAUDE_CODE_ALLOW_PATTERN]);
+    });
+
+    it("leaves project scope alone: CLAUDE_CONFIG_DIR moves no project file", async () => {
+      const { result } = await install("claude-code", { ...pane("augment"), scope: "project", projectDir: cwd });
+      expect(result.exitCode).toBe(0);
+      expect(result.written).toEqual([join(cwd, ".mcp.json"), join(cwd, ".claude", "settings.json")]);
+      expect(existsSync(userSettings())).toBe(false);
+    });
+
+    it("previews both files under --dry-run and writes neither", async () => {
+      const { result, stdout } = await install("typed", { ...pane("augment"), dryRun: true });
+      expect(result.wouldWrite).toEqual([typedFile(), overlaySettings(), userSettings()]);
+      expect(stdout).toContain(`# ${overlaySettings()}${LF}permissions.allow += ["${CLAUDE_CODE_ALLOW_PATTERN}"]`);
+      expect(stdout).toContain(`# ${userSettings()}${LF}permissions.allow += ["${CLAUDE_CODE_ALLOW_PATTERN}"]`);
+      expect(existsSync(overlaySettings())).toBe(false);
+      expect(existsSync(userSettings())).toBe(false);
+    });
+
+    it("uninstall removes the grant from both files when nothing else holds it", async () => {
+      await install("typed", pane("augment"));
+      const { result, stdout } = await uninstall("typed", pane("augment"));
+      expect(result.exitCode).toBe(0);
+      expect(result.written).toEqual([typedFile(), overlaySettings(), userSettings()]);
+      expect(allowOf(overlaySettings())).toEqual([]);
+      expect(allowOf(userSettings())).toEqual([]);
+      expect(stdout).not.toContain("Keeping");
+    });
+
+    it("keeps BOTH grants on `uninstall typed` while Claude Code's entry is in the overlay's .claude.json, which Yaw carries home", async () => {
+      await install("claude-code", pane("augment"));
+      await install("typed", pane("augment"));
+      const { result, stdout } = await uninstall("typed", pane("augment"));
+      expect(result.exitCode).toBe(0);
+      expect(result.written).toEqual([typedFile()]);
+      expect(allowOf(overlaySettings())).toEqual([CLAUDE_CODE_ALLOW_PATTERN]);
+      expect(allowOf(userSettings())).toEqual([CLAUDE_CODE_ALLOW_PATTERN]);
+      const keeping = stdout.split(LF).filter((l) => l.startsWith("Keeping "));
+      expect(keeping).toEqual([
+        `Keeping ${CLAUDE_CODE_ALLOW_PATTERN} in ${overlaySettings()}: Claude Code (user) still launches yaw-mcp from ${overlayClaudeJson()} and reads that grant.`,
+        `Keeping ${CLAUDE_CODE_ALLOW_PATTERN} in ${userSettings()}: Claude Code (user) still launches yaw-mcp from ${overlayClaudeJson()} and reads that grant.`,
+      ]);
+    });
+
+    it("keeps only the HOME grant when Claude Code's entry is in ~/.claude.json and not the overlay's", async () => {
+      // Installed from a normal shell, before this pane: the overlay's own
+      // .claude.json (a fresh directory here) does not carry it.
+      await install("claude-code");
+      await install("typed", pane("augment"));
+      const { result, stdout } = await uninstall("typed", pane("augment"));
+      expect(result.exitCode).toBe(0);
+      expect(allowOf(overlaySettings())).toEqual([]);
+      expect(allowOf(userSettings())).toEqual([CLAUDE_CODE_ALLOW_PATTERN]);
+      expect(result.written).toEqual([typedFile(), overlaySettings()]);
+      expect(stdout.split(LF).filter((l) => l.startsWith("Keeping "))).toEqual([
+        `Keeping ${CLAUDE_CODE_ALLOW_PATTERN} in ${userSettings()}: Claude Code (user) still launches yaw-mcp from ${claudeJson()} and reads that grant.`,
+      ]);
+    });
+
+    it("keeps both grants on `uninstall claude-code` while typed's file still has its entry", async () => {
+      await install("typed", pane("augment"));
+      await install("claude-code", pane("augment"));
+      const { result } = await uninstall("claude-code", pane("augment"));
+      expect(result.exitCode).toBe(0);
+      expect(allowOf(overlaySettings())).toEqual([CLAUDE_CODE_ALLOW_PATTERN]);
+      expect(allowOf(userSettings())).toEqual([CLAUDE_CODE_ALLOW_PATTERN]);
+    });
+  });
+
+  describe("fresh", () => {
+    const freshNote = (clientId: string): string =>
+      `Note: a fresh Yaw Mode pane does not keep its settings.json, so the ${CLAUDE_CODE_ALLOW_PATTERN} grant in ${overlaySettings()} goes when this pane closes. Run \`yaw-mcp install ${clientId}\` from a normal shell to keep it.`;
+
+    it("install writes the overlay only and prints the note once", async () => {
+      const { result, stdout } = await install("typed", pane("fresh"));
+      expect(result.exitCode).toBe(0);
+      expect(result.written).toEqual([typedFile(), overlaySettings()]);
+      expect(existsSync(userSettings())).toBe(false);
+      expect(stdout.split(LF).filter((l) => l.includes("fresh Yaw Mode pane"))).toEqual([freshNote("typed")]);
+    });
+
+    it("prints the note on the --dry-run preview, and not over a grant a re-run does not write", async () => {
+      const preview = await install("claude-code", { ...pane("fresh"), dryRun: true });
+      expect(preview.stdout.split(LF).filter((l) => l.includes("fresh Yaw Mode pane"))).toEqual([
+        freshNote("claude-code"),
+      ]);
+      await install("typed", pane("fresh"));
+      const again = await install("typed", pane("fresh"));
+      expect(again.result.written).toEqual([]);
+      expect(again.stdout).not.toContain("fresh Yaw Mode pane");
+    });
+
+    it("uninstall removes from the overlay only, without a note", async () => {
+      await install("typed", pane("fresh"));
+      seed(userSettings(), `{ "permissions": { "allow": ["${CLAUDE_CODE_ALLOW_PATTERN}"] } }${LF}`);
+      const before = read(userSettings());
+      const { result, stdout } = await uninstall("typed", pane("fresh"));
+      expect(result.exitCode).toBe(0);
+      expect(result.written).toEqual([typedFile(), overlaySettings()]);
+      expect(read(userSettings())).toBe(before);
+      expect(stdout).not.toContain("Yaw Mode");
+    });
+  });
+
+  describe("outside one, nothing changes", () => {
+    /** Each case as the dispatcher would hand it over. Built per test, since
+     *  `home` is. */
+    const cases: Array<[string, () => { claudeConfigDir?: string; clientEnv: ClientEnvValues }]> = [
+      ["YAW_MODE unset", () => ({ claudeConfigDir: overlay(), clientEnv: { claudeConfigDir: overlay() } })],
+      [
+        "YAW_MODE=off",
+        () => ({ claudeConfigDir: overlay(), clientEnv: { claudeConfigDir: overlay(), yawMode: "off" } }),
+      ],
+      ["CLAUDE_CONFIG_DIR unset", () => ({ clientEnv: { yawMode: "augment" } })],
+      [
+        "CLAUDE_CONFIG_DIR = <home>/.claude",
+        () => {
+          const dir = join(home, ".claude");
+          return { claudeConfigDir: dir, clientEnv: { claudeConfigDir: dir, yawMode: "augment" } };
+        },
+      ],
+    ];
+    for (const [what, build] of cases) {
+      it(`${what}: one grant file, and not a word about Yaw Mode`, async () => {
+        const run = build();
+        const grantFile =
+          run.claudeConfigDir !== undefined ? join(run.claudeConfigDir, "settings.json") : userSettings();
+        const installed = await install("typed", run);
+        expect(installed.result.written).toEqual([typedFile(), grantFile]);
+        expect(installed.stdout).toContain(
+          `Wrote ${grantFile} (added ${CLAUDE_CODE_ALLOW_PATTERN} to permissions.allow)${LF}`,
+        );
+        const removed = await uninstall("typed", run);
+        expect(removed.result.written).toEqual([typedFile(), grantFile]);
+        expect(`${installed.stdout}${removed.stdout}`).not.toContain("Yaw Mode");
+        // Nothing on stderr either: a second patch of the SAME file would
+        // report it as "changed while install was running".
+        expect(`${installed.stderr}${removed.stderr}`).toBe("");
+      });
+    }
   });
 });
 

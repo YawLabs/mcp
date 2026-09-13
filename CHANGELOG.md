@@ -90,6 +90,17 @@ The closing lines speak to typed. `install typed` ends `Done: typed is configure
 
 An older typed CLI ignores `~/.config/typed/mcp.json` without a word, so `install typed` now looks for itself. It reads the bundle typed's launcher runs -- `$TYPED_CLI_BUNDLE`, else `~/.config/typed/typed-cli/cli.mjs` -- and when that file exists and does not contain the quoted `"mcp.json"` path segment typed's loader for the file compiles to, prints one warning to stderr: ``yaw-mcp install: warning -- the typed CLI at <bundle> predates ~/.config/typed/mcp.json, so it will not load this entry until it updates -- run `typed update`.`` With `TYPED_CLI_BUNDLE` set the warning says the bundle has to be rebuilt or replaced instead, since `typed update` refreshes only the default one. It probes the bundle's bytes, never a version number, prints nothing when there is no bundle to read, and changes neither what install writes nor its exit code; it fires on `--dry-run` and on an already-configured re-run as well. `TYPED_CLI_BUNDLE` joins the `--help` Environment block.
 
+**Fixed -- in a Yaw Mode pane, the `mcp__mcp__*` grant outlives the pane**
+
+A Yaw Mode pane sets `YAW_MODE` to `augment` or `fresh` and points `CLAUDE_CONFIG_DIR` at a per-pane overlay, and `install claude-code` and `install typed` at user scope wrote the grant only to that overlay's `settings.json`. Yaw discards that copy with the pane: an augment pane starts it as a hardlink to `~/.claude/settings.json`, but Yaw unlinks it to write its own per-pane allow-list, install's atomic write replaces it either way, and what Yaw carries home when the pane closes is `.claude.json` alone. So every session after the pane went back to asking about yaw-mcp's tools.
+
+With `YAW_MODE` set to one of those two values and `CLAUDE_CONFIG_DIR` set to anything but `~/.claude`, a user-scope install or uninstall of either client now:
+
+- **augment** -- writes the grant to `~/.claude/settings.json` as well as the overlay's, and the second `Wrote` line ends ` -- a Yaw Mode pane's own settings.json does not outlive the pane`. `uninstall` removes it from both, and keeps each file's grant while another client that reads that file still has its entry. For `~/.claude/settings.json` that includes a Claude Code entry in the pane's own `.claude.json`, which Yaw carries home.
+- **fresh** -- writes the overlay only, since a fresh pane reads nothing from home, and prints one note: ``Note: a fresh Yaw Mode pane does not keep its settings.json, so the mcp__mcp__* grant in <overlay>/settings.json goes when this pane closes. Run `yaw-mcp install <client>` from a normal shell to keep it.`` `uninstall` removes from the overlay only, without a note.
+
+Project and local scope are unchanged, since `CLAUDE_CONFIG_DIR` moves neither of their files, and so is every run outside a Yaw Mode pane. `YAW_MODE` joins the `--help` Environment block.
+
 **Added -- `install` reaches Zed, Cline, Continue and Codex CLI, and takes `mcp` as another name for Claude Code's project scope**
 
 Four clients are new install targets, landed after 1.0.1. `install`, `uninstall`, `import` and `try` accept each id, `install --all` includes them, and `install --list` and `doctor` show their rows:
