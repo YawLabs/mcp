@@ -224,10 +224,11 @@ export function npxSpec(args: readonly string[]): string | null {
  * debugging against a build nobody else is running. There is no support
  * commitment for older builds, so there is no reason to admit them.
  *
- * release.sh does the bump. A fresh release reads the latest oam release from
- * GitHub before its confirm prompt and, when this is behind, moves it -- with
- * the ratchet literal in oam-spawn.test.ts and a CHANGELOG block -- in a commit
- * made before its lint, typecheck and test gates run.
+ * release.sh does the bump. It reads the latest oam release from GitHub before
+ * its confirm prompt and, when this is behind and the version being released is
+ * not yet tagged or on npm, moves it -- with the ratchet literal in
+ * oam-spawn.test.ts and a CHANGELOG block -- in a commit made before its lint,
+ * typecheck and test gates run.
  *
  * Below-min is treated the same as oam-absent: the spawn falls back to
  * node/npx with one warn log naming both versions. That is a safe outcome --
