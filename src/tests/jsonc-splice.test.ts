@@ -7,7 +7,14 @@
 // outright on removal. A parse-and-compare assertion passes on all of that.
 
 import { describe, expect, it } from "vitest";
-import { editJsoncEntry, editJsoncPath, parseJsonc, removeJsoncEntry } from "../jsonc.js";
+import {
+  addJsoncArrayElement,
+  editJsoncEntry,
+  editJsoncPath,
+  parseJsonc,
+  removeJsoncArrayElements,
+  removeJsoncEntry,
+} from "../jsonc.js";
 
 const lf = (...lines: string[]): string => lines.join("\n");
 const crlf = (...lines: string[]): string => lines.join("\r\n");
@@ -524,5 +531,95 @@ describe("shapes left to jsonc-parser keep its behaviour and its messages", () =
 
   it("an empty document still gets a fresh object", () => {
     expect(parseJsonc(editJsoncEntry("", ["mcpServers"], "mcp", ENTRY))).toEqual({ mcpServers: { mcp: ENTRY } });
+  });
+});
+
+// The two ARRAY helpers, tested DIRECTLY rather than only through
+// claude-code-settings.ts's permissions patch.
+//
+// That one caller passes strings, so every non-scalar path below is
+// unreachable from it today -- and `mergePermissionsAllow`'s own doc
+// anticipates "an object rule, a nested array" in that list, so the shapes are
+// documented as supported and have to be true. They were not: both helpers
+// read `Node.value`, which jsonc-parser populates only for a SCALAR, so an
+// object element compared as `undefined` -- the dedupe appended a duplicate
+// instead of returning the input, and a predicate got `undefined` to decide
+// on.
+describe("addJsoncArrayElement / removeJsoncArrayElements over non-scalar elements", () => {
+  const OBJECT_LIST = lf("{", '  "rules": [', '    { "tool": "Bash" }, // shell', '    "Read(*)"', "  ]", "}", "");
+
+  it("treats an OBJECT element already in the list as a byte-for-byte no-op", () => {
+    // The `Node.value` bug: this appended a second copy of the same object.
+    expect(addJsoncArrayElement(OBJECT_LIST, ["rules"], { tool: "Bash" })).toBe(OBJECT_LIST);
+  });
+
+  it("treats a nested ARRAY element already in the list as a no-op too", () => {
+    const nested = lf("{", '  "rules": [', "    [1, 2] // pair", "  ]", "}", "");
+    expect(addJsoncArrayElement(nested, ["rules"], [1, 2])).toBe(nested);
+  });
+
+  it("appends an object that differs, keeping the comment on the element beside it", () => {
+    // The new element is rendered at the file's own indent step, one key per
+    // line -- jsonc-parser's own formatting for a fresh member, which is what
+    // every other splice in this file produces too.
+    expect(addJsoncArrayElement(OBJECT_LIST, ["rules"], { tool: "Write" })).toBe(
+      lf(
+        "{",
+        '  "rules": [',
+        '    { "tool": "Bash" }, // shell',
+        '    "Read(*)",',
+        "    {",
+        '      "tool": "Write"',
+        "    }",
+        "  ]",
+        "}",
+        "",
+      ),
+    );
+  });
+
+  it("compares by stringify, so a re-ordered object is a DIFFERENT element", () => {
+    // Stated rather than fixed: an order-insensitive compare would need a
+    // canonicaliser, and the one caller writes strings. The contract is what
+    // the doc says it is.
+    const one = lf("{", '  "rules": [', '    { "a": 1, "b": 2 }', "  ]", "}", "");
+    expect(addJsoncArrayElement(one, ["rules"], { b: 2, a: 1 })).not.toBe(one);
+    expect(addJsoncArrayElement(one, ["rules"], { a: 1, b: 2 })).toBe(one);
+  });
+
+  it("hands the predicate the materialised element, so an object can be removed by shape", () => {
+    expect(removeJsoncArrayElements(OBJECT_LIST, ["rules"], (v) => (v as { tool?: string })?.tool === "Bash")).toBe(
+      lf("{", '  "rules": [', '    "Read(*)"', "  ]", "}", ""),
+    );
+  });
+
+  it("leaves the list byte for byte when the predicate matches no object", () => {
+    expect(removeJsoncArrayElements(OBJECT_LIST, ["rules"], (v) => (v as { tool?: string })?.tool === "Write")).toBe(
+      OBJECT_LIST,
+    );
+  });
+
+  it("empties a list of objects to [] rather than deleting the key", () => {
+    const only = lf("{", '  "rules": [', '    { "tool": "Bash" }', "  ],", '  "other": 1', "}", "");
+    expect(removeJsoncArrayElements(only, ["rules"], () => true)).toBe(
+      lf("{", '  "rules": [],', '  "other": 1', "}", ""),
+    );
+  });
+
+  it("creates the list, and the objects above it, when the path names nothing", () => {
+    expect(parseJsonc(addJsoncArrayElement(lf("{}", ""), ["permissions", "allow"], "Read(*)"))).toEqual({
+      permissions: { allow: ["Read(*)"] },
+    });
+  });
+
+  it("refuses a path that names something which is not an array", () => {
+    expect(() => addJsoncArrayElement(lf("{", '  "rules": 1', "}", ""), ["rules"], "x")).toThrow(
+      "rules is a number, not an array",
+    );
+  });
+
+  it("returns the input when a removal's path names no array", () => {
+    const src = lf("{", '  "rules": 1', "}", "");
+    expect(removeJsoncArrayElements(src, ["rules"], () => true)).toBe(src);
   });
 });

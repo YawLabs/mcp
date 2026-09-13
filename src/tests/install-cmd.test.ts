@@ -9,9 +9,10 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { classifyClientConfig } from "../client-config.js";
 import { runDoctor } from "../doctor-cmd.js";
 import {
   type BundlesSummary,
@@ -19,14 +20,11 @@ import {
   DRY_RUN_ENV_PLACEHOLDER,
   deepEqualJson,
   describeEntryDiff,
-  directClientEntries,
   INSTALL_USAGE,
-  mergeClientConfig,
   mergePermissionsAllow,
   NO_CONFIG_FLAG_DEPRECATION,
   parseInstallArgs,
   parseUninstallArgs,
-  readEntryAt,
   removePermissionsAllow,
   runInstall,
   runUninstall,
@@ -40,6 +38,7 @@ import {
   ENTRY_NAME,
   INSTALL_TARGETS,
   type InstallOS,
+  resolveInstallPath,
 } from "../install-targets.js";
 import { parseJsonc } from "../jsonc.js";
 import { MIN_OAM_VERSION, OAM_INSTALL_PS1, OAM_INSTALL_SH, type OamProbe, oamNoBinaryReason } from "../oam-spawn.js";
@@ -172,7 +171,9 @@ describe("parseInstallArgs", () => {
   });
 
   it("rejects unknown client", () => {
-    const r = parseInstallArgs(["zed"]);
+    // A name no row can ever carry. A real client id here goes red the day
+    // that client lands, which is what the previous spelling did.
+    const r = parseInstallArgs(["not-a-client"]);
     expect(r.ok).toBe(false);
   });
 
@@ -305,74 +306,15 @@ describe("parseInstallArgs", () => {
   });
 });
 
-describe("mergeClientConfig", () => {
-  it("preserves other servers in mcpServers", () => {
-    const existing = { mcpServers: { other: { command: "x" } } };
-    const merged = mergeClientConfig(existing, ["mcpServers"], { command: "npx", args: ["-y", "@yawlabs/mcp"] });
-    expect(merged.mcpServers).toEqual({
-      other: { command: "x" },
-      [ENTRY_NAME]: { command: "npx", args: ["-y", "@yawlabs/mcp"] },
-    });
-  });
-
-  it("preserves sibling top-level keys (e.g., model, hooks)", () => {
-    const existing = { model: "claude-opus-4-7", mcpServers: {} };
-    const merged = mergeClientConfig(existing, ["mcpServers"], { command: "npx", args: ["-y", "@yawlabs/mcp"] });
-    expect(merged.model).toBe("claude-opus-4-7");
-    expect((merged.mcpServers as Record<string, unknown>)[ENTRY_NAME]).toBeDefined();
-  });
-
-  it("creates the container if missing", () => {
-    const merged = mergeClientConfig({}, ["servers"], { command: "npx", args: [] });
-    expect(merged.servers).toEqual({ [ENTRY_NAME]: { command: "npx", args: [] } });
-  });
-
-  it("uses the right container key for VS Code (servers, not mcpServers)", () => {
-    const merged = mergeClientConfig({}, ["servers"], { command: "x", args: [] });
-    expect(merged.mcpServers).toBeUndefined();
-    expect(merged.servers).toBeDefined();
-  });
-
-  it("does not mutate the input", () => {
-    const existing = { mcpServers: { other: { command: "x" } } };
-    const snapshot = JSON.stringify(existing);
-    mergeClientConfig(existing, ["mcpServers"], { command: "y", args: [] });
-    expect(JSON.stringify(existing)).toBe(snapshot);
-  });
-
-  it("walks a nested containerPath and preserves siblings at every level", () => {
-    // Claude Code local scope: ["projects", "/abs/dir", "mcpServers"].
-    // Must preserve other projects + every top-level key in ~/.claude.json.
-    const existing = {
-      userID: "abc",
-      projects: {
-        "/other/project": { mcpServers: { foo: { command: "f" } }, history: ["x"] },
-        "/abs/dir": { history: ["y"] },
-      },
-    };
-    const merged = mergeClientConfig(existing, ["projects", "/abs/dir", "mcpServers"], {
-      command: "npx",
-      args: ["-y", "@yawlabs/mcp"],
-    });
-    expect(merged.userID).toBe("abc");
-    const projects = merged.projects as Record<string, Record<string, unknown>>;
-    // Other project untouched.
-    expect(projects["/other/project"].mcpServers).toEqual({ foo: { command: "f" } });
-    expect(projects["/other/project"].history).toEqual(["x"]);
-    // Target project: history preserved, mcpServers added.
-    expect(projects["/abs/dir"].history).toEqual(["y"]);
-    expect((projects["/abs/dir"].mcpServers as Record<string, unknown>)[ENTRY_NAME]).toEqual({
-      command: "npx",
-      args: ["-y", "@yawlabs/mcp"],
-    });
-  });
-
-  it("creates intermediate path segments when missing", () => {
-    const merged = mergeClientConfig({}, ["projects", "/new/dir", "mcpServers"], { command: "npx", args: [] });
-    const projects = merged.projects as Record<string, Record<string, unknown>>;
-    expect(projects["/new/dir"].mcpServers).toEqual({ [ENTRY_NAME]: { command: "npx", args: [] } });
-  });
-});
+// The `mergeClientConfig` describe stood here: sibling preservation at every
+// level of a nested container path, intermediate segments created on the way
+// down, the input never mutated, and the container key taken from the target
+// rather than assumed. That function is gone -- every write goes through
+// `applyClientConfigEdits` -- and each of those properties is now pinned
+// against the live splicer instead: see the nested-container cases in
+// client-config-json.test.ts (which assert the OTHER project is untouched and
+// the chain is materialised), the fresh-document shape there, and the write
+// facade's own verification, which refuses any edit that changed a neighbour.
 
 describe("mergePermissionsAllow", () => {
   it("adds the pattern to an empty settings object", () => {
@@ -864,28 +806,51 @@ describe("runInstall -- other client entries stay direct", () => {
   });
 });
 
-describe("directClientEntries", () => {
+describe("the other servers wired DIRECTLY into a container", () => {
+  // `directClientEntries` in install-cmd.ts used to answer this, over a
+  // container object the consumer had walked to. It is the core's
+  // `otherServerKeys()` now, over the entries the site's own adapter read --
+  // same rule, one reader of the legacy-name list. These are its cases,
+  // moved onto the live implementation rather than deleted with the old one.
+  const keysOf = (container: Record<string, unknown>): string[] =>
+    classifyClientConfig(JSON.stringify({ mcpServers: container }), {
+      id: "default",
+      label: "test",
+      resolved: { absolute: "/x", display: "/x", containerPath: ["mcpServers"] },
+      format: "jsonc",
+      detectDir: null,
+    }).otherServerKeys();
+
   it("skips our own entry and every pre-rename spelling of it", () => {
-    expect(directClientEntries({})).toEqual([]);
-    expect(directClientEntries({ [ENTRY_NAME]: {} })).toEqual([]);
-    expect(directClientEntries({ "mcp.hosting": {} })).toEqual([]);
-    expect(directClientEntries({ mcph: {} })).toEqual([]);
-    expect(directClientEntries({ "yaw-mcp": {} })).toEqual([]);
+    expect(keysOf({})).toEqual([]);
+    expect(keysOf({ [ENTRY_NAME]: {} })).toEqual([]);
+    expect(keysOf({ "mcp.hosting": {} })).toEqual([]);
+    expect(keysOf({ mcph: {} })).toEqual([]);
+    expect(keysOf({ "yaw-mcp": {} })).toEqual([]);
   });
 
   it("counts a trial entry, which is a server wired straight into the client", () => {
-    expect(directClientEntries({ github: {}, "yaw-mcp-try-linear": {} })).toEqual(["github", "yaw-mcp-try-linear"]);
+    expect(keysOf({ github: {}, "yaw-mcp-try-linear": {} })).toEqual(["github", "yaw-mcp-try-linear"]);
   });
 
   it("skips values no client could launch", () => {
-    expect(directClientEntries({ a: "s", b: null, c: [] })).toEqual([]);
+    expect(keysOf({ a: "s", b: null, c: [] })).toEqual([]);
   });
 
-  it("returns nothing for a container that is not an object", () => {
-    expect(directClientEntries(null)).toEqual([]);
-    expect(directClientEntries([])).toEqual([]);
-    expect(directClientEntries("x")).toEqual([]);
-    expect(directClientEntries(undefined)).toEqual([]);
+  it("returns nothing for a container that is not an object at all", () => {
+    // The container key holding a non-object is a `blocked` read, and every
+    // question the view answers is empty for a read that is not ok.
+    for (const raw of ['{"mcpServers":5}', '{"mcpServers":[]}', '{"mcpServers":"x"}', "[1]", null]) {
+      expect(
+        classifyClientConfig(raw, {
+          id: "default",
+          label: "test",
+          resolved: { absolute: "/x", display: "/x", containerPath: ["mcpServers"] },
+          format: "jsonc",
+          detectDir: null,
+        }).otherServerKeys(),
+      ).toEqual([]);
+    }
   });
 });
 
@@ -1689,7 +1654,7 @@ describe("runInstall — collision handling", () => {
   });
 
   it("--force's drop line names only what --repair would have kept; the diff names every dropped key", async () => {
-    // readEntryAt filters a non-string value out on BOTH paths, so "--repair
+    // The core's carryableEnv filters a non-string value out on BOTH paths, so "--repair
     // keeps it" would be false of DEBUG. The line names OAM_BIN alone; the diff
     // line, which describes the real file-to-file change, names both.
     writeFileSync(
@@ -2537,6 +2502,16 @@ describe("runInstall — settings.json that changes between its read and its pat
   });
 });
 
+// The two clients the "not supported yet" remedy names, DERIVED the way the
+// message derives them: the first two rows in table order that are
+// configurable on this OS and are not the refused one. A literal pair here
+// would restate the rule rather than check it, and would have to be re-judged
+// by every client that landed ahead of cursor -- which nothing may do, since
+// rows are appended. Pinned once, below, so the derivation is not vacuous.
+const ALTERNATIVES = INSTALL_TARGETS.filter(
+  (t) => t.clientId !== "claude-desktop" && t.availableOn.includes("linux") && t.notConfigurableOn?.linux === undefined,
+).slice(0, 2);
+
 describe("runInstall — Claude Desktop on Linux refused", () => {
   it("exits 2 saying the config path is undocumented, not that the app does not exist", async () => {
     // Claude Desktop for Linux ships as a beta; the old message ("Anthropic
@@ -2556,7 +2531,7 @@ describe("runInstall — Claude Desktop on Linux refused", () => {
     expect(cap.stderr()).toBe(
       "yaw-mcp install: Claude Desktop on linux is not supported yet.\n" +
         "  Claude Desktop for Linux is in beta, and Anthropic has not documented where it reads claude_desktop_config.json.\n" +
-        "  Install into Claude Code or Cursor instead, or add the entry by hand.\n",
+        `  Install into ${ALTERNATIVES.map((t) => t.label).join(" or ")} instead, or add the entry by hand.\n`,
     );
   });
 });
@@ -2568,10 +2543,16 @@ describe("clientUnavailableMessage", () => {
   const head =
     "Claude Desktop on linux is not supported yet.\n" +
     "  Claude Desktop for Linux is in beta, and Anthropic has not documented where it reads claude_desktop_config.json.\n  ";
+  it("names the first two configurable clients in table order, which today reads as Claude Code or Cursor", () => {
+    // Not tautological: the derivation above could produce an empty or
+    // one-element list and every expectation below would still "match".
+    expect(ALTERNATIVES.map((t) => t.clientId)).toEqual(["claude-code", "cursor"]);
+    expect(ALTERNATIVES.map((t) => t.label).join(" or ")).toBe("Claude Code or Cursor");
+  });
 
   it("words the remedy per verb, and never uses the caller's generic fix, for a client that ships but cannot be configured", () => {
     expect(clientUnavailableMessage("install", desktop, "linux", "GENERIC")).toBe(
-      `yaw-mcp install: ${head}Install into Claude Code or Cursor instead, or add the entry by hand.`,
+      `yaw-mcp install: ${head}Install into ${ALTERNATIVES.map((t) => t.label).join(" or ")} instead, or add the entry by hand.`,
     );
     expect(clientUnavailableMessage("uninstall", desktop, "linux", "GENERIC")).toBe(
       `yaw-mcp uninstall: ${head}Remove the entry by hand if you added one.`,
@@ -2580,7 +2561,9 @@ describe("clientUnavailableMessage", () => {
       `yaw-mcp import: ${head}Add those servers to yaw-mcp yourself instead: \`yaw-mcp add <slug>\` for a catalog server, or \`yaw-mcp add <name> --command "<launch line>"\` for any other.`,
     );
     expect(clientUnavailableMessage("try", desktop, "linux", "GENERIC")).toBe(
-      `yaw-mcp try: ${head}Pick another client, such as --client claude-code or --client cursor, or add the entry by hand.`,
+      `yaw-mcp try: ${head}Pick another client, such as ${ALTERNATIVES.map((t) => `--client ${t.clientId}`).join(
+        " or ",
+      )}, or add the entry by hand.`,
     );
   });
 
@@ -4015,21 +3998,6 @@ describe("runInstall — returned messages match what was printed", () => {
   });
 });
 
-describe("readEntryAt", () => {
-  it("returns the entry, or null for every shape that is not one", () => {
-    const cfg = { mcpServers: { [ENTRY_NAME]: { command: "npx", env: { A: "1" } } } };
-    expect(readEntryAt(cfg, ["mcpServers"], ENTRY_NAME)?.env).toEqual({ A: "1" });
-    // Absent container, absent entry, and non-object shapes must all be null
-    // rather than throw: these come from a user-editable config file.
-    expect(readEntryAt({}, ["mcpServers"], ENTRY_NAME)).toBeNull();
-    expect(readEntryAt({ mcpServers: {} }, ["mcpServers"], ENTRY_NAME)).toBeNull();
-    expect(readEntryAt({ mcpServers: [] }, ["mcpServers"], ENTRY_NAME)).toBeNull();
-    expect(readEntryAt({ mcpServers: "nope" }, ["mcpServers"], ENTRY_NAME)).toBeNull();
-    expect(readEntryAt({ mcpServers: { [ENTRY_NAME]: "nope" } }, ["mcpServers"], ENTRY_NAME)).toBeNull();
-    expect(readEntryAt({ mcpServers: { [ENTRY_NAME]: [] } }, ["mcpServers"], ENTRY_NAME)).toBeNull();
-  });
-});
-
 describe("mergePermissionsAllow — non-string entries", () => {
   it("keeps non-string elements of a pre-existing allow array", () => {
     // The filter used to type-narrow to string, so anything else a user (or a
@@ -4269,17 +4237,42 @@ describe("runInstall --all — an all-refused run", () => {
   // succeed for the rest and the assertions below would be measuring a
   // partially-successful run.
   const seedBothColliding = (): void => {
-    const seeded = { mcpServers: { [ENTRY_NAME]: { command: "npx", args: ["-y", "@yawlabs/mcp"] } } };
-    const vscodeSeeded = { servers: { [ENTRY_NAME]: { command: "npx", args: ["-y", "@yawlabs/mcp"] } } };
-    writeFileSync(join(synthHome, ".claude.json"), JSON.stringify(seeded), "utf8");
-    mkdirSync(join(synthHome, ".cursor"), { recursive: true });
-    writeFileSync(join(synthHome, ".cursor", "mcp.json"), JSON.stringify(seeded), "utf8");
-    mkdirSync(join(synthHome, ".config", "Code", "User"), { recursive: true });
-    writeFileSync(join(synthHome, ".config", "Code", "User", "mcp.json"), JSON.stringify(vscodeSeeded), "utf8");
-    mkdirSync(join(synthHome, ".codeium", "windsurf"), { recursive: true });
-    writeFileSync(join(synthHome, ".codeium", "windsurf", "mcp_config.json"), JSON.stringify(seeded), "utf8");
-    mkdirSync(join(synthHome, ".gemini"), { recursive: true });
-    writeFileSync(join(synthHome, ".gemini", "settings.json"), JSON.stringify(seeded), "utf8");
+    // DERIVED from the table, not a hand-kept list of five files: a client
+    // that lands and is not seeded turns this into a partially-successful run
+    // that still calls itself all-refused, and every assertion below would
+    // then be measuring the wrong thing. Each file gets the entry under that
+    // row's OWN container root, which is why the key comes from `config.root`.
+    for (const t of INSTALL_TARGETS) {
+      if (!t.availableOn.includes("linux")) continue;
+      const scopeSpec = t.scopes.find((sc) => !sc.requiresProjectDir);
+      if (!scopeSpec) continue;
+      const resolved = resolveInstallPath({
+        clientId: t.clientId,
+        scope: scopeSpec.scope,
+        os: "linux",
+        home: synthHome,
+      });
+      mkdirSync(dirname(resolved.absolute), { recursive: true });
+      // The seed has to be in the row's OWN FORMAT, not JSON for everyone.
+      // Writing JSON into a `toml` row's file seeds a MALFORMED config, and a
+      // malformed file is a FAILURE rather than a collision refusal -- which
+      // silently turns this all-refused run into a mixed one and moves the
+      // aggregate exit code off the "needs a flag" code the assertions below
+      // are about. (Measured when codex-cli landed: exit 1 where 2 was
+      // expected, and 1 where 0 was, from this one line.)
+      const args = ["-y", "@yawlabs/mcp"];
+      if (t.config.format === "toml") {
+        const argList = args.map((a) => JSON.stringify(a)).join(", ");
+        writeFileSync(
+          resolved.absolute,
+          `[${t.config.root}.${ENTRY_NAME}]\ncommand = "npx"\nargs = [${argList}]\n`,
+          "utf8",
+        );
+      } else {
+        const seeded = { [t.config.root]: { [ENTRY_NAME]: { command: "npx", args } } };
+        writeFileSync(resolved.absolute, JSON.stringify(seeded), "utf8");
+      }
+    }
   };
 
   it("returns a trail with ONE shared refusal hint, matching the transcript", async () => {
@@ -4488,7 +4481,7 @@ describe("runInstall — idempotence (re-run over an entry that already matches)
   });
 
   it("an extra key on the stored entry is a DIFFERENCE, not a match", async () => {
-    // readEntryAt's sanitized view drops keys it does not model, so comparing
+    // The carried env is string-valued only, so comparing
     // against THAT would call this identical and decline to fix the very thing
     // a re-run is for. The comparison reads the RAW stored value.
     await seedByInstalling();
@@ -4617,6 +4610,15 @@ describe("runInstall --all -- a DRIFTED entry off a TTY", () => {
   const DIFF = 'args: ["-y","@yawlabs/mcp@latest","--stale-flag"] -> ["-y","@yawlabs/mcp@latest"]';
   const cursorPath = (): string => join(synthHome, ".cursor", "mcp.json");
   const allOpts = { os: "linux" as const, all: true, oamProbe: OAM_ABSENT };
+  // How many clients `--all` plans on this OS, DERIVED from the same predicate
+  // runInstallAll uses: available here, then a user scope, else the first
+  // scope that needs no project dir (no --project-dir is passed in these
+  // cases, so a project-only client would be skipped). A literal count would
+  // have to be re-counted by every landing client -- exactly the collision
+  // that would send a sibling package back into this file.
+  const PLANNED = INSTALL_TARGETS.filter(
+    (t) => t.availableOn.includes("linux") && t.scopes.some((sc) => !sc.requiresProjectDir),
+  ).length;
 
   const installFresh = async (): Promise<void> => {
     const cap = captureIo();
@@ -4670,10 +4672,10 @@ describe("runInstall --all -- a DRIFTED entry off a TTY", () => {
       `yaw-mcp install --all: 1 client already has a differing "${ENTRY_NAME}" entry (cursor) and stdin is not a TTY.\n` +
         "  Re-run `yaw-mcp install --all --repair` to bring it up to date (keeping the string values in its env), " +
         "`--force` to overwrite it outright (dropping all of it), `--skip` to leave it untouched, or `--dry-run` to preview.\n" +
-        "1/5 client install was refused (see the flags above). 4 succeeded.\n",
+        `1/${PLANNED} client install was refused (see the flags above). ${PLANNED - 1} succeeded.\n`,
     );
     expect(r.messages[r.messages.length - 1]).toBe(
-      "1/5 client install was refused (see the flags above). 4 succeeded.",
+      `1/${PLANNED} client install was refused (see the flags above). ${PLANNED - 1} succeeded.`,
     );
   });
 
@@ -4688,7 +4690,7 @@ describe("runInstall --all -- a DRIFTED entry off a TTY", () => {
         "  Re-run `yaw-mcp install --all --repair` to bring them up to date (keeping the string values in each " +
         "entry's env), `--force` to overwrite them outright (dropping all of it), `--skip` to leave them " +
         "untouched, or `--dry-run` to preview.\n" +
-        "2/5 client installs were refused (see the flags above). 3 succeeded.\n",
+        `2/${PLANNED} client installs were refused (see the flags above). ${PLANNED - 2} succeeded.\n`,
     );
     expect(stderr.split(`already has a "${ENTRY_NAME}" entry -- left untouched.`).length - 1).toBe(2);
     // ...and each of the two carries its own diff, not just its header line.
@@ -4704,7 +4706,9 @@ describe("runInstall --all -- a DRIFTED entry off a TTY", () => {
     writeFileSync(join(synthHome, ".gemini", "settings.json"), "{oops", "utf8");
     const { r, stderr } = await rerun();
     expect(r.exitCode).toBe(1);
-    expect(stderr).toContain("1/5 client install failed and 1 was refused (see the flags above). 3 succeeded.\n");
+    expect(stderr).toContain(
+      `1/${PLANNED} client install failed and 1 was refused (see the flags above). ${PLANNED - 2} succeeded.\n`,
+    );
     expect(stderr).toContain(`    ${DIFF}\n`);
     expect(stderr).toContain("`yaw-mcp install --all --repair`");
   });
@@ -4716,7 +4720,7 @@ describe("runInstall --all -- a DRIFTED entry off a TTY", () => {
     expect(r.exitCode).toBe(0);
     expect(JSON.parse(readFileSync(cursorPath(), "utf8")).mcpServers[ENTRY_NAME]).toEqual(FRESH_ENTRY);
     expect(stderr).not.toMatch(/stdin is not a TTY/);
-    expect(stdout).toContain("Done: 5/5 clients installed successfully.\n");
+    expect(stdout).toContain(`Done: ${PLANNED}/${PLANNED} clients installed successfully.\n`);
   });
 
   it("--all --dry-run previews the drifted entry's diff and writes nothing, as the hint promises", async () => {
@@ -4735,7 +4739,9 @@ describe("runInstall --all -- a DRIFTED entry off a TTY", () => {
     const { r, stdout } = await rerun({ dryRun: true });
     expect(r.exitCode).toBe(0);
     expect(r.written).toEqual([]);
-    expect(r.messages[r.messages.length - 1]).toBe("Dry run: 5/5 clients would be installed; nothing written.");
+    expect(r.messages[r.messages.length - 1]).toBe(
+      `Dry run: ${PLANNED}/${PLANNED} clients would be installed; nothing written.`,
+    );
     expect(stdout).not.toContain("installed successfully");
   });
 
@@ -4744,29 +4750,25 @@ describe("runInstall --all -- a DRIFTED entry off a TTY", () => {
     writeFileSync(join(synthHome, ".gemini", "settings.json"), "{oops", "utf8");
     const { r, stdout, stderr } = await rerun({ dryRun: true });
     expect(r.exitCode).toBe(1);
-    expect(stderr).toContain("Dry run: 1/5 client preview failed. 4 would be installed; nothing written.\n");
+    expect(stderr).toContain(
+      `Dry run: 1/${PLANNED} client preview failed. ${PLANNED - 1} would be installed; nothing written.\n`,
+    );
     expect(stdout).not.toContain("installed successfully");
   });
 
   it("a one-client run says 'client', not 'clients', on both the Done and the Dry-run line", async () => {
     // No OS plans exactly one client, so the singular is reachable only by
-    // narrowing the table for this test; without it, a hard-coded "clients" in
-    // either closing line passed the whole suite. Restored in `finally` --
-    // every other test reads the same array.
-    const saved = INSTALL_TARGETS.splice(0, INSTALL_TARGETS.length);
-    try {
-      INSTALL_TARGETS.push(...saved.filter((t) => t.clientId === "cursor"));
-      const dry = await rerun({ dryRun: true });
-      expect(dry.r.exitCode).toBe(0);
-      expect(dry.r.messages[dry.r.messages.length - 1]).toBe(
-        "Dry run: 1/1 client would be installed; nothing written.",
-      );
-      const real = await rerun();
-      expect(real.r.exitCode).toBe(0);
-      expect(real.r.messages[real.r.messages.length - 1]).toBe("Done: 1/1 client installed successfully.");
-    } finally {
-      INSTALL_TARGETS.splice(0, INSTALL_TARGETS.length, ...saved);
-    }
+    // narrowing the table for this run; without it, a hard-coded "clients" in
+    // either closing line passed the whole suite. The narrowing rides on the
+    // `targets` option rather than mutating INSTALL_TARGETS, which is readonly
+    // -- its append-only order is an invariant every other test reads.
+    const oneClient = INSTALL_TARGETS.filter((t) => t.clientId === "cursor");
+    const dry = await rerun({ dryRun: true, targets: oneClient });
+    expect(dry.r.exitCode).toBe(0);
+    expect(dry.r.messages[dry.r.messages.length - 1]).toBe("Dry run: 1/1 client would be installed; nothing written.");
+    const real = await rerun({ targets: oneClient });
+    expect(real.r.exitCode).toBe(0);
+    expect(real.r.messages[real.r.messages.length - 1]).toBe("Done: 1/1 client installed successfully.");
   });
 });
 
@@ -4831,7 +4833,7 @@ describe("runInstall — a DIFFERING entry shows what differs", () => {
   });
 
   it("the off-TTY hint names only the env keys --repair keeps when a stored value is not a string", async () => {
-    // readEntryAt filters a non-string value out of the carry-over, so --repair
+    // The core's carryableEnv filters a non-string value out of the carry-over, so --repair
     // does NOT keep all of this env. The diff says DEBUG goes; the hint under
     // it must not then claim the env is kept.
     seedStale({ command: "old", args: [], env: { YAW_MCP_VAULT_PASSPHRASE: "hunter2", DEBUG: 1 } });
@@ -5790,7 +5792,12 @@ describe("install / uninstall keep the neighbouring entries' bytes", () => {
     expect(readFileSync(path, "utf8")).toBe(lf(...head, ...tail));
   });
 
-  it("claude-code: the permissions.allow patch re-renders only the array, in the file's step", async () => {
+  it("claude-code: the permissions.allow patch splices ONE element, leaving the list's own shape", async () => {
+    // The patch used to write the whole `allow` VALUE, so a one-line list was
+    // re-rendered across four lines and -- the reason this changed -- every
+    // comment INSIDE the list was deleted. It now edits the single member in
+    // the original bytes: the list stays on its line, and the trailing comment
+    // stays where the user put it.
     const settingsPath = join(synthHome, ".claude", "settings.json");
     mkdirSync(join(synthHome, ".claude"), { recursive: true });
     const open = ["{", "    // user settings", '    "model": "opus", // pinned', '    "permissions": {'];
@@ -5807,15 +5814,62 @@ describe("install / uninstall keep the neighbouring entries' bytes", () => {
     });
     expect(r.exitCode).toBe(0);
     expect(readFileSync(settingsPath, "utf8")).toBe(
+      lf(...open, `        "allow": ["Bash(ls)",${JSON.stringify(CLAUDE_CODE_ALLOW_PATTERN)}], // mine`, ...close),
+    );
+  });
+
+  it("claude-code: a comment INSIDE permissions.allow survives an install and an uninstall", async () => {
+    // The regression the element splice exists for. An allow-list is exactly
+    // the kind of list people annotate per pattern, and the whole-array write
+    // took those notes with it -- on the way in AND on the way out.
+    const settingsPath = join(synthHome, ".claude", "settings.json");
+    mkdirSync(join(synthHome, ".claude"), { recursive: true });
+    const before = lf(
+      "{",
+      '  "permissions": {',
+      '    "allow": [',
+      "      // the team agreed on this one",
+      '      "Bash(ls:*)"',
+      "    ]",
+      "  }",
+      "}",
+      "",
+    );
+    writeFileSync(settingsPath, before, "utf8");
+    const installed = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: captureIo().io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(installed.exitCode).toBe(0);
+    expect(readFileSync(settingsPath, "utf8")).toBe(
       lf(
-        ...open,
-        '        "allow": [',
-        '            "Bash(ls)",',
-        `            ${JSON.stringify(CLAUDE_CODE_ALLOW_PATTERN)}`,
-        "        ], // mine",
-        ...close,
+        "{",
+        '  "permissions": {',
+        '    "allow": [',
+        "      // the team agreed on this one",
+        '      "Bash(ls:*)",',
+        `      ${JSON.stringify(CLAUDE_CODE_ALLOW_PATTERN)}`,
+        "    ]",
+        "  }",
+        "}",
+        "",
       ),
     );
+    const removed = await runUninstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      force: true,
+      io: captureIo().io,
+    });
+    expect(removed.exitCode).toBe(0);
+    // Back to the original bytes, comment included.
+    expect(readFileSync(settingsPath, "utf8")).toBe(before);
   });
 });
 
@@ -6153,5 +6207,277 @@ describe("Claude Code local scope -- an entry under the OTHER drive-letter case"
     const after = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
     expect(after.mcpServers[ENTRY_NAME]).toBeUndefined();
     expect(after.mcpServers["mcp.hosting"]).toBeDefined();
+  });
+});
+
+describe("runInstall / runUninstall -- a target whose one scope is SEVERAL files", () => {
+  // Cline is the only row with a `sites` hook: a shared file the CLI and the
+  // extension's newer runtime read, plus one copy under each editor whose
+  // Cline extension storage exists. Its `notes` -- which install prints
+  // verbatim -- say install writes the shared file "and each editor copy it
+  // finds", and before the fan-out was wired that sentence was false: measured
+  // on a seeded VS Code storage directory, only the shared file was written.
+  const EDITOR_DIR = join("AppData", "Roaming", "Code", "User", "globalStorage", "saoudrizwan.claude-dev");
+
+  /** The editor copy's path, its storage directory created so the site is
+   *  DETECTED (that directory existing is what says the extension has run
+   *  there). */
+  function seedEditorStorage(home: string): string {
+    const dir = join(home, EDITOR_DIR, "settings");
+    mkdirSync(dir, { recursive: true });
+    return join(dir, "cline_mcp_settings.json");
+  }
+
+  const sharedPath = (home: string): string => join(home, ".cline", "data", "settings", "cline_mcp_settings.json");
+
+  function clineOpts(home: string, extra: Record<string, unknown> = {}) {
+    return {
+      clientId: "cline" as const,
+      home,
+      appData: join(home, "AppData", "Roaming"),
+      suppressBundlesNote: true,
+      ...extra,
+    };
+  }
+
+  it("writes the shared file AND every editor copy it finds", async () => {
+    const home = mkdtempSync(join(tmpdir(), "yaw-cline-"));
+    try {
+      const copy = seedEditorStorage(home);
+      const cap = captureIo();
+      const r = await runInstall({ ...clineOpts(home), io: cap.io });
+      expect(r.exitCode).toBe(0);
+      expect(r.written).toContain(sharedPath(home));
+      expect(r.written).toContain(copy);
+      // The same entry in both, under the row's own container key.
+      const entryOf = (p: string): unknown =>
+        (JSON.parse(readFileSync(p, "utf8")) as { mcpServers: Record<string, unknown> }).mcpServers[ENTRY_NAME];
+      expect(entryOf(copy)).toEqual(entryOf(sharedPath(home)));
+      expect(entryOf(copy)).toBeDefined();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("writes only the shared file when no editor has Cline storage", async () => {
+    const home = mkdtempSync(join(tmpdir(), "yaw-cline-"));
+    try {
+      const cap = captureIo();
+      const r = await runInstall({ ...clineOpts(home), io: cap.io });
+      expect(r.exitCode).toBe(0);
+      expect(r.written).toEqual([sharedPath(home)]);
+      expect(existsSync(join(home, EDITOR_DIR, "settings", "cline_mcp_settings.json"))).toBe(false);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("names every copy it would write under --dry-run, and writes none", async () => {
+    const home = mkdtempSync(join(tmpdir(), "yaw-cline-"));
+    try {
+      const copy = seedEditorStorage(home);
+      const cap = captureIo();
+      const r = await runInstall({ ...clineOpts(home, { dryRun: true }), io: cap.io });
+      expect(r.exitCode).toBe(0);
+      expect(r.written).toEqual([]);
+      expect(r.wouldWrite).toContain(copy);
+      expect(existsSync(copy)).toBe(false);
+      expect(existsSync(sharedPath(home))).toBe(false);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves a copy whose entry DIFFERS alone, and says which", async () => {
+    const home = mkdtempSync(join(tmpdir(), "yaw-cline-"));
+    try {
+      const copy = seedEditorStorage(home);
+      // Somebody's own launch entry at our key. Not ours to replace without a
+      // flag -- the primary site would refuse it off a TTY too.
+      writeFileSync(copy, `${JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "theirs" } } }, null, 2)}\n`);
+      const before = readFileSync(copy, "utf8");
+      const cap = captureIo();
+      const r = await runInstall({ ...clineOpts(home), io: cap.io });
+      // The shared file is still written: the primary install succeeded.
+      expect(r.exitCode).toBe(0);
+      expect(r.written).toContain(sharedPath(home));
+      expect(r.written).not.toContain(copy);
+      expect(readFileSync(copy, "utf8")).toBe(before);
+      expect(cap.stderr()).toMatch(/already has a differing "mcp" entry/);
+      expect(cap.stderr()).toContain(copy);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("--repair brings that copy up to date without a second prompt", async () => {
+    const home = mkdtempSync(join(tmpdir(), "yaw-cline-"));
+    try {
+      const copy = seedEditorStorage(home);
+      writeFileSync(copy, `${JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "theirs" } } }, null, 2)}\n`);
+      const cap = captureIo();
+      const r = await runInstall({ ...clineOpts(home, { repair: true }), io: cap.io });
+      expect(r.exitCode).toBe(0);
+      expect(r.written).toContain(copy);
+      const written = JSON.parse(readFileSync(copy, "utf8")) as { mcpServers: Record<string, { command: string }> };
+      expect(written.mcpServers[ENTRY_NAME].command).not.toBe("theirs");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("uninstall clears the copy too, so no editor is left launching yaw-mcp", async () => {
+    const home = mkdtempSync(join(tmpdir(), "yaw-cline-"));
+    try {
+      const copy = seedEditorStorage(home);
+      const installed = await runInstall({ ...clineOpts(home), io: captureIo().io });
+      expect(installed.written).toContain(copy);
+      const cap = captureIo();
+      const r = await runUninstall({ ...clineOpts(home), force: true, io: cap.io });
+      expect(r.exitCode).toBe(0);
+      expect(r.written).toContain(copy);
+      const after = JSON.parse(readFileSync(copy, "utf8")) as { mcpServers: Record<string, unknown> };
+      expect(Object.keys(after.mcpServers)).toEqual([]);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("runInstall -- .mcp.json is STRICT JSON, so a commented one is refused", () => {
+  // Claude Code reads `.mcp.json` with strict JSON, unlike `~/.claude.json`: a
+  // comment or a trailing comma in it means it loads NO server from that file.
+  // Measured before claude-code's project scope declared `strictJson`: install
+  // spliced its entry in and printed `Done`, over a file Claude Code was
+  // already ignoring in full -- so the user saw a successful install and no
+  // yaw-mcp, with nothing on screen connecting the two.
+  //
+  // The answer is a REFUSAL, not a repair. The comments are the user's, and
+  // yaw-mcp does not get to delete them so its own write can land.
+  const COMMENTED = [
+    "{",
+    "  // our servers",
+    '  "mcpServers": {',
+    '    "other": { "command": "node" }',
+    "  }",
+    "}",
+    "",
+  ].join("\n");
+  const TRAILING_COMMA = ["{", '  "mcpServers": {', '    "other": { "command": "node" },', "  }", "}", ""].join("\n");
+
+  let home: string;
+  let project: string;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "yaw-strict-"));
+    project = mkdtempSync(join(home, "repo-"));
+  });
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  const mcpJson = (): string => join(project, ".mcp.json");
+
+  function run(raw: string, extra: Record<string, unknown> = {}) {
+    writeFileSync(mcpJson(), raw);
+    const cap = captureIo();
+    return {
+      cap,
+      before: raw,
+      result: runInstall({
+        clientId: "claude-code",
+        scope: "project",
+        projectDir: project,
+        home,
+        cwd: project,
+        suppressBundlesNote: true,
+        io: cap.io,
+        ...extra,
+      }),
+    };
+  }
+
+  // --force and --repair are the flags a user reaches for when a write was
+  // refused, and NEITHER may get past this one: the file is unreadable by the
+  // client either way, so writing into it would still print Done over nothing.
+  for (const [name, extra] of [
+    ["no flags", {}],
+    ["--force", { force: true }],
+    ["--repair", { repair: true }],
+    ["--dry-run", { dryRun: true }],
+  ] as const) {
+    for (const [shape, raw] of [
+      ["a comment", COMMENTED],
+      ["a trailing comma", TRAILING_COMMA],
+    ] as const) {
+      it(`refuses ${shape} under ${name}, leaving the bytes exactly as they were`, async () => {
+        const { cap, before, result } = run(raw, extra);
+        const r = await result;
+        expect(r.exitCode).toBe(1);
+        expect(r.written).toEqual([]);
+        expect(r.wouldWrite).toEqual([]);
+        // The refusal names the syntax the CLIENT could not read, and says why
+        // it matters -- that nothing in the file is loading.
+        expect(cap.stderr()).toMatch(/comments or trailing commas/);
+        expect(cap.stderr()).toMatch(/no server in it is loading/);
+        // Byte for byte. A "refusal" that reformatted the file would be a
+        // write the user did not ask for.
+        expect(readFileSync(mcpJson(), "utf8")).toBe(before);
+      });
+    }
+  }
+
+  it("still writes a .mcp.json that is valid strict JSON", async () => {
+    // The gate is the CLIENT's parser, not a new rule about project files: an
+    // ordinary .mcp.json installs exactly as it did.
+    const { result } = run('{\n  "mcpServers": {\n    "other": { "command": "node" }\n  }\n}\n');
+    const r = await result;
+    expect(r.exitCode).toBe(0);
+    // The client config, plus the project's settings.json permissions patch --
+    // the one every claude-code install makes.
+    expect(r.written).toContain(mcpJson());
+    const after = JSON.parse(readFileSync(mcpJson(), "utf8")) as { mcpServers: Record<string, unknown> };
+    expect(Object.keys(after.mcpServers).sort()).toEqual([ENTRY_NAME, "other"]);
+  });
+
+  it("leaves the USER scope tolerant -- ~/.claude.json is not read strictly", async () => {
+    // The flag is on the project scope alone. ~/.claude.json is Claude Code's
+    // own state file and it does accept a comment, so refusing one there would
+    // block an install for no reason the client cares about.
+    writeFileSync(join(home, ".claude.json"), '{\n  // mine\n  "mcpServers": {}\n}\n');
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      home,
+      cwd: project,
+      suppressBundlesNote: true,
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(readFileSync(join(home, ".claude.json"), "utf8")).toContain("// mine");
+  });
+
+  it("refuses through the `mcp` alias too, which is this exact file's own name", async () => {
+    // `install mcp` resolves to claude-code at project scope, so it inherits
+    // the same gate -- and it is the spelling the docs use, i.e. the one most
+    // likely to meet a hand-edited .mcp.json.
+    const parsed = parseInstallArgs(["mcp"]);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.options.clientId).toBe("claude-code");
+    expect(parsed.options.scope).toBe("project");
+    writeFileSync(mcpJson(), COMMENTED);
+    const cap = captureIo();
+    const r = await runInstall({
+      ...parsed.options,
+      projectDir: project,
+      home,
+      cwd: project,
+      suppressBundlesNote: true,
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(readFileSync(mcpJson(), "utf8")).toBe(COMMENTED);
   });
 });

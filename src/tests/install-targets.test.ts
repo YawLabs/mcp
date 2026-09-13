@@ -6,6 +6,7 @@ import { afterAll, describe, expect, it, vi } from "vitest";
 import {
   buildLaunchEntry,
   claudeCodeContainerPaths,
+  claudeCodeContainerPathVariants,
   claudeCodeProjectKey,
   ENTRY_NAME,
   escapeCmdArg,
@@ -16,19 +17,28 @@ import {
   resolveAppDataDir,
   resolveClaudeCodeSettingsPath,
   resolveInstallPath,
+  resolveInstallSites,
   sameClaudeCodeProjectKey,
 } from "../install-targets.js";
 
 describe("INSTALL_TARGETS metadata", () => {
-  it("includes the six expected clients", () => {
-    expect(INSTALL_TARGETS.map((t) => t.clientId).sort()).toEqual([
-      "claude-code",
-      "claude-desktop",
-      "cursor",
-      "gemini-cli",
-      "vscode",
-      "windsurf",
-    ]);
+  // The id LIST is pinned once for the whole suite, in
+  // client-config-boundary.test.ts, as the append-ORDER prefix -- a sorted
+  // literal here would be a second copy of the same fact that every landing
+  // target has to edit, and it could not see an insert (sorting hides it).
+  // What is checked here is the shape a row must have, whatever the ids are.
+  it("gives every client an id, a label, a config root and at least one scope", () => {
+    expect(INSTALL_TARGETS.length).toBeGreaterThan(0);
+    for (const t of INSTALL_TARGETS) {
+      expect(t.clientId, "a row with no clientId").toBeTruthy();
+      expect(t.label, `${t.clientId} has no label`).toBeTruthy();
+      expect(t.config.root, `${t.clientId} has no config root`).toBeTruthy();
+      expect(t.availableOn.length, `${t.clientId} is available nowhere`).toBeGreaterThan(0);
+    }
+    // Ids are unique: two rows sharing one would make `--list` print the file
+    // twice and `resolveInstallPath`'s find return whichever came first.
+    const ids = INSTALL_TARGETS.map((t) => t.clientId);
+    expect(new Set(ids).size, `duplicate client id in ${ids.join(", ")}`).toBe(ids.length);
   });
 
   it("keeps claude-code FIRST in declaration order", () => {
@@ -73,19 +83,36 @@ describe("INSTALL_TARGETS metadata", () => {
     // This is the wire contract — getting it wrong silently fails.
     // code.visualstudio.com/docs/copilot/customization/mcp-servers
     const vscode = INSTALL_TARGETS.find((t) => t.clientId === "vscode");
-    expect(vscode?.jsonShape).toBe("servers");
+    expect(vscode?.config.root).toBe("servers");
   });
 
-  it("every client except VS Code uses the `mcpServers` root key", () => {
-    const mcpServerClients = INSTALL_TARGETS.filter((t) => t.jsonShape === "mcpServers").map((t) => t.clientId);
-    expect(mcpServerClients.sort()).toEqual(["claude-code", "claude-desktop", "cursor", "gemini-cli", "windsurf"]);
+  it("pins the root key of each of the six INLINE clients", () => {
+    // Scoped to the six ids whose paths are resolved by the inline `pathFor`
+    // switch, which is a CLOSED set -- every new target resolves its own path
+    // and pins its own root in its own target test. Unscoped, this literal
+    // would have to be edited by every landing client, which is the collision
+    // the derived lists exist to remove.
+    const roots: Record<string, string> = {};
+    for (const id of ["claude-code", "claude-desktop", "cursor", "vscode", "windsurf", "gemini-cli"]) {
+      const t = INSTALL_TARGETS.find((x) => x.clientId === id);
+      expect(t, `${id} is missing from INSTALL_TARGETS`).toBeDefined();
+      roots[id] = t?.config.root ?? "";
+    }
+    expect(roots).toEqual({
+      "claude-code": "mcpServers",
+      "claude-desktop": "mcpServers",
+      cursor: "mcpServers",
+      vscode: "servers",
+      windsurf: "mcpServers",
+      "gemini-cli": "mcpServers",
+    });
   });
 
   it("agrees with itself about the root key on every scope", () => {
-    // jsonShape is documentation; containerPath is what actually gets
-    // written. Nothing in src/ reads jsonShape, so the two can disagree
-    // silently -- and a row whose containerPath names the wrong key writes a
-    // file the client parses and ignores.
+    // config.root is what messages and previews name; containerPath is what
+    // actually gets written. A row whose containerPath names a different key
+    // writes a file the client parses and ignores, and nothing else in the
+    // suite compares the two.
     for (const t of INSTALL_TARGETS) {
       for (const sc of t.scopes) {
         const resolved = resolveInstallPath({
@@ -100,7 +127,7 @@ describe("INSTALL_TARGETS metadata", () => {
           appData: "/a",
         });
         expect(resolved.containerPath[resolved.containerPath.length - 1], `${t.clientId}/${sc.scope}`).toBe(
-          t.jsonShape,
+          t.config.root,
         );
       }
     }
@@ -1391,5 +1418,89 @@ describe("claudeCodeContainerPaths (the one place a projects[] key is resolved)"
     expect(out[0]).not.toBe(containerPath);
     out[0][1] = "mutated";
     expect(containerPath[1]).toBe("C:/repo");
+  });
+
+  it("answers the same over a KEY LISTER as over a parsed root", () => {
+    // The two spellings exist because a consumer holding BYTES must not parse
+    // a client config itself. They have to agree, or the drive-case fold would
+    // depend on which one a consumer happened to reach for.
+    const root = { projects: { "c:/repo": { mcpServers: {} }, "D:/other": {} } };
+    const keysAt = (prefix: readonly string[]): readonly string[] =>
+      prefix.length === 1 && prefix[0] === "projects" ? Object.keys(root.projects) : [];
+    for (const path of [local("C:/repo"), local("c:/repo"), local("/posix/repo"), ["mcpServers"]]) {
+      expect(claudeCodeContainerPathVariants(path, keysAt)).toEqual(claudeCodeContainerPaths(root, path));
+    }
+  });
+});
+
+describe("resolveInstallSites", () => {
+  const base = { os: "linux" as InstallOS, home: "/home/u" };
+
+  it("gives a single-site row one site at its resolved path, with the scope's effective format", () => {
+    const sites = resolveInstallSites({ ...base, clientId: "cursor", scope: "user" });
+    expect(sites).toHaveLength(1);
+    expect(sites[0].id).toBe("default");
+    expect(sites[0].detectDir).toBeNull();
+    expect(sites[0].resolved).toEqual(resolveInstallPath({ ...base, clientId: "cursor", scope: "user" }));
+    expect(sites[0].format).toBe("jsonc");
+  });
+
+  it("applies the SCOPE's strictJson, so one site is read and written at one strictness", () => {
+    // Every (client, scope) pair, against the format the row plus the scope
+    // declare. Derived rather than spelled out: a row that lands with a strict
+    // scope is covered the day it lands.
+    for (const target of INSTALL_TARGETS) {
+      if (!target.availableOn.includes("linux")) continue;
+      for (const scope of target.scopes) {
+        const sites = resolveInstallSites({
+          ...base,
+          clientId: target.clientId,
+          scope: scope.scope,
+          projectDir: scope.requiresProjectDir ? "/home/u/proj" : undefined,
+        });
+        const expected = scope.strictJson === true && target.config.format === "jsonc" ? "json" : target.config.format;
+        for (const site of sites) {
+          expect(site.format, `${target.clientId} ${scope.scope}`).toBe(expected);
+        }
+      }
+    }
+  });
+
+  it("fans a row with a sites hook out to every declared copy, all at one format", () => {
+    const sites = resolveInstallSites({ ...base, clientId: "cline", scope: "user" });
+    expect(sites.length).toBeGreaterThan(1);
+    expect(sites[0].id).toBe("shared");
+    expect(sites[0].detectDir).toBeNull();
+    // Every editor copy is CONDITIONAL: it is written only where that editor's
+    // Cline storage dir exists.
+    for (const site of sites.slice(1)) expect(site.detectDir, site.id).not.toBeNull();
+    expect(new Set(sites.map((s) => s.format))).toEqual(new Set(["json"]));
+    expect(new Set(sites.map((s) => s.id)).size).toBe(sites.length);
+    // The first site is the one `resolvePath` answers with, so a caller that
+    // only wants "the" file agrees with the fan-out's head.
+    expect(sites[0].resolved).toEqual(resolveInstallPath({ ...base, clientId: "cline", scope: "user" }));
+  });
+
+  it("refuses exactly what resolveInstallPath refuses, with the same message", () => {
+    const cases = [
+      { clientId: "claude-desktop" as const, scope: "user" as const, os: "linux" as InstallOS },
+      { clientId: "claude-code" as const, scope: "local" as const, os: "linux" as InstallOS },
+    ];
+    for (const c of cases) {
+      let fromPath = "";
+      let fromSites = "";
+      try {
+        resolveInstallPath({ ...base, ...c });
+      } catch (e) {
+        fromPath = (e as Error).message;
+      }
+      try {
+        resolveInstallSites({ ...base, ...c });
+      } catch (e) {
+        fromSites = (e as Error).message;
+      }
+      expect(fromPath, `${c.clientId} ${c.scope} should throw`).not.toBe("");
+      expect(fromSites).toBe(fromPath);
+    }
   });
 });

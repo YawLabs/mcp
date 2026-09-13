@@ -68,19 +68,30 @@ import { join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { atomicWriteFile } from "./atomic-write.js";
 import { CATALOG_SLUG_RE, resolveCatalogSlug } from "./catalog.js";
+import { clientChoices, resolveClientArg } from "./client-aliases.js";
+import {
+  applyClientConfigEdits,
+  type ClientConfigView,
+  type ConfigSite,
+  classifyClientConfig,
+  composeEntry,
+  readClientConfigFile,
+  readClientEnv,
+  terminateWithNewline,
+} from "./client-config.js";
 import { probeClientsAsync, probeUsable } from "./doctor-cmd.js";
-import { clientUnavailableMessage, describeUnreadableConfig, mergeClientConfig } from "./install-cmd.js";
+import { clientUnavailableMessage, describeUnreadableConfig } from "./install-cmd.js";
 import {
   buildLaunchEntry,
+  type ClientEnvValues,
   CURRENT_OS,
   INSTALL_TARGETS,
   type InstallClientId,
   type InstallOS,
   type InstallScope,
   resolveAppDataDir,
-  resolveInstallPath,
+  resolveInstallSites,
 } from "./install-targets.js";
-import { editJsoncEntry, parseJsonc, removeJsoncEntry } from "./jsonc.js";
 import { createStreamWriter, log } from "./logger.js";
 import { CONFIG_DIRNAME } from "./paths.js";
 import { QUESTION_CANCELLED, type QuestionCancelled, questionOrEmpty } from "./readline-question.js";
@@ -125,7 +136,7 @@ export const TRY_USAGE = `Usage: yaw-mcp try <slug> [flags]
   it on a timer -- once --ttl has elapsed it is removed by the next
   \`yaw-mcp doctor\` run. Run \`yaw-mcp try-cleanup <slug>\` to remove it now.
 
-  --client <name>      ${wrapToUsageColumn(INSTALL_TARGETS.map((t) => t.clientId))}
+  --client <name>      ${wrapToUsageColumn(clientChoices("try"))}
                        (default: auto-detect, prefers the first installed
                        client in the order probed by \`yaw-mcp install --list\`)
   --ttl <duration>     How long the trial lives before doctor GCs it
@@ -299,15 +310,18 @@ export function parseTryArgs(
     switch (a) {
       case "--client": {
         const v = next();
-        // Validate against the canonical client set so a new INSTALL_TARGETS
-        // entry is accepted here without touching this literal.
-        if (!v || !INSTALL_TARGETS.some((t) => t.clientId === v)) {
+        // `clientChoices("try")` is the canonical client set with NO alias:
+        // `try` picks a client by probing, so a second name for a slot it
+        // already probes would let one file be trialled twice. A new row is
+        // accepted here without touching any literal.
+        const resolved = v === undefined ? null : resolveClientArg("try", v);
+        if (!resolved) {
           return {
             ok: false,
-            error: `--client requires ${INSTALL_TARGETS.map((t) => t.clientId).join("|")}`,
+            error: `--client requires ${clientChoices("try").join("|")}`,
           };
         }
-        opts.clientId = v as InstallClientId;
+        opts.clientId = resolved.clientId;
         break;
       }
       case "--ttl": {
@@ -482,10 +496,11 @@ function trialLaunchFingerprint(entry: { command?: unknown; args?: unknown }): s
  *  the reason -- runTryCleanup's "marker at <path> is unreadable (...)" -- has
  *  a message, while the callers that treat "cannot tell" as "nothing to do"
  *  simply catch. Checking one field instead of all three let a marker with no
- *  clientPath through: existsSync(undefined) is false, so the peel was
- *  skipped, the marker was unlinked, and the user was told the trial was
- *  "cleaned up" while its entry -- inline secret and all -- stayed wired with
- *  nothing left on disk naming it. */
+ *  clientPath through, and a peel handed no path reports "nothing there"
+ *  rather than failing -- so the marker was unlinked and the user was told the
+ *  trial was "cleaned up" while its entry, inline secret and all, stayed wired
+ *  with nothing left on disk naming it. This check is the ONLY thing standing
+ *  between such a marker and the peel. */
 function assertTrialMarkerShape(parsed: unknown): asserts parsed is TrialMarker {
   const m = parsed as TrialMarker | null;
   if (
@@ -546,104 +561,113 @@ async function peelEntryFromConfig(
   dryRun = false,
   expectFingerprint?: string,
 ): Promise<"removed" | "absent" | "not-object" | "replaced"> {
-  if (!existsSync(clientPath)) return "absent";
-  const raw = await readFile(clientPath, "utf8");
-  if (raw.trim().length === 0) return "absent";
-  const parsed = parseJsonc(raw);
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return "not-object";
-  // Walk containerPath ourselves BEFORE handing it to removeJsoncEntry.
-  // jsonc-parser cannot delete under a missing intermediate -- the walk breaks
-  // with no parent and it throws "Can not delete in empty document" (the same
-  // trap editJsoncPath documents in jsonc.ts) -- so removeJsoncEntry's "no-op
-  // when the path does not exist" contract only holds once every container on
-  // the way down is really there. The check belongs HERE, on the caller side,
-  // because only the caller knows what a missing container MEANS: the user
-  // pulled the trial entry and the now-empty mcpServers block (or, at
+  const site = markerSite(clientPath, containerPath);
+  const view = await readClientConfigFile(site);
+  const read = view.read;
+  // No file, or a file that is empty or whitespace-only.
+  if (read.kind === "absent") return "absent";
+  // The bytes could not be read at all (EISDIR, EACCES, EBUSY). Thrown rather
+  // than returned, because every caller's catch already turns that into the
+  // "couldn't strip ..." warning that names the errno, and a new outcome kind
+  // would need handling at three call sites to say the same thing.
+  if (read.kind === "unreadable") throw new Error(read.message);
+  if (read.kind === "malformed") {
+    // The whole FILE is not a map: not a client config at all, so no peel is
+    // possible. The GC keeps the marker on this rather than claiming a clean
+    // sweep. A SYNTAX failure is the parser's refusal and propagates like a
+    // read failure -- it is the same "cannot tell what is in there" as before.
+    if (read.reason === "root") return "not-object";
+    throw new Error(read.detail);
+  }
+  // A container along the path holds a non-object (mcpServers set to 5, to a
+  // string, to an array): a non-object cannot hold a key, so the entry is not
+  // in the file either and no future peel could ever succeed. Reporting it as
+  // a failure would warn "still wired in" about an entry that is not there,
+  // forever -- which is why this is "absent" and only the whole FILE not being
+  // a map is "not-object" above.
+  if (read.kind === "blocked") return "absent";
+  // A shape the splicer will not edit (no JSON-family file produces one; a
+  // TOML inline table would). Reported like a syntax failure: the caller's
+  // warning names it and the marker is kept.
+  if (read.kind === "unspliceable") throw new Error(`the "${read.key}" entry is ${read.reason}`);
+  // The user pulled the trial entry and the now-empty mcpServers block (or, at
   // claude-code local scope, the whole projects[<dir>] block) out by hand, so
-  // there is provably no entry left to peel. Letting the throw out reported
-  // that as a peel FAILURE -- doctor told the user the trial was still wired
-  // into a file that held no trial entry, kept the marker, and re-failed on
-  // every later sweep, so its exit 2 never cleared.
-  //
-  // A container that EXISTS but is not an object (mcpServers set to 5, to a
-  // string, to an array) is "absent" for the same reason: a non-object cannot
-  // hold a key, so the entry is not in the file either and no future peel
-  // could ever succeed. Reporting it as a failure would warn "still wired in"
-  // about an entry that is not there, forever. Only the whole FILE not being
-  // an object stays "not-object" above -- there the marker is naming something
-  // that is not a client config at all, which is worth keeping the marker over
-  // rather than claiming a clean sweep.
-  //
-  // Own properties only, so this walk sees exactly what jsonc-parser's walk
-  // over the parse tree will see: an inherited member is not a container in
-  // the text.
-  //
-  // EXACT, never folded through claudeCodeContainerPaths: `containerPath` is
-  // the value the MARKER recorded when the trial entry was written, and this
-  // peel must delete that entry and nothing else. Folding a drive-letter-case
-  // sibling in here would let a cleanup remove a key the trial never wrote.
-  // Registered as such in the source-shape scan in
-  // src/tests/source-hygiene.test.ts.
-  let container = parsed as Record<string, unknown>;
-  for (const segment of containerPath) {
-    const child = Object.hasOwn(container, segment) ? container[segment] : undefined;
-    if (typeof child !== "object" || child === null || Array.isArray(child)) return "absent";
-    container = child as Record<string, unknown>;
+  // there is provably no entry left to peel.
+  if (!read.containerPresent) return "absent";
+  const current = view.entry(entryName);
+  if (current === undefined) return "absent";
+  // Provenance, read off the SAME view the removal below edits, so the entry
+  // judged here is the entry that would go.
+  if (
+    expectFingerprint !== undefined &&
+    typeof current.value === "object" &&
+    current.value !== null &&
+    trialLaunchFingerprint(current.value as { command?: unknown; args?: unknown }) !== expectFingerprint
+  ) {
+    return "replaced";
   }
-  // Provenance, checked against the CONTAINER we just walked -- the same
-  // object removeJsoncEntry is about to delete from, so the entry judged here
-  // is the entry that would go.
-  if (expectFingerprint !== undefined) {
-    const current = Object.hasOwn(container, entryName) ? container[entryName] : undefined;
-    if (
-      current !== undefined &&
-      typeof current === "object" &&
-      current !== null &&
-      trialLaunchFingerprint(current as { command?: unknown; args?: unknown }) !== expectFingerprint
-    ) {
-      return "replaced";
-    }
-  }
-  const next = removeJsoncEntry(raw, containerPath, entryName);
-  if (next === raw) return "absent";
+  // Through the facade, which verifies the result before this function has
+  // bytes to persist: nothing but the named entry moved, no neighbour changed,
+  // and the file still reads back. A remove is allowed even into a file the
+  // CLIENT itself cannot load -- taking our entry out of a file the client
+  // skips is correct, and refusing it would strand the trial.
+  const next = applyClientConfigEdits(view, [{ op: "remove", key: entryName }], site);
+  if (next === view.raw) return "absent";
   if (dryRun) return "removed";
   // No explicit mode: atomicWriteFile carries the config's existing perms
   // forward, so peeling a trial can never widen a 0600 file that still
   // holds another trial's inline secret.
-  await atomicWriteFile(clientPath, next.endsWith("\n") ? next : `${next}\n`);
+  await atomicWriteFile(clientPath, terminateWithNewline(next));
   return "removed";
 }
 
-/** True when `raw` already holds an entry at `entryName` under `containerPath`.
- *  Parsed with the same JSONC parser the splice uses, and walked with the same
- *  own-property rule, so this answers for the bytes that are about to be
- *  rewritten rather than for a JSON.parse view of them. Any unparseable or
- *  unexpected shape answers false: the run is about to fail on that anyway,
- *  and claiming a replacement it cannot see would be worse than staying quiet.
+/** The site a MARKER names, as the core reads sites.
  *
- *  Deliberately EXACT, never folded through claudeCodeContainerPaths: the
- *  question is "will the write I am about to make at THIS path replace
- *  something", and the write goes to one path. A trial entry under a
+ *  `format` is `"jsonc"` for every marker, because a marker records
+ *  `clientPath`, `containerPath` and `entryName` and has never recorded the
+ *  file's SYNTAX or the scope it was resolved at -- so there is nothing on
+ *  disk to derive a strictness from. `clientName` is deliberately not
+ *  consulted for one either: it is unvalidated marker data, and a wrong id
+ *  there would pick a syntax for a file it does not describe.
+ *
+ *  MEASURED, not assumed: for the one operation a marker drives -- a REMOVAL
+ *  -- `"json"` here would behave identically, and the claim that it would
+ *  strand a trial in a commented file is false. The strict adapter falls back
+ *  to a lenient parse and reports the file `ok` with `unloadable` set, and the
+ *  write facade allows a remove into an unloadable file on purpose (taking our
+ *  entry out of a file the client skips is correct). A file that fails BOTH
+ *  parsers is `malformed` either way. So this is the honest "the marker never
+ *  said, and for a removal it does not matter" value, not a behaviour the peel
+ *  depends on -- a mutation to `"json"` leaves every test green, which is what
+ *  says so.
+ *
+ *  `containerPath` is EXACT, never folded through claudeCodeContainerPaths:
+ *  it is the value the marker recorded when the trial entry was written, and
+ *  a peel must delete that entry and nothing else. Folding a drive-letter-case
+ *  sibling in here would let a cleanup remove a key the trial never wrote. */
+function markerSite(clientPath: string, containerPath: readonly string[]): ConfigSite {
+  return {
+    id: "trial",
+    label: "trial entry",
+    resolved: { absolute: clientPath, display: clientPath, containerPath: [...containerPath] },
+    format: "jsonc",
+    detectDir: null,
+  };
+}
+
+/** True when `raw` already holds an entry at `entryName` in `site`'s
+ *  container. Read through the core, so this answers for the bytes that are
+ *  about to be rewritten, with the same adapter the splice uses. Any
+ *  unparseable or unexpected shape answers false: the run is about to fail on
+ *  that anyway, and claiming a replacement it cannot see would be worse than
+ *  staying quiet.
+ *
+ *  Deliberately asks the ONE site the write goes to: a trial entry under a
  *  drive-letter-case sibling of the project key is a different key that this
  *  run does not touch, so answering yes for it would promise a replacement
- *  that does not happen. Registered as such in the source-shape scan in
- *  src/tests/source-hygiene.test.ts. */
-function configHasEntry(raw: string | null, containerPath: string[], entryName: string): boolean {
-  if (raw === null || raw.trim().length === 0) return false;
-  let parsed: unknown;
-  try {
-    parsed = parseJsonc(raw);
-  } catch {
-    return false;
-  }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return false;
-  let container = parsed as Record<string, unknown>;
-  for (const segment of containerPath) {
-    const child = Object.hasOwn(container, segment) ? container[segment] : undefined;
-    if (typeof child !== "object" || child === null || Array.isArray(child)) return false;
-    container = child as Record<string, unknown>;
-  }
-  return Object.hasOwn(container, entryName);
+ *  that does not happen. */
+function configHasEntry(raw: string | null, site: ConfigSite, entryName: string): boolean {
+  return classifyClientConfig(raw, site).entry(entryName) !== undefined;
 }
 
 /** Peel `marker.entryName` out of the client config the marker names,
@@ -732,6 +756,15 @@ async function autoDetectClient(opts: {
   os: InstallOS;
   cwd: string;
   claudeConfigDir: string | undefined;
+  /** Every client env var, as `readClientEnv` reported it -- threaded for the
+   *  same reason `claudeConfigDir` is, and it was the one consumer that
+   *  missed it. `try` RESOLVES its write through `clientEnv` (see
+   *  resolveInstallPath below), so probing without it split the two: with
+   *  $XDG_CONFIG_HOME set and only Zed configured, the probe looked at
+   *  `~/.config/zed/settings.json`, found nothing, and fell through to
+   *  claude-code -- while a write to the Zed slot would have gone to the
+   *  redirected file the user actually has. */
+  clientEnv?: ClientEnvValues;
   appData?: string;
 }): Promise<{ clientId: InstallClientId; scope: InstallScope | null }> {
   const probes = await probeClientsAsync({
@@ -739,6 +772,7 @@ async function autoDetectClient(opts: {
     os: opts.os,
     cwd: opts.cwd,
     claudeConfigDir: opts.claudeConfigDir,
+    clientEnv: opts.clientEnv,
     appData: opts.appData,
   });
   // First: any client whose config file already exists AND whose contents
@@ -796,7 +830,13 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
     }
     ttlMs = parsedTtl;
   }
-  const claudeConfigDir = env.CLAUDE_CONFIG_DIR && env.CLAUDE_CONFIG_DIR.length > 0 ? env.CLAUDE_CONFIG_DIR : undefined;
+  // Every client env var through the ONE reader (empty counts as unset, one
+  // rule in one place), so a trial lands in the same file install writes --
+  // including a client whose path an env var redirects. `try` used to spell
+  // the CLAUDE_CONFIG_DIR rule for itself, which is how two commands come to
+  // disagree about whether an empty value relocates anything.
+  const clientEnv = readClientEnv(env);
+  const claudeConfigDir = clientEnv.claudeConfigDir;
   // Hermetic-home seam: keep the %APPDATA%-based claude-desktop path inside an
   // overridden home, and otherwise read the ambient %APPDATA% so try names the
   // same file install writes. Computed ONCE -- the step-2 probe and the step-3
@@ -824,7 +864,9 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   }
 
   // Step 2: pick a client (explicit > auto-detect).
-  const detected = opts.clientId ? null : await autoDetectClient({ home, os, cwd, claudeConfigDir, appData });
+  const detected = opts.clientId
+    ? null
+    : await autoDetectClient({ home, os, cwd, claudeConfigDir, clientEnv, appData });
   const clientId = opts.clientId ?? (detected as { clientId: InstallClientId }).clientId;
 
   // Step 3: resolve the config file path (user scope; project scope
@@ -876,9 +918,16 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   const hasUserScope = tryTarget?.scopes.some((sc) => sc.scope === "user") ?? false;
   const scope: InstallScope = hasUserScope ? "user" : (detected?.scope ?? tryTarget?.scopes[0].scope ?? "user");
   const projectDir = scope === "project" ? resolve(cwd) : undefined;
-  let resolved: ReturnType<typeof resolveInstallPath>;
+  // SITES, not a bare path: the file's syntax comes from the row and the scope
+  // through this one resolve, so the read and the write below cannot disagree
+  // about it. `try` writes exactly ONE file -- the first site, whose `resolved`
+  // is byte-for-byte what `resolveInstallPath` returns (asserted in
+  // install-targets.test.ts) -- because every message it prints, and the marker
+  // it writes, name one path. A fan-out across Cline's per-editor copies is
+  // install's behaviour, not a trial's.
+  let site: ConfigSite;
   try {
-    resolved = resolveInstallPath({
+    site = resolveInstallSites({
       clientId,
       scope,
       os,
@@ -886,11 +935,15 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
       appData,
       projectDir,
       claudeConfigDir,
-    });
+      // A MODULAR row resolves its own path from these, so a trial written for
+      // an env-redirected client lands where that client reads.
+      clientEnv,
+    })[0];
   } catch (e) {
     printErr(`yaw-mcp try: ${(e as Error).message}`);
     return { exitCode: 1, written: [] };
   }
+  const resolved = site.resolved;
 
   // Step 4: required-env-var check. Anything in requiredEnvVars not
   // supplied via --env AND not in the current process env blocks the
@@ -974,6 +1027,20 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
       env: Object.keys(trialEnv).length > 0 ? trialEnv : undefined,
     },
   });
+  // The entry as it goes into the FILE: the launch shape above plus whatever
+  // the target declares an entry must carry beyond command/args/env for this
+  // purpose (`extraFields`, e.g. a startup timeout a client requires). No row
+  // declares one today, so this is `{...entry}` on every current target -- but
+  // routing the trial entry through the same composer install uses is what
+  // keeps a row from having to be true for install and wrong for `try`.
+  //
+  // Nothing is CARRIED here, deliberately: `carry` and the env fill exist to
+  // preserve what a user set on OUR broker entry across a re-install, and a
+  // trial entry is a fresh one-shot pointing at someone else's server. Adding
+  // a previous trial's fields to it would be inventing state, not preserving
+  // it -- so `composeEntry` is called with neither `carried` nor `env`, the
+  // way `--force` is.
+  const entryToWrite = composeEntry({ base: entry, transform: tryTarget?.entry, os, purpose: "upstream" });
   // Whether the entry carries inline env: every value in it is a credential
   // or a knob the user chose to persist. Decides two things -- the
   // project-scope refusal right below, and the 0600 tightening in step 7.
@@ -1031,11 +1098,11 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
     createdAt: now,
     // What this run is about to write, so a later sweep can tell this entry
     // from one the user has since put at the same name (see
-    // trialLaunchFingerprint). Taken from `entry` -- the object actually
-    // written -- not from `server`, so the Windows `cmd /c` wrap that
+    // trialLaunchFingerprint). Taken from `entryToWrite` -- the object
+    // actually written -- not from `server`, so the Windows `cmd /c` wrap that
     // buildLaunchEntry adds is inside the fingerprint, exactly as it will be
     // read back out of the config.
-    entryFingerprint: trialLaunchFingerprint(entry),
+    entryFingerprint: trialLaunchFingerprint(entryToWrite),
   };
 
   // Step 6: read existing client config (if any).
@@ -1045,53 +1112,54 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   // owner-only whether `try` created the file or merged into the user's
   // pre-existing config. rawClient decides only the write ROUTE:
   // comment-preserving splice vs fresh render.)
-  // We also retain the RAW text so the write below can route through the
-  // comment-preserving `editJsoncEntry` -- a read-modify-write through
-  // JSON.parse + JSON.stringify drops every `//` and `/* */` the user has
-  // in their config (~/.claude.json on Claude Code carries user comments
-  // routinely; we must not silently strip them on every `try`).
+  // The read goes THROUGH THE CORE: one reader for every syntax, and the
+  // entry-level question below ("is there already something at this name")
+  // answered by the VIEW rather than by a container walk here. The VIEW itself
+  // is retained, not just the bytes, because it is what the write facade edits
+  // -- and that facade preserves the user's `//` and `/* */` comments, which a
+  // read-modify-write through JSON.parse + JSON.stringify would silently strip
+  // (~/.claude.json on Claude Code carries user comments routinely).
   //
   // Broken out into a closure because step 6b's cross-client peel can rewrite
-  // THIS file: when it does, the bytes read here are stale and both the read
-  // and the splice have to be redone against the post-peel file.
-  const readClientRaw = async (): Promise<{ ok: true; raw: string | null } | { ok: false }> => {
-    if (!existsSync(resolved.absolute)) return { ok: true, raw: null };
+  // THIS file: when it does, the view read here is stale and both the read and
+  // the splice have to be redone against the post-peel file.
+  const readClientView = async (): Promise<{ ok: true; view: ClientConfigView } | { ok: false }> => {
+    const view = await readClientConfigFile(site);
+    const read = view.read;
     // Read and parse are reported SEPARATELY. Folding them into one catch
     // told a user whose ~/.claude.json is root-owned or 0600-another-user
     // that their JSON was invalid ("is not valid JSON (EACCES: permission
     // denied...)"), sending them to inspect a file they cannot even read
     // instead of to the permissions. Same shape for EISDIR.
-    let raw: string;
-    try {
-      raw = await readFile(resolved.absolute, "utf8");
-    } catch (e) {
+    if (read.kind === "unreadable") {
       // A DIRECTORY at the path is not a permissions problem, and the
       // permissions-and-ownership advice sends the user nowhere on one. The
       // shared helper says what `add`, `install` and `uninstall` all say for
       // that shape, and keeps the errno wording for every other read failure,
       // which is what a real permissions problem needs.
-      const code = (e as NodeJS.ErrnoException).code;
       printErr(
-        code === "EISDIR"
-          ? `${describeUnreadableConfig("try", resolved.absolute, e)} Refusing to overwrite.`
-          : `yaw-mcp try: ${resolved.absolute} could not be read (${code ?? (e as Error).message}) -- check its permissions and ownership. Refusing to overwrite.`,
+        read.code === "EISDIR"
+          ? `${describeUnreadableConfig("try", resolved.absolute, { code: read.code, message: read.message })} Refusing to overwrite.`
+          : `yaw-mcp try: ${resolved.absolute} could not be read (${read.code ?? read.message}) -- check its permissions and ownership. Refusing to overwrite.`,
       );
       return { ok: false };
     }
-    if (raw.trim().length === 0) return { ok: true, raw: null };
-    let parsed: unknown;
-    try {
-      parsed = parseJsonc(raw);
-    } catch (e) {
-      printErr(`yaw-mcp try: ${resolved.absolute} is not valid JSON (${(e as Error).message}). Refusing to overwrite.`);
+    // `read.syntax` is the adapter's own name for the file's language, so a
+    // non-JSON client would say what it actually is. Every client `try` can
+    // target today is JSON-family, where that name is "JSON" -- these two
+    // lines are byte-for-byte what they printed before.
+    if (read.kind === "malformed") {
+      printErr(
+        read.reason === "root"
+          ? `yaw-mcp try: ${resolved.absolute} is not a ${read.syntax} object — refusing to overwrite.`
+          : `yaw-mcp try: ${resolved.absolute} is not valid ${read.syntax} (${read.detail}). Refusing to overwrite.`,
+      );
       return { ok: false };
     }
-    if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) return { ok: true, raw };
-    printErr(`yaw-mcp try: ${resolved.absolute} is not a JSON object — refusing to overwrite.`);
-    return { ok: false };
+    return { ok: true, view };
   };
 
-  const firstRead = await readClientRaw();
+  const firstRead = await readClientView();
   if (!firstRead.ok) return { exitCode: 1, written: [] };
 
   // Is there already an entry at this exact name in this exact file? A re-run
@@ -1102,30 +1170,29 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   // than inferred from the marker: the marker can name an entry a user has
   // already deleted by hand, and the file is what the splice will actually
   // overwrite.
-  const replacesEntryInPlace = configHasEntry(firstRead.raw, resolved.containerPath, entryName);
+  const replacesEntryInPlace = configHasEntry(firstRead.view.raw, site, entryName);
 
   // If a previous trial of the same slug is wired, overwrite it (the
   // user is re-running `try`, presumably with a different --ttl or env).
   // We never collide with the canonical "yaw-mcp" entry — trials
   // live under their own `yaw-mcp-try-<slug>` name.
   //
-  // Two write paths:
-  //   - File pre-exists with content -> route through `editJsoncEntry` to
-  //     diff against the original bytes; the user's comments survive.
-  //   - File missing / empty -> no comments to preserve, fall back to the
-  //     historical mergeClientConfig + JSON.stringify path (which also
-  //     handles the empty container-path materialization for us).
-  const buildClientJson = (raw: string | null): { ok: true; json: string } | { ok: false } => {
-    if (raw === null) {
-      const merged = mergeClientConfig({}, resolved.containerPath, entry, entryName);
-      return { ok: true, json: `${JSON.stringify(merged, null, 2)}\n` };
-    }
+  // ONE write route: `applyClientConfigEdits`, which is the only exported way
+  // to obtain edited client-config text and therefore the only one that
+  // VERIFIES it -- the entry reads back as written, no neighbour moved or
+  // changed, nothing else in the document differs, and a file its client
+  // cannot load is refused rather than added to. A file that does not exist is
+  // rendered fresh by the same call, container chain and all, byte-identical
+  // to the JSON.stringify render this replaces (pinned in
+  // client-config-json.test.ts). A file that does exist is spliced into its
+  // original bytes, so the user's comments survive.
+  const buildClientJson = (view: ClientConfigView): { ok: true; json: string } | { ok: false } => {
     try {
-      const next = editJsoncEntry(raw, resolved.containerPath, entryName, entry);
-      // editJsoncEntry leaves the user's bytes alone outside what it splices,
-      // so a file that already ends in a newline keeps exactly the one it had;
-      // one that does not is given one here.
-      return { ok: true, json: next.endsWith("\n") ? next : `${next}\n` };
+      // The facade leaves the user's bytes alone outside what it splices, so a
+      // file that already ends in a newline keeps exactly the one it had; one
+      // that does not is given one here.
+      const edits = [{ op: "upsert" as const, key: entryName, entry: entryToWrite }];
+      return { ok: true, json: terminateWithNewline(applyClientConfigEdits(view, edits, site)) };
     } catch (e) {
       printErr(
         `yaw-mcp try: failed to splice entry into ${resolved.absolute} (${(e as Error).message}). Refusing to overwrite.`,
@@ -1134,7 +1201,7 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
     }
   };
 
-  const firstSplice = buildClientJson(firstRead.raw);
+  const firstSplice = buildClientJson(firstRead.view);
   if (!firstSplice.ok) return { exitCode: 1, written: [] };
   let clientJson = firstSplice.json;
   const markerJson = `${JSON.stringify(marker, null, 2)}\n`;
@@ -1218,9 +1285,9 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
         // the peel just rewrote the bytes the splice above was built from, so
         // writing that stale render would re-insert the entry we just removed.
         // Re-read and re-splice against the post-peel file.
-        const reread = await readClientRaw();
+        const reread = await readClientView();
         if (!reread.ok) return { exitCode: 1, written: [] };
-        const respliced = buildClientJson(reread.raw);
+        const respliced = buildClientJson(reread.view);
         if (!respliced.ok) return { exitCode: 1, written: [] };
         clientJson = respliced.json;
       }
@@ -1474,8 +1541,9 @@ export async function runTryCleanup(opts: TryCleanupOptions): Promise<TryCommand
   }
 
   // Peel the entry out of the client config (no-op if already gone). Routed
-  // through `removeJsoncEntry` so user comments in the client config survive
-  // -- a JSON.parse + JSON.stringify pass would silently strip them.
+  // through the client-config core's write facade so user comments in the
+  // client config survive -- a JSON.parse + JSON.stringify pass would silently
+  // strip them -- and so the removal is VERIFIED before anything is persisted.
   const written: string[] = [];
   /** Set when the entry at the marker's name turned out to be someone else's
    *  work, so the closing line does not claim a cleanup that did not happen. */
@@ -1503,8 +1571,8 @@ export async function runTryCleanup(opts: TryCleanupOptions): Promise<TryCommand
       print(`Removed ${marker.entryName} from ${marker.clientPath}`);
     } else if (outcome === "not-object") {
       // Valid JSON that is not an object (an array, a string, a number): there
-      // is no container for removeJsoncEntry to name the entry in, so no peel
-      // is possible. SAY so. Skipping it silently and then printing "cleaned
+      // is no container the entry could be named in, so no peel is possible.
+      // SAY so. Skipping it silently and then printing "cleaned
       // up" is the same false all-clear over a plaintext credential that the
       // GC was fixed to refuse -- the user reads "cleaned up", and the entry
       // is still wired.
@@ -1652,7 +1720,7 @@ export async function gcExpiredTrials(opts: {
     // the config is already clean and only the marker lingers.
     let stage: TrialGcFailure["stage"] = "peel";
     try {
-      // Routed through removeJsoncEntry (inside the shared peel) so user
+      // Routed through the client-config core (inside the shared peel) so user
       // comments in the client config survive doctor's GC pass -- the previous
       // JSON.parse + JSON.stringify shape silently stripped them.
       const outcome = await peelEntryFromConfig(
@@ -1700,9 +1768,9 @@ export async function gcExpiredTrials(opts: {
         continue;
       }
       if (outcome === "not-object") {
-        // Valid JSON, but not an object (an array, a string, a number):
-        // removeJsoncEntry has no container to name the entry in, so the
-        // peel cannot happen. Fail LOUDLY rather than falling through to
+        // Valid JSON, but not an object (an array, a string, a number): there
+        // is no container the entry could be named in, so the peel cannot
+        // happen. Fail LOUDLY rather than falling through to
         // the unlink -- dropping the marker here would leave the trial
         // entry wired with nothing on disk that could ever name it again.
         // Throwing keeps stage "peel", which is what the user needs told.

@@ -1,0 +1,9 @@
+[mcp_servers.other]
+command = "node"
+note = """
+he said \"""
+still inside
+"""
+
+[mcp_servers.mcp]
+command = "old"

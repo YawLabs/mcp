@@ -990,7 +990,7 @@ Intentionally deferred: converting `index.ts`'s 39 `process.exit()` calls to `pr
 
 **Fixed**
 
-- Pinned `@biomejs/biome` to 2.4.16. The 2.5.x native binary segfaults (exit 139) on MINGW64-ARM64 before producing any output, which blocked `npm run lint` and stalled the release script -- its tolerance paths could not engage because there was no output to match against. 2.4.16 runs cleanly.
+- Pinned `@biomejs/biome` to 2.4.16. The 2.5.4 native win32-arm64 binary segfaults (exit 139) on MINGW64-ARM64 before producing any output, which blocked `npm run lint` and stalled the release script -- its tolerance paths could not engage because there was no output to match against. 2.4.16 runs cleanly. (Written at the time as "2.5.x"; later measurement narrowed it to 2.5.4 specifically -- the fault is a per-version packaging bug in the arm64 executable, not a standing arm64 defect, and 2.5.13 runs cleanly too.)
 - `biome.json` follows the 2.4 flat schema (`rules.recommended: true` rather than `rules.preset`), plus the formatter rewrites that pin brought with it.
 
 ## 0.71.0 -- remove the Yaw Team surface (BREAKING)

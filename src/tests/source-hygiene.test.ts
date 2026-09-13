@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { extname, join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { sourceFiles } from "./source-files.js";
 
 // A raw control byte in tracked source, which nothing else in the gate catches.
 //
@@ -161,7 +162,9 @@ describe("tracked source carries no raw control bytes", () => {
   });
 });
 
-// Every read of a client-config container in tracked non-test source, by shape.
+// Every read of a client-config container in non-test source, by shape --
+// enumerated off the FILESYSTEM (sourceFiles), so a module escapes it only by
+// not existing, not by not being tracked yet.
 //
 // Claude Code keys local-scope MCP under projects[<absolute dir>], looks it up
 // byte-exactly, and older versions of this tool wrote that key with whatever
@@ -352,6 +355,30 @@ interface Walk {
 }
 
 const EXPECTED_WALKS: Record<string, Walk[]> = {
+  "src/client-config-json.ts": [
+    {
+      shape: "LOOP for (let i = 0; i < containerPath.length - 1; i++)",
+      why:
+        "buildFreshConfig: builds the chain of a file that does not exist yet, on the canonical path a write " +
+        "goes to. Nothing to fold -- an absent file carries no drive-case sibling key to find",
+    },
+  ],
+  "src/client-config-toml.ts": [
+    {
+      shape: "LOOP for (const key of containerPath)",
+      why:
+        "containerValue: reads the container the splice is about to edit, on the path it was handed. " +
+        "Codex has no per-project container key, so there is no drive-case sibling to fold",
+    },
+    {
+      shape: "LOOP for (let i = 0; i < containerPath.length; i++)",
+      why: "readTomlConfig: the classify walk, which reports a non-table segment as `blocked` rather than folding",
+    },
+    {
+      shape: "LOOP for (let i = 0; i < containerPath.length; i++)",
+      why: "canonTomlConfig: drops the touched entries from the container for the post-write compare",
+    },
+  ],
   "src/doctor-cmd.ts": [
     {
       shape: "CALL walkContainer(root: Record<string, unknown>, path: string[])",
@@ -366,48 +393,29 @@ const EXPECTED_WALKS: Record<string, Walk[]> = {
       why: "that probe's own loop over the helper's paths; the index is what names entryProjectKey",
     },
   ],
+  // import reads and writes through the client-config core now, so the two
+  // per-variant WALKS are gone. `driveCaseVariants` is this file's one call of
+  // the fold helper, over `containerKeysAt` rather than a parsed root, and
+  // readContainer's own fold consumes it through `classifyClientConfig`.
   "src/import-cmd.ts": [
     { shape: "CALL readContainer(ref: ContainerRef)", why: "declaration of the other-scope container read" },
     { shape: "CALL readContainer(searched[i])", why: "the is-yaw-mcp-wired-in search; folds inside readContainer" },
     {
-      shape: "LOOP for (const variantPath of claudeCodeContainerPaths(parsed, ref.containerPath))",
-      why: "readContainer: every variant is checked for a yaw-mcp entry",
-    },
-    {
-      shape: "LOOP for (const variantPath of claudeCodeContainerPaths(parsed, resolved.containerPath))",
+      shape: "LOOP for (const variantPath of driveCaseVariants(targetSite, view.raw))",
       why: "the import SOURCE read; sourcePath then carries the key found into the removal",
     },
-    { shape: "LOOP for (const key of variantPath)", why: "readContainer walking one helper-derived path" },
-    { shape: "LOOP for (const key of variantPath)", why: "the source read walking one helper-derived path" },
   ],
+  // install and uninstall no longer walk a container at all: both read through
+  // the client-config core, which asks its own adapter for the entries at the
+  // address it was handed. `readNested`, `readEntryAt` and `mergeClientConfig`
+  // are DELETED, not merely unused -- their last caller was try-cmd, which now
+  // goes through the core too -- so what is left here is the two loops over
+  // the drive-case variant PATHS, which are addresses rather than walks.
   "src/install-cmd.ts": [
-    {
-      shape: "CALL readNested(root: Record<string, unknown>, containerPath: string[])",
-      why: "the generic walker's own declaration -- it takes whatever path it is handed",
-    },
-    {
-      shape:
-        "CALL readEntryAt(existing: Record<string, unknown>, containerPath: string[], " +
-        "entryName: string = ENTRY_NAME)",
-      why: "declaration of the entry accessor one level up; same generic contract, same handed-in path",
-    },
-    {
-      shape: "CALL readNested(existing, containerPath)",
-      why: "readEntryAt's body, the same generic accessor one level up",
-    },
-    { shape: "CALL readNested(existing, canonicalPath)", why: "install: the container this run writes" },
-    { shape: "CALL readNested(existing, variantPath)", why: "install: the drive-case sibling scan it reports" },
-    { shape: "CALL readNested(existing, variantPath)", why: "uninstall: every site it has to clear" },
-    { shape: "CALL readEntryAt(existing, canonicalPath, ENTRY_NAME)", why: "install: env carried over into the entry" },
-    { shape: "LOOP for (const key of containerPath)", why: "readNested's own body" },
     { shape: "LOOP for (const variantPath of variantPaths.slice(1))", why: "install: the sibling scan" },
     {
       shape: "LOOP for (let i = 0; i < variantPaths.length; i++)",
       why: "uninstall: builds one RemovalSite per helper-derived path",
-    },
-    {
-      shape: "LOOP for (let i = 0; i < containerPath.length - 1; i++)",
-      why: "mergeClientConfig: clones the chain it WRITES into -- one path, never a variant",
     },
   ],
   // Every hit here is in the module that OWNS the projects key. That is the
@@ -417,6 +425,12 @@ const EXPECTED_WALKS: Record<string, Walk[]> = {
     {
       shape: "INDEX const projects = (root as Record<string, unknown>)[PROJECTS_KEY];",
       why: "claudeCodeContainerPaths itself -- the one raw read of the projects object, which the fold is built from",
+    },
+    {
+      shape: "INDEX for (const candidate of keysAt([PROJECTS_KEY])) {",
+      why:
+        "claudeCodeContainerPathVariants asking its key lister for the projects keys -- the same one read as " +
+        "above, for the caller that holds the file's BYTES rather than a parsed root and so must not parse it",
     },
     {
       shape: "INDEX out.push([PROJECTS_KEY, candidate, ...containerPath.slice(2)]);",
@@ -439,24 +453,27 @@ const EXPECTED_WALKS: Record<string, Walk[]> = {
         "import cycle -- and every caller hands it a path it must NOT fold",
     },
   ],
-  "src/try-cmd.ts": [
-    {
-      shape: "LOOP for (const segment of containerPath)",
-      why: "peelEntryFromConfig: the path a trial MARKER recorded -- must delete that entry and no other",
-    },
-    {
-      shape: "LOOP for (const segment of containerPath)",
-      why: "configHasEntry: will the write at THIS path replace something -- the write goes to one path",
-    },
-  ],
+  // `src/try-cmd.ts` used to sit here with two walks -- peelEntryFromConfig's
+  // and configHasEntry's. Both are gone: every `try` read and write goes
+  // through the client-config core, which asks its own adapter for the entries
+  // at the address it was handed. The path a trial MARKER recorded is still
+  // read verbatim and handed to `markerSite`, and is still deliberately NOT
+  // folded through claudeCodeContainerPaths -- a sweep must delete the key the
+  // trial wrote and no other -- but that is now an address, not a walk.
 };
 
 function scanContainerWalks(): Record<string, string[]> {
   const out: Record<string, string[]> = {};
-  for (const file of trackedFiles()) {
-    if (!file.startsWith("src/") || !file.endsWith(".ts") || file.includes("/tests/")) continue;
-    const found = scanSource(readFileSync(join(REPO_ROOT, file), "utf8"));
-    if (found.length > 0) out[file] = found;
+  // `sourceFiles()`, the shared RECURSIVE FILESYSTEM walker -- not
+  // `trackedFiles()`. Enumerating `git ls-files` meant a NEW module escaped
+  // this scan until somebody ran `git add`, which is exactly the window in
+  // which a new container reader gets written: the whole-map compare below
+  // could not fail on a file git had never heard of. A directory read sees a
+  // file the moment it exists. (The BYTE scans above still walk the tracked
+  // set: their subject is what the repo ships, not what is on disk.)
+  for (const file of sourceFiles()) {
+    const found = scanSource(file.text);
+    if (found.length > 0) out[file.path] = found;
   }
   return out;
 }
@@ -500,8 +517,17 @@ describe("every client-config container read goes through claudeCodeContainerPat
     // stops calling it while the import lingers -- the shape table above is
     // what catches that. This pins the other half: the three readers that must
     // fold all name the helper.
+    //
+    // Either SPELLING counts. The rule and the sibling-key list live in one
+    // place; `claudeCodeContainerPaths` takes a parsed root and
+    // `claudeCodeContainerPathVariants` takes a key lister, and a reader that
+    // holds the client config's BYTES rather than a parsed object must use the
+    // second -- so requiring the first name would push a migrated reader back
+    // to parsing a client config itself.
     for (const file of ["src/install-cmd.ts", "src/doctor-cmd.ts", "src/import-cmd.ts"]) {
-      expect(readFileSync(join(REPO_ROOT, file), "utf8"), file).toContain("claudeCodeContainerPaths");
+      expect(readFileSync(join(REPO_ROOT, file), "utf8"), file).toMatch(
+        /claudeCodeContainerPaths\b|claudeCodeContainerPathVariants\b/,
+      );
     }
   });
 });

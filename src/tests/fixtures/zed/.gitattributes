@@ -1,0 +1,7 @@
+# Every file in this directory is a BYTE fixture. The repo root's
+# `* text=auto eol=lf` would rewrite the CRLF fixture's line endings on
+# checkout (this repo is developed on Windows with core.autocrlf=true), which
+# is precisely the byte the fixture exists to carry. `-text` turns all
+# end-of-line conversion off for this directory, so what is committed is what
+# lands in the working tree on every platform.
+* -text

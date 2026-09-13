@@ -26,21 +26,33 @@
 # Environment:
 #   SKIP_CONFIRM=1                   skip the y/N confirm prompt
 #   NO_COLOR=1                       disable ANSI colors
-#   SKIP_LINT=1                      DISABLES THE LINT GATE. Legacy win32-arm64
-#                                    escape hatch: biome 2.5.x segfaulted there
-#                                    on every input with no output, so the
-#                                    tolerance paths in run_npm_check could not
-#                                    engage. Fixed in v0.72.0 by pinning biome
-#                                    to 2.4.16 (66c48f3; the pin lives in
-#                                    package.json), and lint runs clean on
-#                                    win32-arm64 with it. Kept as an escape
-#                                    valve for a future regression, NOT a
-#                                    required workaround -- a failing lint on
-#                                    this host is a real finding, or a broken
+#   SKIP_LINT=1                      DISABLES THE LINT GATE -- an explicit last
+#                                    resort, never a routine skip. There is no
+#                                    CI (no .github/workflows; GitHub Actions is
+#                                    disabled on the repo), so nothing
+#                                    downstream re-checks formatting: a release
+#                                    run with this set is published UNLINTED.
+#                                    Origin: biome 2.5.4's native win32-arm64
+#                                    binary dies (exit 139) on CHECK-shaped
+#                                    runs -- the binary itself, not npm's
+#                                    run-script; it answers `--version` with
+#                                    exit 0, so "it starts" is not evidence the
+#                                    gate works. That is a PER-VERSION defect,
+#                                    not a standing arm64 one -- 2.4.16 and
+#                                    2.5.13 both run correctly on this host
+#                                    (measured 2026-09-11). v0.72.0
+#                                    pinned 2.4.16 (66c48f3). `npm run lint` now
+#                                    goes through scripts/lint.mjs, which runs
+#                                    the x64 build of the INSTALLED version
+#                                    under emulation on Windows ARM64, so this
+#                                    should be unnecessary. Use it only
+#                                    if scripts/lint.mjs cannot produce a
+#                                    verdict at all, and treat that as a bug. A
+#                                    failing lint is a real finding, or a broken
 #                                    install (check node_modules is populated),
-#                                    until proven otherwise. Typecheck + tests
-#                                    still gate the release; formatting goes
-#                                    unverified whenever it is set.
+#                                    until proven otherwise. A lint CRASH fails
+#                                    the release; it is never tolerated.
+#                                    Typecheck + tests still gate the release.
 #   ALLOW_STALE_REMOTE=1             Downgrade a failed pre-flight `git fetch`
 #                                    from a hard stop to a warning. The
 #                                    origin/main sync guard then runs against a
@@ -144,13 +156,26 @@ fail() { FAIL_LINE="${BASH_LINENO[0]}"; echo -e "${RED}  ✗ $1${NC}"; exit 1; }
 MCP_PUBLISHER_VERSION="v1.7.9"
 
 # MINGW64 on Windows ARM64 intermittently segfaults in npm's exit cleanup AFTER
-# a tool has finished and printed its report. This is npm's WRAPPER, not any one
-# tool -- distinct from the biome-2.5.x binary crash that v0.72.0 fixed by
-# pinning 2.4.16 (the @biomejs/biome pin in package.json); do not merge the two.
-# Being intermittent, a clean run does not retire it. The tool's OUTPUT is
-# authoritative: a 139/134 from `npm run` is tolerated only if the tool's own
-# success marker is in the captured output (or a direct re-run bypasses the
-# wrapper). Other platforms treat any non-zero as a hard failure.
+# a tool has finished and printed its report. Attributed to npm's WRAPPER rather
+# than to any one tool because it fires after the tool's output is complete, and
+# on subcommands that never invoke a linter (`npm version` in step 3, `npm
+# publish` in step 4). That is an inference from the shape, not a measured root
+# cause -- it has never been isolated the way the biome crash below was, so do
+# not harden it into more than it is.
+# DISTINCT from the biome 2.5.4 win32-arm64 binary crash that v0.72.0 pinned
+# around (the @biomejs/biome pin in package.json): that one is a PER-VERSION
+# fault in the tool's OWN executable and fires BEFORE any output -- 2.4.16 and
+# 2.5.13 both run clean on this host. See the header and run_npm_check below for
+# the measurements. Do not merge the two.
+# Being intermittent, a clean run does not retire it. What the tool actually DID
+# is authoritative, never npm's exit code -- and each tolerance site proves that
+# its own way: run_npm_check on the tool's success marker in the captured output
+# (or a direct re-run that bypasses the wrapper), step 2's build on a
+# dist/index.js mtime newer than the step, step 3's bump on package.json reading
+# the target version, step 4's publish on the registry answering with it. A
+# 139/134 is tolerated only against one of those four, never on the exit code
+# alone -- and never for lint at all, whose crash run_npm_check hard-fails before
+# this tolerance can see it. Other platforms treat any non-zero as a hard failure.
 IS_MINGW_ARM64=false
 case "$(uname -s 2>/dev/null)" in
   MINGW*ARM64* | MSYS*ARM64* | CYGWIN*ARM64*) IS_MINGW_ARM64=true ;;
@@ -161,19 +186,24 @@ esac
 # verify command (no npm-run wrapper) for tools that print no completion marker.
 run_npm_check() {
   local label="$1" script="$2" fail_re="$3" done_re="${4:-}" verify_cmd="${5:-}" out rc=0
-  # SKIP_LINT=1 escape hatch, matching every sibling @yawlabs release.sh.
-  # HISTORY, not present tense: under biome ^2.5.0 the win32-arm64 binary
-  # segfaulted (139) on THIS repo for every input -- `npm run lint`, `npx biome
-  # check src/`, a single file, and the direct node_modules binary all died with
-  # zero output, so neither the done_re nor the verify_cmd path below could
-  # engage (bc2076e, 2026-07-21 17:01). Superseded 79 minutes later by 66c48f3,
-  # which pinned biome to 2.4.16 exactly; CHANGELOG 0.72.0 records it.
-  # Re-checked 2026-09-06 on win32-arm64 (MINGW64, biome 2.4.16): `npm run lint`
-  # AND the direct node_modules binary both exit 0 printing "Checked 162 files"
-  # -- which is exactly what the Lint call site's done_re matches, so that
-  # tolerance path is LIVE, not unreachable. Retained for a future regression
-  # only. Types and tests still gate the release; formatting goes unverified
-  # whenever it is set.
+  # SKIP_LINT=1 escape hatch -- an explicit LAST RESORT, not a routine skip. It
+  # takes lint out of the release entirely and nothing else re-checks
+  # formatting: this repo has no CI (no .github/workflows, and GitHub Actions is
+  # disabled on YawLabs/mcp), so a SKIP_LINT=1 release is published unlinted.
+  #
+  # HISTORY: the crash it was added for is in biome's native win32-arm64
+  # EXECUTABLE, not in npm's run-script wrapper -- invoking the node_modules
+  # binary directly, with no npm in the picture, died the same way. It is
+  # VERSION-SPECIFIC, not a standing arm64 defect: 2.5.4 dies (139) on every
+  # CHECK-shaped run on this host while answering `--version` with exit 0
+  # (bc2076e, 2026-07-21 17:01), whereas 2.4.16 and 2.5.13 both run correctly
+  # (measured 2026-09-11, direct and via npm).
+  # 66c48f3 pinned biome to 2.4.16 exactly (an exact version, not a caret
+  # range) about 78 minutes later; CHANGELOG 0.72.0
+  # records it. And `npm run lint` now goes through scripts/lint.mjs, which runs
+  # the x64 build of the INSTALLED version under emulation on Windows ARM64, so
+  # an arm64 regression in a future biome cannot take the gate down. Types and
+  # tests still gate the release when it is set.
   if [ "${SKIP_LINT:-}" = "1" ] && [[ "$script" == lint* ]]; then
     warn "SKIP_LINT=1 -- skipping '$label' (lint gate disabled by request; formatting goes unverified)"
     return 0
@@ -187,6 +217,16 @@ run_npm_check() {
     fail "$label failed"
   fi
   [ "$rc" -eq 0 ] && return 0
+  # A lint CRASH is never tolerated, on any host. The ARM64 tolerance below
+  # accepts a 139/134 when the tool's success marker was printed; for lint that
+  # would pass a release on a verdict no process ever returned, and a crashing
+  # biome is exactly the arm64-binary failure this hatch history is about. So
+  # the done_re passed at the Lint call site no longer tolerates anything.
+  # scripts/lint.mjs turns a biome crash into exit 1 with its own "[lint] biome
+  # crashed with / killed by" line, so that shape is matched here as well.
+  if [[ "$script" == lint* ]] && { [ "$rc" -eq 139 ] || [ "$rc" -eq 134 ] || echo "$out" | grep -qE '^\[lint\] biome (killed by|crashed with)'; }; then
+    fail "$label crashed (exit $rc) -- no lint verdict was produced, so the release stops here. Fix the crash (scripts/lint.mjs honours YAWLABS_BIOME_BIN / YAWLABS_BIOME_NATIVE), or as an explicit last resort re-run with SKIP_LINT=1 ./release.sh ${VERSION} -- that publishes unlinted, and there is no CI to catch it."
+  fi
   if [ "$IS_MINGW_ARM64" = true ] && { [ "$rc" -eq 139 ] || [ "$rc" -eq 134 ]; }; then
     if [ -n "$done_re" ] && echo "$out" | grep -qE "$done_re"; then
       warn "$label: npm exited $rc (ARM64 npm-run cleanup segfault) but the tool completed with no findings -- tolerating"
@@ -769,7 +809,7 @@ if [ "$SKIP_CONFIRM" != "true" ] && [ "$RESUMING" != "true" ]; then
 fi
 
 step 1 "Lint + typecheck + tests"
-run_npm_check "Lint" lint 'Found [0-9]+ error' 'Checked [0-9]+ files'
+run_npm_check "Lint" lint 'Found [0-9]+ error' 'Checked [0-9]+ files'  # done_re is inert -- run_npm_check's lint-crash guard hard-fails every 139/134 before the ARM64 tolerance block that would read it; kept so narrowing that guard re-arms it.
 run_npm_check "Type check" typecheck 'error TS[0-9]' '' 'npx tsc --noEmit'
 # Tests go through the same wrapper as lint/typecheck: `npm test` is an
 # npm-run script on the same host that segfaults (139/134) in npm's exit

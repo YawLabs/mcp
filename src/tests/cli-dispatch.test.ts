@@ -18,6 +18,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { clientChoices } from "../client-aliases.js";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const cli = join(repoRoot, "dist", "index.js");
@@ -135,7 +136,11 @@ describe("CLI dispatch -- help goes to stdout and exits 0", () => {
     // own branch rather than the shared tail -- a second shape to keep right.
     const r = runCli(["install", "--help"]);
     expect(r.code).toBe(0);
-    expect(r.stdout).toContain("Usage: yaw-mcp install <claude-code|claude-desktop|cursor|vscode|windsurf|gemini-cli>");
+    // DERIVED: a literal synopsis here would have to be edited by every
+    // landing client and every landing alias, which is the collision the
+    // derived lists exist to remove. The shape checks in
+    // completion-cmd.test.ts are what stop the derivation being vacuous.
+    expect(r.stdout).toContain(`Usage: yaw-mcp install <${clientChoices("install").join("|")}>`);
     expect(r.stderr).toBe("");
   });
 

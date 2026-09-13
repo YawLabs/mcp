@@ -16,7 +16,7 @@
 // at once. Static strings would drift on a codebase that's been
 // shipping a subcommand a day.
 
-import { INSTALL_TARGETS } from "./install-targets.js";
+import { clientChoices } from "./client-aliases.js";
 import { createStreamWriter } from "./logger.js";
 
 export type CompletionShell = "bash" | "zsh" | "fish" | "powershell";
@@ -73,9 +73,12 @@ interface SubcommandSpec {
   flags: string[];
 }
 
-// Derived from the target table, not a hand-kept copy: a fourth list of the
-// same ids is a fourth place to forget when a client is added.
-const INSTALL_CLIENTS = INSTALL_TARGETS.map((t) => t.clientId);
+// Derived from the target table and the alias table, not a hand-kept copy: a
+// fourth list of the same ids is a fourth place to forget when a client is
+// added. `clientChoices` is the one function that answers "which names does
+// this verb take", so install, uninstall and import complete exactly what
+// their parsers accept -- aliases included.
+const INSTALL_CLIENTS = clientChoices("install");
 
 // Single source of truth for shell completion across bash/zsh/fish/powershell.
 // MUST cover every dispatched subcommand in KNOWN_SUBCOMMANDS (src/subcommands.ts)

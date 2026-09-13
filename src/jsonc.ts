@@ -33,6 +33,7 @@ import {
   type Edit,
   type FormattingOptions,
   findNodeAtLocation,
+  getNodeValue,
   type JSONPath,
   modify,
   type Node,
@@ -224,6 +225,7 @@ const FORMATTING_OPTIONS: FormattingOptions = {
 // runtime, so the kinds the splicer needs are spelled as their values here.
 // A wrong value fails the splice tests in src/tests/jsonc-splice.test.ts.
 const TOKEN_CLOSE_BRACE = 2;
+const TOKEN_CLOSE_BRACKET = 4;
 const TOKEN_COMMA = 5;
 const TOKEN_LINE_COMMENT = 12;
 const TOKEN_BLOCK_COMMENT = 13;
@@ -338,10 +340,25 @@ function commaAfter(text: string, from: number): number | undefined {
   return kind === TOKEN_COMMA ? scanner.getTokenOffset() : undefined;
 }
 
-function insertMember(text: string, container: Node, key: string, value: unknown): Edit[] | null {
+/** Splice `value` into `container` as a new last member, preserving every
+ *  byte and comment already in it.
+ *
+ *  `key` null means an ARRAY element: the label and its colon are simply not
+ *  written, and the close token to look for is `]` rather than `}`. Everything
+ *  else -- where the separator comma goes, whether the file's list ends with a
+ *  trailing comma, the indent to line the new member up with, the one-line
+ *  case -- is the same question for both containers, which is why this is one
+ *  function rather than two that could drift. */
+function insertMember(text: string, container: Node, key: string | null, value: unknown): Edit[] | null {
   const eol = detectEol(text);
   const step = detectIndentStep(text, container);
-  const keyText = JSON.stringify(key);
+  // An ARRAY element is the value alone: no label, no colon. `pretty` is the
+  // label a pretty-printed member carries, `compact` the one a member on a
+  // single line carries, each empty for an array.
+  const keyJson = key === null ? null : JSON.stringify(key);
+  const pretty = keyJson === null ? "" : `${keyJson}: `;
+  const compact = (sep: string): string => (keyJson === null ? "" : `${keyJson}:${sep}`);
+  const closeKind = key === null ? TOKEN_CLOSE_BRACKET : TOKEN_CLOSE_BRACE;
   const members = container.children ?? [];
   const close = container.offset + container.length - 1;
 
@@ -355,7 +372,7 @@ function insertMember(text: string, container: Node, key: string, value: unknown
         {
           offset: rest.stop,
           length: 0,
-          content: `${eol}${indent}${keyText}: ${render(value, step, eol, indent, false)}`,
+          content: `${eol}${indent}${pretty}${render(value, step, eol, indent, false)}`,
         },
       ];
     }
@@ -365,7 +382,7 @@ function insertMember(text: string, container: Node, key: string, value: unknown
       // A one-line document (minified, or just short): stay on the line.
       const colonOffset = container.parent?.colonOffset;
       const gap = colonOffset !== undefined && text[colonOffset + 1] === " " ? " " : "";
-      return [{ offset: close, length: 0, content: `${keyText}:${gap}${render(value, step, eol, "", true)}` }];
+      return [{ offset: close, length: 0, content: `${compact(gap)}${render(value, step, eol, "", true)}` }];
     }
     // `{}` in a multi-line file: open it onto lines of its own. Blank space
     // between the braces is replaced; a comment there is left in place.
@@ -377,7 +394,7 @@ function insertMember(text: string, container: Node, key: string, value: unknown
       {
         offset: blank ? container.offset + 1 : close,
         length: blank ? inside.length : 0,
-        content: `${eol}${indent}${keyText}: ${render(value, step, eol, indent, false)}${eol}${outer}`,
+        content: `${eol}${indent}${pretty}${render(value, step, eol, indent, false)}${eol}${outer}`,
       },
     ];
   }
@@ -402,19 +419,19 @@ function insertMember(text: string, container: Node, key: string, value: unknown
     edits.push({
       offset: rest.stop,
       length: 0,
-      content: `${eol}${indent}${keyText}: ${render(value, step, eol, indent, false)}${ownComma}`,
+      content: `${eol}${indent}${pretty}${render(value, step, eol, indent, false)}${ownComma}`,
     });
     return edits;
   }
-  if (rest.stopKind === TOKEN_CLOSE_BRACE) {
-    // One-line container: the member goes in front of its `}`, compact, with
-    // the spacing the container already uses.
+  if (rest.stopKind === closeKind) {
+    // One-line container: the member goes in front of its closing token,
+    // compact, with the spacing the container already uses.
     const colon = last.colonOffset !== undefined && text[last.colonOffset + 1] === " " ? " " : "";
     const gap = isHorizontalSpace(text[rest.stop - 1]) ? " " : "";
     edits.push({
       offset: rest.stop,
       length: 0,
-      content: `${keyText}:${colon}${render(value, step, eol, "", true)}${ownComma}${gap}`,
+      content: `${compact(colon)}${render(value, step, eol, "", true)}${ownComma}${gap}`,
     });
     return edits;
   }
@@ -632,4 +649,142 @@ export function editJsoncPath(src: string, path: Array<string | number>, value: 
   const edits = computeEdits(debommed, path, value);
   if (edits.length === 0) return src;
   return applyEdits(debommed, edits);
+}
+
+/** One element of an array node, as a JS value.
+ *
+ *  `Node.value` is populated ONLY for a scalar: an `object` or an `array`
+ *  child reports `value: undefined` (measured against the jsonc-parser this
+ *  repo pins), so comparing or testing children through `child.value` treats
+ *  every non-scalar element as one and the same `undefined` -- a dedupe that
+ *  can never match an object, and a predicate that is handed nothing to
+ *  decide on. `getNodeValue` materialises the subtree, which is what both
+ *  helpers below need. */
+function elementValue(child: Node): unknown {
+  return getNodeValue(child);
+}
+
+/** The ARRAY at `path`, or null when `src` does not parse or nothing of that
+ *  type is there. Shared by the two array helpers below so they agree about
+ *  what counts as an array to splice into. */
+function arrayNodeAt(text: string, path: Array<string | number>): Node | null {
+  const errors: ParseError[] = [];
+  const root = parseTree(text, errors, { allowTrailingComma: true });
+  if (root === undefined || errors.length > 0) return null;
+  const node = findNodeAtLocation(root, path);
+  return node !== undefined && node.type === "array" ? node : null;
+}
+
+/** Append `value` to the array at `path`, preserving comments.
+ *
+ *  The three editing helpers above address a KEY; this one addresses a list,
+ *  which is a different splice: a list has no member to replace, so setting
+ *  the whole array is the only thing they can do to one -- and that deletes
+ *  every comment INSIDE it. Claude Code's `permissions.allow` is exactly such
+ *  a list, routinely annotated per pattern, so adding one pattern used to
+ *  delete the user's notes about the others.
+ *
+ *  The new element copies the list's own style through the same code path a
+ *  new object member does (indent, line ending, trailing-comma mirroring, the
+ *  one-line case, a comment after the last element left where it is).
+ *
+ *  The array is CREATED, with `value` its only element, when `path` names
+ *  nothing -- and so are any missing objects above it, which is `editJsoncPath`'s
+ *  behaviour and needs no comment-preserving care: a list that does not exist
+ *  yet holds no comment to lose.
+ *
+ *  Returns the input unchanged, byte for byte and BOM included, when the value
+ *  is already an element of that array -- the same no-op contract, and the
+ *  same reason, as `removeJsoncEntry`. Equality is `JSON.stringify` over the
+ *  element's fully materialised value (`getNodeValue`, not `Node.value`, which
+ *  is undefined for an object or an array child), so it covers a string, a
+ *  number, an object and a nested array alike. Key ORDER counts, as it does in
+ *  any stringify comparison: `{"a":1,"b":2}` and `{"b":2,"a":1}` are two
+ *  elements, and this appends the second.
+ *
+ *  Throws when `path` names something that is NOT an array (a string, an
+ *  object): silently replacing it would throw away whatever the user put
+ *  there, and the caller is better placed to name the key in its message. */
+export function addJsoncArrayElement(src: string, path: Array<string | number>, value: unknown): string {
+  if (path.length === 0) throw new Error("addJsoncArrayElement: path must not be empty");
+  const debommed = src.charCodeAt(0) === 0xfeff ? src.slice(1) : src;
+  const array = arrayNodeAt(debommed, path);
+  if (array === null) {
+    const errors: ParseError[] = [];
+    const root = parseTree(debommed, errors, { allowTrailingComma: true });
+    const existing = root === undefined ? undefined : findNodeAtLocation(root, path);
+    if (existing !== undefined) {
+      throw new Error(`addJsoncArrayElement: ${path.join(".")} is a ${existing.type}, not an array`);
+    }
+    return editJsoncPath(debommed, path, [value]);
+  }
+  const wanted = JSON.stringify(value);
+  for (const child of array.children ?? []) {
+    if (JSON.stringify(elementValue(child)) === wanted) return src;
+  }
+  const edits = insertMember(debommed, array, null, value);
+  // `insertMember` returns null only for a container shape its scanner cannot
+  // place a member in. Falling back to the whole-array write keeps the edit
+  // working (it is what this function replaces) at the cost of the comments
+  // inside -- strictly better than refusing, and the caller cannot do more.
+  if (edits === null) {
+    const next = [...(array.children ?? []).map(elementValue), value];
+    return editJsoncPath(debommed, path, next);
+  }
+  return applyEdits(debommed, edits);
+}
+
+/** Remove from the array at `path` every element whose parsed value satisfies
+ *  `matches`, preserving the comments on the elements that stay.
+ *
+ *  `matches` is handed the element's fully materialised value, so an object or
+ *  a nested-array element is a value the predicate can actually test rather
+ *  than the `undefined` `Node.value` reports for those types.
+ *
+ *  The mirror of `addJsoncArrayElement`, and the same reason for existing: the
+ *  whole-array write that would otherwise do this deletes every comment in the
+ *  list. An element's own line goes with it -- including a comment on that
+ *  line, which annotates the element being removed -- exactly as a removed
+ *  object member's does.
+ *
+ *  Returns the input unchanged, byte for byte and BOM included, when nothing
+ *  matches or `path` names no array. An emptied list is left as `[]` rather
+ *  than deleted: dropping a key the user's file declares is a bigger liberty
+ *  than a removal is entitled to. */
+export function removeJsoncArrayElements(
+  src: string,
+  path: Array<string | number>,
+  matches: (value: unknown) => boolean,
+): string {
+  if (path.length === 0) throw new Error("removeJsoncArrayElements: path must not be empty");
+  const debommed = src.charCodeAt(0) === 0xfeff ? src.slice(1) : src;
+  const array = arrayNodeAt(debommed, path);
+  if (array === null) return src;
+  const doomed = (array.children ?? []).filter((child) => matches(elementValue(child)));
+  if (doomed.length === 0) return src;
+  // One at a time, each against the text the last one produced: `removeMember`
+  // computes offsets against the tree it was given, so two sets of edits taken
+  // from the same parse would each be applied at stale positions.
+  let text = debommed;
+  for (let i = 0; i < doomed.length; i++) {
+    const current = arrayNodeAt(text, path);
+    if (current === null) break;
+    const member = (current.children ?? []).find((child) => matches(elementValue(child)));
+    if (member === undefined) break;
+    text = applyEdits(text, removeMember(text, current, member));
+  }
+  // A list emptied by those removals closes up to `[]`, which is what a
+  // whole-array write leaves and therefore what every existing expectation
+  // about an emptied list pins. Only BLANK space is closed up: a comment
+  // between the brackets is content the user wrote and stays, the same rule
+  // `removeMember` applies to an emptied one-line container.
+  const emptied = arrayNodeAt(text, path);
+  if (emptied !== null && (emptied.children ?? []).length === 0) {
+    const open = emptied.offset + 1;
+    const close = emptied.offset + emptied.length - 1;
+    if (close > open && /^\s*$/.test(text.slice(open, close))) {
+      text = text.slice(0, open) + text.slice(close);
+    }
+  }
+  return text;
 }

@@ -61,28 +61,38 @@
 //     would refuse is named (key names only), and one un-removable key never
 //     aborts the removal of the others.
 
-import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, resolve as resolvePath } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { atomicWriteFile } from "./atomic-write.js";
+import { clientChoices, resolveClientArg } from "./client-aliases.js";
+import {
+  applyClientConfigEdits,
+  type ClientConfigEdit,
+  type ClientConfigView,
+  type ConfigSite,
+  classifyClientConfig,
+  containerKeysAt,
+  importViewOf,
+  readClientConfigFile,
+  siteAt,
+  terminateWithNewline,
+} from "./client-config.js";
 import { resolveInstallSite } from "./install-cmd.js";
 import {
   blockedContainerFix,
-  claudeCodeContainerPaths,
-  describeJsonShape,
+  type ClientEnvValues,
+  claudeCodeContainerPathVariants,
   ENTRY_NAME,
-  findBlockedContainerSegment,
-  INSTALL_TARGETS,
   type InstallClientId,
   type InstallOS,
   type InstallScope,
   LEGACY_ENTRY_NAMES,
   resolveAppDataDir,
-  resolveInstallPath,
+  resolveInstallSites,
   unparseableConfigFix,
 } from "./install-targets.js";
-import { parseJsonc, removeJsoncEntry } from "./jsonc.js";
+import { parseJsonc } from "./jsonc.js";
 import { deriveNamespace, type LaunchShape, previewUpsertUserBundle, upsertUserBundle } from "./local-bundles.js";
 import { createStreamWriter } from "./logger.js";
 import { QUESTION_CANCELLED, type QuestionCancelled, questionOrEmpty } from "./readline-question.js";
@@ -96,7 +106,7 @@ export const IMPORT_USAGE = `Usage: yaw-mcp import <client> [flags]
   local ~/.yaw-mcp/bundles.json, so yaw-mcp serves the servers you already had
   instead of starting empty.
 
-  <client> is one of: ${INSTALL_TARGETS.map((t) => t.clientId).join(", ")}.
+  <client> is one of: ${clientChoices("import").join(", ")}.
 
   yaw-mcp's own entry is never imported, under any of its names. Each server's
   command, args, url, headers and env come across as they are -- an import that
@@ -141,6 +151,12 @@ export interface ImportCommandOptions {
   cwd?: string;
   appData?: string;
   claudeConfigDir?: string;
+  /** Every client env var, as `readClientEnv` reported it, threaded from the
+   *  dispatcher. Only a MODULAR row reads it (Zed's $XDG_CONFIG_HOME, Cline's
+   *  three knobs, Continue's global dir); the six inline rows take their one
+   *  variable from `claudeConfigDir` above. Read by the dispatcher and never
+   *  here, so a test that calls this runner directly stays hermetic. */
+  clientEnv?: ClientEnvValues;
   out?: (s: string) => void;
   err?: (s: string) => void;
   /** Test hook: override the TTY verdict instead of reading process.std*. */
@@ -382,11 +398,31 @@ function toEntry(key: string, value: unknown, vars: ClientVars | null): BuiltEnt
  *  when `"password": true`), so the value is never in the file and an import
  *  can only name what it would need. Reading the block is what lets the
  *  refusal say WHICH value VS Code would ask for, and tells a declared input
- *  apart from a typo that is broken in VS Code too. */
-function readVsCodeInputs(parsed: Record<string, unknown>): Map<string, string> {
+ *  apart from a typo that is broken in VS Code too.
+ *
+ *  THE ONE parse of a client config left in this file, and the reason it is
+ *  not routed through the client-config core: `inputs` is not a server
+ *  container. It is a document-level ARRAY of variable declarations that only
+ *  VS Code writes, and the core models entry MAPS -- asking it for the keys at
+ *  `["inputs"]` would report an array as a blocked container, which is neither
+ *  true nor useful here. The vscode row declares `hooks.importVariables:
+ *  "vscode-inputs"` for the handler that will own this; until that handler
+ *  exists, the parse stays here, reaching for nothing but `inputs`, and is
+ *  allow-listed by name in the boundary scan. Unparseable bytes yield no
+ *  declarations rather than throwing: the caller has already classified the
+ *  file through the core and would not be here if it did not parse. */
+function readVsCodeInputs(raw: string): Map<string, string> {
   const out = new Map<string, string>();
-  if (!Array.isArray(parsed.inputs)) return out;
-  for (const item of parsed.inputs) {
+  let parsed: unknown;
+  try {
+    parsed = parseJsonc(raw);
+  } catch {
+    return out;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return out;
+  const inputs = (parsed as Record<string, unknown>).inputs;
+  if (!Array.isArray(inputs)) return out;
+  for (const item of inputs) {
     if (!item || typeof item !== "object" || Array.isArray(item)) continue;
     const r = item as Record<string, unknown>;
     if (typeof r.id !== "string" || r.id === "") continue;
@@ -417,19 +453,22 @@ function renderLaunch(shape: LaunchShape): string {
   return shape.url ? `HTTP ${displaySafe(shape.url)}` : "(no launch command)";
 }
 
-/** A config file plus the JSON path inside it that holds the server entries.
- *  A client with more than one scope has more than one of these. */
-interface ContainerRef {
-  absolute: string;
-  containerPath: string[];
-}
+/** A config file plus the path inside it that holds the server entries -- as a
+ *  `ConfigSite`, so its SYNTAX is the one the target row and the scope
+ *  resolved and is never restated here. A client with more than one scope has
+ *  more than one of these. */
+type ContainerRef = ConfigSite;
 
 function describeContainer(ref: ContainerRef): string {
-  return `${displaySafe(ref.absolute)} (${ref.containerPath.join(".")})`;
+  return `${displaySafe(ref.resolved.absolute)} (${ref.resolved.containerPath.join(".")})`;
 }
 
-function hasYawMcpEntry(container: Record<string, unknown>): boolean {
-  return ENTRY_NAME in container || LEGACY_ENTRY_NAMES.some((n) => n in container);
+/** Is yaw-mcp itself wired into this container -- under its own entry key or a
+ *  pre-rename one? Asked of the VIEW rather than of a parsed object, so the
+ *  answer comes from the site's own adapter and the legacy list has one
+ *  reader. */
+function isWiredIn(view: ClientConfigView): boolean {
+  return view.entry() !== undefined || view.legacyKey() !== null;
 }
 
 /** What one searched container turned out to be. Only `container` can hold a
@@ -438,15 +477,20 @@ function hasYawMcpEntry(container: Record<string, unknown>): boolean {
  *
  *  - `none`: nothing install objects to -- the file is absent or empty, the
  *    container key is absent, or it holds a shape install replaces with `{}`
- *    itself (null, a scalar, an empty array; see findBlockedContainerSegment).
- *    "Run install first" is true for these.
+ *    itself (null, a scalar, an empty array -- the core reports that as a
+ *    `blocked` read with `reparable` true). "Run install first" is true for
+ *    these.
  *  - `refused`: a file install will NOT write -- unreadable, not JSON, a root
  *    that is not an object, or a container key holding a non-empty array. A
  *    bare `yaw-mcp install <client>` exits 1 on it, so the advice has to name
  *    the by-hand step first. `clause` says what is wrong; `installSays` and
- *    `fix` say what install does and what gets past it, in install's words. */
+ *    `fix` say what install does and what gets past it, in install's words.
+ *
+ *  `wired` answers the ONE question the caller asks of a `container`: is
+ *  yaw-mcp itself in it. The container object is deliberately not carried out
+ *  of here any more -- nothing outside the core needs to hold one. */
 type ContainerRead =
-  | { state: "container"; container: Record<string, unknown> }
+  | { state: "container"; wired: boolean }
   | { state: "none" }
   | { state: "refused"; clause: string; installSays: string; fix: (then: string) => string };
 
@@ -462,17 +506,21 @@ type ContainerRead =
  *  no longer reach, while a false "not wired" only refuses a removal that
  *  would have been safe. */
 async function readContainer(ref: ContainerRef): Promise<ContainerRead> {
-  const where = displaySafe(ref.absolute);
-  let raw: string;
-  try {
-    raw = await readFile(ref.absolute, "utf8");
-  } catch (e) {
-    const code = (e as NodeJS.ErrnoException).code;
-    // Absent: install creates the file, so "run install" works.
-    if (code === "ENOENT") return { state: "none" };
+  const where = displaySafe(ref.resolved.absolute);
+  // Read the CANONICAL address first: every state install treats differently
+  // is a fact about the file or about the canonical container, in install's
+  // own order, and only the "is yaw-mcp wired in" question folds across the
+  // drive-case siblings (below).
+  const view = await readClientConfigFile(ref);
+  const read = view.read;
+  // Absent (no file, or an empty one): install creates or fills it, so "run
+  // install" works. The core reads an empty or whitespace-only file as absent
+  // for exactly the reason install writes one as if it were absent.
+  if (read.kind === "absent") return { state: "none" };
+  if (read.kind === "unreadable") {
     // install's describeUnreadableConfig wording, so the two name one fault
     // the same way.
-    if (code === "EISDIR") {
+    if (read.code === "EISDIR") {
       return {
         state: "refused",
         clause: `${where} is a directory, not a file`,
@@ -482,69 +530,70 @@ async function readContainer(ref: ContainerRef): Promise<ContainerRead> {
     }
     return {
       state: "refused",
-      clause: `${where} could not be read (${displaySafe((e as Error).message)})`,
+      clause: `${where} could not be read (${displaySafe(read.message)})`,
       installSays: `cannot read ${where}`,
       fix: (then) => `check the file and its permissions, then ${then}`,
     };
   }
-  // install writes an empty (or whitespace-only) file as if it were absent.
-  if (raw.trim().length === 0) return { state: "none" };
-  let parsed: unknown;
-  try {
-    parsed = parseJsonc(raw);
-  } catch {
+  // `read.syntax` is the adapter's own name for the file's language. Every
+  // client `import` can read today is JSON-family, where that name is "JSON",
+  // so both clauses are byte-identical to the literals they replace.
+  if (read.kind === "malformed") {
     return {
       state: "refused",
-      clause: `${where} is not valid JSON`,
+      clause:
+        read.reason === "root" ? `${where} is not a ${read.syntax} object` : `${where} is not valid ${read.syntax}`,
       installSays: `refuses to overwrite ${where}`,
       fix: unparseableConfigFix,
     };
   }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    return {
-      state: "refused",
-      clause: `${where} is not a JSON object`,
-      installSays: `refuses to overwrite ${where}`,
-      fix: unparseableConfigFix,
-    };
-  }
-  const blocked = findBlockedContainerSegment(parsed as Record<string, unknown>, ref.containerPath);
-  if (blocked) {
-    if (!blocked.reparable) {
-      const keyPath = `"${blocked.path.join(".")}" in ${where}`;
+  if (read.kind === "blocked") {
+    if (!read.reparable) {
+      const keyPath = `"${read.path.join(".")}" in ${where}`;
       return {
         state: "refused",
-        clause: `${keyPath} is ${describeJsonShape(blocked.value)}, not a JSON object`,
+        clause: `${keyPath} is ${read.shape}, not a JSON object`,
         installSays: `refuses to overwrite ${keyPath}`,
         fix: blockedContainerFix,
       };
     }
     return { state: "none" };
   }
-  // EVERY projects[] read resolves its path through the one helper -- see
-  // claudeCodeContainerPaths. The canonical key comes first; a drive-letter-case
-  // sibling of the same project is checked too, because the only question this
-  // function is asked is "is yaw-mcp already wired in for this project", and an
-  // entry an older version wrote under the other spelling answers it yes. The
-  // first container carrying a yaw-mcp entry wins; otherwise the first one that
-  // exists is returned, so a bare canonical container still reads as "present,
-  // nothing wired".
-  let fallback: Record<string, unknown> | null = null;
-  for (const variantPath of claudeCodeContainerPaths(parsed, ref.containerPath)) {
-    let node: unknown = parsed;
-    for (const key of variantPath) {
-      if (!node || typeof node !== "object" || Array.isArray(node)) {
-        node = undefined;
-        break;
-      }
-      node = (node as Record<string, unknown>)[key];
-    }
-    if (!node || typeof node !== "object" || Array.isArray(node)) continue;
-    const container = node as Record<string, unknown>;
-    if (hasYawMcpEntry(container)) return { state: "container", container };
-    fallback ??= container;
+  if (read.kind === "unspliceable") {
+    const keyPath = `the "${read.key}" entry in ${where}`;
+    return {
+      state: "refused",
+      clause: `${keyPath} is ${read.reason}`,
+      installSays: `refuses to edit ${keyPath}`,
+      fix: (then) => `rewrite that entry by hand, then ${then}`,
+    };
   }
-  return fallback ? { state: "container", container: fallback } : { state: "none" };
+  // The only question this function is asked is "is yaw-mcp already wired in
+  // for this project", and an entry an older version wrote under the other
+  // drive-letter case answers it yes -- so the wiring question, and only it,
+  // folds across the siblings. The view picks the first candidate carrying our
+  // wiring and otherwise the first that exists, so a bare canonical container
+  // still reads as "present, nothing wired".
+  const folded = classifyClientConfig(view.raw, ref, { containerPaths: driveCaseVariants(ref, view.raw) });
+  const at = folded.read;
+  // A container that is not present at all is "none": there is nothing there
+  // for install to object to, and nothing for a yaw-mcp entry to be in.
+  if (at.kind !== "ok" || !at.containerPresent) return { state: "none" };
+  return { state: "container", wired: isWiredIn(folded) };
+}
+
+/** The container addresses one site's drive-letter-case siblings occupy, in
+ *  priority order (canonical first).
+ *
+ *  The RULE lives in install-targets.ts, which owns the `projects[...]`
+ *  question; the candidate keys come from the file's own container through the
+ *  core, so nothing here parses a client config to find them. `raw` is the
+ *  bytes when the caller already holds them, and null when it does not -- a
+ *  null yields the canonical path alone, which is the same degradation
+ *  `claudeCodeContainerPathVariants` documents for a key lister that answers
+ *  nothing -- so a caller with no bytes reads where writes go. */
+function driveCaseVariants(site: ConfigSite, raw: string | null): string[][] {
+  return claudeCodeContainerPathVariants(site.resolved.containerPath, (prefix) => containerKeysAt(raw, site, prefix));
 }
 
 export function parseImportArgs(
@@ -602,17 +651,20 @@ export function parseImportArgs(
   if (positional.length !== 1) {
     return { ok: false, error: `yaw-mcp import: expected exactly one client.\n${IMPORT_USAGE}` };
   }
-  const clientId = positional[0] as InstallClientId;
-  // Validated HERE rather than left to resolveInstallSite: that helper answers
+  // Resolved HERE rather than left to resolveInstallSite: that helper answers
   // an unknown client by printing install's own multi-KB usage, which is not
-  // the text an `import` typo should produce.
-  if (!INSTALL_TARGETS.some((t) => t.clientId === clientId)) {
+  // the text an `import` typo should produce. Same resolver as install's, so
+  // import takes exactly the names install does, aliases included.
+  const resolved = resolveClientArg("import", positional[0]);
+  if (!resolved) {
     return {
       ok: false,
-      error: `yaw-mcp import: unknown client "${clientId}". Choose: ${INSTALL_TARGETS.map((t) => t.clientId).join(", ")}`,
+      error: `yaw-mcp import: unknown client "${positional[0]}". Choose: ${clientChoices("import").join(", ")}`,
     };
   }
-  opts.clientId = clientId;
+  opts.clientId = resolved.clientId;
+  // An alias's scope is a DEFAULT: an explicit --scope beside it still wins.
+  if (resolved.scope !== undefined && opts.scope === undefined) opts.scope = resolved.scope;
   return { ok: true, options: opts };
 }
 
@@ -673,71 +725,74 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
   print(`Source: ${target.label} (${site.scope})`);
   print(`File:   ${displaySafe(resolved.absolute)}`);
 
-  let raw: string;
-  try {
-    raw = await readFile(resolved.absolute, "utf8");
-  } catch (e) {
-    const code = (e as NodeJS.ErrnoException).code;
+  // The source file is read THROUGH THE CORE: one reader for every syntax,
+  // the strictness the site declared, and the entries handed back by the
+  // site's own adapter rather than by a walk here.
+  const targetSite = site.sites[0];
+  const view = await readClientConfigFile(targetSite, { transform: target.entry });
+  const read = view.read;
+  if (read.kind === "unreadable") {
+    printErr(`yaw-mcp import: cannot read ${displaySafe(resolved.absolute)}: ${read.message}`);
+    return { exitCode: 1, written: [] };
+  }
+  if (read.kind === "absent") {
+    // `raw` is null for a file that is not there and the empty string for one
+    // that is there and holds nothing -- which the core reads as absent for
+    // the same reason install writes an empty file as if it were absent. Both
+    // mean "no servers to import", and each says which it is: the previous
+    // wording told a user with an empty config that it was invalid JSON.
     printErr(
-      code === "ENOENT"
+      view.raw === null
         ? `yaw-mcp import: ${displaySafe(resolved.absolute)} does not exist -- ${target.label} has no MCP servers configured at this scope.`
-        : `yaw-mcp import: cannot read ${displaySafe(resolved.absolute)}: ${(e as Error).message}`,
+        : `yaw-mcp import: ${displaySafe(resolved.absolute)} is empty -- ${target.label} has no MCP servers configured at this scope.`,
+    );
+    return { exitCode: 1, written: [] };
+  }
+  // `read.syntax` is the adapter's own name for the file's language -- "JSON"
+  // for every client `import` can read today, so both lines are byte-identical
+  // to the literals they replace, and a non-JSON client would say what it is.
+  if (read.kind === "malformed") {
+    printErr(
+      read.reason === "root"
+        ? `yaw-mcp import: ${displaySafe(resolved.absolute)} is not a ${read.syntax} object.`
+        : `yaw-mcp import: ${displaySafe(resolved.absolute)} is not valid ${read.syntax} (${read.detail}).`,
     );
     return { exitCode: 1, written: [] };
   }
 
-  let parsed: unknown;
-  try {
-    // parseJsonc, not JSON.parse: client configs are hand-edited and several
-    // of these clients tolerate `//` comments. The same parser the loader and
-    // the removal preview use, so this command cannot disagree with the write
-    // path below about which files are readable.
-    parsed = parseJsonc(raw);
-  } catch (e) {
-    printErr(`yaw-mcp import: ${displaySafe(resolved.absolute)} is not valid JSON (${(e as Error).message}).`);
-    return { exitCode: 1, written: [] };
-  }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    printErr(`yaw-mcp import: ${displaySafe(resolved.absolute)} is not a JSON object.`);
-    return { exitCode: 1, written: [] };
-  }
-
-  // Walk the client's OWN container path -- `mcpServers` for most clients,
-  // `servers` for VS Code, and `projects[<absDir>].mcpServers` for Claude Code
-  // at local scope. Reading it off the resolved target is what keeps this
-  // command from assuming a single spelling; pasting a Claude Code shape into
-  // a VS Code file fails silently, which is the bug the table records.
+  // The client's OWN container -- `mcpServers` for most clients, `servers` for
+  // VS Code, `context_servers` for Zed, and `projects[<absDir>].mcpServers`
+  // for Claude Code at local scope. It comes off the site the resolver
+  // produced, which is what keeps this command from assuming a single
+  // spelling; pasting a Claude Code shape into a VS Code file fails silently,
+  // which is the bug the table records.
   //
   // EVERY projects[] read resolves its path through the one helper -- see
-  // claudeCodeContainerPaths. The canonical key comes first; a drive-letter-case
+  // driveCaseVariants. The canonical key comes first; a drive-letter-case
   // sibling of the same project is read too, because an older version wrote the
   // servers there and "Nothing to import" over a file full of them is the same
   // blindness `uninstall` had. `sourcePath` carries the key that was actually
   // read all the way down to the removal below: reading a sibling and then
   // deleting from the canonical key would leave every imported server wired.
-  let container: Record<string, unknown> | null = null;
+  //
+  // A `blocked` or `unspliceable` read reaches here and finds no container at
+  // any candidate, which lands on the "nothing to import" line below -- the
+  // same place the walk this replaces left it.
+  let source: ClientConfigView | null = null;
   let sourcePath: string[] = [...resolved.containerPath];
-  for (const variantPath of claudeCodeContainerPaths(parsed, resolved.containerPath)) {
-    let node: unknown = parsed;
-    for (const key of variantPath) {
-      if (!node || typeof node !== "object" || Array.isArray(node)) {
-        node = undefined;
-        break;
-      }
-      node = (node as Record<string, unknown>)[key];
-    }
-    if (!node || typeof node !== "object" || Array.isArray(node)) continue;
-    const found = node as Record<string, unknown>;
+  for (const variantPath of driveCaseVariants(targetSite, view.raw)) {
+    const at = classifyClientConfig(view.raw, siteAt(targetSite, variantPath), { transform: target.entry });
+    if (at.read.kind !== "ok" || !at.read.containerPresent) continue;
     // The first NON-EMPTY container wins; an empty one is only a fallback, so
     // an empty canonical container still produces the "nothing to import"
     // message about the key the user asked about.
-    if (container === null || Object.keys(found).length > 0) {
-      container = found;
+    if (source === null || at.count() > 0) {
+      source = at;
       sourcePath = variantPath;
     }
-    if (Object.keys(found).length > 0) break;
+    if (at.count() > 0) break;
   }
-  if (container === null) {
+  if (source === null) {
     print(`\nNothing to import: no "${resolved.containerPath.join(".")}" object in ${displaySafe(resolved.absolute)}.`);
     return { exitCode: 0, written: [] };
   }
@@ -747,7 +802,7 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
   // spans are interpreted here -- see toEntry.
   const isVsCode = target.clientId === "vscode";
   const vars: ClientVars | null = isVsCode ? { workspaceFolder: site.projectDir } : null;
-  const inputs = isVsCode ? readVsCodeInputs(parsed as Record<string, unknown>) : new Map<string, string>();
+  const inputs = isVsCode ? readVsCodeInputs(view.raw ?? "") : new Map<string, string>();
 
   const candidates: ImportCandidate[] = [];
   const skippedSelf: string[] = [];
@@ -755,12 +810,32 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
   /** Servers refused over a `${...}` this importer cannot resolve, already
    *  rendered as "  <key>: <spans>" lines. */
   const unresolvable: string[] = [];
-  for (const [key, value] of Object.entries(container)) {
+  for (const { key, value } of source.entries()) {
     if (isSelfEntry(key)) {
       skippedSelf.push(key);
       continue;
     }
-    const built = toEntry(key, value, vars);
+    // A value that is not an object is not a server at all (a hand-edit
+    // artifact), and `importViewOf` takes a record -- so that shape is refused
+    // here rather than inside it, on the same terms `toEntry` already refused
+    // it.
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      unusable.push(key);
+      continue;
+    }
+    // THE TARGET's own view of its own entry. With no `forImport` hook this is
+    // the entry as the row's `normalize` says every consumer should see it,
+    // which is what makes a client that stores our launch under a nested
+    // transport key (Cline) import as a launchable server rather than as an
+    // opaque object with no command in it.
+    //
+    // Only `entry` is read today, and that is the whole of what the importer
+    // asks for: `disabled`, `skipReason` and `discardedKeys` arrive on an
+    // ImportView only from a `forImport` hook, no row declares one in this
+    // build, and wiring three branches nothing can reach would be three
+    // untested claims rather than three features. They belong to the package
+    // that adds the first hook.
+    const built = toEntry(key, importViewOf(value as Record<string, unknown>, target.entry).entry, vars);
     if (!built) {
       unusable.push(key);
       continue;
@@ -975,7 +1050,7 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
   //
   // The imported container is FIRST and is the copy already in memory, so the
   // single-scope clients read no extra files at all.
-  const searched: ContainerRef[] = [{ absolute: resolved.absolute, containerPath: sourcePath }];
+  const searched: ContainerRef[] = [siteAt(targetSite, sourcePath)];
   // The container a bare `yaw-mcp install <client>` writes -- the step the
   // refusal below names. Every client has a user scope and resolveInstallSite
   // defaults to it, so it is the user-scope ref.
@@ -983,12 +1058,19 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
   for (const spec of target.scopes) {
     if (spec.scope === site.scope) continue;
     try {
-      const other = resolveInstallPath({
+      // SITES, so each searched container carries the syntax its own row and
+      // scope resolved -- the read below never restates a format. A row that
+      // fans one scope out to several files contributes all of them, which is
+      // where the entry could be.
+      const others = resolveInstallSites({
         clientId: target.clientId,
         scope: spec.scope,
         os: site.os,
         home,
         appData: resolveAppDataDir({ appData: opts.appData, home }),
+        // Same env the target scope resolved with, so an env-redirected client
+        // is searched at its REAL other-scope path rather than the default one.
+        clientEnv: opts.clientEnv,
         // The project the user is standing in -- the same resolution
         // resolveInstallSite would have made had that scope been the target.
         projectDir: spec.requiresProjectDir
@@ -996,12 +1078,16 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
           : undefined,
         claudeConfigDir: opts.claudeConfigDir,
       });
-      const already = searched.find(
-        (r) => r.absolute === other.absolute && r.containerPath.join(".") === other.containerPath.join("."),
-      );
-      const ref = already ?? { absolute: other.absolute, containerPath: other.containerPath };
-      if (!already) searched.push(ref);
-      if (spec.scope === "user") installRef = ref;
+      for (const other of others) {
+        const already = searched.find(
+          (r) =>
+            r.resolved.absolute === other.resolved.absolute &&
+            r.resolved.containerPath.join(".") === other.resolved.containerPath.join("."),
+        );
+        const ref = already ?? other;
+        if (!already) searched.push(ref);
+        if (spec.scope === "user" && installRef === null) installRef = ref;
+      }
     } catch {
       // A scope this machine cannot resolve a path for is one the client is
       // not reading either, so it is simply not searched.
@@ -1010,8 +1096,11 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
   let wiredIn: ContainerRef | null = null;
   const refused = new Map<ContainerRef, Extract<ContainerRead, { state: "refused" }>>();
   for (let i = 0; i < searched.length; i++) {
-    const read: ContainerRead = i === 0 ? { state: "container", container } : await readContainer(searched[i]);
-    if (read.state === "container" && hasYawMcpEntry(read.container)) {
+    // The imported container is FIRST and is the VIEW already in hand, so the
+    // single-scope clients read no extra files at all.
+    const read: ContainerRead =
+      i === 0 ? { state: "container", wired: isWiredIn(source) } : await readContainer(searched[i]);
+    if (read.state === "container" && read.wired) {
       wiredIn = searched[i];
       break;
     }
@@ -1073,21 +1162,29 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
     }
   }
 
-  // Peel the entries out of the RAW BYTES with removeJsoncEntry (jsonc.ts), one
-  // key at a time, exactly as `uninstall` and `try-cleanup` do. A parse-and-reserialize
-  // would take the user's comments -- and, in ~/.claude.json, the rest of
-  // their Claude Code state -- with it.
+  // Peel the entries out of the original bytes through the core's write
+  // facade, one key at a time, exactly as `uninstall` and `try-cleanup` do. A
+  // parse-and-reserialize would take the user's comments -- and, in
+  // ~/.claude.json, the rest of their Claude Code state -- with it, and going
+  // through the facade is what VERIFIES each removal (nothing but that key
+  // moved, no neighbour changed, the file still reads back) before there are
+  // bytes to persist.
   //
-  // Each key is isolated. removeJsoncEntry refuses a key it cannot address (an
-  // empty-string key is the shape that reaches it), and one loop-wide catch
-  // meant that single key aborted the removal for EVERY other imported server,
-  // under a message that named no key at all.
-  let next = raw;
+  // ONE CALL PER KEY, each classified against the text the last one produced,
+  // rather than one call carrying every removal: a key the splicer refuses (an
+  // empty-string key is the shape that reaches it) must not abort the removal
+  // for every other imported server, which is what a single edit list would
+  // do. That was the bug -- one loop-wide catch, under a message that named no
+  // key at all.
+  const removalSite = siteAt(targetSite, sourcePath);
+  let next = view.raw ?? "";
   let removed = 0;
   const unremovable: string[] = [];
   for (const r of imported) {
     try {
-      const after = removeJsoncEntry(next, sourcePath, r.candidate.key);
+      const at = classifyClientConfig(next, removalSite, { transform: target.entry });
+      const edits: ClientConfigEdit[] = [{ op: "remove", key: r.candidate.key }];
+      const after = applyClientConfigEdits(at, edits, removalSite);
       if (after !== next) removed++;
       next = after;
     } catch (e) {
@@ -1106,7 +1203,7 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
     return { exitCode: 0, written };
   }
   try {
-    await atomicWriteFile(resolved.absolute, next.endsWith("\n") ? next : `${next}\n`);
+    await atomicWriteFile(resolved.absolute, terminateWithNewline(next));
   } catch (e) {
     printErr(
       `yaw-mcp import: could not write ${displaySafe(resolved.absolute)} (${(e as Error).message}). It was left unchanged; the servers are imported either way.`,

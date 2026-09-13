@@ -1,0 +1,4 @@
+mcp_servers = { sib = { command = "node" } }
+
+[tui]
+theme = "dark"

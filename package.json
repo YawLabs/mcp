@@ -1,8 +1,8 @@
 {
   "name": "@yawlabs/mcp",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "mcpName": "io.github.YawLabs/mcp",
-  "description": "One install, every MCP server, managed from yaw.sh/mcp. Runs locally: no account, no sign-in.",
+  "description": "MCP gateway and orchestrator: one local install fronts every MCP server for Claude Code, Cursor, and VS Code, loading tools on demand.",
   "license": "SEE LICENSE IN LICENSE.md",
   "author": "Yaw Labs <support@yaw.sh> (https://yaw.sh/mcp)",
   "type": "module",
@@ -19,8 +19,8 @@
     "build": "tsup",
     "dev": "tsup --watch",
     "test": "vitest run",
-    "lint": "biome check src/ tsup.config.ts vitest.config.ts tsconfig.json",
-    "lint:fix": "biome check --write src/ tsup.config.ts vitest.config.ts tsconfig.json",
+    "lint": "node scripts/lint.mjs check src/ tsup.config.ts vitest.config.ts tsconfig.json",
+    "lint:fix": "node scripts/lint.mjs check --write src/ tsup.config.ts vitest.config.ts tsconfig.json",
     "typecheck": "tsc --noEmit",
     "test:dist": "npm run build && npm test",
     "preinstall": "node -e \"const major=Number(process.versions.node.split('.')[0]);if(major<20){console.error('@yawlabs/mcp requires Node 20 or newer; this is Node '+process.versions.node+'. Upgrade Node, then re-run the install.');process.exit(1);}\"",
@@ -31,6 +31,7 @@
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@yawlabs/mcp-compliance": "^0.17.1",
     "jsonc-parser": "^3.3.1",
+    "smol-toml": "^1.8.0",
     "undici": "^6.27.0"
   },
   "overrides": {
@@ -52,9 +53,22 @@
   "keywords": [
     "mcp",
     "model-context-protocol",
-    "orchestrator",
     "mcp-server",
+    "mcp-gateway",
+    "mcp-proxy",
+    "mcp-broker",
+    "mcp-manager",
+    "orchestrator",
+    "cli",
     "ai",
+    "claude-code",
+    "claude-desktop",
+    "cursor",
+    "vscode",
+    "windsurf",
+    "gemini-cli",
+    "secrets-vault",
+    "lazy-loading",
     "yaw",
     "yaw-mcp",
     "yawlabs"
@@ -66,5 +80,5 @@
   "bugs": {
     "url": "https://github.com/YawLabs/mcp/issues"
   },
-  "homepage": "https://yaw.sh/mcp"
+  "homepage": "https://yaw.sh/mcp/"
 }

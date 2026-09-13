@@ -1,9 +1,18 @@
-// Per-client, per-OS config file metadata for `yaw-mcp install <client>`.
-// This is the authoritative mapping of {client, scope, OS} → file path +
-// JSON shape. (A pre-rename dashboard install mirror has been archived; this
-// file is now the sole source of truth.) The tests in install-targets.test.ts lock the
-// specifics (file names, JSON root keys) that would silently break the
-// install flow if regressed.
+// The TABLE of client-install targets: the authoritative mapping of
+// {client, scope, OS} to a config file path plus the shape of that file
+// (`config`: its syntax and its container key). (A pre-rename dashboard
+// install mirror has been archived; this file is now the sole source of
+// truth.) The tests in install-targets.test.ts lock the specifics (file names,
+// container root keys) that would silently break the install flow if
+// regressed.
+//
+// A target is DATA. Every TYPE a row is made of -- and `resolveAppDataDir`,
+// `ENTRY_NAME`, `LEGACY_ENTRY_NAMES` -- lives in the leaf module
+// install-target-model.ts and is re-exported from here, so a row module can
+// import the model without importing this file (which would be a cycle: this
+// file's own evaluation builds the row array out of those modules). The six
+// oldest ids keep their inline `pathFor` branches below; every newer row
+// resolves its own path in its own `target-*.ts`.
 //
 // Bugs we've discovered in the wild and encode as invariants here:
 //   • Claude Code reads MCP servers from `~/.claude.json` (top-level
@@ -49,69 +58,57 @@
 //     `{ command: "cmd", args: ["/c", "npx", "-y", "@yawlabs/mcp@latest"] }`.
 //     (`@latest` is what buildLaunchEntry actually writes -- see the `pkg`
 //     default there; the unpinned spelling here read as a second, wrong shape.)
+//     Continue is the one exception, and it is the CLIENT's rule, not ours:
+//     it adds the cmd.exe wrapper itself, and a pre-wrapped entry breaks it
+//     under a WSL remote. That is `entry.windowsLaunch.broker: "bare"` on
+//     its row, never a client-id branch in a consumer.
+//   • Zed's container key is `context_servers`, not `mcpServers`, and on Linux
+//     its directory follows $XDG_CONFIG_HOME -- but only when that value is
+//     ABSOLUTE, the rule Zed inherits from the dirs crate.
+//   • Cline keeps ONE settings file per runtime, so one (client, scope) pair
+//     maps to SEVERAL files: a shared `~/.cline/...` copy plus one per editor
+//     its extension has run in. Its row is the only one with a `sites` hook.
+//     That file is strict JSON -- Cline parses it with JSON.parse -- so a
+//     comment in it stops every server in it from loading, which is why its
+//     `config.format` is "json" and not "jsonc".
+//   • Continue's file is one yaw-mcp CREATES and owns
+//     (`mcpServers/yaw-mcp.json`), not a user config we splice into. That is
+//     `config.ownership: "dedicated"`, and it changes the uninstall wording
+//     rather than any path.
 
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
+import { type ConfigSite, effectiveConfigFormat } from "./client-config.js";
+import {
+  type ClientEnvValues,
+  defineTarget,
+  type InlineTarget,
+  type InstallOS,
+  type InstallScope,
+  type InstallScopeSpec,
+  type LaunchEntry,
+  LEGACY_ENTRY_NAMES,
+  type ModularTarget,
+  type PathBase,
+  type ResolvedPath,
+} from "./install-target-model.js";
+import { CLINE_TARGET } from "./target-cline.js";
+import { CODEX_CLI_TARGET } from "./target-codex-cli.js";
+import { CONTINUE_TARGET } from "./target-continue.js";
+import { ZED_TARGET } from "./target-zed.js";
 
-export type InstallOS = "macos" | "linux" | "windows";
-export type InstallClientId = "claude-code" | "claude-desktop" | "cursor" | "vscode" | "windsurf" | "gemini-cli";
-export type InstallScope = "user" | "project" | "local";
-export type JsonShape = "mcpServers" | "servers";
+// Every type and constant a target row is made of lives in the LEAF module
+// install-target-model.ts, and is re-exported here so that every pre-existing
+// `from "./install-targets.js"` import path keeps resolving to the same name.
+export * from "./install-target-model.js";
 
-export interface ResolvedPath {
-  /** Absolute path to the config file (with ~ / env vars expanded). */
-  absolute: string;
-  /** Human-friendly display path with ~ / env-var form preserved. */
-  display: string;
-  /** JSON key path to the mcpServers/servers container that holds the
-   *  ENTRY_NAME entry. Almost always `[jsonShape]`, but Claude Code's
-   *  local scope nests under `["projects", <absProjectDir>, "mcpServers"]`
-   *  inside `~/.claude.json`. install-cmd + doctor walk this array to
-   *  read/merge the entry while preserving every sibling at every level. */
-  containerPath: string[];
-}
-
-export interface InstallScopeSpec {
-  scope: InstallScope;
-  /** Short label for help output. */
-  label: string;
-  /** Why you'd choose this scope. */
-  description: string;
-  /** Whether project folder is needed to resolve the path. */
-  requiresProjectDir: boolean;
-}
-
-export interface InstallTarget {
-  clientId: InstallClientId;
-  label: string;
-  jsonShape: JsonShape;
-  /** Scopes this client supports. Empty = client unavailable. */
-  scopes: InstallScopeSpec[];
-  /** OSes yaw-mcp can configure this client on -- the ones where it knows the
-   *  config file path. Every verb refuses on any other OS. Normally that is
-   *  every OS the client ships on; `notConfigurableOn` records the exception. */
-  availableOn: InstallOS[];
-  /** An OS the client DOES ship on but that is still left out of
-   *  `availableOn`, mapped to the reason, worded as one clause. The refusal
-   *  (install, uninstall, import, try), the resolver's throw, doctor and the
-   *  `--all` skip line print it; `install --list` only keys its "not
-   *  supported yet" label off its presence. Either way the claim about a
-   *  third party lives in one place. An OS missing from `availableOn` with no
-   *  entry here is reported as one the client is not available on. */
-  notConfigurableOn?: Partial<Record<InstallOS, string>>;
-  /** Extra user-facing caveats (e.g., "restart the app after editing"). */
-  notes?: string;
-}
-
-export const CURRENT_OS: InstallOS =
-  process.platform === "darwin" ? "macos" : process.platform === "win32" ? "windows" : "linux";
-
-export const INSTALL_TARGETS: InstallTarget[] = [
-  {
+const TARGET_ROWS = [
+  defineTarget({
     clientId: "claude-code",
     label: "Claude Code",
-    jsonShape: "mcpServers",
+    config: { format: "jsonc", root: "mcpServers" },
     availableOn: ["macos", "linux", "windows"],
+    hooks: { permissionsPatch: "claude-code" },
     scopes: [
       {
         scope: "user",
@@ -124,6 +121,15 @@ export const INSTALL_TARGETS: InstallTarget[] = [
         label: "Project",
         description: "Commit to share with your team.",
         requiresProjectDir: true,
+        // `.mcp.json` is read with strict JSON, unlike `~/.claude.json`: a
+        // comment or a trailing comma in it means Claude Code loads NO server
+        // from that file. Declaring it here is what makes the write facade
+        // refuse to splice an entry into one -- printing "Done" over a file
+        // nothing reads, and leaving the user to wonder why their broker never
+        // appears, is the failure this flag exists to stop. It is a REFUSAL,
+        // not a repair: the comments are the user's, and yaw-mcp does not get
+        // to delete them to make its own write land.
+        strictJson: true,
       },
       {
         scope: "local",
@@ -132,11 +138,11 @@ export const INSTALL_TARGETS: InstallTarget[] = [
         requiresProjectDir: true,
       },
     ],
-  },
-  {
+  }),
+  defineTarget({
     clientId: "claude-desktop",
     label: "Claude Desktop",
-    jsonShape: "mcpServers",
+    config: { format: "jsonc", root: "mcpServers" },
     availableOn: ["macos", "windows"],
     // Not "no Linux build" -- there is one, a beta. What is missing is a
     // documented Linux path for claude_desktop_config.json; the header note
@@ -157,11 +163,11 @@ export const INSTALL_TARGETS: InstallTarget[] = [
         requiresProjectDir: false,
       },
     ],
-  },
-  {
+  }),
+  defineTarget({
     clientId: "cursor",
     label: "Cursor",
-    jsonShape: "mcpServers",
+    config: { format: "jsonc", root: "mcpServers" },
     availableOn: ["macos", "linux", "windows"],
     scopes: [
       {
@@ -177,12 +183,13 @@ export const INSTALL_TARGETS: InstallTarget[] = [
         requiresProjectDir: true,
       },
     ],
-  },
-  {
+  }),
+  defineTarget({
     clientId: "vscode",
     label: "VS Code",
-    jsonShape: "servers",
+    config: { format: "jsonc", root: "servers" },
     availableOn: ["macos", "linux", "windows"],
+    hooks: { importVariables: "vscode-inputs" },
     notes:
       "VS Code uses `servers` (not `mcpServers`) as the top-level key in mcp.json -- the user-profile file and .vscode/mcp.json share that shape. The user file covers the DEFAULT profile only; a custom profile keeps its own copy under Code/User/profiles/<id>/mcp.json. Needs VS Code 1.102 or newer, before which user-level MCP lived under the `mcp` key in settings.json.",
     scopes: [
@@ -202,14 +209,14 @@ export const INSTALL_TARGETS: InstallTarget[] = [
         requiresProjectDir: true,
       },
     ],
-  },
+  }),
   // APPENDED, never inserted: autoDetectClient returns the first usable probe
   // slot in array order and documents Claude-Code-first as an invariant, so an
   // insert would silently change which client `try` picks for existing users.
-  {
+  defineTarget({
     clientId: "windsurf",
     label: "Windsurf",
-    jsonShape: "mcpServers",
+    config: { format: "jsonc", root: "mcpServers" },
     availableOn: ["macos", "linux", "windows"],
     notes:
       "Windsurf reads ~/.codeium/windsurf/mcp_config.json and does not create it on first launch. If the server does not appear, open Cascade -> MCP servers -> Manage plugins -> View raw config and check it is the file above.",
@@ -221,11 +228,11 @@ export const INSTALL_TARGETS: InstallTarget[] = [
         requiresProjectDir: false,
       },
     ],
-  },
-  {
+  }),
+  defineTarget({
     clientId: "gemini-cli",
     label: "Gemini CLI",
-    jsonShape: "mcpServers",
+    config: { format: "jsonc", root: "mcpServers" },
     availableOn: ["macos", "linux", "windows"],
     notes:
       "Gemini CLI merges ~/.gemini/settings.json with <project>/.gemini/settings.json, project winning. `mcpServers` is a top-level key, distinct from the sibling `mcp` object that holds discovery knobs.",
@@ -243,8 +250,40 @@ export const INSTALL_TARGETS: InstallTarget[] = [
         requiresProjectDir: true,
       },
     ],
-  },
-];
+  }),
+  // APPENDED, never inserted, for the reason spelled out above the windsurf
+  // row: `try`'s auto-detect returns the FIRST usable probe slot in this
+  // array's order, so inserting a row ahead of an existing one silently
+  // changes which client an existing user's `try` picks. New targets go on the
+  // end, in the order they land.
+  ZED_TARGET,
+  CLINE_TARGET,
+  CONTINUE_TARGET,
+  // Importing this row is also what registers the "toml" config adapter (see
+  // its module header), so the format is readable exactly when a row uses it.
+  CODEX_CLI_TARGET,
+] as const satisfies readonly (InlineTarget | ModularTarget)[];
+
+/** Derived from the rows, never hand-kept beside them: `defineTarget`'s
+ *  `const` type parameter preserves each row's `clientId` literal, so adding a
+ *  row widens this union by exactly that id. */
+export type InstallClientId = (typeof TARGET_ROWS)[number]["clientId"];
+
+/** What every consumer types a row as -- `find`/`filter`/`map` results over
+ *  `INSTALL_TARGETS` are assignable to it. */
+export type InstallTarget = (InlineTarget | ModularTarget) & { clientId: InstallClientId };
+
+/** Exported WIDENED, not as the `as const` tuple: with the tuple type
+ *  `t.availableOn.includes(os)` (install's `--all` filter) does not
+ *  type-check, because each row's `availableOn` is its own readonly literal
+ *  tuple and `includes` then demands that tuple's member type.
+ *
+ *  READONLY, so nothing can reorder or extend the table at runtime -- the
+ *  append-only order above is an invariant `try`'s auto-detect depends on. A
+ *  caller that needs to run a plan over a NARROWER table (the `--all` tests
+ *  do) passes it in through `runInstallAll`'s `targets` seam instead of
+ *  mutating this array. */
+export const INSTALL_TARGETS: readonly InstallTarget[] = TARGET_ROWS;
 
 export interface ResolvePathOptions {
   clientId: InstallClientId;
@@ -273,36 +312,73 @@ export interface ResolvePathOptions {
    *  `process.env.CLAUDE_CONFIG_DIR` and pass it in. Same for `appData` above
    *  -- this function reads NO environment at all. */
   claudeConfigDir?: string;
-}
-
-/** The one place that decides where %APPDATA% lives for a caller.
- *
- *  `resolveInstallPath` is deliberately pure, which makes picking this the
- *  CALLER's job -- and every caller has to pick it the SAME way or read and
- *  write disagree. They did: `doctor` and `try` each derived it from `home`
- *  alone, so on a box with %APPDATA% redirected away from
- *  `<home>\AppData\Roaming` they reported the home-derived path while install
- *  wrote the real one. An explicit `appData` wins; an overridden `home` keeps a
- *  hermetic run inside that home; otherwise the ambient %APPDATA% is
- *  authoritative, because that is the directory Claude Desktop itself reads.
- *
- *  EMPTY counts as UNSET at both env-shaped steps -- matching `cacheDir()` in
- *  paths.ts and the `claudeConfigDir` guards below. A nullish-only check let an
- *  empty-but-set %APPDATA% (ordinary on Windows and in CI) return "", which
- *  `resolveInstallPath` passed straight through, resolving claude-desktop to the
- *  RELATIVE `Claude\claude_desktop_config.json` -- a file doctor stat-ed and
- *  printed against the process cwd. `home` is deliberately NOT guarded that way:
- *  falling an empty `home` through to the ambient %APPDATA% would point a run
- *  that asked for a synthetic home at the developer's REAL config file. */
-export function resolveAppDataDir(opts: { appData?: string; home?: string; env?: NodeJS.ProcessEnv }): string {
-  if (opts.appData !== undefined && opts.appData.length > 0) return opts.appData;
-  if (opts.home !== undefined) return join(opts.home, "AppData", "Roaming");
-  const env = opts.env ?? process.env;
-  const fromEnv = env.APPDATA;
-  return fromEnv && fromEnv.length > 0 ? fromEnv : join(homedir(), "AppData", "Roaming");
+  /** Every client env var, as `readClientEnv` reported it. Only a MODULAR row
+   *  reads it (through `PathBase.env`); the six inline rows take their one
+   *  variable from `claudeConfigDir` above. Verbatim values, so each row
+   *  applies its own resolution policy -- they differ per client, and one
+   *  policy applied here would be wrong for somebody. */
+  clientEnv?: ClientEnvValues;
 }
 
 export function resolveInstallPath(opts: ResolvePathOptions): ResolvedPath {
+  const { target, base } = resolveTargetBase(opts);
+  // A MODULAR row resolves its own path; the six inline ids keep their
+  // `pathFor` branches, whose bytes (and their `display` spellings) are pinned
+  // per client. Testing `resolvePath` first is also what narrows `target` to
+  // InlineTarget below, so the switch can end in an exhaustiveness check.
+  if (target.resolvePath) return target.resolvePath(base);
+  return pathFor(target.clientId, base.scope, base.os, {
+    home: base.home,
+    appData: base.appData,
+    projectDir: base.projectDir,
+    claudeConfigDir: base.env.claudeConfigDir,
+  });
+}
+
+/** Every FILE one (client, scope) reads and writes, as `ConfigSite`s the
+ *  client-config core can classify and edit.
+ *
+ *  One site for every row but Cline, whose `sites` hook fans one pair out to a
+ *  shared file plus one copy per editor its extension has run in. The
+ *  effective FORMAT is applied here, once, from the target's `config` narrowed
+ *  by the scope's `strictJson` -- so a consumer cannot read a site with one
+ *  strictness and write it with another.
+ *
+ *  Validates exactly as `resolveInstallPath` does, and throws the same
+ *  messages, because it shares that function's first half. `selectSites` in
+ *  client-config.ts is what drops a conditional site whose editor is not
+ *  installed; this returns every DECLARED site so a caller can report the
+ *  difference. */
+export function resolveInstallSites(opts: ResolvePathOptions): ConfigSite[] {
+  const { target, scopeSpec, base } = resolveTargetBase(opts);
+  const format = effectiveConfigFormat(target.config, scopeSpec);
+  if (target.sites) return target.sites(base).map((site) => ({ ...site, format }));
+  return [
+    {
+      // "default" rather than the client id: the id names the SITE within a
+      // target, and every single-site row has exactly one.
+      id: "default",
+      label: target.label,
+      resolved: resolveInstallPath(opts),
+      format,
+      detectDir: null,
+    },
+  ];
+}
+
+/** The target, its scope spec and the `PathBase` one resolve runs against --
+ *  the shared first half of `resolveInstallPath` and `resolveInstallSites`.
+ *
+ *  Shared rather than copied because every refusal in it is a CONTRACT: the
+ *  unknown-client, unsupported-scope, unavailable-OS and missing-project-dir
+ *  throws are what `resolveInstallSite` in install-cmd.ts pre-empts with its
+ *  own worded errors, and two copies of this validation would be two places
+ *  for that agreement to drift. */
+function resolveTargetBase(opts: ResolvePathOptions): {
+  target: InstallTarget;
+  scopeSpec: InstallScopeSpec;
+  base: PathBase;
+} {
   const home = opts.home ?? homedir();
   // PURE: this resolver reads NO environment, and `appData` defaults off `home`
   // alone. It used to consult process.env.APPDATA whenever the caller passed no
@@ -352,13 +428,23 @@ export function resolveInstallPath(opts: ResolvePathOptions): ResolvedPath {
   // (isAbsolute('/x') is true on win32).
   const absoluteProjectDir = projectDir && !isAbsolute(projectDir) ? resolve(projectDir) : projectDir;
 
-  const p = pathFor(clientId, scope, os, {
+  const cfgDir = claudeConfigDir && claudeConfigDir.length > 0 ? claudeConfigDir : undefined;
+  // `claudeConfigDir` is a named option of its own AND a member of `env`
+  // because both spellings are load-bearing: the option is how install,
+  // uninstall and import have always threaded Claude Code's redirect through
+  // (index.ts reads it once per verb), while `env` is what a MODULAR row reads
+  // for its own variable. The explicit option wins, so a caller that passes
+  // only one of the two still gets the same answer either way.
+  const env: ClientEnvValues = { ...opts.clientEnv, ...(cfgDir ? { claudeConfigDir: cfgDir } : {}) };
+  const base: PathBase = {
     home,
     appData,
     projectDir: absoluteProjectDir ?? "",
-    claudeConfigDir: claudeConfigDir && claudeConfigDir.length > 0 ? claudeConfigDir : undefined,
-  });
-  return p;
+    os,
+    scope,
+    env,
+  };
+  return { target, scopeSpec, base };
 }
 
 /** The `projects[...]` key Claude Code uses for `projectDir` in ~/.claude.json.
@@ -472,7 +558,7 @@ export function sameClaudeCodeProjectKey(a: string, b: string): boolean {
  *  reported "not installed" for a project that was. Every reader takes its
  *  paths from here, and the source-shape scan in
  *  src/tests/source-hygiene.test.ts accounts for each container read in
- *  tracked non-test source by shape, so the four ways a new reader would
+ *  non-test source by shape, so the four ways a new reader would
  *  reintroduce that split -- indexing the projects object directly, building a
  *  container path with "projects" as its first segment, a C-style index loop
  *  over a container path, or a helper call the formatter wrapped across lines
@@ -499,17 +585,41 @@ export function sameClaudeCodeProjectKey(a: string, b: string): boolean {
  *  POSIX/UNC project keys get exactly one path back, so every other client and
  *  every non-Windows checkout is untouched. */
 export function claudeCodeContainerPaths(root: unknown, containerPath: readonly string[]): string[][] {
+  return claudeCodeContainerPathVariants(containerPath, (prefix) => {
+    if (prefix.length !== 1 || prefix[0] !== PROJECTS_KEY) return [];
+    if (typeof root !== "object" || root === null || Array.isArray(root)) return [];
+    const projects = (root as Record<string, unknown>)[PROJECTS_KEY];
+    if (typeof projects !== "object" || projects === null || Array.isArray(projects)) return [];
+    // Own keys only, in the file's own order, so the result is deterministic
+    // and an inherited member cannot conjure a path that is not in the JSON.
+    return Object.keys(projects as Record<string, unknown>);
+  });
+}
+
+/** `claudeCodeContainerPaths` over a KEY LISTER instead of a parsed root.
+ *
+ *  The rule is the same and lives here, where the `projects[...]` question
+ *  belongs; only the way the candidate keys are obtained differs. A consumer
+ *  holding a parsed object calls `claudeCodeContainerPaths` above; a consumer
+ *  holding the client config's BYTES passes `containerKeysAt` from
+ *  client-config.ts, and so never parses a client config itself -- which is
+ *  what lets the drive-case fold work for every syntax rather than only for
+ *  the ones whose parse a consumer happens to have inlined.
+ *
+ *  `keysAt` is asked for the keys at ONE prefix (`["projects"]`) and may
+ *  answer `[]` for anything else, including a file that does not parse: the
+ *  canonical path is always returned, so "no keys" degrades to "write where
+ *  writes go". */
+export function claudeCodeContainerPathVariants(
+  containerPath: readonly string[],
+  keysAt: (prefix: readonly string[]) => readonly string[],
+): string[][] {
   const canonical = [...containerPath];
   if (containerPath.length < 2 || containerPath[0] !== PROJECTS_KEY) return [canonical];
   const key = containerPath[1];
   if (!WINDOWS_DRIVE_PATH.test(key)) return [canonical];
-  if (typeof root !== "object" || root === null || Array.isArray(root)) return [canonical];
-  const projects = (root as Record<string, unknown>)[PROJECTS_KEY];
-  if (typeof projects !== "object" || projects === null || Array.isArray(projects)) return [canonical];
   const out: string[][] = [canonical];
-  // Own keys only, in the file's own order, so the result is deterministic and
-  // an inherited member cannot conjure a path that is not in the JSON.
-  for (const candidate of Object.keys(projects as Record<string, unknown>)) {
+  for (const candidate of keysAt([PROJECTS_KEY])) {
     if (candidate !== key && sameClaudeCodeProjectKey(candidate, key)) {
       out.push([PROJECTS_KEY, candidate, ...containerPath.slice(2)]);
     }
@@ -727,15 +837,17 @@ export interface BuildLaunchEntryOptions {
    *  that hosts the sidecars the broker spawns, this hosts the broker. */
   oamBinPath?: string | null;
   oamEntry?: string | null;
-}
-
-/** The MCP client `mcpServers["mcp"]` entry — what `install` writes. The key
- *  is ENTRY_NAME (`mcp`); `yaw-mcp` is a LEGACY_ENTRY_NAME nothing writes any
- *  more, so naming it here sent readers looking for the wrong key. */
-export interface LaunchEntry {
-  command: string;
-  args: string[];
-  env?: Record<string, string>;
+  /** Wrap the default broker entry in `cmd /c` on Windows. Defaults to TRUE,
+   *  which is what every client but Continue needs -- `npx` is a `.cmd` shim
+   *  and a client that spawns it directly gets ENOENT.
+   *
+   *  Only the DEFAULT branch reads it. The `upstream` branch always wraps (a
+   *  third-party launcher's args have to survive cmd's parse, which is what
+   *  escapeCmdArg's caret depths are for) and the oam branch is already
+   *  unwrapped (oam is a real executable). The policy per client is DATA on
+   *  the row -- `entry.windowsLaunch` -- and the caller reads it from there;
+   *  this option is how it reaches the builder. */
+  windowsWrap?: boolean;
 }
 
 /** cmd.exe metacharacters that split or redirect an UNQUOTED command line:
@@ -938,7 +1050,13 @@ export function buildLaunchEntry(opts: BuildLaunchEntryOptions): LaunchEntry {
   }
   // No `env` on the default entry: yaw-mcp is local-only, so there is no
   // token to inject. Servers come from ~/.yaw-mcp/bundles.json.
-  return opts.os === "windows"
+  //
+  // `windowsWrap: false` emits the BARE launcher on Windows, for a client that
+  // resolves the `.cmd` shim itself (Continue does, and pre-wrapping breaks it
+  // under a WSL remote). The policy is the target row's -- `entry.windowsLaunch`
+  // -- and the caller reads it off the row; this function only applies it, so
+  // the default stays the `cmd /c` wrap every other client needs.
+  return opts.os === "windows" && opts.windowsWrap !== false
     ? { command: "cmd", args: ["/c", "npx", "-y", pkg] }
     : { command: "npx", args: ["-y", pkg] };
 }
@@ -984,17 +1102,6 @@ export function isProjectLocalEntry(entryPath: string, cwd: string): boolean {
   // anyone running install from their home directory.
   return here === root || here.startsWith(`${root}/`);
 }
-
-/** The entry key we write into `mcpServers` (Claude Code / Desktop / Cursor)
- *  or `servers` (VS Code). Stable across clients so doctor can detect
- *  collisions deterministically. */
-export const ENTRY_NAME = "mcp";
-
-/** Entry keys earlier installers wrote under: the dead `mcp.hosting` / `mcph`
- *  brand and the interim `yaw-mcp` key. Doctor + install detect these so users
- *  upgrading get a visible nudge instead of silently running two parallel
- *  servers from the same client config. Nothing writes these keys anymore. */
-export const LEGACY_ENTRY_NAMES = ["mcp.hosting", "mcph", "yaw-mcp"] as const;
 
 /** The legacy entry key present in `container`, or null -- lets the upgrade
  *  nudge name the actual stale key it found. */
@@ -1102,37 +1209,13 @@ export function blockedContainerFix(then: string): string {
   return `make it an object (or remove the key), then ${then}`;
 }
 
-/** Pattern added to Claude Code's `permissions.allow` on install so the
- *  user isn't re-prompted for each yaw-mcp MCP tool call. Only matters for
- *  Claude Code (Claude Desktop / Cursor / VS Code have their own models).
- *  Keep in sync with the tool-name prefix our proxy exposes -- Claude Code
- *  derives the prefix from ENTRY_NAME by replacing non-alphanumeric chars
- *  with underscores, so "mcp" becomes "mcp__mcp__". */
-export const CLAUDE_CODE_ALLOW_PATTERN = "mcp__mcp__*";
-
-/** Resolve the Claude Code settings.json file that holds `permissions.allow`.
- *  Different from the mcpServers path (`~/.claude.json`): permissions live
- *  in `settings.json`, not the user config. Returns null for clients that
- *  don't use this scheme.
- *
- *  When `claudeConfigDir` is set, user-scope `settings.json` lives at
- *  `<DIR>/settings.json` (NOT `<DIR>/.claude/settings.json` — the `.claude`
- *  segment is absorbed by the env redirect). Project/local scopes are
- *  project-relative and unaffected.
- *
- *  No `os` parameter, unlike pathFor (which spells a `display` string for the
- *  TARGET os): every path here is built with `node:path.join` against the
- *  runner's own platform -- the only thing a caller writing the file could
- *  use. A dead `os` option used to ride along for the sake of old call sites;
- *  it was dropped once the last one stopped passing it. */
-export function resolveClaudeCodeSettingsPath(
-  scope: InstallScope,
-  opts: { home: string; projectDir?: string; claudeConfigDir?: string },
-): string | null {
-  const { home, projectDir, claudeConfigDir } = opts;
-  const cfgDir = claudeConfigDir && claudeConfigDir.length > 0 ? claudeConfigDir : null;
-  if (scope === "user") return cfgDir ? join(cfgDir, "settings.json") : join(home, ".claude", "settings.json");
-  if (scope === "project" && projectDir) return join(projectDir, ".claude", "settings.json");
-  if (scope === "local" && projectDir) return join(projectDir, ".claude", "settings.local.json");
-  return null;
-}
+/** Claude Code's settings.json and the `permissions.allow` grant install adds
+ *  to it live in claude-code-settings.ts -- it is a permissions file, not an
+ *  MCP server list, and the grant is spliced one array ELEMENT at a time so a
+ *  comment inside that list survives. Re-exported here because every caller
+ *  reaches this module for the Claude Code path questions. */
+export {
+  CLAUDE_CODE_ALLOW_PATTERN,
+  prepareClaudeCodeSettingsPatch,
+  resolveClaudeCodeSettingsPath,
+} from "./claude-code-settings.js";

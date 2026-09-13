@@ -1,0 +1,5 @@
+  [mcp_servers.other]
+    command = "node"
+
+  [mcp_servers.mcp]
+    command = "old"
