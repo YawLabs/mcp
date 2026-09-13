@@ -549,8 +549,10 @@ current_oam_floor() {
 # line, where the process list can show it. A token GitHub refuses (a bad Bearer
 # token gets 401 even on this public repo, measured) must not turn a read that
 # works unauthenticated into a hard stop, so a failed authenticated read is
-# retried once without the token. Returns 1 only when the unauthenticated read
-# fails too, or fails on its own when there is no token.
+# retried once without the token. Returns 1 when the parser rejects the body,
+# whichever read fetched it (a rejected body is not retried: the read itself
+# worked), when the read fails and there is no token, or when the authenticated
+# read and the retry without the token both fail.
 latest_oam_release() {
   local body="" t
   t=$(mcp_registry_gh_token)
@@ -612,7 +614,9 @@ semver_cmp() {
 # Any commit ahead with another subject or another set of paths returns 1 (a
 # merge lists no paths here, so it cannot match), as does nothing ahead at all.
 # The origin/main sync guard uses it to let a re-run carry on over the floor
-# commit an earlier failed run left on local main.
+# commit an earlier failed run left on local main. That guard's diverged stop
+# and the pre-flight's floor-ahead stop use it to decide when a bare
+# git reset --keep origin/main would drop nothing but floor commits.
 oam_floor_commits_only() {
   local base="$1" c subj paths n=0
   local subj_re='^fix\(oam\): move the floor to [0-9]+\.[0-9]+\.[0-9]+$'
@@ -671,27 +675,57 @@ oam_floor_rewrite() {
     // script does not understand, and guessing would file the move under a
     // release that already shipped.
     //
-    // When that section already holds ONE floor block -- an earlier run of
-    // this release moved the floor, failed before its push, and oam released
-    // again before the re-run -- the block is rewritten in place rather than
-    // joined by a second one, and it keeps the floor it already names as the
-    // one before: that is the floor the last published release shipped. Two
-    // floor blocks in the section is not a shape this script leaves, so it
-    // stops rather than guess which one is true. Blocks under any other
-    // section are never looked at.
+    // A floor block already in that section may be one a release SHIPPED:
+    // this repo has tagged releases with the first section still headed
+    // ## Unreleased (v1.0.0 and v1.0.1 both were). So git decides. A block
+    // has shipped when its heading line is in the CHANGELOG.md of the most
+    // recent v* tag reachable from HEAD. A shipped block is never rewritten.
+    // When every floor block in the section has shipped, the new block is
+    // added at the end of the section, naming the floor on disk as the one
+    // before. ONE block that has not shipped -- the shape an earlier run of
+    // this release leaves when it moves the floor, fails before its tag, and
+    // oam releases again before the re-run -- is rewritten in place rather
+    // than joined by a second one, and keeps the floor it names as the one
+    // before. Two that have not shipped is not a shape this script leaves, so
+    // it stops rather than guess which one is true. Matching on the heading
+    // errs one way only: a new block whose heading an older release also used
+    // reads as shipped, and is added to rather than rewritten. Git is asked
+    // only when the section holds a floor block, and when it cannot answer,
+    // the run stops. Blocks under any other section are never looked at.
     //
     // A ## line or a block heading inside a ``` or ~~~ code fence is not a
     // real one, so the scan skips fenced lines. A fence closes only on a line
-    // of the same character at least as long as the one that opened it, and a
-    // fence that never closes stops the run: every heading after it would
-    // otherwise read as fenced, and the block would land under the oldest
-    // release in the file.
+    // of the same character at least as long as the one that opened it. A
+    // fence that never closes stops the run wherever it opened: if it opened
+    // in the first section, every heading after it would read as fenced, and
+    // the block would land under the oldest release in the file.
     const BLOCK_HEAD = "**Changed -- the oam floor moves to ";
     const render = (was) => [
       BLOCK_HEAD + next + "**",
       "",
       "`MIN_OAM_VERSION` tracks the latest oam release as policy, and v" + next + " is now current (published " + day + "); the floor was " + was + ". A machine whose oam is older hosts its node/npx sidecars on node instead, and logs a warning naming both versions, `oam self-update` as the fix, and that yaw-mcp needs a restart afterwards. `release.sh` moved the floor and wrote this block; it did not re-run the oam hosting check that `src/oam-spawn.ts` describes.",
     ];
+    // The heading lines a release already shipped, as { tag, lines } where
+    // tag is null when no v* tag is reachable from HEAD. null, with a problem
+    // pushed, when git cannot answer.
+    const shippedLines = () => {
+      const git = (args) => {
+        const r = require("child_process").spawnSync("git", args, { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
+        if (r.status === 0) return r.stdout;
+        const why = r.error ? r.error.message : (r.stderr || "").trim() || "exit " + r.status;
+        problems.push(logPath + ": cannot tell whether its oam floor block already shipped: git " + args.join(" ") + " failed: " + why);
+        return null;
+      };
+      const tags = git(["tag", "--list", "v*", "--merged", "HEAD"]);
+      if (tags === null) return null;
+      if (tags.trim() === "") return { tag: null, lines: new Set() };
+      const described = git(["describe", "--tags", "--abbrev=0", "--match", "v*", "HEAD"]);
+      if (described === null) return null;
+      const tag = described.trim();
+      const shipped = git(["show", tag + ":./" + logPath]);
+      if (shipped === null) return null;
+      return { tag, lines: new Set(shipped.split(/\r?\n/)) };
+    };
     let block = null;
     let log = read(logPath);
     if (log !== null) {
@@ -717,7 +751,7 @@ oam_floor_rewrite() {
       const heading = first === -1 ? "" : lines[first];
       const ours = /^## [Uu]nreleased\b/.test(heading) || heading === "## " + version || heading.startsWith("## " + version + " ");
       if (fence !== null) {
-        problems.push(logPath + ": a code fence opened with " + fence + " never closes, so the end of its first ## section cannot be found");
+        problems.push(logPath + ": a code fence opened with " + fence + " never closes, so no heading after it can be trusted as a section boundary; close the fence");
         log = null;
       } else if (!ours) {
         problems.push(logPath + ": its first ## section is " + JSON.stringify(heading || "(none)") + ", not ## Unreleased or ## " + version + ", so there is no section to record the floor move in");
@@ -725,9 +759,14 @@ oam_floor_rewrite() {
       } else {
         let end = heads.find((i) => i > first);
         if (end === undefined) end = lines.length;
-        const mine = blocks.filter((i) => i > first && i < end);
-        if (mine.length > 1) {
-          problems.push(logPath + ": " + mine.length + " oam floor blocks in " + JSON.stringify(heading) + "; merge them by hand");
+        const inSection = blocks.filter((i) => i > first && i < end);
+        const shipped = inSection.length > 0 ? shippedLines() : { tag: null, lines: new Set() };
+        const mine = shipped === null ? [] : inSection.filter((i) => !shipped.lines.has(lines[i]));
+        if (shipped === null) {
+          log = null;
+        } else if (mine.length > 1) {
+          const unshipped = shipped.tag === null ? "no v* tag reachable from HEAD has shipped" : "the CHANGELOG.md of " + shipped.tag + " does not hold";
+          problems.push(logPath + ": " + mine.length + " oam floor blocks in " + JSON.stringify(heading) + " that " + unshipped + "; merge them by hand");
           log = null;
         } else if (mine.length === 1) {
           const h = mine[0];
@@ -890,6 +929,21 @@ else
   REMOTE_HEAD=$(git rev-parse origin/main 2>/dev/null || echo "")
 fi
 if [ -n "$REMOTE_HEAD" ] && [ "$LOCAL_HEAD" != "$REMOTE_HEAD" ]; then
+  # The subjects of the commits local main has and origin/main lacks. One with
+  # the oam floor move's subject is, in the ordinary case, the floor commit an
+  # earlier failed run left (see below), whose gates may never have passed, so
+  # no stop here advises pushing it, and when main has diverged, pulling cannot
+  # fast-forward over it. Its undo is git reset --keep origin/main, after which
+  # the re-run's pre-flight moves the floor again if it is still behind. That
+  # reset also DISCARDS every other commit origin/main lacks, so a stop that
+  # names it while other commits are present lists them and says how to keep
+  # them.
+  LOCAL_ONLY_SUBJECTS=$(git log --format=%s "${REMOTE_HEAD}..HEAD" 2>/dev/null || echo "")
+  LOCAL_ONLY_FLOOR=false
+  if [[ $'\n'"$LOCAL_ONLY_SUBJECTS" == *$'\n''fix(oam): move the floor to '* ]]; then
+    LOCAL_ONLY_FLOOR=true
+  fi
+  KEEP_MINE="To keep your own commits: git branch keep-mine HEAD, then git reset --keep origin/main, then cherry-pick your own commits back from keep-mine (leaving out every floor commit) and land them on origin/main before re-running ./release.sh ${VERSION}, which moves the floor again if it is still behind. A bare git reset --keep origin/main DISCARDS every commit listed."
   if [ "$RESUMING" = true ]; then
     info "Local HEAD differs from origin/main (resuming after a prior push) -- proceeding"
   elif git merge-base --is-ancestor "$REMOTE_HEAD" "$LOCAL_HEAD" 2>/dev/null; then
@@ -902,24 +956,33 @@ if [ -n "$REMOTE_HEAD" ] && [ "$LOCAL_HEAD" != "$REMOTE_HEAD" ]; then
     # commits ahead of step 1, so a run that fails after it and before step 3's
     # bump commit leaves that commit on local main with package.json unbumped,
     # and the re-run -- fresh, not a resume -- lands here. Refusing it broke the
-    # header's re-run-with-the-same-version promise, and the push advice below
-    # would put a commit whose gates just failed on protected main. So when
+    # header's re-run-with-the-same-version promise, and advising a push would
+    # put a commit whose gates just failed on protected main. So when
     # every commit ahead is a floor commit (oam_floor_commits_only), carry on:
     # step 1's gates run over it, and step 3's push carries it with the bump.
     if oam_floor_commits_only "$REMOTE_HEAD"; then
       warn "Local main is ahead of origin/main only by release.sh's own oam floor commit(s) from an earlier failed run -- continuing; the gates re-run over it and step 3 pushes it with the bump"
+    elif [ "$LOCAL_ONLY_FLOOR" = true ]; then
+      # A floor commit among OTHER unpushed commits is still refused, and the
+      # stop does not advise a push: it would carry a floor commit whose gates
+      # may never have passed. It names the undo and what the undo discards.
+      fail "Local main is AHEAD of origin/main, and its unpushed commits include release.sh's oam floor commit from an earlier failed run, whose gates may not have passed -- do not push them as they are. Unpushed commits, newest first: ${LOCAL_ONLY_SUBJECTS//$'\n'/; }. ${KEEP_MINE}"
     else
-      # A floor commit among OTHER unpushed commits is still refused. The stop
-      # then also names the undo, because pushing would carry a floor commit
-      # whose gates may never have passed.
-      AHEAD_SUBJECTS=$(git log --format=%s "${REMOTE_HEAD}..HEAD" 2>/dev/null || echo "")
-      AHEAD_HINT=""
-      if [[ $'\n'"$AHEAD_SUBJECTS" == *$'\n''fix(oam): move the floor to '* ]]; then
-        AHEAD_HINT=" -- or, if these came from a failed release run, git reset --keep origin/main and re-run; the move is recreated"
-      fi
-      fail "Local main is AHEAD of origin/main (unpushed commits). Push them first: git push origin main${AHEAD_HINT}"
+      fail "Local main is AHEAD of origin/main (unpushed commits). Push them first: git push origin main"
     fi
   else
+    # Behind or diverged. Local main still carrying a floor commit means it has
+    # diverged (a branch that is only behind has no commits of its own) -- for
+    # instance, the fix for the failed gate landed on origin/main through a PR.
+    # git pull --ff-only cannot fast-forward over that, so its advice would
+    # fail. The reset is named bare only when floor commits
+    # (oam_floor_commits_only) are all local main has since the merge base.
+    LOCAL_BASE=$(git merge-base "$REMOTE_HEAD" "$LOCAL_HEAD" 2>/dev/null || echo "")
+    if [ "$LOCAL_ONLY_FLOOR" = true ] && [ -n "$LOCAL_BASE" ] && oam_floor_commits_only "$LOCAL_BASE"; then
+      fail "Local main has diverged from origin/main, and the only commits origin/main lacks are release.sh's own oam floor commit(s) from an earlier failed run. git pull --ff-only cannot fast-forward over them: git reset --keep origin/main and re-run ./release.sh ${VERSION}, which moves the floor again if it is still behind."
+    elif [ "$LOCAL_ONLY_FLOOR" = true ]; then
+      fail "Local main has diverged from origin/main, and the commits origin/main lacks include release.sh's oam floor commit from an earlier failed run, whose gates may not have passed -- git pull --ff-only cannot fast-forward over them, and they should not be pushed as they are. Commits origin/main lacks, newest first: ${LOCAL_ONLY_SUBJECTS//$'\n'/; }. ${KEEP_MINE}"
+    fi
     fail "Local main is not at origin/main (behind or diverged). Pull first: git pull --ff-only origin main"
   fi
 fi
@@ -1100,6 +1163,14 @@ else
     1)
       if [ "$OAM_FLOOR_LOCKED" = true ]; then
         warn "The oam floor ${OAM_FLOOR_NOW} is AHEAD of the latest oam release ${OAM_LATEST} -- v${VERSION} is already tagged or on npm, so this run does not change it. Before the next release, lower MIN_OAM_VERSION in ${OAM_FLOOR_SRC} and the const FLOOR literal in ${OAM_FLOOR_TEST}, or, if a lower release took GitHub's latest marker, re-mark v${OAM_FLOOR_NOW} as latest on YawLabs/oam."
+      elif [ -n "${REMOTE_HEAD:-}" ] && oam_floor_commits_only "$REMOTE_HEAD"; then
+        # The sync guard carried on because local main is ahead only by the
+        # floor commit(s) an earlier failed run left, so one of them may be
+        # what put the floor ahead (oam released, the run failed, and the
+        # release was pulled or lost GitHub's latest marker before the re-run).
+        # Lowering by hand, committing and pushing -- the advice below -- would
+        # push those commits too, and their gates may never have passed.
+        fail "The oam floor ${OAM_FLOOR_NOW} is AHEAD of the latest oam release ${OAM_LATEST}, and local main is ahead of origin/main only by release.sh's own unpushed oam floor commit(s) from an earlier failed run, which may be what moved it there. Do not push them. If a lower release took GitHub's latest marker by mistake, re-mark v${OAM_FLOOR_NOW}: gh release edit v${OAM_FLOOR_NOW} --repo YawLabs/oam --latest, then re-run. Otherwise drop the floor commit(s): git reset --keep origin/main (only those commits are ahead, so no other commit is lost) and re-run ./release.sh ${VERSION}, whose pre-flight then compares the floor origin/main holds with ${OAM_LATEST} instead."
       else
         fail "The oam floor ${OAM_FLOOR_NOW} is AHEAD of the latest oam release ${OAM_LATEST}, and oam's installer and self-update install that same latest release -- so a fresh or updated oam would count as too old and its sidecars would fall back to node. Either the floor was mistyped, oam ${OAM_FLOOR_NOW} was pulled, or a lower release took GitHub's latest marker (a backport, or ${OAM_FLOOR_NOW} published with make_latest=false). In that last case re-mark it rather than lowering the floor: gh release edit v${OAM_FLOOR_NOW} --repo YawLabs/oam --latest, then re-run. Otherwise lower MIN_OAM_VERSION in ${OAM_FLOOR_SRC} AND the const FLOOR literal in ${OAM_FLOOR_TEST} to ${OAM_LATEST} (the ratchet test fails if only the constant drops), add a note to CHANGELOG.md's Unreleased section saying the floor was lowered, then commit, push and re-run."
       fi
@@ -1256,7 +1327,7 @@ if [ -n "$OAM_FLOOR_TARGET" ]; then
     MSYS_NO_PATHCONV=1 git -c core.hooksPath=/dev/null commit -m "fix(oam): move the floor to ${OAM_FLOOR_TARGET}" -- "$OAM_FLOOR_SRC" "$OAM_FLOOR_TEST" CHANGELOG.md
     info "oam floor ${OAM_FLOOR_NOW} -> ${OAM_FLOOR_TARGET}, committed"
     warn "Not re-run by this script: the oam hosting check src/oam-spawn.ts describes for each floor move."
-    warn "If a later step fails before step 3's push, this commit stays on local main; re-running ./release.sh ${VERSION} carries on over it, provided nothing else is committed on top."
+    warn "If a later step fails before step 3's push, this commit stays on local main. Re-running ./release.sh ${VERSION} carries on over it, provided nothing else is committed on top and origin/main has not moved; otherwise the re-run stops at the origin/main sync guard, which names git reset --keep origin/main and anything that reset would discard."
   fi
 fi
 # <<< oam floor move
