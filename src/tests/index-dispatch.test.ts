@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { FLAG_ALIASES, KNOWN_SUBCOMMANDS, suggestFlag, suggestSubcommand } from "../subcommands.js";
-import { buildBrokerBundle } from "./broker-bundle.js";
+import { BROKER_BUNDLE_HOOK_TIMEOUT_MS, buildBrokerBundle } from "./broker-bundle.js";
 
 // The dispatcher in index.ts runs at import time (top-level side effects),
 // so it cannot be imported directly. The did-you-mean logic it uses lives
@@ -265,10 +265,10 @@ async function runEntry(
     // config), do not wedge the suite -- kill and let the assertion fail.
     //
     // The ceiling is for CONTENTION, not for the work -- the same reasoning
-    // the beforeAll build timeout carries. It was sized for a first execution
-    // this file no longer pays: while esbuild wrote the bundle to disk
-    // itself, running it the first time cost an order of magnitude more than
-    // running it again. Measured from inside vitest on a Windows box with
+    // the beforeAll build timeout carries. It was sized for the first
+    // execution of a freshly written bundle (esbuild wrote it then), which
+    // cost 3.6-10.6x as much as running it again. Measured from inside
+    // vitest on a Windows box with
     // on-access AV, three iterations of "build the bundle, run it cold, run
     // it warm":
     //
@@ -279,16 +279,20 @@ async function runEntry(
     // The old 15s guard fired on roughly one run in four; 25s was still
     // inside the observed range, so it went to 90s -- and a full-suite
     // release run on 2026-09-13 outlived even that, SIGKILLing the first
-    // boot below with code null. The cost turned out to follow the writer,
-    // not the file: buildBrokerBundle has node write the same bytes, and the
-    // first run then measured 1.6s standalone (numbers in broker-bundle.ts).
+    // boot below with code null. buildBrokerBundle now has node write the
+    // bundle (fast in that morning's probes, though the difference later
+    // faded on its own) and runs it once before returning, so no runEntry
+    // call is the bundle's first execution any more -- numbers in
+    // broker-bundle.ts.
     //
     // 90s stays anyway. A real hang -- the thing this guard exists for -- is
     // unbounded, so a generous ceiling still catches it, and a tighter one
     // would only add a way to flake on a contended box.
     //
     // Every test that calls runEntry carries an explicit per-test timeout
-    // ABOVE this value. That ordering is load-bearing: the guard firing is a
+    // ABOVE this value times the number of runEntry calls it makes -- 120s
+    // for one call, 200s for the test that makes two. That ordering is
+    // load-bearing: the guard firing is a
     // legible failure (SIGKILL, code null, an assertion naming what was
     // missing), while a vitest timeout reports only that the test was slow.
     // Raise one without the other and you trade the first shape for the
@@ -311,12 +315,13 @@ describe("index.ts entry, run as a real process", () => {
     // runEntry -- so the bundle and the isolated home share one directory.
     ({ dir: workDir, path: bundlePath } = await buildBrokerBundle("yaw-mcp-entry-"));
     // Timeout is deliberately far above the observed cost. This bundles the
-    // whole dependency graph (about 3.9 MB out) and took 2.5-4.4s standalone
-    // when last measured, but it runs while the rest of the unit project's
-    // files do too: on a loaded box it has been seen to exceed 60s and fail
-    // the suite as a hook timeout, taking the tests below down as "skipped".
-    // The ceiling is for contention, not for the work itself.
-  }, 180_000);
+    // whole dependency graph (about 3.9 MB out, 2.5-4.4s standalone when last
+    // measured) and runs it once, but it does both while the rest of the unit
+    // project's files run too: on a loaded box the build alone has been seen
+    // to exceed 60s and fail the suite as a hook timeout, taking the tests
+    // below down as "skipped". The ceiling is for contention, not for the
+    // work itself -- see BROKER_BUNDLE_HOOK_TIMEOUT_MS.
+  }, BROKER_BUNDLE_HOOK_TIMEOUT_MS);
 
   afterAll(async () => {
     if (workDir) await rm(workDir, { recursive: true, force: true });
@@ -348,10 +353,10 @@ describe("index.ts entry, run as a real process", () => {
     // It got past config load and actually started.
     expect(stderr).toContain('"yaw-mcp startup"');
     // Above runEntry's 90s SIGKILL guard, deliberately -- see the note there.
-    // This is the first runEntry in the file, so it is the one that paid the
-    // cold-bundle cost while esbuild wrote the bundle (13-40s measured, and
-    // past the 90s guard in a contended full-suite run). The bundle is
-    // node-written now, and that cost is gone -- see broker-bundle.ts.
+    // This is the first runEntry in the file, so it is the one that used to
+    // pay the cold-bundle cost (13-40s measured in vitest, and past the 90s
+    // guard in a contended full-suite run on 2026-09-13). buildBrokerBundle
+    // now executes the bundle once in beforeAll, so this run is its second.
   }, 120_000);
 
   it("exits 2 on a mis-cased flag instead of booting a stdio server", async () => {
@@ -363,8 +368,9 @@ describe("index.ts entry, run as a real process", () => {
     expect(code).toBe(2);
     expect(stderr).toContain('unknown flag "--HELP"');
     expect(stderr).toContain("--help");
-    // Warm by now (the bundle has been executed once), but kept above the
-    // guard for the same reason -- test order is not a contract.
+    // Warm whatever the test order (beforeAll's warm-up has executed the
+    // bundle), but kept above the guard for the reason runEntry's note gives:
+    // the guard firing is the legible failure, a vitest timeout is not.
   }, 120_000);
 
   it("exits 2 on ANY unknown flag instead of booting a stdio server", async () => {
@@ -379,7 +385,10 @@ describe("index.ts entry, run as a real process", () => {
     const shortFlag = await runEntry({}, ["-x"]);
     expect(shortFlag.code).toBe(2);
     expect(shortFlag.stderr).toContain('unknown flag "-x"');
-  }, 120_000);
+    // Two runEntry calls, so the timeout clears TWO 90s guards: at 120s a
+    // slow first call followed by a hung second one would hit vitest's
+    // timeout before the guard, the illegible shape runEntry's note warns of.
+  }, 200_000);
 
   it("keeps runServer()'s rejection on a real catch, not the last-resort handler", async () => {
     // The regression this block used to be NAMED for and never tested. A

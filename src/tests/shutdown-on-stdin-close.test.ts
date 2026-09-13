@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { buildBrokerBundle } from "./broker-bundle.js";
+import { BROKER_BUNDLE_HOOK_TIMEOUT_MS, buildBrokerBundle } from "./broker-bundle.js";
 
 // The broker used to register SIGTERM and SIGINT and nothing else. That is a
 // POSIX assumption: on Windows an MCP client ends the broker by closing the
@@ -100,14 +100,12 @@ setInterval(() => {}, 1 << 30);
 
 describe("closing stdin shuts the broker down and reaps its upstreams", () => {
   beforeAll(async () => {
-    // Built through the shared helper, which has node write the file rather
-    // than esbuild. With esbuild writing it, the bundle's first run alone
-    // outlasted SETTLE_BUDGET_MS below -- see broker-bundle.ts.
+    // Built through the shared helper, which has node write the file and runs
+    // it once before returning. In the release run that failed, the bundle's
+    // first execution happened inside SETTLE_BUDGET_MS below and outlasted it;
+    // now it happens here -- see broker-bundle.ts.
     ({ dir: workDir, path: bundlePath } = await buildBrokerBundle("yaw-mcp-shutdown-"));
-    // The same ceiling index-dispatch.test.ts gives its build. Bundling the
-    // whole dependency graph took 2.5-4.4s standalone when measured; the
-    // ceiling is headroom for a slow disk or scanner, not an estimate.
-  }, 180_000);
+  }, BROKER_BUNDLE_HOOK_TIMEOUT_MS);
 
   afterAll(async () => {
     if (workDir) await rm(workDir, { recursive: true, force: true });

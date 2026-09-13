@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { buildBrokerBundle } from "./broker-bundle.js";
+import { BROKER_BUNDLE_HOOK_TIMEOUT_MS, buildBrokerBundle } from "./broker-bundle.js";
 
 // The product's central claim, exercised against real processes for the first
 // time: a client asks the broker for a tool, the broker routes the call to an
@@ -136,12 +136,15 @@ describe("a real client, a real broker and a real upstream complete a tool call"
   beforeAll(async () => {
     // Bundled from source rather than read from dist/, so the test does not
     // depend on a build step having run first. Built through the shared
-    // helper, which has node write the file. With esbuild writing it, a
-    // full-suite run failed both tests below on the bundle's first execution
-    // alone: the pipe test outlived its 120s timeout, and the round trip got
-    // no answer to `initialize` within DEADLINE_MS -- see broker-bundle.ts.
+    // helper, which has node write the file and runs it once before
+    // returning. Without that, a full-suite release run failed both tests
+    // below: the pipe test -- the bundle's first execution -- outlived its
+    // 120s timeout, and the round trip, spawned after it, got no answer to
+    // `initialize` within DEADLINE_MS and an empty stderr tail. That the
+    // second failure was the same first-run cost is inferred from that shape,
+    // not measured -- see broker-bundle.ts.
     ({ dir: workDir, path: bundlePath } = await buildBrokerBundle("yaw-mcp-e2e-"));
-  }, 180_000);
+  }, BROKER_BUNDLE_HOOK_TIMEOUT_MS);
 
   afterAll(async () => {
     if (workDir) await rm(workDir, { recursive: true, force: true });
