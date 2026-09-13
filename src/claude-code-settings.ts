@@ -24,11 +24,10 @@
 // instead, so every other element, and every comment, survives byte for byte.
 
 import { readFile, stat } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { describeValueShape } from "./client-config.js";
 import type { InstallScope } from "./install-target-model.js";
 import { addJsoncArrayElement, parseJsonc, removeJsoncArrayElements } from "./jsonc.js";
-import { normalizeForCompare } from "./paths.js";
 
 /** Pattern added to Claude Code's `permissions.allow` on install so the
  *  user isn't re-prompted for each yaw-mcp MCP tool call. Only matters for
@@ -82,23 +81,32 @@ export function resolveClaudeCodeSettingsPath(
  *      `.claude.json` home.
  *    * fresh never links it at all.
  *  So an augment run patches `~/.claude/settings.json` as well, and a fresh one
- *  says the grant goes with the pane.
+ *  says what goes with the pane (the grant, and an entry written inside the
+ *  overlay).
  *
- *  Both conditions are required, and a CLAUDE_CONFIG_DIR that IS
- *  `<home>/.claude` is not an overlay whatever YAW_MODE says: there is no
- *  second file to reach. `home` is compared the way paths.ts compares a home,
- *  resolved and case-folded where the filesystem folds case. */
+ *  Both conditions are required, and the directory must also be NAMED like an
+ *  overlay: its basename starts with `yaw-mode-`, the rule Yaw itself applies
+ *  before it treats a path as one (yaw src/yaw-mode.ts, isValidOverlayPath),
+ *  and the prefix every overlay it builds carries (`yaw-mode-<tag>-<ptyId>`,
+ *  and the older `yaw-mode-pty-<n>`). Yaw exports YAW_MODE to the whole pane,
+ *  shell included, so `CLAUDE_CONFIG_DIR=~/.claude-work yaw-mcp install ...`
+ *  typed at a pane's prompt carries YAW_MODE too -- and that directory is the
+ *  user's own, which outlives the pane like any other. It is treated exactly
+ *  as it would be outside Yaw. The name test also covers a CLAUDE_CONFIG_DIR
+ *  that is `<home>/.claude` itself, whose basename is `.claude`: there is no
+ *  second file to reach there. */
 export function yawModeOverlay(opts: {
   yawMode: string | undefined;
   claudeConfigDir: string | undefined;
-  home: string;
 }): "augment" | "fresh" | null {
   if (opts.yawMode !== "augment" && opts.yawMode !== "fresh") return null;
   const dir = opts.claudeConfigDir;
   if (dir === undefined || dir.length === 0) return null;
-  const same = normalizeForCompare(resolve(dir)) === normalizeForCompare(resolve(opts.home, ".claude"));
-  return same ? null : opts.yawMode;
+  return basename(resolve(dir)).startsWith(YAW_MODE_OVERLAY_PREFIX) ? opts.yawMode : null;
 }
+
+/** The basename prefix of every Yaw Mode overlay directory. */
+const YAW_MODE_OVERLAY_PREFIX = "yaw-mode-";
 
 /** Union `patterns` into `existing.permissions.allow`, preserving every
  *  other key and every element already there. Deduplicates by string equality

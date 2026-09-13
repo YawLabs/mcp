@@ -7,7 +7,9 @@
 // writes that file and none of Claude Code's, because each of Claude Code's
 // would lose the entry somewhere typed is commonly run:
 //   * `CLAUDE_CONFIG_DIR` in a Yaw Mode pane is a disposable per-session
-//     overlay, so an entry written under it is gone when the pane closes;
+//     overlay: a fresh pane keeps none of it, so an entry written under it is
+//     gone when the pane closes, and an augment pane carries only its
+//     `.claude.json` home -- where the next bullet applies;
 //   * Yaw Terminal rewrites an `@yawlabs/mcp@latest` npx entry in
 //     `.claude.json` to the copy it bundles and pins;
 //   * `~/.mcp.json` is a PROJECT-scope file to Claude Code, not a user one.
@@ -73,7 +75,9 @@
 // row on the same file would double-report it in --list, doctor and try, so
 // the notes point at `yaw-mcp install mcp` instead.
 //
-// VERSION FLOOR. Released typed 1.5.0 does not read this file. The notes say
+// VERSION FLOOR: THIS ROW NEEDS A TYPED CLI NEWER THAN 1.5.0. Released typed
+// 1.5.0 -- the newest release as of 2026-09-13 -- does not read this file, so
+// with it an entry here loads nothing. The notes, README and CHANGELOG say
 // "newer than 1.5.0" rather than naming the next version, which has not
 // shipped.
 //
@@ -96,8 +100,14 @@
 //
 // The warning names `typed update`, the launcher's own command that re-runs
 // typed's installer and replaces the default bundle (tools/typed, `update)`).
-// With TYPED_CLI_BUNDLE set that command does not touch the bundle actually
-// run, so that case says so instead.
+// That installs the newest RELEASED bundle, so it clears the warning only once
+// a typed release newer than 1.5.0 is live: measured 2026-09-13, the bundle it
+// downloads (app.typed.cloud/typed-cli/cli.mjs) is 1.5.0 and carries no
+// "mcp.json". Naming it is correct only because this row does not ship before
+// that release -- the floor above -- and a release of yaw-mcp carrying this row
+// ahead of it would make the advice a loop. With TYPED_CLI_BUNDLE set that
+// command does not touch the bundle actually run, so that case says so
+// instead.
 
 import { isAbsolute, join, resolve } from "node:path";
 import { defineTarget, type PathBase, type ResolvedPath } from "./install-target-model.js";
@@ -197,7 +207,7 @@ export const TYPED_TARGET = defineTarget({
     warning: staleTypedCliWarning,
   },
   notes:
-    "typed reads ~/.config/typed/mcp.json at startup, ahead of the user-scope files it shares with Claude Code, so this entry wins over an \"mcp\" entry Yaw Terminal manages in ~/.claude.json; a project's .mcp.json still wins over it. On a Yaw Terminal machine that means an npx entry here replaces Yaw Terminal's local launch for typed, and npx resolves @latest on every typed start, which can outlast typed's MCP connect timeout -- `npm i -g @yawlabs/mcp` with oam installed, then re-run install, writes a fast absolute-path entry instead, or raise MCP_TIMEOUT. The file is strict JSON: no comments, no trailing commas. The mcp__mcp__* grant goes in Claude Code's user settings.json, which typed reads too; under a set CLAUDE_CONFIG_DIR that is <CLAUDE_CONFIG_DIR>/settings.json, so the grant is scoped to that config dir while this file is not. There is no project scope here: <project>/.mcp.json is Claude Code's project file, which typed also reads -- use `yaw-mcp install mcp` for it. Needs a typed CLI newer than 1.5.0; older typed reads only Claude Code's files, so use `yaw-mcp install claude-code` there. Restart typed after editing.",
+    "typed reads ~/.config/typed/mcp.json when a session starts, ahead of the user-scope files it shares with Claude Code, so this entry wins over an \"mcp\" entry Yaw Terminal manages in ~/.claude.json; a project's .mcp.json still wins over it. On a Yaw Terminal machine that means an npx entry here replaces Yaw Terminal's local launch for typed, and npx resolves @latest on every typed start, which can outlast typed's MCP connect timeout -- `npm i -g @yawlabs/mcp` with oam installed, then re-run install, writes a fast absolute-path entry instead, or raise MCP_TIMEOUT. The file is strict JSON: no comments, no trailing commas. The mcp__mcp__* grant goes in Claude Code's user settings.json, which typed reads too; under a set CLAUDE_CONFIG_DIR that is <CLAUDE_CONFIG_DIR>/settings.json, so the grant is scoped to that config dir while this file is not. There is no project scope here: <project>/.mcp.json is Claude Code's project file, which typed also reads -- use `yaw-mcp install mcp` for it. Needs a typed CLI newer than 1.5.0; older typed reads only Claude Code's files, so use `yaw-mcp install claude-code` there. typed picks the change up in its next session.",
   resolvePath: resolveTypedPath,
   scopes: [
     {

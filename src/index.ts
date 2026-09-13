@@ -630,11 +630,15 @@ if (subcommand === "compliance") {
                                (\`augment\` or \`fresh\`), whose
                                CLAUDE_CONFIG_DIR is a per-pane overlay that
                                does not keep its settings.json. With both set,
-                               and CLAUDE_CONFIG_DIR not ~/.claude, \`install\`
+                               and CLAUDE_CONFIG_DIR a directory named
+                               yaw-mode-* as Yaw names its overlays, \`install\`
                                and \`uninstall\` of Claude Code or typed at user
                                scope also add or remove the permissions.allow
-                               grant in ~/.claude/settings.json (augment), or
-                               note that the grant goes with the pane (fresh).
+                               grant in ~/.claude/settings.json (augment). In
+                               a fresh pane only \`install\` says anything: a
+                               note that what it wrote there goes with the
+                               pane. A config dir of any other name is
+                               handled as outside Yaw.
     LOG_LEVEL                     Verbosity of yaw-mcp's own JSON log lines on
                                stderr: \`debug\` | \`info\` | \`warn\` | \`error\`
                                (default info). \`debug\` is what to set when

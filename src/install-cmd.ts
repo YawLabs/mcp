@@ -61,7 +61,7 @@
 // see staleProgramWarning.
 import { readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, resolve } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { atomicWriteFile } from "./atomic-write.js";
 import {
@@ -1632,7 +1632,16 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
         log(`# ${settingsPatch.path}\npermissions.allow += ${JSON.stringify(settingsPatch.added)}`);
       }
     }
-    const freshNote = yawFreshGrantNote(grant, target.clientId);
+    const freshNote = yawFreshPaneNote({
+      grant,
+      target,
+      claudeConfigDir: opts.claudeConfigDir,
+      entryFile: resolved.absolute,
+      wrote: [
+        ...(clientJson !== null ? [resolved.absolute] : []),
+        ...settingsPatches.filter((p) => p.changed).map((p) => p.path),
+      ],
+    });
     if (freshNote !== null) log(freshNote);
     if (scopedGrantNote !== null) log(scopedGrantNote);
     if (legacyEntry) {
@@ -1778,9 +1787,15 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
       }
     }
   }
-  // Only over a grant this run actually wrote: the note is about THAT write.
-  const freshNote = yawFreshGrantNote(grant, target.clientId);
-  if (freshNote !== null && written.includes(settingsPatches[0].path)) log(freshNote);
+  // Only over what this run actually wrote: the note is about THOSE writes.
+  const freshNote = yawFreshPaneNote({
+    grant,
+    target,
+    claudeConfigDir: opts.claudeConfigDir,
+    entryFile: resolved.absolute,
+    wrote: written,
+  });
+  if (freshNote !== null) log(freshNote);
 
   // Nothing changed on disk: the entry already matched and no legacy trim or
   // permissions patch was pending. "Restart it to pick up the new MCP server"
@@ -1880,7 +1895,7 @@ type GrantPatch = ClaudeCodeSettingsPatch & { claudeConfigDir: string | undefine
  *  with the pane: it gets a second patch for `<home>/.claude/settings.json`, so
  *  the grant is there for every session after this one. A fresh pane gets no
  *  second patch -- it reads nothing from home, and install says so instead
- *  (yawFreshGrantNote). Project and local scope are project-relative files
+ *  (yawFreshPaneNote). Project and local scope are project-relative files
  *  CLAUDE_CONFIG_DIR never moves, so no overlay reaches them.
  *
  *  Outside a Yaw Mode pane this returns what the single inline patch did, and
@@ -1896,9 +1911,7 @@ async function prepareGrantPatches(args: {
 }): Promise<{ patches: GrantPatch[]; overlay: "augment" | "fresh" | null }> {
   if (args.target.hooks?.permissionsPatch !== "claude-code") return { patches: [], overlay: null };
   const overlay =
-    args.scope === "user"
-      ? yawModeOverlay({ yawMode: args.yawMode, claudeConfigDir: args.claudeConfigDir, home: args.home })
-      : null;
+    args.scope === "user" ? yawModeOverlay({ yawMode: args.yawMode, claudeConfigDir: args.claudeConfigDir }) : null;
   const patches: GrantPatch[] = [];
   const dirs: Array<{ claudeConfigDir: string | undefined; yawHome: boolean }> = [
     { claudeConfigDir: args.claudeConfigDir, yawHome: false },
@@ -1922,19 +1935,53 @@ async function prepareGrantPatches(args: {
 const YAW_HOME_GRANT_REASON = " -- a Yaw Mode pane's own settings.json does not outlive the pane";
 
 /** The one note a FRESH Yaw Mode pane gets when install writes (or would
- *  write) the grant into its overlay settings.json: the pane keeps no settings,
- *  so the grant goes with it, and a normal shell is where the install sticks.
- *  null for any other run, and when the overlay patch changes nothing. */
-function yawFreshGrantNote(
-  grant: { patches: GrantPatch[]; overlay: "augment" | "fresh" | null },
-  clientId: InstallClientId,
-): string | null {
-  const overlayPatch = grant.patches[0];
-  if (grant.overlay !== "fresh" || overlayPatch === undefined || !overlayPatch.changed) return null;
-  return (
-    `Note: a fresh Yaw Mode pane does not keep its settings.json, so the ${CLAUDE_CODE_ALLOW_PATTERN} grant in ` +
-    `${overlayPatch.path} goes when this pane closes. Run \`yaw-mcp install ${clientId}\` from a normal shell to keep it.`
-  );
+ *  write) into its overlay. A fresh pane keeps nothing of its config dir: Yaw
+ *  neither hardlinks a root file into it (yaw src/yaw-mode.ts, buildOverlayInto
+ *  links them in augment only) nor carries `.claude.json` home when it closes
+ *  (src/pty-manager.ts, maybeSyncClaudeJson returns early outside augment). So
+ *  what this run put there goes with the pane, and a normal shell is where the
+ *  install sticks.
+ *
+ *  WHAT it names follows where each write landed, never the client id. The
+ *  grant is always in the overlay (`<CLAUDE_CONFIG_DIR>/settings.json`). The
+ *  row's own entry is too when its file resolves inside CLAUDE_CONFIG_DIR --
+ *  Claude Code's `<overlay>/.claude.json` -- and the note then says the entry
+ *  goes as well; a file that resolves elsewhere (typed's
+ *  `~/.config/typed/mcp.json`) outlives the pane, and the note names the grant
+ *  alone.
+ *
+ *  `wrote` is the files this run wrote, or would write under --dry-run. null
+ *  for any other run, and when it wrote neither the overlay's grant nor an
+ *  entry inside the overlay. */
+function yawFreshPaneNote(args: {
+  grant: { patches: GrantPatch[]; overlay: "augment" | "fresh" | null };
+  target: InstallTarget;
+  claudeConfigDir: string | undefined;
+  entryFile: string;
+  wrote: readonly string[];
+}): string | null {
+  const overlayPatch = args.grant.patches.find((p) => !p.yawHome);
+  const cfg = args.claudeConfigDir;
+  if (args.grant.overlay !== "fresh" || overlayPatch === undefined || cfg === undefined) return null;
+  const entryInOverlay = samePathKey(args.entryFile).startsWith(`${samePathKey(cfg)}${sep}`);
+  const grantWritten = args.wrote.includes(overlayPatch.path);
+  const entryWritten = entryInOverlay && args.wrote.includes(args.entryFile);
+  if (!grantWritten && !entryWritten) return null;
+  const { label, clientId } = args.target;
+  const again = `Run \`yaw-mcp install ${clientId}\` from a normal shell to keep`;
+  if (!entryInOverlay) {
+    return (
+      `Note: a fresh Yaw Mode pane does not keep its settings.json, so the ${CLAUDE_CODE_ALLOW_PATTERN} grant in ` +
+      `${overlayPatch.path} goes when this pane closes. ${again} it.`
+    );
+  }
+  // A grant already in the file goes with the pane too; one install could not
+  // patch (malformed, and warned about above) is not there to name.
+  return overlayPatch.malformed
+    ? `Note: a fresh Yaw Mode pane does not keep its config dir, so the ${label} entry in ${args.entryFile} goes when ` +
+        `this pane closes. ${again} it.`
+    : `Note: a fresh Yaw Mode pane does not keep its config dir, so the ${label} entry in ${args.entryFile} and the ` +
+        `${CLAUDE_CODE_ALLOW_PATTERN} grant in ${overlayPatch.path} go when this pane closes. ${again} them.`;
 }
 
 /** The warning a row's `programProbe` asks for, or null when it asks for none:
@@ -3330,10 +3377,15 @@ function configDirScopedGrantNote(args: {
  *  grant re-prompts on every tool call -- the same trade the legacy-wildcard
  *  note in claude-code-settings.ts makes. A malformed one does not, and nor
  *  does one its client's parser rejects (see clientLoadsEntry): the client
- *  that owns it cannot load a server from it either. */
+ *  that owns it cannot load a server from it either.
+ *
+ *  `only`, when given, narrows the search to that one file: uninstall's
+ *  overlay question for a Yaw Mode augment pane's home grant, which counts
+ *  the overlay's `.claude.json` alone (see runUninstall). */
 async function sharedGrantHolder(args: {
   self: { clientId: InstallClientId; scope: InstallScope; sites: readonly ConfigSite[] };
   settingsPath: string;
+  only?: string;
   os: InstallOS;
   home: string;
   appData: string;
@@ -3342,6 +3394,7 @@ async function sharedGrantHolder(args: {
   clientEnv: ClientEnvValues | undefined;
 }): Promise<{ label: string; scope: InstallScope; file: string; unreadable: boolean } | null> {
   const settingsKey = samePathKey(args.settingsPath);
+  const onlyKey = args.only === undefined ? null : samePathKey(args.only);
   const isSelfSite = (site: ConfigSite): boolean =>
     args.self.sites.some(
       (own) =>
@@ -3380,6 +3433,7 @@ async function sharedGrantHolder(args: {
       }
       for (const site of candidates) {
         if (isSelfSite(site)) continue;
+        if (onlyKey !== null && samePathKey(site.resolved.absolute) !== onlyKey) continue;
         const view = await readClientConfigFile(site, { transform: peer.entry });
         const unreadable = view.read.kind === "unreadable";
         if (unreadable || clientLoadsEntry(view)) {
@@ -3532,7 +3586,13 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
   // variable unset -- in `clientEnv` too, where Claude Code's own path would
   // otherwise still find the overlay -- and then as the overlay's own question
   // (the overlay's settings file, under the overlay), and either holder keeps
-  // the grant.
+  // the grant. That second question counts ONLY the overlay's `.claude.json`,
+  // the one file Yaw carries home: an entry in another overlay file (typed's
+  // `<overlay>/.mcp.json`) goes with the pane and never reaches a later
+  // session, and a home file there is the first question's already. Its
+  // Keeping line says why a file in the overlay keeps the HOME grant, since the
+  // client launched from that overlay reads the overlay's settings.json, not
+  // this one.
   const rowArgs: RowResolveArgs = {
     os,
     home,
@@ -3562,31 +3622,49 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
   const settingsPatches: GrantPatch[] = [];
   for (const settingsPatch of grant.patches) {
     if (settingsPatch.changed) {
-      const askUnder: Array<RowResolveArgs & { settingsPath: string }> = [];
+      type Question = RowResolveArgs & { settingsPath: string; carriedHome: string | null };
+      const askUnder: Question[] = [];
       if (settingsPatch.yawHome) {
         askUnder.push({
           ...rowArgs,
           settingsPath: settingsPatch.path,
           claudeConfigDir: undefined,
           clientEnv: { ...opts.clientEnv, claudeConfigDir: undefined },
+          carriedHome: null,
         });
-        if (primaryPatch !== null) askUnder.push({ ...rowArgs, settingsPath: primaryPatch.path });
+        if (primaryPatch !== null && opts.claudeConfigDir !== undefined) {
+          askUnder.push({
+            ...rowArgs,
+            settingsPath: primaryPatch.path,
+            carriedHome: join(opts.claudeConfigDir, ".claude.json"),
+          });
+        }
       } else {
-        askUnder.push({ ...rowArgs, settingsPath: settingsPatch.path, claudeConfigDir: settingsPatch.claudeConfigDir });
+        askUnder.push({
+          ...rowArgs,
+          settingsPath: settingsPatch.path,
+          claudeConfigDir: settingsPatch.claudeConfigDir,
+          carriedHome: null,
+        });
       }
       let holder: Awaited<ReturnType<typeof sharedGrantHolder>> = null;
-      for (const under of askUnder) {
+      let carried = false;
+      for (const { carriedHome, ...under } of askUnder) {
         holder = await sharedGrantHolder({
           self: { clientId: target.clientId, scope, sites: selectedSites },
           ...under,
+          only: carriedHome ?? undefined,
         });
+        carried = carriedHome !== null;
         if (holder !== null) break;
       }
       if (holder !== null) {
         log(
           holder.unreadable
             ? `Keeping ${CLAUDE_CODE_ALLOW_PATTERN} in ${settingsPatch.path}: could not read ${holder.file} to tell whether ${holder.label} (${holder.scope}) still uses it.`
-            : `Keeping ${CLAUDE_CODE_ALLOW_PATTERN} in ${settingsPatch.path}: ${holder.label} (${holder.scope}) still launches yaw-mcp from ${holder.file} and reads that grant.`,
+            : carried
+              ? `Keeping ${CLAUDE_CODE_ALLOW_PATTERN} in ${settingsPatch.path}: ${holder.label} (${holder.scope}) still launches yaw-mcp from ${holder.file}, which Yaw carries home when the pane closes.`
+              : `Keeping ${CLAUDE_CODE_ALLOW_PATTERN} in ${settingsPatch.path}: ${holder.label} (${holder.scope}) still launches yaw-mcp from ${holder.file} and reads that grant.`,
         );
         continue;
       }

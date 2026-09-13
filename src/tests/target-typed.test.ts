@@ -281,6 +281,10 @@ describe("the typed row, as data", () => {
     // The npx-over-a-local-launch cost, and the config-dir scope of the grant.
     expect(notes).toContain("MCP_TIMEOUT");
     expect(notes).toContain("scoped to that config dir");
+    // install prints the notes right above the next-session Done line, so they
+    // speak of a session too -- typed has no running app for "Restart" to mean.
+    expect(notes).toContain("typed picks the change up in its next session.");
+    expect(notes).not.toMatch(/restart/i);
     // install prints the notes verbatim; a non-ASCII byte turns to mojibake on
     // a Windows console whose codepage is not UTF-8.
     expect([...notes].every((c) => c.charCodeAt(0) >= 32 && c.charCodeAt(0) < 127)).toBe(true);
@@ -834,8 +838,9 @@ describe("a Yaw Mode pane: the grant outlives the pane", () => {
   // pointed at a per-pane overlay built from <home>/.claude, whose settings.json
   // is discarded with the pane. The dispatcher hands both variables in through
   // `clientEnv` -- CLAUDE_CONFIG_DIR as `claudeConfigDir` as well -- so every
-  // run here passes them the same way.
-  const overlay = (): string => join(home, "yaw-overlay");
+  // run here passes them the same way. The overlay is named the way Yaw names
+  // one, `yaw-mode-<tag>-<ptyId>`: the name is part of what makes it one.
+  const overlay = (): string => join(home, "Temp", "yaw-mode-16224-9qm92t8-pty-40");
   const overlaySettings = (): string => join(overlay(), "settings.json");
   const overlayClaudeJson = (): string => join(overlay(), ".claude.json");
   const pane = (yawMode: string) => ({
@@ -843,18 +848,25 @@ describe("a Yaw Mode pane: the grant outlives the pane", () => {
     clientEnv: { claudeConfigDir: overlay(), yawMode },
   });
 
-  it("recognises an overlay only with YAW_MODE augment|fresh AND a CLAUDE_CONFIG_DIR that is not <home>/.claude", () => {
-    const dir = join(home, "yaw-overlay");
-    expect(yawModeOverlay({ yawMode: "augment", claudeConfigDir: dir, home })).toBe("augment");
-    expect(yawModeOverlay({ yawMode: "fresh", claudeConfigDir: dir, home })).toBe("fresh");
-    expect(yawModeOverlay({ yawMode: undefined, claudeConfigDir: dir, home })).toBeNull();
-    expect(yawModeOverlay({ yawMode: "off", claudeConfigDir: dir, home })).toBeNull();
-    expect(yawModeOverlay({ yawMode: "augment", claudeConfigDir: undefined, home })).toBeNull();
-    expect(yawModeOverlay({ yawMode: "augment", claudeConfigDir: "", home })).toBeNull();
+  it("recognises an overlay only with YAW_MODE augment|fresh AND a CLAUDE_CONFIG_DIR named yaw-mode-*", () => {
+    const dir = join(home, "Temp", "yaw-mode-16224-9qm92t8-pty-40");
+    expect(yawModeOverlay({ yawMode: "augment", claudeConfigDir: dir })).toBe("augment");
+    expect(yawModeOverlay({ yawMode: "fresh", claudeConfigDir: dir })).toBe("fresh");
+    // Yaw's older overlay name, and a trailing separator, still count.
+    expect(yawModeOverlay({ yawMode: "augment", claudeConfigDir: join(home, "yaw-mode-pty-3") })).toBe("augment");
+    expect(yawModeOverlay({ yawMode: "fresh", claudeConfigDir: `${dir}/` })).toBe("fresh");
+    expect(yawModeOverlay({ yawMode: undefined, claudeConfigDir: dir })).toBeNull();
+    expect(yawModeOverlay({ yawMode: "off", claudeConfigDir: dir })).toBeNull();
+    expect(yawModeOverlay({ yawMode: "augment", claudeConfigDir: undefined })).toBeNull();
+    expect(yawModeOverlay({ yawMode: "augment", claudeConfigDir: "" })).toBeNull();
+    // A config dir of the user's own, set at a pane's prompt, is no overlay:
+    // Yaw exports YAW_MODE to the pane's shell as well as to Claude Code.
+    expect(yawModeOverlay({ yawMode: "augment", claudeConfigDir: join(home, "custom-cfg") })).toBeNull();
+    expect(yawModeOverlay({ yawMode: "fresh", claudeConfigDir: join(dir, "nested") })).toBeNull();
     // The home's own config dir is no overlay, however it is spelled.
-    expect(yawModeOverlay({ yawMode: "augment", claudeConfigDir: join(home, ".claude"), home })).toBeNull();
-    expect(yawModeOverlay({ yawMode: "augment", claudeConfigDir: `${join(home, ".claude")}/`, home })).toBeNull();
-    expect(yawModeOverlay({ yawMode: "augment", claudeConfigDir: join(home, "x", "..", ".claude"), home })).toBeNull();
+    expect(yawModeOverlay({ yawMode: "augment", claudeConfigDir: join(home, ".claude") })).toBeNull();
+    expect(yawModeOverlay({ yawMode: "augment", claudeConfigDir: `${join(home, ".claude")}/` })).toBeNull();
+    expect(yawModeOverlay({ yawMode: "augment", claudeConfigDir: join(home, "x", "..", ".claude") })).toBeNull();
   });
 
   describe("augment", () => {
@@ -881,10 +893,20 @@ describe("a Yaw Mode pane: the grant outlives the pane", () => {
     });
 
     it("leaves project scope alone: CLAUDE_CONFIG_DIR moves no project file", async () => {
-      const { result } = await install("claude-code", { ...pane("augment"), scope: "project", projectDir: cwd });
+      const { result, stdout, stderr } = await install("claude-code", {
+        ...pane("augment"),
+        scope: "project",
+        projectDir: cwd,
+      });
       expect(result.exitCode).toBe(0);
       expect(result.written).toEqual([join(cwd, ".mcp.json"), join(cwd, ".claude", "settings.json")]);
       expect(existsSync(userSettings())).toBe(false);
+      // What the two assertions above cannot see: without the user-scope guard
+      // a second patch of the SAME project settings.json is planned, fails its
+      // fingerprint check after the first write and only warns -- `written` and
+      // the home file come out the same.
+      expect(stderr).toBe("");
+      expect(stdout).not.toContain("Yaw Mode");
     });
 
     it("previews both files under --dry-run and writes neither", async () => {
@@ -917,7 +939,32 @@ describe("a Yaw Mode pane: the grant outlives the pane", () => {
       const keeping = stdout.split(LF).filter((l) => l.startsWith("Keeping "));
       expect(keeping).toEqual([
         `Keeping ${CLAUDE_CODE_ALLOW_PATTERN} in ${overlaySettings()}: Claude Code (user) still launches yaw-mcp from ${overlayClaudeJson()} and reads that grant.`,
-        `Keeping ${CLAUDE_CODE_ALLOW_PATTERN} in ${userSettings()}: Claude Code (user) still launches yaw-mcp from ${overlayClaudeJson()} and reads that grant.`,
+        // Not "and reads that grant": the Claude Code launched from the overlay
+        // reads the overlay's settings.json. The home grant is kept for the
+        // sessions after the pane, which get that .claude.json when Yaw carries
+        // it home.
+        `Keeping ${CLAUDE_CODE_ALLOW_PATTERN} in ${userSettings()}: Claude Code (user) still launches yaw-mcp from ${overlayClaudeJson()}, which Yaw carries home when the pane closes.`,
+      ]);
+    });
+
+    it("does not keep the HOME grant for an entry in an overlay file Yaw does not carry home", async () => {
+      // typed in this pane loads <overlay>/.mcp.json (its <configDir>/.mcp.json),
+      // so the overlay's grant stays for it. That file is discarded with the
+      // pane -- only .claude.json goes home -- so no later session reads it,
+      // and the home grant has nothing to keep it.
+      await install("typed", pane("augment"));
+      const overlayMcpJson = join(overlay(), ".mcp.json");
+      seed(
+        overlayMcpJson,
+        `${JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] } } })}\n`,
+      );
+      const { result, stdout } = await uninstall("typed", pane("augment"));
+      expect(result.exitCode).toBe(0);
+      expect(allowOf(overlaySettings())).toEqual([CLAUDE_CODE_ALLOW_PATTERN]);
+      expect(allowOf(userSettings())).toEqual([]);
+      expect(result.written).toEqual([typedFile(), userSettings()]);
+      expect(stdout.split(LF).filter((l) => l.startsWith("Keeping "))).toEqual([
+        `Keeping ${CLAUDE_CODE_ALLOW_PATTERN} in ${overlaySettings()}: typed (user) still launches yaw-mcp from ${overlayMcpJson} and reads that grant.`,
       ]);
     });
 
@@ -972,22 +1019,47 @@ describe("a Yaw Mode pane: the grant outlives the pane", () => {
   });
 
   describe("fresh", () => {
-    const freshNote = (clientId: string): string =>
+    const freshLines = (stdout: string): string[] => stdout.split(LF).filter((l) => l.includes("fresh Yaw Mode pane"));
+    /** typed's entry is in ~/.config/typed/mcp.json, outside the overlay, and
+     *  outlives the pane: only the grant goes. */
+    const grantOnlyNote = (clientId: string): string =>
       `Note: a fresh Yaw Mode pane does not keep its settings.json, so the ${CLAUDE_CODE_ALLOW_PATTERN} grant in ${overlaySettings()} goes when this pane closes. Run \`yaw-mcp install ${clientId}\` from a normal shell to keep it.`;
+    /** Claude Code's user entry is in <overlay>/.claude.json, which a fresh
+     *  pane does not carry home either: the entry goes with the grant. */
+    const entryAndGrantNote = (): string =>
+      `Note: a fresh Yaw Mode pane does not keep its config dir, so the Claude Code entry in ${overlayClaudeJson()} and the ${CLAUDE_CODE_ALLOW_PATTERN} grant in ${overlaySettings()} go when this pane closes. Run \`yaw-mcp install claude-code\` from a normal shell to keep them.`;
 
     it("install writes the overlay only and prints the note once", async () => {
       const { result, stdout } = await install("typed", pane("fresh"));
       expect(result.exitCode).toBe(0);
       expect(result.written).toEqual([typedFile(), overlaySettings()]);
       expect(existsSync(userSettings())).toBe(false);
-      expect(stdout.split(LF).filter((l) => l.includes("fresh Yaw Mode pane"))).toEqual([freshNote("typed")]);
+      expect(freshLines(stdout)).toEqual([grantOnlyNote("typed")]);
+    });
+
+    it("install claude-code says the entry in the overlay's .claude.json goes with the pane too", async () => {
+      const { result, stdout } = await install("claude-code", pane("fresh"));
+      expect(result.exitCode).toBe(0);
+      expect(result.written).toEqual([overlayClaudeJson(), overlaySettings()]);
+      expect(freshLines(stdout)).toEqual([entryAndGrantNote()]);
+      // Still the ordinary Done line: the note is what qualifies it.
+      expect(stdout).toContain("Done: Claude Code is configured.");
+    });
+
+    it("says the overlay entry goes even when the grant was already there", async () => {
+      // The grant is in the overlay from an earlier install typed in this pane,
+      // so install claude-code writes only its entry -- which still goes.
+      await install("typed", pane("fresh"));
+      const { result, stdout } = await install("claude-code", pane("fresh"));
+      expect(result.written).toEqual([overlayClaudeJson()]);
+      expect(freshLines(stdout)).toEqual([entryAndGrantNote()]);
     });
 
     it("prints the note on the --dry-run preview, and not over a grant a re-run does not write", async () => {
       const preview = await install("claude-code", { ...pane("fresh"), dryRun: true });
-      expect(preview.stdout.split(LF).filter((l) => l.includes("fresh Yaw Mode pane"))).toEqual([
-        freshNote("claude-code"),
-      ]);
+      expect(freshLines(preview.stdout)).toEqual([entryAndGrantNote()]);
+      const typedPreview = await install("typed", { ...pane("fresh"), dryRun: true });
+      expect(freshLines(typedPreview.stdout)).toEqual([grantOnlyNote("typed")]);
       await install("typed", pane("fresh"));
       const again = await install("typed", pane("fresh"));
       expect(again.result.written).toEqual([]);
@@ -1023,6 +1095,17 @@ describe("a Yaw Mode pane: the grant outlives the pane", () => {
           return { claudeConfigDir: dir, clientEnv: { claudeConfigDir: dir, yawMode: "augment" } };
         },
       ],
+      // A config dir the user set at a Yaw Mode pane's prompt: YAW_MODE is in
+      // that shell's environment, but the directory is not a Yaw overlay.
+      ...(["augment", "fresh"] as const).map(
+        (yawMode): [string, () => { claudeConfigDir?: string; clientEnv: ClientEnvValues }] => [
+          `YAW_MODE=${yawMode} with a CLAUDE_CONFIG_DIR not named yaw-mode-*`,
+          () => {
+            const dir = join(home, "custom-cfg");
+            return { claudeConfigDir: dir, clientEnv: { claudeConfigDir: dir, yawMode } };
+          },
+        ],
+      ),
     ];
     for (const [what, build] of cases) {
       it(`${what}: one grant file, and not a word about Yaw Mode`, async () => {
