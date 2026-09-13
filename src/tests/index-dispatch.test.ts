@@ -137,44 +137,59 @@ describe("KNOWN_SUBCOMMANDS table", () => {
   });
 
   it("does not list removed or unknown subcommands in --help text", async () => {
-    // Guards against help-text drift (issue #132): when a subcommand is
-    // retired or renamed, its entry in the --help text must not linger.
-    // Scrapes every command name listed under the sections of --help in
-    // index.ts and asserts that every one is present in KNOWN_SUBCOMMANDS.
+    // Guards against help-text drift (issue #132): `servers` left the dispatch
+    // chain and KNOWN_SUBCOMMANDS but stayed in --help. The test above keeps
+    // KNOWN_SUBCOMMANDS equal to the dispatch chain; this one requires every
+    // command --help names to be in it. One direction only -- a dispatched
+    // command missing from --help is not checked.
+    //
+    // Commands are named in two shapes, from Quickstart down to Environment
+    // variables, on lines indented exactly 4 spaces:
+    //   - a numbered Quickstart step, where the command follows `yaw-mcp `
+    //     after the step's label (`2. Verify setup   yaw-mcp doctor`);
+    //   - a section entry, whose command column opens the line and ends at the
+    //     first run of two or more spaces; aliases in it are comma-separated
+    //     (`help, --help, -h`).
+    // The column is cut at two spaces, not three, because
+    // `call <ns> <tool> [json]` leaves only two before its description. Argument
+    // groups (`<...>`, `[...]`) are dropped before the split on commas, so
+    // `remove <slug>, rm <slug>` yields both names and the comma in
+    // `bundles [list, match]` yields no alias. A step whose command column does
+    // not match fails the test instead of dropping out. Commands mentioned
+    // inside a description's prose are not checked.
     const src = await readFile(INDEX_SRC, "utf8");
-    const helpStart = src.indexOf("Setup (connect a client");
+    const helpStart = src.indexOf("Quickstart:");
     const helpEnd = src.indexOf("Environment variables:", helpStart);
     expect(helpStart).toBeGreaterThan(-1);
     expect(helpEnd).toBeGreaterThan(helpStart);
-    const helpBody = src.slice(helpStart, helpEnd);
+    const lines = src
+      .slice(helpStart, helpEnd)
+      .split("\n")
+      .filter((line) => /^ {4}\S/.test(line));
 
-    // Each command is indented by 4 spaces.
-    // Extract the leading command token or comma-separated tokens (e.g. `help, --help, -h`).
-    const commandLines = helpBody.split("\n").filter((line) => line.startsWith("    ") && !line.startsWith("     "));
-
-    const scraped: string[] = [];
-    for (const line of commandLines) {
-      // The command/syntax column precedes the description (separated by at least 3 spaces).
-      const spec =
-        line
-          .slice(4)
-          .split(/\s{3,}/)[0]
-          ?.trim() ?? "";
-      if (spec.includes(",")) {
-        for (const token of spec.split(",")) {
-          const name = token.trim().split(/\s+/)[0];
-          if (name) scraped.push(name);
-        }
+    const fromQuickstart: string[] = [];
+    const fromSections: string[] = [];
+    const unparsedSteps: string[] = [];
+    for (const line of lines) {
+      if (/^ {4}\d+\. /.test(line)) {
+        const name = line.match(/^ {4}\d+\. .+?\s{2,}yaw-mcp ([a-z][\w-]*)/)?.[1];
+        if (name) fromQuickstart.push(name);
+        else unparsedSteps.push(line);
       } else {
-        const name = spec.split(/[\s<[]/)[0];
-        if (name) scraped.push(name);
+        const spec = line.slice(4).split(/ {2,}/)[0] ?? "";
+        for (const alias of spec.replace(/<[^>]*>|\[[^\]]*\]/g, " ").split(",")) {
+          const name = alias.trim().split(/\s+/)[0];
+          if (name) fromSections.push(name);
+        }
       }
     }
 
-    expect(scraped.length).toBeGreaterThan(0);
-    const knownSet = new Set<string>(KNOWN_SUBCOMMANDS);
-    const unknown = scraped.filter((name) => !knownSet.has(name));
-    expect(unknown, "subcommands in --help text that are missing from KNOWN_SUBCOMMANDS").toEqual([]);
+    expect(unparsedSteps, "Quickstart steps with no `yaw-mcp <command>` column").toEqual([]);
+    expect(fromQuickstart.length).toBeGreaterThan(0);
+    expect(fromSections.length).toBeGreaterThan(0);
+    const known = new Set<string>(KNOWN_SUBCOMMANDS);
+    const unknown = [...fromQuickstart, ...fromSections].filter((name) => !known.has(name));
+    expect(unknown, "names --help lists that KNOWN_SUBCOMMANDS does not").toEqual([]);
   });
 });
 

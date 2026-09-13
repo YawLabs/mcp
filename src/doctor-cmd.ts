@@ -1599,9 +1599,9 @@ function renderVaultSection(opts: { status: VaultStatus; print: (s?: string) => 
 // collected once so the two paths can't drift: the binary probe, the
 // config-level default (+ provenance), and a per-server verdict for every
 // configured server. The list covers bundles.json because bundles.json is now
-// the ONLY server source -- account mode is gone (`yaw-mcp servers` is a
-// deprecated stub that always exits 1), so there is no second source of server
-// definitions for this section to be missing.
+// the ONLY server source -- account mode is gone (`yaw-mcp servers`, which
+// listed an account's servers, was deleted in 1.0.0), so there is no second
+// source of server definitions for this section to be missing.
 interface OamRuntimeStatus {
   probe: OamProbe;
   dflt: DefaultRuntimeInfo;

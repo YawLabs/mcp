@@ -222,12 +222,10 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
     flags: ["--json", "--help"],
   },
   { name: "doctor", description: "Print diagnostic of yaw-mcp setup", flags: ["--json", "--help"] },
-  // `servers` is deliberately NOT here. It is still dispatched -- Yaw Terminal
-  // shells out to `yaw-mcp servers --json` and reads signedIn:false from its
-  // always-non-zero exit -- but it is a deprecation stub, and completing a
-  // deprecated thing teaches it to new users: the same rule that hides
-  // --token above. completion-cmd.test.ts's drift guard carries the matching
-  // exemption.
+  // `servers` is not here because it no longer exists: it was deleted in
+  // 1.0.0, and typing it gets the retired-verb hint from RETIRED_SUBCOMMANDS
+  // in subcommands.ts. completion-cmd.test.ts pins it out of both this spec
+  // and KNOWN_SUBCOMMANDS.
   {
     name: "bundles",
     description: "Browse curated multi-server bundles",
