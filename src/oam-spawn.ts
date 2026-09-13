@@ -236,7 +236,7 @@ export function npxSpec(args: readonly string[]): string | null {
  * aggressive floor costs nothing but a fallback, while a lax one silently
  * hosts production sidecars on a runtime that is no longer current.
  */
-export const MIN_OAM_VERSION = "0.13.1";
+export const MIN_OAM_VERSION = "0.15.2";
 
 /** The oam installer one-liners, as oamjs.org publishes them. Both install the
  *  current release, which always satisfies MIN_OAM_VERSION. */
