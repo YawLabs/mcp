@@ -146,7 +146,8 @@ const RULES: Rule[] = [
       "src/install-cmd.ts":
         "the SITE's own container path, read off the resolver -- rendered by `describeContainer` in the " +
         "entry-count line, handed to `claudeCodeContainerPathVariants` as the canonical address a write " +
-        "goes to, and carried per RemovalSite into `siteAt`. Not a walk: every read and write goes " +
+        "goes to, carried per RemovalSite into `siteAt`, and compared by `sharedGrantHolder` to keep the " +
+        "sites an uninstall is emptying out of its holder search. Not a walk: every read and write goes " +
         "through the core",
       "src/try-cmd.ts":
         "a TRIAL MARKER records the container path it wrote at, on disk, in a versioned schema -- so try " +
@@ -178,10 +179,10 @@ const RULES: Rule[] = [
     pattern: /clientId\s*===\s*["']|as\s+InstallClientId\b/,
     allowed: {
       "src/install-cmd.ts":
-        "THREE Claude Code branches remain, each on a line this reason names so it can be deleted with the " +
-        'branch: install\'s settings patch (the `opts.clientId === "claude-code"` guarding ' +
-        "prepareClaudeCodeSettingsPatch), the project-scope approval clause in the Done block, and " +
-        "uninstall's settings patch. All three move to hooks.permissionsPatch with the consumer migration",
+        "ONE Claude Code branch remains: the project-scope approval clause in the Done block " +
+        '(`target.clientId === "claude-code" && scope === "project"`), which names Claude Code\'s own ' +
+        ".mcp.json approval prompt. Install's and uninstall's settings patches read hooks.permissionsPatch " +
+        "now; this line goes when that clause becomes data on the row too",
       "src/import-cmd.ts":
         'one `target.clientId === "vscode"` branch, the input-variable expansion that ' +
         "hooks.importVariables is declared to replace -- it goes when import reads the hook instead",
@@ -192,7 +193,7 @@ const RULES: Rule[] = [
   {
     what: "a client env var read outside the one reader",
     pattern:
-      /env(?:\?\.|\.|\[")(?:CLAUDE_CONFIG_DIR|CODEX_HOME|CLINE_MCP_SETTINGS_PATH|CLINE_DATA_DIR|CLINE_DIR|CONTINUE_GLOBAL_DIR|XDG_CONFIG_HOME|APPDATA)\b/,
+      /env(?:\?\.|\.|\[")(?:CLAUDE_CONFIG_DIR|CODEX_HOME|CLINE_MCP_SETTINGS_PATH|CLINE_DATA_DIR|CLINE_DIR|CONTINUE_GLOBAL_DIR|TYPED_CLI_BUNDLE|XDG_CONFIG_HOME|YAW_MODE|APPDATA)\b/,
     allowed: {
       "src/install-target-model.ts": "resolveAppDataDir -- the one place %APPDATA% is chosen for a client path",
       "src/doctor-cmd.ts":
@@ -263,6 +264,16 @@ describe("the client-config boundary", () => {
       for (const line of rule.negative) {
         expect(rule.pattern.test(codeOf(line)), `${rule.what}: should NOT match ${line}`).toBe(false);
       }
+    }
+  });
+
+  it("flags a direct read of EVERY name in CLIENT_ENV_VARS, so a new variable cannot slip past the one reader", () => {
+    // The env-var rule spells its names in a regex; this is what keeps that
+    // list from falling behind CLIENT_ENV_VARS when a variable is added.
+    const rule = RULES.find((r) => r.what === "a client env var read outside the one reader");
+    expect(rule).toBeDefined();
+    for (const name of CLIENT_ENV_VARS) {
+      expect(rule?.pattern.test(`process.env.${name}`), name).toBe(true);
     }
   });
 
@@ -379,6 +390,7 @@ describe("the table's structure", () => {
       "cline",
       "continue",
       "codex-cli",
+      "typed",
     ]);
   });
 

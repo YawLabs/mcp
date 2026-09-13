@@ -75,6 +75,13 @@
 //     (`mcpServers/yaw-mcp.json`), not a user config we splice into. That is
 //     `config.ownership: "dedicated"`, and it changes the uninstall wording
 //     rather than any path.
+//   • typed gets a file of its own, `<home>/.config/typed/mcp.json` on every
+//     OS, rather than one of Claude Code's: CLAUDE_CONFIG_DIR can be a
+//     disposable overlay, Yaw Terminal rewrites a `@yawlabs/mcp@latest` entry
+//     in `.claude.json`, and `~/.mcp.json` is project scope to Claude Code.
+//     typed reads Claude Code's user settings.json for permissions, so its
+//     row shares Claude Code's grant through `hooks.permissionsPatch`, and
+//     uninstall keeps that grant while either row still has its entry.
 
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
@@ -95,6 +102,7 @@ import {
 import { CLINE_TARGET } from "./target-cline.js";
 import { CODEX_CLI_TARGET } from "./target-codex-cli.js";
 import { CONTINUE_TARGET } from "./target-continue.js";
+import { TYPED_TARGET } from "./target-typed.js";
 import { ZED_TARGET } from "./target-zed.js";
 
 // Every type and constant a target row is made of lives in the LEAF module
@@ -262,6 +270,10 @@ const TARGET_ROWS = [
   // Importing this row is also what registers the "toml" config adapter (see
   // its module header), so the format is readable exactly when a row uses it.
   CODEX_CLI_TARGET,
+  // The second row to declare `hooks.permissionsPatch: "claude-code"`: typed
+  // reads permissions.allow from Claude Code's user settings.json, so its
+  // install unions the same grant into the same file (see its module header).
+  TYPED_TARGET,
 ] as const satisfies readonly (InlineTarget | ModularTarget)[];
 
 /** Derived from the rows, never hand-kept beside them: `defineTarget`'s
@@ -366,8 +378,43 @@ export function resolveInstallSites(opts: ResolvePathOptions): ConfigSite[] {
   ];
 }
 
+/** The program file a row's `programProbe` looks at for one (client, scope),
+ *  the markers that mean it can read the file install writes, and the warning
+ *  to print when it cannot -- or null for a row with no probe.
+ *
+ *  Resolved against the same PathBase as the row's paths, so the program's
+ *  location honours exactly the env values `readClientEnv` reported. Reads no
+ *  file: install-cmd owns the read, like every other read of a path this
+ *  module resolves. */
+export function resolveProgramProbe(
+  opts: ResolvePathOptions,
+): { file: string; markers: readonly string[]; warning: string } | null {
+  const { target, base } = resolveTargetBase(opts);
+  const probe = target.programProbe;
+  if (probe === undefined) return null;
+  const file = probe.programFile(base);
+  return { file, markers: probe.markers, warning: probe.warning(file, base) };
+}
+
+/** The files a row's `hooks.alsoReads` names for one (client, scope), as
+ *  READ-ONLY `ConfigSite`s in the row's effective format -- the client parses
+ *  them the way it parses its own file. Empty for a row without the hook.
+ *  Validates, and throws, exactly as `resolveInstallSites` does. */
+export function resolveAlsoReadSites(opts: ResolvePathOptions): ConfigSite[] {
+  const { target, scopeSpec, base } = resolveTargetBase(opts);
+  const format = effectiveConfigFormat(target.config, scopeSpec);
+  return (target.hooks?.alsoReads?.(base) ?? []).map((resolved, i) => ({
+    id: `also-reads-${i}`,
+    label: target.label,
+    resolved,
+    format,
+    detectDir: null,
+  }));
+}
+
 /** The target, its scope spec and the `PathBase` one resolve runs against --
- *  the shared first half of `resolveInstallPath` and `resolveInstallSites`.
+ *  the shared first half of `resolveInstallPath`, `resolveInstallSites`,
+ *  `resolveAlsoReadSites` and `resolveProgramProbe`.
  *
  *  Shared rather than copied because every refusal in it is a CONTRACT: the
  *  unknown-client, unsupported-scope, unavailable-OS and missing-project-dir
@@ -501,14 +548,45 @@ function resolveTargetBase(opts: ResolvePathOptions): {
  *  whose name legitimately contains a backslash is not mangled. A UNC path has
  *  no drive letter, so only its separators change.
  *
+ *  A TRAILING separator is dropped too, on every shape, unless the path is a
+ *  root ("/", "C:/", "//server/share/"). Both readers of this key look it up
+ *  under the session's working directory, which never ends in a separator
+ *  below a root: Claude Code byte-exactly, and typed's CLI -- which reads the
+ *  same `projects[...]` entries -- after folding separators (and, on win32,
+ *  case) but NOT a trailing slash (typed apps/cli/src/mcp/config.ts,
+ *  collectClaudeJson's `normalizeKey`). So "C:/repo/" is a key neither reads.
+ *  The CLI's own `--project-dir C:/repo/` never reaches here with one --
+ *  resolveInstallSite, `install --list` and `try` all pass the directory
+ *  through `resolve()`, which drops it -- but `resolveInstallPath` passes an
+ *  already-absolute `projectDir` through unchanged and doctor's probe hands it
+ *  its `cwd` option as given, so the key is where the guarantee has to live.
+ *
  *  Exported for tests: the Windows-shape branch is unreachable through
  *  resolveInstallPath on a POSIX runner (isAbsolute("C:\\...") is false
  *  there, so resolve() rewrites the fixture first). */
 export function claudeCodeProjectKey(projectDir: string): string {
   if (WINDOWS_DRIVE_PATH.test(projectDir)) {
-    return projectDir[0].toUpperCase() + projectDir.slice(1).replace(/\\/g, "/");
+    // "C:/" is the drive root, and keeps its separator.
+    return withoutTrailingSlash(projectDir[0].toUpperCase() + projectDir.slice(1).replace(/\\/g, "/"), 3);
   }
-  return projectDir.startsWith("\\\\") ? projectDir.replace(/\\/g, "/") : projectDir;
+  if (projectDir.startsWith("\\\\")) {
+    const key = projectDir.replace(/\\/g, "/");
+    // "//server/share/" is a UNC root. A spelling too short to have one is
+    // left exactly as it came.
+    const root = /^\/\/[^/]+\/[^/]+\//.exec(key);
+    return root ? withoutTrailingSlash(key, root[0].length) : key;
+  }
+  // POSIX: "/" is the root, and only "/" is a separator -- a trailing backslash
+  // is part of a directory NAME there.
+  return withoutTrailingSlash(projectDir, 1);
+}
+
+/** `key` with its trailing "/" run removed, never shortening it below
+ *  `rootLength` characters. */
+function withoutTrailingSlash(key: string, rootLength: number): string {
+  let end = key.length;
+  while (end > rootLength && key[end - 1] === "/") end--;
+  return key.slice(0, end);
 }
 
 /** A path (or a `projects[...]` key, which is the same string) that starts

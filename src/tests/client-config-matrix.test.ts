@@ -299,6 +299,33 @@ describe("each row's own behaviour, as data", () => {
     expect(redirected.display).toBe(redirected.absolute);
   });
 
+  it("typed reads ONE strict-json file under the home on every OS, and shares Claude Code's grant", () => {
+    const typed = row("typed");
+    expect(typed.config.format).toBe("json");
+    expect(typed.scopes.map((s) => s.scope)).toEqual(["user"]);
+    for (const os of typed.availableOn) {
+      // Same absolute path on all three: typed resolves it from os.homedir(),
+      // never %APPDATA% or $XDG_CONFIG_HOME, and not CLAUDE_CONFIG_DIR.
+      const r = resolveInstallPath({
+        clientId: "typed",
+        scope: "user",
+        os,
+        home: HOME,
+        appData: APPDATA,
+        claudeConfigDir: "/synth/overlay",
+        clientEnv: { xdgConfigHome: "/xdg" },
+      });
+      expect(r.absolute, os).toBe(join(HOME, ".config", "typed", "mcp.json"));
+    }
+    // Strict, like Cline: a comment makes the file unwritable.
+    const site = siteFor(typed, typed.scopes[0], "windows");
+    const view = classifyClientConfig('{\n  // a note\n  "mcpServers": {}\n}\n', site);
+    expect(view.unloadable()).not.toBeNull();
+    expect(() => applyClientConfigEdits(view, [{ op: "upsert", key: ENTRY_NAME, entry: ENTRY }], site)).toThrow();
+    expect(typed.entry?.windowsLaunch?.broker).toBe("bare");
+    expect(typed.hooks?.permissionsPatch).toBe(row("claude-code").hooks?.permissionsPatch);
+  });
+
   it("leaves every pre-existing row on the default restart wording", () => {
     // The six oldest rows print exactly what they printed before `reload`
     // existed, which is what makes routing them through reloadDoneClause a

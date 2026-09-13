@@ -86,7 +86,8 @@ export const LEGACY_ENTRY_NAMES = ["mcp.hosting", "mcph", "yaw-mcp"] as const;
 /** What a target's own `resolvePath` / `sites` hooks are handed: the resolved
  *  directories, already defaulted, plus the client env-var values read through
  *  `readClientEnv`. A row NEVER reads `process.env` itself -- the boundary
- *  test's R7 confines those seven names to this module's neighbourhood. */
+ *  test's R7 flags a read of any name in CLIENT_ENV_VARS outside its short
+ *  allowlist. */
 export interface PathBase {
   home: string;
   /** Windows `%APPDATA%`, chosen by the caller via `resolveAppDataDir`. */
@@ -111,7 +112,29 @@ export interface ClientEnvValues {
   clineMcpSettingsPath?: string;
   codexHome?: string;
   continueGlobalDir?: string;
+  typedCliBundle?: string;
   xdgConfigHome?: string;
+  yawMode?: string;
+}
+
+/** How install tells that the client's own INSTALLED PROGRAM is too old to read
+ *  the entry install writes: by probing that program's bytes for a literal the
+ *  capability brings with it, never by comparing a version string -- a build
+ *  can carry a version number without the feature, and the other way round.
+ *
+ *  A function-valued field like `resolvePath`, handed the same PathBase, so the
+ *  program's location comes from the env values `readClientEnv` reported and
+ *  never from a read of `process.env` in the row. */
+export interface ProgramCapabilityProbe {
+  /** The program file to probe. */
+  programFile: (base: PathBase) => string;
+  /** Literal strings; the program HAS the capability when any one of them
+   *  occurs in its bytes. */
+  markers: readonly string[];
+  /** The one warning install prints when the file exists and carries none of
+   *  the markers. Nothing is printed when the file is absent or unreadable --
+   *  there is no program there to judge. */
+  warning: (programFile: string, base: PathBase) => string;
 }
 
 /** One copy of a target's config file. A target with no `sites` hook has
@@ -131,10 +154,26 @@ export interface SiteSpec {
  *  `clientId` -- the three `clientId === "claude-code"` branches and the one
  *  `clientId === "vscode"` branch this replaces are what R6 now forbids. */
 export interface TargetHooks {
-  /** Patch this client's own permission file alongside the launch entry.
-   *  "claude-code" is the only scheme there is; the value names it rather than
-   *  carrying a function so the row stays data. */
+  /** Patch the permission file this client reads alongside the launch entry.
+   *  "claude-code" is the only scheme there is -- `permissions.allow` in
+   *  Claude Code's settings.json, which typed reads as well -- and the value
+   *  names it rather than carrying a function so the row stays data. Install
+   *  and uninstall both read it; two rows whose scheme resolves to the same
+   *  file share one grant, and uninstall keeps it while the other still has
+   *  its entry. */
   permissionsPatch?: "claude-code";
+  /** The OTHER files this client loads a server entry from, each ranked BELOW
+   *  the row's own file: an entry the row writes shadows one there for this
+   *  client, and one there still launches yaw-mcp after the row's own entry is
+   *  gone. READ-ONLY -- no verb writes, lists or probes them. Two readers:
+   *  uninstall's shared-grant check counts an "mcp" entry in one as a client
+   *  still using the grant (on this row's own uninstall as well as a peer's),
+   *  and install says so when the npx entry it writes replaces a launch one of
+   *  them already carries. A function, unlike the named schemes beside it,
+   *  because the files are the client's and move with the `PathBase` (home,
+   *  CLAUDE_CONFIG_DIR); it answers paths only, and the core reads each in the
+   *  row's own format -- the one the client parses them with. */
+  alsoReads?: (base: PathBase) => ResolvedPath[];
   /** Which `${...}` expansion rules `import` applies to this client's entries.
    *  BOTH handlers live in import-cmd.ts; a row only names the value.
    *  "vscode-inputs" is the inputs-block + `${workspaceFolder}` logic. */
@@ -177,6 +216,17 @@ export interface InstallTargetBase {
   /** How the client picks up a config change. Default "restart", which is the
    *  Done line every existing row prints. */
   reload?: ReloadKind;
+  /** For a client that can go on starting yaw-mcp WITHOUT the entry uninstall
+   *  removes: the sentence uninstall's Done line adds to say so and how to stop
+   *  it. Its presence also scopes that line's "no longer launches yaw-mcp" to
+   *  the file the entry left, since the unscoped claim would be false. Absent
+   *  on every row whose client only ever launches what its config names. */
+  uninstallNote?: string;
+  /** For a client whose installed program may predate the file this row
+   *  writes: how install probes for that, and what it warns. See
+   *  ProgramCapabilityProbe. Absent on every row whose client has read its
+   *  file for as long as yaw-mcp has written it. */
+  programProbe?: ProgramCapabilityProbe;
   /** Every copy of the file for one (client, scope) -- a fan-out only Cline
    *  needs. Absent means one site at `resolvePath`/`pathFor`, `detectDir: null`. */
   sites?: (base: PathBase) => SiteSpec[];
