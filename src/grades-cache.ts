@@ -235,6 +235,9 @@ export interface WriteGradeOptions {
   lockWaitMs?: number;
   /** Age past which a lock is treated as abandoned and stolen. */
   lockStaleMs?: number;
+  /** How long the take may keep failing with a transient win32 errno before
+   *  that errno is thrown (GRADES_LOCK_TRANSIENT_MS). */
+  lockTransientMs?: number;
 }
 
 /** Create the lock with O_EXCL, carrying `token`. False when someone else
@@ -332,6 +335,7 @@ async function withGradesLock<T>(path: string, opts: WriteGradeOptions, fn: () =
   const lockPath = `${path}${GRADES_LOCK_SUFFIX}`;
   const staleMs = opts.lockStaleMs ?? GRADES_LOCK_STALE_MS;
   const waitMs = opts.lockWaitMs ?? GRADES_LOCK_WAIT_MS;
+  const transientMs = opts.lockTransientMs ?? GRADES_LOCK_TRANSIENT_MS;
   const token = `${process.pid}-${++lockSeq}\n`;
   const isLive = (ageMs: number): boolean => ageMs > -GRADES_LOCK_FUTURE_SKEW_MS && ageMs < staleMs;
 
@@ -350,9 +354,13 @@ async function withGradesLock<T>(path: string, opts: WriteGradeOptions, fn: () =
       if (!isWin32TransientFsError(err)) throw err;
       const now = Date.now();
       transientSince ??= now;
-      if (now >= deadline || now - transientSince >= GRADES_LOCK_TRANSIENT_MS) throw err;
-      // No stat or steal: the create failed without telling us anything about
-      // a lock at the path, so there is nothing to judge stale. Just pace.
+      if (now >= deadline || now - transientSince >= transientMs) throw err;
+      // No stat or steal. Usually the create itself failed, which says nothing
+      // about a lock at the path. Otherwise the create worked and the token
+      // write or close after it failed, and takeLock has already removed that
+      // half-made lock -- or, if its removal failed too, left a fresh file the
+      // next take will meet as EEXIST and wait out like any live lock. Neither
+      // leaves anything to judge stale here. Just pace.
       await delay(GRADES_LOCK_POLL_MS);
       continue;
     }

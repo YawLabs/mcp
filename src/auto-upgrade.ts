@@ -274,8 +274,13 @@ const UPGRADE_LOCK_FUTURE_SKEW_MS = 5 * 1000;
  *  retry, that EPERM took the "cannot create a lock here" branch and handed
  *  back a no-op release, so the caller ran unlocked beside whichever process
  *  took the lock next. The take is synchronous, so the backoff blocks the
- *  thread: 26 ms in all, paid only when every attempt fails -- and a directory
- *  that genuinely denies the create still ends on that same no-op release. */
+ *  thread. The delays add up to 26 ms, but a short wait on Windows often
+ *  overshoots toward the system timer tick: the three together measured
+ *  31-74 ms on an idle box and up to about 300 ms under load. All three are paid whenever the first three
+ *  attempts fail, whether or not the fourth succeeds, and one
+ *  acquireUpgradeLock can pay them twice -- its first take, then one of the
+ *  retake, the steal's restore or the take after the steal. A directory that
+ *  genuinely denies the create still ends on that same no-op release. */
 const LOCK_CREATE_RETRY_DELAYS_MS = [1, 5, 20];
 
 function sleepSync(ms: number): void {
