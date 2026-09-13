@@ -34,6 +34,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, describe, expect, it, vi } from "vitest";
+import { MIN_OAM_VERSION } from "../oam-spawn.js";
 
 // Every case here spawnSyncs a real bash running a real script, and there are
 // 55 of them: ~142 s of wall clock for the file, so ~2.6 s a case on an idle
@@ -969,5 +970,419 @@ describe("release.sh behaviour-change gate (fixture run)", () => {
     const r = run(["y", "  YAW_MCP_NEW_THING  "]);
     expect(r.out).toContain("found in the Unreleased section");
     expect(r.out).toContain("CONTINUED");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// THE OAM FLOOR
+// ---------------------------------------------------------------------------
+//
+// MIN_OAM_VERSION tracks the latest oam release as policy. release.sh reads
+// that release from GitHub in its pre-flight and, on a fresh release, moves the
+// constant, its test ratchet and a changelog block to it in a commit made
+// before step 1. Every case here is hermetic: curl is a shell function, and the
+// one git repo is a local temp repo with the operator's own config shut out.
+
+const OAM_HELPERS = extractBlock("# >>> oam floor helpers", "# <<< oam floor helpers");
+
+/** Forward slashes, so a Windows temp path can sit inside a bash string. */
+function shPath(p: string): string {
+  return p.replace(/\\/g, "/");
+}
+
+function oamSrcFixture(floor: string): string {
+  return ["// fixture", "/** doc */", `export const MIN_OAM_VERSION = "${floor}";`, "export const OTHER = 1;", ""].join(
+    "\n",
+  );
+}
+
+function oamTestFixture(floor: string): string {
+  return ['describe("MIN_OAM_VERSION freshness floor", () => {', `  const FLOOR = "${floor}";`, "});", ""].join("\n");
+}
+
+const OAM_CHANGELOG = [
+  "# Changelog",
+  "",
+  "## Unreleased -- things",
+  "",
+  "**Fixed -- something**",
+  "",
+  "A paragraph.",
+  "",
+  "## 1.0.1 -- older",
+  "",
+  "Old text.",
+  "",
+].join("\n");
+
+type OamFixture = { floor?: string; ratchet?: string; src?: string; test?: string; changelog?: string };
+
+function writeOamFixture(dir: string, opts: OamFixture = {}): void {
+  const floor = opts.floor ?? "0.13.1";
+  mkdirSync(join(dir, "src", "tests"), { recursive: true });
+  writeFileSync(join(dir, "src", "oam-spawn.ts"), opts.src ?? oamSrcFixture(floor));
+  writeFileSync(join(dir, "src", "tests", "oam-spawn.test.ts"), opts.test ?? oamTestFixture(opts.ratchet ?? floor));
+  writeFileSync(join(dir, "CHANGELOG.md"), opts.changelog ?? OAM_CHANGELOG);
+}
+
+/** What GitHub's /releases/latest answers, trimmed to the fields release.sh reads. */
+function oamRelease(over: Record<string, unknown> = {}): string {
+  return JSON.stringify({
+    tag_name: "v0.15.2",
+    published_at: "2026-09-13T13:11:42Z",
+    draft: false,
+    prerelease: false,
+    ...over,
+  });
+}
+
+/** curl as a shell function: records its arguments, prints $FAKE_BODY, exits $FAKE_CURL_RC. */
+const CURL_STUB = 'curl() { echo "$*" > curl-args.txt; printf \'%s\' "${FAKE_BODY:-}"; return "${FAKE_CURL_RC:-0}"; }';
+
+describe("release.sh oam floor helpers", () => {
+  const dir = newTmp("release-oam-helpers-");
+  const realSrc = shPath(join(repoRoot, "src", "oam-spawn.ts"));
+  const realTest = shPath(join(repoRoot, "src", "tests", "oam-spawn.test.ts"));
+
+  function sh(lines: string[], env: Record<string, string> = {}): RunResult {
+    return runBash([STUB_HELPERS, OAM_HELPERS, CURL_STUB, ...lines].join("\n"), dir, env);
+  }
+
+  it("reads the real MIN_OAM_VERSION out of src/oam-spawn.ts", () => {
+    const r = sh([`OAM_FLOOR_SRC="${realSrc}"`, "current_oam_floor"]);
+    expect(r.status).toBe(0);
+    expect(r.out.trim()).toBe(MIN_OAM_VERSION);
+  });
+
+  it("can move the real constant and the real ratchet literal", () => {
+    // Pins the SHAPES the move depends on in the two real source files. If
+    // either line is reshaped, this goes red now rather than on the next
+    // release that needs a move. The changelog is a fixture: whether the real
+    // one has an Unreleased section depends on where it is in a release cycle.
+    writeFileSync(join(dir, "CHANGELOG.md"), OAM_CHANGELOG);
+    const r = sh([
+      `oam_floor_rewrite --check "${realSrc}" "${realTest}" CHANGELOG.md 999.0.0 "${MIN_OAM_VERSION}" 2026-01-01 9.9.9`,
+      'echo "RC=$?"',
+    ]);
+    expect(r.out.trim()).toBe("RC=0");
+  });
+
+  it("refuses a source with no MIN_OAM_VERSION line, and one with two", () => {
+    writeFileSync(join(dir, "none.ts"), "export const OTHER = 1;\n");
+    writeFileSync(join(dir, "two.ts"), `${oamSrcFixture("0.13.1")}${oamSrcFixture("0.13.2")}`);
+    const none = sh(['OAM_FLOOR_SRC="none.ts"', 'OUT=$(current_oam_floor); echo "RC=$? OUT=[$OUT]"']);
+    expect(none.out).toContain("found 0");
+    expect(none.out).toContain("RC=1 OUT=[]");
+    const two = sh(['OAM_FLOOR_SRC="two.ts"', 'OUT=$(current_oam_floor); echo "RC=$? OUT=[$OUT]"']);
+    expect(two.out).toContain("found 2");
+    expect(two.out).toContain("RC=1 OUT=[]");
+  });
+
+  it("reads the latest oam release and the day it was published", () => {
+    const r = sh(['OUT=$(latest_oam_release); echo "RC=$? OUT=[$OUT]"'], {
+      FAKE_BODY: oamRelease(),
+      FAKE_CURL_RC: "0",
+    });
+    expect(r.out.trim()).toBe("RC=0 OUT=[0.15.2 2026-09-13]");
+    expect(readFileSync(join(dir, "curl-args.txt"), "utf8")).toContain(
+      "https://api.github.com/repos/YawLabs/oam/releases/latest",
+    );
+  });
+
+  it("accepts a tag written without the v", () => {
+    const r = sh(['OUT=$(latest_oam_release); echo "RC=$? OUT=[$OUT]"'], {
+      FAKE_BODY: oamRelease({ tag_name: "0.15.2" }),
+      FAKE_CURL_RC: "0",
+    });
+    expect(r.out.trim()).toBe("RC=0 OUT=[0.15.2 2026-09-13]");
+  });
+
+  it.each([
+    ["a prerelease", oamRelease({ prerelease: true }), "0"],
+    ["a draft", oamRelease({ draft: true }), "0"],
+    ["a tag that is not a version", oamRelease({ tag_name: "nightly" }), "0"],
+    ["a two-part version", oamRelease({ tag_name: "v0.15" }), "0"],
+    ["a release with no publish date", oamRelease({ published_at: null }), "0"],
+    ["a body that is not JSON", "<html>rate limited</html>", "0"],
+    ["a failed request", oamRelease(), "22"],
+  ])("answers nothing, and fails, for %s", (_name, body, rc) => {
+    const r = sh(['OUT=$(latest_oam_release); echo "RC=$? OUT=[$OUT]"'], { FAKE_BODY: body, FAKE_CURL_RC: rc });
+    expect(r.out.trim()).toBe("RC=1 OUT=[]");
+  });
+
+  it.each([
+    ["0.13.1", "0.15.2", "-1"],
+    ["0.15.2", "0.15.2", "0"],
+    ["0.15.3", "0.15.2", "1"],
+    ["0.10.0", "0.9.9", "1"],
+    ["0.9.9", "0.10.0", "-1"],
+    ["1.0.0", "0.99.99", "1"],
+  ])("semver_cmp %s %s is %s, part by part as numbers", (a, b, want) => {
+    expect(sh([`semver_cmp ${a} ${b}`]).out.trim()).toBe(want);
+  });
+});
+
+describe("release.sh oam floor pre-flight", () => {
+  const block = extractBlock("# >>> oam floor pre-flight", "# <<< oam floor pre-flight");
+
+  type PreflightRun = RunResult & { dir: string };
+
+  function run(
+    opts: OamFixture & { body?: string; curlRc?: number; resuming?: boolean; allowStale?: boolean } = {},
+  ): PreflightRun {
+    const dir = newTmp("release-oam-pre-");
+    writeOamFixture(dir, opts);
+    const body = [
+      STUB_HELPERS,
+      OAM_HELPERS,
+      CURL_STUB,
+      `RESUMING=${opts.resuming ? "true" : "false"}`,
+      'VERSION="9.9.9"',
+      block,
+      'echo "TARGET=[$OAM_FLOOR_TARGET] DATE=[$OAM_FLOOR_DATE]"',
+      'echo "CONTINUED"',
+    ].join("\n");
+    const r = runBash(body, dir, {
+      FAKE_BODY: opts.body ?? oamRelease(),
+      FAKE_CURL_RC: String(opts.curlRc ?? 0),
+      // Set either way, so an operator's own environment cannot flip a case.
+      ALLOW_STALE_OAM_FLOOR: opts.allowStale ? "1" : "",
+    });
+    return { ...r, dir };
+  }
+
+  it("plans nothing when the floor is the latest release", () => {
+    const r = run({ floor: "0.15.2" });
+    expect(r.out).toContain("INFO oam floor 0.15.2 is the latest oam release");
+    expect(r.out).toContain("TARGET=[] DATE=[]");
+    expect(r.out).toContain("CONTINUED");
+  });
+
+  it("plans the move on a fresh release whose floor is behind, and writes nothing yet", () => {
+    const r = run({ floor: "0.13.1" });
+    expect(r.out).toContain("INFO oam floor 0.13.1 is behind oam 0.15.2 (published 2026-09-13)");
+    expect(r.out).toContain("TARGET=[0.15.2] DATE=[2026-09-13]");
+    expect(r.out).toContain("CONTINUED");
+    expect(readFileSync(join(r.dir, "src", "oam-spawn.ts"), "utf8")).toBe(oamSrcFixture("0.13.1"));
+    expect(readFileSync(join(r.dir, "src", "tests", "oam-spawn.test.ts"), "utf8")).toBe(oamTestFixture("0.13.1"));
+    expect(readFileSync(join(r.dir, "CHANGELOG.md"), "utf8")).toBe(OAM_CHANGELOG);
+  });
+
+  it("compares versions as numbers, so 0.9.9 is behind 0.10.0", () => {
+    const r = run({ floor: "0.9.9", body: oamRelease({ tag_name: "v0.10.0" }) });
+    expect(r.out).toContain("TARGET=[0.10.0]");
+  });
+
+  it("never moves the floor on a resume", () => {
+    const r = run({ floor: "0.13.1", resuming: true });
+    expect(r.out).toContain("WARN oam 0.15.2 is out and the oam floor is still 0.13.1 -- a resume does not move it");
+    expect(r.out).toContain("TARGET=[]");
+    expect(r.out).toContain("CONTINUED");
+  });
+
+  it("fails closed on a fresh release when GitHub cannot be read", () => {
+    const r = run({ curlRc: 6 });
+    expect(r.out).toContain("FAIL Could not read the latest oam release");
+    expect(r.out).toContain("ALLOW_STALE_OAM_FLOOR=1");
+    expect(r.out).not.toContain("CONTINUED");
+  });
+
+  it("proceeds on the current floor, unchecked, under ALLOW_STALE_OAM_FLOOR=1", () => {
+    const r = run({ curlRc: 6, allowStale: true });
+    expect(r.out).toContain("WARN Could not read the latest oam release from GitHub");
+    expect(r.out).toContain("UNCHECKED");
+    expect(r.out).toContain("TARGET=[]");
+    expect(r.out).toContain("CONTINUED");
+  });
+
+  it("proceeds, unchecked, on a resume when GitHub cannot be read", () => {
+    const r = run({ curlRc: 6, resuming: true });
+    expect(r.out).toContain("UNCHECKED");
+    expect(r.out).toContain("CONTINUED");
+  });
+
+  it("refuses a floor AHEAD of the latest release on a fresh release, and only warns on a resume", () => {
+    const fresh = run({ floor: "0.16.0" });
+    expect(fresh.out).toContain("FAIL The oam floor 0.16.0 is AHEAD of the latest oam release 0.15.2");
+    expect(fresh.out).not.toContain("CONTINUED");
+    const resume = run({ floor: "0.16.0", resuming: true });
+    expect(resume.out).toContain("WARN The oam floor 0.16.0 is AHEAD");
+    expect(resume.out).toContain("CONTINUED");
+  });
+
+  it("stops before the prompt when the changelog has no section for this release", () => {
+    // The first section is a release that already shipped. Filing the move
+    // there would be a lie about 1.0.1, so the run stops instead of guessing.
+    const changelog = OAM_CHANGELOG.replace("## Unreleased -- things", "## 1.0.2 -- shipped");
+    const r = run({ floor: "0.13.1", changelog });
+    expect(r.out).toContain("no section to record the floor move in");
+    expect(r.out).toContain("FAIL oam 0.15.2 is out and the oam floor is 0.13.1, but this script cannot move it");
+    expect(r.out).not.toContain("CONTINUED");
+  });
+
+  it("accepts a first section already renamed to the version being released", () => {
+    const changelog = OAM_CHANGELOG.replace("## Unreleased -- things", "## 9.9.9 -- this release");
+    expect(run({ floor: "0.13.1", changelog }).out).toContain("TARGET=[0.15.2]");
+  });
+
+  it("does not take a longer version for this one (## 9.9.90 is not ## 9.9.9)", () => {
+    const changelog = OAM_CHANGELOG.replace("## Unreleased -- things", "## 9.9.90 -- another");
+    expect(run({ floor: "0.13.1", changelog }).out).toContain("no section to record the floor move in");
+  });
+
+  it("stops before the prompt when the ratchet literal is missing", () => {
+    const r = run({ floor: "0.13.1", test: "describe('no ratchet here', () => {});\n" });
+    expect(r.out).toContain("expected exactly one const FLOOR line, found 0");
+    expect(r.out).not.toContain("CONTINUED");
+  });
+
+  it("stops when the floor cannot be read out of the source at all", () => {
+    const r = run({ src: "export const OTHER = 1;\n" });
+    expect(r.out).toContain("FAIL Could not read the oam floor out of src/oam-spawn.ts");
+    expect(r.out).not.toContain("CONTINUED");
+  });
+});
+
+describe("release.sh oam floor move", () => {
+  const block = extractBlock("# >>> oam floor move", "# <<< oam floor move");
+
+  // An empty global config and no system config, so the operator's own commit
+  // signing, hooks or autocrlf cannot reach these commits.
+  const gitHome = newTmp("release-oam-gitcfg-");
+  writeFileSync(join(gitHome, "config"), "");
+  const GIT_ENV = {
+    GIT_CONFIG_GLOBAL: join(gitHome, "config"),
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_AUTHOR_NAME: "fixture",
+    GIT_AUTHOR_EMAIL: "fixture@example.invalid",
+    GIT_COMMITTER_NAME: "fixture",
+    GIT_COMMITTER_EMAIL: "fixture@example.invalid",
+  };
+
+  function git(dir: string, args: string[]): string {
+    const r = spawnSync("git", args, { cwd: dir, encoding: "utf8", env: { ...process.env, ...GIT_ENV } });
+    if (r.status !== 0) {
+      throw new Error(`git ${args.join(" ")} failed: ${r.stderr}`);
+    }
+    return r.stdout;
+  }
+
+  function repo(opts: OamFixture = {}): string {
+    const dir = newTmp("release-oam-move-");
+    writeOamFixture(dir, opts);
+    writeFileSync(join(dir, "unrelated.txt"), "before\n");
+    git(dir, ["init", "-q", "-b", "main"]);
+    git(dir, ["add", "-A"]);
+    git(dir, ["commit", "-q", "-m", "fixture"]);
+    return dir;
+  }
+
+  function run(dir: string, now: string, target: string): RunResult {
+    const body = [
+      STUB_HELPERS,
+      OAM_HELPERS,
+      "CYAN=''",
+      "NC=''",
+      'VERSION="9.9.9"',
+      `OAM_FLOOR_NOW="${now}"`,
+      `OAM_FLOOR_TARGET="${target}"`,
+      'OAM_FLOOR_DATE="2026-09-13"',
+      block,
+      'echo "CONTINUED"',
+    ].join("\n");
+    // The harness lives OUTSIDE the repo, so it can never show up as a change.
+    const file = join(newTmp("release-oam-move-harness-"), "move.sh");
+    writeFileSync(file, body);
+    const r = spawnSync("bash", [file], {
+      cwd: dir,
+      encoding: "utf8",
+      env: { ...process.env, NO_COLOR: "1", ...GIT_ENV },
+    });
+    return { status: r.status, out: `${r.stdout ?? ""}${r.stderr ?? ""}` };
+  }
+
+  const read = (dir: string, ...p: string[]) => readFileSync(join(dir, ...p), "utf8");
+
+  it("moves all three, and commits exactly those three files", () => {
+    const dir = repo();
+    // A change that is STAGED but is not the release's: `git commit -- <paths>`
+    // must leave it out of the floor commit, and still staged.
+    writeFileSync(join(dir, "unrelated.txt"), "after\n");
+    git(dir, ["add", "unrelated.txt"]);
+
+    const r = run(dir, "0.13.1", "0.15.2");
+    expect(r.out).toContain("INFO oam floor 0.13.1 -> 0.15.2, committed");
+    expect(r.out).toContain("WARN Not re-run by this script");
+    expect(r.out).toContain("CONTINUED");
+
+    expect(read(dir, "src", "oam-spawn.ts")).toBe(oamSrcFixture("0.15.2"));
+    expect(read(dir, "src", "tests", "oam-spawn.test.ts")).toBe(oamTestFixture("0.15.2"));
+    expect(git(dir, ["log", "-1", "--format=%s"]).trim()).toBe("fix(oam): move the floor to 0.15.2");
+    const committed = git(dir, ["show", "--name-only", "--format=", "HEAD"]).trim().split("\n").sort();
+    expect(committed).toEqual(["CHANGELOG.md", "src/oam-spawn.ts", "src/tests/oam-spawn.test.ts"]);
+    expect(git(dir, ["status", "--porcelain"])).toBe("M  unrelated.txt\n");
+  });
+
+  it("files the block at the END of the Unreleased section, above the release before it", () => {
+    const dir = repo();
+    run(dir, "0.13.1", "0.15.2");
+    const log = read(dir, "CHANGELOG.md");
+    const heading = "**Changed -- the oam floor moves to 0.15.2**";
+    expect(log.indexOf(heading)).toBeGreaterThan(log.indexOf("A paragraph."));
+    expect(log.indexOf(heading)).toBeLessThan(log.indexOf("## 1.0.1 -- older"));
+    expect(log).toContain("v0.15.2 is now current (published 2026-09-13); the floor was 0.13.1.");
+    // One blank line on each side of the block, none doubled.
+    expect(log).toContain(`A paragraph.\n\n${heading}\n\n`);
+    expect(log).not.toContain("\n\n\n");
+    expect(log).toContain(
+      "did not re-run the oam hosting check that `src/oam-spawn.ts` describes.\n\n## 1.0.1 -- older",
+    );
+  });
+
+  it("appends at the end of the file when the section is the only one, keeping one trailing newline", () => {
+    const dir = repo({ changelog: "# Changelog\n\n## Unreleased -- only\n\nA paragraph.\n" });
+    run(dir, "0.13.1", "0.15.2");
+    const log = read(dir, "CHANGELOG.md");
+    expect(
+      log.startsWith(
+        "# Changelog\n\n## Unreleased -- only\n\nA paragraph.\n\n**Changed -- the oam floor moves to 0.15.2**\n\n",
+      ),
+    ).toBe(true);
+    expect(log.endsWith("describes.\n")).toBe(true);
+  });
+
+  it("keeps a CRLF changelog CRLF", () => {
+    const dir = repo({ changelog: OAM_CHANGELOG.replace(/\n/g, "\r\n") });
+    run(dir, "0.13.1", "0.15.2");
+    const log = read(dir, "CHANGELOG.md");
+    expect(log).toContain("**Changed -- the oam floor moves to 0.15.2**\r\n");
+    expect(/(^|[^\r])\n/.test(log)).toBe(false);
+  });
+
+  it("moves nothing, and commits nothing, when the floor is already at the target", () => {
+    // The pre-flight's value is stale by the time this runs; the block re-reads.
+    const dir = repo({ floor: "0.15.2" });
+    const before = git(dir, ["rev-parse", "HEAD"]);
+    const r = run(dir, "0.13.1", "0.15.2");
+    expect(r.out).toContain("INFO oam floor already at 0.15.2 -- nothing to move");
+    expect(git(dir, ["rev-parse", "HEAD"])).toBe(before);
+    expect(read(dir, "CHANGELOG.md")).toBe(OAM_CHANGELOG);
+  });
+
+  it("writes none of the three files when one of them does not validate", () => {
+    const dir = repo({ test: "describe('no ratchet here', () => {});\n" });
+    const before = git(dir, ["rev-parse", "HEAD"]);
+    const r = run(dir, "0.13.1", "0.15.2");
+    expect(r.out).toContain("FAIL Could not move the oam floor to 0.15.2");
+    expect(r.out).not.toContain("CONTINUED");
+    expect(read(dir, "src", "oam-spawn.ts")).toBe(oamSrcFixture("0.13.1"));
+    expect(read(dir, "CHANGELOG.md")).toBe(OAM_CHANGELOG);
+    expect(git(dir, ["rev-parse", "HEAD"])).toBe(before);
+  });
+
+  it("does nothing at all when no move was planned", () => {
+    const dir = repo();
+    const r = run(dir, "0.13.1", "");
+    expect(r.out.trim()).toBe("CONTINUED");
   });
 });
