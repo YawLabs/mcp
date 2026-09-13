@@ -30,7 +30,7 @@ import { dirname, join } from "node:path";
 import { Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { clientChoices } from "../client-aliases.js";
-import { reloadDoneClause } from "../client-config.js";
+import { reloadDoneClause, reloadRemovalClause } from "../client-config.js";
 import { runDoctor } from "../doctor-cmd.js";
 import {
   type BundlesSummary,
@@ -227,11 +227,24 @@ describe("the typed row, as data", () => {
     ).toThrow("Client typed does not support scope project");
   });
 
-  it("restarts to pick up a change, shares Claude Code's grant, and takes a bare npx on Windows", () => {
-    expect(row.reload).toBe("restart");
-    expect(reloadDoneClause(row.reload, row.label)).toBe("Restart it to pick up the new MCP server.");
+  it("picks a change up in its next session, shares Claude Code's grant, and takes a bare npx on Windows", () => {
+    // typed reads its MCP config once, at session start -- there is no running
+    // app for "Restart it" to mean.
+    expect(row.reload).toBe("next-session");
+    expect(reloadDoneClause(row.reload, row.label)).toBe("typed picks the entry up in its next session.");
+    expect(reloadRemovalClause(row.reload, row.label)).toBe("typed drops the server in its next session.");
     expect(row.hooks).toEqual({ permissionsPatch: "claude-code" });
     expect(row.entry?.windowsLaunch).toEqual({ broker: "bare", upstream: "cmd-wrap" });
+  });
+
+  it("names typed's own Yaw MCP preload and its opt-out in the uninstall note, in ASCII", () => {
+    const note = row.uninstallNote ?? "";
+    expect(note).toContain("preloads Yaw MCP on its own");
+    expect(note).toContain("TYPED_CLI_NO_YAW_MCP=1");
+    expect([...note].every((c) => c.charCodeAt(0) >= 32 && c.charCodeAt(0) < 127)).toBe(true);
+    // The only row that declares one: every other client launches only what its
+    // config names, so its "no longer launches yaw-mcp" is true as it stands.
+    expect(INSTALL_TARGETS.filter((t) => t.uninstallNote !== undefined).map((t) => t.clientId)).toEqual(["typed"]);
   });
 
   it("says what a user needs in its notes, in ASCII", () => {
@@ -321,10 +334,12 @@ describe("install writes typed's strict-JSON file", () => {
     expect(JSON.parse(FRESH)).toEqual({ mcpServers: { mcp: { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] } } });
   });
 
-  it("prints the row's note and the restart Done line", async () => {
+  it("prints the row's note and the next-session Done line", async () => {
     const { stdout } = await install("typed");
     expect(stdout).toContain(`Note: ${row.notes}`);
-    expect(stdout).toContain("Done: typed is configured. Restart it to pick up the new MCP server.");
+    expect(stdout.split(LF).filter((l) => l.startsWith("Done:"))).toEqual([
+      "Done: typed is configured. typed picks the entry up in its next session.",
+    ]);
   });
 
   it("refuses a commented file, which typed would load no server from, and leaves its bytes", async () => {
@@ -411,7 +426,7 @@ describe("uninstall and the SHARED grant", () => {
     expect(allowOf(userSettings())).toEqual([]);
     expect(result.written).toEqual([typedFile(), userSettings()]);
     expect(stdout).not.toContain("Keeping");
-    expect(stdout).toContain("Done: typed no longer launches yaw-mcp.");
+    expect(stdout).toContain("Done: typed no longer launches yaw-mcp from ~/.config/typed/mcp.json.");
   });
 
   it("keeps the grant on `uninstall typed` while Claude Code's user entry still has it", async () => {
@@ -521,6 +536,88 @@ describe("uninstall and the SHARED grant", () => {
     expect(result.exitCode).toBe(0);
     expect(allowOf(userSettings())).toEqual([CLAUDE_CODE_ALLOW_PATTERN]);
     expect(stdout).toContain(keepLine("Claude Code (user)", claudeJson()));
+  });
+});
+
+describe("the Done lines speak to typed, and to no other row", () => {
+  /** The one `Done:` line of a transcript. */
+  function doneLine(stdout: string): string {
+    const lines = stdout.split(LF).filter((l) => l.startsWith("Done:"));
+    expect(lines, `exactly one Done line in:${LF}${stdout}`).toHaveLength(1);
+    return lines[0];
+  }
+
+  it("pins typed's install and uninstall Done lines whole", async () => {
+    expect(doneLine((await install("typed")).stdout)).toBe(
+      "Done: typed is configured. typed picks the entry up in its next session.",
+    );
+    const { result, stdout } = await uninstall("typed");
+    expect(result.exitCode).toBe(0);
+    expect(doneLine(stdout)).toBe(
+      "Done: typed no longer launches yaw-mcp from ~/.config/typed/mcp.json. typed drops the server in its next " +
+        "session. typed's CLI preloads Yaw MCP on its own when no config it reads references it and it finds a " +
+        "yaw-mcp on PATH or a ~/.yaw-mcp directory -- set TYPED_CLI_NO_YAW_MCP=1 to keep it out. Your servers in " +
+        "~/.yaw-mcp/bundles.json are untouched -- `yaw-mcp install typed` wires it back.",
+    );
+  });
+
+  it("leaves every other row's install and uninstall Done lines byte-identical, at every scope", async () => {
+    // The strings below are what install and uninstall printed before typed's
+    // wording existed, spelled out here rather than read off reloadDoneClause
+    // or the uninstall builder -- those are what this test is guarding.
+    const oldReloadClause: Record<string, (label: string) => string> = {
+      restart: () => "Restart it to pick up the new MCP server.",
+      live: (label) => `${label} starts the server when the file is saved -- no restart needed.`,
+      "reload-window": () => "Reload the IDE window to pick up the new MCP server.",
+    };
+    let checked = 0;
+    for (const t of INSTALL_TARGETS) {
+      if (t.clientId === "typed" || !t.availableOn.includes("linux")) continue;
+      const clause = oldReloadClause[t.reload ?? "restart"];
+      expect(clause, `${t.clientId} uses a reload kind that did not exist before typed`).toBeDefined();
+      for (const spec of t.scopes) {
+        const projectDir = spec.requiresProjectDir ? cwd : undefined;
+        const cap = captureIo();
+        const installed = await runInstall({
+          clientId: t.clientId,
+          scope: spec.scope,
+          os: "linux",
+          home,
+          cwd,
+          projectDir,
+          io: cap.io,
+          oamProbe: OAM_ABSENT,
+          bundlesSummary: BUNDLES_EMPTY,
+        });
+        const what = `${t.clientId} (${spec.scope})`;
+        expect(installed.exitCode, `${what}: ${cap.stderr()}`).toBe(0);
+        expect(doneLine(cap.stdout()), what).toBe(
+          t.clientId === "claude-code" && spec.scope === "project"
+            ? "Done: Claude Code is configured. Restart it in this project and approve the .mcp.json server when " +
+                "prompted -- Claude Code keeps project-scope (.mcp.json) servers disabled until you approve them."
+            : `Done: ${t.label} is configured. ${clause(t.label)}`,
+        );
+        const capU = captureIo();
+        const removed = await runUninstall({
+          clientId: t.clientId,
+          scope: spec.scope,
+          os: "linux",
+          home,
+          cwd,
+          projectDir,
+          force: true,
+          io: capU.io,
+        });
+        expect(removed.exitCode, `${what}: ${capU.stderr()}`).toBe(0);
+        expect(doneLine(capU.stdout()), what).toBe(
+          `Done: ${t.label} no longer launches yaw-mcp. Restart it to drop the server. Your servers in ` +
+            `~/.yaw-mcp/bundles.json are untouched -- \`yaw-mcp install ${t.clientId}\` wires it back.`,
+        );
+        checked++;
+      }
+    }
+    // Not vacuous: every Linux row but typed, at each of its scopes.
+    expect(checked).toBeGreaterThan(10);
   });
 });
 

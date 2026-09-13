@@ -181,6 +181,12 @@ export interface InstallTargetBase {
   /** How the client picks up a config change. Default "restart", which is the
    *  Done line every existing row prints. */
   reload?: ReloadKind;
+  /** For a client that can go on starting yaw-mcp WITHOUT the entry uninstall
+   *  removes: the sentence uninstall's Done line adds to say so and how to stop
+   *  it. Its presence also scopes that line's "no longer launches yaw-mcp" to
+   *  the file the entry left, since the unscoped claim would be false. Absent
+   *  on every row whose client only ever launches what its config names. */
+  uninstallNote?: string;
   /** Every copy of the file for one (client, scope) -- a fan-out only Cline
    *  needs. Absent means one site at `resolvePath`/`pathFor`, `detectDir: null`. */
   sites?: (base: PathBase) => SiteSpec[];

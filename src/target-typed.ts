@@ -32,7 +32,17 @@
 //     `cmd /c`. A `try` upstream keeps the shared wrap, as on every row that
 //     declares a bare broker: that entry names a third-party launcher whose
 //     args have to survive cmd's parse;
-//   * reload "restart": typed reads its MCP config once, at startup;
+//   * reload "next-session": typed reads its MCP config once, when a session
+//     starts, and never re-reads it, so install's Done line says the entry
+//     reaches typed's next session and uninstall's says the server goes in
+//     its next session (typed's own `typed mcp add` prints "takes effect next
+//     session");
+//   * `uninstallNote`: typed's CLI PRELOADS Yaw MCP by itself when no config it
+//     reads references Yaw MCP (a textual match, or a server named "mcp" or
+//     "yaw") and it finds a `yaw-mcp` bin on PATH or a `~/.yaw-mcp` directory,
+//     unless TYPED_CLI_NO_YAW_MCP=1 (typed apps/cli/src/mcp/config.ts,
+//     resolveYawMcpPreload). So removing this entry can leave typed starting
+//     Yaw MCP anyway, and the note says so and names the opt-out;
 //   * `hooks.permissionsPatch: "claude-code"`: typed reads `permissions.allow`
 //     from the same user-scope settings.json Claude Code does
 //     (`<CLAUDE_CONFIG_DIR>/settings.json` when that variable is non-empty,
@@ -84,8 +94,10 @@ export const TYPED_TARGET = defineTarget({
   // STRICT: typed parses this file with JSON.parse.
   config: { format: "json", root: CONTAINER_KEY },
   availableOn: ["macos", "linux", "windows"],
-  // typed reads its MCP config at startup and does not watch the file.
-  reload: "restart",
+  // typed reads its MCP config once per session and does not watch the file.
+  reload: "next-session",
+  uninstallNote:
+    "typed's CLI preloads Yaw MCP on its own when no config it reads references it and it finds a yaw-mcp on PATH or a ~/.yaw-mcp directory -- set TYPED_CLI_NO_YAW_MCP=1 to keep it out.",
   entry: {
     windowsLaunch: { broker: "bare", upstream: "cmd-wrap" },
   },

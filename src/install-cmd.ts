@@ -80,6 +80,7 @@ import {
   type EntryTransform,
   readClientConfigFile,
   reloadDoneClause,
+  reloadRemovalClause,
   selectSites,
   siteAt,
   terminateWithNewline,
@@ -3469,11 +3470,31 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
   // Names what was NOT touched on purpose: `uninstall` unwires a client, it
   // does not delete the user's servers. Without this line the obvious reading
   // of "uninstall" is that bundles.json went with it.
-  log(
-    `\nDone: ${target.label} no longer launches yaw-mcp. Restart it to drop the server. ` +
-      "Your servers in ~/.yaw-mcp/bundles.json are untouched -- `yaw-mcp install " +
-      `${target.clientId}` +
-      "` wires it back.",
-  );
+  log(uninstallDoneLine(target, resolved.display));
   return { written, wouldWrite: [], messages, exitCode: 0 };
+}
+
+/** uninstall's closing line, built from the ROW rather than from its id.
+ *
+ *  For a row with neither `uninstallNote` nor `reload: "next-session"` -- every
+ *  row but typed -- this is exactly the string uninstall printed before either
+ *  field existed: "no longer launches yaw-mcp. Restart it to drop the server."
+ *  How a client lets go of the server is its `reload` kind's fact
+ *  (reloadRemovalClause). A row that declares `uninstallNote` names a client
+ *  that can start yaw-mcp without the entry (typed's own Yaw MCP preload), so
+ *  its "no longer launches" is scoped to the file the entry left and the note
+ *  follows -- an unscoped claim there would be the false all-clear this line
+ *  must not print. */
+function uninstallDoneLine(target: InstallTarget, display: string): string {
+  const note = target.uninstallNote;
+  const head =
+    note === undefined
+      ? `${target.label} no longer launches yaw-mcp.`
+      : `${target.label} no longer launches yaw-mcp from ${display}.`;
+  return (
+    `\nDone: ${head} ${reloadRemovalClause(target.reload, target.label)}${note === undefined ? "" : ` ${note}`} ` +
+    "Your servers in ~/.yaw-mcp/bundles.json are untouched -- `yaw-mcp install " +
+    `${target.clientId}` +
+    "` wires it back."
+  );
 }

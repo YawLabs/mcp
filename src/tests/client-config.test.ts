@@ -42,6 +42,7 @@ import {
   readClientEnv,
   registerConfigAdapter,
   reloadDoneClause,
+  reloadRemovalClause,
   resetConfigAdapterRegistry,
   selectSites,
   syntaxNameFor,
@@ -262,6 +263,17 @@ describe("reload descriptors tell the truth per client", () => {
 
   it("asks for a window reload where that is what it takes", () => {
     expect(reloadDoneClause("reload-window", "Continue")).toBe("Reload the IDE window to pick up the new MCP server.");
+  });
+
+  it("names the next session for a CLI that reads its config once per session", () => {
+    expect(reloadDoneClause("next-session", "typed")).toBe("typed picks the entry up in its next session.");
+    expect(reloadRemovalClause("next-session", "typed")).toBe("typed drops the server in its next session.");
+  });
+
+  it("keeps uninstall's restart clause for every kind that existed before next-session", () => {
+    for (const kind of [undefined, "restart", "live", "reload-window"] as const) {
+      expect(reloadRemovalClause(kind, "Zed"), String(kind)).toBe("Restart it to drop the server.");
+    }
   });
 });
 

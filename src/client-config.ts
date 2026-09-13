@@ -497,8 +497,11 @@ export function composeEntry(opts: ComposeEntryOptions): Record<string, unknown>
  *
  *  `"restart"` is the default and today's wording. `"live"` is a client with a
  *  file watcher. `"reload-window"` is an editor extension with no watcher on
- *  the file yaw-mcp wrote, where a full restart is more than the user needs. */
-export type ReloadKind = "live" | "restart" | "reload-window";
+ *  the file yaw-mcp wrote, where a full restart is more than the user needs.
+ *  `"next-session"` is a CLI that reads its MCP config once, when a session
+ *  starts, so there is no running app to restart: the entry reaches the next
+ *  session (typed). */
+export type ReloadKind = "live" | "restart" | "reload-window" | "next-session";
 
 /** The sentence after "Done: <label> is configured." for one reload kind.
  *
@@ -511,9 +514,26 @@ export function reloadDoneClause(reload: ReloadKind | undefined, label: string):
       return `${label} starts the server when the file is saved -- no restart needed.`;
     case "reload-window":
       return "Reload the IDE window to pick up the new MCP server.";
+    case "next-session":
+      return `${label} picks the entry up in its next session.`;
     default:
       return "Restart it to pick up the new MCP server.";
   }
+}
+
+/** The sentence uninstall's Done line prints after "no longer launches
+ *  yaw-mcp", for one reload kind.
+ *
+ *  Only `"next-session"` differs. Every other kind -- `"live"` and
+ *  `"reload-window"` included -- returns the one clause uninstall printed for
+ *  every row before this function existed, byte for byte, so routing those
+ *  rows through here changes no output. Whether a live client needs that
+ *  restart to DROP a server is a separate question this function does not
+ *  reopen. */
+export function reloadRemovalClause(reload: ReloadKind | undefined, label: string): string {
+  return reload === "next-session"
+    ? `${label} drops the server in its next session.`
+    : "Restart it to drop the server.";
 }
 
 // ---------------------------------------------------------------------------
