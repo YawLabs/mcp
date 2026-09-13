@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { buildBrokerBundle } from "./broker-bundle.js";
+import { BROKER_BUNDLE_HOOK_TIMEOUT_MS, buildBrokerBundle } from "./broker-bundle.js";
 
 // The broker used to register SIGTERM and SIGINT and nothing else. That is a
 // POSIX assumption: on Windows an MCP client ends the broker by closing the
@@ -100,27 +100,12 @@ setInterval(() => {}, 1 << 30);
 
 describe("closing stdin shuts the broker down and reaps its upstreams", () => {
   beforeAll(async () => {
-    const { build } = await import("esbuild");
-    workDir = await mkdtemp(join(tmpdir(), "yaw-mcp-shutdown-"));
-    bundlePath = join(workDir, "entry.mjs");
-    await build({
-      entryPoints: [INDEX_SRC],
-      absWorkingDir: PROJECT_ROOT,
-      outfile: bundlePath,
-      bundle: true,
-      platform: "node",
-      format: "esm",
-      target: "node20",
-      mainFields: ["module", "main"],
-      banner: {
-        js: 'import { createRequire as __yawCreateRequire } from "node:module";\nconst require = __yawCreateRequire(import.meta.url);',
-      },
-      define: { __VERSION__: JSON.stringify("0.0.0-test") },
-      logLevel: "silent",
-    });
-    // Same reasoning as index-dispatch.test.ts: bundling the whole dependency
-    // graph is ~1s standalone but shares the box with every other file.
-  }, 180_000);
+    // Built through the shared helper, which has node write the file and runs
+    // it once before returning. In the release run that failed, the bundle's
+    // first execution happened inside SETTLE_BUDGET_MS below and outlasted it;
+    // now it happens here -- see broker-bundle.ts.
+    ({ dir: workDir, path: bundlePath } = await buildBrokerBundle("yaw-mcp-shutdown-"));
+  }, BROKER_BUNDLE_HOOK_TIMEOUT_MS);
 
   afterAll(async () => {
     if (workDir) await rm(workDir, { recursive: true, force: true });
