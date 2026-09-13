@@ -95,6 +95,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, sep } from "node:path";
+import { isWin32TransientFsError } from "./atomic-write.js";
 import { stripInternalSecretsFromEnv } from "./internal-secret-env.js";
 import { log } from "./logger.js";
 import {
@@ -266,6 +267,35 @@ const UPGRADE_LOCK_STALE_MS = 10 * 60 * 1000;
  *  ahead than this really is a stepped clock (see the steal rule below). */
 const UPGRADE_LOCK_FUTURE_SKEW_MS = 5 * 1000;
 
+/** Backoff between retries of the lock's O_EXCL create on a transient win32
+ *  errno (isWin32TransientFsError). The case it exists for is another
+ *  process's release in flight: a create landing inside that unlink fails
+ *  EPERM instead of EEXIST, and the path is free a moment later. Without the
+ *  retry, that EPERM took the "cannot create a lock here" branch and handed
+ *  back a no-op release, so the caller ran unlocked beside whichever process
+ *  took the lock next. The take is synchronous, so the backoff blocks the
+ *  thread: 26 ms in all, paid only when every attempt fails -- and a directory
+ *  that genuinely denies the create still ends on that same no-op release. */
+const LOCK_CREATE_RETRY_DELAYS_MS = [1, 5, 20];
+
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/** openSync(path, "wx"), retried on a transient win32 errno -- see
+ *  LOCK_CREATE_RETRY_DELAYS_MS. EEXIST and every other errno throw at once. */
+function openLockSync(path: string): number {
+  for (const ms of LOCK_CREATE_RETRY_DELAYS_MS) {
+    try {
+      return openSync(path, "wx");
+    } catch (err) {
+      if (!isWin32TransientFsError(err)) throw err;
+      sleepSync(ms);
+    }
+  }
+  return openSync(path, "wx");
+}
+
 /** Is the process that wrote `lockPath` still running? The lock records its
  *  holder's pid (see take() below), so for a lock whose critical section is
  *  IN-PROCESS -- the bundles.json read-modify-write -- a dead holder means a
@@ -337,7 +367,7 @@ export function acquireUpgradeLock(
   /** undefined = the lock is held by someone else; otherwise a release fn. */
   const take = (): (() => void) | undefined => {
     try {
-      const fd = openSync(lockPath, "wx");
+      const fd = openLockSync(lockPath);
       try {
         // The pid is diagnostic (an operator who finds a stuck lock can tell
         // whether the owner still lives) AND load-bearing: the release below
@@ -436,7 +466,7 @@ export function acquireUpgradeLock(
     // behavior) -- its release is ownership-checked, so nothing cascades.
     try {
       const holder = readFileSync(stolenPath, "utf8");
-      const fd = openSync(lockPath, "wx");
+      const fd = openLockSync(lockPath);
       try {
         writeSync(fd, holder);
       } finally {
