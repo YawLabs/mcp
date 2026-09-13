@@ -2,8 +2,8 @@ import { spawn } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { buildBrokerBundle } from "./broker-bundle.js";
 
 // The broker used to register SIGTERM and SIGINT and nothing else. That is a
 // POSIX assumption: on Windows an MCP client ends the broker by closing the
@@ -24,9 +24,6 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 // This is a wall-clock budget on a real subprocess settling, so the file is
 // listed in TIMING_SENSITIVE in vitest.config.ts and runs in the sequential
 // project rather than against a 4x-oversubscribed box.
-
-const INDEX_SRC = fileURLToPath(new URL("../index.ts", import.meta.url));
-const PROJECT_ROOT = fileURLToPath(new URL("../..", import.meta.url));
 
 /** Generous: the broker tears down each upstream in turn, and the box may be
  *  loaded. Standalone the whole settle is ~2s; the budget is for contention,
