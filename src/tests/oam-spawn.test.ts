@@ -2292,9 +2292,13 @@ describe("MIN_OAM_VERSION freshness floor", () => {
     // The contract is ONE-directional: the constant can never drop below
     // this literal (a revert fails here); raising the constant without the
     // literal passes and merely leaves this pin weak, so bump BOTH together.
-    // Catching a NEW upstream release still takes the release checklist --
-    // a network-dependent freshness gate is deliberately out (see the
-    // doctor-cmd stance on network in tests).
+    // Catching a NEW upstream release is release.sh's job, not this suite's:
+    // its pre-flight reads the latest oam release from GitHub, and on a release
+    // not yet tagged or on npm, the block ahead of step 1 moves the constant AND
+    // this literal to it before the gates run (a tagged or published release,
+    // or ALLOW_STALE_OAM_FLOOR=1 when GitHub is unreadable, leaves both where
+    // they are). The suite itself stays off the network (see the doctor-cmd
+    // stance on network in tests).
     expect(compareVersions(MIN_OAM_VERSION, FLOOR)).toBeGreaterThanOrEqual(0);
   });
 });
