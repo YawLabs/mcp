@@ -12,7 +12,8 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { classifyClientConfig } from "../client-config.js";
+import { classifyClientConfig, unloadableConfigProblem } from "../client-config.js";
+import { readStrictJson } from "../client-config-json.js";
 import { runDoctor } from "../doctor-cmd.js";
 import {
   type BundlesSummary,
@@ -32,13 +33,16 @@ import {
   TOKEN_FLAG_DEPRECATION,
 } from "../install-cmd.js";
 import {
+  blockedContainerFix,
   buildLaunchEntry,
   CLAUDE_CODE_ALLOW_PATTERN,
   CURRENT_OS,
   ENTRY_NAME,
   INSTALL_TARGETS,
   type InstallOS,
+  LEGACY_ENTRY_NAMES,
   resolveInstallPath,
+  unloadableConfigFix,
 } from "../install-targets.js";
 import { parseJsonc } from "../jsonc.js";
 import { MIN_OAM_VERSION, OAM_INSTALL_PS1, OAM_INSTALL_SH, type OamProbe, oamNoBinaryReason } from "../oam-spawn.js";
@@ -2073,6 +2077,30 @@ describe("runInstall — non-object container key", () => {
     expect(r.exitCode).toBe(0);
     expect(r.messages.join(" ")).toMatch(/would replace it with an empty object/);
     expect(readFileSync(clientPath, "utf8")).toBe(original);
+  });
+
+  it("reports the repair in the past tense only AFTER the write has landed", async () => {
+    const clientPath = join(synthHome, ".claude.json");
+    writeFileSync(clientPath, `${JSON.stringify({ mcpServers: null }, null, 2)}\n`, "utf8");
+
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
+    const out = cap.stdout();
+    expect(out).toContain("replaced it with an empty object");
+    // The note follows the `Wrote` line it is about. Printed from the DECISION
+    // to repair it came first, which is what let it describe a repair on runs
+    // that went on to refuse the write.
+    expect(out.indexOf("replaced it with an empty object")).toBeGreaterThan(out.indexOf(`Wrote ${clientPath}`));
+    const parsed = parseJsonc(readFileSync(clientPath, "utf8")) as { mcpServers: Record<string, unknown> };
+    expect(parsed.mcpServers[ENTRY_NAME]).toBeDefined();
   });
 });
 
@@ -6210,22 +6238,49 @@ describe("Claude Code local scope -- an entry under the OTHER drive-letter case"
   });
 });
 
-describe("runInstall / runUninstall -- a target whose one scope is SEVERAL files", () => {
+/** %APPDATA% as this suite SEEDS it and as it hands it to install -- one
+ *  helper, so the fixture and the option cannot drift apart. */
+const clineAppData = (home: string): string => join(home, "AppData", "Roaming");
+
+/** Every platform the Cline fan-out has to work on, and where each keeps an
+ *  editor's `User/` tree -- `editorRoot` in target-cline.ts, read from the
+ *  outside.
+ *
+ *  Parameterised rather than pinned to one value, because a fixture built for
+ *  ONE layout does not fail loudly on the others: it seeds a directory that is
+ *  not the site's `detectDir`, so the editor site is simply never detected and
+ *  every copy assertion below goes red. Seeded at %APPDATA% with no `os`
+ *  passed, this suite passed on Windows and was dead weight on macOS and
+ *  Linux -- the fan-out was proven on the runner's platform alone. */
+const CLINE_PLATFORMS: Array<{ os: InstallOS; editorRoot: (home: string) => string }> = [
+  { os: "windows", editorRoot: (home) => join(clineAppData(home), "Code") },
+  { os: "macos", editorRoot: (home) => join(home, "Library", "Application Support", "Code") },
+  { os: "linux", editorRoot: (home) => join(home, ".config", "Code") },
+];
+
+describe.each(CLINE_PLATFORMS)("runInstall / runUninstall -- a target whose one scope is SEVERAL files ($os)", ({
+  os: targetOs,
+  editorRoot,
+}) => {
   // Cline is the only row with a `sites` hook: a shared file the CLI and the
   // extension's newer runtime read, plus one copy under each editor whose
   // Cline extension storage exists. Its `notes` -- which install prints
   // verbatim -- say install writes the shared file "and each editor copy it
   // finds", and before the fan-out was wired that sentence was false: measured
   // on a seeded VS Code storage directory, only the shared file was written.
-  const EDITOR_DIR = join("AppData", "Roaming", "Code", "User", "globalStorage", "saoudrizwan.claude-dev");
+  /** The editor copy, built from the SAME two pieces target-cline.ts builds
+   *  it from: THIS platform's editor root, then the extension's globalStorage
+   *  beneath it. Hardcoding one platform's root is how the fan-out came to be
+   *  proven on Windows alone -- see CLINE_PLATFORMS. */
+  const editorCopyPath = (home: string): string =>
+    join(editorRoot(home), "User", "globalStorage", "saoudrizwan.claude-dev", "settings", "cline_mcp_settings.json");
 
   /** The editor copy's path, its storage directory created so the site is
    *  DETECTED (that directory existing is what says the extension has run
    *  there). */
   function seedEditorStorage(home: string): string {
-    const dir = join(home, EDITOR_DIR, "settings");
-    mkdirSync(dir, { recursive: true });
-    return join(dir, "cline_mcp_settings.json");
+    mkdirSync(dirname(editorCopyPath(home)), { recursive: true });
+    return editorCopyPath(home);
   }
 
   const sharedPath = (home: string): string => join(home, ".cline", "data", "settings", "cline_mcp_settings.json");
@@ -6234,7 +6289,11 @@ describe("runInstall / runUninstall -- a target whose one scope is SEVERAL files
     return {
       clientId: "cline" as const,
       home,
-      appData: join(home, "AppData", "Roaming"),
+      // Explicit, never the runner's platform: `os` is what target-cline.ts
+      // resolves the editor root from, so leaving it implicit pins the whole
+      // fan-out to whichever box the suite happens to run on.
+      os: targetOs,
+      appData: clineAppData(home),
       suppressBundlesNote: true,
       ...extra,
     };
@@ -6266,7 +6325,7 @@ describe("runInstall / runUninstall -- a target whose one scope is SEVERAL files
       const r = await runInstall({ ...clineOpts(home), io: cap.io });
       expect(r.exitCode).toBe(0);
       expect(r.written).toEqual([sharedPath(home)]);
-      expect(existsSync(join(home, EDITOR_DIR, "settings", "cline_mcp_settings.json"))).toBe(false);
+      expect(existsSync(editorCopyPath(home))).toBe(false);
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
@@ -6338,6 +6397,499 @@ describe("runInstall / runUninstall -- a target whose one scope is SEVERAL files
       expect(r.written).toContain(copy);
       const after = JSON.parse(readFileSync(copy, "utf8")) as { mcpServers: Record<string, unknown> };
       expect(Object.keys(after.mcpServers)).toEqual([]);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Each copy is composed from ITS OWN stored entry.
+  //
+  // The fan-out used to hand every copy the entry composed for the PRIMARY
+  // site, which lost data in both directions and said nothing: measured on a
+  // temp HOME, `install cline --repair` over an editor copy holding
+  // `disabled: true` and an env of its own rewrote that copy as bare
+  // `{command, args}` -- re-enabling a server the user had switched off, the
+  // exact regression target-cline.ts's `carry` hook exists to prevent -- while
+  // the primary's env was pushed INTO the copy, so a per-site secret was both
+  // dropped and replaced by another site's.
+  // -------------------------------------------------------------------------
+
+  const entryIn = (p: string): Record<string, unknown> =>
+    (JSON.parse(readFileSync(p, "utf8")) as { mcpServers: Record<string, Record<string, unknown>> }).mcpServers[
+      ENTRY_NAME
+    ];
+
+  /** Merge fields onto the entry a completed install left in one file, so each
+   *  site can be given a carry of its own. */
+  function amendEntry(p: string, extra: Record<string, unknown>): void {
+    const doc = JSON.parse(readFileSync(p, "utf8")) as { mcpServers: Record<string, Record<string, unknown>> };
+    doc.mcpServers[ENTRY_NAME] = { ...doc.mcpServers[ENTRY_NAME], ...extra };
+    writeFileSync(p, `${JSON.stringify(doc, null, 2)}\n`);
+  }
+
+  it("--repair carries each copy's OWN disabled flag and env, and never the primary's", async () => {
+    const home = mkdtempSync(join(tmpdir(), "yaw-cline-"));
+    try {
+      const copy = seedEditorStorage(home);
+      await runInstall({ ...clineOpts(home), io: captureIo().io });
+      amendEntry(sharedPath(home), { env: { PRIMARY_ONLY: "p" } });
+      amendEntry(copy, { disabled: true, env: { COPY_ONLY: "c" } });
+
+      const cap = captureIo();
+      const r = await runInstall({ ...clineOpts(home, { repair: true }), io: cap.io });
+      expect(r.exitCode).toBe(0);
+      // The copy keeps both of its own carries...
+      expect(entryIn(copy).disabled).toBe(true);
+      expect(entryIn(copy).env).toEqual({ COPY_ONLY: "c" });
+      // ...and neither site's env reaches the other.
+      expect(entryIn(sharedPath(home)).env).toEqual({ PRIMARY_ONLY: "p" });
+      expect(entryIn(sharedPath(home)).disabled).toBeUndefined();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("--force drops a copy's carry, exactly as it drops the primary's", async () => {
+    const home = mkdtempSync(join(tmpdir(), "yaw-cline-"));
+    try {
+      const copy = seedEditorStorage(home);
+      await runInstall({ ...clineOpts(home), io: captureIo().io });
+      amendEntry(sharedPath(home), { env: { PRIMARY_ONLY: "p" } });
+      amendEntry(copy, { disabled: true, env: { COPY_ONLY: "c" } });
+
+      const cap = captureIo();
+      const r = await runInstall({ ...clineOpts(home, { force: true }), io: cap.io });
+      expect(r.exitCode).toBe(0);
+      // --force is documented as overwriting whatever is there. It says that of
+      // the primary, so it has to mean it of a copy too.
+      expect(entryIn(copy).disabled).toBeUndefined();
+      expect(entryIn(copy).env).toBeUndefined();
+      expect(entryIn(sharedPath(home)).env).toBeUndefined();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("reads \"already correct\" against the copy's own composed entry, not the primary's", async () => {
+    const home = mkdtempSync(join(tmpdir(), "yaw-cline-"));
+    try {
+      const copy = seedEditorStorage(home);
+      await runInstall({ ...clineOpts(home), io: captureIo().io });
+      amendEntry(copy, { disabled: true });
+      const before = readFileSync(copy, "utf8");
+
+      const cap = captureIo();
+      const r = await runInstall({ ...clineOpts(home), io: cap.io });
+      expect(r.exitCode).toBe(0);
+      // A carried field is not drift: compared against the PRIMARY's entry this
+      // copy differs forever, and an unauthorised re-run warned about a
+      // difference no re-run could settle.
+      expect(cap.stdout()).toContain(`The "${ENTRY_NAME}" entry in ${copy}`);
+      expect(cap.stdout()).toContain("is already correct");
+      expect(cap.stderr()).not.toMatch(/already has a differing/);
+      expect(readFileSync(copy, "utf8")).toBe(before);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // --keep-legacy reaches the copies, and every removal line names the key it
+  // actually took out.
+  // -------------------------------------------------------------------------
+
+  const LEGACY = "mcp.hosting";
+
+  it("uninstall --keep-legacy leaves a copy's legacy entry alone", async () => {
+    const home = mkdtempSync(join(tmpdir(), "yaw-cline-"));
+    try {
+      const copy = seedEditorStorage(home);
+      await runInstall({ ...clineOpts(home), io: captureIo().io });
+      const doc = JSON.parse(readFileSync(copy, "utf8")) as { mcpServers: Record<string, unknown> };
+      doc.mcpServers[LEGACY] = { command: "old" };
+      writeFileSync(copy, `${JSON.stringify(doc, null, 2)}\n`);
+
+      const cap = captureIo();
+      const r = await runUninstall({ ...clineOpts(home), force: true, keepLegacy: true, io: cap.io });
+      expect(r.exitCode).toBe(0);
+      const after = JSON.parse(readFileSync(copy, "utf8")) as { mcpServers: Record<string, unknown> };
+      // The flag is honoured on the primary site; a copy it silently violates
+      // is a flag that does not mean what uninstall's help says it means.
+      expect(after.mcpServers[LEGACY]).toEqual({ command: "old" });
+      expect(after.mcpServers[ENTRY_NAME]).toBeUndefined();
+      expect(cap.stdout()).not.toContain(`Removed the legacy "${LEGACY}" entry from ${copy}`);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("uninstall --keep-legacy does not rewrite a legacy-ONLY copy, nor claim it removed our entry", async () => {
+    const home = mkdtempSync(join(tmpdir(), "yaw-cline-"));
+    try {
+      const copy = seedEditorStorage(home);
+      await runInstall({ ...clineOpts(home), io: captureIo().io });
+      // This copy has never held our key -- only a pre-rename one.
+      writeFileSync(copy, `${JSON.stringify({ mcpServers: { [LEGACY]: { command: "old" } } }, null, 2)}\n`);
+      const before = readFileSync(copy, "utf8");
+
+      const cap = captureIo();
+      const r = await runUninstall({ ...clineOpts(home), force: true, keepLegacy: true, io: cap.io });
+      expect(r.exitCode).toBe(0);
+      expect(readFileSync(copy, "utf8")).toBe(before);
+      expect(r.written).not.toContain(copy);
+      // Naming a key the file never had is worse than saying nothing -- and a
+      // copy with nothing to do is SILENT, not a warning about an empty edit.
+      expect(cap.stdout()).not.toContain(`Removed the "${ENTRY_NAME}" entry from ${copy}`);
+      expect(cap.stderr()).not.toContain(copy);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("names the legacy key it takes out of a copy, not ours", async () => {
+    const home = mkdtempSync(join(tmpdir(), "yaw-cline-"));
+    try {
+      const copy = seedEditorStorage(home);
+      await runInstall({ ...clineOpts(home), io: captureIo().io });
+      writeFileSync(copy, `${JSON.stringify({ mcpServers: { [LEGACY]: { command: "old" } } }, null, 2)}\n`);
+
+      const cap = captureIo();
+      const r = await runUninstall({ ...clineOpts(home), force: true, io: cap.io });
+      expect(r.exitCode).toBe(0);
+      const after = JSON.parse(readFileSync(copy, "utf8")) as { mcpServers: Record<string, unknown> };
+      expect(Object.keys(after.mcpServers)).toEqual([]);
+      expect(cap.stdout()).toContain(`Removed the legacy "${LEGACY}" entry from ${copy}`);
+      expect(cap.stdout()).not.toContain(`Removed the "${ENTRY_NAME}" entry from ${copy}`);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("trims a legacy key out of a copy whose entry is otherwise already correct", async () => {
+    const home = mkdtempSync(join(tmpdir(), "yaw-cline-"));
+    try {
+      const copy = seedEditorStorage(home);
+      await runInstall({ ...clineOpts(home), io: captureIo().io });
+      // Our entry in this copy is byte-for-byte what a re-run would write --
+      // the `already correct` branch -- with a pre-rename key beside it. Both
+      // keys launch a broker, which is the duplicate-broker state the trim
+      // exists to prevent, so `already correct` is not an answer this file can
+      // have. Measured before the branch carried `&& !trimLegacy`: the copy was
+      // reported correct and kept both keys, while the PRIMARY site trimmed its
+      // own -- one command, two answers, in the same run.
+      const doc = JSON.parse(readFileSync(copy, "utf8")) as { mcpServers: Record<string, unknown> };
+      doc.mcpServers[LEGACY] = { command: "old" };
+      writeFileSync(copy, `${JSON.stringify(doc, null, 2)}\n`);
+
+      const cap = captureIo();
+      const r = await runInstall({ ...clineOpts(home), io: cap.io });
+      expect(r.exitCode).toBe(0);
+      expect(r.written).toContain(copy);
+      const after = JSON.parse(readFileSync(copy, "utf8")) as { mcpServers: Record<string, unknown> };
+      expect(after.mcpServers[LEGACY]).toBeUndefined();
+      expect(after.mcpServers[ENTRY_NAME]).toBeDefined();
+      expect(cap.stdout()).not.toContain(`The "${ENTRY_NAME}" entry in ${copy}`);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // --dry-run may not promise a write the live run refuses.
+  // -------------------------------------------------------------------------
+
+  it("--dry-run refuses a copy its client cannot load, exactly as the live run does", async () => {
+    const home = mkdtempSync(join(tmpdir(), "yaw-cline-"));
+    try {
+      const copy = seedEditorStorage(home);
+      // cline_mcp_settings.json is strict JSON: this parses leniently (so the
+      // entries are visible) but Cline's own JSON.parse rejects it, so nothing
+      // in it is loading and the write facade refuses to add to it.
+      const COMMENTED = [
+        "{",
+        "  // mine",
+        '  "mcpServers": {',
+        '    "other": { "command": "node" }',
+        "  }",
+        "}",
+        "",
+      ].join("\n");
+      writeFileSync(copy, COMMENTED);
+
+      const dry = captureIo();
+      const preview = await runInstall({ ...clineOpts(home, { dryRun: true }), io: dry.io });
+      expect(preview.exitCode).toBe(0);
+      // The refusal is raised by rendering the edit, which the preview used to
+      // short-circuit past -- so it named this file as one it would write.
+      expect(preview.wouldWrite).not.toContain(copy);
+      expect(dry.stdout()).not.toContain(`Would also write the "${ENTRY_NAME}" entry to ${copy}`);
+      expect(dry.stderr()).toContain(copy);
+      expect(dry.stderr()).toMatch(/refusing to write into it/);
+      expect(readFileSync(copy, "utf8")).toBe(COMMENTED);
+
+      const live = captureIo();
+      const r = await runInstall({ ...clineOpts(home), io: live.io });
+      expect(r.exitCode).toBe(0);
+      expect(r.written).not.toContain(copy);
+      expect(live.stderr()).toMatch(/refusing to write into it/);
+      expect(readFileSync(copy, "utf8")).toBe(COMMENTED);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("--dry-run names a stale copy even when the shared file is already correct", async () => {
+    const home = mkdtempSync(join(tmpdir(), "yaw-cline-"));
+    try {
+      // Install with no editor storage, then let the editor appear -- the
+      // ordinary order of events for anyone who wires yaw-mcp before they
+      // install the Cline extension.
+      const first = await runInstall({ ...clineOpts(home), io: captureIo().io });
+      expect(first.written).toEqual([sharedPath(home)]);
+      const copy = seedEditorStorage(home);
+
+      const dry = captureIo();
+      const preview = await runInstall({ ...clineOpts(home, { dryRun: true }), io: dry.io });
+      expect(preview.exitCode).toBe(0);
+      // Measured before the extra-site pass moved above the "nothing to do"
+      // return: this preview said `wouldWrite: []` and "Nothing to do ...
+      // already configured", and the live run a second later wrote the copy.
+      expect(preview.wouldWrite).toContain(copy);
+      expect(dry.stdout()).toContain(`Would also write the "${ENTRY_NAME}" entry to ${copy}`);
+      expect(dry.stdout()).not.toContain("Nothing to do");
+      expect(existsSync(copy)).toBe(false);
+
+      // The promise the preview just made, kept: the live run writes that copy
+      // and nothing else, because the shared file really is already correct.
+      const live = captureIo();
+      const r = await runInstall({ ...clineOpts(home), io: live.io });
+      expect(r.written).toEqual([copy]);
+      expect(preview.wouldWrite).toEqual(r.written);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("--dry-run still warns about a copy that differs, with the shared file already correct", async () => {
+    const home = mkdtempSync(join(tmpdir(), "yaw-cline-"));
+    try {
+      const copy = seedEditorStorage(home);
+      await runInstall({ ...clineOpts(home), io: captureIo().io });
+      // Somebody's own entry at our key in the copy, and nothing left to do on
+      // the shared file. The live run warns and names --repair; the preview
+      // returned before reaching the copies at all, so it printed neither.
+      writeFileSync(copy, `${JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "theirs" } } }, null, 2)}\n`);
+      const before = readFileSync(copy, "utf8");
+
+      const dry = captureIo();
+      const preview = await runInstall({ ...clineOpts(home, { dryRun: true }), io: dry.io });
+      expect(preview.exitCode).toBe(0);
+      expect(dry.stderr()).toMatch(/already has a differing "mcp" entry/);
+      expect(dry.stderr()).toContain(copy);
+      expect(dry.stderr()).toMatch(/--repair/);
+      // Nothing to write is still the right answer -- an unauthorised copy is
+      // left alone -- so the run says so, AFTER the warning rather than
+      // instead of it. That is what the live run does with this same state.
+      expect(preview.wouldWrite).toEqual([]);
+      expect(readFileSync(copy, "utf8")).toBe(before);
+
+      const live = captureIo();
+      const r = await runInstall({ ...clineOpts(home), io: live.io });
+      expect(r.written).toEqual([]);
+      expect(live.stderr()).toMatch(/already has a differing "mcp" entry/);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // uninstall's "Nothing to do" gate is a question about every SELECTED site,
+  // not about the shared file alone.
+  // -------------------------------------------------------------------------
+
+  /** Install both files, then leave the SHARED one holding nothing of ours
+   *  while the editor copy stays wired -- the state a hand-edit of the shared
+   *  file, or a cleanup that knew about only one of the two, leaves behind. */
+  async function wireCopyOnly(home: string, shared: "other-servers" | "empty" | "missing"): Promise<string> {
+    const copy = seedEditorStorage(home);
+    const first = await runInstall({ ...clineOpts(home), io: captureIo().io });
+    expect(first.written).toContain(copy);
+    if (shared === "missing") {
+      rmSync(sharedPath(home));
+      return copy;
+    }
+    writeFileSync(
+      sharedPath(home),
+      `${JSON.stringify({ mcpServers: shared === "empty" ? {} : { other: { command: "node" } } }, null, 2)}\n`,
+    );
+    return copy;
+  }
+
+  it.each([
+    "other-servers",
+    "empty",
+    "missing",
+  ] as const)("clears a still-wired copy when the shared file holds nothing of ours (%s)", async (shared) => {
+    const home = mkdtempSync(join(tmpdir(), "yaw-cline-"));
+    try {
+      const copy = await wireCopyOnly(home, shared);
+
+      const cap = captureIo();
+      const r = await runUninstall({ ...clineOpts(home), force: true, io: cap.io });
+      expect(r.exitCode).toBe(0);
+      // Measured before the copies were consulted above the gate: exit 0,
+      // `written: []`, "Nothing to do: Cline (user) has no yaw-mcp entry" --
+      // and this copy still keyed "mcp", still launching yaw-mcp. The
+      // removals list the gate reads is built from the shared file alone.
+      expect(cap.stdout()).not.toContain("Nothing to do");
+      expect(r.written).toContain(copy);
+      const after = JSON.parse(readFileSync(copy, "utf8")) as { mcpServers: Record<string, unknown> };
+      expect(after.mcpServers[ENTRY_NAME]).toBeUndefined();
+      expect(cap.stdout()).toContain(`Removed the "${ENTRY_NAME}" entry from ${copy}`);
+      expect(cap.stdout()).toContain("no longer launches yaw-mcp");
+      // The shared file holds nothing of ours, so this run has no business
+      // rewriting it -- and did not.
+      expect(r.written).not.toContain(sharedPath(home));
+      if (shared === "other-servers") {
+        const kept = JSON.parse(readFileSync(sharedPath(home), "utf8")) as { mcpServers: Record<string, unknown> };
+        expect(Object.keys(kept.mcpServers)).toEqual(["other"]);
+      }
+      if (shared === "missing") expect(existsSync(sharedPath(home))).toBe(false);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("--dry-run names that copy once, and the live run writes exactly what it promised", async () => {
+    const home = mkdtempSync(join(tmpdir(), "yaw-cline-"));
+    try {
+      const copy = await wireCopyOnly(home, "other-servers");
+      const before = readFileSync(copy, "utf8");
+
+      const dry = captureIo();
+      const preview = await runUninstall({ ...clineOpts(home, { dryRun: true }), force: true, io: dry.io });
+      expect(preview.exitCode).toBe(0);
+      // The preview returned `wouldWrite: []` over this state before the pass
+      // moved above the gate -- a --dry-run that omits the one file the live
+      // run touches.
+      expect(preview.wouldWrite).toEqual([copy]);
+      expect(dry.stdout()).not.toContain("Nothing to do");
+      const named = `Would also remove the "${ENTRY_NAME}" entry from ${copy}`;
+      expect(dry.stdout()).toContain(named);
+      // ONCE. The preview pass that decides the gate is the same one that
+      // prints, so a second pass cannot double every line.
+      expect(dry.stdout().split(named).length - 1).toBe(1);
+      expect(readFileSync(copy, "utf8")).toBe(before);
+
+      const live = captureIo();
+      const r = await runUninstall({ ...clineOpts(home), force: true, io: live.io });
+      expect(r.written).toEqual(preview.wouldWrite);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("still says Nothing to do when neither the shared file nor a copy holds anything of ours", async () => {
+    const home = mkdtempSync(join(tmpdir(), "yaw-cline-"));
+    try {
+      // The gate has to keep firing on the state it was written for: a copy
+      // that exists and holds someone else's server is not wiring of ours.
+      const copy = seedEditorStorage(home);
+      const other = `${JSON.stringify({ mcpServers: { other: { command: "node" } } }, null, 2)}\n`;
+      writeFileSync(copy, other);
+
+      const cap = captureIo();
+      const r = await runUninstall({ ...clineOpts(home), force: true, io: cap.io });
+      expect(r.exitCode).toBe(0);
+      expect(cap.stdout()).toContain(`Nothing to do: Cline (user) has no yaw-mcp entry.`);
+      expect(r.written).toEqual([]);
+      expect(readFileSync(copy, "utf8")).toBe(other);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("names the copy in the confirmation preview, and a declined prompt leaves it wired", async () => {
+    const home = mkdtempSync(join(tmpdir(), "yaw-cline-"));
+    try {
+      const copy = await wireCopyOnly(home, "other-servers");
+      const before = readFileSync(copy, "utf8");
+
+      const no = captureIo();
+      const declined = await runUninstall({ ...clineOpts(home), promptAnswer: "n", io: no.io });
+      expect(declined.exitCode).toBe(1);
+      // The prompt is the only consent this run asks for, so it has to name
+      // the file it is asking about -- which here is the copy, not the shared
+      // file the "Remove from ..." header would otherwise announce over an
+      // empty list.
+      expect(no.stdout()).toContain(`Would also remove the "${ENTRY_NAME}" entry from ${copy}`);
+      expect(no.stdout()).not.toContain(`Remove from ${sharedPath(home)}:`);
+      expect(readFileSync(copy, "utf8")).toBe(before);
+
+      const yes = captureIo();
+      const r = await runUninstall({ ...clineOpts(home), promptAnswer: "y", io: yes.io });
+      expect(r.written).toEqual([copy]);
+      expect(yes.stdout()).toContain(`Removed the "${ENTRY_NAME}" entry from ${copy}`);
+      const after = JSON.parse(readFileSync(copy, "utf8")) as { mcpServers: Record<string, unknown> };
+      expect(after.mcpServers[ENTRY_NAME]).toBeUndefined();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("--dry-run names BOTH wired files, and the live run removes from exactly those", async () => {
+    const home = mkdtempSync(join(tmpdir(), "yaw-cline-"));
+    try {
+      const copy = seedEditorStorage(home);
+      const installed = await runInstall({ ...clineOpts(home), io: captureIo().io });
+      expect(installed.written).toEqual([sharedPath(home), copy]);
+      const before = { shared: readFileSync(sharedPath(home), "utf8"), copy: readFileSync(copy, "utf8") };
+
+      const dry = captureIo();
+      const preview = await runUninstall({ ...clineOpts(home, { dryRun: true }), force: true, io: dry.io });
+      expect(preview.exitCode).toBe(0);
+      // The ordinary both-files-wired state, which is what the copies add to
+      // `wouldWrite` here. Deleting the push that appends them left the shared
+      // file named, the copy silently missing, and the suite green -- a preview
+      // that omits a file the live run rewrites.
+      expect(preview.wouldWrite).toEqual([sharedPath(home), copy]);
+      expect(preview.written).toEqual([]);
+      expect(dry.stdout()).toContain(`Would also remove the "${ENTRY_NAME}" entry from ${copy}`);
+      expect(readFileSync(sharedPath(home), "utf8")).toBe(before.shared);
+      expect(readFileSync(copy, "utf8")).toBe(before.copy);
+
+      // The promise, kept: the same two files and no third.
+      const live = captureIo();
+      const r = await runUninstall({ ...clineOpts(home), force: true, io: live.io });
+      expect(r.written).toEqual(preview.wouldWrite);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("warns ONCE about a copy it cannot read, with a prompt between the two passes", async () => {
+    const home = mkdtempSync(join(tmpdir(), "yaw-cline-"));
+    try {
+      const copy = seedEditorStorage(home);
+      await runInstall({ ...clineOpts(home), io: captureIo().io });
+      // Not JSON at all: the copy is skipped with a warning on either pass,
+      // and the shared file still holds our entry, so this run reaches the
+      // confirmation with a preview pass already behind it.
+      const broken = "{ this is not json\n";
+      writeFileSync(copy, broken);
+
+      const cap = captureIo();
+      const r = await runUninstall({ ...clineOpts(home), promptAnswer: "y", io: cap.io });
+      expect(r.exitCode).toBe(0);
+      expect(r.written).toEqual([sharedPath(home)]);
+      const warning = `${copy} (`;
+      expect(cap.stderr()).toContain("could not be edited");
+      // One warning per unreadable file. The preview pass leaves it to the
+      // live pass, which re-reads the copy after the answer -- flushing it on
+      // both sides would say it twice for one file.
+      expect(cap.stderr().split(warning).length - 1).toBe(1);
+      expect(readFileSync(copy, "utf8")).toBe(broken);
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
@@ -6427,6 +6979,23 @@ describe("runInstall -- .mcp.json is STRICT JSON, so a commented one is refused"
     }
   }
 
+  it("does not claim it repaired the container on a file it then refuses", async () => {
+    // Both hazards in one file: a container holding a non-object (which
+    // install repairs as the first edit) and a comment (which makes .mcp.json
+    // unloadable to Claude Code, so the write is refused). The repair note
+    // printed from the DECISION to repair, ahead of the write -- so this run
+    // told the user a key had been "replaced ... with an empty object" and
+    // then refused, leaving the file byte-identical.
+    const { cap, before, result } = run('{\n  // mine\n  "mcpServers": null\n}\n');
+    const r = await result;
+    expect(r.exitCode).toBe(1);
+    expect(r.written).toEqual([]);
+    expect(cap.stdout()).not.toContain("replaced it with an empty object");
+    expect(cap.stdout()).not.toContain("with an empty object");
+    expect(cap.stderr()).toMatch(/no server in it is loading/);
+    expect(readFileSync(mcpJson(), "utf8")).toBe(before);
+  });
+
   it("still writes a .mcp.json that is valid strict JSON", async () => {
     // The gate is the CLIENT's parser, not a new rule about project files: an
     // ordinary .mcp.json installs exactly as it did.
@@ -6479,5 +7048,220 @@ describe("runInstall -- .mcp.json is STRICT JSON, so a commented one is refused"
     });
     expect(r.exitCode).toBe(1);
     expect(readFileSync(mcpJson(), "utf8")).toBe(COMMENTED);
+  });
+
+  // ---- the READ-path gate: the runs that make no splice at all ---------------
+  //
+  // The write facade's own refusal is scoped to edits that WRITE an entry, so
+  // two install paths never reached it: an `mcp` entry that already matches
+  // (no edit is built) and a legacy-key trim beside one (a removal-only edit
+  // list, which the facade permits by design). Both printed success over a file
+  // Claude Code loads nothing from. These pin the gate install now runs right
+  // after the read.
+
+  /** Deterministic entry: without these the real oam probe decides between an
+   *  npx and an oam entry, and "already identical" would be a fact about the
+   *  machine running the suite. */
+  const PINNED = { os: "linux", oamProbe: OAM_ABSENT } as const;
+  const VALID = '{\n  "mcpServers": {\n    "other": { "command": "node" }\n  }\n}\n';
+  const LEGACY_ENTRY = { command: "npx", args: ["-y", "@yawlabs/mcp"] };
+
+  /** A comment inserted after the opening brace -- the one change between a
+   *  file Claude Code loads and one it ignores in full. */
+  const withComment = (valid: string): string => {
+    expect(valid.startsWith("{\n"), "fixture must open with `{` on its own line").toBe(true);
+    return `{\n  // mine\n${valid.slice(2)}`;
+  };
+
+  /** The refusal line, composed from the shared helpers and the CLIENT's own
+   *  parser over the exact bytes on disk -- never retyped, so a wording change
+   *  in the helper moves this expectation with it, and a surface that stopped
+   *  using the helper is what goes red. */
+  function unloadableRefusal(raw: string): string {
+    const strict = readStrictJson(raw);
+    if (strict.ok) throw new Error("fixture parses as strict JSON, so nothing would refuse it");
+    return `yaw-mcp install: ${mcpJson()} ${unloadableConfigProblem(strict.violation)} -- refusing to write into it; ${unloadableConfigFix("re-run")}.`;
+  }
+
+  /** Every non-empty line of a captured stream. */
+  const linesOf = (s: string): string[] => s.split("\n").filter((l) => l !== "");
+
+  /** A refused run prints its header and nothing else on stdout: no `Done:`,
+   *  no `Nothing to do`, no `already correct` / `already configured`. Asserted
+   *  as the exact line list AND as the named absences, so the failure message
+   *  says which success line leaked. */
+  function expectRefusedStdout(stdout: string): void {
+    const lines = linesOf(stdout);
+    expect(lines.filter((l) => l.startsWith("Done:"))).toEqual([]);
+    expect(lines.filter((l) => /Nothing to do|already configured|already correct/.test(l))).toEqual([]);
+    expect(lines).toEqual(["Target: Claude Code (project)", `File:   ${mcpJson()}`]);
+  }
+
+  /** Install into a VALID .mcp.json and return the bytes it wrote: the entry a
+   *  re-run compares against is install's own output, not a literal that
+   *  drifts when buildLaunchEntry changes. */
+  async function seedByInstalling(): Promise<string> {
+    writeFileSync(mcpJson(), VALID);
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "project",
+      projectDir: project,
+      home,
+      cwd: project,
+      suppressBundlesNote: true,
+      io: cap.io,
+      ...PINNED,
+    });
+    expect(r.exitCode).toBe(0);
+    return readFileSync(mcpJson(), "utf8");
+  }
+
+  it("refuses a commented .mcp.json whose `mcp` entry is ALREADY identical, instead of saying Nothing to do", async () => {
+    const seeded = await seedByInstalling();
+    // The premise, pinned: over the UNcommented bytes the entry really is
+    // identical -- a preview reports the no-op. Without it, a refusal here
+    // could be the collision path, not the identical one this test is about.
+    const premise = run(seeded, { ...PINNED, dryRun: true });
+    const p = await premise.result;
+    expect(p.exitCode).toBe(0);
+    expect(p.wouldWrite).toEqual([]);
+    expect(linesOf(premise.cap.stdout())).toContain("Nothing to do: Claude Code (project) is already configured.");
+
+    const commented = withComment(seeded);
+    const { cap, result } = run(commented, PINNED);
+    const r = await result;
+    expect(r.exitCode).toBe(1);
+    expect(r.written).toEqual([]);
+    expect(r.wouldWrite).toEqual([]);
+    expect(linesOf(cap.stderr())).toEqual([unloadableRefusal(commented)]);
+    expectRefusedStdout(cap.stdout());
+    expect(readFileSync(mcpJson(), "utf8")).toBe(commented);
+  });
+
+  for (const legacy of LEGACY_ENTRY_NAMES) {
+    it(`refuses a commented .mcp.json holding only the legacy "${legacy}" key, and leaves that key in place`, async () => {
+      const commented = withComment(`${JSON.stringify({ mcpServers: { [legacy]: LEGACY_ENTRY } }, null, 2)}\n`);
+      const { cap, result } = run(commented, PINNED);
+      const r = await result;
+      expect(r.exitCode).toBe(1);
+      expect(r.written).toEqual([]);
+      // The READ gate's line, not the facade's "failed to splice" wrapper --
+      // that one also exits 1 here, so the exit code alone cannot tell which
+      // refusal fired.
+      expect(linesOf(cap.stderr())).toEqual([unloadableRefusal(commented)]);
+      expectRefusedStdout(cap.stdout());
+      expect(readFileSync(mcpJson(), "utf8")).toBe(commented);
+      expect((parseJsonc(readFileSync(mcpJson(), "utf8")) as { mcpServers: object }).mcpServers).toHaveProperty([
+        legacy,
+      ]);
+    });
+  }
+
+  it("refuses the REMOVAL-ONLY run -- an identical `mcp` entry beside a legacy key -- keeping the legacy key", async () => {
+    // The shape the write facade lets through by design: the only edit is a
+    // `remove`, and removals are not writes of an entry. Without the read gate
+    // this trimmed the legacy key out of a file Claude Code ignores and printed
+    // Done.
+    const seeded = JSON.parse(await seedByInstalling()) as { mcpServers: Record<string, unknown> };
+    seeded.mcpServers["yaw-mcp"] = LEGACY_ENTRY;
+    const commented = withComment(`${JSON.stringify(seeded, null, 2)}\n`);
+    const { cap, result } = run(commented, PINNED);
+    const r = await result;
+    expect(r.exitCode).toBe(1);
+    expect(r.written).toEqual([]);
+    expect(linesOf(cap.stderr())).toEqual([unloadableRefusal(commented)]);
+    expectRefusedStdout(cap.stdout());
+    expect(linesOf(cap.stdout()).filter((l) => /Removed the legacy/.test(l))).toEqual([]);
+    expect(readFileSync(mcpJson(), "utf8")).toBe(commented);
+  });
+
+  // The flags a user reaches for after a refusal. None of them may carry a run
+  // past the read gate on either no-splice path: --dry-run would preview a
+  // no-op or a trim over an ignored file, --force / --repair would authorise a
+  // write the client still cannot load.
+  for (const [flag, extra] of [
+    ["--dry-run", { dryRun: true }],
+    ["--force", { force: true }],
+    ["--repair", { repair: true }],
+  ] as const) {
+    it(`${flag} does not get past the read gate over an identical entry`, async () => {
+      const commented = withComment(await seedByInstalling());
+      const { cap, result } = run(commented, { ...PINNED, ...extra });
+      const r = await result;
+      expect(r.exitCode).toBe(1);
+      expect(r.written).toEqual([]);
+      expect(r.wouldWrite).toEqual([]);
+      expect(linesOf(cap.stderr())).toEqual([unloadableRefusal(commented)]);
+      expectRefusedStdout(cap.stdout());
+      expect(readFileSync(mcpJson(), "utf8")).toBe(commented);
+    });
+
+    it(`${flag} does not get past the read gate over a legacy-only file`, async () => {
+      const commented = withComment(`${JSON.stringify({ mcpServers: { mcph: LEGACY_ENTRY } }, null, 2)}\n`);
+      const { cap, result } = run(commented, { ...PINNED, ...extra });
+      const r = await result;
+      expect(r.exitCode).toBe(1);
+      expect(r.written).toEqual([]);
+      expect(r.wouldWrite).toEqual([]);
+      expect(linesOf(cap.stderr())).toEqual([unloadableRefusal(commented)]);
+      expectRefusedStdout(cap.stdout());
+      expect(readFileSync(mcpJson(), "utf8")).toBe(commented);
+    });
+
+    it(`${flag} does not get past the read gate on the removal-only run`, async () => {
+      const seeded = JSON.parse(await seedByInstalling()) as { mcpServers: Record<string, unknown> };
+      seeded.mcpServers["mcp.hosting"] = LEGACY_ENTRY;
+      const commented = withComment(`${JSON.stringify(seeded, null, 2)}\n`);
+      const { cap, result } = run(commented, { ...PINNED, ...extra });
+      const r = await result;
+      expect(r.exitCode).toBe(1);
+      expect(r.written).toEqual([]);
+      expect(r.wouldWrite).toEqual([]);
+      expect(linesOf(cap.stderr())).toEqual([unloadableRefusal(commented)]);
+      expectRefusedStdout(cap.stdout());
+      expect(readFileSync(mcpJson(), "utf8")).toBe(commented);
+    });
+  }
+
+  it("leads with the BLOCKED refusal on a file that is both commented and holds a non-reparable container", async () => {
+    // Two faults, one file. A non-empty array under mcpServers is the shape
+    // that can carry real server definitions, and its refusal is the one
+    // doctor's CLIENTS row and import's refusal both lead with -- install must
+    // name the same fault, not the unloadable one.
+    const raw = '{\n  // mine\n  "mcpServers": [{ "name": "spend", "url": "https://x" }]\n}\n';
+    const { cap, result } = run(raw, PINNED);
+    const r = await result;
+    expect(r.exitCode).toBe(1);
+    expect(r.written).toEqual([]);
+    const stderr = linesOf(cap.stderr());
+    expect(stderr).toEqual([
+      `yaw-mcp install: "mcpServers" in ${mcpJson()} is an array of 1, not a JSON object -- refusing to overwrite it; ${blockedContainerFix("re-run")}.`,
+    ]);
+    // And specifically NOT the unloadable clause. unloadableRefusal throws
+    // unless these bytes fail the client's strict parse, so composing it here
+    // also pins the premise: the file IS commented-unloadable, and the blocked
+    // refusal wins over it rather than being the only fault present.
+    expect(stderr).not.toContain(unloadableRefusal(raw));
+    expect(stderr.filter((l) => l.includes(unloadableConfigFix("re-run")))).toEqual([]);
+    expect(readFileSync(mcpJson(), "utf8")).toBe(raw);
+  });
+
+  it("install --list reads a commented .mcp.json holding the `mcp` entry as not loading, not installed", async () => {
+    const commented = withComment(await seedByInstalling());
+    writeFileSync(mcpJson(), commented);
+    const cap = captureIo();
+    const r = await runInstall({ os: "linux", home, cwd: project, listOnly: true, io: cap.io });
+    expect(r.exitCode).toBe(0);
+    // The whole row, cell for cell: the project dir sits under the synthetic
+    // home, so --list renders it home-relative.
+    expect(listRow(cap.stdout(), "Claude Code", "project")).toEqual([
+      "Claude Code",
+      "project",
+      `~/${basename(project)}/.mcp.json`,
+      "not loading (comments or trailing commas)",
+    ]);
+    // Read-only: the listing never touches the file it describes.
+    expect(readFileSync(mcpJson(), "utf8")).toBe(commented);
   });
 });

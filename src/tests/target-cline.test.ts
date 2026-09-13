@@ -70,9 +70,19 @@ import {
   reloadDoneClause,
   selectSites,
   terminateWithNewline,
+  unloadableConfigProblem,
 } from "../client-config.js";
 import { UTF8_BOM } from "../client-config-json.js";
-import { buildLaunchEntry, ENTRY_NAME, INSTALL_TARGETS, type InstallOS, type PathBase } from "../install-targets.js";
+// unloadableConfigFix through install-targets.ts's RE-EXPORT, which is where
+// the consumers reach it -- so a dropped re-export fails this file too.
+import {
+  buildLaunchEntry,
+  ENTRY_NAME,
+  INSTALL_TARGETS,
+  type InstallOS,
+  type PathBase,
+  unloadableConfigFix,
+} from "../install-targets.js";
 
 // CR is built from its code point, never typed as an escape. A backslash-r
 // that loses a level on its way into this file would become a real CR inside a
@@ -726,6 +736,48 @@ describe("a file Cline cannot parse is refused, not spliced", () => {
     expect(uninstallAcross(base).map((o) => o.action)).toEqual(["wrote"]);
     expect(readFileSync(file, "utf8")).not.toContain("@yawlabs/mcp@latest");
     expect(readFileSync(file, "utf8")).toContain("server-filesystem");
+  });
+
+  it("refuses the migration-shaped write -- upsert ours AND drop a legacy key -- with the whole remedy", () => {
+    // The refusal cases above all reach the gate with a single upsert. A file
+    // still holding a LEGACY key is the one install hands a MIXED list
+    // (upsert `mcp`, remove `yaw-mcp`), and the gate's "does any edit write"
+    // is exactly the question a mixed list can answer wrongly.
+    //
+    // MUTATION: `edits.some((edit) => edit.op !== "remove")` ->
+    // `edits.every(...)` in applyClientConfigEdits (client-config.ts). The
+    // mixed list then reads as a removal, the splice lands, and this file is
+    // rewritten with its comment still in it -- Done over a file Cline is
+    // loading no server from.
+    const raw = LEGACY_KEY.replace('{\n  "mcpServers"', '{\n  // left in by hand\n  "mcpServers"');
+    expect(raw).not.toBe(LEGACY_KEY);
+    expect(() => JSON.parse(raw)).toThrow();
+
+    const base = machine("linux");
+    const site = sitesOf(base)[0];
+    const path = site.resolved.absolute;
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, raw, "utf8");
+    const stamp = statSync(path).mtimeMs;
+
+    // The preconditions that make installAcross build the MIXED list: no
+    // entry of ours to compare as identical, and a legacy key to drop.
+    const view = viewOf(site);
+    expect(view.entry()).toBeUndefined();
+    expect(view.legacyKey()).toBe("yaw-mcp");
+    const violation = view.unloadable();
+    if (violation === null) throw new Error("the commented legacy file is loadable -- the fixture is wrong");
+
+    expect(installAcross(base)).toEqual([
+      {
+        id: "shared",
+        path,
+        action: "refused",
+        detail: `${path} ${unloadableConfigProblem(violation)} -- refusing to write into it; ${unloadableConfigFix("re-run")}`,
+      },
+    ]);
+    expect(readFileSync(path, "utf8")).toBe(raw);
+    expect(statSync(path).mtimeMs).toBe(stamp);
   });
 
   it("takes the ordinary malformed path when BOTH parsers refuse the file", () => {

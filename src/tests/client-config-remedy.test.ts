@@ -16,8 +16,14 @@
 //
 // `import --remove-originals` is the third surface: when it refuses to remove
 // the originals it names `yaw-mcp install <client>` as the way forward, and it
-// did so even when install refuses the very file it would write. Its group, at
-// the end, runs import, follows the advice, and re-runs import.
+// did so even when install refuses the very file it would write. Its group
+// runs import, follows the advice, and re-runs import.
+//
+// The last two groups are a STRICT-JSON file its client cannot load (a comment
+// in Claude Code's project `.mcp.json`): the same parity over
+// unloadableConfigProblem / unloadableConfigFix, and the import case where
+// calling such a file "wired" deleted servers from a config that was loading
+// them -- pinned byte for byte on the file that lost them.
 
 import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -25,6 +31,8 @@ import { dirname, join } from "node:path";
 import { Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { type StrictViolation, unloadableConfigProblem } from "../client-config.js";
+import { readStrictJson } from "../client-config-json.js";
 import { runDoctor } from "../doctor-cmd.js";
 import { runImport } from "../import-cmd.js";
 import { runInstall } from "../install-cmd.js";
@@ -34,6 +42,7 @@ import {
   type InstallClientId,
   type InstallScope,
   resolveInstallPath,
+  unloadableConfigFix,
   unparseableConfigFix,
 } from "../install-targets.js";
 import { parseJsonc } from "../jsonc.js";
@@ -520,7 +529,7 @@ async function importRemoving(clientId: InstallClientId = "cursor", scope: Insta
     out: (s) => out.push(s),
     err: (s) => err.push(s),
   });
-  return { exitCode: r.exitCode, stdout: out.join(""), stderr: err.join("") };
+  return { exitCode: r.exitCode, written: r.written, stdout: out.join(""), stderr: err.join("") };
 }
 
 describe("import --remove-originals -- a client config install refuses gets install's remedy, not 'run install first'", () => {
@@ -670,5 +679,329 @@ describe("import --remove-originals -- a client config install refuses gets inst
       `Not removing the originals: no yaw-mcp entry in ${project.absolute} (${project.containerPath.join(".")}), and ${claudeJson} is not valid JSON, so Claude Code would be left with no way to reach them. \`yaw-mcp install claude-code\` refuses to overwrite ${claudeJson}; ${unparseableConfigFix("run `yaw-mcp install claude-code` and re-run this with --remove-originals")}.\n`,
     );
     expect(r.stderr.split("is not valid JSON").length - 1).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A STRICT-JSON client config that yaw-mcp reads and its client does not.
+// Claude Code parses the project `.mcp.json` with JSON.parse, so one comment or
+// one trailing comma means it loads NO server from that file -- a yaw-mcp entry
+// in it included -- while yaw-mcp's lenient parser reads every entry. Each
+// surface used to describe that file from yaw-mcp's side of the parse: install
+// printed success over an entry that was already there, and import called the
+// entry "wired", which is the answer that deletes servers.
+//
+// The clause comes from unloadableConfigProblem and the fix from
+// unloadableConfigFix. The violation both are composed from is readStrictJson's
+// -- the one client-side parse the write facade, doctor's probe and import's
+// view all route through -- so the expected text is the helpers' output over
+// the fixture's own bytes, never a hand-copied literal.
+
+const mcpJsonFile = (): string => join(cwd, ".mcp.json");
+const claudeJsonFile = (): string => join(home, ".claude.json");
+
+/** A yaw-mcp entry as a hand-written or older `.mcp.json` carries it. Its launch
+ *  command is beside the point: every surface checks loadability ahead of any
+ *  entry state. */
+const YAW_ENTRY = { command: "npx", args: ["-y", "@yawlabs/mcp"] };
+
+/** The two shapes the helpers' wording names, applied to a strict-valid body.
+ *
+ *  The comment is LONGER than the ~10 source bytes V8 quotes into a JSON.parse
+ *  "Unexpected token" message. A shorter one (`// c` then a newline) puts that
+ *  raw newline -- or any control byte the file holds -- into the violation's
+ *  `detail`, which every surface interpolates unescaped, so the one-line row
+ *  and refusal split in two. That is a source defect, not a wording rule, and
+ *  is not pinned here as if it were behaviour. */
+const UNLOADABLE_SHAPES = [
+  ["a comment", (json: string): string => `// shared with the team -- keep this list short\n${json}`],
+  ["a trailing comma", (json: string): string => json.replace(/\}\s*$/, ",}")],
+] as const;
+
+/** The client's own verdict on `raw`. THROWS when the client would load the
+ *  file: a clause composed from no violation would make every wording
+ *  assertion below compare one wrong string with another. */
+function violationOf(raw: string): StrictViolation {
+  const r = readStrictJson(raw);
+  if (r.ok) throw new Error(`fixture parses as strict JSON, so it is not unloadable: ${raw}`);
+  return r.violation;
+}
+
+const linesOf = (s: string): string[] => s.split(/\r?\n/);
+
+/** Doctor's CLIENTS row for one label, from the label to the end of its line.
+ *  Exactly one row must carry the label, or the assertion is about the wrong
+ *  line. */
+function doctorRow(text: string, label: string): string {
+  const rows = linesOf(text).filter((l) => l.includes(`${label}:`));
+  expect(rows).toHaveLength(1);
+  return rows[0].slice(rows[0].indexOf(`${label}:`));
+}
+
+async function installClaudeCode(
+  scope: InstallScope,
+  flags: { force?: boolean; repair?: boolean; skip?: boolean; dryRun?: boolean } = {},
+) {
+  const cap = captureIo();
+  const r = await runInstall({
+    clientId: "claude-code",
+    scope,
+    os: "linux",
+    home,
+    cwd,
+    io: cap.io,
+    oamProbe: OAM_ABSENT,
+    ...flags,
+  });
+  return { exitCode: r.exitCode, written: r.written, stdout: cap.stdout(), stderr: cap.stderr() };
+}
+
+/** Did this install run tell the user the client is configured -- either of the
+ *  two success lines ("Nothing to do", "Done:"), whichever path it took. */
+const saysConfigured = (stdout: string): boolean =>
+  linesOf(stdout).some((l) => l.includes("Nothing to do") || l.startsWith("Done:"));
+
+/** install's refusal line for an unloadable file, from the two helpers. */
+const installRefusal = (path: string, raw: string): string =>
+  `yaw-mcp install: ${path} ${unloadableConfigProblem(violationOf(raw))} -- refusing to write into it; ${unloadableConfigFix("re-run")}.`;
+
+const PROJECT_INSTALL = "yaw-mcp install claude-code --scope project";
+
+describe("a strict .mcp.json its client cannot load -- doctor and install name one fault and one fix", () => {
+  it.each(
+    UNLOADABLE_SHAPES,
+  )("%s: doctor's row and install's refusal, byte for byte, from the shared helpers", async (_shape, spoil) => {
+    const bytes = spoil(PROJECT_SERVERS);
+    const path = writeFile(mcpJsonFile(), bytes);
+    const problem = unloadableConfigProblem(violationOf(bytes));
+    const d = await doctor();
+    expect(doctorRow(d.text, "Claude Code (project)")).toBe(
+      `Claude Code (project): exists but ${problem} -- install refuses to write into it; ${unloadableConfigFix(`run \`${PROJECT_INSTALL}\``)}`,
+    );
+    const row = d.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "project");
+    expect(row?.unloadable).toBe(problem);
+    // No yaw-mcp entry in the file: advice, not a cannot-launch warning.
+    expect(row?.hasMcpEntry).toBe(false);
+    expect(d.snapshot.config.warnings).toEqual([]);
+
+    const i = await installClaudeCode("project");
+    expect(i.exitCode).toBe(1);
+    expect(linesOf(i.stderr).filter((l) => l !== "")).toEqual([installRefusal(path, bytes)]);
+    expect(i.written).toEqual([]);
+    expect(readFileSync(path, "utf8")).toBe(bytes);
+  });
+
+  it("one fixture, all three surfaces: doctor, install and import print the one clause for the file", async () => {
+    const user = writeFile(claudeJsonFile(), CLAUDE_JSON_WITH_SERVER);
+    const bytes = UNLOADABLE_SHAPES[0][1](PROJECT_SERVERS);
+    const project = writeFile(mcpJsonFile(), bytes);
+    const problem = unloadableConfigProblem(violationOf(bytes));
+    const local = claudeLocal();
+
+    const d = await doctor();
+    expect(doctorRow(d.text, "Claude Code (project)")).toBe(
+      `Claude Code (project): exists but ${problem} -- install refuses to write into it; ${unloadableConfigFix(`run \`${PROJECT_INSTALL}\``)}`,
+    );
+    const i = await installClaudeCode("project");
+    expect(linesOf(i.stderr).filter((l) => l !== "")).toEqual([installRefusal(project, bytes)]);
+    // import names the same file with the same clause. Its NEXT STEP is not
+    // unloadableConfigFix, and correctly so: import's install step is the one a
+    // bare `yaw-mcp install claude-code` takes, which writes ~/.claude.json --
+    // a file its client loads -- not this one.
+    const r = await importRemoving("claude-code", "user");
+    expect(linesOf(r.stderr)).toContain(
+      `Not removing the originals: no yaw-mcp entry in ${user} (mcpServers) or ${local.absolute} (${local.containerPath.join(".")}), and ${project} ${problem}, so Claude Code would be left with no way to reach them. Run \`yaw-mcp install claude-code\` first, then re-run this with --remove-originals.`,
+    );
+    expect(readFileSync(user)).toEqual(Buffer.from(CLAUDE_JSON_WITH_SERVER));
+    expect(readFileSync(project)).toEqual(Buffer.from(bytes));
+  });
+
+  it("with the yaw-mcp entry in it, doctor's row is a cannot-launch warning: that entry is present and not loading", async () => {
+    const bytes = UNLOADABLE_SHAPES[0][1](JSON.stringify({ mcpServers: { [ENTRY_NAME]: YAW_ENTRY } }, null, 2));
+    const path = writeFile(mcpJsonFile(), bytes);
+    const problem = unloadableConfigProblem(violationOf(bytes));
+    const status = `exists but ${problem} -- install refuses to write into it; ${unloadableConfigFix(`run \`${PROJECT_INSTALL}\``)}`;
+    const d = await doctor();
+    expect(doctorRow(d.text, "Claude Code (project)")).toBe(`Claude Code (project): ${status}`);
+    expect(d.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "project")?.hasMcpEntry).toBe(
+      true,
+    );
+    expect(d.snapshot.config.warnings).toEqual([`${path}: Claude Code (project) ${status}`]);
+    expect(d.exitCode).toBe(2);
+  });
+
+  // The two paths the read-path gate exists for: neither builds a write, so
+  // the facade's own refusal never fired, and install said "configured" over a
+  // file its client loads nothing from. Each fixture starts from the entry
+  // install ITSELF wrote, so "identical" is install's own verdict, not ours.
+  it.each([
+    ["no flag", {}],
+    ["--force", { force: true }],
+    ["--repair", { repair: true }],
+    ["--skip", { skip: true }],
+    ["--dry-run", { dryRun: true }],
+  ])("an entry install wrote, then commented: install refuses under %s instead of calling it configured", async (_flag, flags) => {
+    const path = mcpJsonFile();
+    expect((await installClaudeCode("project")).exitCode).toBe(0);
+    // The control: the same flags over the same entry, still loadable, and
+    // install calls it configured. This is what makes the negative check below
+    // a check -- it looks for a line this run really prints.
+    const control = await installClaudeCode("project", flags);
+    expect(control.exitCode).toBe(0);
+    expect(saysConfigured(control.stdout)).toBe(true);
+    const commented = UNLOADABLE_SHAPES[0][1](readFileSync(path, "utf8"));
+    writeFileSync(path, commented);
+    const i = await installClaudeCode("project", flags);
+    expect(i.exitCode).toBe(1);
+    expect(linesOf(i.stderr).filter((l) => l !== "")).toEqual([installRefusal(path, commented)]);
+    expect(saysConfigured(i.stdout)).toBe(false);
+    expect(i.written).toEqual([]);
+    expect(readFileSync(path, "utf8")).toBe(commented);
+  });
+
+  it("an entry install wrote plus a legacy key, commented: install does not trim the key out of a file nothing loads", async () => {
+    const path = mcpJsonFile();
+    expect((await installClaudeCode("project")).exitCode).toBe(0);
+    const doc = JSON.parse(readFileSync(path, "utf8")) as { mcpServers: Record<string, unknown> };
+    doc.mcpServers["mcp.hosting"] = { command: "npx" };
+    const commented = UNLOADABLE_SHAPES[0][1](`${JSON.stringify(doc, null, 2)}\n`);
+    writeFileSync(path, commented);
+    const i = await installClaudeCode("project");
+    expect(i.exitCode).toBe(1);
+    expect(linesOf(i.stderr).filter((l) => l !== "")).toEqual([installRefusal(path, commented)]);
+    expect(i.written).toEqual([]);
+    expect(readFileSync(path, "utf8")).toBe(commented);
+  });
+
+  it("a file that is BOTH commented and a blocked container: doctor and install lead with the blocked fault", async () => {
+    const bytes = UNLOADABLE_SHAPES[0][1]('{"mcpServers": [{"command": "x"}]}');
+    const path = writeFile(mcpJsonFile(), bytes);
+    const d = await doctor();
+    expect(doctorRow(d.text, "Claude Code (project)")).toBe(
+      `Claude Code (project): present, but "mcpServers" is an array of 1, not a JSON object -- install refuses to overwrite it; ${blockedContainerFix(`run \`${PROJECT_INSTALL}\``)}`,
+    );
+    const row = d.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "project");
+    // Both facts are carried; the row picks the one install raises first.
+    expect(row?.containerBlocked).toBe('"mcpServers" is an array of 1');
+    expect(row?.unloadable).toBe(unloadableConfigProblem(violationOf(bytes)));
+    const i = await installClaudeCode("project");
+    expect(i.exitCode).toBe(1);
+    expect(linesOf(i.stderr).filter((l) => l !== "")).toEqual([
+      `yaw-mcp install: "mcpServers" in ${path} is an array of 1, not a JSON object -- refusing to overwrite it; ${blockedContainerFix("re-run")}.`,
+    ]);
+    expect(readFileSync(path, "utf8")).toBe(bytes);
+  });
+
+  it.each(
+    UNLOADABLE_SHAPES,
+  )("following the advice works: with %s removed, the named install succeeds and doctor sees the entry", async (_shape, spoil) => {
+    const path = writeFile(mcpJsonFile(), spoil(PROJECT_SERVERS));
+    expect((await installClaudeCode("project")).exitCode).toBe(1);
+    // Follow it: the file its client can load again, then the named command.
+    writeFileSync(path, PROJECT_SERVERS);
+    const i = await installClaudeCode("project");
+    expect(i.exitCode).toBe(0);
+    const written = JSON.parse(readFileSync(path, "utf8")) as { mcpServers: Record<string, unknown> };
+    expect(Object.keys(written.mcpServers).sort()).toEqual(["github", ENTRY_NAME].sort());
+    const row = (await doctor()).snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "project");
+    expect(row?.unloadable).toBe(null);
+    expect(row?.hasMcpEntry).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// THE DATA-LOSS CASE. `import claude-code --remove-originals` at USER scope
+// searches every other scope for a yaw-mcp entry before deleting the imported
+// servers from ~/.claude.json, and the project `.mcp.json` is one of them. A
+// commented `.mcp.json` holding the entry read as "wired", so the servers were
+// deleted from the file Claude Code WAS loading them from, on the strength of a
+// broker it loads from nowhere: the client could reach neither. Pinned at the
+// filesystem boundary, byte for byte, because the loss is on disk.
+
+/** ~/.claude.json as Claude Code leaves it: our server plus the client's own
+ *  state, indented so any re-serialisation of the file would show. */
+const CLAUDE_JSON_WITH_SERVER = `{
+  "numStartups": 12,
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/srv/data"]
+    }
+  },
+  "tipsHistory": { "memory-command": 3 }
+}
+`;
+
+const PROJECT_WITH_BROKER = `${JSON.stringify({ mcpServers: { [ENTRY_NAME]: YAW_ENTRY } }, null, 2)}\n`;
+
+/** The container `import` searches at local scope, as the resolver spells it. */
+const claudeLocal = () =>
+  resolveInstallPath({ clientId: "claude-code", scope: "local", os: "linux", projectDir: cwd, home });
+
+describe("import --remove-originals -- a yaw-mcp entry its client cannot load is not wiring", () => {
+  it.each(
+    UNLOADABLE_SHAPES,
+  )("%s in .mcp.json: the import refuses, and ~/.claude.json keeps its server byte for byte", async (_shape, spoil) => {
+    const user = writeFile(claudeJsonFile(), CLAUDE_JSON_WITH_SERVER);
+    const projectBytes = spoil(PROJECT_WITH_BROKER);
+    const project = writeFile(mcpJsonFile(), projectBytes);
+    const local = claudeLocal();
+    const r = await importRemoving("claude-code", "user");
+    expect(r.exitCode).toBe(0);
+    // The import itself ran -- the refusal is at the removal step, so the
+    // byte comparison below is about a run that reached the decision, not one
+    // that bailed before it.
+    expect(r.written).toHaveLength(1);
+    expect(r.written).not.toContain(user);
+    expect(linesOf(r.stdout)).toContain(`Imported 1 server into ${r.written[0]}.`);
+    // The project container is named for the client's fault, not as wiring
+    // and not as "no entry". The next step is the user-scope install -- the
+    // file a bare `yaw-mcp install claude-code` writes is ~/.claude.json, which
+    // its client does load, so "run install first" is true here.
+    expect(linesOf(r.stderr)).toContain(
+      `Not removing the originals: no yaw-mcp entry in ${user} (mcpServers) or ${local.absolute} (${local.containerPath.join(".")}), and ${project} ${unloadableConfigProblem(violationOf(projectBytes))}, so Claude Code would be left with no way to reach them. Run \`yaw-mcp install claude-code\` first, then re-run this with --remove-originals.`,
+    );
+    expect(linesOf(r.stdout).filter((l) => l.startsWith("Reached through") || l.startsWith("Removed "))).toEqual([]);
+    expect(readFileSync(user)).toEqual(Buffer.from(CLAUDE_JSON_WITH_SERVER));
+    expect(readFileSync(project)).toEqual(Buffer.from(projectBytes));
+  });
+
+  it("the same files with the .mcp.json loading: that entry IS wiring, so the original goes -- the refusal is loadability, not scope", async () => {
+    const user = writeFile(claudeJsonFile(), CLAUDE_JSON_WITH_SERVER);
+    const project = writeFile(mcpJsonFile(), PROJECT_WITH_BROKER);
+    const r = await importRemoving("claude-code", "user");
+    expect(r.exitCode).toBe(0);
+    expect(linesOf(r.stderr).filter((l) => l.startsWith("Not removing the originals"))).toEqual([]);
+    expect(linesOf(r.stdout)).toContain(`Reached through the yaw-mcp entry in ${project} (mcpServers).`);
+    expect(linesOf(r.stdout)).toContain(`Removed 1 entry from ${user}. Restart Claude Code so it picks up the change.`);
+    expect(r.written).toContain(user);
+    const after = parseJsonc(readFileSync(user, "utf8")) as Record<string, unknown>;
+    expect(after.mcpServers).toEqual({});
+    // Only the server went: the client's own state in the file is untouched.
+    expect(after.numStartups).toBe(12);
+    expect(after.tipsHistory).toEqual({ "memory-command": 3 });
+    expect(readFileSync(project, "utf8")).toBe(PROJECT_WITH_BROKER);
+  });
+
+  it("following the advice works: the user-scope install, then the re-run removes the original through that entry", async () => {
+    const user = writeFile(claudeJsonFile(), CLAUDE_JSON_WITH_SERVER);
+    const projectBytes = UNLOADABLE_SHAPES[0][1](PROJECT_WITH_BROKER);
+    const project = writeFile(mcpJsonFile(), projectBytes);
+    expect(
+      linesOf((await importRemoving("claude-code", "user")).stderr).some((l) =>
+        l.startsWith("Not removing the originals"),
+      ),
+    ).toBe(true);
+    expect((await installClaudeCode("user")).exitCode).toBe(0);
+    const again = await importRemoving("claude-code", "user");
+    expect(again.exitCode).toBe(0);
+    expect(linesOf(again.stderr).filter((l) => l.startsWith("Not removing the originals"))).toEqual([]);
+    expect(linesOf(again.stdout)).toContain(
+      `Removed 1 entry from ${user}. Restart Claude Code so it picks up the change.`,
+    );
+    const after = parseJsonc(readFileSync(user, "utf8")) as { mcpServers: Record<string, unknown> };
+    expect(Object.keys(after.mcpServers)).toEqual([ENTRY_NAME]);
+    // The commented project file is the user's to fix; nothing here touched it.
+    expect(readFileSync(project, "utf8")).toBe(projectBytes);
   });
 });
