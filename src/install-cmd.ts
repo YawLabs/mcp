@@ -63,7 +63,11 @@ import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { atomicWriteFile } from "./atomic-write.js";
-import { CLAUDE_CODE_ALLOW_PATTERN, prepareClaudeCodeSettingsPatch } from "./claude-code-settings.js";
+import {
+  CLAUDE_CODE_ALLOW_PATTERN,
+  prepareClaudeCodeSettingsPatch,
+  resolveClaudeCodeSettingsPath,
+} from "./claude-code-settings.js";
 import { clientChoices, resolveClientArg } from "./client-aliases.js";
 import {
   applyClientConfigEdits,
@@ -1406,13 +1410,16 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
 
   const home = opts.home ?? homedir();
 
-  // Claude Code: also ensure `permissions.allow` carries our pattern so
-  // the user isn't re-prompted for every yaw-mcp tool call. No-op for other
-  // clients (Claude Desktop / Cursor / VS Code have their own permission
-  // models). Preserves all existing settings — we only union the pattern
-  // into `permissions.allow` and write the file back verbatim otherwise.
+  // A row that declares `hooks.permissionsPatch: "claude-code"` (Claude Code,
+  // and typed, which reads the same settings.json) also gets our pattern into
+  // `permissions.allow`, so the user isn't re-prompted for every yaw-mcp tool
+  // call. Keyed on the ROW's hook, never on its id, so a client that shares
+  // the scheme opts in on its own row. No-op for every other client (Claude
+  // Desktop / Cursor / VS Code have their own permission models). Preserves
+  // all existing settings — we only union the pattern into
+  // `permissions.allow` and write the file back verbatim otherwise.
   const settingsPatch =
-    opts.clientId === "claude-code"
+    target.hooks?.permissionsPatch === "claude-code"
       ? await prepareClaudeCodeSettingsPatch({
           scope,
           home,
@@ -2736,6 +2743,16 @@ export const INSTALL_USAGE = USAGE;
 //                                      not parse.
 // ---------------------------------------------------------------------------
 
+/** The labels of every row that patches Claude Code's permissions file
+ *  ("Claude Code and typed"), for the usage line below. DERIVED from the
+ *  rows' `hooks.permissionsPatch` for the same reason the synopsis derives the
+ *  ids: a hand-kept name here stops being true the day another row declares
+ *  the hook. */
+function grantSharingLabels(): string {
+  const labels = INSTALL_TARGETS.filter((t) => t.hooks?.permissionsPatch === "claude-code").map((t) => t.label);
+  return labels.length <= 1 ? labels.join("") : `${labels.slice(0, -1).join(", ")} and ${labels[labels.length - 1]}`;
+}
+
 const UNINSTALL_USAGE =
   // Every name the parser accepts, because `clientChoices` is what it
   // validates against -- uninstall has accepted windsurf and gemini-cli since
@@ -2746,9 +2763,10 @@ const UNINSTALL_USAGE =
   "                         [--project-dir <path>] [--os macos|linux|windows]\n" +
   "                         [--force | -y] [--keep-legacy] [--dry-run]\n" +
   "\n" +
-  `  Removes the "${ENTRY_NAME}" entry from the client's config, and for Claude Code drops\n` +
-  `  ${CLAUDE_CODE_ALLOW_PATTERN} from permissions.allow. A pre-rename entry (${LEGACY_ENTRY_NAMES.join(", ")})\n` +
-  "  goes with it unless --keep-legacy is passed.\n" +
+  `  Removes the "${ENTRY_NAME}" entry from the client's config, and for ${grantSharingLabels()} drops\n` +
+  `  ${CLAUDE_CODE_ALLOW_PATTERN} from permissions.allow -- unless another of them still has its entry and\n` +
+  "  reads the same settings.json, which keeps the grant and says so.\n" +
+  `  A pre-rename entry (${LEGACY_ENTRY_NAMES.join(", ")}) goes with it unless --keep-legacy is passed.\n` +
   "\n" +
   "  Nothing to remove is exit 0, not an error. Comments and every unrelated key in the\n" +
   "  file are preserved. Local servers in ~/.yaw-mcp/bundles.json are untouched --\n" +
@@ -2943,6 +2961,85 @@ interface RemovalSite {
   legacyEntry: string | null;
 }
 
+/** Who else still relies on the `permissions.allow` grant uninstall is about
+ *  to remove: the first (row, scope) other than `self` whose
+ *  `hooks.permissionsPatch` resolves to the SAME settings file and whose own
+ *  config still carries the "mcp" entry. null when nobody does, which is the
+ *  only case in which removing the grant is safe.
+ *
+ *  GENERIC over the table on purpose -- no client id appears here. Today the
+ *  sharing pairs are Claude Code's user scope and typed (both resolve to the
+ *  user-scope settings.json), and, for a project folder that IS the home
+ *  directory with CLAUDE_CONFIG_DIR unset, Claude Code's project scope with
+ *  both of those (`<home>/.claude/settings.json` is then both files). Any row that
+ *  later declares the hook joins the check by declaring it.
+ *
+ *  A peer scope that needs a project directory is checked only when this run
+ *  resolved one: a user-scope uninstall has no project folder to look in, and
+ *  guessing one (the cwd) would name a folder the user never pointed at.
+ *  Such a scope's settings file is project-relative anyway, so it can only
+ *  coincide with a user-scope file when the project folder is the home.
+ *
+ *  An `unreadable` peer config counts as a holder: its entry cannot be ruled
+ *  out, and a dead wildcard left behind costs nothing where a revoked live
+ *  grant re-prompts on every tool call -- the same trade the legacy-wildcard
+ *  note in claude-code-settings.ts makes. A malformed one does not: the
+ *  client that owns it cannot load a server from it either. */
+async function sharedGrantHolder(args: {
+  self: { clientId: InstallClientId; scope: InstallScope };
+  settingsPath: string;
+  os: InstallOS;
+  home: string;
+  appData: string;
+  projectDir: string | undefined;
+  claudeConfigDir: string | undefined;
+  clientEnv: ClientEnvValues | undefined;
+}): Promise<{ label: string; scope: InstallScope; file: string; unreadable: boolean } | null> {
+  for (const peer of INSTALL_TARGETS) {
+    if (peer.hooks?.permissionsPatch !== "claude-code") continue;
+    if (!peer.availableOn.includes(args.os)) continue;
+    for (const spec of peer.scopes) {
+      if (peer.clientId === args.self.clientId && spec.scope === args.self.scope) continue;
+      // No separate "has a project dir" test: resolveClaudeCodeSettingsPath
+      // answers null for a project or local scope without one, and null never
+      // equals the path this run is patching.
+      const peerProjectDir = spec.requiresProjectDir ? args.projectDir : undefined;
+      const peerSettings = resolveClaudeCodeSettingsPath(spec.scope, {
+        home: args.home,
+        projectDir: peerProjectDir,
+        claudeConfigDir: args.claudeConfigDir,
+      });
+      if (peerSettings !== args.settingsPath) continue;
+      let peerSites: ConfigSite[];
+      try {
+        peerSites = resolveInstallSites({
+          clientId: peer.clientId,
+          scope: spec.scope,
+          os: args.os,
+          home: args.home,
+          appData: args.appData,
+          projectDir: peerProjectDir,
+          claudeConfigDir: args.claudeConfigDir,
+          clientEnv: args.clientEnv,
+        });
+      } catch {
+        // Unreachable for a row that passed the checks above; a peer whose
+        // path cannot be resolved has no file to hold an entry in.
+        continue;
+      }
+      for (const site of selectSites(peerSites)) {
+        const view = await readClientConfigFile(site, { transform: peer.entry });
+        const holds = view.read.kind === "ok" && view.entry() !== undefined;
+        const unreadable = view.read.kind === "unreadable";
+        if (holds || unreadable) {
+          return { label: peer.label, scope: spec.scope, file: site.resolved.absolute, unreadable };
+        }
+      }
+    }
+  }
+  return null;
+}
+
 export async function runUninstall(opts: UninstallCommandOptions): Promise<InstallResult> {
   const stdout = opts.io?.stdout ?? process.stdout;
   const stderr = opts.io?.stderr ?? process.stderr;
@@ -2962,7 +3059,7 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
   }
   const plan = resolveInstallSite("uninstall", opts, err);
   if (!plan) return { written: [], wouldWrite: [], messages, exitCode: 2 };
-  const { target, scope, projectDir, resolved } = plan;
+  const { target, os, scope, projectDir, resolved } = plan;
 
   log(`Target: ${target.label} (${scope})`);
   log(`File:   ${resolved.absolute}`);
@@ -3047,8 +3144,11 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
   // the grant can fall out of sync (a hand-deleted entry, an interrupted
   // earlier run), and a lingering `mcp__mcp__*` in a global allow-list is
   // precisely the leftover this subcommand exists to clean up.
-  const settingsPatch =
-    opts.clientId === "claude-code"
+  //
+  // Keyed on the row's `hooks.permissionsPatch`, like install's patch, never
+  // on the client id.
+  let settingsPatch =
+    target.hooks?.permissionsPatch === "claude-code"
       ? await prepareClaudeCodeSettingsPatch({
           scope,
           home,
@@ -3062,6 +3162,33 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
       `yaw-mcp uninstall: warning -- could not patch ${settingsPatch.path} (${settingsPatch.malformedReason}); left unchanged. Remove "${CLAUDE_CODE_ALLOW_PATTERN}" from permissions.allow by hand.`,
     );
   }
+  // The grant can be SHARED: every row whose hook resolves to the same
+  // settings.json unions the same pattern into it (Claude Code's user scope
+  // and typed both land in the user settings.json). Removing it while another
+  // of those rows still has its entry would revoke a grant a live client
+  // reads, and that client would re-prompt on every yaw-mcp tool call -- so
+  // the grant stays, and the run says which client is keeping it. Only a
+  // patch that would actually change something is worth asking about.
+  if (settingsPatch?.changed) {
+    const holder = await sharedGrantHolder({
+      self: { clientId: target.clientId, scope },
+      settingsPath: settingsPatch.path,
+      os,
+      home,
+      appData: resolveAppDataDir({ appData: opts.appData, home: opts.home }),
+      projectDir,
+      claudeConfigDir: opts.claudeConfigDir,
+      clientEnv: opts.clientEnv,
+    });
+    if (holder !== null) {
+      log(
+        holder.unreadable
+          ? `Keeping ${CLAUDE_CODE_ALLOW_PATTERN} in ${settingsPatch.path}: could not read ${holder.file} to tell whether ${holder.label} (${holder.scope}) still uses it.`
+          : `Keeping ${CLAUDE_CODE_ALLOW_PATTERN} in ${settingsPatch.path}: ${holder.label} (${holder.scope}) still launches yaw-mcp from ${holder.file} and reads that grant.`,
+      );
+      settingsPatch = null;
+    }
+  }
 
   // The editor copies, consulted BEFORE the "Nothing to do" gate below:
   // whether this run has anything to remove is a question about every file it
@@ -3072,8 +3199,8 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
   // printed "Nothing to do: Cline (user) has no yaw-mcp entry", exited 0 with
   // `written: []`, and left that copy launching yaw-mcp; --dry-run reported
   // `wouldWrite: []` over the same state. The `settingsPatch?.changed` escape
-  // beside it does not cover the case: that patch is claude-code-only, and
-  // claude-code has no extra sites.
+  // beside it does not cover the case: that patch exists only for a row with
+  // `hooks.permissionsPatch`, and no such row has extra sites.
   //
   // A PREVIEW pass (`dryRun: true`), not the removal itself: the confirmation
   // below has not been answered yet, and nothing may touch a copy before the

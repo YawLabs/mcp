@@ -75,6 +75,13 @@
 //     (`mcpServers/yaw-mcp.json`), not a user config we splice into. That is
 //     `config.ownership: "dedicated"`, and it changes the uninstall wording
 //     rather than any path.
+//   • typed gets a file of its own, `<home>/.config/typed/mcp.json` on every
+//     OS, rather than one of Claude Code's: CLAUDE_CONFIG_DIR can be a
+//     disposable overlay, Yaw Terminal rewrites a `@yawlabs/mcp@latest` entry
+//     in `.claude.json`, and `~/.mcp.json` is project scope to Claude Code.
+//     typed reads Claude Code's user settings.json for permissions, so its
+//     row shares Claude Code's grant through `hooks.permissionsPatch`, and
+//     uninstall keeps that grant while either row still has its entry.
 
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
@@ -95,6 +102,7 @@ import {
 import { CLINE_TARGET } from "./target-cline.js";
 import { CODEX_CLI_TARGET } from "./target-codex-cli.js";
 import { CONTINUE_TARGET } from "./target-continue.js";
+import { TYPED_TARGET } from "./target-typed.js";
 import { ZED_TARGET } from "./target-zed.js";
 
 // Every type and constant a target row is made of lives in the LEAF module
@@ -262,6 +270,10 @@ const TARGET_ROWS = [
   // Importing this row is also what registers the "toml" config adapter (see
   // its module header), so the format is readable exactly when a row uses it.
   CODEX_CLI_TARGET,
+  // The second row to declare `hooks.permissionsPatch: "claude-code"`: typed
+  // reads permissions.allow from Claude Code's user settings.json, so its
+  // install unions the same grant into the same file (see its module header).
+  TYPED_TARGET,
 ] as const satisfies readonly (InlineTarget | ModularTarget)[];
 
 /** Derived from the rows, never hand-kept beside them: `defineTarget`'s

@@ -56,16 +56,18 @@ Servers auto-unload after ~10 tool calls to other servers, so context stays clea
 ### One command (recommended)
 
 ```bash
-npx -y @yawlabs/mcp@latest install <claude-code|claude-desktop|cursor|vscode|windsurf|gemini-cli>
+npx -y @yawlabs/mcp@latest install <claude-code|claude-desktop|cursor|vscode|windsurf|gemini-cli|zed|cline|continue|codex-cli|typed>
 ```
 
-This edits the chosen client's config (correct path + JSON shape for your OS) to launch yaw-mcp. On Windows it wraps `npx` in `cmd /c` (without which MCP clients hit `ENOENT` on the `npx.cmd` shim). Run it once per client.
+This edits the chosen client's config (correct path + JSON shape for your OS) to launch yaw-mcp. On Windows it wraps `npx` in `cmd /c` (without which MCP clients hit `ENOENT` on the `npx.cmd` shim), except for Continue, Codex CLI and typed, which resolve that shim themselves and get a bare `npx`. Run it once per client. `mcp` is accepted too, as another name for Claude Code's project scope (`<project>/.mcp.json`).
+
+`install typed` writes typed's own `~/.config/typed/mcp.json` (the same path on every OS, whatever `CLAUDE_CONFIG_DIR` says), which typed ranks above Claude Code's user-scope files -- so it wins over an `mcp` entry Yaw Terminal manages in `~/.claude.json`, while a project's `.mcp.json` still wins over it. It needs a typed CLI newer than 1.5.0; with an older one, use `install claude-code`, whose files typed also reads. Like `install claude-code`, it adds `mcp__mcp__*` to `permissions.allow` in Claude Code's user `settings.json`, which typed reads for permissions too. The two share that one grant, so `uninstall` of either keeps it while the other still has its entry, and says so.
 
 Claude Desktop on Linux is not supported yet. Anthropic ships a Linux beta but has not documented where it reads `claude_desktop_config.json`, so `install claude-desktop` refuses on Linux rather than write a guessed path, and `--all` skips it. Add the entry by hand, or use another client.
 
 Useful flags:
 
-- `--scope user|project|local` -- which file to write. Claude Code and Cursor support project and local; VS Code and Gemini CLI support user and project; Claude Desktop and Windsurf are user-only.
+- `--scope user|project|local` -- which file to write. Claude Code supports user, project and local; Cursor, VS Code, Gemini CLI, Zed, Continue and Codex CLI support user and project; Claude Desktop, Windsurf, Cline and typed are user-only.
 - `--dry-run` -- print what would be added (never the rest of the file) and exit without writing.
 - `--repair` / `--force` / `--skip` -- what to do about an existing `mcp` entry that differs from the one install writes. `--repair` brings it up to date and keeps the string values in its `env` block (where the [secret vault](#local-secret-vault) has you put `YAW_MCP_VAULT_PASSPHRASE`), and is a no-op on an entry that already matches. `--force` overwrites it outright, `env` included, naming each key it drops. `--skip` leaves it untouched. Without one of them install prompts on a TTY; off a TTY it shows what differs and refuses with exit 2 (a real failure, such as a malformed config, exits 1). Under `--all` the run exits 2 when every client that did not succeed was refused this way, and 1 if any one failed.
 

@@ -178,10 +178,10 @@ const RULES: Rule[] = [
     pattern: /clientId\s*===\s*["']|as\s+InstallClientId\b/,
     allowed: {
       "src/install-cmd.ts":
-        "THREE Claude Code branches remain, each on a line this reason names so it can be deleted with the " +
-        'branch: install\'s settings patch (the `opts.clientId === "claude-code"` guarding ' +
-        "prepareClaudeCodeSettingsPatch), the project-scope approval clause in the Done block, and " +
-        "uninstall's settings patch. All three move to hooks.permissionsPatch with the consumer migration",
+        "ONE Claude Code branch remains: the project-scope approval clause in the Done block " +
+        '(`target.clientId === "claude-code" && scope === "project"`), which names Claude Code\'s own ' +
+        ".mcp.json approval prompt. Install's and uninstall's settings patches read hooks.permissionsPatch " +
+        "now; this line goes when that clause becomes data on the row too",
       "src/import-cmd.ts":
         'one `target.clientId === "vscode"` branch, the input-variable expansion that ' +
         "hooks.importVariables is declared to replace -- it goes when import reads the hook instead",
@@ -379,6 +379,7 @@ describe("the table's structure", () => {
       "cline",
       "continue",
       "codex-cli",
+      "typed",
     ]);
   });
 

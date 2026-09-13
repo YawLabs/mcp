@@ -298,7 +298,9 @@ if (subcommand === "compliance") {
                              one), so it may create a config for a client that
                              is not on this machine.
     uninstall <client>       Unwire a client: removes the yaw-mcp entry (and,
-                             for Claude Code, its permissions.allow grant).
+                             for Claude Code and typed, the permissions.allow
+                             grant they share -- kept, and named, while the
+                             other still has its entry).
                              Your servers in bundles.json are untouched.
 
   Local servers (no account):
@@ -575,7 +577,11 @@ if (subcommand === "compliance") {
                                \`install\`, \`try\` and \`doctor\` whenever they
                                locate Claude Code's config, so a non-default
                                location is read and written instead of
-                               ~/.claude. It is Claude Code's knob, not
+                               ~/.claude. It also decides which settings.json
+                               \`install typed\` adds the permissions.allow
+                               grant to, since typed reads that same file;
+                               typed's own ~/.config/typed/mcp.json does not
+                               follow it. It is Claude Code's knob, not
                                yaw-mcp's; the server itself never reads it.
     APPDATA                       Windows' roaming app-data directory, honored
                                by \`install\`, \`try\`, \`doctor\` and

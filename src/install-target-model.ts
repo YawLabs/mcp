@@ -131,9 +131,13 @@ export interface SiteSpec {
  *  `clientId` -- the three `clientId === "claude-code"` branches and the one
  *  `clientId === "vscode"` branch this replaces are what R6 now forbids. */
 export interface TargetHooks {
-  /** Patch this client's own permission file alongside the launch entry.
-   *  "claude-code" is the only scheme there is; the value names it rather than
-   *  carrying a function so the row stays data. */
+  /** Patch the permission file this client reads alongside the launch entry.
+   *  "claude-code" is the only scheme there is -- `permissions.allow` in
+   *  Claude Code's settings.json, which typed reads as well -- and the value
+   *  names it rather than carrying a function so the row stays data. Install
+   *  and uninstall both read it; two rows whose scheme resolves to the same
+   *  file share one grant, and uninstall keeps it while the other still has
+   *  its entry. */
   permissionsPatch?: "claude-code";
   /** Which `${...}` expansion rules `import` applies to this client's entries.
    *  BOTH handlers live in import-cmd.ts; a row only names the value.

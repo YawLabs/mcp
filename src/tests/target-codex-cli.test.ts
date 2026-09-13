@@ -175,7 +175,24 @@ describe("the codex-cli row", () => {
     // `try`'s auto-detect returns the first usable probe slot in table order,
     // so a row inserted ahead of an existing one changes which client an
     // existing user's `try` picks.
-    expect(INSTALL_TARGETS.at(-1)?.clientId).toBe("codex-cli");
+    //
+    // Asserted as "after every row that landed before it", not as the literal
+    // last row: `at(-1)` was a statement about merge order that held only
+    // until the next row (typed) was appended -- the same correction the
+    // continue test made when this row landed after it.
+    const ids = INSTALL_TARGETS.map((t) => t.clientId);
+    const landedBefore = [
+      "claude-code",
+      "claude-desktop",
+      "cursor",
+      "vscode",
+      "windsurf",
+      "gemini-cli",
+      "zed",
+      "cline",
+    ];
+    expect(ids.slice(0, landedBefore.length)).toEqual(landedBefore);
+    expect(ids.indexOf("codex-cli")).toBeGreaterThan(ids.indexOf("continue"));
   });
 
   it("declares the TOML container Codex reads, on every OS Codex ships on", () => {
