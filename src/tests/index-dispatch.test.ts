@@ -135,6 +135,47 @@ describe("KNOWN_SUBCOMMANDS table", () => {
     expect(dispatched.length).toBeGreaterThan(0);
     expect(new Set<string>(dispatched)).toEqual(new Set<string>(KNOWN_SUBCOMMANDS));
   });
+
+  it("does not list removed or unknown subcommands in --help text", async () => {
+    // Guards against help-text drift (issue #132): when a subcommand is
+    // retired or renamed, its entry in the --help text must not linger.
+    // Scrapes every command name listed under the sections of --help in
+    // index.ts and asserts that every one is present in KNOWN_SUBCOMMANDS.
+    const src = await readFile(INDEX_SRC, "utf8");
+    const helpStart = src.indexOf("Setup (connect a client");
+    const helpEnd = src.indexOf("Environment variables:", helpStart);
+    expect(helpStart).toBeGreaterThan(-1);
+    expect(helpEnd).toBeGreaterThan(helpStart);
+    const helpBody = src.slice(helpStart, helpEnd);
+
+    // Each command is indented by 4 spaces.
+    // Extract the leading command token or comma-separated tokens (e.g. `help, --help, -h`).
+    const commandLines = helpBody.split("\n").filter((line) => line.startsWith("    ") && !line.startsWith("     "));
+
+    const scraped: string[] = [];
+    for (const line of commandLines) {
+      // The command/syntax column precedes the description (separated by at least 3 spaces).
+      const spec =
+        line
+          .slice(4)
+          .split(/\s{3,}/)[0]
+          ?.trim() ?? "";
+      if (spec.includes(",")) {
+        for (const token of spec.split(",")) {
+          const name = token.trim().split(/\s+/)[0];
+          if (name) scraped.push(name);
+        }
+      } else {
+        const name = spec.split(/[\s<[]/)[0];
+        if (name) scraped.push(name);
+      }
+    }
+
+    expect(scraped.length).toBeGreaterThan(0);
+    const knownSet = new Set<string>(KNOWN_SUBCOMMANDS);
+    const unknown = scraped.filter((name) => !knownSet.has(name));
+    expect(unknown, "subcommands in --help text that are missing from KNOWN_SUBCOMMANDS").toEqual([]);
+  });
 });
 
 // --- index.ts run as a real process ------------------------------------
