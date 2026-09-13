@@ -1,11 +1,11 @@
 import { spawn } from "node:child_process";
 import { readdirSync, readFileSync } from "node:fs";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { FLAG_ALIASES, KNOWN_SUBCOMMANDS, suggestFlag, suggestSubcommand } from "../subcommands.js";
+import { buildBrokerBundle } from "./broker-bundle.js";
 
 // The dispatcher in index.ts runs at import time (top-level side effects),
 // so it cannot be imported directly. The did-you-mean logic it uses lives
@@ -210,7 +210,6 @@ describe("KNOWN_SUBCOMMANDS table", () => {
 // every startup path is fail-open by construction, so no input makes
 // runServer() reject. See "keeps runServer()'s rejection on a real catch".
 const INDEX_SRC = fileURLToPath(new URL("../index.ts", import.meta.url));
-const PROJECT_ROOT = fileURLToPath(new URL("../../", import.meta.url));
 
 let workDir: string;
 let bundlePath: string;
@@ -266,25 +265,29 @@ async function runEntry(
     // config), do not wedge the suite -- kill and let the assertion fail.
     //
     // The ceiling is for CONTENTION, not for the work -- the same reasoning
-    // the beforeAll build timeout carries, and it has to be far larger than
-    // it looks because the FIRST execution of a freshly-written bundle is
-    // roughly an order of magnitude more expensive than the second.
-    //
-    // Measured from inside vitest on a Windows box with on-access AV, three
-    // iterations of "build the bundle, run it cold, run it warm":
+    // the beforeAll build timeout carries. It was sized for a first execution
+    // this file no longer pays: while esbuild wrote the bundle to disk
+    // itself, running it the first time cost an order of magnitude more than
+    // running it again. Measured from inside vitest on a Windows box with
+    // on-access AV, three iterations of "build the bundle, run it cold, run
+    // it warm":
     //
     //     build 26.6s | COLD 40.4s | warm 3.8s
     //     build  1.4s | COLD 15.7s | warm 4.4s
     //     build 23.9s | COLD 13.0s | warm 2.3s
     //
-    // A 3 MB file that did not exist a moment ago is scanned before it runs,
-    // and beforeAll writes a new bundle into a new temp dir on every run, so
-    // the first runEntry in this file always pays it. The old 15s guard fired
-    // on roughly one run in four; 25s was still inside the observed range.
-    // 90s clears the worst measurement with room, and a real hang -- the
-    // thing this guard exists for -- is unbounded, so it still gets caught.
+    // The old 15s guard fired on roughly one run in four; 25s was still
+    // inside the observed range, so it went to 90s -- and a full-suite
+    // release run on 2026-09-13 outlived even that, SIGKILLing the first
+    // boot below with code null. The cost turned out to follow the writer,
+    // not the file: buildBrokerBundle has node write the same bytes, and the
+    // first run then measured 1.6s standalone (numbers in broker-bundle.ts).
     //
-    // The two tests that call runEntry carry an explicit per-test timeout
+    // 90s stays anyway. A real hang -- the thing this guard exists for -- is
+    // unbounded, so a generous ceiling still catches it, and a tighter one
+    // would only add a way to flake on a contended box.
+    //
+    // Every test that calls runEntry carries an explicit per-test timeout
     // ABOVE this value. That ordering is load-bearing: the guard firing is a
     // legible failure (SIGKILL, code null, an assertion naming what was
     // missing), while a vitest timeout reports only that the test was slow.
@@ -304,32 +307,15 @@ async function runEntry(
 
 describe("index.ts entry, run as a real process", () => {
   beforeAll(async () => {
-    const { build } = await import("esbuild");
-    workDir = await mkdtemp(join(tmpdir(), "yaw-mcp-entry-"));
-    bundlePath = join(workDir, "entry.mjs");
-    await build({
-      entryPoints: [INDEX_SRC],
-      absWorkingDir: PROJECT_ROOT,
-      outfile: bundlePath,
-      bundle: true,
-      platform: "node",
-      format: "esm",
-      target: "node20",
-      // Prefer each dep's ESM build, and hand bundled CJS a real require:
-      // both keep the self-contained bundle runnable outside the repo.
-      mainFields: ["module", "main"],
-      banner: {
-        js: 'import { createRequire as __yawCreateRequire } from "node:module";\nconst require = __yawCreateRequire(import.meta.url);',
-      },
-      define: { __VERSION__: JSON.stringify("0.0.0-test") },
-      logLevel: "silent",
-    });
+    // The helper's fresh temp dir is also the child's HOME and cwd -- see
+    // runEntry -- so the bundle and the isolated home share one directory.
+    ({ dir: workDir, path: bundlePath } = await buildBrokerBundle("yaw-mcp-entry-"));
     // Timeout is deliberately far above the observed cost. This bundles the
-    // whole dependency graph (~500 KB) and it finishes in ~1s standalone, but
-    // it runs while the other 74 test files do too: on a loaded box it has
-    // been seen to exceed 60s and fail the suite as a hook timeout, taking
-    // the three tests below down as "skipped". The ceiling is for contention,
-    // not for the work itself.
+    // whole dependency graph (about 3.9 MB out) and took 2.5-4.4s standalone
+    // when last measured, but it runs while the rest of the unit project's
+    // files do too: on a loaded box it has been seen to exceed 60s and fail
+    // the suite as a hook timeout, taking the tests below down as "skipped".
+    // The ceiling is for contention, not for the work itself.
   }, 180_000);
 
   afterAll(async () => {
@@ -362,8 +348,10 @@ describe("index.ts entry, run as a real process", () => {
     // It got past config load and actually started.
     expect(stderr).toContain('"yaw-mcp startup"');
     // Above runEntry's 90s SIGKILL guard, deliberately -- see the note there.
-    // This is the first runEntry in the file, so it is the one that pays the
-    // cold-bundle cost (13-40s measured).
+    // This is the first runEntry in the file, so it is the one that paid the
+    // cold-bundle cost while esbuild wrote the bundle (13-40s measured, and
+    // past the 90s guard in a contended full-suite run). The bundle is
+    // node-written now, and that cost is gone -- see broker-bundle.ts.
   }, 120_000);
 
   it("exits 2 on a mis-cased flag instead of booting a stdio server", async () => {

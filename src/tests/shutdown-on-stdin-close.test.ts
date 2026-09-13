@@ -100,26 +100,13 @@ setInterval(() => {}, 1 << 30);
 
 describe("closing stdin shuts the broker down and reaps its upstreams", () => {
   beforeAll(async () => {
-    const { build } = await import("esbuild");
-    workDir = await mkdtemp(join(tmpdir(), "yaw-mcp-shutdown-"));
-    bundlePath = join(workDir, "entry.mjs");
-    await build({
-      entryPoints: [INDEX_SRC],
-      absWorkingDir: PROJECT_ROOT,
-      outfile: bundlePath,
-      bundle: true,
-      platform: "node",
-      format: "esm",
-      target: "node20",
-      mainFields: ["module", "main"],
-      banner: {
-        js: 'import { createRequire as __yawCreateRequire } from "node:module";\nconst require = __yawCreateRequire(import.meta.url);',
-      },
-      define: { __VERSION__: JSON.stringify("0.0.0-test") },
-      logLevel: "silent",
-    });
-    // Same reasoning as index-dispatch.test.ts: bundling the whole dependency
-    // graph is ~1s standalone but shares the box with every other file.
+    // Built through the shared helper, which has node write the file rather
+    // than esbuild. With esbuild writing it, the bundle's first run alone
+    // outlasted SETTLE_BUDGET_MS below -- see broker-bundle.ts.
+    ({ dir: workDir, path: bundlePath } = await buildBrokerBundle("yaw-mcp-shutdown-"));
+    // The same ceiling index-dispatch.test.ts gives its build. Bundling the
+    // whole dependency graph took 2.5-4.4s standalone when measured; the
+    // ceiling is headroom for a slow disk or scanner, not an estimate.
   }, 180_000);
 
   afterAll(async () => {
