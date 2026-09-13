@@ -64,6 +64,7 @@ import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { atomicWriteFile } from "./atomic-write.js";
+import { quoteArgForDisplay } from "./auto-upgrade.js";
 import {
   CLAUDE_CODE_ALLOW_PATTERN,
   type ClaudeCodeSettingsPatch,
@@ -1633,8 +1634,11 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
       }
     }
     const freshNote = yawFreshPaneNote({
-      grant,
+      grantPatches: settingsPatches,
       target,
+      scope,
+      projectDir,
+      yawMode: opts.clientEnv?.yawMode,
       claudeConfigDir: opts.claudeConfigDir,
       entryFile: resolved.absolute,
       wrote: [
@@ -1789,8 +1793,11 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   }
   // Only over what this run actually wrote: the note is about THOSE writes.
   const freshNote = yawFreshPaneNote({
-    grant,
+    grantPatches: settingsPatches,
     target,
+    scope,
+    projectDir,
+    yawMode: opts.clientEnv?.yawMode,
     claudeConfigDir: opts.claudeConfigDir,
     entryFile: resolved.absolute,
     wrote: written,
@@ -1895,8 +1902,10 @@ type GrantPatch = ClaudeCodeSettingsPatch & { claudeConfigDir: string | undefine
  *  with the pane: it gets a second patch for `<home>/.claude/settings.json`, so
  *  the grant is there for every session after this one. A fresh pane gets no
  *  second patch -- it reads nothing from home, and install says so instead
- *  (yawFreshPaneNote). Project and local scope are project-relative files
- *  CLAUDE_CONFIG_DIR never moves, so no overlay reaches them.
+ *  (yawFreshPaneNote). The grant files of project and local scope are
+ *  project-relative, and CLAUDE_CONFIG_DIR never moves them, so no overlay
+ *  reaches them -- though Claude Code's local-scope ENTRY does follow the
+ *  variable, which yawFreshPaneNote works out for itself at every scope.
  *
  *  Outside a Yaw Mode pane this returns what the single inline patch did, and
  *  every caller prints what it always printed. */
@@ -1942,42 +1951,61 @@ const YAW_HOME_GRANT_REASON = " -- a Yaw Mode pane's own settings.json does not 
  *  what this run put there goes with the pane, and a normal shell is where the
  *  install sticks.
  *
- *  WHAT it names follows where each write landed, never the client id. The
- *  grant is always in the overlay (`<CLAUDE_CONFIG_DIR>/settings.json`). The
- *  row's own entry is too when its file resolves inside CLAUDE_CONFIG_DIR --
- *  Claude Code's `<overlay>/.claude.json` -- and the note then says the entry
- *  goes as well; a file that resolves elsewhere (typed's
- *  `~/.config/typed/mcp.json`) outlives the pane, and the note names the grant
- *  alone.
+ *  Worked out at EVERY scope, not only where prepareGrantPatches works out an
+ *  overlay: the grant patches stay user-scope-only, but Claude Code's LOCAL
+ *  scope entry follows CLAUDE_CONFIG_DIR as well -- it is
+ *  `<CLAUDE_CONFIG_DIR>/.claude.json` under `projects[<dir>]` (resolveInstallPath)
+ *  -- and goes with a fresh pane just as the user entry beside it does.
+ *
+ *  WHAT it names follows where each write landed, never the client id or the
+ *  scope. The grant is named when its file is in the overlay
+ *  (`<CLAUDE_CONFIG_DIR>/settings.json`, user scope); project and local scope
+ *  keep theirs in project-relative files, which outlive the pane. The row's
+ *  own entry is named when its file resolves inside CLAUDE_CONFIG_DIR --
+ *  Claude Code's `<overlay>/.claude.json`, at user or local scope; a file that
+ *  resolves elsewhere (typed's `~/.config/typed/mcp.json`, a project's
+ *  `.mcp.json`) outlives the pane and is not named. So user-scope `install
+ *  typed` names the grant alone, user-scope `install claude-code` both, and
+ *  local-scope `install claude-code` the entry alone.
  *
  *  `wrote` is the files this run wrote, or would write under --dry-run. null
- *  for any other run, and when it wrote neither the overlay's grant nor an
+ *  outside a fresh pane, and when it wrote neither the overlay's grant nor an
  *  entry inside the overlay. */
 function yawFreshPaneNote(args: {
-  grant: { patches: GrantPatch[]; overlay: "augment" | "fresh" | null };
+  grantPatches: readonly GrantPatch[];
   target: InstallTarget;
+  scope: InstallScope;
+  projectDir: string | undefined;
+  yawMode: string | undefined;
   claudeConfigDir: string | undefined;
   entryFile: string;
   wrote: readonly string[];
 }): string | null {
-  const overlayPatch = args.grant.patches.find((p) => !p.yawHome);
   const cfg = args.claudeConfigDir;
-  if (args.grant.overlay !== "fresh" || overlayPatch === undefined || cfg === undefined) return null;
-  const entryInOverlay = samePathKey(args.entryFile).startsWith(`${samePathKey(cfg)}${sep}`);
-  const grantWritten = args.wrote.includes(overlayPatch.path);
+  if (cfg === undefined || yawModeOverlay({ yawMode: args.yawMode, claudeConfigDir: cfg }) !== "fresh") return null;
+  const inOverlay = (file: string): boolean => samePathKey(file).startsWith(`${samePathKey(cfg)}${sep}`);
+  const overlayPatch = args.grantPatches.find((p) => !p.yawHome && inOverlay(p.path));
+  const entryInOverlay = inOverlay(args.entryFile);
+  const grantWritten = overlayPatch !== undefined && args.wrote.includes(overlayPatch.path);
   const entryWritten = entryInOverlay && args.wrote.includes(args.entryFile);
   if (!grantWritten && !entryWritten) return null;
   const { label, clientId } = args.target;
-  const again = `Run \`yaw-mcp install ${clientId}\` from a normal shell to keep`;
-  if (!entryInOverlay) {
+  // The command that writes the same thing from a normal shell: the default
+  // scope needs no flag, any other names itself and the project it resolved.
+  const projectFlag =
+    args.projectDir === undefined ? "" : ` --project-dir ${quoteArgForDisplay(args.projectDir) ?? args.projectDir}`;
+  const scopeFlags = args.scope === "user" ? "" : ` --scope ${args.scope}${projectFlag}`;
+  const again = `Run \`yaw-mcp install ${clientId}${scopeFlags}\` from a normal shell to keep`;
+  if (!entryInOverlay && overlayPatch !== undefined) {
     return (
       `Note: a fresh Yaw Mode pane does not keep its settings.json, so the ${CLAUDE_CODE_ALLOW_PATTERN} grant in ` +
       `${overlayPatch.path} goes when this pane closes. ${again} it.`
     );
   }
-  // A grant already in the file goes with the pane too; one install could not
-  // patch (malformed, and warned about above) is not there to name.
-  return overlayPatch.malformed
+  // A grant already in the file goes with the pane too. One install could not
+  // patch (malformed, and warned about above) is not there to name, and a
+  // project-relative one (local scope) is not in the overlay at all.
+  return overlayPatch === undefined || overlayPatch.malformed
     ? `Note: a fresh Yaw Mode pane does not keep its config dir, so the ${label} entry in ${args.entryFile} goes when ` +
         `this pane closes. ${again} it.`
     : `Note: a fresh Yaw Mode pane does not keep its config dir, so the ${label} entry in ${args.entryFile} and the ` +
@@ -3581,14 +3609,19 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
   // whose configs are the overlay's, so it is asked under CLAUDE_CONFIG_DIR as
   // it stands. `~/.claude/settings.json` is read by the sessions after this
   // pane, whose configs are home's -- AND, in an augment pane, by whatever the
-  // overlay's `.claude.json` holds, since Yaw carries that file home when the
-  // pane closes (syncOverlayBack). So the home-side question is asked with the
+  // overlay's `.claude.json` holds, since Yaw may carry that file home when the
+  // pane closes (syncOverlayBack). MAY, not does: Yaw skips that sync when its
+  // yawModeSyncClaudeJson setting is off, and when ~/.claude.json changed after
+  // the pane started it merges instead, copying home only the top-level keys
+  // home lacks -- so an overlay `mcpServers` entry never reaches a home file
+  // that already has `mcpServers`. The grant is kept for the case where it
+  // does. So the home-side question is asked with the
   // variable unset -- in `clientEnv` too, where Claude Code's own path would
   // otherwise still find the overlay -- and then as the overlay's own question
   // (the overlay's settings file, under the overlay), and either holder keeps
   // the grant. That second question counts ONLY the overlay's `.claude.json`,
-  // the one file Yaw carries home: an entry in another overlay file (typed's
-  // `<overlay>/.mcp.json`) goes with the pane and never reaches a later
+  // the one MCP config file Yaw can carry home: an entry in another overlay
+  // file (typed's `<overlay>/.mcp.json`) goes with the pane and never reaches a later
   // session, and a home file there is the first question's already. Its
   // Keeping line says why a file in the overlay keeps the HOME grant, since the
   // client launched from that overlay reads the overlay's settings.json, not
@@ -3663,7 +3696,7 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
           holder.unreadable
             ? `Keeping ${CLAUDE_CODE_ALLOW_PATTERN} in ${settingsPatch.path}: could not read ${holder.file} to tell whether ${holder.label} (${holder.scope}) still uses it.`
             : carried
-              ? `Keeping ${CLAUDE_CODE_ALLOW_PATTERN} in ${settingsPatch.path}: ${holder.label} (${holder.scope}) still launches yaw-mcp from ${holder.file}, which Yaw carries home when the pane closes.`
+              ? `Keeping ${CLAUDE_CODE_ALLOW_PATTERN} in ${settingsPatch.path}: ${holder.label} (${holder.scope}) still launches yaw-mcp from ${holder.file}, which Yaw may carry home when the pane closes.`
               : `Keeping ${CLAUDE_CODE_ALLOW_PATTERN} in ${settingsPatch.path}: ${holder.label} (${holder.scope}) still launches yaw-mcp from ${holder.file} and reads that grant.`,
         );
         continue;

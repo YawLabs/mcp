@@ -8,8 +8,8 @@
 // would lose the entry somewhere typed is commonly run:
 //   * `CLAUDE_CONFIG_DIR` in a Yaw Mode pane is a disposable per-session
 //     overlay: a fresh pane keeps none of it, so an entry written under it is
-//     gone when the pane closes, and an augment pane carries only its
-//     `.claude.json` home -- where the next bullet applies;
+//     gone when the pane closes, and of its MCP config files an augment pane
+//     carries at most its `.claude.json` home -- where the next bullet applies;
 //   * Yaw Terminal rewrites an `@yawlabs/mcp@latest` npx entry in
 //     `.claude.json` to the copy it bundles and pins;
 //   * `~/.mcp.json` is a PROJECT-scope file to Claude Code, not a user one.
@@ -207,7 +207,7 @@ export const TYPED_TARGET = defineTarget({
     warning: staleTypedCliWarning,
   },
   notes:
-    "typed reads ~/.config/typed/mcp.json when a session starts, ahead of the user-scope files it shares with Claude Code, so this entry wins over an \"mcp\" entry Yaw Terminal manages in ~/.claude.json; a project's .mcp.json still wins over it. On a Yaw Terminal machine that means an npx entry here replaces Yaw Terminal's local launch for typed, and npx resolves @latest on every typed start, which can outlast typed's MCP connect timeout -- `npm i -g @yawlabs/mcp` with oam installed, then re-run install, writes a fast absolute-path entry instead, or raise MCP_TIMEOUT. The file is strict JSON: no comments, no trailing commas. The mcp__mcp__* grant goes in Claude Code's user settings.json, which typed reads too; under a set CLAUDE_CONFIG_DIR that is <CLAUDE_CONFIG_DIR>/settings.json, so the grant is scoped to that config dir while this file is not. There is no project scope here: <project>/.mcp.json is Claude Code's project file, which typed also reads -- use `yaw-mcp install mcp` for it. Needs a typed CLI newer than 1.5.0; older typed reads only Claude Code's files, so use `yaw-mcp install claude-code` there. typed picks the change up in its next session.",
+    "typed reads ~/.config/typed/mcp.json when a session starts, ahead of the user-scope files it shares with Claude Code, so this entry wins over an \"mcp\" entry Yaw Terminal manages in ~/.claude.json; a project's .mcp.json still wins over it. On a Yaw Terminal machine that means an npx entry here replaces Yaw Terminal's local launch for typed, and npx resolves @latest on every typed start, which can outlast typed's MCP connect timeout -- `npm i -g @yawlabs/mcp` with oam installed, then re-run install, writes a fast absolute-path entry instead, or raise MCP_TIMEOUT. The file is strict JSON: no comments, no trailing commas. The mcp__mcp__* grant goes in Claude Code's user settings.json, which typed reads too; under a set CLAUDE_CONFIG_DIR that is <CLAUDE_CONFIG_DIR>/settings.json. There is no project scope here: <project>/.mcp.json is Claude Code's project file, which typed also reads -- use `yaw-mcp install mcp` for it. Needs a typed CLI newer than 1.5.0; older typed reads only Claude Code's files, so use `yaw-mcp install claude-code` there. typed picks the change up in its next session.",
   resolvePath: resolveTypedPath,
   scopes: [
     {
