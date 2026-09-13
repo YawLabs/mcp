@@ -6,7 +6,8 @@
 // step-3 push lands on protected main), so a guard that silently inverts is
 // expensive in exactly the way tests are cheap.
 //
-// Two harness shapes, both hermetic -- no network, no git remote, no npm:
+// Three harness shapes, all hermetic -- no network, no remote but a local bare
+// repo, and never the real npm:
 //
 //   FIXTURE RUN -- copy release.sh into a temp dir beside a synthetic
 //   package.json / server.json / node_modules/.bin and run it for real. This
@@ -24,36 +25,50 @@
 //   wiring, so every extraction ASSERTS its anchors are present: if the script
 //   is reshaped, these fail loudly instead of quietly testing nothing.
 //
+//   STUBBED FULL RUN -- one describe (the oam floor re-run) copies release.sh
+//   into a temp git repo whose origin is a local bare repo, and runs ALL of it
+//   with -y. npm, curl and gh are stub scripts first on PATH, and the harness
+//   refuses to start release.sh unless `command -v` resolves each of the three
+//   to its stub. npm is also pointed at an empty user config and at a registry
+//   URL on 127.0.0.1 port 9 (nothing answered there when measured), so even a
+//   stub that failed to shadow it would have no token and no registry. It is the only shape here that reaches the
+//   gates, the push and the publish, and all three land on stubs and the bare
+//   repo.
+//
 // Deliberately not covered: the IS_MINGW_ARM64 139/134 tolerance paths. They
 // are reachable only when uname reports ARM64, so a test would be the one
 // host-conditional file in the suite and would pass vacuously everywhere else.
 
 import { spawnSync } from "node:child_process";
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, describe, expect, it, vi } from "vitest";
+import { MIN_OAM_VERSION } from "../oam-spawn.js";
 
-// Every case here spawnSyncs a real bash running a real script, and there are
-// 55 of them: ~142 s of wall clock for the file, so ~2.6 s a case on an idle
-// box. None of them ASSERTS a duration -- they assert on the script's stdout
-// -- so the only clock that matters is the harness's patience, and the global
-// 30 s testTimeout was it.
+// Every case here spawnSyncs a real bash running a real script, so the file
+// takes minutes of wall clock and a single case takes seconds. None of them
+// ASSERTS a duration -- they assert on the script's stdout -- so the only clock
+// that matters is the harness's patience, and the global 30 s testTimeout was
+// it.
 //
 // That was enough until the suite grew: the default run packs the parallel
 // files onto every core at once, and under that contention a single case was
 // observed taking 30.3 s and failing the whole run. Twice, non-deterministically,
-// on a green tree. The same file passes standalone in 142 s.
+// on a green tree. The same file, then 55 cases, passed standalone in 142 s.
 //
 // So this is NOT a TIMING_SENSITIVE file (vitest.config.ts) -- that project is
 // for assertions whose SUBJECT is a budget, where isolating the file is what
-// makes the number meaningful, and moving a 142 s file into that sequential
-// group would put all of it on the critical path. Here the deadline is
-// incidental, so the fix is to stop measuring patience in units set for
-// in-process unit tests. 5 minutes is ~2x the file's entire standalone
-// runtime, so no single case can plausibly reach it without being genuinely
-// wedged, which is the failure this still catches.
+// makes the number meaningful, and moving a multi-minute file into that
+// sequential group would put all of it on the critical path. Here the deadline
+// is incidental, so the fix is to stop measuring patience in units set for
+// in-process unit tests. testTimeout applies to each case, not to the file, so
+// the figure it is set against is the slowest single case: one of the stubbed
+// full release runs below, which drives release.sh end to end twice and
+// measured 63 s with the CPU pinned at 100% (2026-09-13). 5 minutes is ~5x
+// that, so no case can plausibly reach it without being genuinely wedged,
+// which is the failure this still catches.
 //
 // release.sh runs this suite as a release gate, so a flake here blocks a
 // release for a reason that has nothing to do with the release.
@@ -78,6 +93,18 @@ function newTmp(prefix: string): string {
   const d = mkdtempSync(join(tmpdir(), prefix));
   tmpRoots.push(d);
   return d;
+}
+
+/**
+ * The environment every child here starts from: this process's, minus the
+ * caller's GIT_* variables. git exports GIT_DIR and GIT_INDEX_FILE to every
+ * hook, so a suite run from a pre-commit hook would otherwise send the
+ * fixtures' `git init` / `add` / `commit` -- and release.sh's own git calls --
+ * into the operator's repository and index, with every case green. Read at
+ * call time, not once at load, so a case can prove it by setting them.
+ */
+function baseEnv(): NodeJS.ProcessEnv {
+  return Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.toUpperCase().startsWith("GIT_")));
 }
 
 /**
@@ -123,7 +150,7 @@ function runBash(body: string, cwd: string, env: Record<string, string> = {}): R
   const r = spawnSync("bash", [file], {
     cwd,
     encoding: "utf8",
-    env: { ...process.env, NO_COLOR: "1", ...env },
+    env: { ...baseEnv(), NO_COLOR: "1", ...env },
   });
   return { status: r.status, out: `${r.stdout ?? ""}${r.stderr ?? ""}` };
 }
@@ -218,7 +245,7 @@ function runRelease(dir: string, version = "9.9.9", env: Record<string, string> 
   const r = spawnSync("bash", ["./release.sh", version], {
     cwd: dir,
     encoding: "utf8",
-    env: { ...process.env, NO_COLOR: "1", ...env },
+    env: { ...baseEnv(), NO_COLOR: "1", ...env },
   });
   return { status: r.status, out: `${r.stdout ?? ""}${r.stderr ?? ""}` };
 }
@@ -742,6 +769,9 @@ describe("release.sh registry_has_version", () => {
     for (const a of args) {
       expect(a).toContain("Cache-Control: no-cache");
       expect(a).toMatch(/[?&]_=\d+/);
+      // Without a total timeout, a stalled registry connection hangs step 5's
+      // probe or the final read-back instead of reading as a miss.
+      expect(a).toMatch(/--max-time \d+/);
     }
     // Per-call uniqueness is what actually moves the cache key: two reads in
     // the same second must not resolve to the same URL.
@@ -899,7 +929,7 @@ describe("release.sh behaviour-change gate (fixture run)", () => {
       cwd: dir,
       encoding: "utf8",
       input: `${answers.join("\n")}\n`,
-      env: { ...process.env, NO_COLOR: "1" },
+      env: { ...baseEnv(), NO_COLOR: "1" },
     });
     return { status: r.status, out: `${r.stdout ?? ""}${r.stderr ?? ""}` };
   }
@@ -946,7 +976,7 @@ describe("release.sh behaviour-change gate (fixture run)", () => {
       cwd: dir,
       encoding: "utf8",
       input: "y\n--no-new-thing\n",
-      env: { ...process.env, NO_COLOR: "1" },
+      env: { ...baseEnv(), NO_COLOR: "1" },
     });
     expect(`${r.stdout ?? ""}${r.stderr ?? ""}`).toContain("CONTINUED");
   });
@@ -969,5 +999,1247 @@ describe("release.sh behaviour-change gate (fixture run)", () => {
     const r = run(["y", "  YAW_MCP_NEW_THING  "]);
     expect(r.out).toContain("found in the Unreleased section");
     expect(r.out).toContain("CONTINUED");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// THE OAM FLOOR
+// ---------------------------------------------------------------------------
+//
+// MIN_OAM_VERSION tracks the latest oam release as policy. release.sh reads
+// that release from GitHub in its pre-flight and, unless the version being
+// released is already tagged or on npm, moves the constant, its test ratchet
+// and a changelog block to it in a commit made before step 1. Every case here
+// is hermetic: curl is a shell function or a stub script, and each case that
+// runs git does so in its own fresh temp git repo, with the operator's global
+// and system git config, XDG git config and GIT_* variables shut out.
+
+const OAM_HELPERS = extractBlock("# >>> oam floor helpers", "# <<< oam floor helpers");
+
+// Git for every oam case that runs real git: an empty global config, no system
+// config, and XDG_CONFIG_HOME pointed at the same empty home, because
+// GIT_CONFIG_GLOBAL does not replace the default git/ignore and git/attributes
+// under it (measured: a user git/ignore matching *.txt makes the move cases'
+// `git add unrelated.txt` fail).
+// With baseEnv() dropping the caller's GIT_* variables as well, the operator's
+// commit signing, hooks, autocrlf, excludes, repository and index cannot reach
+// these repos.
+const gitHome = newTmp("release-oam-gitcfg-");
+writeFileSync(join(gitHome, "config"), "");
+const GIT_ENV = {
+  GIT_CONFIG_GLOBAL: join(gitHome, "config"),
+  GIT_CONFIG_NOSYSTEM: "1",
+  XDG_CONFIG_HOME: gitHome,
+  GIT_AUTHOR_NAME: "fixture",
+  GIT_AUTHOR_EMAIL: "fixture@example.invalid",
+  GIT_COMMITTER_NAME: "fixture",
+  GIT_COMMITTER_EMAIL: "fixture@example.invalid",
+};
+
+function git(dir: string, args: string[]): string {
+  const r = spawnSync("git", args, { cwd: dir, encoding: "utf8", env: { ...baseEnv(), ...GIT_ENV } });
+  if (r.status !== 0) {
+    throw new Error(`git ${args.join(" ")} failed: ${r.stderr}`);
+  }
+  return r.stdout;
+}
+
+/** Run a bash body with cwd `dir` from a harness file OUTSIDE it, so the harness can never show up as a change there. */
+function runOutside(dir: string, body: string, env: Record<string, string> = {}): RunResult {
+  const file = join(newTmp("release-oam-harness-"), "harness.sh");
+  writeFileSync(file, body);
+  const r = spawnSync("bash", [file], {
+    cwd: dir,
+    encoding: "utf8",
+    env: { ...baseEnv(), NO_COLOR: "1", ...GIT_ENV, ...env },
+  });
+  return { status: r.status, out: `${r.stdout ?? ""}${r.stderr ?? ""}` };
+}
+
+/** Forward slashes, so a Windows temp path can sit inside a bash string. */
+function shPath(p: string): string {
+  return p.replace(/\\/g, "/");
+}
+
+function oamSrcFixture(floor: string): string {
+  return ["// fixture", "/** doc */", `export const MIN_OAM_VERSION = "${floor}";`, "export const OTHER = 1;", ""].join(
+    "\n",
+  );
+}
+
+function oamTestFixture(floor: string): string {
+  return ['describe("MIN_OAM_VERSION freshness floor", () => {', `  const FLOOR = "${floor}";`, "});", ""].join("\n");
+}
+
+const OAM_CHANGELOG = [
+  "# Changelog",
+  "",
+  "## Unreleased -- things",
+  "",
+  "**Fixed -- something**",
+  "",
+  "A paragraph.",
+  "",
+  "## 1.0.1 -- older",
+  "",
+  "Old text.",
+  "",
+].join("\n");
+
+type OamFixture = { floor?: string; ratchet?: string; src?: string; test?: string; changelog?: string };
+
+function writeOamFixture(dir: string, opts: OamFixture = {}): void {
+  const floor = opts.floor ?? "0.13.1";
+  mkdirSync(join(dir, "src", "tests"), { recursive: true });
+  writeFileSync(join(dir, "src", "oam-spawn.ts"), opts.src ?? oamSrcFixture(floor));
+  writeFileSync(join(dir, "src", "tests", "oam-spawn.test.ts"), opts.test ?? oamTestFixture(opts.ratchet ?? floor));
+  writeFileSync(join(dir, "CHANGELOG.md"), opts.changelog ?? OAM_CHANGELOG);
+}
+
+/** What GitHub's /releases/latest answers, trimmed to the fields release.sh reads. */
+function oamRelease(over: Record<string, unknown> = {}): string {
+  return JSON.stringify({
+    tag_name: "v0.15.2",
+    published_at: "2026-09-13T13:11:42Z",
+    draft: false,
+    prerelease: false,
+    ...over,
+  });
+}
+
+/**
+ * curl as a shell function. Appends its arguments to curl-args.txt, one line a
+ * call. With -K it saves its stdin -- the config that carries the token -- to
+ * curl-config.txt, and fails with $FAKE_AUTH_RC when that is set. Otherwise it
+ * prints $FAKE_BODY and exits $FAKE_CURL_RC, writing a curl-style failure line
+ * to stderr first when that is non-zero, the way `curl -fsSL` does.
+ */
+const CURL_STUB = `curl() {
+  local a auth=false
+  for a in "$@"; do
+    if [ "$a" = "-K" ]; then auth=true; fi
+  done
+  echo "$*" >> curl-args.txt
+  if [ "$auth" = true ]; then
+    cat > curl-config.txt
+    if [ -n "\${FAKE_AUTH_RC:-}" ]; then
+      echo "curl: (\${FAKE_AUTH_RC}) The requested URL returned error: 401" >&2
+      return "\${FAKE_AUTH_RC}"
+    fi
+  fi
+  if [ "\${FAKE_CURL_RC:-0}" != 0 ]; then
+    echo "curl: (\${FAKE_CURL_RC}) \${FAKE_CURL_ERR:-request failed}" >&2
+  fi
+  printf '%s' "\${FAKE_BODY:-}"
+  return "\${FAKE_CURL_RC:-0}"
+}`;
+
+/** release.sh's token resolver lives outside the helpers block; here the token is $FAKE_GH_TOKEN, empty unless a case sets it. */
+const TOKEN_STUB = 'mcp_registry_gh_token() { printf %s "${FAKE_GH_TOKEN:-}"; }';
+
+describe("release.sh oam floor helpers", () => {
+  const dir = newTmp("release-oam-helpers-");
+  const realSrc = shPath(join(repoRoot, "src", "oam-spawn.ts"));
+
+  function sh(lines: string[], env: Record<string, string> = {}): RunResult {
+    return shIn(dir, lines, env);
+  }
+
+  function shIn(cwd: string, lines: string[], env: Record<string, string> = {}): RunResult {
+    const prelude = [STUB_HELPERS, TOKEN_STUB, OAM_HELPERS, CURL_STUB, "rm -f curl-args.txt curl-config.txt"];
+    return runBash([...prelude, ...lines].join("\n"), cwd, env);
+  }
+
+  /** A fresh dir holding the three floor files, for a case that rewrites them. */
+  function floorDir(opts: OamFixture = {}): string {
+    const d = newTmp("release-oam-rewrite-");
+    writeOamFixture(d, opts);
+    return d;
+  }
+
+  /** oam_floor_rewrite over floorDir's files, 0.13.1 -> `next` unless told otherwise. */
+  function rewrite(d: string, mode: "--check" | "--write", next = "0.15.2", prev = "0.13.1"): RunResult {
+    return shIn(d, [
+      `oam_floor_rewrite ${mode} src/oam-spawn.ts src/tests/oam-spawn.test.ts CHANGELOG.md ${next} ${prev} 2026-09-13 9.9.9`,
+      'echo "RC=$?"',
+    ]);
+  }
+
+  const unchanged = (d: string, opts: OamFixture) => {
+    expect(readFileSync(join(d, "src", "oam-spawn.ts"), "utf8")).toBe(
+      opts.src ?? oamSrcFixture(opts.floor ?? "0.13.1"),
+    );
+    expect(readFileSync(join(d, "src", "tests", "oam-spawn.test.ts"), "utf8")).toBe(
+      opts.test ?? oamTestFixture(opts.ratchet ?? opts.floor ?? "0.13.1"),
+    );
+    expect(readFileSync(join(d, "CHANGELOG.md"), "utf8")).toBe(opts.changelog ?? OAM_CHANGELOG);
+  };
+
+  it("reads the real MIN_OAM_VERSION out of src/oam-spawn.ts", () => {
+    const r = sh([`OAM_FLOOR_SRC="${realSrc}"`, "current_oam_floor"]);
+    expect(r.status).toBe(0);
+    expect(r.out.trim()).toBe(MIN_OAM_VERSION);
+  });
+
+  it("can move the real constant and the real ratchet literal", () => {
+    // Pins the SHAPES the move depends on in the two real source files. If
+    // either line is reshaped, this goes red now rather than on the next
+    // release that needs a move. It runs on COPIES in this describe's temp
+    // dir: oam_floor_rewrite writes, and this file runs in parallel with
+    // oam-spawn.test.ts, so this case never points it at the checkout. The
+    // changelog is a fixture: whether the real one has an Unreleased section
+    // depends on where it is in a release cycle.
+    const srcText = readFileSync(join(repoRoot, "src", "oam-spawn.ts"), "utf8");
+    const testText = readFileSync(join(repoRoot, "src", "tests", "oam-spawn.test.ts"), "utf8");
+    writeFileSync(join(dir, "real-oam-spawn.ts"), srcText);
+    writeFileSync(join(dir, "real-oam-spawn.test.ts"), testText);
+    writeFileSync(join(dir, "CHANGELOG.md"), OAM_CHANGELOG);
+    const args = `real-oam-spawn.ts real-oam-spawn.test.ts CHANGELOG.md 999.0.0 "${MIN_OAM_VERSION}" 2026-01-01 9.9.9`;
+
+    expect(sh([`oam_floor_rewrite --check ${args} >/dev/null`, 'echo "RC=$?"']).out.trim()).toBe("RC=0");
+    expect(readFileSync(join(dir, "real-oam-spawn.ts"), "utf8")).toBe(srcText);
+    expect(readFileSync(join(dir, "real-oam-spawn.test.ts"), "utf8")).toBe(testText);
+
+    expect(sh([`oam_floor_rewrite --write ${args}`, 'echo "RC=$?"']).out.trim()).toBe("RC=0");
+    // Exactly the one line moves in each file, and on it only the version. The
+    // old version comes from each file's own line: the ratchet literal may
+    // legitimately sit below the constant.
+    const movedOnly = (before: string, after: string, re: RegExp) => {
+      const b = before.split("\n");
+      const a = after.split("\n");
+      expect(a.length).toBe(b.length);
+      const changed = b.flatMap((line, i) => (line === a[i] ? [] : [i]));
+      expect(changed).toHaveLength(1);
+      const m = re.exec(b[changed[0]]);
+      expect(m).not.toBeNull();
+      expect(a[changed[0]]).toBe(b[changed[0]].replace(`"${m?.[1]}"`, '"999.0.0"'));
+    };
+    movedOnly(
+      srcText,
+      readFileSync(join(dir, "real-oam-spawn.ts"), "utf8"),
+      /^export const MIN_OAM_VERSION = "(\d+\.\d+\.\d+)";\r?$/,
+    );
+    movedOnly(
+      testText,
+      readFileSync(join(dir, "real-oam-spawn.test.ts"), "utf8"),
+      /^[ \t]*const FLOOR = "(\d+\.\d+\.\d+)";\r?$/,
+    );
+  });
+
+  it("refuses a source with no MIN_OAM_VERSION line, and one with two", () => {
+    writeFileSync(join(dir, "none.ts"), "export const OTHER = 1;\n");
+    writeFileSync(join(dir, "two.ts"), `${oamSrcFixture("0.13.1")}${oamSrcFixture("0.13.2")}`);
+    const none = sh(['OAM_FLOOR_SRC="none.ts"', 'OUT=$(current_oam_floor); echo "RC=$? OUT=[$OUT]"']);
+    expect(none.out).toContain("found 0");
+    expect(none.out).toContain("RC=1 OUT=[]");
+    const two = sh(['OAM_FLOOR_SRC="two.ts"', 'OUT=$(current_oam_floor); echo "RC=$? OUT=[$OUT]"']);
+    expect(two.out).toContain("found 2");
+    expect(two.out).toContain("RC=1 OUT=[]");
+  });
+
+  it("reads the latest oam release and the day it was published", () => {
+    const r = sh(['OUT=$(latest_oam_release); echo "RC=$? OUT=[$OUT]"'], {
+      FAKE_BODY: oamRelease(),
+      FAKE_CURL_RC: "0",
+    });
+    expect(r.out.trim()).toBe("RC=0 OUT=[0.15.2 2026-09-13]");
+    const args = readFileSync(join(dir, "curl-args.txt"), "utf8");
+    expect(args).toContain("https://api.github.com/repos/YawLabs/oam/releases/latest");
+    // Without a total timeout, a stalled connection hangs the pre-flight instead of failing closed.
+    expect(args).toMatch(/--max-time \d+/);
+    // No token resolved: one plain read, with no config on stdin.
+    expect(args.trim().split("\n")).toHaveLength(1);
+    expect(args).not.toContain("-K");
+  });
+
+  it("sends a resolved token as a curl config on stdin, never on the command line", () => {
+    // Unauthenticated, GitHub allows 60 reads an hour per IP. The token lifts
+    // that, and argv is what the process list shows, so it rides in -K -.
+    const r = sh(['OUT=$(latest_oam_release); echo "RC=$? OUT=[$OUT]"'], {
+      FAKE_BODY: oamRelease(),
+      FAKE_CURL_RC: "0",
+      FAKE_GH_TOKEN: "ghp_fixtureSECRET",
+    });
+    expect(r.out.trim()).toBe("RC=0 OUT=[0.15.2 2026-09-13]");
+    const args = readFileSync(join(dir, "curl-args.txt"), "utf8");
+    expect(args.trim().split("\n")).toHaveLength(1);
+    expect(args).toContain("-K -");
+    expect(args).not.toContain("ghp_fixtureSECRET");
+    expect(readFileSync(join(dir, "curl-config.txt"), "utf8")).toBe(
+      'header = "Authorization: Bearer ghp_fixtureSECRET"\n',
+    );
+  });
+
+  it("retries once without the token when the authenticated read fails, and says so", () => {
+    // A bad token gets 401 even on a public repo. That must not turn a read
+    // that works unauthenticated into a hard stop.
+    const r = sh(['OUT=$(latest_oam_release); echo "RC=$? OUT=[$OUT]"'], {
+      FAKE_BODY: oamRelease(),
+      FAKE_CURL_RC: "0",
+      FAKE_GH_TOKEN: "stale",
+      FAKE_AUTH_RC: "22",
+    });
+    expect(r.out).toContain("RC=0 OUT=[0.15.2 2026-09-13]");
+    expect(r.out).toContain("curl: (22) The requested URL returned error: 401");
+    expect(r.out).toContain("retrying once without the token");
+    const calls = readFileSync(join(dir, "curl-args.txt"), "utf8").trim().split("\n");
+    expect(calls).toHaveLength(2);
+    expect(calls[0]).toContain("-K -");
+    expect(calls[1]).not.toContain("-K");
+  });
+
+  it("fails when the unauthenticated retry fails too", () => {
+    const r = sh(['OUT=$(latest_oam_release); echo "RC=$? OUT=[$OUT]"'], {
+      FAKE_BODY: oamRelease(),
+      FAKE_CURL_RC: "6",
+      FAKE_CURL_ERR: "Could not resolve host: api.github.com",
+      FAKE_GH_TOKEN: "stale",
+      FAKE_AUTH_RC: "22",
+    });
+    expect(r.out).toContain("RC=1 OUT=[]");
+    expect(readFileSync(join(dir, "curl-args.txt"), "utf8").trim().split("\n")).toHaveLength(2);
+  });
+
+  it("lets curl's own failure line through, so a rate limit reads differently from offline", () => {
+    // The helper runs inside the pre-flight's $(...), which captures stdout
+    // only. Discarding stderr here hid the one line naming the cause.
+    const limited = sh(['OUT=$(latest_oam_release); echo "RC=$? OUT=[$OUT]"'], {
+      FAKE_CURL_RC: "22",
+      FAKE_CURL_ERR: "The requested URL returned error: 403",
+    });
+    expect(limited.out).toContain("RC=1 OUT=[]");
+    expect(limited.out).toContain("curl: (22) The requested URL returned error: 403");
+    const offline = sh(['OUT=$(latest_oam_release); echo "RC=$? OUT=[$OUT]"'], {
+      FAKE_CURL_RC: "6",
+      FAKE_CURL_ERR: "Could not resolve host: api.github.com",
+    });
+    expect(offline.out).toContain("curl: (6) Could not resolve host");
+  });
+
+  it("accepts a tag written without the v", () => {
+    const r = sh(['OUT=$(latest_oam_release); echo "RC=$? OUT=[$OUT]"'], {
+      FAKE_BODY: oamRelease({ tag_name: "0.15.2" }),
+      FAKE_CURL_RC: "0",
+    });
+    expect(r.out.trim()).toBe("RC=0 OUT=[0.15.2 2026-09-13]");
+  });
+
+  it.each([
+    ["a prerelease", oamRelease({ prerelease: true }), "0", "v0.15.2 is marked as a prerelease"],
+    ["a draft", oamRelease({ draft: true }), "0", "v0.15.2 is marked as a draft"],
+    ["a tag that is not a version", oamRelease({ tag_name: "nightly" }), "0", 'tag_name "nightly" is not'],
+    ["a two-part version", oamRelease({ tag_name: "v0.15" }), "0", 'tag_name "v0.15" is not'],
+    // The next two pin the END anchor of the tag pattern, and the one after
+    // them the START anchor: without either, each of these reads as a version.
+    ["a prerelease-suffixed tag GitHub did not flag", oamRelease({ tag_name: "v0.15.2-rc.1" }), "0", "is not"],
+    ["a four-part tag", oamRelease({ tag_name: "v0.15.2.1" }), "0", "is not"],
+    ["a tag with text before the version", oamRelease({ tag_name: "release-v0.15.2" }), "0", "is not"],
+    ["a release with no publish date", oamRelease({ published_at: null }), "0", "has no published_at date"],
+    ["a body that is not JSON", "<html>rate limited</html>", "0", "is not JSON"],
+    ["a failed request", oamRelease(), "22", "curl: (22)"],
+  ])("answers nothing, fails, and says why on stderr, for %s", (_name, body, rc, why) => {
+    const r = sh(['OUT=$(latest_oam_release); echo "RC=$? OUT=[$OUT]"'], { FAKE_BODY: body, FAKE_CURL_RC: rc });
+    expect(r.out).toContain("RC=1 OUT=[]");
+    expect(r.out).toContain(why);
+  });
+
+  it("prints on --check exactly the block --write puts in the changelog", () => {
+    // The behaviour-change gate is shown --check's output; the move writes
+    // with --write. One template renders both, and this pins that they agree.
+    const d = floorDir();
+    const check = rewrite(d, "--check");
+    expect(check.out).toContain("RC=0");
+    const printed = check.out.slice(0, check.out.lastIndexOf("RC=0")).replace(/\n+$/, "");
+    expect(printed.startsWith("**Changed -- the oam floor moves to 0.15.2**\n\n")).toBe(true);
+    unchanged(d, {});
+
+    // --write prints nothing on stdout.
+    expect(rewrite(d, "--write").out.trim()).toBe("RC=0");
+    const before = OAM_CHANGELOG.split("\n");
+    const after = readFileSync(join(d, "CHANGELOG.md"), "utf8").split("\n");
+    let p = 0;
+    while (p < before.length && before[p] === after[p]) p++;
+    let s = 0;
+    while (s < before.length - p && before[before.length - 1 - s] === after[after.length - 1 - s]) s++;
+    const inserted = after
+      .slice(p, after.length - s)
+      .join("\n")
+      .replace(/^\n+|\n+$/g, "");
+    expect(inserted).toBe(printed);
+  });
+
+  it("skips ## lines inside code fences when it looks for the end of the section", () => {
+    // A fence closes only on the same character, at least as long: the short
+    // ``` inside the four-backtick fence and the ~~~ inside the ``` fence do
+    // not close them, so neither ## line after them is a section heading.
+    const changelog = [
+      "# Changelog",
+      "",
+      "## Unreleased -- things",
+      "",
+      "**Fixed -- something**",
+      "",
+      "```md",
+      "# Notes",
+      "## Servers",
+      "- github",
+      "```",
+      "",
+      "````md",
+      "```",
+      "## Not a heading either",
+      "````",
+      "",
+      "```sh",
+      "~~~",
+      "## Still not a heading",
+      "```",
+      "",
+      "## 1.0.1 -- older",
+      "",
+      "Old text.",
+      "",
+    ].join("\n");
+    const d = floorDir({ changelog });
+    expect(rewrite(d, "--write").out.trim()).toBe("RC=0");
+    const log = readFileSync(join(d, "CHANGELOG.md"), "utf8");
+    const heading = "**Changed -- the oam floor moves to 0.15.2**";
+    expect(log.indexOf(heading)).toBeGreaterThan(log.lastIndexOf("```\n"));
+    expect(log.indexOf(heading)).toBeLessThan(log.indexOf("## 1.0.1 -- older"));
+    // Every fence came through byte for byte.
+    expect(log.slice(0, log.indexOf(heading))).toBe(changelog.slice(0, changelog.indexOf("## 1.0.1 -- older")));
+  });
+
+  it("stops, writing nothing, when a code fence never closes", () => {
+    const changelog = OAM_CHANGELOG.replace("A paragraph.", "A paragraph.\n\n```sh\necho never closed");
+    const d = floorDir({ changelog });
+    const check = rewrite(d, "--check");
+    expect(check.out).toContain("a code fence opened with ``` never closes");
+    expect(check.out).toContain("RC=1");
+    expect(rewrite(d, "--write").out).toContain("RC=1");
+    unchanged(d, { changelog });
+  });
+
+  it("stops, writing nothing, when the section already holds two floor blocks", () => {
+    const twoBlocks = OAM_CHANGELOG.replace(
+      "A paragraph.",
+      [
+        "A paragraph.",
+        "",
+        "**Changed -- the oam floor moves to 0.14.0**",
+        "",
+        "Text; the floor was 0.13.1. More.",
+        "",
+        "**Changed -- the oam floor moves to 0.15.0**",
+        "",
+        "Text; the floor was 0.14.0. More.",
+      ].join("\n"),
+    );
+    const d = floorDir({ changelog: twoBlocks });
+    const check = rewrite(d, "--check");
+    expect(check.out).toContain('2 oam floor blocks in "## Unreleased -- things"; merge them by hand');
+    expect(check.out).toContain("RC=1");
+    expect(rewrite(d, "--write").out).toContain("RC=1");
+    unchanged(d, { changelog: twoBlocks });
+  });
+
+  it("refuses to update a floor block that is not in the shape it writes, rather than guess the old floor", () => {
+    const edited = OAM_CHANGELOG.replace(
+      "A paragraph.",
+      "A paragraph.\n\n**Changed -- the oam floor moves to 0.15.2**\n\nRewritten by hand, naming no earlier floor.",
+    );
+    const d = floorDir({ changelog: edited });
+    const check = rewrite(d, "--check", "0.15.3", "0.15.2");
+    expect(check.out).toContain("cannot be updated in place");
+    expect(check.out).toContain("RC=1");
+    unchanged(d, { changelog: edited });
+  });
+
+  it("leaves a floor block under an older section alone, and adds one to this section", () => {
+    const shipped = OAM_CHANGELOG.replace(
+      "Old text.",
+      "Old text.\n\n**Changed -- the oam floor moves to 0.13.1**\n\nText; the floor was 0.12.0. More.",
+    );
+    const d = floorDir({ changelog: shipped });
+    expect(rewrite(d, "--write").out.trim()).toBe("RC=0");
+    const log = readFileSync(join(d, "CHANGELOG.md"), "utf8");
+    expect(log).toContain("**Changed -- the oam floor moves to 0.13.1**\n\nText; the floor was 0.12.0. More.");
+    expect(log.indexOf("**Changed -- the oam floor moves to 0.15.2**")).toBeLessThan(log.indexOf("## 1.0.1 -- older"));
+  });
+
+  it.each([
+    ["0.13.1", "0.15.2", "-1"],
+    ["0.15.2", "0.15.2", "0"],
+    ["0.15.3", "0.15.2", "1"],
+    ["0.10.0", "0.9.9", "1"],
+    ["0.9.9", "0.10.0", "-1"],
+    ["1.0.0", "0.99.99", "1"],
+  ])("semver_cmp %s %s is %s, part by part as numbers", (a, b, want) => {
+    expect(sh([`semver_cmp ${a} ${b}`]).out.trim()).toBe(want);
+  });
+});
+
+describe("release.sh oam floor pre-flight", () => {
+  const block = extractBlock("# >>> oam floor pre-flight", "# <<< oam floor pre-flight");
+
+  type PreflightRun = RunResult & { dir: string };
+
+  function run(
+    opts: OamFixture & {
+      body?: string;
+      curlRc?: number;
+      curlErr?: string;
+      resuming?: boolean;
+      allowStale?: boolean | string;
+      published?: string;
+      tagged?: boolean;
+    } = {},
+  ): PreflightRun {
+    const dir = newTmp("release-oam-pre-");
+    writeOamFixture(dir, opts);
+    // A real repo, so the v9.9.9 tag lookup asks real git, and asks this repo
+    // rather than any repo above the temp dir.
+    git(dir, ["init", "-q", "-b", "main"]);
+    if (opts.tagged) {
+      git(dir, ["add", "-A"]);
+      git(dir, ["commit", "-q", "-m", "fixture"]);
+      git(dir, ["tag", "-a", "v9.9.9", "-m", "v9.9.9"]);
+    }
+    const body = [
+      STUB_HELPERS,
+      TOKEN_STUB,
+      OAM_HELPERS,
+      CURL_STUB,
+      `RESUMING=${opts.resuming ? "true" : "false"}`,
+      'VERSION="9.9.9"',
+      `ALREADY_PUBLISHED="${opts.published ?? ""}"`,
+      block,
+      'echo "TARGET=[$OAM_FLOOR_TARGET] DATE=[$OAM_FLOOR_DATE] LOCKED=[$OAM_FLOOR_LOCKED]"',
+      'echo "BLOCK=[$OAM_FLOOR_BLOCK]"',
+      'echo "CONTINUED"',
+    ].join("\n");
+    const r = runBash(body, dir, {
+      ...GIT_ENV,
+      FAKE_BODY: opts.body ?? oamRelease(),
+      FAKE_CURL_RC: String(opts.curlRc ?? 0),
+      FAKE_CURL_ERR: opts.curlErr ?? "",
+      // Set either way, so an operator's own environment cannot flip a case.
+      ALLOW_STALE_OAM_FLOOR: typeof opts.allowStale === "string" ? opts.allowStale : opts.allowStale ? "1" : "",
+      FAKE_GH_TOKEN: "",
+    });
+    return { ...r, dir };
+  }
+
+  it("plans nothing when the floor is the latest release", () => {
+    const r = run({ floor: "0.15.2" });
+    expect(r.out).toContain("INFO oam floor 0.15.2 is the latest oam release");
+    expect(r.out).toContain("TARGET=[] DATE=[]");
+    expect(r.out).toContain("BLOCK=[]");
+    expect(r.out).toContain("CONTINUED");
+  });
+
+  it("plans the move on a fresh release whose floor is behind, and writes nothing yet", () => {
+    const r = run({ floor: "0.13.1" });
+    expect(r.out).toContain("INFO oam floor 0.13.1 is behind oam 0.15.2 (published 2026-09-13)");
+    expect(r.out).toContain("TARGET=[0.15.2] DATE=[2026-09-13] LOCKED=[false]");
+    // The block the move will write, as --check rendered it, for the behaviour-change gate.
+    expect(r.out).toContain("BLOCK=[**Changed -- the oam floor moves to 0.15.2**\n\n`MIN_OAM_VERSION` tracks");
+    expect(r.out).toContain("the floor was 0.13.1.");
+    expect(r.out).toContain("CONTINUED");
+    expect(readFileSync(join(r.dir, "src", "oam-spawn.ts"), "utf8")).toBe(oamSrcFixture("0.13.1"));
+    expect(readFileSync(join(r.dir, "src", "tests", "oam-spawn.test.ts"), "utf8")).toBe(oamTestFixture("0.13.1"));
+    expect(readFileSync(join(r.dir, "CHANGELOG.md"), "utf8")).toBe(OAM_CHANGELOG);
+  });
+
+  it("compares versions as numbers, so 0.9.9 is behind 0.10.0", () => {
+    const r = run({ floor: "0.9.9", body: oamRelease({ tag_name: "v0.10.0" }) });
+    expect(r.out).toContain("TARGET=[0.10.0]");
+  });
+
+  it("does not move the floor once the version is on npm, and says so", () => {
+    const r = run({ floor: "0.13.1", resuming: true, published: "9.9.9" });
+    expect(r.out).toContain(
+      "WARN oam 0.15.2 is out and the oam floor is still 0.13.1 -- v9.9.9 is already tagged or on npm, so this run does not move it",
+    );
+    expect(r.out).toContain("TARGET=[] DATE=[] LOCKED=[true]");
+    expect(r.out).toContain("BLOCK=[]");
+    expect(r.out).toContain("CONTINUED");
+  });
+
+  it("does not move the floor once v<version> is tagged", () => {
+    const r = run({ floor: "0.13.1", resuming: true, tagged: true });
+    expect(r.out).toContain("v9.9.9 is already tagged or on npm, so this run does not move it");
+    expect(r.out).toContain("TARGET=[] DATE=[] LOCKED=[true]");
+    expect(r.out).toContain("CONTINUED");
+  });
+
+  it("moves the floor on a resume that is neither tagged nor published, with every fresh-release stop", () => {
+    // RESUMING only means package.json already reads VERSION: a hand-run
+    // `npm version`, a bump committed ahead of the release, or a run that died
+    // in step 3 before tagging. Nothing irreversible has happened yet, so the
+    // floor still moves -- and the stops that come with moving it still apply.
+    const r = run({ floor: "0.13.1", resuming: true });
+    expect(r.out).toContain("INFO oam floor 0.13.1 is behind oam 0.15.2");
+    expect(r.out).toContain("TARGET=[0.15.2] DATE=[2026-09-13] LOCKED=[false]");
+    expect(r.out).toContain("CONTINUED");
+
+    const unreadable = run({ floor: "0.13.1", resuming: true, curlRc: 6 });
+    expect(unreadable.out).toContain("FAIL Could not read the latest oam release");
+    expect(unreadable.out).toContain("ALLOW_STALE_OAM_FLOOR=1");
+    expect(unreadable.out).not.toContain("CONTINUED");
+
+    const ahead = run({ floor: "0.16.0", resuming: true });
+    expect(ahead.out).toContain("FAIL The oam floor 0.16.0 is AHEAD of the latest oam release 0.15.2");
+    expect(ahead.out).not.toContain("CONTINUED");
+  });
+
+  it("fails closed on a fresh release when GitHub cannot be read, pointing at curl's own line", () => {
+    const r = run({ curlRc: 22, curlErr: "The requested URL returned error: 403" });
+    expect(r.out).toContain("curl: (22) The requested URL returned error: 403");
+    expect(r.out).toContain("FAIL Could not read the latest oam release");
+    expect(r.out).toContain("(the curl or parser error above says why)");
+    expect(r.out).toContain("ALLOW_STALE_OAM_FLOOR=1");
+    expect(r.out).not.toContain("CONTINUED");
+  });
+
+  it("still fails closed under ALLOW_STALE_OAM_FLOOR=0 -- only 1 opts in", () => {
+    const r = run({ curlRc: 6, allowStale: "0" });
+    expect(r.out).toContain("FAIL Could not read the latest oam release");
+    expect(r.out).not.toContain("UNCHECKED");
+    expect(r.out).not.toContain("CONTINUED");
+  });
+
+  it("proceeds on the current floor, unchecked, under ALLOW_STALE_OAM_FLOOR=1", () => {
+    const r = run({ curlRc: 6, allowStale: true });
+    expect(r.out).toContain("WARN Could not read the latest oam release from GitHub");
+    expect(r.out).toContain("UNCHECKED");
+    expect(r.out).toContain("TARGET=[]");
+    expect(r.out).toContain("CONTINUED");
+  });
+
+  it("proceeds, unchecked, once the version is on npm when GitHub cannot be read", () => {
+    const r = run({ curlRc: 6, resuming: true, published: "9.9.9" });
+    expect(r.out).toContain("UNCHECKED");
+    expect(r.out).toContain("CONTINUED");
+  });
+
+  it("refuses a floor AHEAD of the latest release, with both ways out, and only warns once the version is on npm", () => {
+    const fresh = run({ floor: "0.16.0" });
+    expect(fresh.out).toContain("FAIL The oam floor 0.16.0 is AHEAD of the latest oam release 0.15.2");
+    // Lowering only the constant turns the ratchet test red, so the recovery
+    // names the literal too.
+    expect(fresh.out).toContain(
+      "lower MIN_OAM_VERSION in src/oam-spawn.ts AND the const FLOOR literal in src/tests/oam-spawn.test.ts to 0.15.2",
+    );
+    // A lower release holding GitHub's latest marker is fixed on GitHub, not in the floor.
+    expect(fresh.out).toContain("gh release edit v0.16.0 --repo YawLabs/oam --latest");
+    expect(fresh.out).not.toContain("CONTINUED");
+    const locked = run({ floor: "0.16.0", resuming: true, published: "9.9.9" });
+    expect(locked.out).toContain("WARN The oam floor 0.16.0 is AHEAD");
+    expect(locked.out).toContain("the const FLOOR literal in src/tests/oam-spawn.test.ts");
+    expect(locked.out).toContain("CONTINUED");
+  });
+
+  it("stops before the prompt when the changelog has no section for this release", () => {
+    // The first section is a release that already shipped. Filing the move
+    // there would be a lie about 1.0.2, so the run stops instead of guessing.
+    const changelog = OAM_CHANGELOG.replace("## Unreleased -- things", "## 1.0.2 -- shipped");
+    const r = run({ floor: "0.13.1", changelog });
+    expect(r.out).toContain("no section to record the floor move in");
+    expect(r.out).toContain("FAIL oam 0.15.2 is out and the oam floor is 0.13.1, but this script cannot move it");
+    expect(r.out).not.toContain("CONTINUED");
+  });
+
+  it("accepts a first section already renamed to the version being released", () => {
+    const changelog = OAM_CHANGELOG.replace("## Unreleased -- things", "## 9.9.9 -- this release");
+    expect(run({ floor: "0.13.1", changelog }).out).toContain("TARGET=[0.15.2]");
+  });
+
+  it("does not take a longer version for this one (## 9.9.90 is not ## 9.9.9)", () => {
+    const changelog = OAM_CHANGELOG.replace("## Unreleased -- things", "## 9.9.90 -- another");
+    expect(run({ floor: "0.13.1", changelog }).out).toContain("no section to record the floor move in");
+  });
+
+  it("stops before the prompt when the ratchet literal is missing", () => {
+    const r = run({ floor: "0.13.1", test: "describe('no ratchet here', () => {});\n" });
+    expect(r.out).toContain("expected exactly one const FLOOR line, found 0");
+    expect(r.out).not.toContain("CONTINUED");
+  });
+
+  it("stops when the floor cannot be read out of the source at all", () => {
+    const r = run({ src: "export const OTHER = 1;\n" });
+    expect(r.out).toContain("FAIL Could not read the oam floor out of src/oam-spawn.ts");
+    expect(r.out).not.toContain("CONTINUED");
+  });
+});
+
+const OAM_MOVE = extractBlock("# >>> oam floor move", "# <<< oam floor move");
+
+/** A temp git repo holding the three floor files and one unrelated file, all committed. */
+function oamRepo(opts: OamFixture = {}): string {
+  const dir = newTmp("release-oam-move-");
+  writeOamFixture(dir, opts);
+  writeFileSync(join(dir, "unrelated.txt"), "before\n");
+  git(dir, ["init", "-q", "-b", "main"]);
+  git(dir, ["add", "-A"]);
+  git(dir, ["commit", "-q", "-m", "fixture"]);
+  return dir;
+}
+
+/** Run release.sh's move block in `dir`, as if the pre-flight had read `now` and planned `target`. */
+function runMove(dir: string, now: string, target: string): RunResult {
+  const body = [
+    STUB_HELPERS,
+    OAM_HELPERS,
+    "CYAN=''",
+    "NC=''",
+    'VERSION="9.9.9"',
+    `OAM_FLOOR_NOW="${now}"`,
+    `OAM_FLOOR_TARGET="${target}"`,
+    'OAM_FLOOR_DATE="2026-09-13"',
+    OAM_MOVE,
+    'echo "CONTINUED"',
+  ].join("\n");
+  return runOutside(dir, body);
+}
+
+describe("release.sh oam floor move", () => {
+  const repo = oamRepo;
+  const run = runMove;
+  const read = (dir: string, ...p: string[]) => readFileSync(join(dir, ...p), "utf8");
+
+  it("moves all three, and commits exactly those three files", () => {
+    const dir = repo();
+    // A change that is STAGED but is not the release's: `git commit -- <paths>`
+    // must leave it out of the floor commit, and still staged.
+    writeFileSync(join(dir, "unrelated.txt"), "after\n");
+    git(dir, ["add", "unrelated.txt"]);
+
+    const r = run(dir, "0.13.1", "0.15.2");
+    expect(r.out).toContain("INFO oam floor 0.13.1 -> 0.15.2, committed");
+    expect(r.out).toContain("WARN Not re-run by this script");
+    expect(r.out).toContain("CONTINUED");
+
+    expect(read(dir, "src", "oam-spawn.ts")).toBe(oamSrcFixture("0.15.2"));
+    expect(read(dir, "src", "tests", "oam-spawn.test.ts")).toBe(oamTestFixture("0.15.2"));
+    expect(git(dir, ["log", "-1", "--format=%s"]).trim()).toBe("fix(oam): move the floor to 0.15.2");
+    const committed = git(dir, ["show", "--name-only", "--format=", "HEAD"]).trim().split("\n").sort();
+    expect(committed).toEqual(["CHANGELOG.md", "src/oam-spawn.ts", "src/tests/oam-spawn.test.ts"]);
+    expect(git(dir, ["status", "--porcelain"])).toBe("M  unrelated.txt\n");
+  });
+
+  it("files the block at the END of the Unreleased section, above the release before it", () => {
+    const dir = repo();
+    run(dir, "0.13.1", "0.15.2");
+    const log = read(dir, "CHANGELOG.md");
+    const heading = "**Changed -- the oam floor moves to 0.15.2**";
+    expect(log.indexOf(heading)).toBeGreaterThan(log.indexOf("A paragraph."));
+    expect(log.indexOf(heading)).toBeLessThan(log.indexOf("## 1.0.1 -- older"));
+    expect(log).toContain("v0.15.2 is now current (published 2026-09-13); the floor was 0.13.1.");
+    // One blank line on each side of the block, none doubled.
+    expect(log).toContain(`A paragraph.\n\n${heading}\n\n`);
+    expect(log).not.toContain("\n\n\n");
+    expect(log).toContain(
+      "did not re-run the oam hosting check that `src/oam-spawn.ts` describes.\n\n## 1.0.1 -- older",
+    );
+  });
+
+  it("appends at the end of the file when the section is the only one, keeping one trailing newline", () => {
+    const dir = repo({ changelog: "# Changelog\n\n## Unreleased -- only\n\nA paragraph.\n" });
+    run(dir, "0.13.1", "0.15.2");
+    const log = read(dir, "CHANGELOG.md");
+    expect(
+      log.startsWith(
+        "# Changelog\n\n## Unreleased -- only\n\nA paragraph.\n\n**Changed -- the oam floor moves to 0.15.2**\n\n",
+      ),
+    ).toBe(true);
+    expect(log.endsWith("describes.\n")).toBe(true);
+  });
+
+  it("keeps a CRLF changelog CRLF", () => {
+    const dir = repo({ changelog: OAM_CHANGELOG.replace(/\n/g, "\r\n") });
+    run(dir, "0.13.1", "0.15.2");
+    const log = read(dir, "CHANGELOG.md");
+    expect(log).toContain("**Changed -- the oam floor moves to 0.15.2**\r\n");
+    expect(/(^|[^\r])\n/.test(log)).toBe(false);
+  });
+
+  it("moves nothing, and commits nothing, when the floor is already at the target", () => {
+    // The pre-flight's value is stale by the time this runs; the block re-reads.
+    const dir = repo({ floor: "0.15.2" });
+    const before = git(dir, ["rev-parse", "HEAD"]);
+    const r = run(dir, "0.13.1", "0.15.2");
+    expect(r.out).toContain("INFO oam floor already at 0.15.2 -- nothing to move");
+    expect(git(dir, ["rev-parse", "HEAD"])).toBe(before);
+    expect(read(dir, "CHANGELOG.md")).toBe(OAM_CHANGELOG);
+  });
+
+  it("writes none of the three files when one of them does not validate", () => {
+    const dir = repo({ test: "describe('no ratchet here', () => {});\n" });
+    const before = git(dir, ["rev-parse", "HEAD"]);
+    const r = run(dir, "0.13.1", "0.15.2");
+    expect(r.out).toContain("FAIL Could not move the oam floor to 0.15.2");
+    expect(r.out).not.toContain("CONTINUED");
+    expect(read(dir, "src", "oam-spawn.ts")).toBe(oamSrcFixture("0.13.1"));
+    expect(read(dir, "CHANGELOG.md")).toBe(OAM_CHANGELOG);
+    expect(git(dir, ["rev-parse", "HEAD"])).toBe(before);
+  });
+
+  it.each([
+    // A half-written edit would ride inside the floor commit.
+    ["a half-written edit", `${oamSrcFixture("0.13.1")}export const HALF_WRITTEN = (\n`],
+    // A floor hand-set to the target would take the nothing-to-move branch and
+    // stay uncommitted, so the dirt check has to come before the re-read.
+    ["the floor hand-set to the target", oamSrcFixture("0.15.2")],
+  ])("stops, committing nothing, when src/oam-spawn.ts holds %s since the pre-flight", (_name, src) => {
+    const dir = repo();
+    const before = git(dir, ["rev-parse", "HEAD"]);
+    writeFileSync(join(dir, "src", "oam-spawn.ts"), src);
+    const r = run(dir, "0.13.1", "0.15.2");
+    expect(r.out).toContain("FAIL Uncommitted changes appeared in the oam floor files since the pre-flight");
+    expect(r.out).toContain(" M src/oam-spawn.ts");
+    expect(r.out).not.toContain("nothing to move");
+    expect(r.out).not.toContain("CONTINUED");
+    expect(git(dir, ["rev-parse", "HEAD"])).toBe(before);
+    expect(read(dir, "CHANGELOG.md")).toBe(OAM_CHANGELOG);
+  });
+
+  it("stops, rather than lowering it, when the floor was committed AHEAD of the target since the pre-flight", () => {
+    const dir = repo({ floor: "0.16.0" });
+    const before = git(dir, ["rev-parse", "HEAD"]);
+    const r = run(dir, "0.13.1", "0.15.2");
+    expect(r.out).toContain("FAIL The oam floor now reads 0.16.0, not below 0.15.2 as the pre-flight planned");
+    expect(r.out).not.toContain("CONTINUED");
+    expect(git(dir, ["rev-parse", "HEAD"])).toBe(before);
+    expect(read(dir, "src", "oam-spawn.ts")).toBe(oamSrcFixture("0.16.0"));
+  });
+
+  it("rewrites its own block in place on a second move, keeping the floor the last release shipped", () => {
+    // The re-run after a failed gate, with oam released again in between.
+    const dir = repo();
+    expect(run(dir, "0.13.1", "0.15.2").out).toContain("INFO oam floor 0.13.1 -> 0.15.2, committed");
+    const r = run(dir, "0.15.2", "0.15.3");
+    expect(r.out).toContain("INFO oam floor 0.15.2 -> 0.15.3, committed");
+    const log = read(dir, "CHANGELOG.md");
+    const section = log.slice(0, log.indexOf("## 1.0.1 -- older"));
+    expect(section.match(/oam floor moves to/g)).toHaveLength(1);
+    expect(section).toContain("**Changed -- the oam floor moves to 0.15.3**");
+    expect(section).toContain("v0.15.3 is now current (published 2026-09-13); the floor was 0.13.1.");
+    expect(log).not.toContain("0.15.2 is now current");
+    expect(log).not.toContain("\n\n\n");
+    expect(read(dir, "src", "oam-spawn.ts")).toBe(oamSrcFixture("0.15.3"));
+    expect(git(dir, ["log", "--format=%s"]).trim().split("\n")).toEqual([
+      "fix(oam): move the floor to 0.15.3",
+      "fix(oam): move the floor to 0.15.2",
+      "fixture",
+    ]);
+  });
+
+  it("files the block under a first section already renamed to the version being released", () => {
+    // The only move case whose section is found by VERSION rather than by
+    // the Unreleased pattern, so the only one that needs the move to pass it.
+    const dir = repo({ changelog: OAM_CHANGELOG.replace("## Unreleased -- things", "## 9.9.9 -- this release") });
+    const r = run(dir, "0.13.1", "0.15.2");
+    expect(r.out).toContain("INFO oam floor 0.13.1 -> 0.15.2, committed");
+    const log = read(dir, "CHANGELOG.md");
+    const heading = "**Changed -- the oam floor moves to 0.15.2**";
+    expect(log.indexOf(heading)).toBeGreaterThan(log.indexOf("## 9.9.9 -- this release"));
+    expect(log.indexOf(heading)).toBeLessThan(log.indexOf("## 1.0.1 -- older"));
+  });
+
+  it("commits past a refusing local pre-commit hook", () => {
+    const dir = repo();
+    mkdirSync(join(dir, "hooks"));
+    writeFileSync(join(dir, "hooks", "pre-commit"), "#!/bin/sh\necho HOOK_RAN\nexit 1\n");
+    chmodSync(join(dir, "hooks", "pre-commit"), 0o755);
+    // A LOCAL hooksPath, which is how the real checkout is configured; GIT_ENV
+    // blanks only the global and system config.
+    git(dir, ["config", "core.hooksPath", "hooks"]);
+    const r = run(dir, "0.13.1", "0.15.2");
+    expect(r.out).not.toContain("HOOK_RAN");
+    expect(r.out).toContain("INFO oam floor 0.13.1 -> 0.15.2, committed");
+    expect(git(dir, ["log", "-1", "--format=%s"]).trim()).toBe("fix(oam): move the floor to 0.15.2");
+  });
+
+  it("keeps a caller's GIT_DIR, GIT_INDEX_FILE and XDG git config out of the fixture repo", () => {
+    // git exports GIT_DIR and GIT_INDEX_FILE to every hook. A suite run from a
+    // pre-commit hook must not commit the fixture into the operator's repo or
+    // rewrite its index. And a user git/ignore under XDG_CONFIG_HOME, which
+    // GIT_CONFIG_GLOBAL does not replace, must not hide the fixture's files.
+    const outer = newTmp("release-oam-outer-");
+    writeFileSync(join(outer, "keep.txt"), "outer\n");
+    git(outer, ["init", "-q", "-b", "main"]);
+    git(outer, ["add", "-A"]);
+    git(outer, ["commit", "-q", "-m", "outer"]);
+    const head = git(outer, ["rev-parse", "HEAD"]);
+    const index = readFileSync(join(outer, ".git", "index"));
+    const xdg = newTmp("release-oam-xdg-");
+    mkdirSync(join(xdg, "git"));
+    writeFileSync(join(xdg, "git", "ignore"), "*.txt\n");
+
+    const saved = {
+      GIT_DIR: process.env.GIT_DIR,
+      GIT_INDEX_FILE: process.env.GIT_INDEX_FILE,
+      XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
+    };
+    process.env.GIT_DIR = join(outer, ".git");
+    process.env.GIT_INDEX_FILE = join(outer, ".git", "index");
+    process.env.XDG_CONFIG_HOME = xdg;
+    let dir = "";
+    let r: RunResult = { status: null, out: "" };
+    try {
+      dir = repo();
+      r = run(dir, "0.13.1", "0.15.2");
+      // What the first move case does: stage a change to a .txt file.
+      writeFileSync(join(dir, "unrelated.txt"), "after\n");
+      git(dir, ["add", "unrelated.txt"]);
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) {
+          delete process.env[k];
+        } else {
+          process.env[k] = v;
+        }
+      }
+    }
+    expect(r.out).toContain("INFO oam floor 0.13.1 -> 0.15.2, committed");
+    expect(git(outer, ["rev-parse", "HEAD"])).toBe(head);
+    expect(readFileSync(join(outer, ".git", "index")).equals(index)).toBe(true);
+    expect(git(dir, ["log", "--format=%s"]).trim().split("\n")).toEqual([
+      "fix(oam): move the floor to 0.15.2",
+      "fixture",
+    ]);
+  });
+
+  it("does nothing at all when no move was planned", () => {
+    const dir = repo();
+    const r = run(dir, "0.13.1", "");
+    expect(r.out.trim()).toBe("CONTINUED");
+  });
+});
+
+describe("release.sh oam_floor_commits_only", () => {
+  // Whether local main is ahead of a base ONLY by the move block's own
+  // commits -- the shape the origin/main sync guard lets a re-run carry on over.
+  function ahead(dir: string, base: string): string {
+    const body = [OAM_HELPERS, `if oam_floor_commits_only "${base}"; then echo "ONLY_FLOOR"; else echo "OTHER"; fi`];
+    return runOutside(dir, body.join("\n")).out.trim();
+  }
+
+  function start(): { dir: string; base: string } {
+    const dir = oamRepo();
+    return { dir, base: git(dir, ["rev-parse", "HEAD"]).trim() };
+  }
+
+  it("answers no when nothing is ahead, and yes for one floor commit or two", () => {
+    const { dir, base } = start();
+    expect(ahead(dir, base)).toBe("OTHER");
+    expect(runMove(dir, "0.13.1", "0.15.2").out).toContain("committed");
+    expect(ahead(dir, base)).toBe("ONLY_FLOOR");
+    expect(runMove(dir, "0.15.2", "0.15.3").out).toContain("committed");
+    expect(ahead(dir, base)).toBe("ONLY_FLOOR");
+  });
+
+  it("answers no when any other commit is ahead, above the floor commit or below it", () => {
+    const above = start();
+    runMove(above.dir, "0.13.1", "0.15.2");
+    writeFileSync(join(above.dir, "unrelated.txt"), "fix\n");
+    git(above.dir, ["commit", "-q", "-am", "fix a test"]);
+    expect(ahead(above.dir, above.base)).toBe("OTHER");
+
+    const below = start();
+    writeFileSync(join(below.dir, "unrelated.txt"), "fix\n");
+    git(below.dir, ["commit", "-q", "-am", "fix a test"]);
+    runMove(below.dir, "0.13.1", "0.15.2");
+    expect(ahead(below.dir, below.base)).toBe("OTHER");
+  });
+
+  it("answers no for the floor subject on other paths, and for the floor paths under another subject", () => {
+    const subject = start();
+    writeFileSync(join(subject.dir, "unrelated.txt"), "sneaky\n");
+    git(subject.dir, ["commit", "-q", "-am", "fix(oam): move the floor to 0.15.2"]);
+    expect(ahead(subject.dir, subject.base)).toBe("OTHER");
+
+    const paths = start();
+    runMove(paths.dir, "0.13.1", "0.15.2");
+    git(paths.dir, ["commit", "-q", "--amend", "-m", "chore: bump the floor"]);
+    expect(ahead(paths.dir, paths.base)).toBe("OTHER");
+  });
+
+  it("answers no for a merge, even one with the floor subject", () => {
+    const { dir, base } = start();
+    git(dir, ["checkout", "-q", "-b", "side"]);
+    runMove(dir, "0.13.1", "0.15.2");
+    git(dir, ["checkout", "-q", "main"]);
+    git(dir, ["merge", "-q", "--no-ff", "-m", "fix(oam): move the floor to 0.15.2", "side"]);
+    expect(git(dir, ["rev-list", "--count", `${base}..HEAD`]).trim()).toBe("2");
+    expect(ahead(dir, base)).toBe("OTHER");
+  });
+});
+
+describe("release.sh behaviour-change gate with a planned oam floor move", () => {
+  // A floor move is a changed threshold, so the truthful answer to the gate is
+  // yes, and its way back is `oam self-update`. The move writes the block that
+  // names it AFTER the gate, so the gate reads the block --check rendered.
+  const gate = extractBlock(
+    '  read -p "Behaviour change with no opt-in? (y/N) " -r BEHAVIOUR_REPLY || BEHAVIOUR_REPLY=""',
+    "  fi",
+  );
+
+  function run(target: string): RunResult {
+    const dir = newTmp("release-oam-gate-");
+    writeOamFixture(dir);
+    const check = runBash(
+      [
+        STUB_HELPERS,
+        TOKEN_STUB,
+        OAM_HELPERS,
+        "oam_floor_rewrite --check src/oam-spawn.ts src/tests/oam-spawn.test.ts CHANGELOG.md 0.15.2 0.13.1 2026-09-13 0.81.0",
+      ].join("\n"),
+      dir,
+    );
+    expect(check.status).toBe(0);
+    // The fixture's own Unreleased section does not name the switch, so only the rendered block can.
+    expect(OAM_CHANGELOG).not.toContain("oam self-update");
+    expect(check.out).toContain("`oam self-update`");
+    const body = [STUB_HELPERS, 'VERSION="0.81.0"', "CYAN=''", "NC=''", gate, 'echo "CONTINUED"'].join("\n");
+    const file = join(newTmp("release-oam-gate-harness-"), "gate.sh");
+    writeFileSync(file, body);
+    const r = spawnSync("bash", [file], {
+      cwd: dir,
+      encoding: "utf8",
+      input: "y\noam self-update\n",
+      env: { ...baseEnv(), NO_COLOR: "1", OAM_FLOOR_TARGET: target, OAM_FLOOR_BLOCK: check.out },
+    });
+    return { status: r.status, out: `${r.stdout ?? ""}${r.stderr ?? ""}` };
+  }
+
+  it("accepts oam self-update, which only the block the move has yet to write names", () => {
+    const r = run("0.15.2");
+    expect(r.out).toContain("oam self-update found in the Unreleased section");
+    expect(r.out).toContain("CONTINUED");
+  });
+
+  it("still aborts on the same answers when no floor move is planned", () => {
+    const r = run("");
+    expect(r.out).toContain("'oam self-update' does not appear in CHANGELOG.md's Unreleased section");
+    expect(r.out).not.toContain("CONTINUED");
+  });
+});
+
+describe("release.sh oam floor block placement", () => {
+  // Every oam case above drives a block lifted out of release.sh, which tests
+  // its logic but not where it sits. The order is load-bearing: the helpers
+  // are defined before the sync guard calls one, the pre-flight runs after the
+  // tag guard and before the prompt (which needs its plan), and the move runs
+  // after the prompt and before step 1 (whose gates must cover it).
+  it("keeps the helpers, sync guard, pre-flight, prompt, move and step 1 in that order", () => {
+    const lines = releaseSh.split("\n");
+    const at = (l: string) => {
+      const i = lines.indexOf(l);
+      if (i === -1) {
+        throw new Error(`release.sh anchor not found: ${JSON.stringify(l)}`);
+      }
+      return i;
+    };
+    const order = [
+      at("# <<< oam floor helpers"),
+      at('    if oam_floor_commits_only "$REMOTE_HEAD"; then'),
+      at('if [ "$RESUMING" != true ] && git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null 2>&1; then'),
+      at("# >>> oam floor pre-flight"),
+      at("# <<< oam floor pre-flight"),
+      at('if [ "$SKIP_CONFIRM" != "true" ] && [ "$RESUMING" != "true" ]; then'),
+      at("# >>> oam floor move"),
+      at("# <<< oam floor move"),
+      at('step 1 "Lint + typecheck + tests"'),
+    ];
+    expect(order).toEqual([...order].sort((a, b) => a - b));
+  });
+});
+
+describe("release.sh oam floor re-run after a failed gate (stubbed full run)", () => {
+  // The whole script, end to end, over a floor that is behind: see the file
+  // header for what is stubbed and what keeps the real npm out of reach. The
+  // floor move commits ahead of step 1, so a failing gate leaves that commit
+  // on local main, and the re-run meets the origin/main sync guard with main
+  // ahead of origin. It must carry on over the script's own commit, and only
+  // over that.
+  const NPM_STUB = [
+    "#!/bin/bash",
+    'echo "npm $*" >> "$FAKE_STATE/npm.log"',
+    'case "$1" in',
+    "  view)",
+    '    case "$2" in',
+    '      "@yawlabs/mcp") echo "1.0.1" ;;',
+    '      "@yawlabs/mcp@"*)',
+    '        v="${2#@yawlabs/mcp@}"',
+    '        if [ -f "$FAKE_STATE/published-$v" ]; then',
+    '          if [ "${3:-}" = "dist.integrity" ]; then echo "sha512-fixture"; else echo "$v"; fi',
+    "        fi ;;",
+    "    esac ;;",
+    "  whoami) echo fixture ;;",
+    "  run)",
+    '    case "$2" in',
+    '      lint) echo "Checked 3 files" ;;',
+    "      typecheck) ;;",
+    "      test)",
+    '        if [ -f "$FAKE_STATE/fail-tests" ]; then echo " Test Files  1 failed (3)"; exit 1; fi',
+    '        echo " Test Files  3 passed (3)" ;;',
+    '      build) mkdir -p dist; echo "built" > dist/index.js ;;',
+    "    esac ;;",
+    "  version)",
+    `    node -e 'const fs=require("fs");const j=JSON.parse(fs.readFileSync("package.json","utf8"));j.version=process.argv[1];fs.writeFileSync("package.json",JSON.stringify(j,null,2)+String.fromCharCode(10))' "$2" ;;`,
+    "  publish)",
+    `    v=$(node -p 'require("./package.json").version'); touch "$FAKE_STATE/published-$v"; echo "+ @yawlabs/mcp@$v" ;;`,
+    `  pack) echo '[{"integrity":"sha512-fixture"}]' ;;`,
+    "esac",
+    "exit 0",
+    "",
+  ].join("\n");
+
+  const CURL_SCRIPT = [
+    "#!/bin/bash",
+    'echo "curl $*" >> "$FAKE_STATE/curl.log"',
+    'case "$*" in',
+    "  *api.github.com/repos/YawLabs/oam/releases/latest*)",
+    `    printf '{"tag_name":"v%s","published_at":"2026-09-13T13:11:42Z","draft":false,"prerelease":false}' "$(cat "$FAKE_STATE/oam-latest")" ;;`,
+    "  *registry.modelcontextprotocol.io*)",
+    '    u="$*"; v="${u#*version=}"; v="${v%%&*}"',
+    `    if [ -f "$FAKE_STATE/published-$v" ]; then printf '{"servers":[{"server":{"version":"%s"}}]}' "$v"; else printf '{"servers":[]}'; fi ;;`,
+    '  *) echo "curl: (22) the stub does not serve $*" >&2; exit 22 ;;',
+    "esac",
+    "",
+  ].join("\n");
+
+  type FullRun = { root: string; work: string; bare: string; state: string };
+
+  function setup(): FullRun {
+    const root = newTmp("release-oam-full-");
+    const bin = join(root, "bin");
+    mkdirSync(bin);
+    const stubs: [string, string][] = [
+      ["npm", NPM_STUB],
+      ["curl", CURL_SCRIPT],
+      ["gh", "#!/bin/bash\nexit 1\n"],
+    ];
+    for (const [name, text] of stubs) {
+      writeFileSync(join(bin, name), text);
+      chmodSync(join(bin, name), 0o755);
+    }
+    const state = join(root, "state");
+    mkdirSync(state);
+    writeFileSync(join(state, "oam-latest"), "0.15.2");
+    writeFileSync(join(root, "npmrc"), "");
+
+    const bare = join(root, "origin.git");
+    git(root, ["init", "-q", "--bare", "-b", "main", bare]);
+    const work = join(root, "work");
+    mkdirSync(work);
+    copyFileSync(releaseShPath, join(work, "release.sh"));
+    writeOamFixture(work);
+    mkdirSync(join(work, "node_modules", ".bin"), { recursive: true });
+    for (const b of ALL_BINS) {
+      writeFileSync(join(work, "node_modules", ".bin", b), "");
+    }
+    writeFileSync(join(work, ".gitignore"), "node_modules\ndist\n");
+    const pkg = { name: "@yawlabs/mcp", version: "1.0.1", mcpName: "io.github.YawLabs/mcp", description: "fixture" };
+    writeFileSync(join(work, "package.json"), `${JSON.stringify(pkg, null, 2)}\n`);
+    writeFileSync(join(work, "package-lock.json"), "{}\n");
+    const server = {
+      name: "io.github.YawLabs/mcp",
+      description: "a valid short description",
+      version: "1.0.1",
+      packages: [{ version: "1.0.1" }],
+    };
+    writeFileSync(join(work, "server.json"), `${JSON.stringify(server, null, 2)}\n`);
+    git(work, ["init", "-q", "-b", "main"]);
+    git(work, ["add", "-A"]);
+    git(work, ["commit", "-q", "-m", "fixture"]);
+    git(work, ["remote", "add", "origin", shPath(bare)]);
+    git(work, ["push", "-q", "origin", "main"]);
+    git(work, ["fetch", "-q", "origin"]);
+    return { root, work, bare, state };
+  }
+
+  function release(f: FullRun): RunResult {
+    const harness = [
+      `STUBS="$(cd "${shPath(join(f.root, "bin"))}" && pwd)" || exit 97`,
+      'export PATH="$STUBS:$PATH"',
+      "for t in npm curl gh; do",
+      '  if [ "$(command -v "$t")" != "$STUBS/$t" ]; then',
+      '    echo "REFUSING TO RUN: $t resolves to $(command -v "$t"), not the stub"',
+      "    exit 98",
+      "  fi",
+      "done",
+      "bash ./release.sh -y 1.0.2",
+    ].join("\n");
+    const file = join(f.root, "run.sh");
+    writeFileSync(file, harness);
+    // npm's own config variables go too: with the stub shadowing npm they are
+    // unused, and without it they must not point anywhere real.
+    const env = Object.fromEntries(
+      Object.entries(baseEnv()).filter(([k]) => !k.toLowerCase().startsWith("npm_config_")),
+    );
+    const r = spawnSync("bash", [file], {
+      cwd: f.work,
+      encoding: "utf8",
+      env: {
+        ...env,
+        ...GIT_ENV,
+        NO_COLOR: "1",
+        FAKE_STATE: shPath(f.state),
+        NPM_CONFIG_USERCONFIG: join(f.root, "npmrc"),
+        NPM_CONFIG_REGISTRY: "http://127.0.0.1:9/",
+        GITHUB_TOKEN: "",
+        MCP_REGISTRY_TOKEN: "",
+        SKIP_CONFIRM: "",
+        SKIP_LINT: "",
+        ALLOW_STALE_REMOTE: "",
+        ALLOW_UNVERIFIED_VERSION: "",
+        ALLOW_STALE_OAM_FLOOR: "",
+      },
+    });
+    const out = `${r.stdout ?? ""}${r.stderr ?? ""}`;
+    expect(out).not.toContain("REFUSING TO RUN");
+    return { status: r.status, out };
+  }
+
+  const subjects = (dir: string, range: string) =>
+    git(dir, ["log", "--format=%s", range]).trim().split("\n").filter(Boolean);
+
+  it("carries on over the floor commit a failed test gate left on local main, and pushes it with the bump", () => {
+    const f = setup();
+    writeFileSync(join(f.state, "fail-tests"), "");
+    const first = release(f);
+    expect(first.out).toContain("oam floor 0.13.1 -> 0.15.2, committed");
+    expect(first.out).toContain("Tests failed");
+    expect(first.status).toBe(1);
+    expect(subjects(f.work, "origin/main..HEAD")).toEqual(["fix(oam): move the floor to 0.15.2"]);
+
+    rmSync(join(f.state, "fail-tests"));
+    const second = release(f);
+    expect(second.out).toContain("ahead of origin/main only by release.sh's own oam floor commit(s)");
+    expect(second.out).toContain("oam floor 0.15.2 is the latest oam release");
+    expect(second.out).toContain("v1.0.2 released to npm + MCP registry.");
+    expect(second.status).toBe(0);
+    expect(subjects(f.bare, "main")).toEqual(["v1.0.2", "fix(oam): move the floor to 0.15.2", "fixture"]);
+    expect(git(f.bare, ["tag", "-l"]).trim()).toBe("v1.0.2");
+  });
+
+  it("still stops at the sync guard when another commit sits on the floor commit, and names the undo", () => {
+    const f = setup();
+    writeFileSync(join(f.state, "fail-tests"), "");
+    expect(release(f).status).toBe(1);
+    writeFileSync(join(f.work, "README.md"), "a fix for the failing test\n");
+    git(f.work, ["add", "README.md"]);
+    git(f.work, ["commit", "-q", "-m", "fix the failing test"]);
+    rmSync(join(f.state, "fail-tests"));
+
+    const second = release(f);
+    expect(second.out).toContain("Local main is AHEAD of origin/main (unpushed commits)");
+    expect(second.out).toContain("git reset --keep origin/main and re-run");
+    expect(second.status).toBe(1);
+    expect(subjects(f.bare, "main")).toEqual(["fixture"]);
+    expect(git(f.bare, ["tag", "-l"]).trim()).toBe("");
   });
 });
