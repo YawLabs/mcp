@@ -12,11 +12,15 @@ import {
   adapterFor,
   applyClientConfigEdits,
   type ClientConfigEdit,
+  ClientConfigWriteError,
   type ConfigFormat,
   type ConfigSite,
   classifyClientConfig,
   type EntryTransform,
+  type StrictViolation,
   terminateWithNewline,
+  unloadableConfigFix,
+  unloadableConfigProblem,
 } from "../client-config.js";
 import { buildFreshConfig, JSON_ADAPTER, JSONC_ADAPTER, UTF8_BOM } from "../client-config-json.js";
 import { deepEqualJson } from "../install-cmd.js";
@@ -67,6 +71,45 @@ function install(
 function uninstall(raw: string, where: ConfigSite = FLAT, key = "mcp"): string {
   const view = classifyClientConfig(raw, where);
   return applyClientConfigEdits(view, [{ op: "remove", key }], where);
+}
+
+/** The refusal `fn` throws, as the typed error -- so a test can compare the
+ *  WHOLE message with toBe. `toThrow(/fragment/)` only proves the fragment is
+ *  somewhere in it, which is how a dropped clause stays green. Anything that
+ *  is not a ClientConfigWriteError, or no throw at all, fails the test. */
+function refusalOf(fn: () => unknown): ClientConfigWriteError {
+  try {
+    fn();
+  } catch (err) {
+    if (err instanceof ClientConfigWriteError) return err;
+    throw err;
+  }
+  throw new Error("expected a ClientConfigWriteError, and the call returned normally");
+}
+
+/** The message `JSON.parse` itself throws for `text` -- the client's own
+ *  complaint, which a violation's `detail` is supposed to carry verbatim. */
+function jsonParseMessageOf(text: string): string {
+  try {
+    JSON.parse(text);
+  } catch (err) {
+    return err instanceof Error ? err.message : String(err);
+  }
+  throw new Error("expected JSON.parse to reject the text");
+}
+
+/** The violation on a view, or a failed test -- never a silent `?.` chain that
+ *  turns a missing violation into an `undefined === undefined` pass. */
+function violationOf(raw: string, where: ConfigSite): StrictViolation {
+  const violation = classifyClientConfig(raw, where).unloadable();
+  if (violation === null) throw new Error("expected the file to be strict-unloadable");
+  return violation;
+}
+
+/** The upsert refusal for a strict-unloadable file, composed from the shared
+ *  helpers -- the same composition every surface is meant to print. */
+function unloadableRefusal(where: string, violation: StrictViolation): string {
+  return `${where} ${unloadableConfigProblem(violation)} -- refusing to write into it; ${unloadableConfigFix("re-run")}`;
 }
 
 describe("a JSONC file keeps every neighbouring byte", () => {
@@ -279,6 +322,156 @@ describe("strict JSON refuses what its client cannot read", () => {
     const read = classifyClientConfig('{\n  "mcpServers": {\n', STRICT).read;
     expect(read.kind).toBe("malformed");
     if (read.kind === "malformed") expect(read.reason).toBe("syntax");
+  });
+
+  it("refuses with the WHOLE message: the path, the problem, the client's own complaint and the remedy", () => {
+    // Every other refusal assertion in this file matches a fragment
+    // (/refusing to write into it/, /comments or trailing commas/), so deleting
+    // the remedy clause -- the part that tells the user what to DO -- leaves
+    // them all green. `try` surfaces this error verbatim, so the clause is
+    // user-facing and has to be pinned whole.
+    //
+    // MUTATION: drop `; ${unloadableConfigFix("re-run")}` from the throw in
+    // applyClientConfigEdits (client-config.ts), and this goes red.
+    for (const [label, raw] of [
+      ["comment", WITH_COMMENT],
+      ["trailing comma", WITH_TRAILING_COMMA],
+    ] as const) {
+      const view = classifyClientConfig(raw, STRICT);
+      const violation = violationOf(raw, STRICT);
+      // The middle of the message is the CLIENT's parser speaking: its syntax
+      // and JSON.parse's own words, not a paraphrase. No BOM here, so the text
+      // JSON.parse sees is the file.
+      expect(violation.detail, label).toBe(jsonParseMessageOf(raw));
+      const problem = unloadableConfigProblem(violation);
+      expect(problem, label).toContain(
+        `which its client reads as invalid JSON (${violation.detail}), so no server in it is loading`,
+      );
+      expect(unloadableConfigFix("re-run").endsWith(", then re-run"), label).toBe(true);
+
+      const err = refusalOf(() => applyClientConfigEdits(view, [{ op: "upsert", key: "mcp", entry: ENTRY }], STRICT));
+      expect(err.message, label).toBe(
+        `/home/u/cfg.json ${problem} -- refusing to write into it; ${unloadableConfigFix("re-run")}`,
+      );
+      expect(view.raw, label).toBe(raw);
+    }
+  });
+
+  it("refuses a MIXED edit list in either order: one write in it is enough", () => {
+    // The gate asks whether ANY edit writes. Every other case here hands it a
+    // single upsert or a pure removal, where "any edit writes" and "every edit
+    // writes" -- or "the first edit writes" -- all give the same answer. A
+    // legacy migration is the real mixed list: upsert ours, drop the old key.
+    //
+    // MUTATIONS: `edits.some(...)` -> `edits.every(...)` in
+    // applyClientConfigEdits turns both orders red; a gate on `edits[0]` only
+    // turns the removal-first order red.
+    const raw = '{\n  // mine\n  "mcpServers": {\n    "yaw-mcp": {"command": "npx"}\n  }\n}\n';
+    const view = classifyClientConfig(raw, STRICT);
+    expect(view.legacyKey()).toBe("yaw-mcp");
+    const expected = unloadableRefusal("/home/u/cfg.json", violationOf(raw, STRICT));
+    const upsert: ClientConfigEdit = { op: "upsert", key: "mcp", entry: ENTRY };
+    const remove: ClientConfigEdit = { op: "remove", key: "yaw-mcp" };
+    for (const edits of [
+      [upsert, remove],
+      [remove, upsert],
+    ]) {
+      const order = edits.map((e) => e.op).join(",");
+      expect(refusalOf(() => applyClientConfigEdits(view, edits, STRICT)).message, order).toBe(expected);
+    }
+    expect(view.raw).toBe(raw);
+    // The control: the removal ALONE goes through on the same view, so the
+    // refusals above are the upsert's doing, not something about the file.
+    const removed = applyClientConfigEdits(view, [remove], STRICT);
+    expect(classifyClientConfig(removed, STRICT).legacyKey()).toBeNull();
+    expect(removed).toContain("// mine");
+  });
+
+  it("locates a comment behind a BOM in the ORIGINAL bytes, one past where JSON.parse counts", () => {
+    // Hand-computed against the file as it sits on disk:
+    //   [0] U+FEFF  [1] {  [2] LF  [3] [4] spaces  [5] the first slash
+    // Line 2 starts at [3], so the slash is line 2 column 3.
+    // JSON.parse is handed the text AFTER the BOM, so its own offset is one
+    // less (4); the reported position has to add the stripped BOM back.
+    //
+    // MUTATION: pass `0` instead of `had ? 1 : 0` to strictPosition in
+    // readStrictJson (client-config-json.ts) -- the offset comes back 4,
+    // which points at a space, and this goes red.
+    const raw = `${UTF8_BOM}{\n  // mine\n  "mcpServers": {}\n}\n`;
+    expect(raw.slice(5, 7)).toBe("//");
+    const view = classifyClientConfig(raw, STRICT);
+    // Still readable by us -- a BOM is not the problem, the comment is.
+    expect(view.read.kind).toBe("ok");
+    const violation = violationOf(raw, STRICT);
+    expect(violation.position).toEqual({ offset: 5, line: 2, column: 3 });
+    // The reference the shift corrects: V8's own count, against the de-BOM'd
+    // text (measured on Node 22.22.2).
+    expect(violation.detail).toBe(jsonParseMessageOf(raw.slice(1)));
+    expect(violation.detail).toMatch(/at position 4\b/);
+    // And the refusal still carries the whole remedy on a BOM-prefixed file.
+    expect(refusalOf(() => install(raw, STRICT)).message).toBe(unloadableRefusal("/home/u/cfg.json", violation));
+  });
+
+  it("locates a syntax error behind a BOM in the ORIGINAL bytes when BOTH parsers refuse", () => {
+    // A missing comma between two members: JSON.parse and the lenient parse
+    // both reject it, so the read is plain `malformed`, positioned by
+    // jsonc-parser's scanner. Hand-computed against the file:
+    //   [0] U+FEFF, [1] {, [2] LF                       -- line 1
+    //   [3..19] `  "mcpServers": {`, [20] LF            -- line 2
+    //   line 3 starts at [21]; in `    "fs": {"command": "npx"} "x": 1`
+    //   the `"x"` token is at index 29, so offset 50, column 30.
+    //
+    // MUTATION: pass `0` instead of `shift` to jsoncPosition in classifyJson
+    // (client-config-json.ts) -- the offset comes back 49 and the column 29.
+    const raw = `${UTF8_BOM}{\n  "mcpServers": {\n    "fs": {"command": "npx"} "x": 1\n  }\n}\n`;
+    expect(raw.slice(50, 53)).toBe('"x"');
+    expect(raw.lastIndexOf("\n", 49)).toBe(20);
+    for (const where of [STRICT, FLAT]) {
+      const view = classifyClientConfig(raw, where);
+      const read = view.read;
+      expect(read.kind, where.format).toBe("malformed");
+      if (read.kind !== "malformed") continue;
+      expect(read.reason, where.format).toBe("syntax");
+      expect(view.unloadable(), where.format).toBeNull();
+      expect(read.position, where.format).toEqual({ offset: 50, line: 3, column: 30 });
+      // The same position, rendered the way the refusal prints it.
+      expect(refusalOf(() => install(raw, where)).message, where.format).toBe(
+        `/home/u/cfg.json is not valid JSON at line 3 column 30 (${read.detail})`,
+      );
+    }
+  });
+
+  // KNOWN DEFECT, pinned with it.fails so the suite stays green until it is
+  // fixed -- flip both of these to `it` in the same change as the fix.
+  //
+  // On LINE 1 of a BOM-prefixed file the COLUMN counts the BOM. positionAt
+  // derives the column from an offset that (correctly, per ConfigPosition's
+  // doc) includes the BOM, and line 1 is the only line whose start is BEFORE
+  // the BOM. ConfigPosition promises "the spelling every editor uses", no
+  // editor shows a BOM as a column, and V8's own message disagrees with the
+  // position in the SAME refusal line. Measured on Node 22.22.2:
+  //   BOM + `{// c ...`   -> position {offset 2, line 1, column 3}; V8 says column 2
+  //   BOM + `{"a" "b"}`   -> position {offset 6, line 1, column 7}; V8 says column 6
+  // Lines 2+ are unaffected (the two tests above).
+  it.fails("KNOWN DEFECT: reports an editor column for a comment on line 1 of a BOM-prefixed file", () => {
+    // [0] U+FEFF  [1] {  [2] the first slash -- the 2nd character an editor
+    // shows on line 1, so column 2. The offset keeps counting the BOM.
+    const raw = `${UTF8_BOM}{// c\n"mcpServers":{}}\n`;
+    expect(raw.slice(2, 4)).toBe("//");
+    expect(violationOf(raw, STRICT).position).toEqual({ offset: 2, line: 1, column: 2 });
+  });
+
+  it.fails("KNOWN DEFECT: renders an editor column for a syntax error on line 1 of a BOM-prefixed file", () => {
+    // [0] U+FEFF  [1] {  [2..4] "a"  [5] space  [6] "b" -- the 6th character
+    // an editor shows on line 1. Both parsers refuse (no colon), so this is
+    // the malformed path and its rendered refusal.
+    const raw = `${UTF8_BOM}{"a" "b"}\n`;
+    expect(raw.slice(6, 9)).toBe('"b"');
+    const read = classifyClientConfig(raw, STRICT).read;
+    if (read.kind !== "malformed") throw new Error(`expected malformed, got ${read.kind}`);
+    expect(refusalOf(() => install(raw, STRICT)).message).toBe(
+      `/home/u/cfg.json is not valid JSON at line 1 column 6 (${read.detail})`,
+    );
   });
 });
 

@@ -212,6 +212,40 @@ export interface StrictViolation {
   position: ConfigPosition | null;
 }
 
+/** What is WRONG with such a file, as one clause a message can put a path in
+ *  front of (`<path> has comments or trailing commas, ...`).
+ *
+ *  ONE wording for every surface that describes the state, for the reason
+ *  `unparseableConfigFix` gives for its own: the write facade's refusal below,
+ *  install's own refusal, doctor's CLIENTS line for the same file, and
+ *  import's refusal to remove originals. Doctor used to say `present, no "mcp"
+ *  entry -- run ...` about a file install cannot be made to write, so what the
+ *  refusal knows has to reach the surfaces that advise instead of being
+ *  re-worded beside each one.
+ *
+ *  It says the CONSEQUENCE, not just the syntax: "has a comment" reads as
+ *  cosmetic, and the fact the user needs is that their client is loading no
+ *  server at all from this file -- including any yaw-mcp entry already in it. */
+export function unloadableConfigProblem(v: StrictViolation): string {
+  return `has comments or trailing commas, which its client reads as invalid ${v.syntax} (${v.detail}), so no server in it is loading`;
+}
+
+/** The by-hand fix for that file. yaw-mcp will not do it: the comments are the
+ *  user's, and deleting them to make its own write land is not a repair it
+ *  gets to make -- so every surface hands the same two options back, and
+ *  `then` is the step once the file loads again (install passes "re-run",
+ *  doctor the install command for the row it is describing, import that
+ *  command plus its own re-run).
+ *
+ *  Defined HERE rather than beside `unparseableConfigFix` and
+ *  `blockedContainerFix` in install-targets.ts -- which re-exports it so
+ *  consumers reach all three in one place -- because the refusal that must not
+ *  disagree with it is thrown in this module, and install-targets.ts imports
+ *  this one. */
+export function unloadableConfigFix(then: string): string {
+  return `remove the comments and trailing commas, or move the file aside, then ${then}`;
+}
+
 /** One server in the container, in file order.
  *
  *  `key` is how the client addresses it (an object key in every JSON-family
@@ -968,9 +1002,11 @@ export function applyClientConfigEdits(
   }
   const unloadable = view.unloadable();
   if (unloadable !== null && writes) {
+    // The remedy rides along, so a caller that surfaces this error verbatim
+    // (`try`) tells the user the same two options install and doctor do. The
+    // wording is the shared helpers' -- see unloadableConfigProblem.
     throw new ClientConfigWriteError(
-      `${where} has comments or trailing commas, which its client reads as invalid ${unloadable.syntax} ` +
-        `(${unloadable.detail}), so no server in it is loading -- refusing to write into it`,
+      `${where} ${unloadableConfigProblem(unloadable)} -- refusing to write into it; ${unloadableConfigFix("re-run")}`,
     );
   }
 

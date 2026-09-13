@@ -77,6 +77,7 @@ import {
   readClientConfigFile,
   siteAt,
   terminateWithNewline,
+  unloadableConfigProblem,
 } from "./client-config.js";
 import { resolveInstallSite } from "./install-cmd.js";
 import {
@@ -90,6 +91,7 @@ import {
   LEGACY_ENTRY_NAMES,
   resolveAppDataDir,
   resolveInstallSites,
+  unloadableConfigFix,
   unparseableConfigFix,
 } from "./install-targets.js";
 import { parseJsonc } from "./jsonc.js";
@@ -566,6 +568,28 @@ async function readContainer(ref: ContainerRef): Promise<ContainerRead> {
       clause: `${keyPath} is ${read.reason}`,
       installSays: `refuses to edit ${keyPath}`,
       fix: (then) => `rewrite that entry by hand, then ${then}`,
+    };
+  }
+  // Parses for US, not for its client: a strict-JSON site carrying a comment
+  // or a trailing comma, which that client reads with JSON.parse and so loads
+  // NO server from -- including any yaw-mcp entry sitting in it.
+  //
+  // REFUSED rather than `container`, and this is the asymmetry the doc above
+  // is about. A yaw-mcp entry in such a file is NOT wiring: the client cannot
+  // see it. Answering "wired" here let `--remove-originals` delete servers out
+  // of a config that WAS loading them (~/.claude.json) on the strength of a
+  // broker the client never loads, leaving it able to reach neither -- the
+  // false-"wired" half, which is the destructive one. Placed after `blocked`
+  // to match install's own order: applyClientConfigEdits raises the blocked
+  // refusal before the unloadable gate, so on a file that is both, the blocked
+  // clause is the one the user actually hits.
+  const unloadable = view.unloadable();
+  if (unloadable !== null) {
+    return {
+      state: "refused",
+      clause: `${where} ${unloadableConfigProblem(unloadable)}`,
+      installSays: `refuses to write into ${where}`,
+      fix: unloadableConfigFix,
     };
   }
   // The only question this function is asked is "is yaw-mcp already wired in

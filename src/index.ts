@@ -280,6 +280,10 @@ if (subcommand === "compliance") {
                              the file is absent, \`legacy: <key>\` that the only
                              yaw-mcp wiring there is a pre-rename entry,
                              \`malformed\` that the file does not parse,
+                             \`not loading (comments or trailing commas)\`
+                             that the file parses for yaw-mcp but its client
+                             reads it as invalid JSON and so loads no server
+                             from it, whatever the list holds,
                              \`unreadable: <reason>\` that its bytes could not
                              be read, and \`not supported yet\` that yaw-mcp
                              cannot configure that client on this OS. An

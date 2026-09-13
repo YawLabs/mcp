@@ -41,7 +41,8 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, posix, resolve, win32 } from "node:path";
 import { cliToNamespaces } from "./cli-shadows.js";
-import { readClientEnv } from "./client-config.js";
+import { effectiveConfigFormat, readClientEnv, unloadableConfigProblem } from "./client-config.js";
+import { readStrictJson } from "./client-config-json.js";
 import {
   CURRENT_SCHEMA_VERSION,
   type LoadedConfigFile,
@@ -71,6 +72,7 @@ import {
   type InstallScope,
   resolveAppDataDir,
   resolveInstallPath,
+  unloadableConfigFix,
   unparseableConfigFix,
 } from "./install-targets.js";
 import { parseJsonc } from "./jsonc.js";
@@ -429,6 +431,27 @@ export interface ClientProbeResult {
   /** The file exists but its content did not PARSE as a JSON object. Never
    *  set for a read failure -- that is `unreadable`. */
   malformed: boolean;
+  /** The file parses for yaw-mcp but NOT for the client that owns it: a
+   *  STRICT-JSON site (claude-code's project `.mcp.json` -- see `strictJson`
+   *  in install-targets.ts) carrying a comment or a trailing comma, which
+   *  that client reads with `JSON.parse`, so it loads NO server from the
+   *  file -- ours included. Worded as one clause a message puts the file in
+   *  front of (`unloadableConfigProblem`, the same helper the write refusal
+   *  in client-config.ts composes its message from), or null. Additive JSON
+   *  field.
+   *
+   *  Mutually exclusive with `malformed`, and for the reason classifyJson
+   *  already decides: a file that fails BOTH parsers is malformed -- doctor
+   *  cannot read it either, so there is nothing to say about what the client
+   *  would have loaded. `containerBlocked` can co-exist with it and is
+   *  reported FIRST, because that is the refusal install actually raises on
+   *  such a file (applyClientConfigEdits checks the blocked read before the
+   *  unloadable gate).
+   *
+   *  Entries still count and still read: yaw-mcp's own lenient parse sees
+   *  them, which is what lets this row say the yaw-mcp entry sitting in the
+   *  file is not loading rather than reporting the file as OK. */
+  unloadable: string | null;
   /** The file exists but its BYTES could not be read (EISDIR for a directory
    *  at the path, EACCES, a win32 EBUSY while an AV scanner holds the handle)
    *  -- the error message, or null. Kept apart from `malformed`: a read
@@ -701,7 +724,14 @@ function isTransientRead(c: ClientProbeResult): boolean {
  *  the probe had just failed -- while a readable ~/.cursor/mcp.json sat one
  *  slot further along. */
 export function probeUsable(c: ClientProbeResult): boolean {
-  return !c.unavailable && c.exists && !c.malformed && c.unreadable === null;
+  // `unloadable` excluded for the same reason as the two above, one step
+  // further on: this gate picks a client to WRITE a trial entry into, and the
+  // write facade refuses a strict file its client cannot load. Auto-detect
+  // would otherwise pick a commented `.mcp.json` and `try` would abort on the
+  // refusal, with a readable config sitting one slot along. A REMOVAL into
+  // such a file stays allowed (see try-cmd's markerSite) -- this is the
+  // choose-a-target gate, not the peel.
+  return !c.unavailable && c.exists && !c.malformed && c.unreadable === null && c.unloadable === null;
 }
 
 /** True for every probe state renderClientStatus describes as "the client
@@ -718,6 +748,14 @@ function clientCannotLaunch(c: ClientProbeResult): boolean {
   return (
     (c.unreadable !== null && !isTransientRead(c)) ||
     c.malformed ||
+    // Only WITH our entry in it. The file's client loads no server from it
+    // either way, but a strict file yaw-mcp was never installed to is the
+    // blocked-container case ("install refuses this file" is advice, and a
+    // commented `.mcp.json` in a checkout must not drag a working machine to
+    // exit 2); a strict file that HOLDS the "mcp" entry is the state this
+    // fold exists for -- the CLIENTS row says the entry is not loading while
+    // DIAGNOSIS said "All good", on --json too.
+    (c.unloadable !== null && c.hasMcpEntry) ||
     c.launchCommandMissing !== null ||
     c.launchOamEntryMissing !== null ||
     c.launchOamNotAbsolute !== null
@@ -2254,6 +2292,22 @@ function renderClientStatus(c: ClientProbeResult, installCmd: string): string {
   if (c.containerBlocked !== null) {
     return `present, but ${c.containerBlocked}, not a JSON object -- install refuses to overwrite it; ${blockedContainerFix(`run \`${installCmd}\``)}`;
   }
+  // The file parses for US and not for its client -- strict JSON (Claude
+  // Code's project `.mcp.json`) carrying a comment or a trailing comma. Every
+  // branch below reads the ENTRIES, and every one of them would be describing
+  // a file the client loads nothing from: an entry that is present and not
+  // loading reported "OK", an absent one "present, no entry -- run install",
+  // and that run exits 1 on this very file. The problem clause and the fix are
+  // the write refusal's own helpers, so the two surfaces cannot drift.
+  //
+  // BELOW containerBlocked deliberately: install checks the blocked read
+  // first (applyClientConfigEdits), so on a file that is both, the blocked
+  // refusal is the one the user would actually hit. A REPARABLE container
+  // leaves containerBlocked null and lands here, which is right -- install
+  // repairs that key and is then refused by the unloadable gate.
+  if (c.unloadable !== null) {
+    return `exists but ${c.unloadable} -- install refuses to write into it; ${unloadableConfigFix(`run \`${installCmd}\``)}`;
+  }
   // Checked BEFORE the combined legacy branch: a launch command that no longer
   // exists is the one state that means the client cannot start yaw-mcp AT ALL,
   // and the combined branch used to swallow it -- a config carrying both a
@@ -2384,7 +2438,14 @@ interface ProbeOptions {
  *  results are already final. */
 interface ProbeSlot {
   result: ClientProbeResult;
-  read: { path: string; containerPath: string[] } | null;
+  /** `strict` is the SITE's declared strictness, never a guess about the
+   *  bytes: `effectiveConfigFormat` narrowed by the scope's `strictJson`,
+   *  exactly as `resolveInstallSites` narrows it for the write path. It is
+   *  what lets the classification ask "would this client load the file"
+   *  (readStrictJson) instead of only "can we read it" -- and threading it
+   *  from HERE is what keeps the probe and the write facade agreeing about
+   *  one file, rather than doctor calling a config install refuses healthy. */
+  read: { path: string; containerPath: string[]; strict: boolean } | null;
 }
 
 /** The content-derived part of a ClientProbeResult -- everything a slot does
@@ -2409,6 +2470,7 @@ const EMPTY_PROBE: Readonly<ProbeClassification> = {
   hasLegacyEntry: false,
   legacyEntryName: null,
   malformed: false,
+  unloadable: null,
   unreadable: null,
   unreadableCode: null,
   containerBlocked: null,
@@ -2493,7 +2555,17 @@ function* enumerateProbeSlots(opts: ProbeOptions): Generator<ProbeSlot> {
           unavailable: false,
           ...EMPTY_PROBE,
         },
-        read: exists ? { path: resolved.absolute, containerPath: resolved.containerPath } : null,
+        read: exists
+          ? {
+              path: resolved.absolute,
+              containerPath: resolved.containerPath,
+              // The scope's own strictness, resolved the one way the write
+              // path resolves it -- claude-code's `.mcp.json` is the single
+              // strict site today, and a row added to INSTALL_TARGETS is
+              // picked up here without touching this file.
+              strict: effectiveConfigFormat(target.config, scope) === "json",
+            }
+          : null,
       };
     }
   }
@@ -2514,7 +2586,8 @@ function probeClients(opts: ProbeOptions): ClientProbeResult[] {
       } catch (err) {
         Object.assign(result, unreadableProbe(err));
       }
-      if (raw !== null) Object.assign(result, classifyProbeContent(raw, read.containerPath, existsSync, platform));
+      if (raw !== null)
+        Object.assign(result, classifyProbeContent(raw, read.containerPath, read.strict, existsSync, platform));
     }
     out.push(result);
   }
@@ -2641,6 +2714,17 @@ function oamRunEntryFromTokens(tokens: readonly string[]): string | null {
 /** Classify raw config file content for a probe result. Shared by both
  *  the sync and async probe variants so the parsing logic lives once.
  *
+ *  `strict` is the SITE's declared strictness (ProbeSlot.read), and it is
+ *  REQUIRED rather than defaulted: every caller has to answer for it, so a
+ *  third probe cannot quietly inherit "lenient" and report a file its client
+ *  loads nothing from as healthy. When set, the bytes are put through
+ *  `readStrictJson` -- the CLIENT's own parser, exported from
+ *  client-config-json.ts for exactly this -- BEFORE the lenient parse below.
+ *  Writing a second `JSON.parse` here instead is what that export exists to
+ *  prevent: this file already carries that shape (BOM strip + JSON.parse) for
+ *  state.json, and a copy of it would be free to disagree with the refusal
+ *  the write facade raises over the same file.
+ *
  *  `platform` picks the path semantics for every launch check below (see
  *  ProbeOptions.platform): node:path's bare `isAbsolute` is bound to the
  *  running platform, and with it the foreign-path branches could only ever
@@ -2649,6 +2733,7 @@ function oamRunEntryFromTokens(tokens: readonly string[]): string | null {
 function classifyProbeContent(
   raw: string,
   containerPath: string[],
+  strict: boolean,
   exists: (p: string) => boolean = existsSync,
   platform: NodeJS.Platform = process.platform,
 ): ProbeClassification {
@@ -2656,6 +2741,15 @@ function classifyProbeContent(
   if (raw.trim().length === 0) {
     return { ...EMPTY_PROBE };
   }
+  // Asked BEFORE the lenient parse and reported only alongside a successful
+  // one, which is classifyJson's precedence rather than a second rule: a file
+  // that fails BOTH parsers is `malformed` (every MALFORMED exit below carries
+  // EMPTY_PROBE's null), and one that fails only the client's is readable by
+  // us and unloadable by them. The whitespace-only file above never reaches
+  // here -- `JSON.parse("")` throws, and an empty config is "not configured",
+  // not a file whose client is failing to load it.
+  const client = strict ? readStrictJson(raw) : null;
+  const unloadable = client !== null && !client.ok ? unloadableConfigProblem(client.violation) : null;
   try {
     const parsed = parseJsonc(raw);
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
@@ -2693,10 +2787,16 @@ function classifyProbeContent(
       if (blocked !== null && !blocked.reparable) {
         return {
           ...EMPTY_PROBE,
+          // Both, when both are true: a strict file can be unloadable AND
+          // hold a container install refuses, and dropping the strictness
+          // here would leave the row silent about it the moment the user
+          // fixed the container. Which one the ROW leads with is
+          // renderClientStatus's business.
+          unloadable,
           containerBlocked: `"${blocked.path.join(".")}" is ${describeJsonShape(blocked.value)}`,
         };
       }
-      return { ...EMPTY_PROBE };
+      return { ...EMPTY_PROBE, unloadable };
     }
     const legacyEntryName = findLegacyEntry(container);
     const entry = container[ENTRY_NAME];
@@ -2765,6 +2865,7 @@ function classifyProbeContent(
       hasLegacyEntry: legacyEntryName !== null,
       legacyEntryName,
       malformed: false,
+      unloadable,
       unreadable: null,
       unreadableCode: null,
       containerBlocked: null,
@@ -2804,7 +2905,8 @@ export async function probeClientsAsync(opts: ProbeOptions): Promise<ClientProbe
       } catch (err) {
         Object.assign(result, unreadableProbe(err));
       }
-      if (raw !== null) Object.assign(result, classifyProbeContent(raw, read.containerPath, existsSync, platform));
+      if (raw !== null)
+        Object.assign(result, classifyProbeContent(raw, read.containerPath, read.strict, existsSync, platform));
     }
     out.push(result);
   }

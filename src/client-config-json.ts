@@ -204,6 +204,41 @@ function messageOf(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/** One parse of `raw` by the CLIENT's own parser -- `JSON.parse` -- for the
+ *  strict-JSON targets. `ok` carries the parsed document; otherwise the
+ *  violation, whose `position` is against the ORIGINAL bytes.
+ *
+ *  The BOM is stripped before the strict parse, so a Notepad-saved file is not
+ *  reported unloadable for its first three bytes. Two different reasons, and
+ *  neither is "every client accepts a BOM":
+ *    * Claude Code does accept one -- measured, `claude mcp list` reads a
+ *      BOM-prefixed .mcp.json. Reporting that file as unloadable would be our
+ *      bug rather than the user's.
+ *    * Where a client does NOT (Cline reads with JSON.parse and is INFERRED to
+ *      reject one -- inference, untested against Cline), the refusal would be
+ *      pointless anyway: the splicer drops the BOM and does not re-emit it, so
+ *      the write is what FIXES the file. Refusing it would leave the user
+ *      stuck with a config nothing can repair except an editor.
+ *
+ *  EXPORTED because `classifyJson` is not the only thing that has to answer
+ *  "would the client load this file". The doctor / `install --list` probe
+ *  classifies client configs on its own path (it folds drive-letter-case
+ *  project keys and inspects the launch entry, neither of which this adapter
+ *  does), and it has to ask that question with THIS function rather than a
+ *  JSON.parse of its own: a probe that disagreed with the write facade would
+ *  report a file install REFUSES as fine, or the reverse. */
+export function readStrictJson(raw: string): { ok: true; parsed: unknown } | { ok: false; violation: StrictViolation } {
+  const { text, had } = stripBom(raw);
+  try {
+    return { ok: true, parsed: JSON.parse(text) };
+  } catch (err) {
+    return {
+      ok: false,
+      violation: { syntax: "JSON", detail: messageOf(err), position: strictPosition(err, raw, had ? 1 : 0) },
+    };
+  }
+}
+
 /** Classify one JSON-family file. Pure, and never throws: every failure is a
  *  ConfigRead kind.
  *
@@ -224,27 +259,16 @@ function classifyJson(
   // and nothing to report, and every consumer already treats it as "not
   // configured" rather than as a parse failure.
   if (raw.trim().length === 0) return { kind: "absent" };
-  const { text, had } = stripBom(raw);
+  const { had } = stripBom(raw);
   const shift = had ? 1 : 0;
 
   let parsed: unknown;
   let unloadable: StrictViolation | null = null;
   if (strict) {
-    try {
-      // The BOM is stripped before the strict parse, so a Notepad-saved file
-      // is not reported unloadable for its first three bytes. Two different
-      // reasons, and neither is "every client accepts a BOM":
-      //   * Claude Code does accept one -- measured, `claude mcp list` reads a
-      //     BOM-prefixed .mcp.json. Reporting that file as unloadable would be
-      //     our bug rather than the user's.
-      //   * Where a client does NOT (Cline reads with JSON.parse and is
-      //     INFERRED to reject one -- inference, untested against Cline), the
-      //     refusal would be pointless anyway: the splicer drops the BOM and
-      //     does not re-emit it, so the write is what FIXES the file. Refusing
-      //     it would leave the user stuck with a config nothing can repair
-      //     except an editor.
-      parsed = JSON.parse(text);
-    } catch (strictErr) {
+    const client = readStrictJson(raw);
+    if (client.ok) {
+      parsed = client.parsed;
+    } else {
       let lenient: unknown;
       try {
         lenient = parseJsonc(raw);
@@ -258,11 +282,7 @@ function classifyJson(
         };
       }
       parsed = lenient;
-      unloadable = {
-        syntax: "JSON",
-        detail: messageOf(strictErr),
-        position: strictPosition(strictErr, raw, shift),
-      };
+      unloadable = client.violation;
     }
   } else {
     try {

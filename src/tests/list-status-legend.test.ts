@@ -208,9 +208,9 @@ describe("the --list legend enumerates every status statusFor can print", () => 
       shapes.filter((s) => s.length === 0),
       "statusFor returns an empty status string",
     ).toEqual([]);
-    // Not vacuous: statusFor returns nine shapes today, and the scan has to
+    // Not vacuous: statusFor returns ten shapes today, and the scan has to
     // see all of them before the check below means anything.
-    expect(shapes.length).toBeGreaterThanOrEqual(9);
+    expect(shapes.length).toBeGreaterThanOrEqual(10);
 
     const legend = listLegend();
     const unlisted = shapes.filter((s) => !DELIBERATELY_UNLISTED.has(s) && !legendNames(legend, s));
@@ -251,6 +251,7 @@ describe("the --list legend enumerates every status statusFor can print", () => 
       "malformed",
       "no-entries",
       "not installed",
+      "not loading (comments or trailing commas)",
       "not supported yet",
       "other-entries",
       "unavailable",

@@ -1219,3 +1219,13 @@ export {
   prepareClaudeCodeSettingsPatch,
   resolveClaudeCodeSettingsPath,
 } from "./claude-code-settings.js";
+/** The third of that set: the by-hand fix for a file that PARSES for yaw-mcp
+ *  but not for the client that owns it -- strict JSON carrying a comment or a
+ *  trailing comma, so the client loads no server from it at all.
+ *
+ *  Defined in client-config.ts, beside the write facade's refusal that must not
+ *  disagree with it, and re-exported here so a consumer reaches all three fixes
+ *  from one module rather than importing this one from somewhere else. The
+ *  comment on the definition promises exactly this re-export; keep the two
+ *  together if either moves. */
+export { unloadableConfigFix } from "./client-config.js";

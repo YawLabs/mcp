@@ -10,6 +10,7 @@ function writeYawMcpConfig(root: string, filename: string, obj: unknown): void {
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { unloadableConfigProblem } from "../client-config.js";
 import {
   DOCTOR_ENV_VARS,
   DOCTOR_USAGE,
@@ -18,11 +19,19 @@ import {
   oamRunEntryPath,
   parseDoctorArgs,
   probeClientsAsync,
+  probeUsable,
   registrySkipCheck,
   runDoctor as runDoctorUnstubbed,
   scanShellHistoryForShadows,
 } from "../doctor-cmd.js";
-import { claudeCodeProjectKey, ENTRY_NAME } from "../install-targets.js";
+import {
+  blockedContainerFix,
+  claudeCodeProjectKey,
+  describeJsonShape,
+  ENTRY_NAME,
+  unloadableConfigFix,
+  unparseableConfigFix,
+} from "../install-targets.js";
 import { MIN_OAM_VERSION, OAM_INSTALL_PS1, OAM_INSTALL_SH } from "../oam-spawn.js";
 import { STATE_FILENAME, STATE_SCHEMA_VERSION } from "../persistence.js";
 import { SECRETS_SCHEMA_VERSION } from "../secrets-vault.js";
@@ -3767,6 +3776,284 @@ describe("runDoctor -- cannot-launch client states are warnings on both surfaces
     expect(warnings[1]).toContain("Claude Code (local) ");
     expect(warnings[1]).toContain("rerun `yaw-mcp install claude-code --scope local`");
     expect(r.exitCode).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A STRICT-JSON site whose client cannot load the file. Claude Code reads the
+// project `.mcp.json` with JSON.parse, so a comment or a trailing comma means
+// it loads NO server from that file -- while yaw-mcp's lenient parser reads it
+// fine. Doctor used to describe such a file entry by entry: "OK -- has mcp
+// entry" over an entry that is not loading, "present, no entry -- run install"
+// over a file install refuses to write. Every expected status below is composed
+// from the same helpers the refusal uses, never retyped, and the detail clause
+// is taken from JSON.parse's own message rather than from the probe.
+// ---------------------------------------------------------------------------
+
+describe("runDoctor -- a strict client config its client cannot load", () => {
+  const PROJECT_LABEL = "Claude Code (project)";
+  const PROJECT_INSTALL = "yaw-mcp install claude-code --scope project";
+
+  const projectMcpJson = (): string => join(synthCwd, ".mcp.json");
+
+  /** The clause unloadableConfigProblem renders for `raw`, built from
+   *  JSON.parse's own error -- the client's parser -- so the test does not
+   *  read the violation back out of the code under test. */
+  function problemFor(raw: string): string {
+    let detail: string | null = null;
+    try {
+      JSON.parse(raw);
+    } catch (err) {
+      detail = (err as Error).message;
+    }
+    if (detail === null) throw new Error("fixture parses as strict JSON -- it is not an unloadable file");
+    return unloadableConfigProblem({ syntax: "JSON", detail, position: null });
+  }
+
+  /** The exact CLIENTS status for an unloadable file on this row. */
+  const unloadableStatus = (raw: string): string =>
+    `exists but ${problemFor(raw)} -- install refuses to write into it; ${unloadableConfigFix(`run \`${PROJECT_INSTALL}\``)}`;
+
+  /** One CLIENTS row, parsed: the status after `  <label>: `, and the path line
+   *  under it. Exactly one such row must exist. */
+  function clientsRow(text: string, label: string): { status: string; path: string } {
+    const lines = text.split("\n");
+    const prefix = `  ${label}: `;
+    const hits = lines.flatMap((l, i) => (l.startsWith(prefix) ? [i] : []));
+    expect(hits).toHaveLength(1);
+    return { status: lines[hits[0]].slice(prefix.length), path: lines[hits[0] + 1] };
+  }
+
+  const WITH_ENTRY = `{
+  // shared with the team
+  "mcpServers": {
+    "${ENTRY_NAME}": { "command": "npx", "args": ["-y", "@yawlabs/mcp@latest"] }
+  }
+}
+`;
+
+  it("a commented project .mcp.json WITH the entry: the row says it is not loading, and the run is a warning", async () => {
+    writeFileSync(projectMcpJson(), WITH_ENTRY);
+    const cap = captureOut();
+    const errs: string[] = [];
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      err: (s) => errs.push(s),
+    });
+    const status = unloadableStatus(WITH_ENTRY);
+    const row = clientsRow(cap.text(), PROJECT_LABEL);
+    expect(row.status).toBe(status);
+    expect(row.path).toBe(`    ${projectMcpJson()}`);
+
+    const probe = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "project");
+    expect(probe?.unloadable).toBe(problemFor(WITH_ENTRY));
+    expect(probe?.malformed).toBe(false);
+    // The lenient parse still sees the entry -- that is what makes this the
+    // cannot-launch case rather than advice.
+    expect(probe?.hasMcpEntry).toBe(true);
+    // Not a target `try` may auto-pick: the write facade refuses this file.
+    expect(probeUsable(probe!)).toBe(false);
+
+    // Folded into the warnings in the house `<path>: <client> (<scope>) <status>`
+    // shape, and it is the ONLY warning on this otherwise-empty machine.
+    const warning = `${projectMcpJson()}: ${PROJECT_LABEL} ${status}`;
+    expect(r.snapshot.config.warnings).toEqual([warning]);
+    expect(errs.join("").split("\n")).toContain(`warning: ${warning}`);
+    expect(r.exitCode).toBe(2);
+    const lines = cap.text().split("\n");
+    expect(lines).toContain("  Warnings above need attention.");
+    expect(lines).not.toContain("  All good. yaw-mcp should start cleanly.");
+  });
+
+  // Two shapes WITHOUT our entry, because the probe returns them from two
+  // different exits: a container holding someone else's server, and a file
+  // with no container at all.
+  it.each([
+    [
+      "holding another server",
+      `{
+  // shared with the team
+  "mcpServers": {
+    "other": { "command": "npx", "args": ["-y", "some-server"] },
+  }
+}
+`,
+    ],
+    [
+      "with no mcpServers key at all",
+      `{
+  // nothing configured yet
+  "note": "x",
+}
+`,
+    ],
+  ])("a commented project .mcp.json WITHOUT the entry (%s): the row says so, but the run stays healthy", async (_shape, raw) => {
+    writeFileSync(projectMcpJson(), raw);
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, err: () => {} });
+    expect(clientsRow(cap.text(), PROJECT_LABEL).status).toBe(unloadableStatus(raw));
+    const probe = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "project");
+    expect(probe?.unloadable).toBe(problemFor(raw));
+    expect(probe?.hasMcpEntry).toBe(false);
+    // A strict file yaw-mcp was never installed to is advice, not a
+    // cannot-launch state: a commented .mcp.json in some checkout must not
+    // drag a working machine to exit 2.
+    expect(r.snapshot.config.warnings).toEqual([]);
+    expect(r.exitCode).toBe(0);
+    expect(cap.text().split("\n")).toContain("  All good. yaw-mcp should start cleanly.");
+  });
+
+  it("--json: the project slot carries unloadable non-null and malformed false, and folds the same warning", async () => {
+    writeFileSync(projectMcpJson(), WITH_ENTRY);
+    const errs: string[] = [];
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: () => {},
+      err: (s) => errs.push(s),
+      json: true,
+      skipRegistryCheck: true,
+    });
+    const parsed = JSON.parse(r.lines[0]) as {
+      warnings: string[];
+      diagnosis: { exitCode: number; summary: string };
+      clients: Array<{
+        clientId: string;
+        scope: string;
+        malformed: boolean;
+        unloadable: string | null;
+        hasMcpEntry: boolean;
+      }>;
+    };
+    const slot = parsed.clients.find((c) => c.clientId === "claude-code" && c.scope === "project");
+    expect(slot?.unloadable).toBe(problemFor(WITH_ENTRY));
+    expect(slot?.malformed).toBe(false);
+    expect(slot?.hasMcpEntry).toBe(true);
+    // An additive field present on EVERY slot, null where nothing is wrong --
+    // a consumer can read it without a presence check.
+    expect(parsed.clients.every((c) => "unloadable" in c)).toBe(true);
+    expect(parsed.clients.find((c) => c.clientId === "claude-code" && c.scope === "user")?.unloadable).toBeNull();
+    expect(parsed.warnings).toEqual([`${projectMcpJson()}: ${PROJECT_LABEL} ${unloadableStatus(WITH_ENTRY)}`]);
+    expect(parsed.diagnosis).toEqual({ exitCode: 2, summary: "Warnings need attention." });
+    expect(r.exitCode).toBe(2);
+
+    // The async probe (install --list, try) threads the same site strictness.
+    const asyncProbe = (await probeClientsAsync({ home: synthHome, os: "linux", cwd: synthCwd })).find(
+      (c) => c.clientId === "claude-code" && c.scope === "project",
+    );
+    expect(asyncProbe?.unloadable).toBe(problemFor(WITH_ENTRY));
+    expect(asyncProbe?.malformed).toBe(false);
+  });
+
+  it("a file that fails BOTH parsers is malformed, with unloadable null", async () => {
+    // Commented AND truncated: the lenient parser cannot read it either, so
+    // there is nothing to say about what the client would have loaded.
+    const raw = `{
+  // shared with the team
+  "mcpServers": {
+    "${ENTRY_NAME}": { "command": "npx"`;
+    writeFileSync(projectMcpJson(), raw);
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, err: () => {} });
+    const probe = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "project");
+    expect(probe?.malformed).toBe(true);
+    expect(probe?.unloadable).toBeNull();
+    expect(clientsRow(cap.text(), PROJECT_LABEL).status).toBe(
+      `exists but JSON is malformed -- install refuses to overwrite it; ${unparseableConfigFix(`run \`${PROJECT_INSTALL}\``)}`,
+    );
+    expect(r.exitCode).toBe(2);
+  });
+
+  it("a commented file whose mcpServers is a non-empty array leads with the BLOCKED wording, and keeps both facts", async () => {
+    const servers = [{ command: "npx" }];
+    const raw = `{
+  // shared with the team
+  "mcpServers": ${JSON.stringify(servers)}
+}
+`;
+    writeFileSync(projectMcpJson(), raw);
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, err: () => {} });
+    // install checks the blocked read first, so that is the refusal the user
+    // would actually hit -- and the row says that one, not the strictness.
+    expect(clientsRow(cap.text(), PROJECT_LABEL).status).toBe(
+      `present, but "mcpServers" is ${describeJsonShape(servers)}, not a JSON object -- install refuses to overwrite it; ${blockedContainerFix(`run \`${PROJECT_INSTALL}\``)}`,
+    );
+    const probe = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "project");
+    expect(probe?.containerBlocked).toBe(`"mcpServers" is ${describeJsonShape(servers)}`);
+    // The strictness is still recorded, so fixing the container does not
+    // leave the row silent about the comment.
+    expect(probe?.unloadable).toBe(problemFor(raw));
+    expect(probe?.malformed).toBe(false);
+    // No entry could be read out of an array container: advice, not a warning.
+    expect(probe?.hasMcpEntry).toBe(false);
+    expect(r.snapshot.config.warnings).toEqual([]);
+    expect(r.exitCode).toBe(0);
+  });
+
+  // The negative case, twice: a plain strict file, and the same file saved
+  // with a BOM -- which Claude Code does load, so reporting it unloadable
+  // would be yaw-mcp's bug.
+  it.each([
+    ["plain", ""],
+    ["BOM-prefixed", "\uFEFF"],
+  ])("a %s strict file that parses cleanly: unloadable null and the ordinary OK row", async (_shape, prefix) => {
+    writeFileSync(
+      projectMcpJson(),
+      `${prefix}${JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] } } }, null, 2)}\n`,
+    );
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const probe = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "project");
+    expect(probe?.unloadable).toBeNull();
+    expect(probe?.malformed).toBe(false);
+    expect(probe?.hasMcpEntry).toBe(true);
+    expect(probeUsable(probe!)).toBe(true);
+    expect(clientsRow(cap.text(), PROJECT_LABEL).status).toBe(`OK -- has "${ENTRY_NAME}" entry`);
+    expect(r.snapshot.config.warnings).toEqual([]);
+    expect(r.exitCode).toBe(0);
+  });
+
+  it("the user-scope ~/.claude.json is NOT strict: a comment in it leaves unloadable null on every scope reading it", async () => {
+    // Strictness is the SITE's, not a guess about the bytes: Claude Code reads
+    // ~/.claude.json leniently, so the same comment that sinks .mcp.json is
+    // harmless here and must not be flagged.
+    const raw = `{
+  // hand-edited
+  "mcpServers": {
+    "${ENTRY_NAME}": { "command": "npx", "args": ["-y", "@yawlabs/mcp@latest"] },
+  },
+  "projects": {
+    ${JSON.stringify(claudeCodeProjectKey(synthCwd))}: { "mcpServers": { "other": { "command": "x" } } },
+  },
+}
+`;
+    writeFileSync(join(synthHome, ".claude.json"), raw);
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const user = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
+    const local = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "local");
+    expect(user?.exists).toBe(true);
+    expect(user?.unloadable).toBeNull();
+    expect(user?.malformed).toBe(false);
+    expect(user?.hasMcpEntry).toBe(true);
+    expect(local?.unloadable).toBeNull();
+    expect(local?.malformed).toBe(false);
+    expect(clientsRow(cap.text(), "Claude Code (user)").status).toBe(`OK -- has "${ENTRY_NAME}" entry`);
+    expect(clientsRow(cap.text(), "Claude Code (local)").status).toBe(
+      `present, no "${ENTRY_NAME}" entry -- run \`yaw-mcp install claude-code --scope local\``,
+    );
+    // Guard against a vacuous pass: the SAME bytes really are unloadable for a
+    // strict parser, so a null above is the site's strictness talking.
+    expect(problemFor(raw)).toContain("has comments or trailing commas");
+    expect(r.snapshot.config.warnings).toEqual([]);
+    expect(r.exitCode).toBe(0);
   });
 });
 
