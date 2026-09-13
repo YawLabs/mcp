@@ -378,6 +378,22 @@ export function resolveInstallSites(opts: ResolvePathOptions): ConfigSite[] {
   ];
 }
 
+/** The files a row's `hooks.alsoReads` names for one (client, scope), as
+ *  READ-ONLY `ConfigSite`s in the row's effective format -- the client parses
+ *  them the way it parses its own file. Empty for a row without the hook.
+ *  Validates, and throws, exactly as `resolveInstallSites` does. */
+export function resolveAlsoReadSites(opts: ResolvePathOptions): ConfigSite[] {
+  const { target, scopeSpec, base } = resolveTargetBase(opts);
+  const format = effectiveConfigFormat(target.config, scopeSpec);
+  return (target.hooks?.alsoReads?.(base) ?? []).map((resolved, i) => ({
+    id: `also-reads-${i}`,
+    label: target.label,
+    resolved,
+    format,
+    detectDir: null,
+  }));
+}
+
 /** The target, its scope spec and the `PathBase` one resolve runs against --
  *  the shared first half of `resolveInstallPath` and `resolveInstallSites`.
  *
