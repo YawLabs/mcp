@@ -1,11 +1,12 @@
 import { spawn } from "node:child_process";
 import { readdirSync, readFileSync } from "node:fs";
-import { readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { FLAG_ALIASES, KNOWN_SUBCOMMANDS, suggestFlag, suggestSubcommand } from "../subcommands.js";
-import { BROKER_BUNDLE_HOOK_TIMEOUT_MS, buildBrokerBundle } from "./broker-bundle.js";
+import { BROKER_BUNDLE_HOOK_TIMEOUT_MS, useBrokerBundle } from "./broker-bundle.js";
 
 // The dispatcher in index.ts runs at import time (top-level side effects),
 // so it cannot be imported directly. The did-you-mean logic it uses lives
@@ -213,6 +214,7 @@ const INDEX_SRC = fileURLToPath(new URL("../index.ts", import.meta.url));
 
 let workDir: string;
 let bundlePath: string;
+let releaseBundle: () => Promise<void> = async () => {};
 
 async function runEntry(
   env: Record<string, string>,
@@ -311,20 +313,22 @@ async function runEntry(
 
 describe("index.ts entry, run as a real process", () => {
   beforeAll(async () => {
-    // The helper's fresh temp dir is also the child's HOME and cwd -- see
-    // runEntry -- so the bundle and the isolated home share one directory.
-    ({ dir: workDir, path: bundlePath } = await buildBrokerBundle("yaw-mcp-entry-"));
-    // Timeout is deliberately far above the observed cost. This bundles the
-    // whole dependency graph (about 3.9 MB out, 2.5-4.4s standalone when last
-    // measured) and runs it once, but it does both while the rest of the unit
-    // project's files run too: on a loaded box the build alone has been seen
-    // to exceed 60s and fail the suite as a hook timeout, taking the tests
-    // below down as "skipped". The ceiling is for contention, not for the
-    // work itself -- see BROKER_BUNDLE_HOOK_TIMEOUT_MS.
+    // The bundle is the run's shared one, built and executed once by the
+    // global setup before any test file started. The child's HOME and cwd are
+    // this file's OWN temp dir -- see runEntry -- because e2e-round-trip runs
+    // in parallel with this file and a shared home would mix their configs.
+    ({ path: bundlePath, release: releaseBundle } = await useBrokerBundle("yaw-mcp-entry-"));
+    workDir = await mkdtemp(join(tmpdir(), "yaw-mcp-entry-home-"));
+    // The ceiling only matters on useBrokerBundle's fallback, which bundles
+    // the whole dependency graph here (about 3.9 MB out, 2.5-4.4s standalone
+    // when last measured) and runs it once while the rest of the unit
+    // project's files run too -- on a loaded box that build alone has been
+    // seen to exceed 60s. See BROKER_BUNDLE_HOOK_TIMEOUT_MS.
   }, BROKER_BUNDLE_HOOK_TIMEOUT_MS);
 
   afterAll(async () => {
     if (workDir) await rm(workDir, { recursive: true, force: true });
+    await releaseBundle();
   });
 
   // YAW_MCP_URL used to be hard-validated at load and a non-https,
@@ -355,8 +359,9 @@ describe("index.ts entry, run as a real process", () => {
     // Above runEntry's 90s SIGKILL guard, deliberately -- see the note there.
     // This is the first runEntry in the file, so it is the one that used to
     // pay the cold-bundle cost (13-40s measured in vitest, and past the 90s
-    // guard in a contended full-suite run on 2026-09-13). buildBrokerBundle
-    // now executes the bundle once in beforeAll, so this run is its second.
+    // guard in a contended full-suite run on 2026-09-13). The run's global
+    // setup now executes the bundle once before any test file starts, so this
+    // run is never its first.
   }, 120_000);
 
   it("exits 2 on a mis-cased flag instead of booting a stdio server", async () => {
@@ -368,8 +373,8 @@ describe("index.ts entry, run as a real process", () => {
     expect(code).toBe(2);
     expect(stderr).toContain('unknown flag "--HELP"');
     expect(stderr).toContain("--help");
-    // Warm whatever the test order (beforeAll's warm-up has executed the
-    // bundle), but kept above the guard for the reason runEntry's note gives:
+    // Warm whatever the test order (the bundle's warm-up ran before any test
+    // file did), but kept above the guard for the reason runEntry's note gives:
     // the guard firing is the legible failure, a vitest timeout is not.
   }, 120_000);
 

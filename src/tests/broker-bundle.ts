@@ -1,6 +1,8 @@
-// The esbuild bundle of src/index.ts that each of the three bundling suites
-// builds for itself -- its own temp dir, its own warm-up run -- and spawns:
-// index-dispatch, e2e-round-trip and shutdown-on-stdin-close. index.ts
+// The esbuild bundle of src/index.ts that three suites spawn: index-dispatch,
+// e2e-round-trip and shutdown-on-stdin-close. It is built and warmed up ONCE
+// per vitest run, by broker-bundle.setup.ts (the root global setup), and only
+// when the run includes one of those suites; each suite gets the path through
+// useBrokerBundle() below and keeps its own temp dir for HOME. index.ts
 // dispatches at module scope, so it cannot be imported and called -- these
 // suites bundle it into a self-contained ESM file and run that with node.
 // (cli-dispatch.test.ts also runs index.ts as a real process, but it spawns
@@ -55,10 +57,11 @@
 //    be sufficient.
 //
 // 2. IT RUNS THE BUNDLE ONCE BEFORE ANY TEST DOES. Whatever makes a first run
-//    expensive -- scanning or something else -- that run now happens here,
-//    inside the caller's beforeAll ceiling, and every test spawns a bundle
+//    expensive -- scanning or something else -- that run now happens in the
+//    global setup, before any test file starts, and every test spawns a bundle
 //    that has already executed. This is the half that does not depend on
-//    knowing the cause.
+//    knowing the cause. Building once rather than once per suite also means
+//    one fresh file to pay that first run for, not three.
 //
 // If a first run turns slow again, time the variants above before widening a
 // test's budget -- widening is what index-dispatch did the last time (its
@@ -67,8 +70,17 @@
 import { spawn } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { inject } from "vitest";
+
+declare module "vitest" {
+  export interface ProvidedContext {
+    /** The warmed bundle broker-bundle.setup.ts built for this run, or unset
+     *  when the run includes no suite that spawns it. */
+    brokerBundlePath: string | undefined;
+  }
+}
 
 const INDEX_SRC = fileURLToPath(new URL("../index.ts", import.meta.url));
 const PROJECT_ROOT = fileURLToPath(new URL("../..", import.meta.url));
@@ -84,9 +96,10 @@ const PROJECT_ROOT = fileURLToPath(new URL("../..", import.meta.url));
  *  working bundle under exactly the load that failed the release. */
 export const WARM_UP_GUARD_MS = 300_000;
 
-/** The beforeAll ceiling every caller passes: the 180s the suites already gave
- *  the build alone (seen to exceed 60s on a loaded box), plus the warm-up
- *  guard. Derived, so raising the guard cannot leave a hook timeout that fires
+/** The beforeAll ceiling every caller passes. It only matters when
+ *  useBrokerBundle falls back to building in the suite: the 180s the suites
+ *  already gave the build alone (seen to exceed 60s on a loaded box), plus the
+ *  warm-up guard. Derived, so raising the guard cannot leave a hook timeout that fires
  *  first and reports only "hook timed out" in place of the named kill error
  *  warmUp() raises below. */
 export const BROKER_BUNDLE_HOOK_TIMEOUT_MS = 180_000 + WARM_UP_GUARD_MS;
@@ -189,4 +202,45 @@ function warmUp(path: string, home: string): Promise<void> {
       reject(new Error(`warm-up run of ${path} --version ${how}; stderr tail:\n${stderr.slice(-800)}`));
     });
   });
+}
+
+/** The suites that spawn the bundle, relative to the project root. The global
+ *  setup builds only when a run includes one of them, so a targeted run of any
+ *  other file pays for no build and no warm-up. A test in broker-bundle.test.ts
+ *  keeps this list equal to the set of files that call useBrokerBundle. */
+export const BROKER_BUNDLE_CONSUMERS: readonly string[] = [
+  "src/tests/index-dispatch.test.ts",
+  "src/tests/e2e-round-trip.test.ts",
+  "src/tests/shutdown-on-stdin-close.test.ts",
+];
+
+/** Whether a run whose test files are `planned` needs the bundle. vitest
+ *  reports forward-slash paths while path.resolve returns backslashes on
+ *  Windows, and a Windows drive letter can arrive in either case, so both
+ *  sides are compared with forward slashes, and case-insensitively on win32. */
+export function runNeedsBrokerBundle(
+  planned: readonly string[],
+  root: string,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  const norm = (p: string): string => {
+    const slashed = resolve(root, p).replace(/\\/g, "/");
+    return platform === "win32" ? slashed.toLowerCase() : slashed;
+  };
+  const wanted = new Set(BROKER_BUNDLE_CONSUMERS.map(norm));
+  return planned.some((p) => wanted.has(norm(p)));
+}
+
+/** The bundle for a suite's beforeAll. Normally the one the global setup
+ *  built and warmed for the whole run, and `release` does nothing: the setup's
+ *  teardown removes it. When the setup provided none -- a watch-mode rerun
+ *  that brought a consumer in after the first run, say -- this builds a
+ *  private bundle, says so on stderr so a broken detection is visible rather
+ *  than silently back to one build per suite, and `release` removes it. */
+export async function useBrokerBundle(prefix: string): Promise<{ path: string; release: () => Promise<void> }> {
+  const shared = inject("brokerBundlePath");
+  if (shared) return { path: shared, release: async () => {} };
+  process.stderr.write(`broker-bundle: the global setup provided no bundle; building one for ${prefix}\n`);
+  const own = await buildBrokerBundle(prefix);
+  return { path: own.path, release: () => rm(own.dir, { recursive: true, force: true }) };
 }

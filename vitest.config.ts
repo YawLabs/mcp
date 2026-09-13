@@ -34,6 +34,9 @@ export default defineConfig({
     // tsup build, a spawned CLI) had to remember its own literal -- and only
     // cli-dispatch.test.ts does. This is the floor for the ones that do not.
     hookTimeout: 30000,
+    // Builds and warms the broker bundle once for the whole run, when the run
+    // includes a suite that spawns it (see src/tests/broker-bundle.ts).
+    globalSetup: ["./src/tests/broker-bundle.setup.ts"],
     // `extends: true` so each project inherits the timeouts above rather than
     // silently falling back to vitest's defaults.
     projects: [

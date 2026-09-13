@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { BROKER_BUNDLE_HOOK_TIMEOUT_MS, buildBrokerBundle } from "./broker-bundle.js";
+import { BROKER_BUNDLE_HOOK_TIMEOUT_MS, useBrokerBundle } from "./broker-bundle.js";
 
 // The broker used to register SIGTERM and SIGINT and nothing else. That is a
 // POSIX assumption: on Windows an MCP client ends the broker by closing the
@@ -33,6 +33,7 @@ const SETTLE_BUDGET_MS = 20_000;
 
 let workDir: string;
 let bundlePath: string;
+let releaseBundle: () => Promise<void> = async () => {};
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
@@ -100,15 +101,18 @@ setInterval(() => {}, 1 << 30);
 
 describe("closing stdin shuts the broker down and reaps its upstreams", () => {
   beforeAll(async () => {
-    // Built through the shared helper, which has node write the file and runs
-    // it once before returning. In the release run that failed, the bundle's
-    // first execution happened inside SETTLE_BUDGET_MS below and outlasted it;
-    // now it happens here -- see broker-bundle.ts.
-    ({ dir: workDir, path: bundlePath } = await buildBrokerBundle("yaw-mcp-shutdown-"));
+    // The run's global setup builds the bundle once, has node write the file,
+    // and runs it before any test file starts. In the release run that
+    // failed, the bundle's first execution happened inside SETTLE_BUDGET_MS
+    // below and outlasted it -- see broker-bundle.ts. This suite's own files
+    // go in its own temp dir, never the shared bundle's.
+    ({ path: bundlePath, release: releaseBundle } = await useBrokerBundle("yaw-mcp-shutdown-"));
+    workDir = await mkdtemp(join(tmpdir(), "yaw-mcp-shutdown-home-"));
   }, BROKER_BUNDLE_HOOK_TIMEOUT_MS);
 
   afterAll(async () => {
     if (workDir) await rm(workDir, { recursive: true, force: true });
+    await releaseBundle();
   });
 
   it("runs shutdown(), exits, and takes the upstream server with it", async () => {
