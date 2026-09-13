@@ -162,6 +162,18 @@ export interface TargetHooks {
    *  file share one grant, and uninstall keeps it while the other still has
    *  its entry. */
   permissionsPatch?: "claude-code";
+  /** The OTHER files this client loads a server entry from, each ranked BELOW
+   *  the row's own file: an entry the row writes shadows one there for this
+   *  client, and one there still launches yaw-mcp after the row's own entry is
+   *  gone. READ-ONLY -- no verb writes, lists or probes them. Two readers:
+   *  uninstall's shared-grant check counts an "mcp" entry in one as a client
+   *  still using the grant (on this row's own uninstall as well as a peer's),
+   *  and install says so when the npx entry it writes replaces a launch one of
+   *  them already carries. A function, unlike the named schemes beside it,
+   *  because the files are the client's and move with the `PathBase` (home,
+   *  CLAUDE_CONFIG_DIR); it answers paths only, and the core reads each in the
+   *  row's own format -- the one the client parses them with. */
+  alsoReads?: (base: PathBase) => ResolvedPath[];
   /** Which `${...}` expansion rules `import` applies to this client's entries.
    *  BOTH handlers live in import-cmd.ts; a row only names the value.
    *  "vscode-inputs" is the inputs-block + `${workspaceFolder}` logic. */

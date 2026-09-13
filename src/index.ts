@@ -581,7 +581,10 @@ if (subcommand === "compliance") {
                                \`install typed\` adds the permissions.allow
                                grant to, since typed reads that same file;
                                typed's own ~/.config/typed/mcp.json does not
-                               follow it. It is Claude Code's knob, not
+                               follow it, so that grant is scoped to the
+                               directory, and install and uninstall say so --
+                               except in a Yaw Mode pane, where YAW_MODE
+                               (below) decides. It is Claude Code's knob, not
                                yaw-mcp's; the server itself never reads it.
     APPDATA                       Windows' roaming app-data directory, honored
                                by \`install\`, \`try\`, \`doctor\` and

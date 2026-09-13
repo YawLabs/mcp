@@ -146,7 +146,8 @@ const RULES: Rule[] = [
       "src/install-cmd.ts":
         "the SITE's own container path, read off the resolver -- rendered by `describeContainer` in the " +
         "entry-count line, handed to `claudeCodeContainerPathVariants` as the canonical address a write " +
-        "goes to, and carried per RemovalSite into `siteAt`. Not a walk: every read and write goes " +
+        "goes to, carried per RemovalSite into `siteAt`, and compared by `sharedGrantHolder` to keep the " +
+        "sites an uninstall is emptying out of its holder search. Not a walk: every read and write goes " +
         "through the core",
       "src/try-cmd.ts":
         "a TRIAL MARKER records the container path it wrote at, on disk, in a versioned schema -- so try " +
