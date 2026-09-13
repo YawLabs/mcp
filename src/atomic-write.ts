@@ -39,8 +39,26 @@ import { setTimeout as delay } from "node:timers/promises";
 // still surfaces from the final attempt. POSIX rename has no spurious
 // failure mode of this shape, so retrying there would only delay reporting
 // a genuine permission error.
-const RENAME_RETRY_CODES = new Set(["EPERM", "EBUSY", "EACCES"]);
+const WIN32_TRANSIENT_CODES = new Set(["EPERM", "EBUSY", "EACCES"]);
 const RENAME_RETRY_DELAYS_MS = [10, 50, 100];
+
+/** True when `err` is one of the errnos Windows raises for a path that is
+ *  only momentarily unusable, and this process is running on Windows. The same
+ *  codes also cover a genuine permission denial, so a caller that retries on
+ *  this must bound the retries and let the last error surface.
+ *
+ *  Two causes, one code set. The first is the alien handle described above.
+ *  The second is a path whose previous file is still being DELETED: an
+ *  O_EXCL create that lands inside another thread's or process's unlink fails
+ *  EPERM instead of succeeding or answering EEXIST. Measured on Windows 11,
+ *  Node 22.22.2 (libuv 1.51.0): 3 async `open(p, "wx")` loops racing one
+ *  `rm(p)` hit it 225 times in 2000 races. The lock takes in grades-cache.ts
+ *  and auto-upgrade.ts retry on it for that reason. POSIX has neither cause. */
+export function isWin32TransientFsError(err: unknown): boolean {
+  if (process.platform !== "win32") return false;
+  const code = (err as NodeJS.ErrnoException | null)?.code;
+  return code !== undefined && WIN32_TRANSIENT_CODES.has(code);
+}
 
 async function renameWithRetry(tmp: string, target: string): Promise<void> {
   if (process.platform !== "win32") {
@@ -52,8 +70,7 @@ async function renameWithRetry(tmp: string, target: string): Promise<void> {
       await rename(tmp, target);
       return;
     } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code === undefined || !RENAME_RETRY_CODES.has(code)) throw err;
+      if (!isWin32TransientFsError(err)) throw err;
       await delay(ms);
     }
   }

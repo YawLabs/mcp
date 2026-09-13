@@ -20,7 +20,7 @@ import { type FileHandle, mkdir, open, readFile, rename, rm, stat } from "node:f
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { atomicWriteFile } from "./atomic-write.js";
+import { atomicWriteFile, isWin32TransientFsError } from "./atomic-write.js";
 import { setJsonKey } from "./json-key.js";
 import { parseJsonc } from "./jsonc.js";
 import { log } from "./logger.js";
@@ -193,7 +193,10 @@ async function readGradesCacheImpl(home: string, opts: { strictRead: boolean }):
 // (exit 3): the honest outcome, and one re-audit repairs it. A release that
 // fails (a Windows AV handle on the lock file) leaves it to go stale, so the
 // worst case for the NEXT writer is one stale-age wait, still inside its
-// budget. In-process concurrency rides the same lock -- the second caller
+// budget. A release that SUCCEEDS has a Windows hazard of its own: a take
+// landing inside its unlink fails EPERM, not EEXIST, so the take paces and
+// retries that errno for up to GRADES_LOCK_TRANSIENT_MS rather than failing
+// the write. In-process concurrency rides the same lock -- the second caller
 // simply polls until the first releases -- so there is exactly one mechanism
 // and one set of rules to reason about.
 
@@ -205,6 +208,14 @@ const GRADES_LOCK_STALE_MS = 10_000;
  *  purpose, so waiting out a crashed holder always fits inside it. */
 const GRADES_LOCK_WAIT_MS = 15_000;
 const GRADES_LOCK_POLL_MS = 25;
+/** How long the take may keep failing with a transient win32 errno
+ *  (isWin32TransientFsError) before that errno is thrown. The usual cause is
+ *  the holder's release in flight: a create landing inside its unlink fails
+ *  EPERM rather than EEXIST, and one poll later the path is free. A failure
+ *  still going after a second is not a release -- it is a directory this
+ *  process cannot create files in, and the real errno says so better than
+ *  a lock timeout would. The give-up deadline still applies if it is shorter. */
+const GRADES_LOCK_TRANSIENT_MS = 1_000;
 /** How far ahead of Date.now() a lock's mtime may sit and still count as
  *  "taken just now": filesystem timestamp granularity routinely reports an
  *  mtime a hair ahead of the clock, and without the margin a lock taken
@@ -229,7 +240,9 @@ export interface WriteGradeOptions {
 /** Create the lock with O_EXCL, carrying `token`. False when someone else
  *  holds it; any other failure (EACCES, a vanished directory) throws, because
  *  a lock this process cannot create sits in the directory grades.json itself
- *  could not have been written into. */
+ *  could not have been written into. The one exception is withGradesLock's to
+ *  make, not this function's: on Windows it retries a transient errno for up
+ *  to GRADES_LOCK_TRANSIENT_MS before letting it through. */
 async function takeLock(lockPath: string, token: string): Promise<boolean> {
   let fh: FileHandle;
   try {
@@ -326,7 +339,25 @@ async function withGradesLock<T>(path: string, opts: WriteGradeOptions, fn: () =
   // directory does not exist yet.
   await mkdir(dirname(path), { recursive: true });
   const deadline = Date.now() + waitMs;
-  while (!(await takeLock(lockPath, token))) {
+  // When the current unbroken run of transient take failures began; null
+  // whenever the last take answered normally. See GRADES_LOCK_TRANSIENT_MS.
+  let transientSince: number | null = null;
+  for (;;) {
+    let taken: boolean;
+    try {
+      taken = await takeLock(lockPath, token);
+    } catch (err) {
+      if (!isWin32TransientFsError(err)) throw err;
+      const now = Date.now();
+      transientSince ??= now;
+      if (now >= deadline || now - transientSince >= GRADES_LOCK_TRANSIENT_MS) throw err;
+      // No stat or steal: the create failed without telling us anything about
+      // a lock at the path, so there is nothing to judge stale. Just pace.
+      await delay(GRADES_LOCK_POLL_MS);
+      continue;
+    }
+    if (taken) break;
+    transientSince = null;
     let ageMs: number | null;
     try {
       ageMs = Date.now() - (await stat(lockPath)).mtimeMs;

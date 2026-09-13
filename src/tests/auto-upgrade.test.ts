@@ -293,13 +293,19 @@ describe("maybeAutoUpgrade", () => {
 // against a genuine temp directory.
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
-  return { ...actual, realpathSync: vi.fn((p: string) => p), renameSync: vi.fn(actual.renameSync) };
+  return {
+    ...actual,
+    realpathSync: vi.fn((p: string) => p),
+    renameSync: vi.fn(actual.renameSync),
+    openSync: vi.fn(actual.openSync),
+  };
 });
 
 import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readdirSync,
   readFileSync,
   realpathSync,
@@ -313,6 +319,7 @@ import { tmpdir } from "node:os";
 
 const mockRealpathSync = vi.mocked(realpathSync);
 const mockRenameSync = vi.mocked(renameSync);
+const mockOpenSync = vi.mocked(openSync);
 
 describe("detectRunningInstallPrefix", () => {
   it("returns the install prefix when argv[1] is inside a node_modules tree", () => {
@@ -1539,6 +1546,68 @@ describe("acquireUpgradeLock", () => {
     const release = acquireUpgradeLock(join(dir, "does", "not", "exist"));
     expect(release).toBeTypeOf("function");
     expect(() => release?.()).not.toThrow();
+  });
+
+  describe("a transient win32 errno on the O_EXCL create", () => {
+    // On Windows a create that lands inside another process's unlink of the
+    // lock -- that process's release -- fails EPERM instead of EEXIST
+    // (measured; see isWin32TransientFsError). The take used to read it as
+    // "cannot create a lock here" and hand back the no-op release, so this
+    // process ran its critical section unlocked beside whoever took the lock
+    // next. The errno is injected because nothing a test can arrange holds
+    // that window open; the platform is pinned because the retry is win32-only
+    // and reads process.platform at call time.
+    const eperm = (): NodeJS.ErrnoException =>
+      Object.assign(new Error("EPERM: operation not permitted, open"), { code: "EPERM" });
+    const onPlatform = <T>(platform: NodeJS.Platform, fn: () => T): T => {
+      const original = Object.getOwnPropertyDescriptor(process, "platform");
+      Object.defineProperty(process, "platform", { value: platform, configurable: true });
+      try {
+        return fn();
+      } finally {
+        if (original) Object.defineProperty(process, "platform", original);
+      }
+    };
+    /** openSync calls against the lock path, ignoring any other file. */
+    const lockOpens = (): number => mockOpenSync.mock.calls.filter(([p]) => p === lockFile()).length;
+
+    afterEach(() => {
+      mockOpenSync.mockReset();
+    });
+
+    it("retries it on win32 and takes a REAL lock, not the no-op release", () => {
+      mockOpenSync.mockImplementationOnce(() => {
+        throw eperm();
+      });
+      const release = onPlatform("win32", () => acquireUpgradeLock(dir));
+      expect(release).toBeTypeOf("function");
+      // The no-op release leaves no file; a real take writes our pid.
+      expect(readFileSync(lockFile(), "utf8").trim()).toBe(String(process.pid));
+      expect(lockOpens()).toBe(2);
+      release?.();
+      expect(existsSync(lockFile())).toBe(false);
+    });
+
+    it("gives up after a bounded number of attempts and keeps the best-effort no-op release", () => {
+      mockOpenSync.mockImplementation(() => {
+        throw eperm();
+      });
+      const release = onPlatform("win32", () => acquireUpgradeLock(dir));
+      expect(release).toBeTypeOf("function");
+      expect(existsSync(lockFile())).toBe(false);
+      // One attempt per backoff step plus the final one.
+      expect(lockOpens()).toBe(4);
+    });
+
+    it("does not retry on POSIX, where EPERM is a real permission failure", () => {
+      mockOpenSync.mockImplementationOnce(() => {
+        throw eperm();
+      });
+      const release = onPlatform("linux", () => acquireUpgradeLock(dir));
+      expect(release).toBeTypeOf("function");
+      expect(existsSync(lockFile())).toBe(false);
+      expect(lockOpens()).toBe(1);
+    });
   });
 });
 
