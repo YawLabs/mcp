@@ -582,9 +582,10 @@ if (subcommand === "compliance") {
                                grant to, since typed reads that same file;
                                typed's own ~/.config/typed/mcp.json does not
                                follow it, so that grant is scoped to the
-                               directory (install says so). It is Claude
-                               Code's knob, not yaw-mcp's; the server itself
-                               never reads it.
+                               directory, and install and uninstall say so --
+                               except in a Yaw Mode pane, where YAW_MODE
+                               (below) decides. It is Claude Code's knob, not
+                               yaw-mcp's; the server itself never reads it.
     APPDATA                       Windows' roaming app-data directory, honored
                                by \`install\`, \`try\`, \`doctor\` and
                                \`install --list\` when they locate a config
@@ -619,6 +620,25 @@ if (subcommand === "compliance") {
                                Codex requires the directory to EXIST and be a
                                directory; an empty value counts as unset. It
                                does not move a project's .codex/config.toml.
+    TYPED_CLI_BUNDLE              The typed CLI bundle typed's launcher runs
+                               (default ~/.config/typed/typed-cli/cli.mjs).
+                               \`install typed\` reads that file and warns once
+                               when it predates ~/.config/typed/mcp.json; it
+                               says nothing when no bundle is there. It does
+                               not move typed's mcp.json.
+    YAW_MODE                      Set by Yaw Terminal in a Yaw Mode pane
+                               (\`augment\` or \`fresh\`), whose
+                               CLAUDE_CONFIG_DIR is a per-pane overlay that
+                               does not keep its settings.json. With both set,
+                               and CLAUDE_CONFIG_DIR a directory named
+                               yaw-mode-* as Yaw names its overlays, \`install\`
+                               and \`uninstall\` of Claude Code or typed at user
+                               scope also add or remove the permissions.allow
+                               grant in ~/.claude/settings.json (augment). In
+                               a fresh pane only \`install\` says anything: a
+                               note that what it wrote there goes with the
+                               pane. A config dir of any other name is
+                               handled as outside Yaw.
     LOG_LEVEL                     Verbosity of yaw-mcp's own JSON log lines on
                                stderr: \`debug\` | \`info\` | \`warn\` | \`error\`
                                (default info). \`debug\` is what to set when

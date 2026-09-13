@@ -24,7 +24,7 @@
 // instead, so every other element, and every comment, survives byte for byte.
 
 import { readFile, stat } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { describeValueShape } from "./client-config.js";
 import type { InstallScope } from "./install-target-model.js";
 import { addJsoncArrayElement, parseJsonc, removeJsoncArrayElements } from "./jsonc.js";
@@ -64,6 +64,49 @@ export function resolveClaudeCodeSettingsPath(
   if (scope === "local" && projectDir) return join(projectDir, ".claude", "settings.local.json");
   return null;
 }
+
+/** Which Yaw Mode overlay this run's Claude Code config lives in, or null for
+ *  none.
+ *
+ *  Yaw Terminal runs Claude Code in a Yaw Mode pane with `YAW_MODE` set to
+ *  `augment` or `fresh` and `CLAUDE_CONFIG_DIR` pointed at a per-pane overlay
+ *  directory it builds from `<os.homedir()>/.claude` (yaw src/pty-manager.ts,
+ *  `userClaudeDir`; src/yaw-mode.ts, buildOverlayInto). The overlay's
+ *  settings.json does not outlive the pane, in either mode:
+ *    * augment HARDLINKS it to `~/.claude/settings.json`
+ *      (HARDLINK_ROOT_FILES), but Yaw's own writeOverlayPermissions unlinks
+ *      that hardlink to write its per-pane allow-list, and install's atomic
+ *      write replaces the file either way -- so a grant written there lands in
+ *      a copy the pane's teardown discards. syncOverlayBack carries only
+ *      `.claude.json` home.
+ *    * fresh never links it at all.
+ *  So an augment run patches `~/.claude/settings.json` as well, and a fresh one
+ *  says what goes with the pane (the grant, and an entry written inside the
+ *  overlay).
+ *
+ *  Both conditions are required, and the directory must also be NAMED like an
+ *  overlay: its basename starts with `yaw-mode-`, the rule Yaw itself applies
+ *  before it treats a path as one (yaw src/yaw-mode.ts, isValidOverlayPath),
+ *  and the prefix every overlay it builds carries (`yaw-mode-<tag>-<ptyId>`,
+ *  and the older `yaw-mode-pty-<n>`). Yaw exports YAW_MODE to the whole pane,
+ *  shell included, so `CLAUDE_CONFIG_DIR=~/.claude-work yaw-mcp install ...`
+ *  typed at a pane's prompt carries YAW_MODE too -- and that directory is the
+ *  user's own, which outlives the pane like any other. It is treated exactly
+ *  as it would be outside Yaw. The name test also covers a CLAUDE_CONFIG_DIR
+ *  that is `<home>/.claude` itself, whose basename is `.claude`: there is no
+ *  second file to reach there. */
+export function yawModeOverlay(opts: {
+  yawMode: string | undefined;
+  claudeConfigDir: string | undefined;
+}): "augment" | "fresh" | null {
+  if (opts.yawMode !== "augment" && opts.yawMode !== "fresh") return null;
+  const dir = opts.claudeConfigDir;
+  if (dir === undefined || dir.length === 0) return null;
+  return basename(resolve(dir)).startsWith(YAW_MODE_OVERLAY_PREFIX) ? opts.yawMode : null;
+}
+
+/** The basename prefix of every Yaw Mode overlay directory. */
+const YAW_MODE_OVERLAY_PREFIX = "yaw-mode-";
 
 /** Union `patterns` into `existing.permissions.allow`, preserving every
  *  other key and every element already there. Deduplicates by string equality

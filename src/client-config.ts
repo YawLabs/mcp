@@ -497,8 +497,11 @@ export function composeEntry(opts: ComposeEntryOptions): Record<string, unknown>
  *
  *  `"restart"` is the default and today's wording. `"live"` is a client with a
  *  file watcher. `"reload-window"` is an editor extension with no watcher on
- *  the file yaw-mcp wrote, where a full restart is more than the user needs. */
-export type ReloadKind = "live" | "restart" | "reload-window";
+ *  the file yaw-mcp wrote, where a full restart is more than the user needs.
+ *  `"next-session"` is a CLI that reads its MCP config once, when a session
+ *  starts, so there is no running app to restart: the entry reaches the next
+ *  session (typed). */
+export type ReloadKind = "live" | "restart" | "reload-window" | "next-session";
 
 /** The sentence after "Done: <label> is configured." for one reload kind.
  *
@@ -511,9 +514,26 @@ export function reloadDoneClause(reload: ReloadKind | undefined, label: string):
       return `${label} starts the server when the file is saved -- no restart needed.`;
     case "reload-window":
       return "Reload the IDE window to pick up the new MCP server.";
+    case "next-session":
+      return `${label} picks the entry up in its next session.`;
     default:
       return "Restart it to pick up the new MCP server.";
   }
+}
+
+/** The sentence uninstall's Done line prints after "no longer launches
+ *  yaw-mcp", for one reload kind.
+ *
+ *  Only `"next-session"` differs. Every other kind -- `"live"` and
+ *  `"reload-window"` included -- returns the one clause uninstall printed for
+ *  every row before this function existed, byte for byte, so routing those
+ *  rows through here changes no output. Whether a live client needs that
+ *  restart to DROP a server is a separate question this function does not
+ *  reopen. */
+export function reloadRemovalClause(reload: ReloadKind | undefined, label: string): string {
+  return reload === "next-session"
+    ? `${label} drops the server in its next session.`
+    : "Restart it to drop the server.";
 }
 
 // ---------------------------------------------------------------------------
@@ -1153,8 +1173,10 @@ function verifyEdits(
 // The one reader of the env vars that relocate a client config
 // ---------------------------------------------------------------------------
 
-/** Every environment variable that moves a client's config file, as DATA, so a
- *  test can assert the CLI's Environment help block names all of them.
+/** Every environment variable that moves a client's config file -- or says
+ *  something install needs about where the client runs (typed's CLI bundle,
+ *  a Yaw Mode pane) -- as DATA, so a test can assert the CLI's Environment
+ *  help block names all of them.
  *
  *  Before this, `CLAUDE_CONFIG_DIR` was read in six hand-rolled places in
  *  src/. Adding more variables to six sites is exactly the one-adopter trap
@@ -1168,7 +1190,9 @@ export const CLIENT_ENV_VARS = [
   "CLINE_MCP_SETTINGS_PATH",
   "CODEX_HOME",
   "CONTINUE_GLOBAL_DIR",
+  "TYPED_CLI_BUNDLE",
   "XDG_CONFIG_HOME",
+  "YAW_MODE",
 ] as const;
 
 /** The overrides one environment carries. A variable that is unset -- or set
@@ -1186,11 +1210,21 @@ export interface ClientEnv {
   /** Codex: the directory its `config.toml` lives in. */
   codexHome?: string;
   continueGlobalDir?: string;
+  /** typed's launcher: the typed CLI bundle it runs instead of
+   *  `~/.config/typed/typed-cli/cli.mjs`. Not a config location -- install
+   *  probes that bundle's bytes to tell whether the typed CLI can read the file
+   *  `install typed` writes. */
+  typedCliBundle?: string;
   /** XDG config root. Reported VERBATIM: whether a relative value is usable is
    *  the resolver's call -- each client's own resolver is the reference for
    *  its files -- and a reader that silently dropped one would make "why is my
    *  XDG_CONFIG_HOME ignored" invisible. */
   xdgConfigHome?: string;
+  /** Yaw Terminal's marker for a Yaw Mode pane: `augment` or `fresh`, where
+   *  CLAUDE_CONFIG_DIR is a per-pane overlay whose settings.json does not
+   *  outlive the pane. Reported verbatim; `yawModeOverlay` in
+   *  claude-code-settings.ts decides what a value means. */
+  yawMode?: string;
 }
 
 /** Read every client-config override from one environment.
@@ -1221,7 +1255,11 @@ export function readClientEnv(env: NodeJS.ProcessEnv = process.env): ClientEnv {
   if (codexHome !== undefined) out.codexHome = codexHome;
   const continueGlobalDir = value("CONTINUE_GLOBAL_DIR");
   if (continueGlobalDir !== undefined) out.continueGlobalDir = continueGlobalDir;
+  const typedCliBundle = value("TYPED_CLI_BUNDLE");
+  if (typedCliBundle !== undefined) out.typedCliBundle = typedCliBundle;
   const xdgConfigHome = value("XDG_CONFIG_HOME");
   if (xdgConfigHome !== undefined) out.xdgConfigHome = xdgConfigHome;
+  const yawMode = value("YAW_MODE");
+  if (yawMode !== undefined) out.yawMode = yawMode;
   return out;
 }
