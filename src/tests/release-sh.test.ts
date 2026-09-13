@@ -64,11 +64,16 @@ import { MIN_OAM_VERSION } from "../oam-spawn.js";
 // sequential group would put all of it on the critical path. Here the deadline
 // is incidental, so the fix is to stop measuring patience in units set for
 // in-process unit tests. testTimeout applies to each case, not to the file, so
-// the figure it is set against is the slowest single case: one of the stubbed
-// full release runs below, which drives release.sh end to end twice and
-// measured 63 s with the CPU pinned at 100% (2026-09-13). 5 minutes is ~5x
-// that, so no case can plausibly reach it without being genuinely wedged,
-// which is the failure this still catches.
+// the figure it is set against is the slowest single case. That is a stubbed
+// full release run below: the one where the fix lands on origin/main, which
+// runs release.sh four times (the first run stopping at step 1's failing test
+// gate, the next two at the origin/main sync guard, the last running all five
+// steps to the publish) and measured 66 s with other work holding the CPU near
+// 80% (2026-09-13). The one that carries on over a failed gate's floor commit
+// runs it twice and measured 58 s in the same run, and 63 s with the CPU
+// pinned at 100% the same day. 5 minutes is more than 4x the slowest, so no
+// case can plausibly reach it without being genuinely wedged, which is the
+// failure this still catches.
 //
 // release.sh runs this suite as a release gate, so a flake here blocks a
 // release for a reason that has nothing to do with the release.
@@ -1147,13 +1152,26 @@ describe("release.sh oam floor helpers", () => {
 
   function shIn(cwd: string, lines: string[], env: Record<string, string> = {}): RunResult {
     const prelude = [STUB_HELPERS, TOKEN_STUB, OAM_HELPERS, CURL_STUB, "rm -f curl-args.txt curl-config.txt"];
-    return runBash([...prelude, ...lines].join("\n"), cwd, env);
+    // GIT_ENV because oam_floor_rewrite asks git whether a floor block shipped.
+    return runBash([...prelude, ...lines].join("\n"), cwd, { ...GIT_ENV, ...env });
   }
 
   /** A fresh dir holding the three floor files, for a case that rewrites them. */
   function floorDir(opts: OamFixture = {}): string {
     const d = newTmp("release-oam-rewrite-");
     writeOamFixture(d, opts);
+    return d;
+  }
+
+  /**
+   * floorDir, committed to a fresh git repo: a changelog section that holds a
+   * floor block makes oam_floor_rewrite ask git whether that block shipped.
+   */
+  function floorRepo(opts: OamFixture = {}): string {
+    const d = floorDir(opts);
+    git(d, ["init", "-q", "-b", "main"]);
+    git(d, ["add", "-A"]);
+    git(d, ["commit", "-q", "-m", "fixture"]);
     return d;
   }
 
@@ -1435,12 +1453,38 @@ describe("release.sh oam floor helpers", () => {
         "Text; the floor was 0.14.0. More.",
       ].join("\n"),
     );
-    const d = floorDir({ changelog: twoBlocks });
+    const d = floorRepo({ changelog: twoBlocks });
     const check = rewrite(d, "--check");
-    expect(check.out).toContain('2 oam floor blocks in "## Unreleased -- things"; merge them by hand');
+    expect(check.out).toContain(
+      '2 oam floor blocks in "## Unreleased -- things" that no v* tag reachable from HEAD has shipped; merge them by hand',
+    );
     expect(check.out).toContain("RC=1");
     expect(rewrite(d, "--write").out).toContain("RC=1");
     unchanged(d, { changelog: twoBlocks });
+  });
+
+  it("stops, writing nothing, when git cannot tell whether the section's floor block shipped", () => {
+    // git show fails for a v* tag whose tree has no CHANGELOG.md. The script
+    // does not tell that failure from any other, and reading a failure as "not
+    // shipped" is the reading that would rewrite a published block, so it stops.
+    const withBlock = OAM_CHANGELOG.replace(
+      "A paragraph.",
+      "A paragraph.\n\n**Changed -- the oam floor moves to 0.15.2**\n\nText; the floor was 0.13.1. More.",
+    );
+    const d = floorDir({ changelog: withBlock });
+    git(d, ["init", "-q", "-b", "main"]);
+    git(d, ["add", "src"]);
+    git(d, ["commit", "-q", "-m", "no changelog yet"]);
+    git(d, ["tag", "-a", "v1.0.0", "-m", "v1.0.0"]);
+    git(d, ["add", "CHANGELOG.md"]);
+    git(d, ["commit", "-q", "-m", "changelog"]);
+    const check = rewrite(d, "--check", "0.15.3", "0.15.2");
+    expect(check.out).toContain(
+      "cannot tell whether its oam floor block already shipped: git show v1.0.0:./CHANGELOG.md failed",
+    );
+    expect(check.out).toContain("RC=1");
+    expect(rewrite(d, "--write", "0.15.3", "0.15.2").out).toContain("RC=1");
+    unchanged(d, { changelog: withBlock });
   });
 
   it("refuses to update a floor block that is not in the shape it writes, rather than guess the old floor", () => {
@@ -1448,7 +1492,7 @@ describe("release.sh oam floor helpers", () => {
       "A paragraph.",
       "A paragraph.\n\n**Changed -- the oam floor moves to 0.15.2**\n\nRewritten by hand, naming no earlier floor.",
     );
-    const d = floorDir({ changelog: edited });
+    const d = floorRepo({ changelog: edited });
     const check = rewrite(d, "--check", "0.15.3", "0.15.2");
     expect(check.out).toContain("cannot be updated in place");
     expect(check.out).toContain("RC=1");
@@ -1573,11 +1617,14 @@ describe("release.sh oam floor pre-flight", () => {
     expect(r.out).toContain("CONTINUED");
   });
 
-  it("moves the floor on a resume that is neither tagged nor published, with every fresh-release stop", () => {
+  it("moves the floor on a resume that is neither tagged nor published, and fails closed and refuses an ahead floor as a fresh release does", () => {
     // RESUMING only means package.json already reads VERSION: a hand-run
     // `npm version`, a bump committed ahead of the release, or a run that died
     // in step 3 before tagging. Nothing irreversible has happened yet, so the
-    // floor still moves -- and the stops that come with moving it still apply.
+    // floor still moves -- and the pre-flight's fail-closed and floor-ahead
+    // stops still apply. A resume still skips the confirm prompt and the
+    // behaviour-change gate (release.sh's `[ "$RESUMING" != "true" ]` block),
+    // so the move is not put to the operator before it is committed.
     const r = run({ floor: "0.13.1", resuming: true });
     expect(r.out).toContain("INFO oam floor 0.13.1 is behind oam 0.15.2");
     expect(r.out).toContain("TARGET=[0.15.2] DATE=[2026-09-13] LOCKED=[false]");
@@ -1638,6 +1685,57 @@ describe("release.sh oam floor pre-flight", () => {
     expect(locked.out).toContain("WARN The oam floor 0.16.0 is AHEAD");
     expect(locked.out).toContain("the const FLOOR literal in src/tests/oam-spawn.test.ts");
     expect(locked.out).toContain("CONTINUED");
+  });
+
+  it("names the reset, not a hand-lowering and a push, when the floor is ahead only because of an unpushed floor commit", () => {
+    // A run moved the floor to 0.15.2 and failed a gate, then 0.15.2 lost
+    // GitHub's latest marker to 0.15.1 before the re-run. The sync guard
+    // carried the re-run on over that floor commit, so the usual advice --
+    // lower by hand, commit, push -- would push it too.
+    const dir = oamRepo();
+    const base = git(dir, ["rev-parse", "HEAD"]).trim();
+    expect(runMove(dir, "0.13.1", "0.15.2").out).toContain("INFO oam floor 0.13.1 -> 0.15.2, committed");
+    const preflight = () =>
+      runOutside(
+        dir,
+        [
+          STUB_HELPERS,
+          TOKEN_STUB,
+          OAM_HELPERS,
+          CURL_STUB,
+          "RESUMING=false",
+          'VERSION="9.9.9"',
+          'ALREADY_PUBLISHED=""',
+          `REMOTE_HEAD="${base}"`,
+          block,
+          'echo "CONTINUED"',
+        ].join("\n"),
+        {
+          FAKE_BODY: oamRelease({ tag_name: "v0.15.1" }),
+          FAKE_CURL_RC: "0",
+          FAKE_GH_TOKEN: "",
+          ALLOW_STALE_OAM_FLOOR: "",
+        },
+      );
+
+    const r = preflight();
+    expect(r.out).toContain(
+      "FAIL The oam floor 0.15.2 is AHEAD of the latest oam release 0.15.1, and local main is ahead of origin/main only by release.sh's own unpushed oam floor commit(s) from an earlier failed run",
+    );
+    expect(r.out).toContain("git reset --keep origin/main (only those commits are ahead, so no other commit is lost)");
+    expect(r.out).toContain("gh release edit v0.15.2 --repo YawLabs/oam --latest");
+    expect(r.out).not.toContain("commit, push and re-run");
+    expect(r.out).not.toContain("CONTINUED");
+
+    // With any other commit ahead, the reset would lose it, so the usual advice stands.
+    writeFileSync(join(dir, "unrelated.txt"), "fix\n");
+    git(dir, ["commit", "-q", "-am", "fix a test"]);
+    const other = preflight();
+    expect(other.out).toContain(
+      "FAIL The oam floor 0.15.2 is AHEAD of the latest oam release 0.15.1, and oam's installer",
+    );
+    expect(other.out).not.toContain("git reset --keep");
+    expect(other.out).not.toContain("CONTINUED");
   });
 
   it("stops before the prompt when the changelog has no section for this release", () => {
@@ -1814,8 +1912,9 @@ describe("release.sh oam floor move", () => {
     expect(read(dir, "src", "oam-spawn.ts")).toBe(oamSrcFixture("0.16.0"));
   });
 
-  it("rewrites its own block in place on a second move, keeping the floor the last release shipped", () => {
-    // The re-run after a failed gate, with oam released again in between.
+  it("rewrites its own unshipped block in place on a second move, keeping the floor it names as the one before", () => {
+    // The re-run after a failed gate, with oam released again in between. No
+    // v* tag exists, so the block has not shipped.
     const dir = repo();
     expect(run(dir, "0.13.1", "0.15.2").out).toContain("INFO oam floor 0.13.1 -> 0.15.2, committed");
     const r = run(dir, "0.15.2", "0.15.3");
@@ -1833,6 +1932,41 @@ describe("release.sh oam floor move", () => {
       "fix(oam): move the floor to 0.15.2",
       "fixture",
     ]);
+  });
+
+  it("never rewrites a floor block a tagged release shipped under ## Unreleased, and adds the new one after it", () => {
+    // v1.0.0 and v1.0.1 of this repo were both tagged with their notes still
+    // under ## Unreleased, so the next release's section can hold the block
+    // the last one published. Release 1.0.0 moves the floor and is tagged;
+    // release 1.0.1 moves it again, fails a gate, and re-runs after another
+    // oam release.
+    const dir = repo();
+    const heading = (v: string) => `**Changed -- the oam floor moves to ${v}**`;
+    expect(run(dir, "0.13.1", "0.15.2").out).toContain("INFO oam floor 0.13.1 -> 0.15.2, committed");
+    git(dir, ["tag", "-a", "v1.0.0", "-m", "v1.0.0"]);
+    const shippedBlock = [heading("0.15.2"), "", ""].join("\n");
+    const shippedText = read(dir, "CHANGELOG.md");
+    const shipped = shippedText.slice(shippedText.indexOf(shippedBlock), shippedText.indexOf("## 1.0.1 -- older"));
+
+    expect(run(dir, "0.15.2", "0.15.3").out).toContain("INFO oam floor 0.15.2 -> 0.15.3, committed");
+    let log = read(dir, "CHANGELOG.md");
+    // The shipped block, byte for byte, then the new one naming the floor 1.0.0 shipped.
+    expect(log).toContain(shipped.replace(/\n+$/, ""));
+    expect(log.indexOf(heading("0.15.3"))).toBeGreaterThan(log.indexOf(heading("0.15.2")));
+    expect(log.indexOf(heading("0.15.3"))).toBeLessThan(log.indexOf("## 1.0.1 -- older"));
+    expect(log).toContain("v0.15.3 is now current (published 2026-09-13); the floor was 0.15.2.");
+    expect(log).not.toContain("\n\n\n");
+
+    // The re-run: the 0.15.3 block has not shipped, so it is the one rewritten,
+    // and the two blocks are not the two-unshipped-blocks stop.
+    const again = run(dir, "0.15.3", "0.15.4");
+    expect(again.out).toContain("INFO oam floor 0.15.3 -> 0.15.4, committed");
+    log = read(dir, "CHANGELOG.md");
+    expect(log).toContain(shipped.replace(/\n+$/, ""));
+    expect(log).not.toContain(heading("0.15.3"));
+    expect(log).toContain("v0.15.4 is now current (published 2026-09-13); the floor was 0.15.2.");
+    const section = log.slice(0, log.indexOf("## 1.0.1 -- older"));
+    expect(section.match(/oam floor moves to/g)).toHaveLength(2);
   });
 
   it("files the block under a first section already renamed to the version being released", () => {
@@ -2058,12 +2192,13 @@ describe("release.sh oam floor block placement", () => {
 });
 
 describe("release.sh oam floor re-run after a failed gate (stubbed full run)", () => {
-  // The whole script, end to end, over a floor that is behind: see the file
+  // The whole, unmodified script over a floor that is behind: see the file
   // header for what is stubbed and what keeps the real npm out of reach. The
   // floor move commits ahead of step 1, so a failing gate leaves that commit
   // on local main, and the re-run meets the origin/main sync guard with main
-  // ahead of origin. It must carry on over the script's own commit, and only
-  // over that.
+  // ahead of origin, or diverged from it once a fix lands there. It must carry
+  // on over the script's own commit, and only over that; every other shape
+  // stops with advice that names what following it would discard.
   const NPM_STUB = [
     "#!/bin/bash",
     'echo "npm $*" >> "$FAKE_STATE/npm.log"',
@@ -2226,7 +2361,7 @@ describe("release.sh oam floor re-run after a failed gate (stubbed full run)", (
     expect(git(f.bare, ["tag", "-l"]).trim()).toBe("v1.0.2");
   });
 
-  it("still stops at the sync guard when another commit sits on the floor commit, and names the undo", () => {
+  it("still stops at the sync guard when another commit sits on the floor commit, and names the undo and what it discards", () => {
     const f = setup();
     writeFileSync(join(f.state, "fail-tests"), "");
     expect(release(f).status).toBe(1);
@@ -2236,10 +2371,64 @@ describe("release.sh oam floor re-run after a failed gate (stubbed full run)", (
     rmSync(join(f.state, "fail-tests"));
 
     const second = release(f);
-    expect(second.out).toContain("Local main is AHEAD of origin/main (unpushed commits)");
-    expect(second.out).toContain("git reset --keep origin/main and re-run");
+    expect(second.out).toContain(
+      "Local main is AHEAD of origin/main, and its unpushed commits include release.sh's oam floor commit",
+    );
+    // It lists what a bare reset would throw away, and how to keep it.
+    expect(second.out).toContain(
+      "Unpushed commits, newest first: fix the failing test; fix(oam): move the floor to 0.15.2.",
+    );
+    expect(second.out).toContain("git branch keep-mine HEAD, then git reset --keep origin/main");
+    expect(second.out).toContain("A bare git reset --keep origin/main DISCARDS every commit listed.");
+    expect(second.out).not.toContain("Push them first");
     expect(second.status).toBe(1);
     expect(subjects(f.bare, "main")).toEqual(["fixture"]);
     expect(git(f.bare, ["tag", "-l"]).trim()).toBe("");
+  });
+
+  it("names the reset, not an impossible fast-forward, when the fix for the failed gate landed on origin/main", () => {
+    const f = setup();
+    writeFileSync(join(f.state, "fail-tests"), "");
+    expect(release(f).status).toBe(1);
+    // The fix merged through a PR: origin/main moves, local main keeps the floor commit.
+    const other = join(f.root, "other");
+    git(f.root, ["clone", "-q", shPath(f.bare), other]);
+    writeFileSync(join(other, "README.md"), "a fix for the failing test\n");
+    git(other, ["add", "README.md"]);
+    git(other, ["commit", "-q", "-m", "fix the failing test"]);
+    git(other, ["push", "-q", "origin", "main"]);
+    rmSync(join(f.state, "fail-tests"));
+
+    const diverged = release(f);
+    expect(diverged.out).toContain(
+      "Local main has diverged from origin/main, and the only commits origin/main lacks are release.sh's own oam floor commit(s) from an earlier failed run. git pull --ff-only cannot fast-forward over them: git reset --keep origin/main and re-run ./release.sh 1.0.2",
+    );
+    expect(diverged.out).not.toContain("Pull first");
+    expect(diverged.status).toBe(1);
+
+    // A commit of the operator's own on top: the reset would discard it too.
+    writeFileSync(join(f.work, "unrelated.txt"), "local\n");
+    git(f.work, ["add", "unrelated.txt"]);
+    git(f.work, ["commit", "-q", "-m", "a local tweak"]);
+    const mixed = release(f);
+    expect(mixed.out).toContain("Local main has diverged from origin/main, and the commits origin/main lacks include");
+    expect(mixed.out).toContain("newest first: a local tweak; fix(oam): move the floor to 0.15.2.");
+    expect(mixed.out).toContain("A bare git reset --keep origin/main DISCARDS every commit listed.");
+    expect(mixed.out).not.toContain("Pull first");
+    expect(mixed.status).toBe(1);
+    expect(subjects(f.bare, "main")).toEqual(["fix the failing test", "fixture"]);
+
+    // The advice works: reset, re-run, and the move is made again over the fix.
+    git(f.work, ["reset", "-q", "--keep", "origin/main"]);
+    const third = release(f);
+    expect(third.out).toContain("oam floor 0.13.1 -> 0.15.2, committed");
+    expect(third.out).toContain("v1.0.2 released to npm + MCP registry.");
+    expect(third.status).toBe(0);
+    expect(subjects(f.bare, "main")).toEqual([
+      "v1.0.2",
+      "fix(oam): move the floor to 0.15.2",
+      "fix the failing test",
+      "fixture",
+    ]);
   });
 });
