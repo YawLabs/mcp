@@ -3068,6 +3068,25 @@ describe("runInstall --list (read-only)", () => {
     expect(cap.stdout()).toMatch(/Claude Code\s+user\s+~[\\/].claude\.json\s+malformed/);
   });
 
+  // The Codex CLI row reads a TOML file, and --list reads it through the TOML
+  // adapter. Before that, every one of these rows -- including the file
+  // `install codex-cli` itself writes -- listed as `malformed`, because the
+  // probe parsed config.toml as JSON. The fixtures are the TOML codec's own.
+  it.each([
+    ["f05-identical", "installed"],
+    ["g12-no-container", "no-entries"],
+    ["f03-siblings", "other-entries"],
+    ["f10-malformed", "malformed"],
+  ])("--list: Codex CLI user row by state (%s -> %s)", async (id, status) => {
+    const bytes = readFileSync(join(import.meta.dirname, "fixtures", "codex", id, "input.toml"), "utf8");
+    mkdirSync(join(synthHome, ".codex"), { recursive: true });
+    writeFileSync(join(synthHome, ".codex", "config.toml"), bytes, "utf8");
+    const cap = captureIo();
+    const r = await runInstall({ os: "linux", home: synthHome, cwd: synthCwd, listOnly: true, io: cap.io });
+    expect(r.exitCode).toBe(0);
+    expect(listRow(cap.stdout(), "Codex CLI", "user")).toEqual(["Codex CLI", "user", "~/.codex/config.toml", status]);
+  });
+
   it("does not require a token", async () => {
     // No token anywhere. --list should still work.
     const cap = captureIo();

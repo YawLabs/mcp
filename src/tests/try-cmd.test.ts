@@ -2037,6 +2037,63 @@ describe("runTry — auto-detected client (no --client)", () => {
     // to, which is the half of the split a path assertion alone would miss.
     expect(existsSync(join(synthHome, ".claude.json"))).toBe(false);
   });
+
+  describe("auto-detect does not pick a non-JSON client file (trial markers cannot peel TOML yet)", () => {
+    // A trial marker records no syntax and peels as jsonc, so a trial written
+    // into ~/.codex/config.toml could never be cleaned up by try-cleanup or
+    // doctor's trial GC. Now that the probe reads that file as a valid TOML
+    // config -- and so as a usable slot -- auto-detect has to keep to
+    // JSON-family files on its own. An explicit --client is a separate matter.
+    const seedCodex = (): { path: string; bytes: string } => {
+      const bytes = readFileSync(join(import.meta.dirname, "fixtures", "codex", "f05-identical", "input.toml"), "utf8");
+      mkdirSync(join(synthHome, ".codex"), { recursive: true });
+      const path = join(synthHome, ".codex", "config.toml");
+      writeFileSync(path, bytes, "utf8");
+      return { path, bytes };
+    };
+
+    it("with only ~/.codex/config.toml on disk, the trial goes to claude-code, not codex-cli", async () => {
+      const codex = seedCodex();
+      const cap = captureIO();
+      const r = await runTry({
+        slug: "demo",
+        home: synthHome,
+        cwd: synthCwd,
+        os: "linux",
+        env: {},
+        out: cap.pushOut,
+        err: cap.pushErr,
+        fetchExplore: async () => SAMPLE,
+      });
+      expect(r.exitCode).toBe(0);
+      expect(r.marker?.clientName).toBe("claude-code");
+      expect(r.marker?.clientPath).toBe(join(synthHome, ".claude.json"));
+      // The TOML file was never touched.
+      expect(readFileSync(codex.path, "utf8")).toBe(codex.bytes);
+    });
+
+    it("with ~/.cursor/mcp.json beside it, cursor is chosen", async () => {
+      const codex = seedCodex();
+      mkdirSync(join(synthHome, ".cursor"), { recursive: true });
+      const cursorPath = join(synthHome, ".cursor", "mcp.json");
+      writeFileSync(cursorPath, JSON.stringify({ mcpServers: { existing: { command: "x" } } }));
+      const cap = captureIO();
+      const r = await runTry({
+        slug: "demo",
+        home: synthHome,
+        cwd: synthCwd,
+        os: "linux",
+        env: {},
+        out: cap.pushOut,
+        err: cap.pushErr,
+        fetchExplore: async () => SAMPLE,
+      });
+      expect(r.exitCode).toBe(0);
+      expect(r.marker?.clientName).toBe("cursor");
+      expect(r.marker?.clientPath).toBe(cursorPath);
+      expect(readFileSync(codex.path, "utf8")).toBe(codex.bytes);
+    });
+  });
 });
 
 describe("runTry -- an explicitly named client with nothing configured", () => {
