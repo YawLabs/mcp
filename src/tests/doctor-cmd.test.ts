@@ -10,7 +10,7 @@ function writeYawMcpConfig(root: string, filename: string, obj: unknown): void {
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { unloadableConfigProblem } from "../client-config.js";
+import { classifyClientConfig, unloadableConfigProblem } from "../client-config.js";
 import {
   DOCTOR_ENV_VARS,
   DOCTOR_USAGE,
@@ -29,6 +29,7 @@ import {
   claudeCodeProjectKey,
   describeJsonShape,
   ENTRY_NAME,
+  resolveInstallSites,
   unloadableConfigFix,
   unparseableConfigFix,
 } from "../install-targets.js";
@@ -4482,5 +4483,390 @@ describe("runDoctor — nothing configured", () => {
     expect(txt).toContain("servers (local bundles.json):");
     expect(txt).not.toContain("no bundles.json on this machine yet");
     expect(txt).not.toContain("No MCP servers are configured yet");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A TOML client config. Codex CLI keeps its servers in ~/.codex/config.toml,
+// and doctor used to put every client file through its JSON walk -- so the
+// very file `yaw-mcp install codex-cli` writes read as "exists but JSON is
+// malformed", doctor exited 2, and `install --list` said malformed. The probe
+// now dispatches on the SITE's declared format: JSON-family rows keep the JSON
+// walk, every other format is classified by its registered adapter through
+// the same core read install uses. The fixtures are the TOML codec's own
+// (src/tests/fixtures/codex), so doctor is pinned against the bytes the
+// adapter's tests already describe.
+// ---------------------------------------------------------------------------
+
+describe("runDoctor -- a TOML client config (Codex CLI) is classified by its adapter", () => {
+  const CODEX_LABEL = "Codex CLI (user)";
+  const CODEX_INSTALL = "yaw-mcp install codex-cli";
+  const FIXTURES = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "codex");
+
+  const fixture = (id: string): string => readFileSync(join(FIXTURES, id, "input.toml"), "utf8");
+  const codexToml = (): string => join(synthHome, ".codex", "config.toml");
+
+  /** Write `raw` as the user-scope config.toml under the synthetic home. */
+  function writeCodexToml(raw: string, dir: string = join(synthHome, ".codex")): void {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "config.toml"), raw);
+  }
+
+  /** One CLIENTS row's status, after `  <label>: `. Exactly one must exist. */
+  function clientsRow(text: string, label: string): { status: string; path: string } {
+    const lines = text.split("\n");
+    const prefix = `  ${label}: `;
+    const hits = lines.flatMap((l, i) => (l.startsWith(prefix) ? [i] : []));
+    expect(hits).toHaveLength(1);
+    return { status: lines[hits[0]].slice(prefix.length), path: lines[hits[0] + 1] };
+  }
+
+  type Probe = Awaited<ReturnType<typeof runDoctor>>["snapshot"]["clients"][number];
+  const codexRow = (clients: readonly Probe[], scope = "user"): Probe | undefined =>
+    clients.find((c) => c.clientId === "codex-cli" && c.scope === scope);
+
+  /** The user-scope site install resolves for codex-cli -- what the adapter
+   *  is handed, so a reason clause can be read from the core, not retyped. */
+  const codexSite = () =>
+    resolveInstallSites({ clientId: "codex-cli", scope: "user", os: "linux", home: synthHome })[0];
+
+  const failingRead =
+    (code: string): ((path: string) => string) =>
+    (path) => {
+      throw Object.assign(new Error(`${code}: resource busy or locked, open '${path}'`), { code });
+    };
+
+  it("a valid [mcp_servers.mcp] table (f05-identical) reads OK on both probes", async () => {
+    writeCodexToml(fixture("f05-identical"));
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const row = codexRow(r.snapshot.clients);
+    expect(row?.path).toBe(codexToml());
+    expect(row?.exists).toBe(true);
+    expect(row?.malformed).toBe(false);
+    expect(row?.hasMcpEntry).toBe(true);
+    expect(row?.containerEntries).toBe(1);
+    expect(row?.launchRuntime).toBe("node");
+    expect(row?.syntax).toBe("TOML");
+    expect(row?.entryUnspliceable).toBeNull();
+    expect(row?.unloadable).toBeNull();
+    expect(cap.text()).toContain(`${CODEX_LABEL}: OK -- has "${ENTRY_NAME}" entry`);
+    expect(r.snapshot.config.warnings.filter((w) => w.includes("config.toml"))).toEqual([]);
+    expect(r.exitCode).toBe(0);
+
+    const asyncRow = codexRow(await probeClientsAsync({ home: synthHome, os: "linux", cwd: synthCwd }));
+    expect(asyncRow).toEqual(row);
+    expect(probeUsable(row!)).toBe(true);
+  });
+
+  it("cwd === home (the Yaw Terminal sidecar): user and project alias one config.toml and neither warns", async () => {
+    writeCodexToml(fixture("f05-identical"));
+    const r = await runDoctor({
+      cwd: synthHome,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: () => {},
+      err: () => {},
+      json: true,
+      skipRegistryCheck: true,
+    });
+    const parsed = JSON.parse(r.lines[0]) as {
+      warnings: string[];
+      diagnosis: { exitCode: number };
+      clients: Array<{ clientId: string; scope: string; hasMcpEntry: boolean; path: string }>;
+    };
+    expect(parsed.warnings.filter((w) => w.includes("Codex CLI (user, project)"))).toEqual([]);
+    expect(parsed.warnings.filter((w) => w.includes("Codex CLI"))).toEqual([]);
+    expect(parsed.diagnosis.exitCode).toBe(0);
+    const codex = parsed.clients.filter((c) => c.clientId === "codex-cli");
+    expect(codex.map((c) => c.scope)).toEqual(["user", "project"]);
+    // Both scopes really do read the ONE file here, which is what made the old
+    // warning say "(user, project)".
+    expect(codex.every((c) => c.path === codexToml())).toBe(true);
+    expect(codex.every((c) => c.hasMcpEntry)).toBe(true);
+  });
+
+  it("no mcp_servers table (g12-no-container) is present, no entry", async () => {
+    writeCodexToml(fixture("g12-no-container"));
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    expect(clientsRow(cap.text(), CODEX_LABEL).status).toBe(
+      `present, no "${ENTRY_NAME}" entry -- run \`${CODEX_INSTALL}\``,
+    );
+    const row = codexRow(r.snapshot.clients);
+    expect(row?.exists).toBe(true);
+    expect(row?.containerEntries).toBe(0);
+    expect(row?.hasMcpEntry).toBe(false);
+    expect(r.exitCode).toBe(0);
+  });
+
+  it("sibling servers without our entry (f03-siblings) is present, no entry, and healthy", async () => {
+    writeCodexToml(fixture("f03-siblings"));
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const row = codexRow(r.snapshot.clients);
+    expect(row?.hasMcpEntry).toBe(false);
+    expect(row?.containerEntries).toBeGreaterThanOrEqual(1);
+    expect(row?.malformed).toBe(false);
+    expect(r.exitCode).toBe(0);
+  });
+
+  it("a legacy key (f08-legacy) is reported by name", async () => {
+    writeCodexToml(fixture("f08-legacy"));
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, err: () => {} });
+    const row = codexRow(r.snapshot.clients);
+    expect(row?.malformed).toBe(false);
+    expect(row?.hasLegacyEntry).toBe(true);
+    // The fixture's own key: `[mcp_servers.yaw-mcp]`.
+    expect(row?.legacyEntryName).toBe("yaw-mcp");
+  });
+
+  it("an empty config.toml (g11-empty) exists, with the empty skeleton, and is not malformed", async () => {
+    writeCodexToml(fixture("g11-empty"));
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const row = codexRow(r.snapshot.clients);
+    expect(row?.exists).toBe(true);
+    expect(row?.malformed).toBe(false);
+    expect(row?.hasMcpEntry).toBe(false);
+    expect(row?.containerEntries).toBe(0);
+    expect(row?.containerBlocked).toBeNull();
+    expect(row?.unreadable).toBeNull();
+    expect(row?.entryUnspliceable).toBeNull();
+    expect(r.exitCode).toBe(0);
+  });
+
+  it("a config.toml that does not parse (f10-malformed) says TOML, byte-exact", async () => {
+    writeCodexToml(fixture("f10-malformed"));
+    const cap = captureOut();
+    const errs: string[] = [];
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      err: (s) => errs.push(s),
+    });
+    const status = `exists but TOML is malformed -- install refuses to overwrite it; fix the TOML by hand, or move the file aside, then run \`${CODEX_INSTALL}\``;
+    expect(clientsRow(cap.text(), CODEX_LABEL).status).toBe(status);
+    // Composed from the helper too, so the literal above cannot drift from it.
+    expect(status).toContain(unparseableConfigFix(`run \`${CODEX_INSTALL}\``, "TOML"));
+    const row = codexRow(r.snapshot.clients);
+    expect(row?.malformed).toBe(true);
+    expect(r.exitCode).toBe(2);
+    const codexWarnings = r.snapshot.config.warnings.filter((w) => w.includes("Codex CLI"));
+    expect(codexWarnings).toHaveLength(1);
+    const warning = codexWarnings[0];
+    expect(warning).toContain(codexToml());
+    expect(warning).toContain(`${CODEX_LABEL} exists but TOML is malformed`);
+    // No line about the codex rows -- CLIENTS or WARNINGS -- calls it JSON.
+    const codexLines = cap
+      .text()
+      .split("\n")
+      .filter((l) => l.includes("Codex CLI"));
+    expect(codexLines.length).toBeGreaterThan(0);
+    expect(codexLines.filter((l) => l.includes("JSON"))).toEqual([]);
+    expect(codexWarnings.filter((w) => w.includes("JSON"))).toEqual([]);
+    expect(errs.join("")).toContain(`warning: ${warning}`);
+  });
+
+  it("an [[mcp_servers]] array (f11-array-container) is blocked, worded as a TOML table, not a warning", async () => {
+    writeCodexToml(fixture("f11-array-container"));
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const row = codexRow(r.snapshot.clients);
+    expect(row?.containerBlocked).toBe('"mcp_servers" is an array of 1');
+    expect(clientsRow(cap.text(), CODEX_LABEL).status).toBe(
+      `present, but "mcp_servers" is an array of 1, not a TOML table -- install refuses to overwrite it; make it a table (or remove the key), then run \`${CODEX_INSTALL}\``,
+    );
+    expect(row?.malformed).toBe(false);
+    expect(r.snapshot.config.warnings).toEqual([]);
+    expect(r.exitCode).toBe(0);
+  });
+
+  it("mcp_servers = 5 and mcp_servers = [] are blocked for TOML (never repaired)", async () => {
+    writeCodexToml("mcp_servers = 5\n");
+    let r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: () => {} });
+    expect(codexRow(r.snapshot.clients)?.containerBlocked).toBe('"mcp_servers" is a number');
+
+    writeCodexToml("mcp_servers = []\n");
+    // The JSON twin in the same run: an empty-array container is REPARABLE for
+    // JSON (install replaces it with an object, nothing is lost), so it is not
+    // blocked there. The TOML adapter never repairs a container in place -- a
+    // deliberate divergence, pinned from both sides.
+    writeFileSync(join(synthHome, ".claude.json"), JSON.stringify({ mcpServers: [] }));
+    r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: () => {} });
+    expect(codexRow(r.snapshot.clients)?.containerBlocked).toBe('"mcp_servers" is an empty array');
+    const claude = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
+    expect(claude?.containerBlocked).toBeNull();
+    expect(claude?.malformed).toBe(false);
+  });
+
+  it.each([
+    ["f09-inline"],
+    ["f16-dotted"],
+    ["g10-array-entry"],
+  ])("an unspliceable mcp entry (%s) is reported present, not editable, not a warning", async (id) => {
+    const raw = fixture(id);
+    writeCodexToml(raw);
+    const read = classifyClientConfig(raw, codexSite()).read;
+    if (read.kind !== "unspliceable") throw new Error(`fixture ${id} is not unspliceable: ${read.kind}`);
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const row = codexRow(r.snapshot.clients);
+    expect(row?.hasMcpEntry).toBe(true);
+    expect(row?.malformed).toBe(false);
+    expect(row?.entryUnspliceable).toBe(read.reason);
+    expect(row?.launchRuntime).toBeNull();
+    expect(clientsRow(cap.text(), CODEX_LABEL).status).toBe(
+      `has "${ENTRY_NAME}" entry, but it is ${read.reason} -- install will not edit it and doctor cannot check its launch command; rewrite that entry by hand as its own table (or delete it), then run \`${CODEX_INSTALL}\``,
+    );
+    expect(r.snapshot.config.warnings).toEqual([]);
+    expect(r.exitCode).toBe(0);
+    expect(probeUsable(row!)).toBe(false);
+  });
+
+  it("the inline-table row (f09-inline) reads byte-exact", async () => {
+    writeCodexToml(fixture("f09-inline"));
+    const cap = captureOut();
+    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    expect(clientsRow(cap.text(), CODEX_LABEL).status).toBe(
+      `has "${ENTRY_NAME}" entry, but it is an inline table under [mcp_servers] (mcp = { ... }) -- install will not edit it and doctor cannot check its launch command; rewrite that entry by hand as its own table (or delete it), then run \`${CODEX_INSTALL}\``,
+    );
+  });
+
+  it("launch checks run on a TOML entry: a missing absolute command", async () => {
+    const gone = join(synthHome, "gone", "oam");
+    // A TOML literal string, so a win32 path's backslashes stay verbatim.
+    writeCodexToml(`[mcp_servers.mcp]\ncommand = '${gone}'\nargs = ["run", "x.js"]\n`);
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, err: () => {} });
+    const row = codexRow(r.snapshot.clients);
+    expect(row?.launchCommandMissing).toBe(gone);
+    expect(cap.text()).toContain("launch command does not exist");
+    expect(r.exitCode).toBe(2);
+  });
+
+  it("launch checks run on a TOML entry: an oam entry file that no longer exists", async () => {
+    const oamBin = join(synthHome, "oam");
+    writeFileSync(oamBin, "");
+    const gone = join(synthHome, "gone", "broker.js");
+    writeCodexToml(`[mcp_servers.mcp]\ncommand = '${oamBin}'\nargs = ["run", "--no-check", '${gone}']\n`);
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, err: () => {} });
+    const row = codexRow(r.snapshot.clients);
+    expect(row?.launchRuntime).toBe("oam");
+    expect(row?.launchOamEntryMissing).toBe(gone);
+    expect(cap.text()).toContain("oam cannot fetch it on demand");
+    expect(r.exitCode).toBe(2);
+  });
+
+  it("CODEX_HOME moves the probed user file", async () => {
+    const dir = join(synthHome, "elsewhere-codex");
+    writeCodexToml(fixture("f05-identical"), dir);
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: { CODEX_HOME: dir }, os: "linux", out: () => {} });
+    const row = codexRow(r.snapshot.clients);
+    expect(row?.path).toBe(join(dir, "config.toml"));
+    expect(row?.hasMcpEntry).toBe(true);
+    expect(row?.syntax).toBe("TOML");
+  });
+
+  it("an EBUSY read on the codex row is transient-unreadable, not malformed", async () => {
+    writeCodexToml(fixture("f05-identical"));
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: () => {},
+      err: () => {},
+      readClientConfig: failingRead("EBUSY"),
+    });
+    const row = codexRow(r.snapshot.clients);
+    expect(row?.exists).toBe(true);
+    expect(row?.unreadableCode).toBe("EBUSY");
+    expect(row?.malformed).toBe(false);
+    expect(r.exitCode).toBe(0);
+
+    const asyncRow = codexRow(
+      await probeClientsAsync({
+        home: synthHome,
+        os: "linux",
+        cwd: synthCwd,
+        readClientConfig: failingRead("EBUSY"),
+      }),
+    );
+    expect(asyncRow?.unreadableCode).toBe("EBUSY");
+    expect(asyncRow?.malformed).toBe(false);
+  });
+
+  it("--json: every clients[] slot carries syntax and entryUnspliceable", async () => {
+    writeCodexToml(fixture("f05-identical"));
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: () => {},
+      err: () => {},
+      json: true,
+      skipRegistryCheck: true,
+    });
+    const parsed = JSON.parse(r.lines[0]) as {
+      clients: Array<{
+        clientId: string;
+        scope: string;
+        unavailable: boolean;
+        syntax: string;
+        entryUnspliceable: string | null;
+      }>;
+    };
+    expect(parsed.clients.every((c) => "syntax" in c)).toBe(true);
+    expect(parsed.clients.every((c) => "entryUnspliceable" in c)).toBe(true);
+    const claudeCode = parsed.clients.filter((c) => c.clientId === "claude-code");
+    expect(claudeCode.length).toBeGreaterThan(0);
+    expect(claudeCode.every((c) => c.syntax === "JSON")).toBe(true);
+    const codex = parsed.clients.filter((c) => c.clientId === "codex-cli");
+    expect(codex.length).toBeGreaterThan(0);
+    expect(codex.every((c) => c.syntax === "TOML")).toBe(true);
+    // An UNAVAILABLE slot carries it too, from its row's declared format.
+    const desktop = parsed.clients.find((c) => c.clientId === "claude-desktop");
+    expect(desktop?.unavailable).toBe(true);
+    expect(desktop?.syntax).toBe("JSON");
+    expect(parsed.clients.filter((c) => c.syntax === "JSON").every((c) => c.entryUnspliceable === null)).toBe(true);
+  });
+
+  // The JSON classifier still owns JSON rows: the drive-letter-case fold over
+  // Claude Code's projects[] map is the JSON walk's, and the dispatch must not
+  // have routed it anywhere else. Win32-only because claudeCodeProjectKey
+  // produces a drive-letter key only from a drive-letter cwd, which a POSIX
+  // runner's synthetic home never is (and resolveInstallSites would resolve()
+  // a fake `C:\\x` there into a relative-looking POSIX path).
+  it.runIf(process.platform === "win32")("the JSON classifier still owns JSON rows (drive-case parity)", async () => {
+    const canonical = claudeCodeProjectKey(synthCwd);
+    const variant = canonical[0].toLowerCase() + canonical.slice(1);
+    expect(variant).not.toBe(canonical);
+    const raw = JSON.stringify({
+      projects: {
+        [variant]: { mcpServers: { [ENTRY_NAME]: { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] } } },
+      },
+    });
+    // On disk as well as through the seam: the probe's existsSync gate runs
+    // before the read, so the file must exist for the read to happen.
+    writeFileSync(join(synthHome, ".claude.json"), raw);
+    const clients = await probeClientsAsync({
+      home: synthHome,
+      os: "windows",
+      cwd: synthCwd,
+      platform: "win32",
+      readClientConfig: () => raw,
+    });
+    const local = clients.find((c) => c.clientId === "claude-code" && c.scope === "local");
+    expect(local?.syntax).toBe("JSON");
+    expect(local?.hasMcpEntry).toBe(true);
+    expect(local?.entryProjectKey).toBe(variant);
   });
 });
