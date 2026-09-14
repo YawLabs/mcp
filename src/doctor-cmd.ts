@@ -420,13 +420,26 @@ export interface ClientProbeResult {
    *  field. */
   syntax: SyntaxName;
   /** Set when yaw-mcp's "mcp" entry is present but spelled in a way install
-   *  will not rewrite -- a TOML inline table, dotted keys, or an array of
-   *  tables -- as the adapter's reason clause verbatim ("an inline table under
-   *  [mcp_servers] (mcp = { ... })"); null otherwise, and on every
-   *  JSON-family row. `hasMcpEntry` is true on such a row, but its launch
-   *  command goes unchecked: the read carries no entries. Additive JSON
+   *  will not rewrite -- whatever spelling the file's adapter refuses: for TOML
+   *  an inline table, dotted keys, an array of tables, or an entry inside an
+   *  inline `mcp_servers = { ... }`. `reason` is the adapter's clause verbatim
+   *  ("an inline table under [mcp_servers] (mcp = { ... })") and `fix` its
+   *  by-hand step for that shape (the status line appends "then run
+   *  install"). Null otherwise, and on every JSON-family row. `hasMcpEntry` is
+   *  true on such a row, but its launch command goes unchecked and
+   *  `containerEntries` is 0: the read carries no entries. Additive JSON
    *  field. */
-  entryUnspliceable: string | null;
+  entryUnspliceable: { reason: string; fix: string } | null;
+  /** Set when the file reads fine and holds no "mcp" entry, but the container
+   *  cannot take one: a TOML root-level inline `mcp_servers = { ... }`, which
+   *  the `[mcp_servers.mcp]` header install writes would redefine, so install
+   *  refuses the write. Same shape as `entryUnspliceable`; the two are
+   *  mutually exclusive (an entry inside such a container is reported as the
+   *  entry's problem). Without it the row read "present, no entry -- run
+   *  install", and that run exits 1. Not a warning: the client loads the file
+   *  as it is. Null otherwise, and on every JSON-family row. Additive JSON
+   *  field. */
+  containerUnspliceable: { reason: string; fix: string } | null;
   /** How many keys the container at the slot's container path holds
    *  (`mcpServers`; `servers` for VS Code; `projects[<dir>].mcpServers` for
    *  Claude Code's local scope; `mcp_servers` for Codex CLI), yaw-mcp's own entry and any legacy one
@@ -434,9 +447,10 @@ export interface ClientProbeResult {
    *  local slots read the same .claude.json and each counts its own list. 0
    *  when there is nothing to count: no file, a file that could not be read or
    *  parsed, or one that parses with no such object or an empty one (what
-   *  `uninstall` leaves behind once it removes the last entry). `install
-   *  --list` tells `other-entries` from `no-entries` by it. Additive JSON
-   *  field. */
+   *  `uninstall` leaves behind once it removes the last entry) -- and 0 on an
+   *  `entryUnspliceable` row, whose adapter read carries no entries, siblings
+   *  or not. `install --list` tells `other-entries` from `no-entries` by it.
+   *  Additive JSON field. */
   containerEntries: number;
   /** Pre-rename `"mcp.hosting"` key still in the container. Surfaced because
    *  the client launches it too, so the user is running yaw-mcp twice --
@@ -495,11 +509,14 @@ export interface ClientProbeResult {
    *  whose wording node reshapes across versions. */
   unreadableCode: string | null;
   /** The container key install cannot splice its entry into, worded for a
-   *  message (`"mcpServers" is an array of 2`), or null. Set only for a key
-   *  findBlockedContainerSegment reports as NOT reparable -- the shape install
-   *  REFUSES with exit 1. A reparable one (null, a scalar, an empty array)
-   *  stays null: install replaces it with `{}`, so the ordinary "run install"
-   *  line is true there. Additive JSON field. */
+   *  message (`"mcpServers" is an array of 2`), or null -- the shape install
+   *  REFUSES with exit 1. On a JSON-family row it is set only for a key
+   *  findBlockedContainerSegment reports as NOT reparable; a reparable one
+   *  (null, a scalar, an empty array) stays null, because install replaces it
+   *  with `{}` and the ordinary "run install" line is true there. On a
+   *  non-JSON row it is whatever the file's adapter reports as blocked: a TOML
+   *  container is never repaired in place, so any non-table `mcp_servers` --
+   *  a scalar and an empty array included -- sets it. Additive JSON field. */
   containerBlocked: string | null;
   unavailable: boolean;
   /** On an `unavailable` row whose client DOES ship on this OS but that
@@ -760,13 +777,16 @@ export function probeUsable(c: ClientProbeResult): boolean {
   // choose-a-target gate, not the peel.
   // `entryUnspliceable` excluded too: try's peel and write refuse an entry
   // install will not edit, so auto-detect must not pick that file either.
+  // `containerUnspliceable` the same: the write of a trial entry into an
+  // inline container is the very write upsert refuses.
   return (
     !c.unavailable &&
     c.exists &&
     !c.malformed &&
     c.unreadable === null &&
     c.unloadable === null &&
-    c.entryUnspliceable === null
+    c.entryUnspliceable === null &&
+    c.containerUnspliceable === null
   );
 }
 
@@ -2324,9 +2344,11 @@ function renderClientStatus(c: ClientProbeResult, installCmd: string): string {
     return `exists but ${c.syntax} is malformed -- install refuses to overwrite it; ${unparseableConfigFix(`run \`${installCmd}\``, c.syntax)}`;
   }
   // The same trap one level down: the file parses, but a key on the way to the
-  // entry holds a non-empty array, which install refuses rather than drop (see
-  // findBlockedContainerSegment). It used to fall through to "present, no
-  // entry -- run install", and running it exits 1.
+  // entry holds a shape install refuses rather than drop -- a non-empty array
+  // on a JSON-family row (see findBlockedContainerSegment), any non-table
+  // `mcp_servers` on a TOML row, whose adapter repairs nothing in place. It
+  // used to fall through to "present, no entry -- run install", and running
+  // it exits 1.
   if (c.containerBlocked !== null) {
     return `present, but ${c.containerBlocked}, not ${containerNounFor(c.syntax)} -- install refuses to overwrite it; ${blockedContainerFix(`run \`${installCmd}\``, c.syntax)}`;
   }
@@ -2346,13 +2368,26 @@ function renderClientStatus(c: ClientProbeResult, installCmd: string): string {
   if (c.unloadable !== null) {
     return `exists but ${c.unloadable} -- install refuses to write into it; ${unloadableConfigFix(`run \`${installCmd}\``)}`;
   }
-  // Our entry is there, but in a spelling install will not rewrite (a TOML
-  // inline table, dotted keys, an array of tables). Present, so not "no
-  // entry"; not a warning, since the client may well load it; but its launch
-  // command went unchecked -- the adapter's read carries no entries -- so the
-  // line says so rather than reporting OK.
+  // Our entry is there, but in a spelling install will not rewrite (for TOML:
+  // an inline table, dotted keys, an array of tables, or an entry inside an
+  // inline `mcp_servers = { ... }`). Present, so not "no entry"; not a
+  // warning, since the client may well load it; but its launch command went
+  // unchecked -- the adapter's read carries no entries -- so the line says so
+  // rather than reporting OK. The by-hand step is the ADAPTER's, per shape:
+  // "rewrite it as its own table (or delete it)" is what three of those
+  // shapes need and exactly wrong for the fourth, where a new header would
+  // redefine the inline container and a deletion leaves it just as
+  // unextendable.
   if (c.entryUnspliceable !== null) {
-    return `has "${ENTRY_NAME}" entry, but it is ${c.entryUnspliceable} -- install will not edit it and doctor cannot check its launch command; rewrite that entry by hand as its own table (or delete it), then run \`${installCmd}\``;
+    return `has "${ENTRY_NAME}" entry, but it is ${c.entryUnspliceable.reason} -- install will not edit it and doctor cannot check its launch command; ${c.entryUnspliceable.fix}, then run \`${installCmd}\``;
+  }
+  // No entry, and the container cannot take one: a TOML inline
+  // `mcp_servers = { ... }`, which the header install writes would redefine.
+  // The file loads as it is, so not a warning -- but the "present, no entry
+  // -- run install" line below would name a run that exits 1, the same
+  // fall-through the containerBlocked branch exists to prevent.
+  if (c.containerUnspliceable !== null) {
+    return `present, no "${ENTRY_NAME}" entry, but the container is ${c.containerUnspliceable.reason} -- install refuses to write into it; ${c.containerUnspliceable.fix}, then run \`${installCmd}\``;
   }
   // Checked BEFORE the combined legacy branch: a launch command that no longer
   // exists is the one state that means the client cannot start yaw-mcp AT ALL,
@@ -2532,6 +2567,7 @@ const EMPTY_PROBE: Readonly<ProbeClassification> = {
   launchForeignPath: null,
   entryProjectKey: null,
   entryUnspliceable: null,
+  containerUnspliceable: null,
 };
 
 const MALFORMED: Readonly<ProbeClassification> = { ...EMPTY_PROBE, malformed: true };
@@ -2823,8 +2859,17 @@ function classifyProbeViaAdapter(
         : { ...EMPTY_PROBE, unloadable, containerBlocked: `"${read.path.join(".")}" is ${read.shape}` };
     case "unspliceable":
       // Present, but in a spelling install will not edit. The read carries no
-      // entries, so there is nothing to run the launch checks on.
-      return { ...EMPTY_PROBE, hasMcpEntry: read.key === ENTRY_NAME, entryUnspliceable: read.reason };
+      // entries, so there is nothing to run the launch checks on. The fix is
+      // the adapter's own where it gives one; the generic clause is only for
+      // an adapter written before `fix` existed.
+      return {
+        ...EMPTY_PROBE,
+        hasMcpEntry: read.key === ENTRY_NAME,
+        entryUnspliceable: {
+          reason: read.reason,
+          fix: read.fix ?? "rewrite it by hand as a table of its own (or delete it)",
+        },
+      };
     case "ok": {
       if (!read.containerPresent) return { ...EMPTY_PROBE, unloadable };
       const entry = view.entry();
@@ -2836,6 +2881,10 @@ function classifyProbeViaAdapter(
         hasLegacyEntry: legacy !== null,
         legacyEntryName: legacy,
         unloadable,
+        // Only meaningful with no entry: the adapter reports an entry INSIDE
+        // such a container as unspliceable, so this and hasMcpEntry are never
+        // both set.
+        containerUnspliceable: read.containerUnspliceable ?? null,
       };
       if (entry === undefined) return base;
       try {
@@ -3044,8 +3093,9 @@ function classifyProbeContent(
       // is not news, and naming it would send the user after a key that holds
       // nothing.
       entryProjectKey: ENTRY_NAME in container || legacyEntryName !== null ? entryProjectKey : null,
-      // A JSON object key is always spliceable.
+      // A JSON object key is always spliceable, and so is a JSON container.
       entryUnspliceable: null,
+      containerUnspliceable: null,
     };
   } catch {
     // Parse failures only: the READ happens in the caller, under its own

@@ -775,9 +775,12 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
     );
     return { exitCode: 1, written: [] };
   }
-  // `read.syntax` is the adapter's own name for the file's language -- "JSON"
-  // for every client `import` can read today, so both lines are byte-identical
-  // to the literals they replace, and a non-JSON client would say what it is.
+  // `read.syntax` is the adapter's own name for the file's language: "JSON"
+  // for every JSON-family client, where both lines are byte-identical to the
+  // literals they replaced, and "TOML" for Codex CLI's config.toml, which
+  // import reads through its forImport row (target-codex-cli.ts) -- so a
+  // config.toml that does not parse is reported as TOML here, as in
+  // readContainer above.
   if (read.kind === "malformed") {
     printErr(
       read.reason === "root"

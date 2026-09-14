@@ -23,7 +23,10 @@ describe("probe format coverage", () => {
           f === "json" || f === "jsonc" || hasConfigAdapter(f),
           `${row.clientId} (${scope.scope}) declares format "${f}" with no classifier`,
         ).toBe(true);
-        expect(() => syntaxNameFor(f)).not.toThrow();
+        // A VALUE assertion: syntaxNameFor's exhaustive switch returns the
+        // unknown format itself from its `never` branch rather than throwing,
+        // so `not.toThrow()` could never go red here.
+        expect(["JSON", "TOML"]).toContain(syntaxNameFor(f));
       }
     }
     // Anchor: the loop ran over real rows, including the non-JSON one.

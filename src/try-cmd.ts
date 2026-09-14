@@ -1150,10 +1150,11 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
       );
       return { ok: false };
     }
-    // `read.syntax` is the adapter's own name for the file's language, so a
-    // non-JSON client would say what it actually is. Every client `try` can
-    // target today is JSON-family, where that name is "JSON" -- these two
-    // lines are byte-for-byte what they printed before.
+    // `read.syntax` is the adapter's own name for the file's language: "JSON"
+    // for every JSON-family client, where these two lines are byte-for-byte
+    // what they printed before, and "TOML" for Codex CLI's config.toml, which
+    // an explicit `--client codex-cli` reads through the same core (only
+    // auto-detect keeps to JSON-family files -- see autoDetectClient).
     if (read.kind === "malformed") {
       printErr(
         read.reason === "root"

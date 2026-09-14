@@ -172,16 +172,27 @@ function classifyToml(raw: string, addr: EntryAddress, transform?: EntryTransfor
       // never calls it because it only repairs a `reparable` read.
       return { kind: "blocked", path: read.path, shape: read.shape, reparable: false, unloadable: null };
     case "unspliceable":
-      return { kind: "unspliceable", key: read.key, reason: read.shape };
+      // `shape` is the clause a message puts after "it is"; `fix` is the
+      // by-hand step for that shape. The splice's own `remedy` stays behind:
+      // it is worded for the refusal beside install's preview.
+      return { kind: "unspliceable", key: read.key, reason: read.shape, fix: read.fix };
     default:
       // `unloadable` is a strict-JSON concept: a comment makes a .mcp.json
       // unreadable to its client. TOML has no such gap -- what smol-toml
       // accepts here, Codex's `toml` crate accepts -- so it is always null.
+      // An inline root container rides along the same way, so the one surface
+      // that would send the user to install (doctor) can say the run is
+      // refused; every other consumer reads a healthy file, which it is.
       return {
         kind: "ok",
         containerPresent: read.containerPresent,
         entries: entryViewsOf(read, transform),
         unloadable: null,
+        ...(read.containerUnspliceable === null
+          ? {}
+          : {
+              containerUnspliceable: { reason: read.containerUnspliceable.shape, fix: read.containerUnspliceable.fix },
+            }),
       };
   }
 }

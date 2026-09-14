@@ -281,7 +281,7 @@ describe("parse and classify", () => {
 
   it("reads a file with no mcp_servers at all as ok-but-absent (g12)", () => {
     const read = readTomlConfig(fixture("g12-no-container", "input.toml"), CONTAINER, [ENTRY]);
-    expect(read).toEqual({ kind: "ok", containerPresent: false, entries: [] });
+    expect(read).toEqual({ kind: "ok", containerPresent: false, entries: [], containerUnspliceable: null });
   });
 
   it("lists the server names in file order and decodes one entry's fields (f03)", () => {
@@ -2122,5 +2122,71 @@ describe("codex agreement table", () => {
     // them itself -- which is the `blocked` kind above, not `malformed`.
     expect(() => parseTomlConfig(lf("[[mcp_servers]]", 'command = "npx"'))).not.toThrow();
     expect(() => parseTomlConfig(lf('mcp_servers = "none"'))).not.toThrow();
+  });
+
+  // Every unspliceable shape carries a by-hand `fix` beside the splice's own
+  // `remedy`. The fix is what doctor prints, and it is per shape because no
+  // one clause is true of every spelling: three shapes can be rewritten as a
+  // `[mcp_servers.mcp]` table or deleted and re-installed, but an entry inside
+  // an inline root container can do neither -- a header under
+  // `mcp_servers = { ... }` is a redefinition, and with the entry gone the
+  // container still refuses the header -- so only converting the container
+  // works, and that shape's fix says so without an "(or delete it)".
+  it.each([
+    [
+      "inline entry",
+      lf("[mcp_servers]", 'mcp = { command = "npx" }'),
+      "replace that line by hand with a [mcp_servers.mcp] table (or delete it)",
+    ],
+    [
+      "root dotted keys",
+      lf('mcp_servers.mcp.command = "npx"'),
+      "replace those lines by hand with a [mcp_servers.mcp] table (or delete them)",
+    ],
+    [
+      "dotted keys under the container",
+      lf("[mcp_servers]", 'mcp.command = "npx"'),
+      "replace those lines by hand with a [mcp_servers.mcp] table (or delete them)",
+    ],
+    [
+      "array-of-tables entry",
+      lf("[[mcp_servers.mcp]]", 'command = "npx"'),
+      "rewrite it by hand as a single [mcp_servers.mcp] table (or delete it)",
+    ],
+    [
+      "entry inside an inline root container",
+      lf('mcp_servers = { mcp = { command = "npx" } }'),
+      "convert the inline mcp_servers = { ... } to [mcp_servers.mcp]-style tables by hand",
+    ],
+  ])("unspliceable %s: the read names a by-hand fix", (_shape, toml, fix) => {
+    const read = readTomlConfig(toml, CONTAINER, [ENTRY]);
+    expect(read.kind).toBe("unspliceable");
+    if (read.kind !== "unspliceable") return;
+    expect(read.fix).toBe(fix);
+    expect(read.remedy).not.toBe(read.fix);
+    // The fix never points at install's preview, which doctor does not print.
+    expect(read.fix).not.toContain("below");
+    expect(read.fix).not.toContain("re-run");
+  });
+
+  it("an inline root container with none of the named entries reads ok, with the container flagged", () => {
+    // The READ is fine and Codex loads the file; it is the WRITE of a
+    // `[mcp_servers.mcp]` header that upsertTomlEntry refuses (see the
+    // "inline root container" refusal elsewhere in this file). The read says
+    // so on the side, so doctor can stop sending the user to that write.
+    const read = readTomlConfig(lf('mcp_servers = { sib = { command = "node" } }'), CONTAINER, [ENTRY]);
+    expect(read.kind).toBe("ok");
+    if (read.kind !== "ok") return;
+    expect(read.entries.map((e) => e.key)).toEqual(["sib"]);
+    expect(read.containerUnspliceable).toEqual({
+      shape: "an inline table (mcp_servers = { ... }) that a later [mcp_servers.mcp] header cannot extend",
+      fix: "convert it to [mcp_servers.mcp]-style tables by hand",
+    });
+    // Null on a header container, and on a pure read (no names to write, so
+    // no write to refuse).
+    const header = readTomlConfig(lf("[mcp_servers.sib]", 'command = "node"'), CONTAINER, [ENTRY]);
+    expect(header.kind === "ok" && header.containerUnspliceable).toBeNull();
+    const pure = readTomlConfig(lf('mcp_servers = { sib = { command = "node" } }'), CONTAINER);
+    expect(pure.kind === "ok" && pure.containerUnspliceable).toBeNull();
   });
 });

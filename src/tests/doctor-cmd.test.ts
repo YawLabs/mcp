@@ -4705,24 +4705,32 @@ describe("runDoctor -- a TOML client config (Codex CLI) is classified by its ada
     expect(claude?.malformed).toBe(false);
   });
 
+  // The fourth unspliceable shape is not a fixture of the codec's: our entry
+  // INSIDE a root-level inline container. It is the one whose by-hand step
+  // differs -- see the byte-exact test below.
+  const ENTRY_IN_INLINE_ROOT = 'mcp_servers = { mcp = { command = "npx" } }\n';
+
   it.each([
-    ["f09-inline"],
-    ["f16-dotted"],
-    ["g10-array-entry"],
-  ])("an unspliceable mcp entry (%s) is reported present, not editable, not a warning", async (id) => {
-    const raw = fixture(id);
+    ["f09-inline", fixture("f09-inline")],
+    ["f16-dotted", fixture("f16-dotted")],
+    ["g10-array-entry", fixture("g10-array-entry")],
+    ["entry inside an inline root container", ENTRY_IN_INLINE_ROOT],
+  ])("an unspliceable mcp entry (%s) is reported present, not editable, not a warning", async (_id, raw) => {
     writeCodexToml(raw);
     const read = classifyClientConfig(raw, codexSite()).read;
-    if (read.kind !== "unspliceable") throw new Error(`fixture ${id} is not unspliceable: ${read.kind}`);
+    if (read.kind !== "unspliceable") throw new Error(`not unspliceable: ${read.kind}`);
+    if (read.fix === undefined) throw new Error("the TOML adapter always names a fix");
     const cap = captureOut();
     const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
     const row = codexRow(r.snapshot.clients);
     expect(row?.hasMcpEntry).toBe(true);
     expect(row?.malformed).toBe(false);
-    expect(row?.entryUnspliceable).toBe(read.reason);
+    // The reason AND the fix are the adapter's own, not retyped by doctor.
+    expect(row?.entryUnspliceable).toEqual({ reason: read.reason, fix: read.fix });
+    expect(row?.containerUnspliceable).toBeNull();
     expect(row?.launchRuntime).toBeNull();
     expect(clientsRow(cap.text(), CODEX_LABEL).status).toBe(
-      `has "${ENTRY_NAME}" entry, but it is ${read.reason} -- install will not edit it and doctor cannot check its launch command; rewrite that entry by hand as its own table (or delete it), then run \`${CODEX_INSTALL}\``,
+      `has "${ENTRY_NAME}" entry, but it is ${read.reason} -- install will not edit it and doctor cannot check its launch command; ${read.fix}, then run \`${CODEX_INSTALL}\``,
     );
     expect(r.snapshot.config.warnings).toEqual([]);
     expect(r.exitCode).toBe(0);
@@ -4734,8 +4742,55 @@ describe("runDoctor -- a TOML client config (Codex CLI) is classified by its ada
     const cap = captureOut();
     await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
     expect(clientsRow(cap.text(), CODEX_LABEL).status).toBe(
-      `has "${ENTRY_NAME}" entry, but it is an inline table under [mcp_servers] (mcp = { ... }) -- install will not edit it and doctor cannot check its launch command; rewrite that entry by hand as its own table (or delete it), then run \`${CODEX_INSTALL}\``,
+      `has "${ENTRY_NAME}" entry, but it is an inline table under [mcp_servers] (mcp = { ... }) -- install will not edit it and doctor cannot check its launch command; replace that line by hand with a [mcp_servers.mcp] table (or delete it), then run \`${CODEX_INSTALL}\``,
     );
+  });
+
+  it("an entry inside an inline root container gets the container's fix, with no (or delete it)", async () => {
+    // Both halves of the generic clause fail for this shape: adding a
+    // [mcp_servers.mcp] header under `mcp_servers = { ... }` is a TOML
+    // redefinition (the file stops loading for Codex too), and deleting the
+    // entry then running install is refused by upsertTomlEntry on the still
+    // inline container. So the line names the container's conversion alone.
+    writeCodexToml(ENTRY_IN_INLINE_ROOT);
+    const cap = captureOut();
+    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const status = clientsRow(cap.text(), CODEX_LABEL).status;
+    expect(status).toBe(
+      `has "${ENTRY_NAME}" entry, but it is inside the inline table mcp_servers = { ... } -- install will not edit it and doctor cannot check its launch command; convert the inline mcp_servers = { ... } to [mcp_servers.mcp]-style tables by hand, then run \`${CODEX_INSTALL}\``,
+    );
+    expect(status).not.toContain("or delete it");
+  });
+
+  it("an inline root container with no mcp entry (g09-inline-root) is not sent to a refused install run", async () => {
+    // The read is fine -- Codex loads the file, --list says other-entries --
+    // but the `[mcp_servers.mcp]` header install writes would redefine the
+    // inline container, so install exits 1 on it. The row used to fall
+    // through to "present, no entry -- run install", naming exactly that run.
+    const raw = fixture("g09-inline-root");
+    writeCodexToml(raw);
+    const read = classifyClientConfig(raw, codexSite()).read;
+    if (read.kind !== "ok" || read.containerUnspliceable === undefined) {
+      throw new Error(`g09 should read ok with an unspliceable container: ${read.kind}`);
+    }
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const row = codexRow(r.snapshot.clients);
+    expect(row?.hasMcpEntry).toBe(false);
+    expect(row?.containerEntries).toBeGreaterThan(0);
+    expect(row?.containerBlocked).toBeNull();
+    expect(row?.entryUnspliceable).toBeNull();
+    expect(row?.containerUnspliceable).toEqual(read.containerUnspliceable);
+    expect(clientsRow(cap.text(), CODEX_LABEL).status).toBe(
+      `present, no "${ENTRY_NAME}" entry, but the container is an inline table (mcp_servers = { ... }) that a later [mcp_servers.mcp] header cannot extend -- install refuses to write into it; convert it to [mcp_servers.mcp]-style tables by hand, then run \`${CODEX_INSTALL}\``,
+    );
+    expect(cap.text()).not.toContain(`present, no "${ENTRY_NAME}" entry -- run`);
+    expect(r.snapshot.config.warnings).toEqual([]);
+    expect(r.exitCode).toBe(0);
+    expect(probeUsable(row!)).toBe(false);
+    // The same row through the async probe, which --list reads.
+    const asyncRow = codexRow(await probeClientsAsync({ home: synthHome, os: "linux", cwd: synthCwd }));
+    expect(asyncRow).toEqual(row);
   });
 
   it("launch checks run on a TOML entry: a missing absolute command", async () => {
@@ -4803,7 +4858,7 @@ describe("runDoctor -- a TOML client config (Codex CLI) is classified by its ada
     expect(asyncRow?.malformed).toBe(false);
   });
 
-  it("--json: every clients[] slot carries syntax and entryUnspliceable", async () => {
+  it("--json: every clients[] slot carries syntax, entryUnspliceable and containerUnspliceable", async () => {
     writeCodexToml(fixture("f05-identical"));
     const r = await runDoctor({
       cwd: synthCwd,
@@ -4821,11 +4876,13 @@ describe("runDoctor -- a TOML client config (Codex CLI) is classified by its ada
         scope: string;
         unavailable: boolean;
         syntax: string;
-        entryUnspliceable: string | null;
+        entryUnspliceable: { reason: string; fix: string } | null;
+        containerUnspliceable: { reason: string; fix: string } | null;
       }>;
     };
     expect(parsed.clients.every((c) => "syntax" in c)).toBe(true);
     expect(parsed.clients.every((c) => "entryUnspliceable" in c)).toBe(true);
+    expect(parsed.clients.every((c) => "containerUnspliceable" in c)).toBe(true);
     const claudeCode = parsed.clients.filter((c) => c.clientId === "claude-code");
     expect(claudeCode.length).toBeGreaterThan(0);
     expect(claudeCode.every((c) => c.syntax === "JSON")).toBe(true);
@@ -4836,7 +4893,9 @@ describe("runDoctor -- a TOML client config (Codex CLI) is classified by its ada
     const desktop = parsed.clients.find((c) => c.clientId === "claude-desktop");
     expect(desktop?.unavailable).toBe(true);
     expect(desktop?.syntax).toBe("JSON");
-    expect(parsed.clients.filter((c) => c.syntax === "JSON").every((c) => c.entryUnspliceable === null)).toBe(true);
+    const jsonRows = parsed.clients.filter((c) => c.syntax === "JSON");
+    expect(jsonRows.every((c) => c.entryUnspliceable === null)).toBe(true);
+    expect(jsonRows.every((c) => c.containerUnspliceable === null)).toBe(true);
   });
 
   // The JSON classifier still owns JSON rows: the drive-letter-case fold over

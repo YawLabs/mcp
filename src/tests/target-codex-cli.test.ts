@@ -45,6 +45,7 @@ import {
   reloadDoneClause,
   resetConfigAdapterRegistry,
 } from "../client-config.js";
+import { readTomlConfig } from "../client-config-toml.js";
 import { runDoctor } from "../doctor-cmd.js";
 import { type BundlesSummary, runInstall } from "../install-cmd.js";
 import {
@@ -627,6 +628,12 @@ describe("install refuses rather than corrupt a file", () => {
       expect(view.read).toMatchObject({ kind: "unspliceable", key: ENTRY_NAME });
       const reason = view.read.kind === "unspliceable" ? view.read.reason : "";
       expect(reason).toMatch(shape);
+      // The codec's by-hand `fix` reaches the core read too (doctor prints
+      // it); its splice-facing `remedy` deliberately does not.
+      const codec = readTomlConfig(raw, ["mcp_servers"], [ENTRY_NAME]);
+      if (codec.kind !== "unspliceable") throw new Error(`codec says ${codec.kind}`);
+      expect(view.read).toMatchObject({ fix: codec.fix });
+      expect(view.read).not.toHaveProperty("remedy");
       // An `unspliceable` read refuses every edit through the facade --
       // install AND uninstall -- which is the safe end of the trade: the
       // splice has no table span it can take (or, for an array of tables,
@@ -659,6 +666,19 @@ describe("install refuses rather than corrupt a file", () => {
     expect(view.read).toMatchObject({ kind: "ok", containerPresent: true });
     expect(view.otherServerKeys()).toEqual(["sib"]);
     expect(refusalOf(() => installThrough(raw, site))).toContain("an inline table, which cannot gain an entry");
+    // The read says on the side that this write is refused, so doctor does
+    // not send the user to it. Absent (not null) on a header container: the
+    // field is optional on the core union so a sibling adapter written
+    // before it compiles unchanged.
+    expect(view.read).toMatchObject({
+      containerUnspliceable: {
+        reason: "an inline table (mcp_servers = { ... }) that a later [mcp_servers.mcp] header cannot extend",
+        fix: "convert it to [mcp_servers.mcp]-style tables by hand",
+      },
+    });
+    const header = classifyClientConfig(fixture("f03-siblings"), site, { transform: CODEX.entry });
+    expect(header.read.kind).toBe("ok");
+    expect(header.read).not.toHaveProperty("containerUnspliceable");
   });
 });
 
