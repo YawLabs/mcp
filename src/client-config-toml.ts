@@ -1203,7 +1203,15 @@ interface ShapeProblem {
    *  it is per shape because one clause is not true of every shape: an entry
    *  inside an inline `mcp_servers = { ... }` can neither be rewritten as its
    *  own header (a redefinition) nor deleted and re-installed (the container
-   *  refuses the header too); only converting the container works. */
+   *  refuses the header too); only converting the container works.
+   *
+   *  Where a new table is called for it is placed AT THE END OF THE FILE, and
+   *  the wording says so. Doctor prints no table to copy, and "replace that
+   *  line with a table" read literally puts the header where the line was --
+   *  so every key after it in the same section (a sibling server, a root
+   *  setting) becomes a key of our entry, and the next install, which replaces
+   *  our entry's whole section, deletes it with nothing to flag the loss. A
+   *  header at the end of the file owns only the lines written under it. */
   fix: string;
   /** True when `removeTomlEntry` can still delete it: the entry occupies whole
    *  lines under a header, so there is a span to take. False when there is no
@@ -1248,7 +1256,7 @@ function entryShapeProblem(
     return {
       shape: `written as dotted keys at the top level (${entryPath.join(".")}.command = ...)`,
       remedy: `only a ${headerLabel} table can be rewritten in place -- replace those lines with the table below by hand (or delete them and re-run)`,
-      fix: `replace those lines by hand with a ${headerLabel} table (or delete them)`,
+      fix: `move those lines by hand into a ${headerLabel} table at the end of the file (or delete them)`,
       removable: false,
     };
   }
@@ -1257,7 +1265,7 @@ function entryShapeProblem(
     return {
       shape: `written as dotted keys under [${containerLabel}] (${name}.command = ...)`,
       remedy: `only a ${headerLabel} table can be rewritten in place -- replace those lines with the table below by hand (or delete them and re-run)`,
-      fix: `replace those lines by hand with a ${headerLabel} table (or delete them)`,
+      fix: `move those lines by hand into a ${headerLabel} table at the end of the file (or delete them)`,
       removable: false,
     };
   }
@@ -1265,7 +1273,7 @@ function entryShapeProblem(
     return {
       shape: `an inline table under [${containerLabel}] (${name} = { ... })`,
       remedy: `only a ${headerLabel} table can be rewritten in place -- replace that line with the table below by hand (or delete it and re-run)`,
-      fix: `replace that line by hand with a ${headerLabel} table (or delete it)`,
+      fix: `move that line by hand into a ${headerLabel} table at the end of the file (or delete it)`,
       removable: false,
     };
   }
@@ -1283,7 +1291,7 @@ function entryShapeProblem(
   return {
     shape: `not written as a ${headerLabel} table`,
     remedy: `only a ${headerLabel} table can be rewritten in place -- replace it with the table below by hand (or delete it and re-run)`,
-    fix: `replace it by hand with a ${headerLabel} table (or delete it)`,
+    fix: `move it by hand into a ${headerLabel} table at the end of the file (or delete it)`,
     removable: false,
   };
 }

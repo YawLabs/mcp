@@ -4742,7 +4742,7 @@ describe("runDoctor -- a TOML client config (Codex CLI) is classified by its ada
     const cap = captureOut();
     await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
     expect(clientsRow(cap.text(), CODEX_LABEL).status).toBe(
-      `has "${ENTRY_NAME}" entry, but it is an inline table under [mcp_servers] (mcp = { ... }) -- install will not edit it and doctor cannot check its launch command; replace that line by hand with a [mcp_servers.mcp] table (or delete it), then run \`${CODEX_INSTALL}\``,
+      `has "${ENTRY_NAME}" entry, but it is an inline table under [mcp_servers] (mcp = { ... }) -- install will not edit it and doctor cannot check its launch command; move that line by hand into a [mcp_servers.mcp] table at the end of the file (or delete it), then run \`${CODEX_INSTALL}\``,
     );
   });
 

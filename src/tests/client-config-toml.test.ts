@@ -2136,17 +2136,17 @@ describe("codex agreement table", () => {
     [
       "inline entry",
       lf("[mcp_servers]", 'mcp = { command = "npx" }'),
-      "replace that line by hand with a [mcp_servers.mcp] table (or delete it)",
+      "move that line by hand into a [mcp_servers.mcp] table at the end of the file (or delete it)",
     ],
     [
       "root dotted keys",
       lf('mcp_servers.mcp.command = "npx"'),
-      "replace those lines by hand with a [mcp_servers.mcp] table (or delete them)",
+      "move those lines by hand into a [mcp_servers.mcp] table at the end of the file (or delete them)",
     ],
     [
       "dotted keys under the container",
       lf("[mcp_servers]", 'mcp.command = "npx"'),
-      "replace those lines by hand with a [mcp_servers.mcp] table (or delete them)",
+      "move those lines by hand into a [mcp_servers.mcp] table at the end of the file (or delete them)",
     ],
     [
       "array-of-tables entry",
@@ -2167,6 +2167,64 @@ describe("codex agreement table", () => {
     // The fix never points at install's preview, which doctor does not print.
     expect(read.fix).not.toContain("below");
     expect(read.fix).not.toContain("re-run");
+  });
+
+  // The printed fix, FOLLOWED LITERALLY, must not cost the user anything. A
+  // sibling sits after our entry in each file. "Replace that line with a
+  // table" done in place would pull the sibling under the new header, and the
+  // install that follows replaces our entry's whole section -- deleting it
+  // with verifyTomlSplice satisfied, since the key is now inside the entry.
+  // The fix says "at the end of the file", so this does exactly that: removes
+  // the entry's own lines, appends its table last, installs, and checks every
+  // sibling and root key is still there.
+  it.each([
+    {
+      shape: "inline entry",
+      toml: lf("[mcp_servers]", 'mcp = { command = "a" }', 'other = { command = "b" }'),
+      entryLines: ['mcp = { command = "a" }'],
+      siblings: ["other"],
+      rootKeys: [],
+    },
+    {
+      shape: "dotted keys under the container",
+      toml: lf("[mcp_servers]", 'mcp.command = "a"', 'other.command = "b"'),
+      entryLines: ['mcp.command = "a"'],
+      siblings: ["other"],
+      rootKeys: [],
+    },
+    {
+      shape: "root dotted keys",
+      toml: lf('mcp_servers.mcp.command = "a"', 'model = "o3"', "[mcp_servers.other]", 'command = "b"'),
+      entryLines: ['mcp_servers.mcp.command = "a"'],
+      siblings: ["other"],
+      rootKeys: ["model"],
+    },
+  ])("following the $shape fix literally, then installing, keeps every sibling", ({
+    toml,
+    entryLines,
+    siblings,
+    rootKeys,
+  }) => {
+    const read = readTomlConfig(toml, CONTAINER, [ENTRY]);
+    expect(read.kind).toBe("unspliceable");
+    if (read.kind !== "unspliceable") return;
+    expect(read.fix).toContain("at the end of the file");
+
+    // The user's edit: take the entry's lines out, add its table at the end.
+    const kept = toml.split("\n").filter((line) => !entryLines.includes(line));
+    const edited = `${kept.join("\n").replace(/\n+$/, "")}\n[mcp_servers.mcp]\ncommand = "a"\n`;
+    const afterEdit = readTomlConfig(edited, CONTAINER, [ENTRY]);
+    expect(afterEdit.kind).toBe("ok");
+
+    const installed = upsertTomlEntry(edited, CONTAINER, ENTRY, BROKER);
+    const after = readTomlConfig(installed, CONTAINER, [ENTRY]);
+    expect(after.kind).toBe("ok");
+    if (after.kind !== "ok") return;
+    const names = after.entries.map((e) => e.key);
+    for (const sibling of siblings) expect(names).toContain(sibling);
+    expect(names).toContain(ENTRY);
+    const root = parseTomlConfig(installed) as Record<string, unknown>;
+    for (const key of rootKeys) expect(root).toHaveProperty(key);
   });
 
   it("an inline root container with none of the named entries reads ok, with the container flagged", () => {
