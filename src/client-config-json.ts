@@ -222,11 +222,13 @@ function messageOf(err: unknown): string {
  *
  *  EXPORTED because `classifyJson` is not the only thing that has to answer
  *  "would the client load this file". The doctor / `install --list` probe
- *  classifies client configs on its own path (it folds drive-letter-case
- *  project keys and inspects the launch entry, neither of which this adapter
- *  does), and it has to ask that question with THIS function rather than a
- *  JSON.parse of its own: a probe that disagreed with the write facade would
- *  report a file install REFUSES as fine, or the reverse. */
+ *  classifies JSON-family client configs on its own path (it folds
+ *  drive-letter-case project keys, which this adapter does not), and it has
+ *  to ask that question with THIS function rather than a JSON.parse of its
+ *  own: a probe that disagreed with the write facade would report a file
+ *  install REFUSES as fine, or the reverse. A non-JSON file (Codex CLI's
+ *  config.toml) never reaches that path -- the probe classifies it through
+ *  its registered adapter instead. */
 export function readStrictJson(raw: string): { ok: true; parsed: unknown } | { ok: false; violation: StrictViolation } {
   const { text, had } = stripBom(raw);
   try {

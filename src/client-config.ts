@@ -21,9 +21,12 @@
 //     strict JSON), which delegates every splice to jsonc.ts so it inherits
 //     that module's byte-preservation contract.
 //   * a sibling module -- one more adapter per syntax, registered through
-//     `registerConfigAdapter`. The `"toml"` format is DECLARED here and has
-//     no adapter in this build: `adapterFor("toml")` throws
-//     MissingConfigAdapterError until one is registered.
+//     `registerConfigAdapter`. The `"toml"` format is read by the adapter
+//     target-codex-cli.ts registers at module scope, which any importer of
+//     install-targets.ts gets; install, uninstall, try, import, doctor and
+//     install --list all read a TOML file through this core. A format with
+//     no registered adapter makes `adapterFor` throw
+//     MissingConfigAdapterError.
 //
 // NO AMBIENT READS. This module reads `process.env` at exactly one place --
 // the default argument of `readClientEnv` -- and the filesystem at exactly
@@ -64,9 +67,10 @@ import {
  *  skips. Strictness is therefore a property the TARGET declares (see
  *  `effectiveConfigFormat`), never a guess about the bytes.
  *
- *  `"toml"` is declared with no adapter in this build. It is part of the union
- *  so `adapterFor` can refuse it by name instead of a consumer discovering
- *  the gap as a parse failure. */
+ *  `"toml"` is read by the adapter target-codex-cli.ts registers at module
+ *  scope (any importer of install-targets.ts gets it). It is still `adapterFor`
+ *  that resolves it, so a build without that registration refuses the format
+ *  by name instead of a consumer discovering the gap as a parse failure. */
 export type ConfigFormat = "json" | "jsonc" | "toml";
 
 /** Every DECLARED format, for a caller that has to enumerate them. Not "every
@@ -79,7 +83,24 @@ export const CONFIG_FORMATS: readonly ConfigFormat[] = ["json", "jsonc", "toml"]
 export type SyntaxName = "JSON" | "TOML";
 
 export function syntaxNameFor(format: ConfigFormat): SyntaxName {
-  return format === "toml" ? "TOML" : "JSON";
+  switch (format) {
+    case "json":
+    case "jsonc":
+      return "JSON";
+    case "toml":
+      return "TOML";
+    default: {
+      const _exhaustive: never = format;
+      return _exhaustive;
+    }
+  }
+}
+
+/** The container a syntax keeps its server map in, as the full noun phrase a
+ *  sentence needs: "not a JSON object", "not a TOML table". It returns the
+ *  article too, so a template cannot double a word. */
+export function containerNounFor(syntax: SyntaxName): string {
+  return syntax === "TOML" ? "a TOML table" : "a JSON object";
 }
 
 /** Where a client keeps its server map, as data.

@@ -73,6 +73,7 @@ import {
   type ConfigSite,
   classifyClientConfig,
   containerKeysAt,
+  containerNounFor,
   importViewOf,
   readClientConfigFile,
   siteAt,
@@ -537,26 +538,28 @@ async function readContainer(ref: ContainerRef): Promise<ContainerRead> {
       fix: (then) => `check the file and its permissions, then ${then}`,
     };
   }
-  // `read.syntax` is the adapter's own name for the file's language. Every
-  // client `import` can read today is JSON-family, where that name is "JSON",
-  // so both clauses are byte-identical to the literals they replace.
+  // `read.syntax` and `view.adapter.syntax` are the adapter's own name for the
+  // file's language. A JSON-family client says "JSON", byte-identical to the
+  // literals these clauses replaced; Codex CLI's config.toml (its row declares
+  // `forImport`, so import reads it) says "TOML", and so does the remedy.
   if (read.kind === "malformed") {
     return {
       state: "refused",
       clause:
         read.reason === "root" ? `${where} is not a ${read.syntax} object` : `${where} is not valid ${read.syntax}`,
       installSays: `refuses to overwrite ${where}`,
-      fix: unparseableConfigFix,
+      fix: (then: string) => unparseableConfigFix(then, read.syntax),
     };
   }
   if (read.kind === "blocked") {
     if (!read.reparable) {
       const keyPath = `"${read.path.join(".")}" in ${where}`;
+      const syntax = view.adapter.syntax;
       return {
         state: "refused",
-        clause: `${keyPath} is ${read.shape}, not a JSON object`,
+        clause: `${keyPath} is ${read.shape}, not ${containerNounFor(syntax)}`,
         installSays: `refuses to overwrite ${keyPath}`,
-        fix: blockedContainerFix,
+        fix: (then: string) => blockedContainerFix(then, syntax),
       };
     }
     return { state: "none" };
@@ -855,10 +858,10 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
     //
     // Only `entry` is read today, and that is the whole of what the importer
     // asks for: `disabled`, `skipReason` and `discardedKeys` arrive on an
-    // ImportView only from a `forImport` hook, no row declares one in this
-    // build, and wiring three branches nothing can reach would be three
-    // untested claims rather than three features. They belong to the package
-    // that adds the first hook.
+    // ImportView only from a `forImport` hook. Codex CLI's row declares one
+    // (target-codex-cli.ts), so a TOML entry reaches this line through it, but
+    // the importer does not act on those three fields yet -- wiring them is
+    // separate work, with its own tests, not a side effect of reading TOML.
     const built = toEntry(key, importViewOf(value as Record<string, unknown>, target.entry).entry, vars);
     if (!built) {
       unusable.push(key);

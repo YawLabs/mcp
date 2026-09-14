@@ -778,8 +778,14 @@ async function autoDetectClient(opts: {
   // First: any client whose config file already exists AND whose contents
   // doctor could read (the user is actively using it, and `try` will be able
   // to splice into it).
+  //
+  // JSON-family files only. A trial marker records no syntax and peels with
+  // format "jsonc" (markerSite), so a trial auto-written into a non-JSON file
+  // (Codex CLI's config.toml) could never be cleaned up by try-cleanup or
+  // doctor's trial GC. Auto-detect keeps to JSON-family files until the marker
+  // records one; an explicit --client is unaffected.
   for (const p of probes) {
-    if (probeUsable(p)) return { clientId: p.clientId, scope: p.scope };
+    if (probeUsable(p) && p.syntax === "JSON") return { clientId: p.clientId, scope: p.scope };
   }
   // Second: any client that's available on this OS (config file not
   // yet created -- we'll create it). claude-code is availableOn every
