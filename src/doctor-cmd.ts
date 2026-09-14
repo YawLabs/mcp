@@ -41,7 +41,18 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, posix, resolve, win32 } from "node:path";
 import { cliToNamespaces } from "./cli-shadows.js";
-import { effectiveConfigFormat, readClientEnv, unloadableConfigProblem } from "./client-config.js";
+import {
+  type ConfigFormat,
+  type ConfigSite,
+  classifyClientConfig,
+  containerNounFor,
+  type EntryTransform,
+  effectiveConfigFormat,
+  readClientEnv,
+  type SyntaxName,
+  syntaxNameFor,
+  unloadableConfigProblem,
+} from "./client-config.js";
 import { readStrictJson } from "./client-config-json.js";
 import {
   CURRENT_SCHEMA_VERSION,
@@ -71,7 +82,7 @@ import {
   type InstallOS,
   type InstallScope,
   resolveAppDataDir,
-  resolveInstallPath,
+  resolveInstallSites,
   unloadableConfigFix,
   unparseableConfigFix,
 } from "./install-targets.js";
@@ -401,16 +412,45 @@ export interface ClientProbeResult {
   path: string;
   exists: boolean;
   hasMcpEntry: boolean;
-  /** How many keys the JSON object at the slot's container path holds
+  /** The language of the file this slot reads, as its row and scope resolve
+   *  it (`syntaxNameFor(effectiveConfigFormat(...))`): "JSON" for every
+   *  JSON-family row, strict or not, and "TOML" for Codex CLI. Present on
+   *  every slot, unavailable ones included. It words the malformed and blocked
+   *  lines, so a config.toml is never told to "fix the JSON". Additive JSON
+   *  field. */
+  syntax: SyntaxName;
+  /** Set when yaw-mcp's "mcp" entry is present but spelled in a way install
+   *  will not rewrite -- whatever spelling the file's adapter refuses: for TOML
+   *  an inline table, dotted keys, an array of tables, or an entry inside an
+   *  inline `mcp_servers = { ... }`. `reason` is the adapter's clause verbatim
+   *  ("an inline table under [mcp_servers] (mcp = { ... })") and `fix` its
+   *  by-hand step for that shape (the status line appends "then run
+   *  install"). Null otherwise, and on every JSON-family row. `hasMcpEntry` is
+   *  true on such a row, but its launch command goes unchecked and
+   *  `containerEntries` is 0: the read carries no entries. Additive JSON
+   *  field. */
+  entryUnspliceable: { reason: string; fix: string } | null;
+  /** Set when the file reads fine and holds no "mcp" entry, but the container
+   *  cannot take one: a TOML root-level inline `mcp_servers = { ... }`, which
+   *  the `[mcp_servers.mcp]` header install writes would redefine, so install
+   *  refuses the write. Same shape as `entryUnspliceable`; the two are
+   *  mutually exclusive (an entry inside such a container is reported as the
+   *  entry's problem). Without it the row read "present, no entry -- run
+   *  install", and that run exits 1. Not a warning: the client loads the file
+   *  as it is. Null otherwise, and on every JSON-family row. Additive JSON
+   *  field. */
+  containerUnspliceable: { reason: string; fix: string } | null;
+  /** How many keys the container at the slot's container path holds
    *  (`mcpServers`; `servers` for VS Code; `projects[<dir>].mcpServers` for
-   *  Claude Code's local scope), yaw-mcp's own entry and any legacy one
+   *  Claude Code's local scope; `mcp_servers` for Codex CLI), yaw-mcp's own entry and any legacy one
    *  included. That object only, never the whole file: Claude Code's user and
    *  local slots read the same .claude.json and each counts its own list. 0
    *  when there is nothing to count: no file, a file that could not be read or
    *  parsed, or one that parses with no such object or an empty one (what
-   *  `uninstall` leaves behind once it removes the last entry). `install
-   *  --list` tells `other-entries` from `no-entries` by it. Additive JSON
-   *  field. */
+   *  `uninstall` leaves behind once it removes the last entry) -- and 0 on an
+   *  `entryUnspliceable` row, whose adapter read carries no entries, siblings
+   *  or not. `install --list` tells `other-entries` from `no-entries` by it.
+   *  Additive JSON field. */
   containerEntries: number;
   /** Pre-rename `"mcp.hosting"` key still in the container. Surfaced because
    *  the client launches it too, so the user is running yaw-mcp twice --
@@ -428,8 +468,9 @@ export interface ClientProbeResult {
    *  Same division of labour as the field above: the clause names an install
    *  run where one is the remedy, and install is what removes the key. */
   legacyEntryName: string | null;
-  /** The file exists but its content did not PARSE as a JSON object. Never
-   *  set for a read failure -- that is `unreadable`. */
+  /** The file exists but its content did not parse in its own syntax (see
+   *  `syntax`): invalid JSON or a non-object JSON root, or TOML that does not
+   *  parse. Never set for a read failure -- that is `unreadable`. */
   malformed: boolean;
   /** The file parses for yaw-mcp but NOT for the client that owns it: a
    *  STRICT-JSON site (claude-code's project `.mcp.json` -- see `strictJson`
@@ -468,11 +509,14 @@ export interface ClientProbeResult {
    *  whose wording node reshapes across versions. */
   unreadableCode: string | null;
   /** The container key install cannot splice its entry into, worded for a
-   *  message (`"mcpServers" is an array of 2`), or null. Set only for a key
-   *  findBlockedContainerSegment reports as NOT reparable -- the shape install
-   *  REFUSES with exit 1. A reparable one (null, a scalar, an empty array)
-   *  stays null: install replaces it with `{}`, so the ordinary "run install"
-   *  line is true there. Additive JSON field. */
+   *  message (`"mcpServers" is an array of 2`), or null -- the shape install
+   *  REFUSES with exit 1. On a JSON-family row it is set only for a key
+   *  findBlockedContainerSegment reports as NOT reparable; a reparable one
+   *  (null, a scalar, an empty array) stays null, because install replaces it
+   *  with `{}` and the ordinary "run install" line is true there. On a
+   *  non-JSON row it is whatever the file's adapter reports as blocked: a TOML
+   *  container is never repaired in place, so any non-table `mcp_servers` --
+   *  a scalar and an empty array included -- sets it. Additive JSON field. */
   containerBlocked: string | null;
   unavailable: boolean;
   /** On an `unavailable` row whose client DOES ship on this OS but that
@@ -731,7 +775,19 @@ export function probeUsable(c: ClientProbeResult): boolean {
   // refusal, with a readable config sitting one slot along. A REMOVAL into
   // such a file stays allowed (see try-cmd's markerSite) -- this is the
   // choose-a-target gate, not the peel.
-  return !c.unavailable && c.exists && !c.malformed && c.unreadable === null && c.unloadable === null;
+  // `entryUnspliceable` excluded too: try's peel and write refuse an entry
+  // install will not edit, so auto-detect must not pick that file either.
+  // `containerUnspliceable` the same: the write of a trial entry into an
+  // inline container is the very write upsert refuses.
+  return (
+    !c.unavailable &&
+    c.exists &&
+    !c.malformed &&
+    c.unreadable === null &&
+    c.unloadable === null &&
+    c.entryUnspliceable === null &&
+    c.containerUnspliceable === null
+  );
 }
 
 /** True for every probe state renderClientStatus describes as "the client
@@ -2282,15 +2338,19 @@ function renderClientStatus(c: ClientProbeResult, installCmd: string): string {
   // unparseableConfigFix), so the old "fix or rerun `yaw-mcp install`" offered
   // a rerun that could only hit that refusal. The remedy is install's own,
   // from the one helper both surfaces call, and names this row's command.
+  // The syntax word is the row's own (`c.syntax`), so a config.toml that does
+  // not parse says TOML and names the TOML fix.
   if (c.malformed) {
-    return `exists but JSON is malformed -- install refuses to overwrite it; ${unparseableConfigFix(`run \`${installCmd}\``)}`;
+    return `exists but ${c.syntax} is malformed -- install refuses to overwrite it; ${unparseableConfigFix(`run \`${installCmd}\``, c.syntax)}`;
   }
   // The same trap one level down: the file parses, but a key on the way to the
-  // entry holds a non-empty array, which install refuses rather than drop (see
-  // findBlockedContainerSegment). It used to fall through to "present, no
-  // entry -- run install", and running it exits 1.
+  // entry holds a shape install refuses rather than drop -- a non-empty array
+  // on a JSON-family row (see findBlockedContainerSegment), any non-table
+  // `mcp_servers` on a TOML row, whose adapter repairs nothing in place. It
+  // used to fall through to "present, no entry -- run install", and running
+  // it exits 1.
   if (c.containerBlocked !== null) {
-    return `present, but ${c.containerBlocked}, not a JSON object -- install refuses to overwrite it; ${blockedContainerFix(`run \`${installCmd}\``)}`;
+    return `present, but ${c.containerBlocked}, not ${containerNounFor(c.syntax)} -- install refuses to overwrite it; ${blockedContainerFix(`run \`${installCmd}\``, c.syntax)}`;
   }
   // The file parses for US and not for its client -- strict JSON (Claude
   // Code's project `.mcp.json`) carrying a comment or a trailing comma. Every
@@ -2307,6 +2367,27 @@ function renderClientStatus(c: ClientProbeResult, installCmd: string): string {
   // repairs that key and is then refused by the unloadable gate.
   if (c.unloadable !== null) {
     return `exists but ${c.unloadable} -- install refuses to write into it; ${unloadableConfigFix(`run \`${installCmd}\``)}`;
+  }
+  // Our entry is there, but in a spelling install will not rewrite (for TOML:
+  // an inline table, dotted keys, an array of tables, or an entry inside an
+  // inline `mcp_servers = { ... }`). Present, so not "no entry"; not a
+  // warning, since the client may well load it; but its launch command went
+  // unchecked -- the adapter's read carries no entries -- so the line says so
+  // rather than reporting OK. The by-hand step is the ADAPTER's, per shape:
+  // "rewrite it as its own table (or delete it)" is what three of those
+  // shapes need and exactly wrong for the fourth, where a new header would
+  // redefine the inline container and a deletion leaves it just as
+  // unextendable.
+  if (c.entryUnspliceable !== null) {
+    return `has "${ENTRY_NAME}" entry, but it is ${c.entryUnspliceable.reason} -- install will not edit it and doctor cannot check its launch command; ${c.entryUnspliceable.fix}, then run \`${installCmd}\``;
+  }
+  // No entry, and the container cannot take one: a TOML inline
+  // `mcp_servers = { ... }`, which the header install writes would redefine.
+  // The file loads as it is, so not a warning -- but the "present, no entry
+  // -- run install" line below would name a run that exits 1, the same
+  // fall-through the containerBlocked branch exists to prevent.
+  if (c.containerUnspliceable !== null) {
+    return `present, no "${ENTRY_NAME}" entry, but the container is ${c.containerUnspliceable.reason} -- install refuses to write into it; ${c.containerUnspliceable.fix}, then run \`${installCmd}\``;
   }
   // Checked BEFORE the combined legacy branch: a launch command that no longer
   // exists is the one state that means the client cannot start yaw-mcp AT ALL,
@@ -2397,7 +2478,7 @@ interface ProbeOptions {
   home: string;
   os: InstallOS;
   cwd: string;
-  /** Windows %APPDATA% override, threaded to resolveInstallPath so the
+  /** Windows %APPDATA% override, threaded to resolveInstallSites so the
    *  claude-desktop path stays inside a test's synthetic home. Derived from
    *  home at the call sites whenever home itself is overridden -- without
    *  it, a home override was NOT hermetic for the one client that lives
@@ -2438,24 +2519,29 @@ interface ProbeOptions {
  *  results are already final. */
 interface ProbeSlot {
   result: ClientProbeResult;
-  /** `strict` is the SITE's declared strictness, never a guess about the
-   *  bytes: `effectiveConfigFormat` narrowed by the scope's `strictJson`,
-   *  exactly as `resolveInstallSites` narrows it for the write path. It is
-   *  what lets the classification ask "would this client load the file"
-   *  (readStrictJson) instead of only "can we read it" -- and threading it
-   *  from HERE is what keeps the probe and the write facade agreeing about
-   *  one file, rather than doctor calling a config install refuses healthy. */
-  read: { path: string; containerPath: string[]; strict: boolean } | null;
+  /** `site` is the SITE install itself resolves (`resolveInstallSites`), so
+   *  its `format` is the declared one, never a guess about the bytes:
+   *  `effectiveConfigFormat` narrowed by the scope's `strictJson`, exactly as
+   *  the write path narrows it. The format is what picks the classifier (see
+   *  classifyProbe) -- doctor's JSON walk for a JSON-family file, the
+   *  registered adapter for anything else -- and, for JSON, what lets the walk
+   *  ask "would this client load the file" (readStrictJson) instead of only
+   *  "can we read it". Threading it from HERE is what keeps the probe and the
+   *  write facade agreeing about one file, rather than doctor calling a config
+   *  install reads fine malformed. `transform` is the row's entry transform,
+   *  which the adapter path hands the core like install does. */
+  read: { path: string; site: ConfigSite; transform: EntryTransform | undefined } | null;
 }
 
 /** The content-derived part of a ClientProbeResult -- everything a slot does
- *  not already know before its file is read. The empty skeleton and
- *  classifyProbeContent are both typed against it, so a field added to
- *  ClientProbeResult that neither sets is a compile error rather than an
- *  `undefined` in the --json blob. */
+ *  not already know before its file is read. The empty skeleton and both
+ *  classifiers (classifyProbeContent, classifyProbeViaAdapter) are typed
+ *  against it, so a field added to ClientProbeResult that none of them sets
+ *  is a compile error rather than an `undefined` in the --json blob.
+ *  `syntax` is omitted because the slot knows it before any read. */
 type ProbeClassification = Omit<
   ClientProbeResult,
-  "clientId" | "scope" | "path" | "exists" | "unavailable" | "unavailableReason"
+  "clientId" | "scope" | "path" | "exists" | "unavailable" | "unavailableReason" | "syntax"
 >;
 
 // The "nothing found" probe skeleton, in ONE place. classifyProbeContent
@@ -2480,6 +2566,8 @@ const EMPTY_PROBE: Readonly<ProbeClassification> = {
   launchOamEntryMissing: null,
   launchForeignPath: null,
   entryProjectKey: null,
+  entryUnspliceable: null,
+  containerUnspliceable: null,
 };
 
 const MALFORMED: Readonly<ProbeClassification> = { ...EMPTY_PROBE, malformed: true };
@@ -2487,7 +2575,8 @@ const MALFORMED: Readonly<ProbeClassification> = { ...EMPTY_PROBE, malformed: tr
 /** What a slot reports when its config file's BYTES could not be read.
  *  Distinct from MALFORMED on purpose: both probes used to wrap the read AND
  *  the classification in one catch that assigned MALFORMED, but
- *  classifyProbeContent has its own catch for parse failures, so that outer
+ *  classifyProbeContent has its own catch for parse failures (and the adapter
+ *  path answers `malformed` without throwing), so that outer
  *  catch only ever saw READ errors -- and reported a directory at
  *  ~/.claude.json, or a transient win32 EBUSY, as "JSON is malformed". */
 function unreadableProbe(err: unknown): ProbeClassification {
@@ -2518,6 +2607,7 @@ function* enumerateProbeSlots(opts: ProbeOptions): Generator<ProbeSlot> {
           exists: false,
           unavailable: true,
           ...EMPTY_PROBE,
+          syntax: syntaxNameFor(effectiveConfigFormat(target.config, target.scopes[0])),
           ...(why !== undefined ? { unavailableReason: why } : {}),
         },
         read: null,
@@ -2528,9 +2618,15 @@ function* enumerateProbeSlots(opts: ProbeOptions): Generator<ProbeSlot> {
     // know the path; for project/local we use cwd (typical: the user
     // ran doctor inside the repo they care about).
     for (const scope of target.scopes) {
-      let resolved: ReturnType<typeof resolveInstallPath>;
+      // The FIRST site install resolves for this (client, scope), not a
+      // ConfigSite built by hand: its format is the one install reads and
+      // writes with, so doctor cannot classify a file in a syntax install does
+      // not. `sites[0].resolved` is byte-for-byte what resolveInstallPath
+      // answers for every row (Cline's resolvePath is clineSites(base)[0]
+      // .resolved) -- Cline's per-editor copies are still not probed here.
+      let site: ConfigSite;
       try {
-        resolved = resolveInstallPath({
+        site = resolveInstallSites({
           clientId: target.clientId,
           scope: scope.scope,
           os: opts.os,
@@ -2539,33 +2635,29 @@ function* enumerateProbeSlots(opts: ProbeOptions): Generator<ProbeSlot> {
           projectDir: scope.requiresProjectDir ? opts.cwd : undefined,
           claudeConfigDir: opts.claudeConfigDir,
           clientEnv: opts.clientEnv,
-        });
+        })[0];
       } catch {
-        // resolveInstallPath throws when project is required but missing —
+        // resolveInstallSites throws when project is required but missing —
         // shouldn't happen here since we always pass cwd, but defensive.
         continue;
       }
-      const exists = existsSync(resolved.absolute);
+      // existsSync, not the core's read: the core reads a whitespace-only
+      // file as absent, and this row must still say the file exists.
+      const exists = existsSync(site.resolved.absolute);
       yield {
         result: {
           clientId: target.clientId,
           scope: scope.scope,
-          path: resolved.absolute,
+          path: site.resolved.absolute,
           exists,
           unavailable: false,
           ...EMPTY_PROBE,
+          // The site's own format, resolved the one way the write path
+          // resolves it -- a row added to INSTALL_TARGETS is picked up here
+          // without touching this file.
+          syntax: syntaxNameFor(site.format),
         },
-        read: exists
-          ? {
-              path: resolved.absolute,
-              containerPath: resolved.containerPath,
-              // The scope's own strictness, resolved the one way the write
-              // path resolves it -- claude-code's `.mcp.json` is the single
-              // strict site today, and a row added to INSTALL_TARGETS is
-              // picked up here without touching this file.
-              strict: effectiveConfigFormat(target.config, scope) === "json",
-            }
-          : null,
+        read: exists ? { path: site.resolved.absolute, site, transform: target.entry } : null,
       };
     }
   }
@@ -2586,8 +2678,7 @@ function probeClients(opts: ProbeOptions): ClientProbeResult[] {
       } catch (err) {
         Object.assign(result, unreadableProbe(err));
       }
-      if (raw !== null)
-        Object.assign(result, classifyProbeContent(raw, read.containerPath, read.strict, existsSync, platform));
+      if (raw !== null) Object.assign(result, classifyProbe(raw, read, existsSync, platform));
     }
     out.push(result);
   }
@@ -2702,7 +2793,7 @@ export function oamRunEntryPath(command: string, args: readonly string[]): strin
 }
 
 /** The `run` half of oamRunEntryPath, over an already-unwrapped oam argv --
- *  so classifyProbeContent, which needs the unwrap's oam token as well, does
+ *  so launchChecks, which needs the unwrap's oam token as well, does
  *  not unwrap the same entry twice. */
 function oamRunEntryFromTokens(tokens: readonly string[]): string | null {
   // Leading flags belong to oam itself; the first bare token is the subcommand.
@@ -2711,8 +2802,192 @@ function oamRunEntryFromTokens(tokens: readonly string[]): string | null {
   return tokens.slice(sub + 1).find((t) => !t.startsWith("-")) ?? null;
 }
 
-/** Classify raw config file content for a probe result. Shared by both
- *  the sync and async probe variants so the parsing logic lives once.
+/** Formats doctor's own JSON walk (classifyProbeContent) classifies. An
+ *  ALLOW-list: any other format -- today toml, tomorrow whatever registers an
+ *  adapter -- goes to its adapter, so a new syntax can never fall into
+ *  parseJsonc again and be reported as malformed JSON. */
+const JSON_PROBE_FORMATS: ReadonlySet<ConfigFormat> = new Set<ConfigFormat>(["json", "jsonc"]);
+
+/** Classify one slot's bytes with the classifier its SITE's format calls for.
+ *  Shared by both the sync and async probe variants. */
+function classifyProbe(
+  raw: string,
+  read: NonNullable<ProbeSlot["read"]>,
+  exists: (p: string) => boolean,
+  platform: NodeJS.Platform,
+): ProbeClassification {
+  return JSON_PROBE_FORMATS.has(read.site.format)
+    ? classifyProbeContent(raw, read.site.resolved.containerPath, read.site.format === "json", exists, platform)
+    : classifyProbeViaAdapter(raw, read.site, read.transform, exists, platform);
+}
+
+/** Classify a NON-JSON client config through the same core read install uses
+ *  (classifyClientConfig), so doctor and install cannot disagree about one
+ *  file's syntax. Reached only through classifyProbe.
+ *
+ *  No drive-case fold: that belongs to Claude Code's projects[] map, which is
+ *  JSON. The adapter never throws on bad bytes -- it answers `malformed` -- and
+ *  a MissingConfigAdapterError propagates ON PURPOSE: a build without the
+ *  adapter is a defect, and must not be reported as a malformed user file.
+ *  The only catch is around the launch checks, so an unexpected throw there
+ *  degrades one row to unreadable instead of crashing doctor, the panel's
+ *  `doctor --json` or `install --list` -- and is never reported as
+ *  malformed. */
+function classifyProbeViaAdapter(
+  raw: string,
+  site: ConfigSite,
+  transform: EntryTransform | undefined,
+  exists: (p: string) => boolean,
+  platform: NodeJS.Platform,
+): ProbeClassification {
+  const view = classifyClientConfig(raw, site, { transform });
+  const read = view.read;
+  const violation = view.unloadable();
+  const unloadable = violation ? unloadableConfigProblem(violation) : null;
+  switch (read.kind) {
+    case "absent":
+      return { ...EMPTY_PROBE };
+    case "unreadable":
+      // Unreachable with the bytes already in hand; mapped defensively.
+      return { ...EMPTY_PROBE, unreadable: read.message, unreadableCode: read.code };
+    case "malformed":
+      return { ...MALFORMED };
+    case "blocked":
+      // The adapter decides reparability; a TOML container is never reparable.
+      return read.reparable
+        ? { ...EMPTY_PROBE, unloadable }
+        : { ...EMPTY_PROBE, unloadable, containerBlocked: `"${read.path.join(".")}" is ${read.shape}` };
+    case "unspliceable":
+      // Present, but in a spelling install will not edit. The read carries no
+      // entries, so there is nothing to run the launch checks on. The fix is
+      // the adapter's own where it gives one; the generic clause is only for
+      // an adapter written before `fix` existed.
+      return {
+        ...EMPTY_PROBE,
+        hasMcpEntry: read.key === ENTRY_NAME,
+        entryUnspliceable: {
+          reason: read.reason,
+          fix: read.fix ?? "rewrite it by hand as a table of its own (or delete it)",
+        },
+      };
+    case "ok": {
+      if (!read.containerPresent) return { ...EMPTY_PROBE, unloadable };
+      const entry = view.entry();
+      const legacy = view.legacyKey();
+      const base: ProbeClassification = {
+        ...EMPTY_PROBE,
+        hasMcpEntry: entry !== undefined,
+        containerEntries: view.count(),
+        hasLegacyEntry: legacy !== null,
+        legacyEntryName: legacy,
+        unloadable,
+        // Only meaningful with no entry: the adapter reports an entry INSIDE
+        // such a container as unspliceable, so this and hasMcpEntry are never
+        // both set.
+        containerUnspliceable: read.containerUnspliceable ?? null,
+      };
+      if (entry === undefined) return base;
+      try {
+        // The RAW stored value, not EntryView.launch: the launch checks read
+        // `command`/`args` off the stored entry exactly as the JSON walk does.
+        return { ...base, ...launchChecks(entry.value, exists, platform) };
+      } catch (e) {
+        return { ...base, unreadable: `launch check failed: ${(e as Error).message}`, unreadableCode: null };
+      }
+    }
+    default: {
+      const _exhaustive: never = read;
+      return _exhaustive;
+    }
+  }
+}
+
+/** The launch checks for one stored entry value: what runtime it launches on
+ *  and whether its command (or the oam it wraps, and that oam's entry file)
+ *  can start at all. All-null when `entry` is not an object with a string
+ *  `command`. Shared by the JSON walk and the adapter path, so a TOML entry is
+ *  checked by the same rules as a JSON one.
+ *
+ *  `platform` picks the path semantics for every check (see
+ *  ProbeOptions.platform): node:path's bare `isAbsolute` is bound to the
+ *  running platform, and with it the foreign-path branches could only ever
+ *  execute on a POSIX runner and the native-drive-letter one only on win32
+ *  -- so on a Windows-only maintainer box the WSL wiring here never ran. */
+function launchChecks(
+  entry: unknown,
+  exists: (p: string) => boolean,
+  platform: NodeJS.Platform,
+): Pick<
+  ProbeClassification,
+  "launchCommandMissing" | "launchRuntime" | "launchOamNotAbsolute" | "launchOamEntryMissing" | "launchForeignPath"
+> {
+  const isAbsolute = platform === "win32" ? win32.isAbsolute : posix.isAbsolute;
+  let launchCommandMissing: string | null = null;
+  let launchRuntime: "oam" | "node" | null = null;
+  let launchOamNotAbsolute: string | null = null;
+  let launchOamEntryMissing: string | null = null;
+  let launchForeignPath: string | null = null;
+  if (typeof entry === "object" && entry !== null && !Array.isArray(entry)) {
+    const command = (entry as { command?: unknown }).command;
+    if (typeof command === "string") {
+      const entryArgs = (entry as { args?: unknown }).args;
+      // FILTERED to strings, not cast to them. A hand-edited config whose
+      // args carry a number or a null parses fine, but every consumer below
+      // (isOamLaunch, oamArgvTokens) calls string methods on each token --
+      // so the old `as string[]` threw a TypeError into the JSON classifier's
+      // outer catch and reported a perfectly parseable file as "exists but JSON is
+      // malformed", sending the user to fix a syntax error that isn't there.
+      const args = Array.isArray(entryArgs) ? entryArgs.filter((a): a is string => typeof a === "string") : [];
+      launchRuntime = isOamLaunch(command, args) ? "oam" : "node";
+      if (isForeignAbsoluteLaunch(command, platform)) {
+        // Written for another OS: none of the checks below can be applied
+        // from here, and applying them anyway is what produced a "bare oam"
+        // PATH warning for a fully absolute Windows path.
+        launchForeignPath = command;
+      } else {
+        if (isAbsolute(command) && !exists(command)) launchCommandMissing = command;
+        if (launchRuntime === "oam") {
+          // Every oam-specific check reads the UNWRAPPED launch, not the raw
+          // argv: launchRuntime is "oam" for the `cmd /d /s /c oam run ...`
+          // and `sh -c "oam run ..."` shapes too, and on those `command` is
+          // the wrapper and the raw argv's first non-flag token is the
+          // wrapper's own switch. A null unwrap (a quoted `sh -c` payload,
+          // which isOamLaunch still classifies) means nothing is checked --
+          // under-reporting is the safe direction.
+          const oamArgv = oamArgvTokens(command, args);
+          if (oamArgv !== null) {
+            // A BARE oam is the one shape the absolute-path check above
+            // cannot see, and it is the shape older installs actually
+            // wrote. It resolves against the CLIENT's PATH, not the shell's,
+            // so a GUI-launched client (Claude Desktop from the Dock, Cursor
+            // from Explorer) never finds an oam that lives in ~/.oam/bin --
+            // the broker fails to start with no fallback. `install` no
+            // longer writes this, but nothing rewrites the configs that
+            // already carry it, so doctor is the only thing that can
+            // surface it. Tested on the unwrapped token: a bare `oam`
+            // reached through a wrapper resolves the same way and used to
+            // read as "OK (runs on oam)".
+            if (isForeignAbsoluteLaunch(oamArgv.oam, platform)) launchForeignPath = oamArgv.oam;
+            else if (!isAbsolute(oamArgv.oam)) launchOamNotAbsolute = oamArgv.oam;
+            // `oam run [--no-check] <entry>`: unlike npx, oam cannot fetch a
+            // missing entry on demand, so a stale path here is a hard
+            // launch failure rather than a slow start.
+            const entryPath = oamRunEntryFromTokens(oamArgv.rest);
+            if (entryPath !== null && isAbsolute(entryPath) && !exists(entryPath)) {
+              launchOamEntryMissing = entryPath;
+            }
+          }
+        }
+      }
+    }
+  }
+  return { launchCommandMissing, launchRuntime, launchOamNotAbsolute, launchOamEntryMissing, launchForeignPath };
+}
+
+/** The JSON-family classifier: raw JSON or JSONC content for a probe result.
+ *  Reached only through classifyProbe, for a site whose format is in
+ *  JSON_PROBE_FORMATS; every other syntax is classified by its adapter
+ *  (classifyProbeViaAdapter).
  *
  *  `strict` is the SITE's declared strictness (ProbeSlot.read), and it is
  *  REQUIRED rather than defaulted: every caller has to answer for it, so a
@@ -2725,11 +3000,8 @@ function oamRunEntryFromTokens(tokens: readonly string[]): string | null {
  *  state.json, and a copy of it would be free to disagree with the refusal
  *  the write facade raises over the same file.
  *
- *  `platform` picks the path semantics for every launch check below (see
- *  ProbeOptions.platform): node:path's bare `isAbsolute` is bound to the
- *  running platform, and with it the foreign-path branches could only ever
- *  execute on a POSIX runner and the native-drive-letter one only on win32
- *  -- so on a Windows-only maintainer box the WSL wiring here never ran. */
+ *  `platform` picks the path semantics for the launch checks (see
+ *  launchChecks and ProbeOptions.platform). */
 function classifyProbeContent(
   raw: string,
   containerPath: string[],
@@ -2737,7 +3009,6 @@ function classifyProbeContent(
   exists: (p: string) => boolean = existsSync,
   platform: NodeJS.Platform = process.platform,
 ): ProbeClassification {
-  const isAbsolute = platform === "win32" ? win32.isAbsolute : posix.isAbsolute;
   if (raw.trim().length === 0) {
     return { ...EMPTY_PROBE };
   }
@@ -2799,66 +3070,10 @@ function classifyProbeContent(
       return { ...EMPTY_PROBE, unloadable };
     }
     const legacyEntryName = findLegacyEntry(container);
-    const entry = container[ENTRY_NAME];
-    let launchCommandMissing: string | null = null;
-    let launchRuntime: "oam" | "node" | null = null;
-    let launchOamNotAbsolute: string | null = null;
-    let launchOamEntryMissing: string | null = null;
-    let launchForeignPath: string | null = null;
-    if (typeof entry === "object" && entry !== null && !Array.isArray(entry)) {
-      const command = (entry as { command?: unknown }).command;
-      if (typeof command === "string") {
-        const entryArgs = (entry as { args?: unknown }).args;
-        // FILTERED to strings, not cast to them. A hand-edited config whose
-        // args carry a number or a null parses fine, but every consumer below
-        // (isOamLaunch, oamArgvTokens) calls string methods on each token --
-        // so the old `as string[]` threw a TypeError into this function's outer
-        // catch and reported a perfectly parseable file as "exists but JSON is
-        // malformed", sending the user to fix a syntax error that isn't there.
-        const args = Array.isArray(entryArgs) ? entryArgs.filter((a): a is string => typeof a === "string") : [];
-        launchRuntime = isOamLaunch(command, args) ? "oam" : "node";
-        if (isForeignAbsoluteLaunch(command, platform)) {
-          // Written for another OS: none of the checks below can be applied
-          // from here, and applying them anyway is what produced a "bare oam"
-          // PATH warning for a fully absolute Windows path.
-          launchForeignPath = command;
-        } else {
-          if (isAbsolute(command) && !exists(command)) launchCommandMissing = command;
-          if (launchRuntime === "oam") {
-            // Every oam-specific check reads the UNWRAPPED launch, not the raw
-            // argv: launchRuntime is "oam" for the `cmd /d /s /c oam run ...`
-            // and `sh -c "oam run ..."` shapes too, and on those `command` is
-            // the wrapper and the raw argv's first non-flag token is the
-            // wrapper's own switch. A null unwrap (a quoted `sh -c` payload,
-            // which isOamLaunch still classifies) means nothing is checked --
-            // under-reporting is the safe direction.
-            const oamArgv = oamArgvTokens(command, args);
-            if (oamArgv !== null) {
-              // A BARE oam is the one shape the absolute-path check above
-              // cannot see, and it is the shape older installs actually
-              // wrote. It resolves against the CLIENT's PATH, not the shell's,
-              // so a GUI-launched client (Claude Desktop from the Dock, Cursor
-              // from Explorer) never finds an oam that lives in ~/.oam/bin --
-              // the broker fails to start with no fallback. `install` no
-              // longer writes this, but nothing rewrites the configs that
-              // already carry it, so doctor is the only thing that can
-              // surface it. Tested on the unwrapped token: a bare `oam`
-              // reached through a wrapper resolves the same way and used to
-              // read as "OK (runs on oam)".
-              if (isForeignAbsoluteLaunch(oamArgv.oam, platform)) launchForeignPath = oamArgv.oam;
-              else if (!isAbsolute(oamArgv.oam)) launchOamNotAbsolute = oamArgv.oam;
-              // `oam run [--no-check] <entry>`: unlike npx, oam cannot fetch a
-              // missing entry on demand, so a stale path here is a hard
-              // launch failure rather than a slow start.
-              const entryPath = oamRunEntryFromTokens(oamArgv.rest);
-              if (entryPath !== null && isAbsolute(entryPath) && !exists(entryPath)) {
-                launchOamEntryMissing = entryPath;
-              }
-            }
-          }
-        }
-      }
-    }
+    // Still inside the try: launchChecks filters args to strings, but any
+    // other throw lands in the catch below exactly as it always did.
+    const { launchCommandMissing, launchRuntime, launchOamNotAbsolute, launchOamEntryMissing, launchForeignPath } =
+      launchChecks(container[ENTRY_NAME], exists, platform);
     return {
       hasMcpEntry: ENTRY_NAME in container,
       containerEntries: Object.keys(container).length,
@@ -2878,6 +3093,9 @@ function classifyProbeContent(
       // is not news, and naming it would send the user after a key that holds
       // nothing.
       entryProjectKey: ENTRY_NAME in container || legacyEntryName !== null ? entryProjectKey : null,
+      // A JSON object key is always spliceable, and so is a JSON container.
+      entryUnspliceable: null,
+      containerUnspliceable: null,
     };
   } catch {
     // Parse failures only: the READ happens in the caller, under its own
@@ -2905,8 +3123,7 @@ export async function probeClientsAsync(opts: ProbeOptions): Promise<ClientProbe
       } catch (err) {
         Object.assign(result, unreadableProbe(err));
       }
-      if (raw !== null)
-        Object.assign(result, classifyProbeContent(raw, read.containerPath, read.strict, existsSync, platform));
+      if (raw !== null) Object.assign(result, classifyProbe(raw, read, existsSync, platform));
     }
     out.push(result);
   }

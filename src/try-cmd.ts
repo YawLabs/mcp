@@ -778,8 +778,14 @@ async function autoDetectClient(opts: {
   // First: any client whose config file already exists AND whose contents
   // doctor could read (the user is actively using it, and `try` will be able
   // to splice into it).
+  //
+  // JSON-family files only. A trial marker records no syntax and peels with
+  // format "jsonc" (markerSite), so a trial auto-written into a non-JSON file
+  // (Codex CLI's config.toml) could never be cleaned up by try-cleanup or
+  // doctor's trial GC. Auto-detect keeps to JSON-family files until the marker
+  // records one; an explicit --client is unaffected.
   for (const p of probes) {
-    if (probeUsable(p)) return { clientId: p.clientId, scope: p.scope };
+    if (probeUsable(p) && p.syntax === "JSON") return { clientId: p.clientId, scope: p.scope };
   }
   // Second: any client that's available on this OS (config file not
   // yet created -- we'll create it). claude-code is availableOn every
@@ -1144,10 +1150,11 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
       );
       return { ok: false };
     }
-    // `read.syntax` is the adapter's own name for the file's language, so a
-    // non-JSON client would say what it actually is. Every client `try` can
-    // target today is JSON-family, where that name is "JSON" -- these two
-    // lines are byte-for-byte what they printed before.
+    // `read.syntax` is the adapter's own name for the file's language: "JSON"
+    // for every JSON-family client, where these two lines are byte-for-byte
+    // what they printed before, and "TOML" for Codex CLI's config.toml, which
+    // an explicit `--client codex-cli` reads through the same core (only
+    // auto-detect keeps to JSON-family files -- see autoDetectClient).
     if (read.kind === "malformed") {
       printErr(
         read.reason === "root"

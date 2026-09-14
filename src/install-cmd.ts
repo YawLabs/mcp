@@ -81,6 +81,7 @@ import {
   classifyClientConfig,
   composeEntry,
   containerKeysAt,
+  containerNounFor,
   describeValueShape,
   type EntryTransform,
   readClientConfigFile,
@@ -868,8 +869,8 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     // a non-JSON client says what it actually is.
     err(
       read.reason === "root"
-        ? `yaw-mcp install: ${resolved.absolute} is not a ${read.syntax} object -- refusing to overwrite it; ${unparseableConfigFix("re-run")}.`
-        : `yaw-mcp install: ${resolved.absolute} is not valid ${read.syntax} (${read.detail}) -- refusing to overwrite it; ${unparseableConfigFix("re-run")}.`,
+        ? `yaw-mcp install: ${resolved.absolute} is not a ${read.syntax} object -- refusing to overwrite it; ${unparseableConfigFix("re-run", read.syntax)}.`
+        : `yaw-mcp install: ${resolved.absolute} is not valid ${read.syntax} (${read.detail}) -- refusing to overwrite it; ${unparseableConfigFix("re-run", read.syntax)}.`,
     );
     return { written: [], wouldWrite: [], messages, exitCode: 1 };
   }
@@ -1408,7 +1409,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
       const keyPath = read.path.join(".");
       if (!read.reparable) {
         err(
-          `yaw-mcp install: "${keyPath}" in ${resolved.absolute} is ${read.shape}, not a JSON object -- refusing to overwrite it; ${blockedContainerFix("re-run")}.`,
+          `yaw-mcp install: "${keyPath}" in ${resolved.absolute} is ${read.shape}, not ${containerNounFor(view.adapter.syntax)} -- refusing to overwrite it; ${blockedContainerFix("re-run", view.adapter.syntax)}.`,
         );
         return { written: [], wouldWrite: [], messages, exitCode: 1 };
       }

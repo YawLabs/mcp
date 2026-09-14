@@ -85,7 +85,7 @@
 
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
-import { type ConfigSite, effectiveConfigFormat } from "./client-config.js";
+import { type ConfigSite, effectiveConfigFormat, type SyntaxName } from "./client-config.js";
 import {
   type ClientEnvValues,
   defineTarget,
@@ -1221,7 +1221,8 @@ export interface BlockedContainerSegment {
  *
  * Lives here, not in install-cmd.ts, because doctor asks the same question of
  * the same file: install-cmd imports doctor-cmd, so doctor could not import it
- * from there without a cycle.
+ * from there without a cycle. Doctor asks it for JSON-family files only; a
+ * non-JSON file's blocked container comes from its adapter's `blocked` read.
  */
 export function findBlockedContainerSegment(
   root: Record<string, unknown>,
@@ -1273,18 +1274,26 @@ export function describeJsonShape(value: unknown): string {
  *  refusal, so half of that advice could never work. `then` is the step once
  *  the file parses: install passes "re-run" (the user just typed the command),
  *  doctor passes the install command for the row it is describing, and import
- *  passes that command plus its own re-run. */
-export function unparseableConfigFix(then: string): string {
-  return `fix the JSON by hand, or move the file aside, then ${then}`;
+ *  passes that command plus its own re-run.
+ *
+ *  `syntax` defaults to JSON, so the one-argument form is unchanged; a caller
+ *  holding a ConfigRead, a view or a doctor probe row passes its syntax so a
+ *  TOML file is never told to "fix the JSON". */
+export function unparseableConfigFix(then: string, syntax: SyntaxName = "JSON"): string {
+  return `fix the ${syntax} by hand, or move the file aside, then ${then}`;
 }
 
 /** The by-hand fix for a container key install cannot splice its entry into:
  *  one findBlockedContainerSegment reports as NOT reparable (a non-empty
  *  array -- null, a scalar and an empty array are replaced with `{}` instead).
  *  Shared by install's refusal, doctor's CLIENTS line and import's refusal to
- *  remove originals, for the same reason as unparseableConfigFix. */
-export function blockedContainerFix(then: string): string {
-  return `make it an object (or remove the key), then ${then}`;
+ *  remove originals, for the same reason as unparseableConfigFix.
+ *
+ *  `syntax` defaults to JSON ("make it an object"). A TOML container is never
+ *  repaired in place -- its adapter reports every non-table shape as blocked
+ *  -- and is worded "make it a table". */
+export function blockedContainerFix(then: string, syntax: SyntaxName = "JSON"): string {
+  return `make it ${syntax === "TOML" ? "a table" : "an object"} (or remove the key), then ${then}`;
 }
 
 /** Claude Code's settings.json and the `permissions.allow` grant install adds

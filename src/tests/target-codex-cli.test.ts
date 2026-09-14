@@ -3,24 +3,29 @@
 // things that are Codex's alone: CODEX_HOME, the bare-npx Windows entry, the
 // startup timeout, the carried env_vars, and the spellings the splice refuses.
 //
-// WHAT THIS IS NOT. It does not call `runInstall`: install-cmd.ts still
-// carries its own JSONC walk (the boundary test's allowlist says so, one line
-// per consumer), so a TOML client is unreachable from the CLI until the
-// consumer migration lands. What is testable today -- and what the consumer
-// will run -- is the composition the core defines: classify the bytes, compose
-// the entry from the row's transform, apply the edits through the write facade
-// that verifies its own output. `installThrough` below is exactly that
-// sequence, and every byte-exact expectation is a fixture on disk that the
-// TOML adapter's own suite already loads.
-//
-// Hermetic: a synthetic home, every env value passed in rather than read, and
-// nothing is written to disk -- `classifyClientConfig` takes the text and
+// TWO LAYERS. Most of this file drives the core directly: classify the bytes,
+// compose the entry from the row's transform, apply the edits through the
+// write facade that verifies its own output. `installThrough` below is exactly
+// that sequence, and every byte-exact expectation is a fixture on disk that the
+// TOML adapter's own suite already loads. Those describes are hermetic: a
+// synthetic home, every env value passed in rather than read, and nothing is
+// written to disk -- `classifyClientConfig` takes the text and
 // `applyClientConfigEdits` returns it.
+//
+// TOML is also reachable from the CLI: install, uninstall, try, import, doctor
+// and `install --list` all read config.toml through the same core. The last
+// describe carries that round trip -- `runInstall` writes a real config.toml
+// into a temp home, and `--list` and `runDoctor` read back the file install
+// wrote -- so install and doctor cannot disagree about a Codex file unnoticed.
+// That was the reported bug: doctor and --list parsed the file install had
+// just written as JSON and called it malformed.
 
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   adapterFor,
   applyClientConfigEdits,
@@ -40,6 +45,9 @@ import {
   reloadDoneClause,
   resetConfigAdapterRegistry,
 } from "../client-config.js";
+import { readTomlConfig } from "../client-config-toml.js";
+import { runDoctor } from "../doctor-cmd.js";
+import { type BundlesSummary, runInstall } from "../install-cmd.js";
 import {
   buildLaunchEntry,
   ENTRY_NAME,
@@ -50,6 +58,7 @@ import {
   LEGACY_ENTRY_NAMES,
   resolveInstallPath,
 } from "../install-targets.js";
+import type { OamProbe } from "../oam-spawn.js";
 
 const HOME = "/synth/home";
 const PROJECT = "/synth/home/proj";
@@ -619,6 +628,12 @@ describe("install refuses rather than corrupt a file", () => {
       expect(view.read).toMatchObject({ kind: "unspliceable", key: ENTRY_NAME });
       const reason = view.read.kind === "unspliceable" ? view.read.reason : "";
       expect(reason).toMatch(shape);
+      // The codec's by-hand `fix` reaches the core read too (doctor prints
+      // it); its splice-facing `remedy` deliberately does not.
+      const codec = readTomlConfig(raw, ["mcp_servers"], [ENTRY_NAME]);
+      if (codec.kind !== "unspliceable") throw new Error(`codec says ${codec.kind}`);
+      expect(view.read).toMatchObject({ fix: codec.fix });
+      expect(view.read).not.toHaveProperty("remedy");
       // An `unspliceable` read refuses every edit through the facade --
       // install AND uninstall -- which is the safe end of the trade: the
       // splice has no table span it can take (or, for an array of tables,
@@ -651,6 +666,19 @@ describe("install refuses rather than corrupt a file", () => {
     expect(view.read).toMatchObject({ kind: "ok", containerPresent: true });
     expect(view.otherServerKeys()).toEqual(["sib"]);
     expect(refusalOf(() => installThrough(raw, site))).toContain("an inline table, which cannot gain an entry");
+    // The read says on the side that this write is refused, so doctor does
+    // not send the user to it. Absent (not null) on a header container: the
+    // field is optional on the core union so a sibling adapter written
+    // before it compiles unchanged.
+    expect(view.read).toMatchObject({
+      containerUnspliceable: {
+        reason: "an inline table (mcp_servers = { ... }) that a later [mcp_servers.mcp] header cannot extend",
+        fix: "convert it to [mcp_servers.mcp]-style tables by hand",
+      },
+    });
+    const header = classifyClientConfig(fixture("f03-siblings"), site, { transform: CODEX.entry });
+    expect(header.read.kind).toBe("ok");
+    expect(header.read).not.toHaveProperty("containerUnspliceable");
   });
 });
 
@@ -836,5 +864,186 @@ describe("the TOML adapter the row registers", () => {
     expect(view.count()).toBe(0);
     // No strict-JSON gap in TOML: what the reader accepts, Codex accepts.
     expect(view.unloadable()).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The CLI round trip: install -> --list -> doctor over the file install wrote
+// ---------------------------------------------------------------------------
+
+/** oam absent, so the entry written is the npx one on every machine. */
+const OAM_ABSENT = async (): Promise<OamProbe> => ({
+  bin: null,
+  binPath: null,
+  version: null,
+  belowMin: false,
+  failure: null,
+  failureDetail: null,
+});
+
+/** The bundles.json summary, seamed so no run walks up from the real cwd
+ *  looking for one. The path is the fixture's own string and never compared. */
+const BUNDLES_EMPTY = (): BundlesSummary => ({
+  state: "empty",
+  count: 0,
+  path: "/synth/.yaw-mcp/bundles.json",
+  warnings: [],
+});
+
+function captureIo() {
+  const out: string[] = [];
+  const err: string[] = [];
+  const sink = (arr: string[]): NodeJS.WritableStream =>
+    new Writable({
+      write(chunk: Buffer, _enc, cb): void {
+        arr.push(chunk.toString());
+        cb();
+      },
+    }) as unknown as NodeJS.WritableStream;
+  return {
+    io: { stdin: process.stdin, stdout: sink(out), stderr: sink(err), isTTY: false },
+    stdout: () => out.join(""),
+    stderr: () => err.join(""),
+  };
+}
+
+// Deliberately OUTSIDE every describe that swaps the adapter registry: these
+// runs need the real TOML adapter the row registers at module scope.
+describe("install -> --list -> doctor over the file install wrote", () => {
+  let home: string;
+  let projectDir: string;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "yaw-mcp-codex-home-"));
+    projectDir = mkdtempSync(join(tmpdir(), "yaw-mcp-codex-proj-"));
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(projectDir, { recursive: true, force: true });
+  });
+
+  /** The user-scope file. `join`, so a Windows runner agrees with the row. */
+  const userFile = (): string => join(home, ".codex", "config.toml");
+
+  function seed(text: string): void {
+    mkdirSync(dirname(userFile()), { recursive: true });
+    writeFileSync(userFile(), text, "utf8");
+  }
+
+  async function install() {
+    const cap = captureIo();
+    const result = await runInstall({
+      clientId: "codex-cli",
+      scope: "user",
+      os: "linux",
+      home,
+      cwd: projectDir,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+      bundlesSummary: BUNDLES_EMPTY,
+    });
+    return { result, stdout: cap.stdout(), stderr: cap.stderr() };
+  }
+
+  async function list(): Promise<string> {
+    const cap = captureIo();
+    await runInstall({ listOnly: true, os: "linux", home, cwd: projectDir, io: cap.io });
+    return cap.stdout();
+  }
+
+  /** The cells of the one Codex CLI row for SCOPE, split on the table's
+   *  two-space gutter so `not installed` stays one cell. */
+  function listRow(out: string, scope: string): string[] {
+    const rows = out
+      .split("\n")
+      .map((l) => l.trim().split(/ {2,}/))
+      .filter((cells) => cells[0] === "Codex CLI" && cells[1] === scope);
+    expect(rows, `exactly one Codex CLI (${scope}) row in:\n${out}`).toHaveLength(1);
+    return rows[0];
+  }
+
+  /** The `N/M client scopes have yaw-mcp configured` headline's N. */
+  function headlineCount(out: string): number {
+    const m = /^(\d+)\/\d+ client scopes have yaw-mcp configured on linux\./m.exec(out);
+    expect(m, `no headline in:\n${out}`).not.toBeNull();
+    return Number(m?.[1]);
+  }
+
+  async function doctor(): Promise<{ text: string; exitCode: number }> {
+    const out: string[] = [];
+    const diagnosis = await runDoctor({
+      home,
+      cwd: projectDir,
+      os: "linux",
+      env: {},
+      out: (s) => out.push(s),
+      err: () => {},
+      skipRegistryCheck: true,
+      oamProbe: OAM_ABSENT,
+    });
+    return { text: out.join(""), exitCode: diagnosis.exitCode };
+  }
+
+  it("install codex-cli writes a config.toml that --list and doctor read as installed", async () => {
+    const before = await list();
+    expect(listRow(before, "user")[3]).toBe("not installed");
+    expect(headlineCount(before)).toBe(0);
+
+    const installed = await install();
+    expect(installed.result.exitCode, installed.stderr).toBe(0);
+    // The premise: what install wrote is the TOML table, not a JSON document.
+    expect(readFileSync(userFile(), "utf8")).toBe(fixture("f01-missing", "expected"));
+
+    const after = await list();
+    expect(listRow(after, "user")[3]).toBe("installed");
+    expect(headlineCount(after)).toBe(1);
+
+    // The reported repro: this line read "exists but JSON is malformed" and
+    // doctor exited 2 over the file install had just written.
+    const d = await doctor();
+    expect(d.text).toContain('Codex CLI (user): OK -- has "mcp" entry');
+    expect(d.text).not.toContain("JSON is malformed");
+    expect(d.exitCode).toBe(0);
+  });
+
+  it("truncated bytes: --list says malformed, and doctor and install both say TOML", async () => {
+    seed(fixture("f10-malformed"));
+    expect(listRow(await list(), "user")[3]).toBe("malformed");
+
+    const d = await doctor();
+    expect(d.text).toContain("Codex CLI (user): exists but TOML is malformed");
+    expect(d.text).toContain("fix the TOML by hand, or move the file aside, then run `yaw-mcp install codex-cli`");
+
+    const refused = await install();
+    expect(refused.result.exitCode).not.toBe(0);
+    expect(refused.stderr).toContain("is not valid TOML");
+    expect(refused.stderr).toContain(
+      "-- refusing to overwrite it; fix the TOML by hand, or move the file aside, then re-run.",
+    );
+    expect(refused.stderr).not.toContain("JSON");
+    // And the file is untouched.
+    expect(readFileSync(userFile(), "utf8")).toBe(fixture("f10-malformed"));
+  });
+
+  it("install over an [[mcp_servers]] array refuses in TOML words", async () => {
+    seed(fixture("f11-array-container"));
+    const refused = await install();
+    expect(refused.result.exitCode).not.toBe(0);
+    expect(refused.stderr).toContain(
+      `"mcp_servers" in ${userFile()} is an array of 1, not a TOML table -- refusing to overwrite it; make it a table (or remove the key), then re-run.`,
+    );
+    expect(refused.stderr).not.toContain("JSON");
+    expect(readFileSync(userFile(), "utf8")).toBe(fixture("f11-array-container"));
+  });
+
+  it("an inline mcp entry lists as installed and counts in the headline (f09)", async () => {
+    // The accepted over-count: install will not edit this spelling, but the
+    // entry IS there, so --list says installed and the headline counts it.
+    // Doctor words the row as present-but-not-editable (doctor-cmd.test.ts).
+    seed(fixture("f09-inline"));
+    const out = await list();
+    expect(listRow(out, "user")[3]).toBe("installed");
+    expect(headlineCount(out)).toBe(1);
   });
 });

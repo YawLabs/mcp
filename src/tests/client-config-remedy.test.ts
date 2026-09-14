@@ -31,7 +31,7 @@ import { dirname, join } from "node:path";
 import { Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { type StrictViolation, unloadableConfigProblem } from "../client-config.js";
+import { containerNounFor, type StrictViolation, unloadableConfigProblem } from "../client-config.js";
 import { readStrictJson } from "../client-config-json.js";
 import { runDoctor } from "../doctor-cmd.js";
 import { runImport } from "../import-cmd.js";
@@ -679,6 +679,78 @@ describe("import --remove-originals -- a client config install refuses gets inst
       `Not removing the originals: no yaw-mcp entry in ${project.absolute} (${project.containerPath.join(".")}), and ${claudeJson} is not valid JSON, so Claude Code would be left with no way to reach them. \`yaw-mcp install claude-code\` refuses to overwrite ${claudeJson}; ${unparseableConfigFix("run `yaw-mcp install claude-code` and re-run this with --remove-originals")}.\n`,
     );
     expect(r.stderr.split("is not valid JSON").length - 1).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A TOML client config (Codex CLI's config.toml). The same three surfaces name
+// the same fault, and the remedy helpers take the file's syntax so a TOML file
+// is never told to "fix the JSON" or "make it an object".
+
+const CODEX_FIXTURES = fileURLToPath(new URL("./fixtures/codex/", import.meta.url));
+const codexFixture = (id: string): string => readFileSync(join(CODEX_FIXTURES, id, "input.toml"), "utf8");
+const codexUserFile = (): string => join(home, ".codex", "config.toml");
+const codexProjectFile = (): string => join(cwd, ".codex", "config.toml");
+
+async function installCodex() {
+  const cap = captureIo();
+  const r = await runInstall({
+    clientId: "codex-cli",
+    scope: "user",
+    os: "linux",
+    home,
+    cwd,
+    io: cap.io,
+    oamProbe: OAM_ABSENT,
+  });
+  return { exitCode: r.exitCode, stderr: cap.stderr() };
+}
+
+describe("a TOML client config -- every surface names TOML, through the same helpers", () => {
+  it("the remedy helpers default to JSON and name TOML when told", () => {
+    expect(unparseableConfigFix("re-run")).toBe("fix the JSON by hand, or move the file aside, then re-run");
+    expect(unparseableConfigFix("re-run", "TOML")).toBe("fix the TOML by hand, or move the file aside, then re-run");
+    expect(blockedContainerFix("re-run")).toBe("make it an object (or remove the key), then re-run");
+    expect(blockedContainerFix("re-run", "TOML")).toBe("make it a table (or remove the key), then re-run");
+    expect(containerNounFor("JSON")).toBe("a JSON object");
+    expect(containerNounFor("TOML")).toBe("a TOML table");
+  });
+
+  it("TOML parity: doctor row and install refusal give one remedy for the same malformed config.toml", async () => {
+    const path = writeFile(codexUserFile(), codexFixture("f10-malformed"));
+    const d = await doctor();
+    const i = await installCodex();
+    expect(d.text).toContain(
+      `Codex CLI (user): exists but TOML is malformed -- install refuses to overwrite it; ${unparseableConfigFix("run `yaw-mcp install codex-cli`", "TOML")}`,
+    );
+    expect(i.exitCode).toBe(1);
+    expect(i.stderr).toContain(`yaw-mcp install: ${path} is not valid TOML`);
+    expect(i.stderr).toContain(`-- refusing to overwrite it; ${unparseableConfigFix("re-run", "TOML")}.`);
+    expect(d.text).not.toContain(unparseableConfigFix("run `yaw-mcp install codex-cli`"));
+    expect(i.stderr).not.toContain("JSON");
+  });
+
+  it("import --remove-originals over a malformed or blocked codex config.toml says TOML", async () => {
+    // Importing from the PROJECT file, whose one server is the user's own; the
+    // user file install would write is the one install refuses.
+    const project = writeFile(codexProjectFile(), codexFixture("f03-siblings"));
+    const user = writeFile(codexUserFile(), codexFixture("f10-malformed"));
+    const malformed = await importRemoving("codex-cli", "project");
+    expect(malformed.stderr).toContain(`and ${user} is not valid TOML, so Codex CLI would be left`);
+    expect(malformed.stderr).toContain(
+      `\`yaw-mcp install codex-cli\` refuses to overwrite ${user}; ${unparseableConfigFix("run `yaw-mcp install codex-cli` and re-run this with --remove-originals", "TOML")}.`,
+    );
+    expect(malformed.stderr).not.toContain("JSON");
+
+    writeFileSync(user, codexFixture("f11-array-container"));
+    const blocked = await importRemoving("codex-cli", "project");
+    expect(blocked.stderr).toContain(`"mcp_servers" in ${user} is an array of 1, not a TOML table`);
+    expect(blocked.stderr).toContain(
+      `; ${blockedContainerFix("run `yaw-mcp install codex-cli` and re-run this with --remove-originals", "TOML")}.`,
+    );
+    expect(blocked.stderr).not.toContain("JSON");
+    // The refusal writes nothing.
+    expect(readFileSync(project, "utf8")).toBe(codexFixture("f03-siblings"));
   });
 });
 

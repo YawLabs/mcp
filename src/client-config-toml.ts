@@ -1079,9 +1079,22 @@ export type TomlConfigRead =
   /** Parses, but one of the named entries is in a spelling the splice will not
    *  REWRITE. `removable` is true for the one such shape it can still delete
    *  (an `[[array of tables]]` entry, which is whole lines): uninstall may
-   *  proceed on it, install may not. */
-  | { kind: "unspliceable"; key: string; shape: string; remedy: string; removable: boolean }
-  | { kind: "ok"; containerPresent: boolean; entries: TomlEntryView[] };
+   *  proceed on it, install may not. `remedy` is worded for the splice's own
+   *  refusal; `fix` is the same by-hand step worded for any surface (see
+   *  ShapeProblem). */
+  | { kind: "unspliceable"; key: string; shape: string; remedy: string; fix: string; removable: boolean }
+  /** Read. `containerUnspliceable` is set when the container is a root-level
+   *  inline table (`mcp_servers = { ... }`) holding none of the named entries:
+   *  the read is fine and Codex loads it, but no `[mcp_servers.<name>]` header
+   *  can ever be added -- `upsertTomlEntry` refuses (see rootContainerIsInline)
+   *  -- so a surface that would send the user to install can say so instead.
+   *  Null for every other container. */
+  | {
+      kind: "ok";
+      containerPresent: boolean;
+      entries: TomlEntryView[];
+      containerUnspliceable: { shape: string; fix: string } | null;
+    };
 
 /** Parse and classify a config.toml text.
  *
@@ -1119,7 +1132,7 @@ export function readTomlConfig(
   let cursor: Record<string, unknown> = parsed;
   for (let i = 0; i < containerPath.length; i++) {
     const key = containerPath[i];
-    if (!(key in cursor)) return { kind: "ok", containerPresent: false, entries: [] };
+    if (!(key in cursor)) return { kind: "ok", containerPresent: false, entries: [], containerUnspliceable: null };
     const next = cursor[key];
     if (!isTomlTable(next)) {
       return {
@@ -1140,6 +1153,7 @@ export function readTomlConfig(
         key: name,
         shape: problem.shape,
         remedy: problem.remedy,
+        fix: problem.fix,
         removable: problem.removable,
       };
     }
@@ -1147,7 +1161,22 @@ export function readTomlConfig(
   // Object key order is the file's own table order (smol-toml inserts as it
   // parses), which is what `--list` and import report.
   const entries = Object.keys(cursor).map((key) => ({ key, value: cursor[key] }));
-  return { kind: "ok", containerPresent: true, entries };
+  // The container itself, when the named entries are absent from it: an inline
+  // root table reads fine and loads fine, but the write that would add the
+  // first named entry is refused at upsertTomlEntry (rootContainerIsInline).
+  // Said here so doctor does not send the user to a run it knows is refused.
+  // With a named entry INSIDE it, the loop above already returned
+  // unspliceable for that entry; with no names at all (a pure read) there is
+  // no write to refuse, so it stays null.
+  const first = entryNames[0];
+  const containerUnspliceable =
+    first !== undefined && rootContainerIsInline(scan, containerPath)
+      ? {
+          shape: `an inline table (${containerPath.map(tomlKey).join(".")} = { ... }) that a later [${[...containerPath, first].map(tomlKey).join(".")}] header cannot extend`,
+          fix: `convert it to [${[...containerPath, first].map(tomlKey).join(".")}]-style tables by hand`,
+        }
+      : null;
+  return { kind: "ok", containerPresent: true, entries, containerUnspliceable };
 }
 
 /** The named entry's decoded fields, or undefined when it is absent or is not
@@ -1166,7 +1195,24 @@ export function tomlEntryNames(read: TomlConfigRead): string[] {
 
 interface ShapeProblem {
   shape: string;
+  /** What to do, worded for the splice's own refusal (`TomlSpliceRefusal`),
+   *  which is printed beside the table install would have written. */
   remedy: string;
+  /** The same by-hand step worded for ANY surface: no "below", no "re-run" --
+   *  the surface appends its own "then run ...". Doctor prints this one, and
+   *  it is per shape because one clause is not true of every shape: an entry
+   *  inside an inline `mcp_servers = { ... }` can neither be rewritten as its
+   *  own header (a redefinition) nor deleted and re-installed (the container
+   *  refuses the header too); only converting the container works.
+   *
+   *  Where a new table is called for it is placed AT THE END OF THE FILE, and
+   *  the wording says so. Doctor prints no table to copy, and "replace that
+   *  line with a table" read literally puts the header where the line was --
+   *  so every key after it in the same section (a sibling server, a root
+   *  setting) becomes a key of our entry, and the next install, which replaces
+   *  our entry's whole section, deletes it with nothing to flag the loss. A
+   *  header at the end of the file owns only the lines written under it. */
+  fix: string;
   /** True when `removeTomlEntry` can still delete it: the entry occupies whole
    *  lines under a header, so there is a span to take. False when there is no
    *  header at all (an inline table or dotted keys), which is the case nothing
@@ -1196,6 +1242,7 @@ function entryShapeProblem(
     return {
       shape: `an array of tables ([[${entryPath.map(tomlKey).join(".")}]])`,
       remedy: `Codex reads a server as a single table, so make it one ${headerLabel} table (or remove it), then re-run`,
+      fix: `rewrite it by hand as a single ${headerLabel} table (or delete it)`,
       removable: true,
     };
   }
@@ -1209,6 +1256,7 @@ function entryShapeProblem(
     return {
       shape: `written as dotted keys at the top level (${entryPath.join(".")}.command = ...)`,
       remedy: `only a ${headerLabel} table can be rewritten in place -- replace those lines with the table below by hand (or delete them and re-run)`,
+      fix: `move those lines by hand into a ${headerLabel} table at the end of the file (or delete them)`,
       removable: false,
     };
   }
@@ -1217,6 +1265,7 @@ function entryShapeProblem(
     return {
       shape: `written as dotted keys under [${containerLabel}] (${name}.command = ...)`,
       remedy: `only a ${headerLabel} table can be rewritten in place -- replace those lines with the table below by hand (or delete them and re-run)`,
+      fix: `move those lines by hand into a ${headerLabel} table at the end of the file (or delete them)`,
       removable: false,
     };
   }
@@ -1224,19 +1273,25 @@ function entryShapeProblem(
     return {
       shape: `an inline table under [${containerLabel}] (${name} = { ... })`,
       remedy: `only a ${headerLabel} table can be rewritten in place -- replace that line with the table below by hand (or delete it and re-run)`,
+      fix: `move that line by hand into a ${headerLabel} table at the end of the file (or delete it)`,
       removable: false,
     };
   }
   if (rootContainerIsInline(scan, containerPath)) {
+    // No "(or delete it)" here: with the entry gone, the container is still an
+    // inline table and the header install writes is still a redefinition, so
+    // the only fix is the container's.
     return {
       shape: `inside the inline table ${containerLabel} = { ... }`,
       remedy: `TOML cannot extend an inline table with a later table, so convert it to ${headerLabel}-style tables by hand, then re-run`,
+      fix: `convert the inline ${containerLabel} = { ... } to ${headerLabel}-style tables by hand`,
       removable: false,
     };
   }
   return {
     shape: `not written as a ${headerLabel} table`,
     remedy: `only a ${headerLabel} table can be rewritten in place -- replace it with the table below by hand (or delete it and re-run)`,
+    fix: `move it by hand into a ${headerLabel} table at the end of the file (or delete it)`,
     removable: false,
   };
 }
