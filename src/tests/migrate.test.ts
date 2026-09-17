@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { lstat, readFile, rename, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,6 +9,7 @@ import {
   LEGACY_LOCAL_FILENAME,
   LEGACY_PROJECT_FILENAME,
   migrateLegacyConfigPaths,
+  planLegacyConfigMigration,
 } from "../migrate.js";
 import { CONFIG_DIRNAME, userConfigDir } from "../paths.js";
 
@@ -543,5 +544,84 @@ describe("findLegacyProjectRoot (via migrateLegacyConfigPaths walk-up)", () => {
     } finally {
       rmSync(linkParent, { recursive: true, force: true });
     }
+  });
+});
+
+// planLegacyConfigMigration is the no-write twin the loader's read-only mode
+// (YAW_MCP_READONLY_DIAGNOSTICS) reports from. It shares migrateFile and the
+// walk with the real migrator, so these cases pin the two halves of that
+// promise: it names exactly what a real run would move, and it moves nothing.
+describe("planLegacyConfigMigration", () => {
+  let home: string;
+  let cwd: string;
+
+  beforeEach(() => {
+    // realpathSync both: findLegacyProjectRoot realpaths the walk, so on a
+    // platform whose tmpdir() sits behind a symlink (macOS /var) the project
+    // paths it reports would never byte-match a raw mkdtemp spelling.
+    home = realpathSync(mkdtempSync(join(tmpdir(), "yaw-mcp-migrate-plan-")));
+    cwd = realpathSync(mkdtempSync(join(home, "proj-")));
+    // The walk-up block above renames through the wrapped mock without
+    // resetting it, and these cases assert on its call count.
+    mockRename.mockClear();
+    // Pinned for the same reason as the first block: a case below asserts on a
+    // WARN line that an inherited LOG_LEVEL=error would suppress.
+    vi.stubEnv("LOG_LEVEL", "warn");
+  });
+
+  afterEach(() => {
+    mockRename.mockReset();
+    vi.unstubAllEnvs();
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("lists the global, local and project files a real run would move, and renames none of them", async () => {
+    const legacyGlobal = writeLegacy(home, LEGACY_GLOBAL_FILENAME);
+    const legacyProject = writeLegacy(cwd, LEGACY_PROJECT_FILENAME);
+    const legacyLocal = writeLegacy(cwd, LEGACY_LOCAL_FILENAME);
+
+    const plan = await planLegacyConfigMigration({ cwd, home });
+
+    expect(plan).toEqual([
+      { scope: "global", legacy: legacyGlobal, target: join(userConfigDir(home), "config.json") },
+      { scope: "local", legacy: legacyLocal, target: join(cwd, CONFIG_DIRNAME, "config.local.json") },
+      { scope: "project", legacy: legacyProject, target: join(cwd, CONFIG_DIRNAME, "config.json") },
+    ]);
+    // Nothing moved, and not even the directories a move would mkdir exist.
+    expect(mockRename).not.toHaveBeenCalled();
+    await expect(stat(legacyGlobal)).resolves.toBeDefined();
+    await expect(stat(legacyProject)).resolves.toBeDefined();
+    await expect(stat(legacyLocal)).resolves.toBeDefined();
+    await expect(stat(userConfigDir(home))).rejects.toThrow();
+    await expect(stat(join(cwd, CONFIG_DIRNAME))).rejects.toThrow();
+
+    // ...and it is the same list the real migrator then acts on.
+    await migrateLegacyConfigPaths({ cwd, home });
+    for (const { legacy, target } of plan) {
+      await expect(stat(legacy)).rejects.toThrow();
+      await expect(stat(target)).resolves.toBeDefined();
+    }
+  });
+
+  it("leaves out a legacy file whose target is already populated, as a real run skips it", async () => {
+    writeLegacy(home, LEGACY_GLOBAL_FILENAME);
+    mkdirSync(userConfigDir(home), { recursive: true });
+    writeFileSync(join(userConfigDir(home), "config.json"), JSON.stringify({ servers: ["github-new"] }), "utf8");
+
+    const warns: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown): boolean => {
+      warns.push(String(chunk));
+      return true;
+    });
+    const plan = await planLegacyConfigMigration({ cwd, home }).finally(() => spy.mockRestore());
+
+    expect(plan).toEqual([]);
+    expect(mockRename).not.toHaveBeenCalled();
+    // The orphan is announced exactly as the real run announces it.
+    expect(findLog(warns, "legacy file exists alongside new location -- legacy is ignored")).toBeDefined();
+  });
+
+  it("returns an empty plan when there is nothing to migrate", async () => {
+    await expect(planLegacyConfigMigration({ cwd, home })).resolves.toEqual([]);
   });
 });

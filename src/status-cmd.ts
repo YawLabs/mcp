@@ -18,7 +18,10 @@
 //   It never calls loadVault. The bundles WRITE path is the only thing in
 //   local-bundles.ts that takes the cross-process lock, and nothing here is on
 //   it. A test snapshots size+mtime of every file under the config dir across
-//   a run and requires them identical.
+//   a run and requires them identical. That is also why
+//   YAW_MCP_READONLY_DIAGNOSTICS has nothing to switch off here: this never
+//   calls loadYawMcpConfig (whose legacy-path migration renames files) and
+//   never touches trials.
 //
 //   COMPOSED, NOT REIMPLEMENTED. Every reader above is the same function the
 //   corresponding user-facing command already uses, so a status payload cannot

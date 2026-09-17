@@ -4,6 +4,20 @@ All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented 
 
 ## Unreleased -- a fresh Yaw Mode pane names the local-scope entry it will lose
 
+**Added -- `YAW_MCP_READONLY_DIAGNOSTICS=1` runs `doctor` and `bundles` without writing anything**
+
+Yaw Terminal's MCP panel runs `yaw-mcp doctor --json`, `status --json` and `bundles list --json` on every refresh, and `doctor` is not read-only. It sweeps expired `yaw-mcp try` trials: a read-modify-write of each client config the trial was wired into (`~/.claude.json` among them), taken with no lock against the client that owns the file, which drops a UTF-8 BOM and adds a trailing newline on the way through. It also renames a pre-0.12 `~/.yaw-mcp.json` or project `.yaw-mcp.json` / `.yaw-mcp.local.json` into `.yaw-mcp/` as part of loading config, and so does `bundles match`. A refresh the user did not ask for should not do either.
+
+With the variable set (`1` or `true` in any case, surrounding whitespace ignored -- the spellings `YAW_MCP_AUTO_LOAD`, `YAW_MCP_FOUNDRY` and `YAW_MCP_REWARD_GRADER` take):
+
+- `doctor`, text and `--json`, does not run the trial sweep. It still scans the trials. An expired one is not listed as live and not dropped: each becomes a warning -- ``trial "<slug>": expired but not swept -- YAW_MCP_READONLY_DIAGNOSTICS is set, so this run edits no client config, and its entry may still be wired into <path>; run `yaw-mcp doctor` with YAW_MCP_READONLY_DIAGNOSTICS unset to sweep it, or `yaw-mcp try-cleanup <slug>` `` -- so the run exits 2, the same as for an expired trial the sweep could not remove. TRIALS prints a count and points at WARNINGS.
+- `doctor` and `bundles match` do not migrate a legacy config file. Each file the migration would have moved is a warning instead, naming the file and where the next ordinary run moves it, because the settings in it are not part of that report. The check runs the migrator's own walk and per-file checks, so it names exactly the files a real run would move.
+- `status` and `bundles list` wrote nothing before and write nothing now.
+
+**`doctor --json` gains fields only on a run with the variable set**: a top-level `"readOnly": true`, and `trials.unswept` (`{ slug, clientName, clientPath, markerPath, msSinceExpiry }` per expired trial left in place, possibly empty) with `trials.sweepHint` (one display sentence naming both commands, or `null`). Without the variable, `doctor` (text and `--json`), `bundles` and `status` behave and print exactly as before: the trial sweep and the migration still run, and none of the new fields, lines or warnings appear. The variable is not listed in doctor's ENVIRONMENT section, because its 28-character name would re-pad every line of that section on every ordinary run. A run with it set prints `mode: read-only (YAW_MCP_READONLY_DIAGNOSTICS is set) -- no trial sweep, no config migration` under the header instead.
+
+The broker never reads the variable. Its startup config load still migrates legacy files even when the variable has leaked into a client's environment, because it is the process that folds them in.
+
 **Added -- a startup pre-warm of `npx -y <pkg>@latest` servers so the first `initialize` of a session does not pay the cold-cache tax**
 
 A server entry shaped `{ command: "npx", args: ["-y", "@yawlabs/<x>-mcp@latest"] }` resolves `@latest` on every spawn. On a fresh `~/.npm/_npx/` cache -- which npm keeps per-tarball-URL hash and so flushes whenever a package publishes a new build -- the first spawn does a registry round-trip + a tar download + the child's own `initialize`. Together that is reliably >30s, which exceeds the downstream MCP client's `initialize` deadline and surfaces as the user-visible line "MCP request initialize to server mcp timed out after 30000ms". yaw-mcp's own `MCP_CONNECT_TIMEOUT` is 15s by default, so the user loses the activation AND yaw-mcp spends 15s in the attempt before giving up.

@@ -1,6 +1,16 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
 function writeYawMcpConfig(root: string, filename: string, obj: unknown): void {
@@ -11,6 +21,7 @@ function writeYawMcpConfig(root: string, filename: string, obj: unknown): void {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { classifyClientConfig, unloadableConfigProblem } from "../client-config.js";
+import { legacyMigrationSkippedWarning } from "../config-loader.js";
 import {
   DOCTOR_ENV_VARS,
   DOCTOR_USAGE,
@@ -1130,6 +1141,7 @@ describe("runDoctor — env table lockstep with `yaw-mcp --help`", () => {
     "YAW_MCP_CATALOG_URL", // endpoint override, not a behavior toggle
     "YAW_MCP_VAULT_PASSPHRASE", // a credential -- SECRET VAULT reports it as a boolean
     "YAW_MCP_VAULT_PASSPHRASE_NEW", // a credential, same reason
+    "YAW_MCP_READONLY_DIAGNOSTICS", // reported by the `mode: read-only` line / `readOnly`, and only when set
   ]);
 
   it("finds the help table at all", () => {
@@ -1793,6 +1805,276 @@ describe("runDoctor — --json", () => {
     expect(parsed.trials.live[0].msUntilExpiry).toBe(3_600_000);
     // Live trial NOT swept: marker still present, entry still wired.
     expect(existsSync(join(trialsRoot, "bar.json"))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// YAW_MCP_READONLY_DIAGNOSTICS. Yaw Terminal's MCP panel runs `doctor --json`
+// on every refresh, and a background refresh must write nothing: no trial
+// sweep (a lockless read-modify-write of the client's own config) and no
+// legacy-config migration (a mkdir + rename). What the sweep is there to
+// guarantee must still hold on such a run: an expired trial is never reported
+// as live, and never silently missing from the report.
+// ---------------------------------------------------------------------------
+
+describe("runDoctor — YAW_MCP_READONLY_DIAGNOSTICS", () => {
+  const fixedNow = 1_000_000_000_000;
+  const READONLY_ENV = { YAW_MCP_READONLY_DIAGNOSTICS: "1" };
+
+  /** An expired trial whose entry IS wired into a client config -- the exact
+   *  state the ordinary sweep rewrites. The config carries a UTF-8 BOM and no
+   *  trailing newline on purpose: the splicer drops the one and
+   *  terminateWithNewline adds the other, so the byte-identity assertions
+   *  below cannot pass against a run that rewrote the file at all. */
+  function seedExpiredWiredTrial(): { clientConfigPath: string; markerPath: string } {
+    const clientConfigPath = join(synthHome, "client.json");
+    const body = JSON.stringify({ mcpServers: { "yaw-mcp-try-foo": { command: "x" }, keep: { command: "y" } } });
+    writeFileSync(clientConfigPath, `${String.fromCharCode(0xfeff)}${body}`);
+    const trialsRoot = join(synthHome, ".yaw-mcp", "trials");
+    mkdirSync(trialsRoot, { recursive: true });
+    const markerPath = join(trialsRoot, "foo.json");
+    writeFileSync(
+      markerPath,
+      JSON.stringify({
+        slug: "foo",
+        expiresAt: fixedNow - 60_000,
+        clientPath: clientConfigPath,
+        clientName: "claude-code",
+        containerPath: ["mcpServers"],
+        entryName: "yaw-mcp-try-foo",
+      }),
+    );
+    return { clientConfigPath, markerPath };
+  }
+
+  /** Every entry under `root`: a file as `size:mtimeMs`, a directory as
+   *  "dir". A rewrite moves the mtime even at the same length, and a created
+   *  or deleted file OR directory (the migration's mkdir) changes the key set. */
+  function snapshotTree(root: string): Record<string, string> {
+    const out: Record<string, string> = {};
+    const walk = (dir: string): void => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const full = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          out[relative(root, full)] = "dir";
+          walk(full);
+          continue;
+        }
+        const st = statSync(full);
+        out[relative(root, full)] = `${st.size}:${st.mtimeMs}`;
+      }
+    };
+    walk(root);
+    return out;
+  }
+
+  it("--json: leaves an expired trial's client entry and marker byte-identical, and reports it as expired, not live", async () => {
+    const { clientConfigPath, markerPath } = seedExpiredWiredTrial();
+    const clientBefore = readFileSync(clientConfigPath);
+    const markerBefore = readFileSync(markerPath);
+
+    const errLines: string[] = [];
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: READONLY_ENV,
+      os: "linux",
+      out: () => {},
+      err: (s) => errLines.push(s),
+      json: true,
+      skipRegistryCheck: true,
+      now: () => fixedNow,
+    });
+
+    // Nothing written: same bytes, BOM and missing newline included, and the
+    // marker is still there for the next ordinary sweep to act on.
+    expect(readFileSync(clientConfigPath).equals(clientBefore)).toBe(true);
+    expect(existsSync(markerPath)).toBe(true);
+    expect(readFileSync(markerPath).equals(markerBefore)).toBe(true);
+
+    const parsed = JSON.parse(r.lines[0]);
+    expect(parsed.readOnly).toBe(true);
+    // Not swept, not failed -- and NOT live, which is the reading a consumer
+    // must never get of an expired trial.
+    expect(parsed.trials.cleared).toBe(0);
+    expect(parsed.trials.failed).toBe(0);
+    expect(parsed.trials.failures).toEqual([]);
+    expect(parsed.trials.live).toEqual([]);
+    expect(parsed.trials.unswept).toEqual([
+      {
+        slug: "foo",
+        clientName: "claude-code",
+        clientPath: clientConfigPath,
+        markerPath,
+        msSinceExpiry: 60_000,
+      },
+    ]);
+    // How to sweep, in the blob itself.
+    expect(parsed.trials.sweepHint).toContain("yaw-mcp doctor");
+    expect(parsed.trials.sweepHint).toContain("yaw-mcp try-cleanup <slug>");
+    expect(parsed.trials.sweepHint).toContain("YAW_MCP_READONLY_DIAGNOSTICS");
+
+    // ...and as a warning, so it moves the exit code and the diagnosis the
+    // panel renders, exactly like an expired trial the sweep could not peel.
+    const warning = parsed.warnings.find((w: string) => w.includes('trial "foo"'));
+    expect(warning).toBeDefined();
+    expect(warning).toContain("expired but not swept");
+    expect(warning).toContain("YAW_MCP_READONLY_DIAGNOSTICS");
+    expect(warning).toContain(clientConfigPath);
+    expect(warning).toContain("yaw-mcp try-cleanup foo");
+    expect(r.exitCode).toBe(2);
+    expect(parsed.diagnosis.exitCode).toBe(2);
+    expect(errLines.join("")).toContain(`warning: ${warning}`);
+  });
+
+  it("text: same state, same warning, one count line under TRIALS, and nothing written", async () => {
+    const { clientConfigPath, markerPath } = seedExpiredWiredTrial();
+    const clientBefore = readFileSync(clientConfigPath);
+
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: READONLY_ENV,
+      os: "linux",
+      out: () => {},
+      err: () => {},
+      skipRegistryCheck: true,
+      now: () => fixedNow,
+    });
+    const text = r.lines.join("\n");
+
+    expect(readFileSync(clientConfigPath).equals(clientBefore)).toBe(true);
+    expect(existsSync(markerPath)).toBe(true);
+
+    expect(text).toContain("mode: read-only (YAW_MCP_READONLY_DIAGNOSTICS is set)");
+    expect(text).toContain("TRIALS (yaw-mcp try)");
+    expect(text).toContain("1 expired trial not swept (YAW_MCP_READONLY_DIAGNOSTICS is set) -- see WARNINGS");
+    expect(text).not.toContain("swept 1 expired trial");
+    // Listed once, under WARNINGS -- never as a live trial with a countdown.
+    const warningLine = r.lines.find((l) => l.includes('trial "foo": expired but not swept'));
+    expect(warningLine).toBeDefined();
+    expect(r.lines.filter((l) => l.includes('trial "foo"'))).toHaveLength(1);
+    expect(text).not.toContain("expires in");
+    expect(text).toContain("Warnings above need attention");
+    expect(r.exitCode).toBe(2);
+  });
+
+  it("does not migrate a legacy config file, and says so instead of reporting no config", async () => {
+    const legacyGlobal = join(synthHome, ".yaw-mcp.json");
+    writeFileSync(legacyGlobal, JSON.stringify({ servers: ["legacy_only"] }));
+    const legacyProject = join(synthCwd, ".yaw-mcp.json");
+    writeFileSync(legacyProject, JSON.stringify({ blocked: ["slack"] }));
+
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: READONLY_ENV,
+      os: "linux",
+      out: () => {},
+      err: () => {},
+      json: true,
+      skipRegistryCheck: true,
+    });
+
+    // Not moved: both legacy files in place, neither target created -- not
+    // even the project `.yaw-mcp/` directory the migration would mkdir.
+    expect(existsSync(legacyGlobal)).toBe(true);
+    expect(existsSync(legacyProject)).toBe(true);
+    expect(existsSync(join(synthHome, ".yaw-mcp", "config.json"))).toBe(false);
+    expect(existsSync(join(synthCwd, ".yaw-mcp"))).toBe(false);
+
+    // Reported: the settings in those files are not in this load, and the
+    // report says so rather than reading as a machine with no config.
+    const parsed = JSON.parse(r.lines[0]);
+    expect(parsed.loadedFiles).toEqual([]);
+    expect(parsed.warnings).toContain(
+      legacyMigrationSkippedWarning({
+        scope: "global",
+        legacy: legacyGlobal,
+        target: join(synthHome, ".yaw-mcp", "config.json"),
+      }),
+    );
+    expect(parsed.warnings).toContain(
+      legacyMigrationSkippedWarning({
+        scope: "project",
+        legacy: legacyProject,
+        target: join(synthCwd, ".yaw-mcp", "config.json"),
+      }),
+    );
+    expect(r.exitCode).toBe(2);
+  });
+
+  it("writes nothing anywhere under home -- trials and legacy config together, on both surfaces", async () => {
+    seedExpiredWiredTrial();
+    writeFileSync(join(synthHome, ".yaw-mcp.json"), JSON.stringify({ servers: ["legacy_only"] }));
+    const before = snapshotTree(synthHome);
+
+    for (const json of [true, false]) {
+      await runDoctor({
+        cwd: synthCwd,
+        home: synthHome,
+        env: READONLY_ENV,
+        os: "linux",
+        out: () => {},
+        err: () => {},
+        json,
+        skipRegistryCheck: true,
+        now: () => fixedNow,
+      });
+      expect(snapshotTree(synthHome)).toEqual(before);
+    }
+  });
+
+  it.each(["true", "TRUE", " 1 "])("honours the %j spelling", async (value) => {
+    const { markerPath } = seedExpiredWiredTrial();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_READONLY_DIAGNOSTICS: value },
+      os: "linux",
+      out: () => {},
+      err: () => {},
+      json: true,
+      skipRegistryCheck: true,
+      now: () => fixedNow,
+    });
+    expect(existsSync(markerPath)).toBe(true);
+    expect(JSON.parse(r.lines[0]).readOnly).toBe(true);
+  });
+
+  it.each([
+    "0",
+    "false",
+    "yes",
+    "",
+  ])("treats %j as unset: sweeps as before and emits none of the read-only fields", async (value) => {
+    // The control for every case above: the SAME fixture is sweepable, so
+    // "left untouched" there is the flag's doing, not a fixture the sweep
+    // could not act on. And an ordinary run's blob is the pre-flag shape --
+    // no `readOnly`, no `trials.unswept` / `trials.sweepHint`.
+    const { clientConfigPath, markerPath } = seedExpiredWiredTrial();
+    const clientBefore = readFileSync(clientConfigPath);
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_READONLY_DIAGNOSTICS: value },
+      os: "linux",
+      out: () => {},
+      err: () => {},
+      json: true,
+      skipRegistryCheck: true,
+      now: () => fixedNow,
+    });
+    const parsed = JSON.parse(r.lines[0]);
+    expect(parsed.trials.cleared).toBe(1);
+    expect(existsSync(markerPath)).toBe(false);
+    expect(readFileSync(clientConfigPath).equals(clientBefore)).toBe(false);
+    const after = JSON.parse(readFileSync(clientConfigPath, "utf8"));
+    expect(after.mcpServers["yaw-mcp-try-foo"]).toBeUndefined();
+    expect(after.mcpServers.keep).toBeDefined();
+    expect(Object.hasOwn(parsed, "readOnly")).toBe(false);
+    expect(Object.keys(parsed.trials).sort()).toEqual(["cleared", "failed", "failures", "live", "malformed"]);
+    expect(r.exitCode).toBe(0);
   });
 });
 

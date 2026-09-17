@@ -30,7 +30,7 @@ import { join, resolve } from "node:path";
 import { parseJsonc } from "./jsonc.js";
 import { NAMESPACE_RE } from "./local-bundles.js";
 import { log } from "./logger.js";
-import { migrateLegacyConfigPaths } from "./migrate.js";
+import { migrateLegacyConfigPaths, type PendingLegacyMigration, planLegacyConfigMigration } from "./migrate.js";
 import { findProjectConfigDir, userConfigDir } from "./paths.js";
 
 export const CONFIG_FILENAME = "config.json";
@@ -94,8 +94,61 @@ export interface LoadConfigOptions {
    *  decision can be probed without stubbing the real environment.
    *
    *  Wire any future env-dependent key up explicitly, the way this one is --
-   *  do not turn the field back into a general escape hatch. */
+   *  do not turn the field back into a general escape hatch. That is why
+   *  YAW_MCP_READONLY_DIAGNOSTICS is NOT read from here: it arrives as
+   *  `readOnly` below, decided by the caller. */
   env?: NodeJS.ProcessEnv;
+  /** Load without writing anything: the pre-0.12 legacy-path migration is
+   *  PLANNED instead of run, and each file it would have moved comes back as
+   *  a warning (its settings are not in this load, and the caller's report
+   *  must say so rather than read as if the file did not exist). Nothing is
+   *  memoized either, so a later ordinary load in the same process still
+   *  migrates.
+   *
+   *  A caller option rather than an env read, deliberately: the diagnostic
+   *  commands (doctor, `bundles match`) pass `isReadOnlyDiagnostics(env)`,
+   *  while the server's own startup load never passes it. An env read here
+   *  would let a YAW_MCP_READONLY_DIAGNOSTICS that leaked into a client's
+   *  environment switch the BROKER's migration off too, so the one process
+   *  whose job it is to fold the legacy file in would never do it. */
+  readOnly?: boolean;
+}
+
+/** Opt-in: `YAW_MCP_READONLY_DIAGNOSTICS=1` (or "true") makes the diagnostic
+ *  commands write nothing. Yaw Terminal's MCP panel runs `doctor --json`,
+ *  `status --json` and `bundles list --json` on every refresh, and a
+ *  background refresh must not edit a client config or move a file:
+ *
+ *    - `doctor` (text and --json) skips the expired-trial sweep
+ *      (gcExpiredTrials, which rewrites client configs and unlinks markers).
+ *      It still scans the trials and reports the expired ones as not swept,
+ *      as warnings, with the command that sweeps them.
+ *    - `doctor` and `bundles match` load config.json with `readOnly` (above):
+ *      the legacy-path migration (a mkdir + rename) is reported, not run.
+ *    - `status` and `bundles list` already write nothing, flag or no flag.
+ *
+ *  Unset, every command behaves exactly as before. */
+export const READONLY_DIAGNOSTICS_ENV = "YAW_MCP_READONLY_DIAGNOSTICS";
+
+/** Is YAW_MCP_READONLY_DIAGNOSTICS on? "1" or "true", case-insensitive -- the
+ *  truthy spellings these YAW_MCP_* opt-ins accept (isPersistenceDisabled,
+ *  isTrustBypassEnabled, isAutoLoadEnabled). Trimmed like isAutoLoadEnabled,
+ *  for the same cmd.exe reason: `set VAR=1 && ...` delivers "1 ". Anything
+ *  else, unset and empty included, is off.
+ *
+ *  Takes `env` for the reason isPersistenceDisabled does: doctor and `bundles`
+ *  thread an injected environment, and a predicate they cannot hand their own
+ *  env to is one they cannot share. */
+export function isReadOnlyDiagnostics(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = env[READONLY_DIAGNOSTICS_ENV]?.trim();
+  if (raw === undefined || raw === "") return false;
+  return raw === "1" || raw.toLowerCase() === "true";
+}
+
+/** The warning a read-only load raises for a legacy file it did not move.
+ *  Exported so the tests pin the wording instead of re-spelling it. */
+export function legacyMigrationSkippedWarning(p: PendingLegacyMigration): string {
+  return `${p.legacy}: pre-0.12 config file not migrated -- ${READONLY_DIAGNOSTICS_ENV} is set, so this run moves no files and the settings in it are NOT part of this report. The next yaw-mcp start (or this command with ${READONLY_DIAGNOSTICS_ENV} unset) moves it to ${p.target}.`;
 }
 
 /** Config keys that used to drive the hosted backend and are now inert.
@@ -437,7 +490,21 @@ export async function loadYawMcpConfig(opts: LoadConfigOptions = {}): Promise<Re
   // silently lose their allow/deny lists until they moved the file by hand.
   // Fail-open: migration errors are logged, never thrown. Memoized per
   // (cwd, home) so repeat loads in one process don't re-walk the tree.
-  await migrateLegacyConfigPathsOnce(cwd, home);
+  //
+  // A read-only load (see LoadConfigOptions.readOnly) plans the same walk
+  // instead and warns per file it would have moved. Not memoized: the memo
+  // means "the move has run for this pair", which a plan never makes true.
+  if (opts.readOnly) {
+    const pending = await planLegacyConfigMigration({ cwd, home }).catch((err): PendingLegacyMigration[] => {
+      log("warn", "Legacy config migration check failed", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return [];
+    });
+    for (const p of pending) warnings.push(legacyMigrationSkippedWarning(p));
+  } else {
+    await migrateLegacyConfigPathsOnce(cwd, home);
+  }
 
   const projectConfigDir = await findProjectConfigDir(cwd, home, opts.env).catch((err) => {
     log("warn", "Failed searching for project .yaw-mcp/ dir", {

@@ -22,6 +22,11 @@
 //     downgrading doesn't silently revive a stale version.
 //   - Quiet but visible: every successful move logs at INFO so users
 //     can trace where their config went.
+//   - Plannable without writing: planLegacyConfigMigration runs the SAME walk
+//     and the same per-file checks and returns what it would move instead of
+//     moving it. That is what a read-only diagnostic run
+//     (YAW_MCP_READONLY_DIAGNOSTICS, see config-loader.ts) reports, so the
+//     read-only answer to "what would move" cannot drift from the real one.
 
 import type { Stats } from "node:fs";
 import { lstat, mkdir, rename, stat } from "node:fs/promises";
@@ -49,11 +54,27 @@ async function exists(path: string): Promise<boolean> {
   }
 }
 
+/** A legacy file a migration run WOULD move, and where to. */
+export interface PendingLegacyMigration {
+  scope: "global" | "local" | "project";
+  legacy: string;
+  target: string;
+}
+
 // Move legacy → new, but only if the new path is empty. Ensures the
 // parent dir exists first (the whole point of this migration is that
 // `.yaw-mcp/` may not have been created yet). Logs on move, logs on skip
 // due to an already-populated target, logs on error.
-async function migrateFile(legacy: string, target: string, scope: string): Promise<void> {
+//
+// `plan` non-null is the no-write mode: every check below still runs (and
+// still logs its skip, exactly as a real run would), but a file that would be
+// renamed is recorded there instead -- no mkdir, no rename.
+async function migrateFile(
+  legacy: string,
+  target: string,
+  scope: PendingLegacyMigration["scope"],
+  plan: PendingLegacyMigration[] | null,
+): Promise<void> {
   // ONE lstat serves as both the existence probe and the ownership check
   // below -- the path used to be stat'ed twice, and the two stats could
   // disagree about the file they described.
@@ -122,6 +143,11 @@ async function migrateFile(legacy: string, target: string, scope: string): Promi
     return;
   }
 
+  if (plan !== null) {
+    plan.push({ scope, legacy, target });
+    return;
+  }
+
   try {
     await mkdir(dirname(target), { recursive: true });
     await rename(legacy, target);
@@ -164,12 +190,29 @@ export interface MigrateOptions {
 // layout. Intentionally does NOT return anything — failures are
 // absorbed via log so a bad filesystem state can't brick startup.
 export async function migrateLegacyConfigPaths(opts: MigrateOptions): Promise<void> {
+  await walkLegacyConfigPaths(opts, null);
+}
+
+/** What migrateLegacyConfigPaths WOULD move for this (cwd, home), without
+ *  moving anything: no mkdir, no rename. The same walk and the same per-file
+ *  checks (symlink, ownership, an already-populated target) decide, so a file
+ *  listed here is exactly one a real run would rename. The skip logs a real
+ *  run emits are emitted here too. Used by the loader's read-only mode. */
+export async function planLegacyConfigMigration(opts: MigrateOptions): Promise<PendingLegacyMigration[]> {
+  const plan: PendingLegacyMigration[] = [];
+  await walkLegacyConfigPaths(opts, plan);
+  return plan;
+}
+
+// The one walk behind both entry points above. `plan` null renames; non-null
+// records instead (see migrateFile).
+async function walkLegacyConfigPaths(opts: MigrateOptions, plan: PendingLegacyMigration[] | null): Promise<void> {
   const { cwd, home } = opts;
 
   // User-global: ~/.yaw-mcp.json → ~/.yaw-mcp/config.json
   const legacyGlobal = join(home, LEGACY_GLOBAL_FILENAME);
   const newGlobal = join(userConfigDir(home), NEW_CONFIG_FILENAME);
-  await migrateFile(legacyGlobal, newGlobal, "global");
+  await migrateFile(legacyGlobal, newGlobal, "global", plan);
 
   // A `.yaw-mcp.local.json` sitting AT $HOME is the one legacy file with no
   // new-layout home: the loader's machine-local scope is per-project
@@ -200,11 +243,11 @@ export async function migrateLegacyConfigPaths(opts: MigrateOptions): Promise<vo
 
     const legacyLocal = join(legacyProjectRoot, LEGACY_LOCAL_FILENAME);
     const newLocal = join(newDir, NEW_LOCAL_FILENAME);
-    await migrateFile(legacyLocal, newLocal, "local");
+    await migrateFile(legacyLocal, newLocal, "local", plan);
 
     const legacyProject = join(legacyProjectRoot, LEGACY_PROJECT_FILENAME);
     const newProject = join(newDir, NEW_CONFIG_FILENAME);
-    await migrateFile(legacyProject, newProject, "project");
+    await migrateFile(legacyProject, newProject, "project", plan);
   }
 }
 

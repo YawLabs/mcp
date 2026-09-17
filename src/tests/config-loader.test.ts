@@ -8,11 +8,14 @@ import {
   CURRENT_SCHEMA_VERSION,
   DEPRECATED_KEYS,
   isAllowed,
+  isReadOnlyDiagnostics,
   KNOWN_CONFIG_KEYS,
   LOCAL_CONFIG_FILENAME,
+  legacyMigrationSkippedWarning,
   loadYawMcpConfig,
   type Profile,
   profileAllows,
+  READONLY_DIAGNOSTICS_ENV,
   toProfile,
 } from "../config-loader.js";
 import { CONFIG_DIRNAME } from "../paths.js";
@@ -587,6 +590,109 @@ describe("loadYawMcpConfig — legacy migration", () => {
     expect(r.loadedFiles).toEqual([]);
     expect(existsSync(legacy)).toBe(true);
     expect(existsSync(join(synthCwd, CONFIG_DIRNAME, CONFIG_FILENAME))).toBe(false);
+  });
+});
+
+// `readOnly` is what YAW_MCP_READONLY_DIAGNOSTICS turns into for the
+// diagnostic commands. Each case pairs "nothing moved" with "and it said so":
+// a read-only load that skipped the move in silence would report a pre-0.12
+// user's allow/deny lists as simply absent.
+describe("loadYawMcpConfig — readOnly (no legacy migration)", () => {
+  it("leaves a legacy ~/.yaw-mcp.json in place and warns that it was not loaded", async () => {
+    const legacy = join(synthHome, ".yaw-mcp.json");
+    writeFileSync(legacy, JSON.stringify({ servers: ["legacy_only"] }));
+    const target = join(synthHome, CONFIG_DIRNAME, CONFIG_FILENAME);
+
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {}, readOnly: true });
+
+    expect(existsSync(legacy)).toBe(true);
+    expect(existsSync(target)).toBe(false);
+    expect(r.servers).toBeUndefined();
+    expect(r.loadedFiles).toEqual([]);
+    expect(r.warnings).toEqual([legacyMigrationSkippedWarning({ scope: "global", legacy, target })]);
+    expect(r.warnings[0]).toContain("YAW_MCP_READONLY_DIAGNOSTICS");
+  });
+
+  it("leaves a legacy PROJECT file in place without creating the project .yaw-mcp/ directory", async () => {
+    const legacy = join(synthCwd, ".yaw-mcp.json");
+    writeFileSync(legacy, JSON.stringify({ blocked: ["slack"] }));
+
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {}, readOnly: true });
+
+    expect(existsSync(legacy)).toBe(true);
+    // The migration's mkdir is skipped along with its rename.
+    expect(existsSync(join(synthCwd, CONFIG_DIRNAME))).toBe(false);
+    expect(r.blocked).toBeUndefined();
+    expect(r.warnings).toEqual([
+      legacyMigrationSkippedWarning({
+        scope: "project",
+        legacy,
+        target: join(synthCwd, CONFIG_DIRNAME, CONFIG_FILENAME),
+      }),
+    ]);
+  });
+
+  it("does not warn about a legacy file a real run would not move either (target already populated)", async () => {
+    // The plan runs migrateFile's own checks, so it names only files a real
+    // run would rename -- not the orphan the migration deliberately ignores.
+    writeFileSync(join(synthHome, ".yaw-mcp.json"), JSON.stringify({ servers: ["legacy_only"] }));
+    writeConfig(synthHome, CONFIG_FILENAME, { servers: ["current"] });
+
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {}, readOnly: true });
+
+    expect(r.servers).toEqual(["current"]);
+    expect(r.warnings).toEqual([]);
+  });
+
+  it("does not poison the per-process migration memo: a later ordinary load still migrates", async () => {
+    // The memo means "the move has run for this (cwd, home)". A read-only
+    // load that primed it would stop the next ordinary load in the same
+    // process -- the server's own -- from ever migrating the file.
+    const legacy = join(synthHome, ".yaw-mcp.json");
+    writeFileSync(legacy, JSON.stringify({ servers: ["legacy_only"] }));
+
+    await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {}, readOnly: true });
+    expect(existsSync(legacy)).toBe(true);
+
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    expect(r.servers).toEqual(["legacy_only"]);
+    expect(existsSync(legacy)).toBe(false);
+    expect(r.warnings).toEqual([]);
+  });
+
+  it("is not switched on by the env var alone -- only the caller's readOnly decides", async () => {
+    // The broker's own startup load passes no readOnly. A
+    // YAW_MCP_READONLY_DIAGNOSTICS that leaked into a client's environment must
+    // not stop the one process whose job is to fold the legacy file in.
+    const legacy = join(synthHome, ".yaw-mcp.json");
+    writeFileSync(legacy, JSON.stringify({ servers: ["legacy_only"] }));
+
+    const r = await loadYawMcpConfig({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_READONLY_DIAGNOSTICS: "1" },
+    });
+
+    expect(r.servers).toEqual(["legacy_only"]);
+    expect(existsSync(legacy)).toBe(false);
+  });
+});
+
+describe("isReadOnlyDiagnostics", () => {
+  it.each(["1", "true", "TRUE", "True", " 1 ", "true\t"])("is on for %j", (value) => {
+    expect(isReadOnlyDiagnostics({ [READONLY_DIAGNOSTICS_ENV]: value })).toBe(true);
+  });
+
+  it.each(["0", "false", "yes", "on", "2", "", "   "])("is off for %j", (value) => {
+    expect(isReadOnlyDiagnostics({ [READONLY_DIAGNOSTICS_ENV]: value })).toBe(false);
+  });
+
+  it("is off when unset", () => {
+    expect(isReadOnlyDiagnostics({})).toBe(false);
+  });
+
+  it("names the variable the docs name", () => {
+    expect(READONLY_DIAGNOSTICS_ENV).toBe("YAW_MCP_READONLY_DIAGNOSTICS");
   });
 });
 

@@ -16,7 +16,15 @@
 // and an un-finishable sweep raises the exit code. There is
 // no lock around that write, so it carries the same TOCTOU class as any
 // other config mutation. The sweep is best-effort: any failure is swallowed
-// and never aborts the diagnostic.
+// and never aborts the diagnostic. The config load also runs the pre-0.12
+// legacy-path migration (a mkdir + rename; see migrate.ts).
+//
+// YAW_MCP_READONLY_DIAGNOSTICS=1 turns BOTH writes off, for a caller that runs
+// doctor in the background (Yaw Terminal's MCP panel, on every refresh): the
+// trials are still scanned, and each expired one is reported as not swept --
+// a warning, with the command that sweeps it -- and a legacy config file the
+// migration would have moved is reported the same way instead of moved. See
+// isReadOnlyDiagnostics (config-loader.ts). Unset, nothing here changes.
 //
 // Exit codes:
 //   0  healthy — every config file parsed cleanly and raised no warnings
@@ -56,8 +64,10 @@ import {
 import { readStrictJson } from "./client-config-json.js";
 import {
   CURRENT_SCHEMA_VERSION,
+  isReadOnlyDiagnostics,
   type LoadedConfigFile,
   loadYawMcpConfig,
+  READONLY_DIAGNOSTICS_ENV,
   type ResolvedConfig,
 } from "./config-loader.js";
 import {
@@ -133,7 +143,15 @@ import {
   sidecarsRoot,
 } from "./sidecars-cmd.js";
 import { TRUST_BYPASS_ENV } from "./trust.js";
-import { formatTtl, gcExpiredTrials, scanTrials, type TrialGcFailure, trialGcFailureWarning } from "./try-cmd.js";
+import {
+  formatTtl,
+  gcExpiredTrials,
+  scanTrials,
+  type TrialGcFailure,
+  type TrialScanEntry,
+  type TrialScanResult,
+  trialGcFailureWarning,
+} from "./try-cmd.js";
 import {
   BINARY_RETIRED_HINT,
   buildUpgradePlan,
@@ -269,6 +287,14 @@ export interface DoctorJsonSnapshot {
   timestamp: string;
   version: string;
   platform: InstallOS;
+  /** `true` when YAW_MCP_READONLY_DIAGNOSTICS was set for this run: no
+   *  expired trial was swept (see `trials.unswept`) and no legacy config file
+   *  was migrated (each one it would have moved is in `warnings`). ABSENT --
+   *  not `false` -- on an ordinary run, like the two `trials` fields that go
+   *  with it, so a run without the flag emits byte-for-byte what it did before
+   *  the flag existed. It also tells a consumer that set the flag whether it
+   *  actually reached the process. Additive JSON field. */
+  readOnly?: true;
   // DEPRECATED — every member is always `null`. yaw-mcp is local-only; there
   // is no token and no API base to report. The NESTED SHAPE is retained
   // rather than flattened to a bare `null` for the same reason as
@@ -329,8 +355,9 @@ export interface DoctorJsonSnapshot {
   shellShadows: ShadowHit[];
   // Trial state. `cleared` is the count of expired trials swept this run
   // (the GC write side effect — runs on the --json path too, matching the
-  // text path). `live` lists still-active trials with their TTL; `malformed`
-  // lists marker files that failed to parse.
+  // text path; 0 on a read-only run, which sweeps nothing). `live` lists
+  // still-active trials with their TTL; `malformed` lists marker files that
+  // failed to parse.
   trials: {
     cleared: number;
     /** Expired trials the sweep could NOT finish. `failed` is the count;
@@ -340,6 +367,27 @@ export interface DoctorJsonSnapshot {
     failures: TrialGcFailure[];
     live: Array<{ slug: string; clientName: string; clientPath: string; msUntilExpiry: number }>;
     malformed: string[];
+    /** Expired trials a read-only run (YAW_MCP_READONLY_DIAGNOSTICS) scanned
+     *  and deliberately did NOT sweep: the marker is still on disk and the
+     *  entry may still be wired into `clientPath`. Never listed in `live`, and
+     *  each one is also folded into `warnings` (so the run exits 2), because
+     *  an expired trial left in a client config must not read as live or as
+     *  gone. `msSinceExpiry` is how long ago it expired.
+     *
+     *  Present ONLY on a read-only run (and then possibly empty); absent
+     *  otherwise, where every expired trial is either `cleared` or in
+     *  `failures`. Additive JSON field. */
+    unswept?: Array<{
+      slug: string;
+      clientName: string;
+      clientPath: string;
+      markerPath: string;
+      msSinceExpiry: number;
+    }>;
+    /** How to sweep what `unswept` lists, as one sentence for display; null
+     *  when `unswept` is empty. Present only alongside `unswept`. Additive
+     *  JSON field. */
+    sweepHint?: string | null;
   };
   // DEPRECATED — both members are always `null`. The background HTTP
   // posters (analytics, tool-report) that populated this were removed with
@@ -656,6 +704,9 @@ async function collectDoctorBase(opts: DoctorOptions): Promise<{
   appData: string | undefined;
   os: InstallOS;
   env: NodeJS.ProcessEnv;
+  /** YAW_MCP_READONLY_DIAGNOSTICS, read from the INJECTED env once, here, so
+   *  the config load below and each path's trial step answer from one read. */
+  readOnly: boolean;
   timestamp: string;
   config: ResolvedConfig;
   trustProbe: ProjectTrustProbe | null;
@@ -672,9 +723,12 @@ async function collectDoctorBase(opts: DoctorOptions): Promise<{
   const appData = resolveAppDataDir({ home: opts.home, env: opts.env });
   const os = opts.os ?? CURRENT_OS;
   const env = opts.env ?? process.env;
+  const readOnly = isReadOnlyDiagnostics(env);
   const timestamp = new Date().toISOString();
 
-  const config = await loadYawMcpConfig({ cwd, home, env });
+  // readOnly: plan the legacy-path migration instead of running it, and warn
+  // for each file it would have moved (see LoadConfigOptions.readOnly).
+  const config = await loadYawMcpConfig({ cwd, home, env, readOnly });
   // Project-trust gate (see trust.ts). Folded into config.warnings so it
   // renders in WARNINGS (text) / `.warnings` (json), hits the always-on stderr
   // stream, and drives the exit-2 gate like every other warning.
@@ -697,6 +751,7 @@ async function collectDoctorBase(opts: DoctorOptions): Promise<{
     appData,
     os,
     env,
+    readOnly,
     timestamp,
     config,
     trustProbe,
@@ -878,12 +933,15 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
     write(`${s}\n`);
   };
 
-  const { cwd, home, appData, os, env, timestamp, config, trustProbe, claudeConfigDir, clientEnv } =
+  const { cwd, home, appData, os, env, readOnly, timestamp, config, trustProbe, claudeConfigDir, clientEnv } =
     await collectDoctorBase(opts);
 
   print(`yaw-mcp doctor -- ${timestamp}`);
   print(`yaw-mcp version: ${VERSION}`);
   print(`platform: ${os}`);
+  // Only on a read-only run, so an ordinary report is unchanged -- the text
+  // counterpart of the --json `readOnly` field.
+  if (readOnly) print(`mode: read-only (${READONLY_DIAGNOSTICS_ENV} is set) -- no trial sweep, no config migration`);
   print("");
 
   print("CONFIG FILES");
@@ -971,7 +1029,9 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   // config.warnings, so the text path gates exit 2 exactly like --json does
   // for the same state (they used to diverge: text printed the line and
   // exited 0 "All good", json exited 2).
-  const trialWarnings = await renderTrialsSection({ home, print, now: opts.now });
+  // A read-only run sweeps nothing; its expired trials come back as warnings
+  // too (see collectTrialStatus), folded at this same position.
+  const trialWarnings = await renderTrialsSection({ home, print, now: opts.now, readOnly });
   if (trialWarnings.length > 0) config.warnings = [...config.warnings, ...trialWarnings];
 
   // Probe every supported client/scope combo on the current OS, against the
@@ -1116,18 +1176,23 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
   // Same collection prologue as the text path -- option defaults, config load,
   // project-trust fold, CLAUDE_CONFIG_DIR -- so `doctor --json` reports the
   // gate in `.warnings` and exits 2 identically. See collectDoctorBase.
-  const { cwd, home, appData, os, env, timestamp, config, trustProbe, claudeConfigDir, clientEnv } =
+  const { cwd, home, appData, os, env, readOnly, timestamp, config, trustProbe, claudeConfigDir, clientEnv } =
     await collectDoctorBase(opts);
 
-  // Trial GC + readout. The --json path MUST run gcExpiredTrials too, so
-  // `doctor` and `doctor --json` have the SAME persistent side effects
-  // (peel expired entries out of client configs, delete markers). Previously
-  // the JSON path returned early and
-  // skipped GC entirely, leaving expired trials wired up. Best-effort:
-  // any sweep failure is swallowed, matching renderTrialsSection.
-  // Scan once, then hand the scan to the GC pass so the trials dir isn't
-  // read twice (GC only unlinks expired markers, so live/malformed in this
-  // pre-sweep scan match the post-sweep readout state).
+  // Trial GC + readout, through the same collector as the text path's TRIALS
+  // section (collectTrialStatus). On an ordinary run the --json path MUST run
+  // gcExpiredTrials too, so `doctor` and `doctor --json` have the SAME
+  // persistent side effects (peel expired entries out of client configs,
+  // delete markers). Previously the JSON path returned early and skipped GC
+  // entirely, leaving expired trials wired up while the snapshot said nothing
+  // about them. That is the rule's point: an expired trial must never sit in
+  // a client config unreported to the consumer reading this blob.
+  //
+  // A read-only run (YAW_MCP_READONLY_DIAGNOSTICS) keeps that promise without
+  // the write: it sweeps nothing, and every expired trial comes back in
+  // `trials.unswept` AND as a warning (so the run exits 2), with the command
+  // that sweeps it -- never dropped, never listed as live. Both surfaces take
+  // the same branch because both ask the one collector.
   //
   // Runs BEFORE probeClients, matching the text path (renderTrialsSection GCs
   // at its own section, then the CLIENTS section probes). gcExpiredTrials
@@ -1135,12 +1200,8 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
   // so probing first would snapshot pre-GC configs and report entries this
   // same run just deleted -- the "Same data-collection sequence" claim in the
   // header above is only true with the GC ahead of the probe.
-  const trialScan = await scanTrials({ home, now: opts.now });
-  const trialGc = await gcExpiredTrials({
-    home,
-    now: opts.now,
-    scan: trialScan,
-  }).catch(() => ({ cleared: 0, failed: 0, failures: [] }));
+  const trialStatus = await collectTrialStatus({ home, now: opts.now, readOnly });
+  const { scan: trialScan, gc: trialGc } = trialStatus;
 
   const clients = probeClients({
     home,
@@ -1270,6 +1331,20 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
       msUntilExpiry,
     })),
     malformed: trialScan.malformed,
+    // Read-only runs only, so an ordinary run's `trials` block is unchanged
+    // (see DoctorJsonSnapshot.trials.unswept).
+    ...(readOnly
+      ? {
+          unswept: trialStatus.unswept.map(({ marker, path, msUntilExpiry }) => ({
+            slug: marker.slug,
+            clientName: marker.clientName,
+            clientPath: marker.clientPath,
+            markerPath: path,
+            msSinceExpiry: Math.max(0, -msUntilExpiry),
+          })),
+          sweepHint: trialStatus.unswept.length > 0 ? TRIAL_SWEEP_HINT : null,
+        }
+      : {}),
   };
 
   // oam runtime block — same collector as the text path's OAM RUNTIME
@@ -1289,12 +1364,13 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
   // vault and no refs) so a consumer can read `.vault` without a presence
   // check. Names and booleans only -- never a value, never the passphrase.
   const vault = await collectVaultStatus({ home, env, servers: oamStatus.servers });
-  // Trial-GC failures fold AFTER the bundle warnings, matching the text
-  // path's order (trust -> bundle -> trials) so the two surfaces emit the
-  // same warning list in the same order. Same per-failure wording helper
-  // as the text path, so they cannot drift on content either.
-  if (trialGc.failures.length > 0) {
-    config.warnings = [...config.warnings, ...trialGc.failures.map(trialGcFailureWarning)];
+  // Trial-GC failures (or, on a read-only run, the unswept expired trials)
+  // fold AFTER the bundle warnings, matching the text path's order (trust ->
+  // bundle -> trials) so the two surfaces emit the same warning list in the
+  // same order. The strings come from collectTrialStatus, the collector the
+  // text path uses, so they cannot drift on content either.
+  if (trialStatus.warnings.length > 0) {
+    config.warnings = [...config.warnings, ...trialStatus.warnings];
   }
   // Client cannot-launch states fold LAST, through the same helper and at the
   // same position as the text path (trust -> bundle -> trials -> clients), so
@@ -1368,6 +1444,8 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
     timestamp,
     version: VERSION,
     platform: os,
+    // Present only on a read-only run -- see DoctorJsonSnapshot.readOnly.
+    ...(readOnly ? { readOnly: true as const } : {}),
     // DEPRECATED keys, emitted with their original nested shape and null
     // members so `doctor --json` stays parseable for consumers reading
     // `.token.source` / `.apiBase.value`. See DoctorJsonSnapshot.
@@ -1417,7 +1495,12 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
 // credentials -- putting either here would paste the user's vault passphrase
 // into every support ticket. Vault state is reported as a boolean by the
 // SECRET VAULT section instead (see VaultStatus.passphraseSet), so the drift
-// check should read them as covered, not missing.
+// check should read them as covered, not missing. YAW_MCP_READONLY_DIAGNOSTICS
+// is excluded because a run with it set already says so where it matters (the
+// `mode: read-only` header line and the --json `readOnly` field), and a row
+// here would change every ordinary report: its name is the longest in the
+// table, so it would re-pad every line of the section, and add a key to the
+// --json `env` block, for a run that never set it.
 //
 // The lockstep is PINNED, not just asked for: the "env table lockstep with
 // `yaw-mcp --help`" suite in doctor-cmd.test.ts reads the help table straight
@@ -2237,34 +2320,97 @@ function renderReliabilitySection(opts: {
   print("");
 }
 
+/** The display sentence for how to sweep what a read-only run left in place.
+ *  The --json `trials.sweepHint`; the per-trial warnings carry the same two
+ *  commands. */
+const TRIAL_SWEEP_HINT = `Expired trials are not swept while ${READONLY_DIAGNOSTICS_ENV} is set. Run \`yaw-mcp doctor\` with it unset to sweep them all, or \`yaw-mcp try-cleanup <slug>\` to remove one.`;
+
+/** The doctor-facing wording for an expired trial a read-only run scanned and
+ *  did not sweep. Shaped like trialGcFailureWarning's "peel" line, because
+ *  what the user has to do about it is the same: the entry may still be wired
+ *  in. "May", not "is": the scan reads the marker, not the client config, and
+ *  reading the config to find out is exactly the peel this run skipped. */
+function trialUnsweptWarning(entry: TrialScanEntry): string {
+  const { slug, clientPath } = entry.marker;
+  return `trial "${slug}": expired but not swept -- ${READONLY_DIAGNOSTICS_ENV} is set, so this run edits no client config, and its entry may still be wired into ${clientPath}; run \`yaw-mcp doctor\` with ${READONLY_DIAGNOSTICS_ENV} unset to sweep it, or \`yaw-mcp try-cleanup ${slug}\``;
+}
+
+/** The trial scan and what the sweep step did with it, for BOTH doctor paths
+ *  -- the text TRIALS section and the --json `trials` block -- so the two
+ *  cannot disagree about whether this run swept, or word its warnings apart. */
+interface TrialStatus {
+  scan: TrialScanResult;
+  gc: { cleared: number; failed: number; failures: TrialGcFailure[] };
+  /** Expired trials a read-only run left in place. Always empty when the
+   *  sweep ran: every expired trial is then cleared or in `gc.failures`. */
+  unswept: TrialScanEntry[];
+  /** The warnings to fold, in order: the sweep's failures, or the unswept
+   *  trials (only one of the two can be non-empty). */
+  warnings: string[];
+}
+
+async function collectTrialStatus(opts: {
+  home: string;
+  now?: () => number;
+  /** YAW_MCP_READONLY_DIAGNOSTICS: scan and report, never sweep. */
+  readOnly: boolean;
+}): Promise<TrialStatus> {
+  const { home, now, readOnly } = opts;
+  // Scan once, then hand the scan to the GC pass so the trials dir isn't read
+  // twice (GC only unlinks expired markers, so live/malformed in this
+  // pre-sweep scan match the post-sweep readout state).
+  const scan = await scanTrials({ home, now });
+  if (readOnly) {
+    // No gcExpiredTrials at all: it is a read-modify-write of client configs
+    // and an unlink of markers, taken with no lock against the client that
+    // owns the file. Everything it would have acted on is reported instead.
+    return {
+      scan,
+      gc: { cleared: 0, failed: 0, failures: [] },
+      unswept: scan.expired,
+      warnings: scan.expired.map(trialUnsweptWarning),
+    };
+  }
+  // Best-effort: any sweep failure is swallowed rather than aborting the
+  // diagnostic.
+  const gc = await gcExpiredTrials({ home, now, scan }).catch(() => ({
+    cleared: 0,
+    failed: 0,
+    failures: [],
+  }));
+  return { scan, gc, unswept: [], warnings: gc.failures.map(trialGcFailureWarning) };
+}
+
 // Trials section — runs the expired-trial GC pass first (peels each
 // expired entry out of its client config + deletes the marker), then
 // renders the still-live trials
 // with their countdown. Section is OMITTED when there are no trials
 // at all so healthy installs stay quiet. Mirrors the silence-on-empty
 // convention of the reliability and background-posters sections.
+// A read-only run skips the GC pass and says how many expired trials it left.
 async function renderTrialsSection(opts: {
   home: string;
   print: (s?: string) => void;
   now?: () => number;
+  readOnly: boolean;
 }): Promise<string[]> {
-  const { home, print, now } = opts;
-  // Scan once, then hand the scan to the GC pass (GC only unlinks expired
-  // markers, so live/malformed here match the post-sweep readout state).
-  const scan = await scanTrials({ home, now });
-  const gc = await gcExpiredTrials({ home, now, scan }).catch(() => ({
-    cleared: 0,
-    failed: 0,
-    failures: [],
-  }));
+  const { home, print, now, readOnly } = opts;
+  const { scan, gc, unswept, warnings } = await collectTrialStatus({ home, now, readOnly });
   // The failures are part of the visibility predicate AND are returned as
   // warnings: an expired trial the sweep could not finish used to vanish
   // from this section entirely (the sweep logged it at debug and doctor
   // said "All good"). Returning them lets the text path fold them into
   // config.warnings exactly like the --json path, so both surfaces exit 2
-  // for the same state.
-  const warnings = gc.failures.map(trialGcFailureWarning);
-  if (scan.live.length === 0 && gc.cleared === 0 && gc.failed === 0 && scan.malformed.length === 0) return warnings;
+  // for the same state. A read-only run's unswept trials follow the same rule.
+  if (
+    scan.live.length === 0 &&
+    gc.cleared === 0 &&
+    gc.failed === 0 &&
+    unswept.length === 0 &&
+    scan.malformed.length === 0
+  ) {
+    return warnings;
+  }
   print("TRIALS (yaw-mcp try)");
   if (gc.cleared > 0) {
     print(`  swept ${gc.cleared} expired trial${gc.cleared === 1 ? "" : "s"} this run`);
@@ -2277,6 +2423,13 @@ async function renderTrialsSection(opts: {
     // appeared twice in the report. Say how many here and point at the block
     // that carries the detail.
     print(`  ${gc.failed} expired trial${gc.failed === 1 ? "" : "s"} could not be swept -- see WARNINGS`);
+  }
+  if (unswept.length > 0) {
+    // Count here, detail under WARNINGS -- the same once-only split as the
+    // failed line above.
+    print(
+      `  ${unswept.length} expired trial${unswept.length === 1 ? "" : "s"} not swept (${READONLY_DIAGNOSTICS_ENV} is set) -- see WARNINGS`,
+    );
   }
   for (const { marker, msUntilExpiry } of scan.live) {
     print(`  ${marker.slug} -> ${marker.clientName} (${marker.clientPath}) -- expires in ${formatTtl(msUntilExpiry)}`);
