@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -400,6 +400,35 @@ describe("runBundlesCommand — match", () => {
       expect(r.exitCode).toBe(0);
       expect(io.out.join("\n")).not.toMatch(/Excluded by your config\.json/);
       expect(io.out.join("\n")).toContain("3 available servers");
+    });
+
+    it("under YAW_MCP_READONLY_DIAGNOSTICS, does not migrate a pre-0.12 ~/.yaw-mcp.json -- and says its profile was not applied", async () => {
+      // The header's one write: the config load renames a legacy flat file
+      // into ~/.yaw-mcp/config.json. A read-only run must leave it where it is,
+      // and must not pretend the deny-list inside it does not exist.
+      seedThree();
+      const legacy = join(home, ".yaw-mcp.json");
+      writeFileSync(legacy, JSON.stringify({ blocked: ["slack"] }), "utf8");
+      const target = join(home, CONFIG_DIRNAME, "config.json");
+
+      const io = captureIO();
+      const r = await run({ json: true, env: { YAW_MCP_READONLY_DIAGNOSTICS: "1" }, out: io.push, err: io.pushErr });
+      expect(r.exitCode).toBe(0);
+      expect(existsSync(legacy)).toBe(true);
+      expect(existsSync(target)).toBe(false);
+      // Not loaded, so not applied...
+      expect(JSON.parse(r.stdout.join("\n")).excluded).toEqual([]);
+      // ...and stderr says why, naming the file.
+      expect(r.stderr.join("\n")).toContain(`warning: ${legacy}: pre-0.12 config file not migrated`);
+
+      // The control: the same command without the flag migrates it, and the
+      // profile then applies. Also proves the read-only run did not mark this
+      // (cwd, home) as already migrated.
+      const io2 = captureIO();
+      const r2 = await run({ json: true, env: {}, out: io2.push, err: io2.pushErr });
+      expect(existsSync(legacy)).toBe(false);
+      expect(existsSync(target)).toBe(true);
+      expect(JSON.parse(r2.stdout.join("\n")).excluded).toEqual(["slack"]);
     });
   });
 

@@ -421,6 +421,7 @@ Common ones (run `yaw-mcp --help` for the full list):
 | `MCP_CALL_TIMEOUT` | Milliseconds to wait for a single proxied `tools/call`. Default `60000` (the SDK's own bound); raise it for legitimately slow servers. Same `1..2147483647` whole-millisecond parse, invalid values fall back with one warn. |
 | `YAW_MCP_IDLE_THRESHOLD` | Non-matching tool calls a loaded server tolerates before it is unloaded. Default `10`; bursty servers earn more patience automatically. The older name `MCP_CONNECT_IDLE_THRESHOLD` still works as a fallback. |
 | `YAW_MCP_DISABLE_PERSISTENCE` | `1` keeps learning + pack history process-scoped (CI, containers). Default off. |
+| `YAW_MCP_READONLY_DIAGNOSTICS` | `1` makes `doctor` (text and `--json`) and `bundles` write nothing, for a caller that runs them in the background on a timer. `doctor` still scans `yaw-mcp try` trials but does not sweep expired ones out of your client configs: each is reported as a warning (so the run exits 2) and listed in `--json`'s `trials.unswept`, with `trials.sweepHint` naming the fix -- a plain `yaw-mcp doctor` with the variable unset, or `yaw-mcp try-cleanup <slug>`. A pre-0.12 `~/.yaw-mcp.json` or project `.yaw-mcp.json` / `.yaw-mcp.local.json` is not moved into `.yaw-mcp/`; each is reported as a warning instead (its settings are not loaded for that run). `--json` carries `"readOnly": true` on such a run. `status` never writes, so it is unaffected. Default off. |
 | `LOG_LEVEL` | `debug` \| `info` \| `warn` \| `error`. Default `info`. |
 
 ## Requirements

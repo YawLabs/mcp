@@ -25,6 +25,11 @@
 //           through. One-shot, idempotent (an existing target is never
 //           overwritten) and fail-open, but a real write -- so `match` is a
 //           read of the CONFIG, not a read-only command on the filesystem.
+//           With YAW_MCP_READONLY_DIAGNOSTICS set it IS one: the load plans
+//           the migration instead, and each file it would have moved comes
+//           back as a warning (its allow/deny lists are not in the result).
+//
+// `list` does no I/O at all, flag or no flag.
 //
 // Output is human-readable text by default. `--json` on either action
 // emits a machine-readable shape for pipeline use.
@@ -43,7 +48,7 @@ import {
   comparePartialBundles,
   matchBundles,
 } from "./bundles.js";
-import { isAllowed, loadYawMcpConfig } from "./config-loader.js";
+import { isAllowed, isReadOnlyDiagnostics, loadYawMcpConfig } from "./config-loader.js";
 import { loadLocalBundles } from "./local-bundles.js";
 import { createStreamWriter } from "./logger.js";
 
@@ -163,7 +168,9 @@ export async function runBundlesCommand(opts: BundlesCommandOptions = {}): Promi
   // over the identical server set.
   const env = opts.env ?? process.env;
   const loaded = await loadLocalBundles({ cwd: opts.cwd, home: opts.home, env });
-  const config = await loadYawMcpConfig({ cwd: opts.cwd, home: opts.home, env });
+  // readOnly under YAW_MCP_READONLY_DIAGNOSTICS: no legacy-path migration (see
+  // the header), read from the same injected env as everything else here.
+  const config = await loadYawMcpConfig({ cwd: opts.cwd, home: opts.home, env, readOnly: isReadOnlyDiagnostics(env) });
 
   // Surface load warnings so a malformed bundles.json (or config.json) reads as
   // "this file is broken" instead of "you have no servers." stderr keeps stdout

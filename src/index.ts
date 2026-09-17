@@ -540,6 +540,13 @@ if (subcommand === "compliance") {
                                are written -- never the raw intent -- but
                                ordinary words survive, so do not enable it on
                                intents that carry names or other PII.
+    YAW_MCP_READONLY_DIAGNOSTICS  Set to \`1\` to make \`doctor\` and \`bundles\`
+                               write nothing, for a caller that runs them in
+                               the background: expired \`yaw-mcp try\` trials
+                               are reported as warnings instead of swept out
+                               of client configs, and a pre-0.12 config file
+                               is reported instead of moved into .yaw-mcp/
+                               (default: off; \`status\` never writes).
     YAW_MCP_CATALOG_URL          Override the catalog \`add\`/\`try\` resolve slugs
                                against (default https://yaw.sh/data/mcp-catalog.json).
 
