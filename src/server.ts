@@ -10,6 +10,7 @@ import {
   ListToolsRequestSchema,
   ReadResourceRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import { maybeAutoPrewarmNpxCache } from "./auto-prewarm.js";
 import { maybeAutoUpgrade } from "./auto-upgrade.js";
 import { bundleActivateHint, CURATED_BUNDLES, matchBundles, topPartialBundles } from "./bundles.js";
 import { formatShadowLine, installTargetForCli } from "./cli-shadows.js";
@@ -1748,6 +1749,26 @@ export class ConnectServer {
     // different trees (the global prefix vs ~/.yaw-mcp/sidecars) and each
     // serializes itself with its own lockfile.
     maybeRefreshSidecars().catch((err: Error) => log("warn", "Sidecar refresh check failed", { error: err?.message }));
+
+    // Pre-warm `~/.npm/_npx/<hash>/node_modules/<pkg>` for every active
+    // `npx -y <pkg>@latest` server, so the user's first `initialize` for that
+    // server does not pay the cold-cache tax. Without this, a fresh
+    // `_npx` cache makes a single spawn do registry + tar + child initialize,
+    // which is reliably >30s -- exceeding the downstream MCP client's
+    // `initialize` deadline and surfacing as "MCP request initialize to server
+    // mcp timed out after 30000ms". The prime runs `npx -y <pkg>@latest
+    // --version` once per unique package, in parallel, and resolves in <30s
+    // in the worst case. No-op when the user opts out
+    // (YAW_MCP_AUTO_PREWARM=0) or has no npx servers. Shares the sidecars lock
+    // with `maybeRefreshSidecars` so a manual `sidecars install` running at
+    // startup defers this pass and vice versa.
+    //
+    // Fire-and-forget for its siblings' reasons: the work it can trigger is
+    // a parallel batch of `npx` downloads, gated on the network, that the
+    // serve hot path must not block on. Ordering does not matter -- the
+    // prewarm touches `~/.npm/`, the sidecar refresh touches
+    // `~/.yaw-mcp/sidecars/`, and the upgrade touches the global prefix.
+    maybeAutoPrewarmNpxCache().catch((err: Error) => log("warn", "Auto-prewarm check failed", { error: err?.message }));
 
     log("info", "yaw-mcp started", {
       servers: this.config?.servers.length ?? 0,
