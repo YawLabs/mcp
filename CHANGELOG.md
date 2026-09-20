@@ -56,6 +56,10 @@ A `config.toml` that really does not parse is reported in TOML words by `doctor`
 
 `MIN_OAM_VERSION` tracks the latest oam release as policy, and v0.16.1 is now current (published 2026-09-15); the floor was 0.15.2. A machine whose oam is older hosts its node/npx sidecars on node instead, and logs a warning naming both versions, `oam self-update` as the fix, and that yaw-mcp needs a restart afterwards. `release.sh` moved the floor and wrote this block; it did not re-run the oam hosting check that `src/oam-spawn.ts` describes.
 
+**Changed -- the oam floor moves to 0.16.2**
+
+`MIN_OAM_VERSION` tracks the latest oam release as policy, and v0.16.2 is now current (published 2026-09-18); the floor was 0.16.1. A machine whose oam is older hosts its node/npx sidecars on node instead, and logs a warning naming both versions, `oam self-update` as the fix, and that yaw-mcp needs a restart afterwards. `release.sh` moved the floor and wrote this block; it did not re-run the oam hosting check that `src/oam-spawn.ts` describes.
+
 ## 1.0.2 -- `install --force` stops keeping the env it promised to overwrite, editing a client config stops rewriting the entry next to ours, and the install surfaces stop stating things that are not so
 
 An audit of the install surface. Nothing in the install blocks changes how yaw-mcp brokers servers at runtime -- they are `yaw-mcp install` and the commands that share its config-writing code -- and the blocks after the `doctor` block are unrelated changes, each saying what it touches. The `--force` block is first, deliberately: it is the first of this section's script-visible changes, and the one whose difference is a credential that used to survive and no longer does. It is not the only one -- `install --all` now exits 2 where it exited 1 on a refusal-only run, `--force --repair` together now exits 2 instead of writing, and `install --list`'s STATUS column can now read `installed (other drive case)` for a Claude Code project whose entry an older version left under the other drive-letter spelling -- and each such change is called out in the block it belongs to.
