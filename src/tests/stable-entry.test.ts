@@ -194,3 +194,33 @@ describe("stableSpellingOf -- version directory at a filesystem root", () => {
     expect(stableSpellingOf("/1.0.0/dist/index.js", posix)).toBe("/current/dist/index.js");
   });
 });
+
+describe("isEphemeralMountPath -- the supported install layouts", () => {
+  // One row per shape we actually ship or that a supported host produces.
+  // "ephemeral" means: the path carries a segment that is gone on the next
+  // launch, so it must never be persisted and no later repair could converge.
+  const CASES: Array<[string, string, boolean]> = [
+    ["linux AppImage, FUSE mount", "/tmp/.mount_Yaw8xKq1/resources/app.asar.unpacked", true],
+    ["linux AppImage, relocated TMPDIR", "/run/user/1000/.mount_YawAbc/resources/app", true],
+    ["linux AppImage, extract-and-run (no FUSE)", "/tmp/appimage_extracted_9f2c1/resources/app", true],
+    [
+      "macOS translocated (quarantined)",
+      "/private/var/folders/x/AppTranslocation/UUID/d/Yaw.app/Contents/Resources",
+      true,
+    ],
+    ["macOS /Applications", "/Applications/Yaw.app/Contents/Resources/app.asar.unpacked", false],
+    ["macOS homebrew cask target", "/opt/homebrew/Caskroom/yaw/2.1.5/Yaw.app/Contents/Resources", false],
+    ["linux deb/rpm", "/opt/Yaw/resources/app.asar.unpacked", false],
+    ["linux /usr/lib", "/usr/lib/yaw/resources/app.asar.unpacked", false],
+    ["windows scoop", "C:\\Users\\j\\scoop\\apps\\yaw\\2.1.5\\resources", false],
+    ["windows Program Files", "C:\\Program Files\\Yaw\\resources", false],
+    ["ordinary /tmp checkout", "/tmp/build/yaw/node_modules", false],
+    ["a dir merely CONTAINING mount_", "/opt/mount_data/yaw/node_modules", false],
+  ];
+
+  for (const [name, p, ephemeral] of CASES) {
+    it(`${ephemeral ? "refuses" : "allows"}: ${name}`, () => {
+      expect(isEphemeralMountPath(p)).toBe(ephemeral);
+    });
+  }
+});

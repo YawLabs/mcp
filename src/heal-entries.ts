@@ -32,6 +32,10 @@
  *   3. NOT READ-ONLY  -- `YAW_MCP_READONLY_DIAGNOSTICS` is honoured, so the
  *      panel's background poll stays a pure read. That flag exists precisely
  *      so a poll nobody asked for writes nothing, and this does not flip it.
+ *   4. NOT FOREIGN    -- an entry written for another OS is unverifiable from
+ *      here, never broken. A WSL session reading a Windows profile passes every
+ *      recogniser above and then fails gate 2 for the wrong reason, because
+ *      `statSync` on `C:\...` from Linux throws. See isForeignEntry.
  *
  * Gate 2 is also what makes the pass converge: it is a no-op the instant the
  * entry resolves, so it cannot fight another writer or rewrite in a loop.
@@ -53,7 +57,7 @@ import {
   readClientConfigFile,
 } from "./client-config.js";
 import { isReadOnlyDiagnostics } from "./config-loader.js";
-import { oamRunEntryPath } from "./doctor-cmd.js";
+import { isForeignAbsoluteLaunch, oamRunEntryPath } from "./doctor-cmd.js";
 import { ENTRY_NAME } from "./install-target-model.js";
 import {
   buildLaunchEntry,
@@ -104,6 +108,11 @@ export interface HealOptions {
   cwd?: string;
   claudeConfigDir?: string;
   env?: NodeJS.ProcessEnv;
+  /** Path SEMANTICS of the machine doing the inspecting -- never the `os`
+   *  option, which picks which client layout to look at. Same seam and same
+   *  distinction as doctor's ProbeOptions.platform, and it exists for the same
+   *  case: a WSL session reading a Windows profile. */
+  platform?: NodeJS.Platform;
   /** Plan only: compute and return what WOULD change, write nothing. */
   dryRun?: boolean;
   /** Test seams, same pair install-cmd exposes and for the same reason: the
@@ -114,10 +123,46 @@ export interface HealOptions {
   resolveOamEntry?: (pkg: string) => string | null;
 }
 
-/** Normalised for comparison: separators folded and case lowered, because a
- *  Windows path is case-insensitive and reaches us spelled either way. */
-function norm(p: string): string {
-  return p.split("\\").join("/").toLowerCase();
+/**
+ * Normalised for comparison: separators folded always, case folded ONLY where
+ * the filesystem folds it.
+ *
+ * Lowercasing unconditionally was wrong off Windows. Linux and a case-sensitive
+ * APFS volume treat `/opt/Yaw` and `/opt/yaw` as two different directories, so
+ * folding case there can call two distinct files equal -- which would let the
+ * dedupe key collapse two real entries into one (healing only the first) and
+ * let the convergence guard mistake a different path for the old one (skipping
+ * a repair that was needed).
+ */
+function norm(p: string, platform: NodeJS.Platform = process.platform): string {
+  const slashed = p.split("\\").join("/");
+  return platform === "win32" ? slashed.toLowerCase() : slashed;
+}
+
+/**
+ * An entry written for a DIFFERENT operating system than the one inspecting it.
+ *
+ * The case this exists for is a WSL session reading a Windows profile. Every
+ * recogniser upstream says yes to such an entry -- `oam.exe` is an oam command,
+ * and the path really does sit inside an `@yawlabs/mcp` tree -- but `statSync`
+ * on `C:\...` from Linux throws, so gate 2 reads BROKEN and the sweep would
+ * rewrite a working Windows entry with Linux paths, breaking the Windows client
+ * that owns it.
+ *
+ * Doctor already refuses to judge this shape (isForeignAbsoluteLaunch): it
+ * reports the row as unverifiable rather than broken, precisely because the
+ * exists check cannot be applied across the boundary. The healer needs the same
+ * rule and needs it more, because doctor only prints and this WRITES.
+ *
+ * Checked in both directions. `isForeignAbsoluteLaunch` covers a drive-letter
+ * path seen from POSIX; the POSIX-path-seen-from-win32 half is checked here,
+ * because win32's `isAbsolute` accepts `/foo` and `statSync` would then answer
+ * about the current drive rather than about the file the entry means.
+ */
+function isForeignEntry(command: string, entryPath: string, platform: NodeJS.Platform): boolean {
+  if (isForeignAbsoluteLaunch(command, platform)) return true;
+  if (platform === "win32" && (entryPath.startsWith("/") || command.startsWith("/"))) return true;
+  return false;
 }
 
 /** Gate 1. Is this entry file one WE would have written -- i.e. does it live
@@ -154,6 +199,7 @@ export async function healStaleBrokerEntries(opts: HealOptions = {}): Promise<He
   if (isReadOnlyDiagnostics(env)) return { healed: [], unhealable: [] };
 
   const os = opts.os ?? CURRENT_OS;
+  const platform = opts.platform ?? process.platform;
   const healed: HealedEntry[] = [];
   const unhealable: UnhealableConfig[] = [];
 
@@ -204,7 +250,7 @@ export async function healStaleBrokerEntries(opts: HealOptions = {}): Promise<He
       if (site === undefined) continue;
       const resolvedSite = site;
 
-      const key = `${norm(resolvedSite.resolved.absolute)}::${addressOf(resolvedSite).containerPath.join(".")}`;
+      const key = `${norm(resolvedSite.resolved.absolute, platform)}::${addressOf(resolvedSite).containerPath.join(".")}`;
       if (seen.has(key)) continue;
       seen.add(key);
 
@@ -241,6 +287,11 @@ export async function healStaleBrokerEntries(opts: HealOptions = {}): Promise<He
         const entryPath = oamRunEntryPath(launch.command, launch.args);
         if (entryPath === null || !isOwnBrokerEntry(entryPath)) continue;
 
+        // Written for another OS than the one inspecting: unverifiable here,
+        // never broken. See isForeignEntry -- this is the WSL case, and it is
+        // checked BEFORE gate 2, because gate 2 is exactly what gets it wrong.
+        if (isForeignEntry(launch.command, entryPath, platform)) continue;
+
         // Gate 2: only a BROKEN entry is ever rewritten.
         //
         // A FILE, not merely something at that path: `existsSync` is true for a
@@ -273,7 +324,7 @@ export async function healStaleBrokerEntries(opts: HealOptions = {}): Promise<He
         // answer -- but the cost of being wrong here is an endless rewrite.
         const nextLaunch = launchOf(next);
         const nextEntry = nextLaunch === null ? null : oamRunEntryPath(nextLaunch.command, nextLaunch.args);
-        if (nextEntry !== null && norm(nextEntry) === norm(entryPath)) continue;
+        if (nextEntry !== null && norm(nextEntry, platform) === norm(entryPath, platform)) continue;
 
         if (opts.dryRun !== true) {
           const text = applyClientConfigEdits(view, [{ op: "upsert", key: ENTRY_NAME, entry: next }], resolvedSite);

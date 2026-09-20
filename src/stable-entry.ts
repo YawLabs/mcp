@@ -38,8 +38,10 @@ export interface StableSpellingDeps {
 /**
  * Paths that exist only for the lifetime of the process reading them.
  *
- * An AppImage is FUSE-mounted at `/tmp/.mount_<name><random>` and unmounted on
- * exit; a quarantined macOS app is copied to
+ * An AppImage is FUSE-mounted at `$TMPDIR/.mount_<name><random>` and unmounted
+ * on exit -- or, where FUSE is unavailable, unpacked to
+ * `$TMPDIR/appimage_extracted_<hash>` and deleted on exit; a quarantined macOS
+ * app is copied to
  * `/private/var/folders/.../AppTranslocation/<uuid>/d/` with a fresh uuid every
  * launch. Persisting either names a file that is gone the moment Yaw exits --
  * and unlike the scoop case NO refresh cadence can save it, because the next
@@ -56,12 +58,19 @@ export function isEphemeralMountPath(p: string): boolean {
   const posix = p.replace(/\\/g, "/");
   return (
     posix.includes("/AppTranslocation/") ||
-    // AppImage's runtime mount. Anchored on the `.mount_` segment the
-    // runtime creates, NOT on `/tmp`: the mount lives under $TMPDIR, which
-    // is not always /tmp. Matching the segment covers a relocated TMPDIR
-    // too, without reading the AppImage runtime's own env var -- which
-    // would add an undocumented env knob for no extra coverage.
-    /(^|\/)\.mount_/.test(posix)
+    // AppImage's FUSE mount. Anchored on the `.mount_` segment the runtime
+    // creates, NOT on `/tmp`: the mount lives under $TMPDIR, which is not
+    // always /tmp. Matching the segment covers a relocated TMPDIR too, without
+    // reading the AppImage runtime's own env var.
+    /(^|\/)\.mount_/.test(posix) ||
+    // The OTHER AppImage shape, and the one easy to miss: when FUSE is
+    // unavailable -- a container, a hardened or older distro, `--appimage-
+    // extract-and-run` -- the runtime does not mount at all. It unpacks to
+    // `$TMPDIR/appimage_extracted_<hash>` and deletes that on exit, so the
+    // path is just as temporary while looking nothing like a mount. Covering
+    // only `.mount_` meant those users had an ephemeral path baked into a
+    // machine-global config, and no later pass could converge on it.
+    /(^|\/)appimage_extracted_/i.test(posix)
   );
 }
 

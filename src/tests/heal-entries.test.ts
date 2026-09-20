@@ -208,3 +208,73 @@ describe("healStaleBrokerEntries -- gate 2 and unreadable configs", () => {
     expect(r.unhealable.filter((u) => u.reason === "absent")).toEqual([]);
   });
 });
+
+describe("healStaleBrokerEntries -- a config written for another OS", () => {
+  /** A Windows-spelled entry, exactly what a Yaw install on Windows writes. */
+  const WIN_OAM = "C:\\tools\\oam.exe";
+  const WIN_ENTRY = "C:\\Users\\x\\scoop\\apps\\yaw\\2.1.2\\node_modules\\@yawlabs\\mcp\\dist\\index.js";
+
+  function winEntryToml(): string {
+    // TOML literal strings (single quotes) take a Windows path verbatim, which
+    // is what install itself writes.
+    return ["[mcp_servers.mcp]", `command = '${WIN_OAM}'`, `args = ['run', '--no-check', '${WIN_ENTRY}']`, ""].join(
+      "\n",
+    );
+  }
+
+  it("leaves it alone when inspected from POSIX -- the WSL case", async () => {
+    // Every recogniser says yes: oam.exe IS an oam command and the path IS
+    // inside an @yawlabs/mcp tree. But statSync on C:... from Linux throws, so
+    // gate 2 would read BROKEN and the sweep would rewrite a WORKING Windows
+    // entry with Linux paths, breaking the client that owns it. Doctor already
+    // refuses to judge this shape; the healer writes, so it matters more.
+    const p = writeCodexConfig(winEntryToml());
+    const before = readFileSync(p, "utf8");
+    const healed = await heal({ platform: "linux" });
+    expect(healed.filter((x) => x.clientId === "codex-cli")).toEqual([]);
+    expect(readFileSync(p, "utf8")).toBe(before);
+  });
+
+  it("leaves a POSIX-spelled entry alone when inspected from win32", async () => {
+    // The other direction: win32 isAbsolute accepts "/opt/...", so statSync
+    // would answer about the current drive rather than about the file meant.
+    const p = writeCodexConfig(
+      [
+        "[mcp_servers.mcp]",
+        "command = '/usr/local/bin/oam'",
+        "args = ['run', '--no-check', '/opt/yaw/node_modules/@yawlabs/mcp/dist/index.js']",
+        "",
+      ].join("\n"),
+    );
+    const before = readFileSync(p, "utf8");
+    const healed = await heal({ platform: "win32" });
+    expect(healed.filter((x) => x.clientId === "codex-cli")).toEqual([]);
+    expect(readFileSync(p, "utf8")).toBe(before);
+  });
+});
+
+describe("healStaleBrokerEntries -- machines with no oam binary", () => {
+  it("repairs to the npx entry when oam publishes nothing for this chip", async () => {
+    // oamPublishesBinaryFor: win32/darwin get x64 + arm64, linux gets x64
+    // ONLY -- so a linux-arm64 box (a Pi, an arm server, an arm container)
+    // has no oam at all. probeOam answers with a null binPath there, and the
+    // repair has to land on the self-refetching npx entry rather than write
+    // an oam entry naming a binary that does not exist.
+    const p2 = writeCodexConfig(tomlEntry(DEAD));
+    const noOam = (): OamProbe => ({
+      bin: null,
+      binPath: null,
+      version: null,
+      belowMin: false,
+      failure: null,
+      failureDetail: null,
+    });
+    const healed = await heal({ oamProbe: noOam });
+    const codex = healed.filter((h) => h.clientId === "codex-cli");
+    expect(codex).toHaveLength(1);
+    expect(codex[0].to).toBe("npx");
+    const after = readFileSync(p2, "utf8");
+    expect(after).toContain("npx");
+    expect(after).not.toContain("oam");
+  });
+});
