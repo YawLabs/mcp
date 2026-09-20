@@ -12,6 +12,7 @@ import {
 } from "../completion-cmd.js";
 import { parseDoctorArgs } from "../doctor-cmd.js";
 import { parseFoundryArgs } from "../foundry-cmd.js";
+import { parseHealArgs } from "../heal-cmd.js";
 import { parseImportArgs } from "../import-cmd.js";
 import { parseInstallArgs, parseUninstallArgs } from "../install-cmd.js";
 import { parseAddArgs, parseListArgs, parseRemoveArgs } from "../local-add-cmd.js";
@@ -482,6 +483,7 @@ const FLAG_PARSERS: Record<string, (argv: string[]) => ProbeResult> = {
   try: parseTryArgs,
   "try-cleanup": parseTryCleanupArgs,
   doctor: parseDoctorArgs,
+  heal: parseHealArgs,
   bundles: parseBundlesArgs,
   upgrade: parseUpgradeArgs,
   completion: parseCompletionArgs,

@@ -222,6 +222,11 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
     flags: ["--json", "--help"],
   },
   { name: "doctor", description: "Print diagnostic of yaw-mcp setup", flags: ["--json", "--help"] },
+  {
+    name: "heal",
+    description: "Re-point client entries whose launch file no longer exists",
+    flags: ["--json", "--dry-run", "--quiet", "--help"],
+  },
   // `servers` is not here because it no longer exists: it was deleted in
   // 1.0.0, and typing it gets the retired-verb hint from RETIRED_SUBCOMMANDS
   // in subcommands.ts. completion-cmd.test.ts pins it out of both this spec

@@ -8,6 +8,7 @@ import { runComplianceCommand } from "./compliance-cmd.js";
 import { loadYawMcpConfig } from "./config-loader.js";
 import { parseDoctorArgs, runDoctor } from "./doctor-cmd.js";
 import { parseFoundryArgs, runFoundryExport } from "./foundry-cmd.js";
+import { parseHealArgs, runHeal } from "./heal-cmd.js";
 import { parseImportArgs, runImport } from "./import-cmd.js";
 import { INSTALL_USAGE, parseInstallArgs, parseUninstallArgs, runInstall, runUninstall } from "./install-cmd.js";
 import { parseAddArgs, parseListArgs, parseRemoveArgs, runAdd, runList, runRemove } from "./local-add-cmd.js";
@@ -191,6 +192,8 @@ if (subcommand === "compliance") {
   // THIS file to test the branch is impossible, since the dispatcher runs at
   // import time. The branch is now just the shared parse-then-dispatch tail.
   run("doctor", parseDoctorArgs(process.argv.slice(3)), runDoctor);
+} else if (subcommand === "heal") {
+  run("heal", parseHealArgs(process.argv.slice(3)), runHeal);
 } else if (subcommand === "reset-learning") {
   const parsed = parseResetLearningArgs(process.argv.slice(3));
   if (parsed.kind === "help") {
@@ -367,6 +370,12 @@ if (subcommand === "compliance") {
                              local servers (ready vs. partially installed).
 
   Maintenance:
+    heal                     Re-point client entries whose launch file no
+                             longer exists -- what an app upgrade leaves
+                             behind when it deletes the directory the entry
+                             named. Only touches an entry yaw-mcp wrote that
+                             is currently broken. Runs automatically at
+                             startup; this is the manual form.
     upgrade                  Show (or --run) the command that bumps
                              @yawlabs/mcp to the latest version.
     sidecars install         Install your servers into ~/.yaw-mcp/sidecars so
@@ -432,6 +441,12 @@ if (subcommand === "compliance") {
                                self-upgrade check at server startup (default:
                                stale global installs are upgraded in the
                                background -- npm, pnpm, and bun globals alike).
+    YAW_MCP_AUTO_HEAL             Set to \`0\` to disable the startup pass that
+                               re-points client entries whose launch file no
+                               longer exists -- what an app upgrade leaves
+                               behind when it deletes the directory the entry
+                               named (default: on; it only rewrites an entry
+                               yaw-mcp wrote AND that is currently broken).
     YAW_MCP_CONFIG_RELOAD         Set to \`0\` to stop re-reading bundles.json
                                while the session runs, restoring the pre-0.81
                                behaviour where an edit takes effect only after

@@ -44,7 +44,7 @@ import {
   unloadableConfigFix,
   unparseableConfigFix,
 } from "../install-targets.js";
-import { MIN_OAM_VERSION, OAM_INSTALL_PS1, OAM_INSTALL_SH } from "../oam-spawn.js";
+import { isOamLaunch, MIN_OAM_VERSION, OAM_INSTALL_PS1, OAM_INSTALL_SH } from "../oam-spawn.js";
 import { STATE_FILENAME, STATE_SCHEMA_VERSION } from "../persistence.js";
 import { SECRETS_SCHEMA_VERSION } from "../secrets-vault.js";
 
@@ -4013,6 +4013,30 @@ describe("runDoctor -- cannot-launch client states are warnings on both surfaces
   // twice, differing only in the scope label. The fold groups by (file,
   // client, status) and lists the scopes on one line; CLIENTS keeps its one
   // line per scope, because those rows ARE per scope.
+  // The OTHER file-level state, pinned separately because it reached the fold
+  // by a different route. `malformed` names the row install command, so its
+  // rendered status differs per scope and it has always needed a state-named
+  // key. `unreadable` names no command, so its status was IDENTICAL per scope
+  // and the old status key folded it by accident -- which meant keying the
+  // non-malformed branch on the container silently split one unreadable
+  // ~/.claude.json into a (user) line and a (local) line, byte-identical
+  // apart from the label. Caught by an adversarial review probe, not by the
+  // suite, because nothing pinned this shape.
+  it("folds an UNREADABLE file once, not once per scope", async () => {
+    // A directory where the config should be: the read fails with EISDIR.
+    mkdirSync(join(synthHome, ".claude.json"));
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: () => {},
+      err: () => {},
+    });
+    const unreadable = r.snapshot.config.warnings.filter((w) => w.includes("could not be read"));
+    expect(unreadable).toHaveLength(1);
+    expect(unreadable[0]).toContain("Claude Code (user, local)");
+  });
   it("folds a file-level state ONCE per file, listing every scope that reads it", async () => {
     writeFileSync(join(synthHome, ".claude.json"), "{ broken");
     const cap = captureOut();
@@ -5209,5 +5233,34 @@ describe("runDoctor -- a TOML client config (Codex CLI) is classified by its ada
     expect(local?.syntax).toBe("JSON");
     expect(local?.hasMcpEntry).toBe(true);
     expect(local?.entryProjectKey).toBe(variant);
+  });
+});
+
+describe("oamRunEntryPath -- fish and PowerShell wrappers", () => {
+  it("extracts the entry from fish -c", () => {
+    expect(oamRunEntryPath("fish", ["-c", "oam run --no-check /p/index.js"])).toBe("/p/index.js");
+  });
+
+  it("extracts the entry from pwsh -Command, rejoining the tail", () => {
+    // PowerShell -Command takes the REST of the line, not one argument.
+    expect(oamRunEntryPath("pwsh", ["-NoProfile", "-Command", "oam", "run", "--no-check", "/p/index.js"])).toBe(
+      "/p/index.js",
+    );
+  });
+
+  it("REFUSES a quoted payload rather than cut a path in half", () => {
+    // isOamLaunch says yes (it only reads the first token); this one must
+    // still decline, because a half-path would fail the exists check and
+    // read as a broken entry -- which the heal pass rewrites.
+    const args = [
+      "-Command",
+      "oam run --no-check " + String.fromCharCode(39) + "/p/a b/index.js" + String.fromCharCode(39),
+    ];
+    expect(isOamLaunch("pwsh", args)).toBe(true);
+    expect(oamRunEntryPath("pwsh", args)).toBeNull();
+  });
+
+  it("declines a PowerShell launch with no -Command", () => {
+    expect(oamRunEntryPath("pwsh", ["-File", "run.ps1"])).toBeNull();
   });
 });

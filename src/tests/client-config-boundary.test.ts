@@ -149,6 +149,11 @@ const RULES: Rule[] = [
         "goes to, carried per RemovalSite into `siteAt`, and compared by `sharedGrantHolder` to keep the " +
         "sites an uninstall is emptying out of its holder search. Not a walk: every read and write goes " +
         "through the core",
+      "src/heal-entries.ts":
+        "the SITE's own container path, read off the resolver, used ONLY as half of a dedupe key -- two " +
+        "scopes can resolve to the same file and the same container (Codex user and project, once cwd is " +
+        "home) and that one entry must be healed once, not twice. Never walked, never written: every read " +
+        "and write goes through the core",
       "src/try-cmd.ts":
         "a TRIAL MARKER records the container path it wrote at, on disk, in a versioned schema -- so try " +
         "reads that field back and hands it to `markerSite`, which is the only way a sweep can delete the " +
@@ -169,6 +174,10 @@ const RULES: Rule[] = [
     allowed: {
       "src/install-targets.ts": "declares it",
       "src/install-cmd.ts": "the broker entry, with the row's windowsLaunch policy passed in",
+      "src/heal-entries.ts":
+        "the SAME broker entry install writes, rebuilt for a row whose baked path has rotted -- the point " +
+        "of the repair is that it is byte-identical to what install would write today, so it has to call " +
+        "the one builder rather than hand-assemble a second opinion",
       "src/try-cmd.ts": "the upstream trial entry",
     },
     positive: ["buildLaunchEntry({ os })"],
