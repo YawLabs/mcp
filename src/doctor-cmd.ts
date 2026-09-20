@@ -116,6 +116,9 @@ import {
   type OamProbe,
   type OamProbeFailure,
   oamInstallAdvice,
+  POSIX_SHELL,
+  POWERSHELL,
+  powershellPayload,
   probeOam,
 } from "./oam-spawn.js";
 import { normalizeForCompare, userConfigDir } from "./paths.js";
@@ -2923,9 +2926,11 @@ function oamArgvTokens(command: string, args: readonly string[]): { oam: string;
     return { oam: args[i], rest: args.slice(i + 1) };
   }
 
-  if (/^(sh|bash|zsh|dash)$/i.test(base)) {
+  if (POSIX_SHELL.test(base)) {
     // A POSIX shell carries the whole command as one string after -c, so the
-    // payload has to be tokenised on whitespace.
+    // payload has to be tokenised on whitespace. fish is in this set because
+    // its `-c` packages the payload the same way; the quoting rules that make
+    // fish fish are only a parser's problem, and this does not parse.
     const dashC = args.indexOf("-c");
     const payload = dashC >= 0 ? args[dashC + 1] : args[0];
     if (payload === undefined) return null;
@@ -2933,6 +2938,24 @@ function oamArgvTokens(command: string, args: readonly string[]): { oam: string;
     // path in half, and half a path fails the exists() check below -- doctor
     // would report a healthy entry as missing. Under-reporting is the safe
     // direction here (isOamLaunch takes the same position), so bail instead.
+    if (/["']/.test(payload)) return null;
+    const tokens = payload.trim().split(/\s+/);
+    if (tokens[0] === undefined || !isOamCommand(tokens[0])) return null;
+    return { oam: tokens[0], rest: tokens.slice(1) };
+  }
+
+  if (POWERSHELL.test(base)) {
+    // PowerShell's `-Command` takes the REST of the line rather than one
+    // argument, so powershellPayload rejoins the tail before this tokenises it.
+    // A launch with no `-Command` (-File, -EncodedCommand, a bare script) is
+    // not the shape install writes and comes back null.
+    const payload = powershellPayload(args);
+    if (payload === null) return null;
+    // Same bail as the POSIX branch, and it matters more here: a caller that
+    // mis-extracts a token gets a path that does not exist, which reads as a
+    // BROKEN entry -- and the heal pass rewrites those. Refusing to guess is
+    // what keeps a working pwsh entry from being repaired out from under
+    // someone.
     if (/["']/.test(payload)) return null;
     const tokens = payload.trim().split(/\s+/);
     if (tokens[0] === undefined || !isOamCommand(tokens[0])) return null;

@@ -278,3 +278,40 @@ describe("healStaleBrokerEntries -- machines with no oam binary", () => {
     expect(after).not.toContain("oam");
   });
 });
+
+describe("healStaleBrokerEntries -- wrapper shapes", () => {
+  /** A broken entry reached through a shell wrapper rather than directly. */
+  function wrapped(command: string, args: string[]): string {
+    return ["[mcp_servers.mcp]", `command = ${JSON.stringify(command)}`, `args = ${JSON.stringify(args)}`, ""].join(
+      "\n",
+    );
+  }
+
+  it("repairs an entry wrapped in pwsh -Command", async () => {
+    const p2 = writeCodexConfig(wrapped("pwsh", ["-NoProfile", "-Command", "oam", "run", "--no-check", DEAD]));
+    const healed = await heal();
+    const codex = healed.filter((h) => h.clientId === "codex-cli");
+    expect(codex).toHaveLength(1);
+    expect(codex[0].from).toBe(DEAD);
+    // The repair writes the shape install writes, so the hand-rolled wrapper
+    // does not survive it. That is the deal gate 2 makes: the entry was not
+    // starting, and a working entry beats a broken one in the users chosen
+    // spelling.
+    expect(readFileSync(p2, "utf8")).not.toContain("2.1.2");
+  });
+
+  it("repairs an entry wrapped in fish -c", async () => {
+    const p2 = writeCodexConfig(wrapped("fish", ["-c", `oam run --no-check ${DEAD}`]));
+    const healed = await heal();
+    expect(healed.filter((h) => h.clientId === "codex-cli")).toHaveLength(1);
+    expect(readFileSync(p2, "utf8")).not.toContain("2.1.2");
+  });
+
+  it("leaves a WORKING pwsh-wrapped entry alone", async () => {
+    const p2 = writeCodexConfig(wrapped("pwsh", ["-Command", "oam", "run", "--no-check", liveEntry]));
+    const before = readFileSync(p2, "utf8");
+    const healed = await heal();
+    expect(healed.filter((h) => h.clientId === "codex-cli")).toEqual([]);
+    expect(readFileSync(p2, "utf8")).toBe(before);
+  });
+});

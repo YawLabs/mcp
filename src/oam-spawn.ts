@@ -1984,11 +1984,17 @@ export function isOamLaunch(command: string, args: readonly string[] = []): bool
     return first !== undefined && isOamCommand(first);
   }
 
-  if (/^(sh|bash|zsh|dash)$/i.test(base)) {
+  if (POSIX_SHELL.test(base)) {
     // A POSIX shell takes the WHOLE command as one string after -c
     // ("oam run /path/index.js"), so the payload has to be tokenised. Reading
     // it as a bare command name is what made this return false for every
     // realistic `sh -c` entry.
+    //
+    // fish rides in this branch rather than getting one of its own: its `-c`
+    // takes a single command string exactly like the Bourne family, and the
+    // things that make fish different (its own quoting and expansion rules)
+    // only matter to a parser that tries to UNDERSTAND the payload. This reads
+    // the first whitespace token and nothing more.
     const dashC = args.indexOf("-c");
     const payload = dashC >= 0 ? args[dashC + 1] : args[0];
     if (payload === undefined) return false;
@@ -2003,5 +2009,45 @@ export function isOamLaunch(command: string, args: readonly string[] = []): bool
     return firstToken !== undefined && firstToken.length > 0 && isOamCommand(firstToken);
   }
 
+  if (POWERSHELL.test(base)) {
+    const payload = powershellPayload(args);
+    if (payload === null) return false;
+    const firstToken = payload
+      .trim()
+      .split(/\s+/)[0]
+      ?.replace(/^["']|["']$/g, "");
+    return firstToken !== undefined && firstToken.length > 0 && isOamCommand(firstToken);
+  }
+
   return false;
+}
+
+/** The shells whose `-c` carries the whole command as ONE string. */
+export const POSIX_SHELL = /^(sh|bash|zsh|dash|fish)$/i;
+
+/** `pwsh` and Windows PowerShell, with or without the `.exe`. */
+export const POWERSHELL = /^(pwsh|powershell)(\.exe)?$/i;
+
+/**
+ * PowerShell's `-Command` switch accepts any unambiguous prefix, so `-c`,
+ * `-com` and `-Command` all name it. Spelled out rather than matched loosely so
+ * `-Confirm` and `-ComputerName` cannot be mistaken for it.
+ */
+const PS_COMMAND_SWITCH = /^-c(o(m(m(a(n(d)?)?)?)?)?)?$/i;
+
+/**
+ * The command text a PowerShell launch carries, or null when this is not that
+ * shape.
+ *
+ * Unlike a POSIX shell, `-Command` takes the REST of the line rather than one
+ * argument, so the tail is rejoined before tokenising. A launch with no
+ * `-Command` at all -- `-File`, `-EncodedCommand`, a bare script -- returns
+ * null: those are not the shape install writes, and guessing at them is how a
+ * recogniser starts claiming oam for things that are not oam.
+ */
+export function powershellPayload(args: readonly string[]): string | null {
+  const i = args.findIndex((a) => PS_COMMAND_SWITCH.test(a));
+  if (i < 0) return null;
+  const payload = args.slice(i + 1).join(" ");
+  return payload.trim().length > 0 ? payload : null;
 }

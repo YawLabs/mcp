@@ -2613,3 +2613,41 @@ describe("oamHeapOomHint", () => {
     expect(oamHeapOomHint("FATAL ERROR: Ineffective mark-compacts near heap limit Allocation failed")).toBeNull();
   });
 });
+
+describe("isOamLaunch -- fish and PowerShell wrappers", () => {
+  it("recognises fish -c", () => {
+    expect(isOamLaunch("fish", ["-c", "oam run --no-check /p/index.js"])).toBe(true);
+  });
+
+  it("recognises pwsh -Command", () => {
+    expect(isOamLaunch("pwsh", ["-Command", "oam run --no-check /p/index.js"])).toBe(true);
+  });
+
+  it("recognises powershell.exe with switches before -Command", () => {
+    expect(
+      isOamLaunch("C:\\Windows\\System32\\powershell.exe", ["-NoProfile", "-Command", "oam", "run", "/p/i.js"]),
+    ).toBe(true);
+  });
+
+  it("accepts the -Command abbreviations PowerShell accepts", () => {
+    for (const flag of ["-c", "-co", "-comm", "-Command"]) {
+      expect(isOamLaunch("pwsh", [flag, "oam run /p/i.js"]), flag).toBe(true);
+    }
+  });
+
+  it("does NOT mistake -Confirm or -ComputerName for -Command", () => {
+    expect(isOamLaunch("pwsh", ["-Confirm", "oam run /p/i.js"])).toBe(false);
+    expect(isOamLaunch("pwsh", ["-ComputerName", "oam run /p/i.js"])).toBe(false);
+  });
+
+  it("declines a PowerShell launch that is not -Command", () => {
+    expect(isOamLaunch("pwsh", ["-File", "run.ps1"])).toBe(false);
+    expect(isOamLaunch("pwsh", ["-EncodedCommand", "b2FtIHJ1bg=="])).toBe(false);
+    expect(isOamLaunch("pwsh", [])).toBe(false);
+  });
+
+  it("still declines a wrapper whose payload is not oam", () => {
+    expect(isOamLaunch("fish", ["-c", "node /p/index.js"])).toBe(false);
+    expect(isOamLaunch("pwsh", ["-Command", "npx -y @yawlabs/mcp@latest"])).toBe(false);
+  });
+});

@@ -44,7 +44,7 @@ import {
   unloadableConfigFix,
   unparseableConfigFix,
 } from "../install-targets.js";
-import { MIN_OAM_VERSION, OAM_INSTALL_PS1, OAM_INSTALL_SH } from "../oam-spawn.js";
+import { isOamLaunch, MIN_OAM_VERSION, OAM_INSTALL_PS1, OAM_INSTALL_SH } from "../oam-spawn.js";
 import { STATE_FILENAME, STATE_SCHEMA_VERSION } from "../persistence.js";
 import { SECRETS_SCHEMA_VERSION } from "../secrets-vault.js";
 
@@ -5233,5 +5233,34 @@ describe("runDoctor -- a TOML client config (Codex CLI) is classified by its ada
     expect(local?.syntax).toBe("JSON");
     expect(local?.hasMcpEntry).toBe(true);
     expect(local?.entryProjectKey).toBe(variant);
+  });
+});
+
+describe("oamRunEntryPath -- fish and PowerShell wrappers", () => {
+  it("extracts the entry from fish -c", () => {
+    expect(oamRunEntryPath("fish", ["-c", "oam run --no-check /p/index.js"])).toBe("/p/index.js");
+  });
+
+  it("extracts the entry from pwsh -Command, rejoining the tail", () => {
+    // PowerShell -Command takes the REST of the line, not one argument.
+    expect(oamRunEntryPath("pwsh", ["-NoProfile", "-Command", "oam", "run", "--no-check", "/p/index.js"])).toBe(
+      "/p/index.js",
+    );
+  });
+
+  it("REFUSES a quoted payload rather than cut a path in half", () => {
+    // isOamLaunch says yes (it only reads the first token); this one must
+    // still decline, because a half-path would fail the exists check and
+    // read as a broken entry -- which the heal pass rewrites.
+    const args = [
+      "-Command",
+      "oam run --no-check " + String.fromCharCode(39) + "/p/a b/index.js" + String.fromCharCode(39),
+    ];
+    expect(isOamLaunch("pwsh", args)).toBe(true);
+    expect(oamRunEntryPath("pwsh", args)).toBeNull();
+  });
+
+  it("declines a PowerShell launch with no -Command", () => {
+    expect(oamRunEntryPath("pwsh", ["-File", "run.ps1"])).toBeNull();
   });
 });
