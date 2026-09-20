@@ -73,6 +73,7 @@ import { CURRENT_OS, type InstallOS } from "./install-targets.js";
 import { stripInternalSecretsFromEnv } from "./internal-secret-env.js";
 import { log } from "./logger.js";
 import { sidecarsNodeModules } from "./paths.js";
+import { isEphemeralMountPath, type StableSpellingDeps, stableSpellingOf } from "./stable-entry.js";
 
 /**
  * Strip an npm version/tag suffix from a package spec:
@@ -1852,11 +1853,27 @@ function notePinnedSidecar(pkg: string, version: string | null, source: PinSourc
  * yaw-mcp is itself launched via `npx -y`, its own module lives in the cache,
  * so there is nothing durable to point at.
  */
-export function resolveStableNpmEntry(pkg: string, fromUrl: string = import.meta.url): string | null {
+export function resolveStableNpmEntry(
+  pkg: string,
+  fromUrl: string = import.meta.url,
+  deps: StableSpellingDeps = {},
+): string | null {
   for (const nodeModules of ownNodeModules(fromUrl)) {
     if (nodeModules.includes(NPX_CACHE_MARKER)) continue;
+    // A per-launch mount (AppImage, macOS App Translocation) is not durable in
+    // ANY spelling: the path carries a fresh random segment every launch, so
+    // there is nothing to point at that outlives this process. Rewriting such
+    // an entry later cannot converge either -- each pass would name a new dead
+    // path -- so it is refused at write time and the npx entry stands.
+    if (isEphemeralMountPath(nodeModules)) continue;
     const hit = packageEntry(join(nodeModules, ...pkg.split("/")), pkg);
-    if (hit) return hit.entry;
+    // `hit.entry` comes from `import.meta.url`, which Node has already
+    // realpathed past whatever link the launcher used -- for the copy bundled
+    // in Yaw Terminal that turns `...\apps\yaw\current\...` into
+    // `...\apps\yaw\2.1.5\...`, and the version directory is exactly what
+    // the app's updater deletes. stableSpellingOf recovers a spelling the
+    // updater MAINTAINS, and is a no-op when there is not one.
+    if (hit) return stableSpellingOf(hit.entry, deps);
   }
   return null;
 }
