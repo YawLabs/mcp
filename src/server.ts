@@ -33,6 +33,7 @@ import { appendFoundryTrace, isFoundryEnabled, redactIntent } from "./foundry.js
 import { closestNames } from "./fuzzy.js";
 import { type GradesCache, readGradesCache } from "./grades-cache.js";
 import { type LoadedGuides, loadGuides, renderGuide } from "./guide.js";
+import { maybeHealStaleBrokerEntries } from "./heal-entries.js";
 import { type ActivationFailure, formatHealthWarning, healthFactor, scrubForWarning } from "./health-score.js";
 import {
   ADAPTIVE_MAX,
@@ -1769,6 +1770,18 @@ export class ConnectServer {
     // prewarm touches `~/.npm/`, the sidecar refresh touches
     // `~/.yaw-mcp/sidecars/`, and the upgrade touches the global prefix.
     maybeAutoPrewarmNpxCache().catch((err: Error) => log("warn", "Auto-prewarm check failed", { error: err?.message }));
+
+    // Re-point any client entry whose baked launch file an app upgrade
+    // deleted. CROSS-CLIENT on purpose, and that is the whole point: the
+    // client with the dead entry cannot start this process, so the repair
+    // has to ride in on a client whose entry still works. On a Yaw box the
+    // Claude Code entry is kept live by the app, so a pane spawn is what
+    // heals Codex. Writes nothing when READONLY_DIAGNOSTICS is set, when
+    // YAW_MCP_AUTO_HEAL=0, or -- the steady state -- when every entry
+    // resolves. Never awaited: serve must not block on filesystem work.
+    maybeHealStaleBrokerEntries().catch((err: Error) =>
+      log("warn", "Stale-entry heal failed", { error: err?.message }),
+    );
 
     log("info", "yaw-mcp started", {
       servers: this.config?.servers.length ?? 0,

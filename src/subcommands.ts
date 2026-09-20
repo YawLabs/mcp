@@ -50,6 +50,7 @@ export const KNOWN_SUBCOMMANDS = [
   "list",
   "status",
   "doctor",
+  "heal",
   "reset-learning",
   "sidecars",
   "bundles",

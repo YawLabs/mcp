@@ -50,6 +50,7 @@ import { homedir } from "node:os";
 import { join, posix, resolve, win32 } from "node:path";
 import { cliToNamespaces } from "./cli-shadows.js";
 import {
+  addressOf,
   type ConfigFormat,
   type ConfigSite,
   classifyClientConfig,
@@ -458,6 +459,18 @@ export interface ClientProbeResult {
   clientId: InstallClientId;
   scope: InstallScope;
   path: string;
+  /** Where inside the file this slot's entry lives (`mcpServers`;
+   *  `projects[<dir>].mcpServers` for Claude Code's local scope;
+   *  for Codex CLI).
+   *
+   *  Carried because `path` alone does not identify an ENTRY. Two scopes can
+   *  read the same file and mean DIFFERENT entries (Claude Code user vs
+   *  local), and two scopes can read the same file and mean the SAME entry
+   *  (Codex user vs project, once the process cwd is the home directory).
+   *  Only the pair tells those apart, which is what the warning fold needs.
+   *  Empty for an unavailable slot, which has no file to address. Additive
+   *  JSON field. */
+  containerPath: readonly string[];
   exists: boolean;
   hasMcpEntry: boolean;
   /** The language of the file this slot reads, as its row and scope resolve
@@ -915,7 +928,20 @@ function clientLaunchWarnings(clients: readonly ClientProbeResult[]): string[] {
     // text now differs per scope and cannot be the key. Keyed on the state
     // instead; the folded line keeps the first grouped row's wording -- for
     // Claude Code's (user, local) pair on ~/.claude.json, the user scope's.
-    const key = `${c.path}\0${client}\0${c.malformed ? "malformed" : status}`;
+    // FILE-level states (malformed, unreadable) are true of the whole file,
+    // so they fold across scopes regardless of container -- that is what
+    // keeps Claude Code (user, local) on a single line.
+    //
+    // ENTRY-level states key on the CONTAINER rather than on the rendered
+    // status. Status embeds the scope's own install command, so two probes
+    // that are literally the same entry -- Codex CLI's user and project
+    // scopes, which resolve to the same file AND the same `mcp_servers`
+    // table whenever the process cwd is the home directory, as it is under
+    // Yaw Terminal -- differed by the string "--scope project" alone and
+    // printed one identical fault twice, each line naming a remedy that was
+    // wrong for the other. Container identity is what actually decides
+    // whether two probes describe one entry or two.
+    const key = c.malformed ? `${c.path}\0${client}\0malformed` : `${c.path}\0${client}\0${c.containerPath.join(".")}`;
     const seen = grouped.get(key);
     if (seen) seen.scopes.push(c.scope);
     else grouped.set(key, { path: c.path, client, scopes: [c.scope], status });
@@ -1521,6 +1547,7 @@ export const DOCTOR_ENV_VARS: ReadonlyArray<{ name: string; defaultHint: string 
   { name: "YAW_MCP_DEFAULT_RUNTIME", defaultHint: "oam when installed" },
   { name: "YAW_MCP_TOOL_EXPOSURE", defaultHint: "gateway" },
   { name: "YAW_MCP_AUTO_UPGRADE", defaultHint: "default on" },
+  { name: "YAW_MCP_AUTO_HEAL", defaultHint: "default on" },
   { name: "YAW_MCP_SIDECAR_REFRESH", defaultHint: "default on" },
   { name: "YAW_MCP_CONFIG_RELOAD", defaultHint: "default on" },
   { name: "YAW_MCP_PREWARM", defaultHint: "default on" },
@@ -2694,7 +2721,7 @@ interface ProbeSlot {
  *  `syntax` is omitted because the slot knows it before any read. */
 type ProbeClassification = Omit<
   ClientProbeResult,
-  "clientId" | "scope" | "path" | "exists" | "unavailable" | "unavailableReason" | "syntax"
+  "clientId" | "scope" | "path" | "containerPath" | "exists" | "unavailable" | "unavailableReason" | "syntax"
 >;
 
 // The "nothing found" probe skeleton, in ONE place. classifyProbeContent
@@ -2759,6 +2786,7 @@ function* enumerateProbeSlots(opts: ProbeOptions): Generator<ProbeSlot> {
           path: "(n/a)",
           exists: false,
           unavailable: true,
+          containerPath: [],
           ...EMPTY_PROBE,
           syntax: syntaxNameFor(effectiveConfigFormat(target.config, target.scopes[0])),
           ...(why !== undefined ? { unavailableReason: why } : {}),
@@ -2809,6 +2837,7 @@ function* enumerateProbeSlots(opts: ProbeOptions): Generator<ProbeSlot> {
           // resolves it -- a row added to INSTALL_TARGETS is picked up here
           // without touching this file.
           syntax: syntaxNameFor(site.format),
+          containerPath: addressOf(site).containerPath,
         },
         read: exists ? { path: site.resolved.absolute, site, transform: target.entry } : null,
       };
