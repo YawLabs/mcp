@@ -25,9 +25,10 @@
  *      `node_modules/@yawlabs/mcp/` tree. A hand-written entry, a pinned
  *      `--package` form, a bare `oam`, or an oam entry for somebody else's
  *      server all fail this and are invisible to the sweep.
- *   2. ACTUALLY BROKEN -- the entry file does not exist. A WORKING entry is
- *      never touched, however unusual it looks, so a user who hand-tuned
- *      something that still starts keeps it.
+ *   2. ACTUALLY BROKEN -- the entry path is not a regular file: missing, or a
+ *      directory, or an unreadable or dangling link. A WORKING entry is never
+ *      touched, however unusual it looks, so a user who hand-tuned something
+ *      that still starts keeps it.
  *   3. NOT READ-ONLY  -- `YAW_MCP_READONLY_DIAGNOSTICS` is honoured, so the
  *      panel's background poll stays a pure read. That flag exists precisely
  *      so a poll nobody asked for writes nothing, and this does not flip it.
@@ -38,9 +39,9 @@
  * STDOUT IS OFF LIMITS. The primary trigger runs inside `serve`, where
  * `process.stdout` IS the JSON-RPC transport and one stray byte corrupts the
  * session. Everything here reports through `log` (stderr) or through the
- * returned array.
+ * returned result.
  */
-import { existsSync } from "node:fs";
+import { statSync } from "node:fs";
 import { atomicWriteFile } from "./atomic-write.js";
 import {
   addressOf,
@@ -77,6 +78,25 @@ export interface HealedEntry {
   to: string;
 }
 
+/** A config this pass could not even look inside, so it can make no claim
+ *  about whether the entry in it is healthy. Reported separately because
+ *  "nothing to repair" and "I declined to read it" are different answers and
+ *  only one of them means the user is fine. */
+export interface UnhealableConfig {
+  clientId: string;
+  scope: string;
+  path: string;
+  /** The `ConfigRead` kind that stopped us: `unspliceable`, `blocked`,
+   *  `malformed` or `unreadable`. */
+  reason: string;
+}
+
+/** What one sweep concluded. */
+export interface HealResult {
+  healed: HealedEntry[];
+  unhealable: UnhealableConfig[];
+}
+
 export interface HealOptions {
   os?: InstallOS;
   home?: string;
@@ -108,6 +128,19 @@ function isOwnBrokerEntry(entryPath: string): boolean {
   return norm(entryPath).includes("/node_modules/@yawlabs/mcp/");
 }
 
+/** Gate 2's real question: can `oam run` actually start this path? Only a
+ *  regular file can be, so a directory sitting at the entry path is as broken
+ *  as a missing one. Throws (ENOENT, EACCES, a dangling symlink) count as
+ *  broken, which is the safe direction: the worst case is rewriting an entry
+ *  that was already not going to start. */
+function isLaunchableFile(entryPath: string): boolean {
+  try {
+    return statSync(entryPath).isFile();
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Re-point every stale broker entry this machine can see.
  *
@@ -115,13 +148,14 @@ function isOwnBrokerEntry(entryPath: string): boolean {
  * must still heal the others, and every caller is a fire-and-forget startup
  * path.
  */
-export async function healStaleBrokerEntries(opts: HealOptions = {}): Promise<HealedEntry[]> {
+export async function healStaleBrokerEntries(opts: HealOptions = {}): Promise<HealResult> {
   const env = opts.env ?? process.env;
   // Gate 3, checked once and up front.
-  if (isReadOnlyDiagnostics(env)) return [];
+  if (isReadOnlyDiagnostics(env)) return { healed: [], unhealable: [] };
 
   const os = opts.os ?? CURRENT_OS;
   const healed: HealedEntry[] = [];
+  const unhealable: UnhealableConfig[] = [];
 
   // Resolved ONCE for the whole sweep, and LAZILY: probing oam spawns a
   // process, and this pass runs on every broker start. The steady state is
@@ -178,7 +212,25 @@ export async function healStaleBrokerEntries(opts: HealOptions = {}): Promise<He
         // Same transform install reads with, so carried fields and the
         // normalised view match what install would compute for this row.
         const view = await readClientConfigFile(resolvedSite, { transform: target.entry });
-        if (view.read.kind !== "ok") continue;
+        if (view.read.kind !== "ok") {
+          // A file this pass DECLINED to look inside is not the same as a file
+          // with nothing wrong, and reporting "no stale entries found" for one
+          // is the misleading half of a silent skip. `unspliceable` is the one
+          // that bites in practice -- a TOML root-level inline
+          // `mcp_servers = { ... }` parses fine and holds our entry, but the
+          // splicer will not edit it -- so the user can be sitting on a dead
+          // entry this pass will never repair and never mention. Collected and
+          // surfaced by the caller; doctor still explains each one in full.
+          if (view.read.kind !== "absent") {
+            unhealable.push({
+              clientId: target.clientId,
+              scope: scope.scope,
+              path: resolvedSite.resolved.absolute,
+              reason: view.read.kind,
+            });
+          }
+          continue;
+        }
         const stored = view.read.entries.find((e) => e.key === ENTRY_NAME);
         if (stored === undefined) continue;
 
@@ -190,7 +242,14 @@ export async function healStaleBrokerEntries(opts: HealOptions = {}): Promise<He
         if (entryPath === null || !isOwnBrokerEntry(entryPath)) continue;
 
         // Gate 2: only a BROKEN entry is ever rewritten.
-        if (existsSync(entryPath)) continue;
+        //
+        // A FILE, not merely something at that path: `existsSync` is true for a
+        // directory, and `oam run <a directory>` cannot start the broker any
+        // more than a missing path can -- so testing existence alone declared
+        // an unstartable entry healthy and left it that way. statSync follows
+        // symlinks, which is what we want: a link to a real file is fine, and a
+        // dangling one throws and counts as broken.
+        if (isLaunchableFile(entryPath)) continue;
 
         const { oamBinPath, oamEntry } = await replacementFor();
         const base = buildLaunchEntry({
@@ -244,23 +303,23 @@ export async function healStaleBrokerEntries(opts: HealOptions = {}): Promise<He
       clients: healed.map((h) => `${h.clientId} (${h.scope})`),
     });
   }
-  return healed;
+  return { healed, unhealable };
 }
 
 /**
  * The startup wrapper: the same sweep, opt-out-able and incapable of
  * rejecting. `serve` calls this and does not await it.
  */
-export async function maybeHealStaleBrokerEntries(opts: HealOptions = {}): Promise<HealedEntry[]> {
+export async function maybeHealStaleBrokerEntries(opts: HealOptions = {}): Promise<HealResult> {
   const env = opts.env ?? process.env;
   // Same shape as YAW_MCP_AUTO_PREWARM: an explicit "0" turns it off.
-  if (env.YAW_MCP_AUTO_HEAL === "0") return [];
+  if (env.YAW_MCP_AUTO_HEAL === "0") return { healed: [], unhealable: [] };
   try {
     return await healStaleBrokerEntries(opts);
   } catch (err) {
     log("warn", "Stale-entry heal pass failed", {
       error: err instanceof Error ? err.message : String(err),
     });
-    return [];
+    return { healed: [], unhealable: [] };
   }
 }

@@ -14,7 +14,7 @@
  * governs the UNATTENDED pass -- does not apply. The read-only gate still does,
  * because that one is about never writing behind a diagnostics poll.
  */
-import { type HealedEntry, healStaleBrokerEntries } from "./heal-entries.js";
+import { type HealedEntry, type HealResult, healStaleBrokerEntries } from "./heal-entries.js";
 
 export interface HealOptions {
   json?: boolean;
@@ -57,11 +57,24 @@ function describe(h: HealedEntry): string {
 }
 
 export async function runHeal(options: HealOptions = {}): Promise<{ exitCode: number }> {
-  const healed = await healStaleBrokerEntries({ dryRun: options.dryRun });
+  let result: HealResult;
+  try {
+    result = await healStaleBrokerEntries({ dryRun: options.dryRun });
+  } catch (err) {
+    // The sweep already catches per-file problems; reaching here means
+    // something unexpected went wrong for the whole run. Say so rather than
+    // letting it escape as a bare non-zero exit: the app maps ANY non-zero to
+    // "skipped (exit N)" -- the same line an older broker that does not know
+    // this verb produces -- so an unreported throw would read as a benign
+    // no-op forever.
+    process.stderr.write(`yaw-mcp heal: ${err instanceof Error ? err.message : String(err)}\n`);
+    return { exitCode: 1 };
+  }
+  const { healed, unhealable } = result;
 
   if (options.json === true) {
     process.stdout.write(
-      `${JSON.stringify({ healed, count: healed.length, dryRun: options.dryRun === true }, null, 2)}\n`,
+      `${JSON.stringify({ healed, unhealable, count: healed.length, dryRun: options.dryRun === true }, null, 2)}\n`,
     );
     return { exitCode: 0 };
   }
@@ -76,9 +89,20 @@ export async function runHeal(options: HealOptions = {}): Promise<{ exitCode: nu
           (options.dryRun === true ? "" : "\nRestart the affected client(s) to pick this up.\n"),
       );
     }
+    // Never folded into the "no stale entries" line above: these are files the
+    // sweep could not read INTO, so it cannot claim they are healthy, and a
+    // user sitting on a dead entry in one of them would otherwise be told
+    // everything was fine. `doctor` explains each shape and its by-hand fix.
+    if (unhealable.length > 0) {
+      process.stdout.write(
+        `\n${unhealable.length} config${unhealable.length === 1 ? "" : "s"} could not be checked:\n` +
+          `${unhealable.map((u) => `  ${u.clientId} (${u.scope}): ${u.path} -- ${u.reason}`).join("\n")}\n` +
+          "Run `yaw-mcp doctor` for what each one needs.\n",
+      );
+    }
   }
-  // Zero either way: finding nothing to heal is the healthy outcome, and a
-  // repair that succeeded is not an error. The app treats a non-zero exit as
-  // "retry next launch", so a clean sweep must never report one.
+  // Zero for both outcomes above: finding nothing to heal is the healthy
+  // result, and a repair that succeeded is not an error. Only the catch above
+  // returns non-zero, so the app can tell a real failure from a clean sweep.
   return { exitCode: 0 };
 }

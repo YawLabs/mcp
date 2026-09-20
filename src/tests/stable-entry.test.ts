@@ -165,3 +165,32 @@ describe("stableSpellingOf -- regressions found on a real filesystem", () => {
     expect(stableSpellingOf(entry, deps)).toBe(CUR + "/dist/index.js");
   });
 });
+
+describe("stableSpellingOf -- version directory at a filesystem root", () => {
+  // dirname returns a ROOT with its separator attached ("C:\\", "/") and every
+  // other directory without one, so the separator is not at index
+  // parent.length. Getting that wrong read the first character of the segment
+  // NAME as the separator -- "C:\\1.0.0" gave sep "1" and name ".0.0" -- which
+  // failed the version test and built "C:\\1current", so a release directory
+  // sitting at a root was silently never aliased.
+  const deps: StableSpellingDeps = {
+    argv1: undefined,
+    realpath: (p: string): string => (p.startsWith("C:\\current") ? "C:\\1.0.0" + p.slice("C:\\current".length) : p),
+    readdir: (p: string): string[] => (p === "C:\\" ? ["1.0.0", "current"] : []),
+    isSymlink: (p: string): boolean => p === "C:\\current",
+  };
+
+  it("aliases it to the sibling link rather than skipping it", () => {
+    expect(stableSpellingOf("C:\\1.0.0\\dist\\index.js", deps)).toBe("C:\\current\\dist\\index.js");
+  });
+
+  it("does the same on a POSIX root", () => {
+    const posix: StableSpellingDeps = {
+      argv1: undefined,
+      realpath: (p: string): string => (p.startsWith("/current") ? "/1.0.0" + p.slice("/current".length) : p),
+      readdir: (p: string): string[] => (p === "/" ? ["1.0.0", "current"] : []),
+      isSymlink: (p: string): boolean => p === "/current",
+    };
+    expect(stableSpellingOf("/1.0.0/dist/index.js", posix)).toBe("/current/dist/index.js");
+  });
+});

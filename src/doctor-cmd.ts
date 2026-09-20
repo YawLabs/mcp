@@ -928,9 +928,18 @@ function clientLaunchWarnings(clients: readonly ClientProbeResult[]): string[] {
     // text now differs per scope and cannot be the key. Keyed on the state
     // instead; the folded line keeps the first grouped row's wording -- for
     // Claude Code's (user, local) pair on ~/.claude.json, the user scope's.
-    // FILE-level states (malformed, unreadable) are true of the whole file,
-    // so they fold across scopes regardless of container -- that is what
-    // keeps Claude Code (user, local) on a single line.
+    // FILE-level states are keyed on the state NAME, so they fold across every
+    // scope reading that file -- what keeps Claude Code (user, local) on one
+    // line. Both are listed explicitly rather than inferred from the rendered
+    // status, because they got there for opposite reasons: `malformed` names
+    // the row's own install command and so reads differently per scope (which
+    // is why it needed a literal key even before containers were involved),
+    // while `unreadable` carries no install command and so read IDENTICALLY
+    // per scope -- the old status key folded it by accident. Keying that one on
+    // the container split a single unreadable ~/.claude.json into a (user) and
+    // a (local) line, byte-identical apart from the scope label. `unloadable`
+    // is deliberately NOT here: it names the install command too, so it has
+    // always come out one line per scope.
     //
     // ENTRY-level states key on the CONTAINER rather than on the rendered
     // status. Status embeds the scope's own install command, so two probes
@@ -941,7 +950,9 @@ function clientLaunchWarnings(clients: readonly ClientProbeResult[]): string[] {
     // printed one identical fault twice, each line naming a remedy that was
     // wrong for the other. Container identity is what actually decides
     // whether two probes describe one entry or two.
-    const key = c.malformed ? `${c.path}\0${client}\0malformed` : `${c.path}\0${client}\0${c.containerPath.join(".")}`;
+    const fileLevel = c.malformed ? "malformed" : c.unreadable !== null ? "unreadable" : null;
+    const key =
+      fileLevel !== null ? `${c.path}\0${client}\0${fileLevel}` : `${c.path}\0${client}\0${c.containerPath.join(".")}`;
     const seen = grouped.get(key);
     if (seen) seen.scopes.push(c.scope);
     else grouped.set(key, { path: c.path, client, scopes: [c.scope], status });

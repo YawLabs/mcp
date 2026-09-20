@@ -145,8 +145,25 @@ function aliasSpellingOf(entry: string, target: string, deps: StableSpellingDeps
   for (const ancestor of ancestorsOf(entry)) {
     const parent = dirname(ancestor);
     if (parent === ancestor) continue;
+    // `parent` may ALREADY carry its trailing separator: `dirname` returns a
+    // filesystem root ("C:\", "/") with one attached and everything else
+    // without. So the separator is NOT reliably at index `parent.length`.
+    //
+    // Assuming it was took the first character of the segment NAME as the
+    // separator -- for "C:\1.0.0" that gave sep "1" and name ".0.0" -- which
+    // failed the version test below AND built a candidate ("C:\1current") that
+    // could never resolve. A version directory sitting directly at a
+    // filesystem root was therefore silently never aliased.
+    //
+    // The separator CHARACTER is reused as the caller wrote it rather than
+    // going through `join`, which normalises to the platform separator and
+    // would emit a mixed-separator path for a forward-slash-spelled Windows
+    // input. The result is persisted and later string-compared by the heal
+    // recogniser, so it has to come back spelled the way it went in.
+    const sepChar = endsWithSeparator(parent) ? "" : ancestor.charAt(parent.length);
+    const self = ancestor.slice(parent.length + sepChar.length);
     // Only a version-shaped segment is a rotation candidate. See the header.
-    if (!looksLikeVersionDir(ancestor.slice(parent.length + 1))) continue;
+    if (!looksLikeVersionDir(self)) continue;
     let names: string[];
     try {
       names = readdir(parent);
@@ -159,13 +176,6 @@ function aliasSpellingOf(entry: string, target: string, deps: StableSpellingDeps
     } catch {
       continue;
     }
-    const self = ancestor.slice(parent.length + 1);
-    // Reuse the separator CHARACTER the caller actually wrote rather than
-    // `join`, which normalises to the platform separator and would emit a
-    // mixed-separator path for a forward-slash-spelled Windows input. The
-    // result is persisted and later string-compared by the heal recogniser, so
-    // it has to come back spelled the way it went in.
-    const sepChar = ancestor.charAt(parent.length);
     for (const name of names) {
       if (name === self) continue;
       const link = parent + sepChar + name;
@@ -183,6 +193,14 @@ function aliasSpellingOf(entry: string, target: string, deps: StableSpellingDeps
     }
   }
   return null;
+}
+
+/** True when `p` already carries a trailing separator. `dirname` returns a
+ *  filesystem root that way ("C:\\", "/", "//server/share/") and returns every
+ *  other directory without one. */
+function endsWithSeparator(p: string): boolean {
+  const last = p.charAt(p.length - 1);
+  return last === "/" || last === "\\";
 }
 
 /** Directory prefixes of `entry`, DEEPEST first, excluding the filesystem

@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { healStaleBrokerEntries } from "../heal-entries.js";
+import { type HealedEntry, healStaleBrokerEntries } from "../heal-entries.js";
 import type { OamProbe } from "../oam-spawn.js";
 
 /** An oam that is installed and healthy, at a path we never have to create:
@@ -61,7 +61,13 @@ function tomlEntry(entryPath: string, extra = ""): string {
 
 /** Heal against the fake home, with oam forced present and the resolver
  *  answering with a path that really exists. */
-function heal(over: Record<string, unknown> = {}) {
+async function heal(over: Record<string, unknown> = {}): Promise<HealedEntry[]> {
+  return (await healResult(over)).healed;
+}
+
+/** The whole sweep result, for the cases that assert on what it DECLINED to
+ *  read as well as on what it repaired. */
+function healResult(over: Record<string, unknown> = {}) {
   return healStaleBrokerEntries({
     home,
     cwd: home,
@@ -168,5 +174,37 @@ describe("healStaleBrokerEntries", () => {
     // has to keep going rather than take the whole pass down.
     mkdirSync(join(home, ".codex", "config.toml"), { recursive: true });
     await expect(heal()).resolves.toBeInstanceOf(Array);
+  });
+});
+
+describe("healStaleBrokerEntries -- gate 2 and unreadable configs", () => {
+  it("treats a DIRECTORY at the entry path as broken, not as healthy", async () => {
+    // oam run <a directory> cannot start the broker any more than a missing
+    // path can, but existsSync is true for both -- so this entry used to be
+    // declared healthy and left unstartable forever.
+    const dirEntry = join(home, "adirectory");
+    mkdirSync(dirEntry, { recursive: true });
+    const p = writeCodexConfig(tomlEntry(join(dirEntry, "node_modules", "@yawlabs", "mcp", "dist")));
+    const healed = await heal();
+    expect(healed.filter((h) => h.clientId === "codex-cli")).toHaveLength(1);
+    expect(readFileSync(p, "utf8")).not.toContain("adirectory");
+  });
+
+  it("reports a config it could not read into instead of calling it clean", async () => {
+    // A root-level TOML inline table parses fine and holds our entry, but the
+    // splicer refuses it -- so the sweep can make no claim about the entry
+    // inside. Saying "no stale entries found" for this is the misleading half.
+    writeCodexConfig(["mcp_servers = { mcp = { command = 'oam' } }", ""].join("\n"));
+    const r = await healResult();
+    const codex = r.unhealable.filter((u) => u.clientId === "codex-cli");
+    expect(codex.length).toBeGreaterThan(0);
+    expect(r.healed.filter((h) => h.clientId === "codex-cli")).toEqual([]);
+  });
+
+  it("does not report an ABSENT config as unreadable", async () => {
+    // No file at all is the ordinary case for a client the user never
+    // installed to, and must not be dressed up as a problem.
+    const r = await healResult();
+    expect(r.unhealable.filter((u) => u.reason === "absent")).toEqual([]);
   });
 });
