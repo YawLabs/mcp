@@ -127,6 +127,7 @@ import {
   setSessionVaultPassphrase,
   VaultPassphraseRequiredError,
   verifyVaultPassphrase,
+  withHeartbeat,
 } from "./upstream.js";
 import { fenceUpstreamInstructions } from "./upstream-instructions.js";
 import { buildCoUsageMap, formatReliabilityWarning, formatUsageHint, selectFlakyNamespaces } from "./usage-hints.js";
@@ -4797,7 +4798,19 @@ export class ConnectServer {
       if (mode === "form" && !(await this.openBrowser(page.url))) return { kind: "unreachable", reason: "no-browser" };
 
       progress?.("Waiting for the masked entry page in your browser");
-      const outcome = await page.result;
+      // A heartbeat for the same reason the connect path has one: this wait
+      // can run the page's whole TTL, and a client that keeps a tool call
+      // alive by resetting its timeout on progress would otherwise give up
+      // on the activation while the user is still typing. The tick names
+      // the deadline, so the reader knows whether waiting longer can still
+      // work.
+      const ttlSeconds = Math.round(this.secretEntryPageTtlMs / 1000);
+      const outcome = await withHeartbeat(
+        progress,
+        (elapsed) =>
+          `Still waiting for the masked entry page -- ${elapsed}s so far, ${Math.max(0, ttlSeconds - elapsed)}s before it expires`,
+        () => page.result,
+      );
       // URL mode: tell the client the out-of-band step is over, so it can drop
       // whatever "waiting" state it shows. Not sent when the page was closed
       // under us -- that is shutdown, and the transport is going with it.

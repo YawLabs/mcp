@@ -1135,8 +1135,12 @@ export const PROGRESS_HEARTBEAT_MS = 5_000;
  *
  *  The timer is unref'd: a heartbeat exists to describe work that is already
  *  holding the process open, and must never be the reason a process stays
- *  alive. It is cleared in a finally, so a fast phase leaves nothing behind. */
-async function withHeartbeat<T>(
+ *  alive. It is cleared in a finally, so a fast phase leaves nothing behind.
+ *
+ *  Exported for the one other wait of the same shape: server.ts holds a
+ *  tools/call open while the user types on the masked secret-entry page,
+ *  which can take the page's whole TTL. */
+export async function withHeartbeat<T>(
   progress: ConnectProgress | undefined,
   tick: (elapsedSeconds: number) => string,
   work: () => Promise<T>,

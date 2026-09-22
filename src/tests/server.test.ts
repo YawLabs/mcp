@@ -83,6 +83,7 @@ import {
   connectToUpstream,
   type DownstreamClientBridge,
   disconnectFromUpstream,
+  PROGRESS_HEARTBEAT_MS,
   VaultPassphraseRequiredError,
   vaultPassphrase,
   verifyVaultPassphrase,
@@ -6908,6 +6909,58 @@ describe("vault passphrase elicitation", () => {
     expect(opened[0].opts.fields).toEqual([{ name: "passphrase", label: "Vault passphrase" }]);
     expect(priv.openBrowser).toHaveBeenCalledWith(opened[0].page.url);
     expect(opened[0].close).toHaveBeenCalled();
+  });
+
+  it("keeps reporting progress while the page waits, naming the time left before it expires", async () => {
+    // The wait on the page can run its whole TTL. A client that keeps a tool
+    // call alive by resetting its timeout on progress (the pattern the
+    // connect path's heartbeat serves) would otherwise give up on the
+    // activation while the user is still typing in the browser.
+    vi.useFakeTimers();
+    try {
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+      priv.server.getClientCapabilities = () => ({ elicitation: {} });
+      priv.server.elicitInput = accept();
+      priv.secretEntryPageTtlMs = 60_000;
+      let submit: (value: string) => void = () => {};
+      priv.openSecretPage = vi.fn(async () => ({
+        url: `http://127.0.0.1:5555/${"a".repeat(64)}`,
+        elicitationId: "elicit-slow",
+        result: new Promise((resolve) => {
+          submit = (value) => resolve({ kind: "submitted", values: { passphrase: value } });
+        }),
+        close: vi.fn(),
+      }));
+      priv.openBrowser = vi.fn().mockResolvedValue(true);
+      vi.mocked(connectToUpstream)
+        .mockRejectedValueOnce(lockedVaultError("gh"))
+        .mockImplementationOnce(async (cfg: UpstreamServerConfig) => makeConnection(cfg.namespace, ["t"]));
+      const messages: string[] = [];
+      const activation = priv.activateOne("gh", (m: string) => messages.push(m));
+
+      // Let the prompt reach the page wait, then run two heartbeats.
+      await vi.advanceTimersByTimeAsync(0);
+      const before = messages.length;
+      await vi.advanceTimersByTimeAsync(PROGRESS_HEARTBEAT_MS);
+      await vi.advanceTimersByTimeAsync(PROGRESS_HEARTBEAT_MS);
+      const ticks = messages.slice(before);
+      expect(ticks).toHaveLength(2);
+      expect(ticks[0]).toContain("Still waiting for the masked entry page");
+      expect(ticks[0]).toContain("5s so far");
+      expect(ticks[0]).toContain("55s before it expires");
+      expect(ticks[1]).toContain("10s so far");
+
+      // ...and it stops once the page answers.
+      submit("typed-eventually");
+      const result = await activation;
+      expect(result.ok).toBe(true);
+      const settledAt = messages.length;
+      await vi.advanceTimersByTimeAsync(PROGRESS_HEARTBEAT_MS * 3);
+      expect(messages.slice(settledAt).filter((m) => m.includes("Still waiting"))).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("URL-mode client: sends a URL elicitation for the page and does not open a browser itself", async () => {
