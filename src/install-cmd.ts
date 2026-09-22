@@ -1087,8 +1087,8 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     );
   } else if (oamProbeResult.belowMin) {
     runtimeLines.push(
-      `Runtime: node (oam${oamVersion} is below the ${MIN_OAM_VERSION} minimum -- upgrade oam and re-run install ` +
-        "to host yaw-mcp on it)",
+      `Runtime: node (oam${oamVersion} is below the ${MIN_OAM_VERSION} minimum -- run \`oam self-update\`, then ` +
+        "re-run install to host yaw-mcp on it)",
     );
   } else if (oamProbeResult.failure) {
     // oamFailureLabel, not a phrase table of our own: the probe distinguishes

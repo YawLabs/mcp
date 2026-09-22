@@ -195,7 +195,10 @@ describe("probeOam default runner", () => {
     expect(otherWorkRan, "event loop was blocked by the probe").toBe(true);
     expect(settled, "the probe settled before its deadline -- it was not in flight at all").toBe(false);
 
-    // Now let the probe's own deadline expire.
+    // Now let the probe's own deadline expire -- twice, because a timeout is
+    // retried once before the probe falls back.
+    await vi.advanceTimersByTimeAsync(OAM_PROBE_TIMEOUT_MS);
+    expect(settled, "the probe gave up on the first timeout instead of retrying").toBe(false);
     await vi.advanceTimersByTimeAsync(OAM_PROBE_TIMEOUT_MS);
     const probe = await pending;
 
@@ -211,8 +214,10 @@ describe("probeOam default runner", () => {
       failure: "timeout",
       failureDetail: `oam --version exceeded ${OAM_PROBE_TIMEOUT_MS}ms`,
     });
-    // Best-effort kill still attempted, with the stronger signal.
-    expect(killed).toEqual([OAM_PROBE_KILL_SIGNAL]);
+    // Best-effort kill still attempted, with the stronger signal -- once per
+    // attempt, and exactly two attempts: the retry is bounded.
+    expect(spawnCalls).toHaveLength(2);
+    expect(killed).toEqual([OAM_PROBE_KILL_SIGNAL, OAM_PROBE_KILL_SIGNAL]);
   });
 
   it("probes once per process, not once per call", async () => {
@@ -244,12 +249,15 @@ describe("probeOam default runner", () => {
     vi.useFakeTimers();
 
     const pending = probeOam();
+    // Two deadlines: the first timeout is retried once.
+    await vi.advanceTimersByTimeAsync(OAM_PROBE_TIMEOUT_MS);
     await vi.advanceTimersByTimeAsync(OAM_PROBE_TIMEOUT_MS);
     await pending;
 
-    expect(killed).toEqual([OAM_PROBE_KILL_SIGNAL]);
-    expect(unrefed, "child was not unref'd -- it can still hold the loop").toHaveLength(1);
-    expect(stdoutDestroyed, "stdout pipe was not released").toHaveLength(1);
+    // One of each per attempt -- the retry's child is detached as well.
+    expect(killed).toEqual([OAM_PROBE_KILL_SIGNAL, OAM_PROBE_KILL_SIGNAL]);
+    expect(unrefed, "child was not unref'd -- it can still hold the loop").toHaveLength(2);
+    expect(stdoutDestroyed, "stdout pipe was not released").toHaveLength(2);
   });
 
   it("survives a pipe error on stdout rather than taking the broker down", async () => {
@@ -409,6 +417,10 @@ describe("probeOam default runner", () => {
       const pending = probeOam();
       expect(unrefedTimers, "deadline timer was not unref'd").toHaveLength(1);
 
+      // The first timeout starts the one retry, whose deadline timer must be
+      // unref'd too.
+      await vi.advanceTimersByTimeAsync(OAM_PROBE_TIMEOUT_MS);
+      expect(unrefedTimers, "the retry's deadline timer was not unref'd").toHaveLength(2);
       await vi.advanceTimersByTimeAsync(OAM_PROBE_TIMEOUT_MS);
       await pending;
     } finally {

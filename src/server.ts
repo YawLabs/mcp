@@ -11,7 +11,6 @@ import {
   ListToolsRequestSchema,
   ReadResourceRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { maybeAutoPrewarmNpxCache } from "./auto-prewarm.js";
 import { maybeAutoUpgrade } from "./auto-upgrade.js";
 import { bundleActivateHint, CURATED_BUNDLES, matchBundles, topPartialBundles } from "./bundles.js";
 import { formatShadowLine, installTargetForCli } from "./cli-shadows.js";
@@ -49,7 +48,8 @@ import { setJsonKey } from "./json-key.js";
 import { LearningStore, PENALTY_RATE_THRESHOLD } from "./learning.js";
 import { bundlesSignature, loadLocalBundles } from "./local-bundles.js";
 import { log } from "./logger.js";
-import { computeSecretsReport, META_TOOL_NAMES, META_TOOLS } from "./meta-tools.js";
+import { computeSecretsReport, META_TOOL_NAMES, META_TOOLS, SERVER_INSTRUCTIONS } from "./meta-tools.js";
+import { isFeatureDisabled } from "./opt-out-env.js";
 import { PackDetector } from "./pack-detect.js";
 import { isPersistenceDisabled, loadState, type PersistedToolCacheEntry, saveState } from "./persistence.js";
 import { createProgressReporter, isProgressRequested, type ProgressReporter } from "./progress.js";
@@ -182,42 +182,64 @@ export function isAutoLoadEnabled(): boolean {
 // server itself -- it reads getProfiledActiveServers, not the tool cache --
 // and activating it by namespace works exactly as before.
 export function isPrewarmEnabled(): boolean {
-  // `0` and `false` are the two off spellings YAW_MCP_AUTO_UPGRADE and
-  // YAW_MCP_CONFIG_RELOAD already accept; anything else, including unset,
-  // leaves pre-warm on. Trimmed -- which widens nothing, both off spellings
-  // are still exactly those two -- for the cmd.exe reason isAutoLoadEnabled
-  // documents: `set VAR=0 && yaw-mcp serve` delivers "0 ", and a check that
-  // did not trim would silently ignore the opt-out on Windows.
-  const raw = process.env.YAW_MCP_PREWARM?.trim().toLowerCase();
-  return !(raw === "0" || raw === "false");
+  // The shared opt-out parse (opt-out-env.ts): `0` and `false`, trimmed, turn
+  // it off; anything else, including unset, leaves pre-warm on. Kept as a
+  // named wrapper because the tests and the prewarm path read it by this
+  // name, and because "enabled" is the question this call site asks.
+  return !isFeatureDisabled("YAW_MCP_PREWARM");
 }
 
 // Last unrecognized YAW_MCP_TOOL_EXPOSURE value the warning in
 // resolveToolExposure fired for. Null means "nothing warned about yet".
 let exposureWarnedFor: string | null = null;
 
+/** `clientInfo.name` values for which an UNSET `YAW_MCP_TOOL_EXPOSURE` means
+ *  `lite` rather than `gateway` -- see ToolExposure in proxy.ts for why lite
+ *  exists. typed-cli sends `clientInfo: { name: 'typed-cli' }` on initialize
+ *  (typed apps/cli/src/mcp/client.ts) and inlines every advertised tool into
+ *  every request, with no deferred loading to hide the eight meta-tools it
+ *  never needs. Detected here, from clientInfo, rather than by an env var
+ *  typed could set: in the common Yaw Terminal case the yaw-mcp entry comes
+ *  from `~/.claude.json`, which typed reads but cannot add an env var to, so
+ *  broker-side detection is the only path that covers it. Exact match on
+ *  the name as sent -- a prefix or case-insensitive match would widen this
+ *  to clients nobody measured. */
+export const LITE_BY_DEFAULT_CLIENTS: ReadonlySet<string> = new Set(["typed-cli"]);
+
 // How much of the catalog tools/list advertises. Gateway by default -- see
-// ToolExposure in proxy.ts for the measurement that made it the default.
-// YAW_MCP_TOOL_EXPOSURE=full restores the previous behavior for a client that
-// genuinely wants the whole catalog inlined. Re-read per call, same discipline
-// as resolveMinCompliance, so a mid-session change lands on the next
-// tools/list instead of needing a restart.
-export function resolveToolExposure(): ToolExposure {
+// ToolExposure in proxy.ts for the measurement that made it the default --
+// and lite by default for the clients in LITE_BY_DEFAULT_CLIENTS, which is
+// why the connected client's `clientInfo` is a parameter: the handlers pass
+// `this.server.getClientVersion()`, populated by the SDK from the initialize
+// request (undefined before it, and in a unit test that never handshakes,
+// which lands on gateway). An explicit YAW_MCP_TOOL_EXPOSURE always wins over
+// that default: `full` restores the previous behavior for a client that
+// genuinely wants the whole catalog inlined, `lite` opts any client into the
+// three-tool surface, `gateway` pins a typed-cli session to the full
+// meta-tool set. Re-read per call, same discipline as resolveMinCompliance,
+// so a mid-session change lands on the next tools/list instead of needing a
+// restart.
+export function resolveToolExposure(clientInfo?: { name?: string }): ToolExposure {
+  const fallback: ToolExposure =
+    clientInfo?.name !== undefined && LITE_BY_DEFAULT_CLIENTS.has(clientInfo.name) ? "lite" : "gateway";
   const raw = process.env.YAW_MCP_TOOL_EXPOSURE?.trim().toLowerCase();
   if (raw === "full") return "full";
-  if (raw === undefined || raw === "" || raw === "gateway") return "gateway";
+  if (raw === "lite") return "lite";
+  if (raw === "gateway") return "gateway";
+  if (raw === undefined || raw === "") return fallback;
   // Unknown value: an operator who mistyped should not silently get the
-  // 27,000-token surface back. Said once per distinct bad value, not once
-  // per call: this resolver runs from all three list handlers, so an
-  // unconditional warn is three lines per client refresh and three more
-  // after every list_changed notification. Keyed on the VALUE (same
-  // discipline as idleThresholdClampWarnedFor below) so a session that
-  // swaps one typo for another is still told.
+  // 27,000-token surface back, so it lands on the same default an unset
+  // value would -- the smaller surface for THIS client. Said once per
+  // distinct bad value, not once per call: this resolver runs from all
+  // three list handlers, so an unconditional warn is three lines per client
+  // refresh and three more after every list_changed notification. Keyed on
+  // the VALUE (same discipline as idleThresholdClampWarnedFor below) so a
+  // session that swaps one typo for another is still told.
   if (exposureWarnedFor !== raw) {
     exposureWarnedFor = raw;
-    log("warn", `unrecognized YAW_MCP_TOOL_EXPOSURE "${raw}"; using "gateway"`, { raw });
+    log("warn", `unrecognized YAW_MCP_TOOL_EXPOSURE "${raw}"; using "${fallback}"`, { raw });
   }
-  return "gateway";
+  return fallback;
 }
 
 // Baseline number of non-matching tool calls a namespace tolerates before
@@ -873,6 +895,12 @@ export class ConnectServer {
           resources: { listChanged: true },
           prompts: { listChanged: true },
         },
+        // Returned once, in the initialize result, and injected by Claude
+        // Code into the system prompt as a "# MCP Server Instructions"
+        // block. This is where the routing prose the meta-tool descriptions
+        // used to repeat now lives -- a description is paid on every
+        // tools/list, this is paid once. See SERVER_INSTRUCTIONS.
+        instructions: SERVER_INSTRUCTIONS,
       },
     );
     // yaw-mcp itself does not handle elicitation or sampling requests; it
@@ -931,13 +959,24 @@ export class ConnectServer {
     return map;
   }
 
+  /** The exposure THIS session's lists are served at: the env when set,
+   *  else the default for the connected client (lite for typed-cli, gateway
+   *  otherwise -- see resolveToolExposure). The one place the client's
+   *  identity is read, so the three list handlers and discover's "in
+   *  context" summary cannot disagree about which surface they describe.
+   *  getClientVersion() is the SDK's copy of the initialize request's
+   *  clientInfo and is undefined before the handshake. */
+  private currentExposure(): ToolExposure {
+    return resolveToolExposure(this.server.getClientVersion());
+  }
+
   private setupHandlers(): void {
     this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
       tools: buildToolList(
         this.connections,
         this.getDeferredServers(),
         this.toolFilters,
-        resolveToolExposure(),
+        this.currentExposure(),
         this.sessionActivated,
         // Hidden here, refused at the gate, but still ROUTED: dropping the
         // route instead would make a call by name return `Unknown tool`,
@@ -956,7 +995,7 @@ export class ConnectServer {
       resources: buildResourceList(
         this.connections,
         this.getBuiltinResources(),
-        resolveToolExposure(),
+        this.currentExposure(),
         this.sessionActivated,
       ),
     }));
@@ -978,7 +1017,7 @@ export class ConnectServer {
     });
 
     this.server.setRequestHandler(ListPromptsRequestSchema, async () => ({
-      prompts: buildPromptList(this.connections, resolveToolExposure(), this.sessionActivated),
+      prompts: buildPromptList(this.connections, this.currentExposure(), this.sessionActivated),
     }));
 
     this.server.setRequestHandler(GetPromptRequestSchema, async (request) => {
@@ -1331,10 +1370,9 @@ export class ConnectServer {
     // whatever the file says at the next boundary, rather than treating edits
     // made while it was off as already-seen.
     //
-    // `0` and `false` are the two spellings YAW_MCP_AUTO_UPGRADE already
-    // accepts; anything else, including unset, leaves reload on.
-    const reloadOptOut = process.env.YAW_MCP_CONFIG_RELOAD;
-    if (reloadOptOut === "0" || reloadOptOut?.toLowerCase() === "false") return;
+    // The shared opt-out parse (opt-out-env.ts): `0` and `false`, trimmed,
+    // turn it off; anything else, including unset, leaves reload on.
+    if (isFeatureDisabled("YAW_MCP_CONFIG_RELOAD")) return;
 
     // A reload during teardown would spawn nothing but could still notify a
     // closing transport, and shuttingDown is the latch every other
@@ -1797,25 +1835,18 @@ export class ConnectServer {
     // serializes itself with its own lockfile.
     maybeRefreshSidecars().catch((err: Error) => log("warn", "Sidecar refresh check failed", { error: err?.message }));
 
-    // Pre-warm `~/.npm/_npx/<hash>/node_modules/<pkg>` for every active
-    // `npx -y <pkg>@latest` server, so the user's first `initialize` for that
-    // server does not pay the cold-cache tax. Without this, a fresh
-    // `_npx` cache makes a single spawn do registry + tar + child initialize,
-    // which is reliably >30s -- exceeding the downstream MCP client's
-    // `initialize` deadline and surfacing as "MCP request initialize to server
-    // mcp timed out after 30000ms". The prime runs `npx -y <pkg>@latest
-    // --version` once per unique package, in parallel, and resolves in <30s
-    // in the worst case. No-op when the user opts out
-    // (YAW_MCP_AUTO_PREWARM=0) or has no npx servers. Shares the sidecars lock
-    // with `maybeRefreshSidecars` so a manual `sidecars install` running at
-    // startup defers this pass and vice versa.
-    //
-    // Fire-and-forget for its siblings' reasons: the work it can trigger is
-    // a parallel batch of `npx` downloads, gated on the network, that the
-    // serve hot path must not block on. Ordering does not matter -- the
-    // prewarm touches `~/.npm/`, the sidecar refresh touches
-    // `~/.yaw-mcp/sidecars/`, and the upgrade touches the global prefix.
-    maybeAutoPrewarmNpxCache().catch((err: Error) => log("warn", "Auto-prewarm check failed", { error: err?.message }));
+    // There is deliberately NO npx-cache pre-warm here. 1.0.7 added a
+    // fire-and-forget `npx -y <pkg>@latest --version` pass at this point
+    // (auto-prewarm.ts, since deleted) to spare the first activation the
+    // cold-cache tax. It never ran: the call passed no server list, so the
+    // pass saw zero npx packages and returned on every start. Wiring it up
+    // for real would have spawned up to twenty parallel npx children -- a
+    // registry hit and a package boot each -- on EVERY broker start, and Yaw
+    // Terminal starts one broker per pane. Its stated goal was unreachable
+    // from here anyway: `server.connect` above has already completed, so the
+    // handshake this was meant to protect is over before the pass fires. A
+    // once-a-day warm belongs in an explicit verb the app runs at launch, not
+    // on the serve hot path.
 
     // Re-point any client entry whose baked launch file an app upgrade
     // deleted. CROSS-CLIENT on purpose, and that is the whole point: the
@@ -3342,7 +3373,7 @@ export class ConnectServer {
     // accumulator, the session tool total -- keys on this predicate so the
     // summary means what it says. Resolved once per discover; the whole
     // body is rendered from one snapshot.
-    const exposure = resolveToolExposure();
+    const exposure = this.currentExposure();
     const isAdvertised = (namespace: string): boolean => exposure === "full" || this.sessionActivated.has(namespace);
 
     // The SESSION token total, computed over every live connection rather than

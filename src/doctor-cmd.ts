@@ -1559,7 +1559,7 @@ export const DOCTOR_ENV_VARS: ReadonlyArray<{ name: string; defaultHint: string 
   { name: "YAW_MCP_PRUNE_RESPONSES", defaultHint: "pruning active" },
   { name: "YAW_MCP_MAX_RESULT_BYTES", defaultHint: "default 100000" },
   { name: "YAW_MCP_DEFAULT_RUNTIME", defaultHint: "oam when installed" },
-  { name: "YAW_MCP_TOOL_EXPOSURE", defaultHint: "gateway" },
+  { name: "YAW_MCP_TOOL_EXPOSURE", defaultHint: "gateway; lite for typed-cli" },
   { name: "YAW_MCP_AUTO_UPGRADE", defaultHint: "default on" },
   { name: "YAW_MCP_AUTO_HEAL", defaultHint: "default on" },
   { name: "YAW_MCP_SIDECAR_REFRESH", defaultHint: "default on" },
@@ -2040,11 +2040,19 @@ function renderOamRuntimeSection(opts: {
   print("OAM RUNTIME");
   if (probe.belowMin) {
     print(`  binary:  installed (v${probe.version}) -- below min ${MIN_OAM_VERSION}; IGNORED, servers run on node`);
-    // The floor tracks the latest oam release, so "below min" is always
-    // "out of date" rather than "wrong build" -- and oam updates itself in
-    // place. Naming the one command that fixes it beats re-running an
-    // installer that has to be looked up.
+    // The floor is a released oam (the last one verify:oam-floor passed on),
+    // so "below min" is always "out of date" rather than "wrong build" -- and
+    // oam updates itself in place. Naming the one command that fixes it beats
+    // re-running an installer that has to be looked up.
+    //
+    // The restart line is here because this report is the one surface a
+    // user reads: the broker's own warn names the restart too, but MCP
+    // clients hide stderr. probeOam caches its answer for the life of the
+    // process, so a broker that saw the old oam keeps hosting sidecars on
+    // node after self-update -- and a fresh `doctor`, which probes anew,
+    // reports green while it does.
     print("           fix: oam self-update");
+    print("           then: restart yaw-mcp -- a running broker keeps its oam probe for its lifetime");
   } else if (probe.failure !== null) {
     // PRESENT but unusable. This used to print "not installed", which sent a
     // user who has oam installed (and often OAM_BIN set at it) off to install
@@ -3174,10 +3182,15 @@ function launchChecks(
           if (oamArgv !== null) {
             // A BARE oam is the one shape the absolute-path check above
             // cannot see, and it is the shape older installs actually
-            // wrote. It resolves against the CLIENT's PATH, not the shell's,
-            // so a GUI-launched client (Claude Desktop from the Dock, Cursor
-            // from Explorer) never finds an oam that lives in ~/.oam/bin --
-            // the broker fails to start with no fallback. `install` no
+            // wrote. It resolves against the CLIENT's PATH, not the shell's.
+            // On macOS and Linux, install.sh puts oam in ~/.oam/bin and only
+            // prints an `export PATH=...` line, so a GUI-launched client
+            // (Claude Desktop from the Dock) never finds it -- the broker
+            // fails to start with no fallback. On Windows, install.ps1 does
+            // add its install dir (%LOCALAPPDATA%\oam\bin by default) to the
+            // user PATH, but a client started before that change still lacks
+            // it, and an oam that install.ps1 did not put on disk gets no
+            // such entry. `install` no
             // longer writes this, but nothing rewrites the configs that
             // already carry it, so doctor is the only thing that can
             // surface it. Tested on the unwrapped token: a bare `oam`

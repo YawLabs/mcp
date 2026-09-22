@@ -9,27 +9,44 @@
 // original node/npx command whenever oam can't host the server:
 //   * oam isn't installed (no `oam` on PATH / OAM_BIN)        -> Node
 //   * the command isn't Node-based (uv/uvx/docker/python/...) -> unchanged
+//   * a node launch's first arg is a flag (--inspect, ...)    -> Node
+//     (it is not the entry file, and oam would eat it)
+//   * a flag other than -y/--yes comes before the npx spec    -> npx (Node)
+//     (--package, -p, --node-options, ...: yaw-mcp does not parse them)
 //   * an npx package can't be resolved on disk                -> npx (Node)
 //     (oam run needs a real entry; it can't reproduce npx's fetch-on-demand)
 //   * the npx spec is a git/path spec, not a registry package -> npx (Node)
-//   * the npx spec constrains the version and no on-disk copy -> npx (Node)
-//     satisfies it (npx honours the pin; `oam run <entry>` cannot)
+//   * the npx spec pins an exact version no on-disk copy      -> npx (Node)
+//     declares (npx honours the pin; `oam run <entry>` cannot)
+//   * the npx spec is a version range (`^1.2.3`, `1.x`, ...)  -> npx (Node)
+//     whatever copy is on disk (yaw-mcp carries no range evaluator)
 //
 // Compat note: oam is the DEFAULT for every node/npx sidecar (see
 // default-runtime.ts), not an opt-in tier -- that changed in #99, and this note
 // described the opt-in model for two releases after it.
 //
-// MEASURED: the SDK-hosting mechanism re-verified against oam 0.13.0 on
-// 2026-09-02, and the floor moved to 0.13.1 the same day without re-running
-// it -- 0.13.1 is a same-day patch on 0.13.0, so the mechanism check is
-// carried forward, not re-measured (a stdio @modelcontextprotocol/sdk server completes
-// initialize + tools/list + tools/call hosted on `oam run`); the full
-// per-server matrix below was last run against 0.11.0 on 2026-08-22
-// (first 0.9.0 on 2026-08-08). Re-run at least the mechanism check for
-// each floor move -- release.sh moves the floor on its own and does not run
-// it -- so nobody re-derives it: the
-// pure-JS/SDK tier (memory, tailscale, lemonsqueezy, redis, postgres, ctxlint)
-// completes an MCP initialize handshake hosted on oam, AND so do both
+// MEASURED: the SDK-hosting mechanism check -- a stdio @modelcontextprotocol/sdk
+// server completes initialize + tools/list + tools/call hosted on `oam run` --
+// is now `npm run verify:oam-floor` (scripts/verify-oam-floor.mjs): release.sh
+// runs it in step 1 against this machine's oam, and `--raise` is the only
+// thing that moves MIN_OAM_VERSION, so every floor from here on has that
+// check behind it by construction (0.16.3 itself: 2026-09-21, on the
+// verifier's first run). Before that the check was re-run by hand against
+// 0.13.0 on 2026-09-02 and carried forward, not re-measured, across the
+// 0.13.1 -> 0.16.3 moves release.sh made on its own. The full per-server
+// matrix below was last run against 0.11.0 on 2026-08-22 (first 0.9.0 on
+// 2026-08-08), and nothing in THIS repo re-runs it. oam's own release gate
+// does, per oam release: its scripts/mcp-sidecar-matrix.mjs reproduces this
+// rewrite (`npx [-y] <pkg> [...rest]` -> `oam run <resolved bin> [-- ...rest]`,
+// the bin read from the package's own package.json) and, for each sidecar in
+// it, runs initialize, tools/list and a real tool call on oam and again on a
+// node control; oam's scripts/release-local.sh runs that against the freshly
+// built native (Windows arm64) release asset before `gh release create`, a
+// failure on oam that the node control does not reproduce stops that release,
+// and a run that cannot answer for a sidecar (an install failure, a broken
+// upstream, a missing fixture) only warns. What the 0.11.0 run here measured:
+// the pure-JS/SDK tier (memory, tailscale, lemonsqueezy, redis, postgres,
+// ctxlint) completes an MCP initialize handshake hosted on oam, AND so do both
 // bundled-browser servers -- @modelcontextprotocol/server-puppeteer and
 // @playwright/mcp each launched a real Chromium and served a real
 // tools/call navigate on oam, matching the node control. An earlier note here
@@ -40,6 +57,17 @@
 // booted and then sat mute forever while the launcher reported success.
 // MIN_OAM_VERSION gates that fix in, so a machine below the floor gets node.
 //
+// One browser mode is still NOT hostable: @playwright/mcp with --isolated boots
+// and lists its tools on oam, but every browser tool errors (measured on
+// Windows). In that mode it connects to a local pipe path, and oam has no
+// client for a named pipe or a Unix-domain socket -- net.connect({path}) fails
+// with ERR_FEATURE_UNAVAILABLE_ON_PLATFORM. oam never had such a client: up to
+// 0.16.2 it dialled host:port instead, and a844903 (first in 0.16.3) only
+// replaced that silent misconnect with the refusal. Neither the 0.11.0 run nor
+// oam's matrix covers this mode (its playwright row runs with a persistent
+// profile). The boot is healthy, so the boot-scoped node downgrade below never
+// fires; `"runtime": "node"` for that server is the escape.
+//
 // Native addons: oam refuses to dlopen a .node addon by default, throwing a
 // CATCHABLE error with code OAM-NATIVE0001 (OAM_ENABLE_NATIVE_ADDONS=1 opts
 // into oam's alpha N-API support). The refusal is designed to be catchable so
@@ -47,12 +75,16 @@
 // keeps working, and oam deliberately omits `process.versions.modules`/`napi`
 // so addon loaders do not try in the first place.
 //
-// MEASURED against oam 0.11.0 on 2026-08-22: this does NOT break ssh2. With a
+// This does NOT break ssh2. MEASURED against oam 0.11.0 on 2026-08-22: with a
 // compiled sshcrypto.node present on disk, ssh2 loads and its Client and kex
 // layers work identically to the node control -- its binding require is
-// try/catch-wrapped, so it degrades to the pure-JS cipher path. The addon is
-// refused; the sidecar is not. Note OAM_ENABLE_NATIVE_ADDONS=1 would not even
-// help there: that addon is NAN/node-gyp, and the alpha loader rejects it with
+// try/catch-wrapped, so it degrades to the pure-JS cipher path. Client and kex
+// were last exercised there; the newer measurement is a boot only: on
+// 2026-09-21 @yawlabs/ssh-mcp 0.17.0, which imports ssh2 at startup with
+// sshcrypto.node on disk, completed initialize + tools/list (21 tools) on oam
+// 0.16.3 and on a 0.16.4 debug build. The addon is refused; the sidecar is
+// not. Note OAM_ENABLE_NATIVE_ADDONS=1 would not even help there: that addon
+// is NAN/node-gyp, and the alpha loader rejects it with
 // "napi_register_module_v1 missing".
 //
 // The residual risk is narrower than "native addons are broken": a package that
@@ -218,24 +250,35 @@ export function npxSpec(args: readonly string[]): string | null {
 /**
  * Minimum oam version yaw-mcp will host sidecars on.
  *
- * POLICY: this tracks the LATEST oam release. Bump it with every oam release,
- * not only when a release happens to fix something this code noticed. oam is
- * pre-1.0 and moves fast, the install channel (oamjs.org) only ever hands out
- * the current release, and hosting sidecars on a runtime older than that means
- * debugging against a build nobody else is running. There is no support
- * commitment for older builds, so there is no reason to admit them.
+ * POLICY: this is the last oam release the hosting mechanism was VERIFIED on
+ * -- `npm run verify:oam-floor` (scripts/verify-oam-floor.mjs) hosted a stdio
+ * @modelcontextprotocol/sdk server on that oam through `oam run` and completed
+ * initialize + tools/list + tools/call. It moves only by `npm run
+ * verify:oam-floor -- --raise`, which runs that check against the oam on the
+ * machine and then rewrites this constant, the ratchet literal in
+ * oam-spawn.test.ts and a CHANGELOG block together; the operator commits the
+ * result like any other change. release.sh runs the check (never the raise)
+ * in step 1, so a release cannot ship a floor the check has not passed on
+ * the release machine.
  *
- * release.sh does the bump. It reads the latest oam release from GitHub before
- * its confirm prompt and, when this is behind and the version being released is
- * not yet tagged or on npm, moves it -- with the ratchet literal in
- * oam-spawn.test.ts and a CHANGELOG block -- in a commit made before its lint,
- * typecheck and test gates run.
+ * It used to track the LATEST oam release, moved by release.sh from GitHub's
+ * /releases/latest without running anything. That is not free: a machine
+ * whose oam is below the floor hosts its node/npx sidecars on node with a
+ * warning (resolveOamSpawn), and install/heal write npx entries for the
+ * broker instead of oam ones (install-targets.ts) -- the slow spawn shape
+ * this whole module exists to avoid -- and typed users hit the same fallback
+ * because typed's preload launches the same broker binary. 0.16.1 -> 0.16.2
+ * -> 0.16.3 in five days paid that on every machine that had not run `oam
+ * self-update`, for releases that changed nothing the mechanism depends on.
+ * A verified floor still moves forward -- oamjs.org only ever installs the
+ * current release, and there is no support commitment for older builds -- but
+ * each move is a measurement, not a mirror of the release feed.
  *
  * Below-min is treated the same as oam-absent: the spawn falls back to
  * node/npx with one warn log naming both versions. That is a safe outcome --
- * the user gets node, which is what they had before oam existed -- so an
- * aggressive floor costs nothing but a fallback, while a lax one silently
- * hosts production sidecars on a runtime that is no longer current.
+ * the user gets node, which is what they had before oam existed -- so a
+ * floor that is too high costs a fallback, while one that is too low hosts
+ * production sidecars on a build the check never ran on.
  */
 export const MIN_OAM_VERSION = "0.16.3";
 
@@ -326,19 +369,31 @@ export function oamInstallAdvice(os: InstallOS): string {
 /**
  * Recognize oam's heap-cap death in a child's stderr, and say what fixes it.
  *
- * Since 0.9.2 oam caps the V8 heap -- 4 GiB unless OAM_MAX_HEAP_MB overrides,
- * 0 disables -- and turns what node renders as an ungraceful "Ineffective
- * mark-compacts near heap limit" abort into a deterministic exit 134 with
- * `error[OAM-RT-OOM]` on stderr, stdout left clean so the protocol channel is
- * not corrupted on the way out. That is a BETTER death than node's: it is
- * bounded, it names its own cause, and it cannot be mistaken for a crash. But
- * only if something reads it -- unrecognized it lands inside a 500-char stderr
- * tail under a generic "failed to start", and the one lever that fixes it is
- * never mentioned to the person who needs it.
+ * oam caps the V8 heap -- at OAM_MAX_HEAP_MB when that is a positive number;
+ * otherwise at 4 GiB, or at 75% of a Linux cgroup memory limit when that
+ * figure lands between 128 MiB and 4 GiB -- and turns what node renders as an
+ * ungraceful "Ineffective mark-compacts near heap limit" abort into a
+ * deterministic exit 134 with `error[OAM-RT-OOM]` on stderr, stdout left clean
+ * so the protocol channel is not corrupted on the way out. That is a BETTER
+ * death than node's: it is bounded, it names its own cause, and it cannot be
+ * mistaken for a crash. But only if something reads it -- unrecognized it
+ * lands inside a 500-char stderr tail under a generic "failed to start", and
+ * the one lever that fixes it is never mentioned to the person who needs it.
+ *
+ * OAM_MAX_HEAP_MB=0, or any non-numeric value (an empty one reads as unset),
+ * REMOVES oam's cap rather than raising it: V8's own limit applies (about
+ * 1.4 GiB), oam registers no near-heap-limit callback, and the child dies with
+ * a raw V8 crash (exit 127 measured on Windows) and no OAM-RT-OOM -- so this
+ * hint never fires for it.
  *
  * Matches the stable error CODE, not the prose: the banner carries the
- * resolved cap and whether it came from the env, so matching the sentence
- * would break on the next release that rewords it.
+ * resolved cap and where it came from (the env, the cgroup, or the default),
+ * so matching the sentence would break on the next release that rewords it.
+ *
+ * The hint names no default cap, because the cgroup rule makes any single
+ * number wrong somewhere. It does not need one: the banner is the last thing
+ * oam writes before exiting, so the stderr tail that both callers in
+ * upstream.ts append to the same message carries the real cap and its source.
  *
  * Returns null for every other stderr, including a node-hosted OOM -- node's
  * abort has no equivalent code, and inventing a hint for it here would put
@@ -347,7 +402,7 @@ export function oamInstallAdvice(os: InstallOS): string {
 export function oamHeapOomHint(stderr: string): string | null {
   if (!stderr.includes("OAM-RT-OOM")) return null;
   return (
-    "The oam-hosted child hit its V8 heap cap (oam defaults to 4 GiB). Raise it with " +
+    "The oam-hosted child hit its V8 heap cap. Raise it with " +
     'OAM_MAX_HEAP_MB=<mb> in this server\'s env, or set "runtime": "node" for this ' +
     "server in bundles.json."
   );
@@ -365,7 +420,8 @@ let warnedOamUnavailable = false;
 /** Why the probe produced no usable binary even though oam was present on
  *  disk. `null` is BOTH "oam is usable" and "oam is absent" -- absence is the
  *  routine case and is already conveyed by `bin === null` with no failure.
- *    "timeout" -- `oam --version` outlived OAM_PROBE_TIMEOUT_MS
+ *    "timeout" -- `oam --version` outlived OAM_PROBE_TIMEOUT_MS on both
+ *                 attempts (a timeout is retried once; see probeOamUncached)
  *    "exit"    -- it ran and exited non-zero (or died on a signal)
  *    "spawn"   -- it could not be executed at all (EACCES, a non-executable
  *                 file, or an injected `run` that rejected without a code) */
@@ -668,7 +724,9 @@ function classifyProbeFailure(err: unknown): OamProbeFailure {
 }
 
 /**
- * Probe the oam binary once (`oam --version`) and cache the result. OAM_BIN
+ * Probe the oam binary (`oam --version`) once per process and cache the
+ * result; a timed-out attempt is retried once before that result is decided
+ * (see probeOamUncached). OAM_BIN
  * overrides the binary path; it's normalized to a cmd-safe path so a
  * forward-slash OAM_BIN still spawns. The version output is parsed and gated
  * against MIN_OAM_VERSION: a below-min install is reported with bin=null
@@ -680,8 +738,11 @@ function classifyProbeFailure(err: unknown): OamProbeFailure {
  * `run` is injectable so the parse + gate logic is testable without a real
  * binary on PATH.
  */
-/** How long `oam --version` gets before we give up and fall back to node.
- *  Matches the 3s budget uv-bootstrap's onPath() probe already uses. */
+/** How long ONE `oam --version` attempt gets. A timeout is retried once and
+ *  falls back to node only if the retry fails as well, so a wedged binary
+ *  costs two of these windows. Matches the 3s budget uv-bootstrap's onPath()
+ *  probe already uses; resolveUv retries a timeout of that same PATH probe
+ *  once in the same way. */
 export const OAM_PROBE_TIMEOUT_MS = 3_000;
 
 /**
@@ -935,8 +996,37 @@ async function probeOamUncached(run: (bin: string) => Promise<string>, generatio
     if (generation === oamProbeGeneration) oamProbeCache = probe;
     return probe;
   };
+  /** Run the probe, retrying ONLY a timeout, and only once -- the same rule
+   *  uv-bootstrap's resolveUv applies to its PATH probe. Every other rejection
+   *  (ENOENT, a non-zero exit, EACCES) is a real answer and reaches the catch
+   *  below on the first attempt, so the routine oam-absent path pays nothing
+   *  for this. A timeout is not an answer: a saturated machine can push a
+   *  working binary past OAM_PROBE_TIMEOUT_MS, and because the result is
+   *  published for the process lifetime, that one slow start would otherwise
+   *  pin every sidecar to node until restart.
+   *
+   *  The retry runs inside the collapsed probe (oamProbeInFlight), so racing
+   *  connects share it rather than each starting their own. A wedged oam -- the
+   *  D-state case spawnVersionProbe exists for -- costs one more
+   *  OAM_PROBE_TIMEOUT_MS window and one more detached child per process, and
+   *  that window passes before upstream.ts arms its connect timer, so it is
+   *  not charged against MCP_CONNECT_TIMEOUT. */
+  const runRetryingTimeout = async (): Promise<string> => {
+    try {
+      return await run(bin);
+    } catch (err) {
+      if ((err as { code?: unknown } | null)?.code !== "ETIMEDOUT") throw err;
+      // Debug, not warn: nothing has been decided yet. The warn below fires
+      // only if the second attempt times out as well.
+      log("debug", "oam --version timed out; retrying once before falling back to node", {
+        timeoutMs: OAM_PROBE_TIMEOUT_MS,
+        bin,
+      });
+      return await run(bin);
+    }
+  };
   try {
-    const version = parseOamVersion(await run(bin));
+    const version = parseOamVersion(await runRetryingTimeout());
     if (version !== null && compareVersions(version, MIN_OAM_VERSION) < 0) {
       log("warn", "oam is installed but below the minimum supported version; falling back to node", {
         // The full token, prerelease suffix included: a build reporting
@@ -945,8 +1035,9 @@ async function probeOamUncached(run: (bin: string) => Promise<string>, generatio
         // make this line look like a comparator bug.
         oamVersion: version,
         minVersion: MIN_OAM_VERSION,
-        // The floor tracks the latest release, so below-min always means out
-        // of date, and oam updates itself in place.
+        // The floor is a released oam (the last one verify:oam-floor passed
+        // on), so below-min always means out of date, and oam updates itself
+        // in place.
         updateWith: "oam self-update",
         // ...but updating alone changes nothing here. oamProbeCache is written
         // once per process and only ever cleared by a test hook, so every
@@ -961,9 +1052,11 @@ async function probeOamUncached(run: (bin: string) => Promise<string>, generatio
     }
     if (version === null) {
       // A clean exit with nothing version-shaped in stdout is treated as
-      // usable -- a working --version proves oam exists, and an oam that
-      // prints its version to stderr is the known shape here (the probe only
-      // pipes stdout). But it means the MIN_OAM_VERSION gate above never ran
+      // usable -- a working --version proves oam exists, and refusing on a
+      // future change to its output format would silently disable every
+      // opted-in server (see probeOam's doc). No released oam has printed this
+      // way: clap writes --version to stdout, the one stream the probe pipes.
+      // But it means the MIN_OAM_VERSION gate above never ran
       // for this binary, so the "old builds hang in ways that read as server
       // bugs" class it guards is back on the table with nothing said about it.
       // Debug rather than warn: the binary works, and this is diagnostic
@@ -991,15 +1084,16 @@ async function probeOamUncached(run: (bin: string) => Promise<string>, generatio
     //
     // EVERY other failure is not routine: oam IS on disk and did not produce a
     // usable --version. Since the probe result is cached for the process
-    // lifetime, that one moment silently downgrades every opted-in server to
+    // lifetime, that one outcome silently downgrades every opted-in server to
     // node until restart, with nothing to explain why. So warn once, matching
     // the belowMin path, and let the timeout keep its own message -- it is the
-    // only failure with an actionable budget attached to it.
+    // only failure with an actionable budget attached to it. A timeout reaches
+    // here only after runRetryingTimeout's second attempt timed out too.
     const code = (err as { code?: unknown } | null)?.code;
     /** ENOENT is absence ONLY when the name was ours to guess. */
     const absent = code === "ENOENT" && !explicit;
     if (code === "ETIMEDOUT") {
-      log("warn", "oam did not respond to --version in time; falling back to node for this process", {
+      log("warn", "oam did not respond to --version twice; falling back to node for this process", {
         timeoutMs: OAM_PROBE_TIMEOUT_MS,
         bin,
       });

@@ -890,11 +890,16 @@ export interface BuildLaunchEntryOptions {
    *  resolveNpmEntry and resolveStableNpmEntry do: `bin` is what THIS process
    *  can spawn (`OAM_BIN` or a bare `oam`, already resolved against the shell
    *  PATH by having run it), while this value gets PERSISTED into a config file
-   *  some other process reads. oam installs to `$HOME/.oam/bin` and only nudges
-   *  the shell profile, so a GUI-launched client (Claude Desktop, Cursor from
-   *  Finder/Explorer) inherits no such PATH -- a bare `oam` there is an ENOENT
-   *  with no fallback, and doctor cannot even see it (it flags a missing command
-   *  only when isAbsolute(command)). A non-absolute value is therefore IGNORED
+   *  some other process reads. On macOS and Linux, oam's install.sh installs to
+   *  `$HOME/.oam/bin` and only prints an `export PATH=...` line for the shell
+   *  profile, so a GUI-launched client (Claude Desktop, Cursor from Finder)
+   *  inherits no such PATH -- a bare `oam` there is an ENOENT with no fallback,
+   *  and doctor cannot even see it (it flags a missing command only when
+   *  isAbsolute(command)). On Windows, install.ps1 installs to
+   *  `%LOCALAPPDATA%\oam\bin` by default and does add its install dir to the
+   *  user PATH -- but a client started before that change still lacks it, and
+   *  an oam that install.ps1 did not put on disk gets no such entry. A
+   *  non-absolute value is therefore IGNORED
    *  here, not just filtered by the caller, so the invariant is enforced at the
    *  boundary instead of by convention.
    *

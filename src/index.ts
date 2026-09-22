@@ -481,10 +481,14 @@ if (subcommand === "compliance") {
                                \`0\` disables).
     YAW_MCP_TOOL_EXPOSURE         How much of the catalog tools/list advertises.
                                \`gateway\` (default) exposes the meta-tools
-                               plus loaded servers only; \`full\` restores the
+                               plus loaded servers only; \`lite\` (the default
+                               when the client is typed-cli) exposes only
+                               mcp_connect_exec / find_tool / read_tool plus
+                               loaded servers; \`full\` restores the
                                pre-gateway behavior and inlines the whole
-                               catalog. Re-read per call -- a change lands on
-                               the next tools/list without a restart.
+                               catalog. Set, it wins over the client default.
+                               Re-read per call -- a change lands on the next
+                               tools/list without a restart.
     YAW_MCP_ROUTE_EFFORT          How hard dispatch tries to break ranking ties
                                with the client LLM: \`off\` | \`auto\` |
                                \`aggressive\` (default auto). The dispatch
@@ -574,10 +578,11 @@ if (subcommand === "compliance") {
                                (\`oam.exe\` on Windows).
     OAM_MAX_HEAP_MB               Read by oam, not by yaw-mcp: raises the V8
                                heap cap oam applies to a hosted server (4 GiB
-                               by default since oam 0.9.2). Set it in that
-                               server's \`env\` in bundles.json when a hosted
-                               sidecar dies with a heap out-of-memory error,
-                               or give that server \`"runtime": "node"\`.
+                               by default; can be lower inside a memory-limited
+                               Linux container). Set it in that server's \`env\`
+                               in bundles.json when a hosted sidecar dies with a
+                               heap out-of-memory error, or give that server
+                               \`"runtime": "node"\`.
     MCP_CONNECT_TIMEOUT           Milliseconds to wait for a server's MCP
                                handshake (default 15000). This is the FALLBACK
                                only -- a server's own \`connectTimeoutMs\` in

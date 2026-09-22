@@ -34,6 +34,16 @@ export interface CatalogRequiredEnv {
   label?: string;
   placeholder?: string;
   docsUrl?: string;
+  /** `true` marks a var the server runs WITHOUT -- one that only unlocks
+   *  more of its tools (Terraform's TFE_TOKEN adds the 47 cloud tools to a
+   *  9-tool local install). It is still declared, so `add` writes the key
+   *  into the entry's env for the user to fill later, but its absence never
+   *  blocks an add or a trial and never counts as a missing credential.
+   *  Anything other than the boolean `true` (absent, `"true"`, `1`) reads as
+   *  required: the gate is the safe default for a value that did not survive
+   *  the wire, and the field is read by every client of one shared catalog,
+   *  so the parse is deliberately strict rather than truthy. */
+  optional?: boolean;
 }
 
 /** A raw catalog server entry (only the fields this resolver reads). */
@@ -58,8 +68,20 @@ export interface ResolvedCatalogServer {
   name: string;
   command: string;
   args: string[];
-  /** Names (not values) of env vars the server needs. */
+  /** Names (not values) of env vars the server NEEDS: the catalog's
+   *  `requiredEnv` entries minus the ones flagged `"optional": true`. Every
+   *  gate downstream (`add`'s refusal, `try`'s, the ambient-env note) reads
+   *  this list, so its meaning is unchanged by the optional flag: a server
+   *  whose declared vars are all optional resolves with an EMPTY list here
+   *  and gates exactly like one that declares nothing. */
   requiredEnvKeys: string[];
+  /** Names of env vars the catalog declares with `"optional": true`. Kept
+   *  apart from requiredEnvKeys rather than folded into it with a marker, so
+   *  a consumer that only knows the required list keeps its old meaning.
+   *  `add` seeds these into the entry's env (empty when unset) so the
+   *  app's env editor and `yaw-mcp set` have a key to fill; nothing refuses
+   *  on them. */
+  optionalEnvKeys: string[];
   description?: string;
   source?: string;
   docUrl?: string;
@@ -359,11 +381,23 @@ export async function resolveCatalogSlug(
     throw new Error(`catalog entry "${slug}" install command was empty.`);
   }
 
-  const requiredEnvKeys = Array.isArray(entry.requiredEnv)
-    ? entry.requiredEnv
-        .map((e) => (e && typeof e === "object" ? e.key : undefined))
-        .filter((k): k is string => typeof k === "string" && ENV_KEY_RE.test(k))
-    : [];
+  // One pass over `requiredEnv`, split by the `optional` flag. The key filter
+  // is the same for both halves (only a well-formed shell identifier can be
+  // written into an env map), and the flag is read as `=== true`: this is
+  // remote data, and a truthy test would let `"false"` -- a string a hand
+  // edit of the catalog could plausibly leave -- lift a var out of the gate.
+  const requiredEnvKeys: string[] = [];
+  const optionalEnvKeys: string[] = [];
+  if (Array.isArray(entry.requiredEnv)) {
+    for (const e of entry.requiredEnv) {
+      const key = e && typeof e === "object" ? e.key : undefined;
+      if (typeof key !== "string" || !ENV_KEY_RE.test(key)) continue;
+      (e.optional === true ? optionalEnvKeys : requiredEnvKeys).push(key);
+    }
+  }
+  // A key listed twice with the flag disagreeing is a catalog bug; required
+  // wins, so the key is gated on AND never printed as both at once.
+  const optionalOnly = optionalEnvKeys.filter((k) => !requiredEnvKeys.includes(k));
 
   const source =
     typeof entry.repo === "string" ? entry.repo : typeof entry.homepage === "string" ? entry.homepage : undefined;
@@ -373,6 +407,7 @@ export async function resolveCatalogSlug(
     command,
     args,
     requiredEnvKeys,
+    optionalEnvKeys: optionalOnly,
     description: typeof entry.description === "string" ? entry.description : undefined,
     source,
     docUrl: source,

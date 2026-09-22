@@ -1820,9 +1820,9 @@ describe("runUpgrade", () => {
   });
 
   it("warns that oam is below the floor even when yaw-mcp itself has nothing to do", async () => {
-    // MIN_OAM_VERSION tracks the LATEST oam release, so upgrading yaw-mcp can
-    // raise the floor past the user's oam and silently drop every sidecar from
-    // oam to node. `upgrade` is the command a user runs to "get current", and it
+    // MIN_OAM_VERSION moves forward with oam releases, so upgrading yaw-mcp
+    // can raise the floor past the user's oam and silently drop every sidecar
+    // from oam to node. `upgrade` is the command a user runs to "get current", and it
     // used to print "nothing to do" with no mention of that -- the only other
     // notices are a warn line on the broker's stderr (which MCP clients hide)
     // and `doctor`.

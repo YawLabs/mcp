@@ -788,10 +788,10 @@ async function probeOamQuietly(): Promise<OamProbe> {
  *  floor yaw-mcp hosts sidecars on. Empty when oam is absent (node is the
  *  baseline, nothing to say), current, or unprobeable.
  *
- *  Why `upgrade` of all commands: MIN_OAM_VERSION tracks the LATEST oam release
- *  and moves with every one, so the very act of upgrading yaw-mcp can raise the
- *  floor past the user's oam and silently drop every sidecar from oam to
- *  node/npx. That state is otherwise surfaced only as one warn line on the
+ *  Why `upgrade` of all commands: MIN_OAM_VERSION moves forward with oam
+ *  releases (to the last one `verify:oam-floor` passed on), so the very act of
+ *  upgrading yaw-mcp can raise the floor past the user's oam and silently drop
+ *  every sidecar from oam to node/npx. That state is otherwise surfaced only as one warn line on the
  *  broker's stderr (which MCP clients hide) and in `yaw-mcp doctor` — while
  *  `upgrade`, the command a user runs precisely to "get current", printed
  *  "nothing to do".
@@ -812,6 +812,12 @@ async function oamFloorLines(probe?: UpgradeCommandOptions["oamProbe"]): Promise
       "         requires, so MCP sidecars run on node instead of oam. Update it:",
       "",
       "  oam self-update",
+      "",
+      // A broker already running keeps the probe's cached answer for its
+      // lifetime (probeOam), so without a restart it stays on node after the
+      // update; the broker's own warn says so, but MCP clients hide stderr.
+      "         then restart yaw-mcp: a running broker keeps its oam probe for its",
+      "         lifetime, so it stays on node until it does.",
     ];
   } catch {
     return [];

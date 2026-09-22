@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { META_TOOLS } from "../meta-tools.js";
+import { LITE_META_TOOL_NAMES, META_TOOLS } from "../meta-tools.js";
 import {
   type BuiltinResource,
   buildPromptList,
@@ -1374,6 +1374,65 @@ describe("gateway exposure covers resources and prompts too", () => {
   it("full exposure still lists everything, unchanged", () => {
     expect(buildResourceList(connections, [], "full", new Set()).some((r) => r.uri.includes("db"))).toBe(true);
     expect(buildPromptList(connections, "full", new Set())).toHaveLength(1);
+  });
+});
+
+describe("buildToolList — lite exposure", () => {
+  // Lite is gateway with the meta-tool list cut to the exec-route three. It
+  // exists for a client that inlines every advertised tool into every
+  // request (typed-cli); the assertions below are the two halves of that
+  // contract -- the three are exactly what is listed, and the upstream gate
+  // is gateway's, unchanged.
+  const connections = new Map([["db", makeConnection("db", ["query", "explain"], ["db://tables"], ["review"])]]);
+  const inactive = [makeInactiveServer("tailscale", [{ name: "status", description: "d" }])];
+
+  it("advertises exactly exec, find_tool and read_tool before anything is activated", () => {
+    const names = buildToolList(connections, inactive, undefined, "lite", new Set()).map((t) => t.name);
+    expect(names).toEqual([META_TOOLS.read_tool.name, META_TOOLS.findTool.name, META_TOOLS.exec.name]);
+    expect(names).toEqual([...names].filter((n) => LITE_META_TOOL_NAMES.has(n)));
+  });
+
+  it("keeps the listed three byte-identical to their gateway entries", () => {
+    // Lite narrows the list; it must not hand the client a different schema
+    // or description for a tool it would also see under gateway.
+    const lite = buildToolList(connections, inactive, undefined, "lite", new Set());
+    const gateway = buildToolList(connections, inactive, undefined, "gateway", new Set());
+    for (const tool of lite) expect(gateway.find((g) => g.name === tool.name)).toEqual(tool);
+  });
+
+  it("gates upstream tools exactly as gateway does: activated yes, merely connected no, deferred never", () => {
+    const activated = buildToolList(connections, inactive, undefined, "lite", new Set(["db"])).map((t) => t.name);
+    expect(activated).toContain("db_query");
+    expect(activated).toContain("db_explain");
+    expect(activated.some((n) => n.startsWith("tailscale_"))).toBe(false);
+    const other = buildToolList(connections, inactive, undefined, "lite", new Set(["other"])).map((t) => t.name);
+    expect(other.some((n) => n.startsWith("db_"))).toBe(false);
+    expect(other.some((n) => n.startsWith("tailscale_"))).toBe(false);
+  });
+
+  it("still honors a per-namespace tool filter on an activated namespace", () => {
+    const filters = new Map([["db", new Set(["query"])]]);
+    const names = buildToolList(connections, inactive, filters, "lite", new Set(["db"])).map((t) => t.name);
+    expect(names).toContain("db_query");
+    expect(names).not.toContain("db_explain");
+  });
+
+  it("applies the same activation gate to resources and prompts", () => {
+    // "Not activated" has to mean the same thing on every list, or lite
+    // leaks the catalog through resources/list while withholding tools/list.
+    expect(buildResourceList(connections, [], "lite", new Set()).some((r) => r.uri.includes("db"))).toBe(false);
+    expect(buildPromptList(connections, "lite", new Set())).toHaveLength(0);
+    expect(buildResourceList(connections, [], "lite", new Set(["db"])).length).toBeGreaterThan(0);
+    expect(buildPromptList(connections, "lite", new Set(["db"]))).toHaveLength(1);
+  });
+
+  it("leaves routes complete, so the eight unlisted meta-tools' work is still reachable by name", () => {
+    // The reach guarantee lite depends on more than gateway does: with no
+    // activate in the list, exec's load-on-first-use through the deferred
+    // route is the ONLY way a lite client gets a cold server's tool.
+    const routes = buildToolRoutes(connections, inactive);
+    expect(routes.get("tailscale_status")?.deferred).toBe(true);
+    expect(routes.has("db_query")).toBe(true);
   });
 });
 

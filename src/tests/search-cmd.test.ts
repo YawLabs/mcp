@@ -303,3 +303,82 @@ describe("runSearch against an EMPTY catalog", () => {
     expect(cap.text()).toContain("No catalog server matches");
   });
 });
+
+// The catalog's `"optional": true` flag on a requiredEnv entry. `needs` keeps
+// its meaning (what `add` refuses without) and the optional keys get a part
+// of their own, so a "no credentials" server that merely READS a token when
+// present is not listed as needing one. Own fixture: the suites above count
+// matches against CATALOG.
+describe("runSearch with optional env", () => {
+  const OPTIONAL_CATALOG = [
+    {
+      slug: "terraform",
+      name: "Terraform",
+      description: "Registry search, no credentials.",
+      toolCount: 56,
+      install: { command: "docker run terraform", runtime: "other" },
+      requiredEnv: [{ key: "TFE_TOKEN", optional: true }],
+    },
+    {
+      slug: "consul",
+      name: "Consul",
+      description: "Query a Consul cluster.",
+      toolCount: 85,
+      install: { command: "docker run consul", runtime: "other" },
+      requiredEnv: [{ key: "CONSUL_HTTP_ADDR" }, { key: "CONSUL_HTTP_TOKEN", optional: true }],
+    },
+    {
+      slug: "docker",
+      name: "Docker",
+      description: "Manage Docker containers.",
+      toolCount: 19,
+      install: { command: "uvx docker-mcp", runtime: "python" },
+      requiredEnv: [{ key: "DOCKER_HOST", optional: true }],
+      requiresSetup: true,
+    },
+    {
+      slug: "strict",
+      name: "Strict",
+      description: "A string flag is not the flag.",
+      install: { command: "npx strict", runtime: "node" },
+      requiredEnv: [{ key: "K", optional: "true" }],
+    },
+  ] as unknown as CatalogServer[];
+  const fetchOptionalCatalog = async (): Promise<CatalogServer[]> => OPTIONAL_CATALOG;
+
+  it("lists an all-optional server as 'no credentials' with its optional keys apart", async () => {
+    const cap = capture();
+    await runSearch({ query: "terraform", fetchCatalog: fetchOptionalCatalog, env: {}, ...cap });
+    expect(cap.text()).toContain("runtime other | 56 tools | no credentials | optional TFE_TOKEN");
+    expect(cap.text()).not.toMatch(/needs TFE_TOKEN/);
+  });
+
+  it("keeps `needs` to the required key on a mixed server", async () => {
+    const cap = capture();
+    await runSearch({ query: "consul", fetchCatalog: fetchOptionalCatalog, env: {}, ...cap });
+    expect(cap.text()).toContain("runtime other | 85 tools | needs CONSUL_HTTP_ADDR | optional CONSUL_HTTP_TOKEN");
+  });
+
+  it("drops the '(no env keys listed)' parenthetical from a requiresSetup server that lists an optional key", async () => {
+    const cap = capture();
+    await runSearch({ query: "docker", fetchCatalog: fetchOptionalCatalog, env: {}, ...cap });
+    expect(cap.text()).toContain("runtime python | 19 tools | needs setup | optional DOCKER_HOST");
+    expect(cap.text()).not.toContain("no env keys listed");
+  });
+
+  it("reads a non-boolean flag as required", async () => {
+    const cap = capture();
+    await runSearch({ query: "strict", fetchCatalog: fetchOptionalCatalog, env: {}, ...cap });
+    expect(cap.text()).toContain("needs K");
+    expect(cap.text()).not.toContain("optional K");
+  });
+
+  it("--json keeps requiredEnvKeys to the gate and adds optionalEnvKeys beside it", async () => {
+    const cap = capture();
+    await runSearch({ query: "consul", json: true, fetchCatalog: fetchOptionalCatalog, env: {}, ...cap });
+    const parsed = JSON.parse(cap.text());
+    expect(parsed.results[0].slug).toBe("consul");
+    expect(parsed.results[0].requiredEnvKeys).toEqual(["CONSUL_HTTP_ADDR"]);
+    expect(parsed.results[0].optionalEnvKeys).toEqual(["CONSUL_HTTP_TOKEN"]);
+  });
+});

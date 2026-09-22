@@ -1,17 +1,24 @@
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { type HealedEntry, healStaleBrokerEntries } from "../heal-entries.js";
-import type { OamProbe } from "../oam-spawn.js";
+import {
+  type HealedEntry,
+  type HealResult,
+  healStaleBrokerEntries,
+  maybeHealStaleBrokerEntries,
+} from "../heal-entries.js";
+import { MIN_OAM_VERSION, type OamProbe } from "../oam-spawn.js";
 
 /** An oam that is installed and healthy, at a path we never have to create:
- *  buildLaunchEntry only requires the string be absolute. */
+ *  buildLaunchEntry only requires the string be absolute. The version is
+ *  derived from MIN_OAM_VERSION, as the other usable fixtures are, so it stays
+ *  a state probeOam can produce; heal reads only binPath, so it is inert here. */
 const OAM_BIN = process.platform === "win32" ? "C:\\tools\\oam.exe" : "/usr/local/bin/oam";
 const probe = (): OamProbe => ({
   bin: "oam",
   binPath: OAM_BIN,
-  version: "0.16.2",
+  version: MIN_OAM_VERSION,
   belowMin: false,
   failure: null,
   failureDetail: null,
@@ -313,5 +320,162 @@ describe("healStaleBrokerEntries -- wrapper shapes", () => {
     const healed = await heal();
     expect(healed.filter((h) => h.clientId === "codex-cli")).toEqual([]);
     expect(readFileSync(p2, "utf8")).toBe(before);
+  });
+});
+
+describe("maybeHealStaleBrokerEntries -- YAW_MCP_AUTO_HEAL", () => {
+  /** The startup wrapper against the same fake home. */
+  function maybeHeal(env: NodeJS.ProcessEnv): Promise<HealResult> {
+    return maybeHealStaleBrokerEntries({ home, cwd: home, env, oamProbe: probe, resolveOamEntry: () => liveEntry });
+  }
+
+  // The gate used to be a bare `=== "0"` under a comment claiming it matched
+  // its siblings' parse -- so "false" did nothing, and neither did the "0 "
+  // that cmd.exe's `set YAW_MCP_AUTO_HEAL=0 && ...` delivers. All three are
+  // opt-outs now, through the one shared parser.
+  it.each(["0", "false", "FALSE", "0 "])("writes nothing and reports nothing under %j", async (value) => {
+    const p = writeCodexConfig(tomlEntry(DEAD));
+    const before = readFileSync(p, "utf8");
+    const r = await maybeHeal({ YAW_MCP_AUTO_HEAL: value });
+    expect(r).toEqual({ healed: [], unhealable: [] });
+    expect(readFileSync(p, "utf8")).toBe(before);
+  });
+
+  it.each(["no", "off", "1", "00"])("still heals under the near-miss %j", async (value) => {
+    // Only the two documented spellings turn it off. A near-miss that
+    // silently disabled the heal would leave a dead entry in place for a user
+    // who meant to keep the feature.
+    const p = writeCodexConfig(tomlEntry(DEAD));
+    const r = await maybeHeal({ YAW_MCP_AUTO_HEAL: value });
+    expect(r.healed.filter((h) => h.clientId === "codex-cli")).toHaveLength(1);
+    expect(readFileSync(p, "utf8")).not.toContain("2.1.2");
+  });
+
+  it("still honours the read-only gate, which the verb-level opt-out does not replace", async () => {
+    const p = writeCodexConfig(tomlEntry(DEAD));
+    const before = readFileSync(p, "utf8");
+    const r = await maybeHeal({ YAW_MCP_READONLY_DIAGNOSTICS: "1" });
+    expect(r.healed).toEqual([]);
+    expect(readFileSync(p, "utf8")).toBe(before);
+  });
+});
+
+describe("healStaleBrokerEntries -- client config redirects come from the environment", () => {
+  // The sweep used to build its sites from `opts.claudeConfigDir` /
+  // `opts.appData` alone, and neither caller passed them, so a redirected
+  // client was inspected at its DEFAULT path: "No stale yaw-mcp entries found"
+  // while doctor -- which reads every redirect through readClientEnv -- kept
+  // flagging the dead entry in the file the client actually reads.
+
+  it("heals the config.toml CODEX_HOME points at, not ~/.codex/config.toml", async () => {
+    const codexHome = join(home, "elsewhere", "codex");
+    mkdirSync(codexHome, { recursive: true });
+    const redirected = join(codexHome, "config.toml");
+    writeFileSync(redirected, tomlEntry(DEAD));
+
+    const healed = await heal({ env: { CODEX_HOME: codexHome } });
+    const codex = healed.filter((h) => h.clientId === "codex-cli");
+    expect(codex).toHaveLength(1);
+    expect(codex[0].path).toBe(redirected);
+    expect(readFileSync(redirected, "utf8")).not.toContain("2.1.2");
+    // And the default location was neither created nor consulted.
+    expect(existsSync(join(home, ".codex", "config.toml"))).toBe(false);
+  });
+
+  it("heals the .claude.json under CLAUDE_CONFIG_DIR -- what every Yaw Terminal pane sets", async () => {
+    const configDir = join(home, "overlay");
+    mkdirSync(configDir, { recursive: true });
+    const redirected = join(configDir, ".claude.json");
+    writeFileSync(
+      redirected,
+      JSON.stringify({ mcpServers: { mcp: { command: OAM_BIN, args: ["run", "--no-check", DEAD] } } }, null, 2),
+    );
+
+    const healed = await heal({ env: { CLAUDE_CONFIG_DIR: configDir } });
+    const claude = healed.filter((h) => h.clientId === "claude-code");
+    expect(claude).toHaveLength(1);
+    expect(claude[0].path).toBe(redirected);
+    expect(claude[0].from).toBe(DEAD);
+    expect(readFileSync(redirected, "utf8")).not.toContain("2.1.2");
+    expect(existsSync(join(home, ".claude.json"))).toBe(false);
+  });
+
+  it("lets an explicit claudeConfigDir option win over the environment", async () => {
+    // Install, doctor and the tests all pin the redirect as an option; the
+    // env is the fallback for the two callers that pass nothing.
+    const fromOpt = join(home, "from-opt");
+    const fromEnv = join(home, "from-env");
+    mkdirSync(fromOpt, { recursive: true });
+    mkdirSync(fromEnv, { recursive: true });
+    const entry = { mcpServers: { mcp: { command: OAM_BIN, args: ["run", "--no-check", DEAD] } } };
+    writeFileSync(join(fromOpt, ".claude.json"), JSON.stringify(entry));
+    writeFileSync(join(fromEnv, ".claude.json"), JSON.stringify(entry));
+
+    const healed = await heal({ claudeConfigDir: fromOpt, env: { CLAUDE_CONFIG_DIR: fromEnv } });
+    const claude = healed.filter((h) => h.clientId === "claude-code");
+    expect(claude.map((h) => h.path)).toEqual([join(fromOpt, ".claude.json")]);
+    expect(readFileSync(join(fromEnv, ".claude.json"), "utf8")).toContain("2.1.2");
+  });
+
+  it("treats an empty CLAUDE_CONFIG_DIR as unset, the rule the one reader already applies", async () => {
+    const p = join(home, ".claude.json");
+    writeFileSync(p, JSON.stringify({ mcpServers: { mcp: { command: OAM_BIN, args: ["run", "--no-check", DEAD] } } }));
+    const healed = await heal({ env: { CLAUDE_CONFIG_DIR: "" } });
+    expect(healed.filter((h) => h.clientId === "claude-code").map((h) => h.path)).toEqual([p]);
+  });
+});
+
+describe("healStaleBrokerEntries -- a client whose one scope is SEVERAL files", () => {
+  // Cline fans one (client, scope) out to a shared file plus one copy per
+  // editor its extension has run in, and install writes ALL of them. The
+  // sweep used to take `[0]` -- the shared file -- and never looked at the
+  // editor copies, so a dead entry in one of them was never repaired.
+  //
+  // `os` is passed explicitly so the editor root is a known path under the
+  // fake home on every runner (target-cline.ts resolves it per OS).
+  const CLINE_ENTRY = { mcpServers: { mcp: { command: OAM_BIN, args: ["run", "--no-check", DEAD] } } };
+
+  function seedClineFiles(): { shared: string; vscode: string } {
+    const shared = join(home, ".cline", "data", "settings", "cline_mcp_settings.json");
+    const storage = join(home, ".config", "Code", "User", "globalStorage", "saoudrizwan.claude-dev");
+    const vscode = join(storage, "settings", "cline_mcp_settings.json");
+    mkdirSync(dirname(shared), { recursive: true });
+    mkdirSync(dirname(vscode), { recursive: true });
+    writeFileSync(shared, JSON.stringify(CLINE_ENTRY, null, 2));
+    writeFileSync(vscode, JSON.stringify(CLINE_ENTRY, null, 2));
+    return { shared, vscode };
+  }
+
+  it("heals the shared file AND each editor copy this machine has", async () => {
+    const { shared, vscode } = seedClineFiles();
+    const healed = await heal({ os: "linux" });
+    const cline = healed.filter((h) => h.clientId === "cline");
+    expect(cline.map((h) => h.path).sort()).toEqual([shared, vscode].sort());
+    expect(readFileSync(shared, "utf8")).not.toContain("2.1.2");
+    expect(readFileSync(vscode, "utf8")).not.toContain("2.1.2");
+  });
+
+  it("reads an editor copy only where the editor's storage directory exists", async () => {
+    // selectSites is install's own filter, and the sweep applies the same
+    // one: a copy whose editor has never run Cline is not a slot here. The
+    // shared file is unconditional.
+    const shared = join(home, ".cline", "data", "settings", "cline_mcp_settings.json");
+    mkdirSync(dirname(shared), { recursive: true });
+    writeFileSync(shared, JSON.stringify(CLINE_ENTRY, null, 2));
+    const healed = await heal({ os: "linux" });
+    expect(healed.filter((h) => h.clientId === "cline").map((h) => h.path)).toEqual([shared]);
+  });
+
+  it("reports a malformed editor copy separately, and still heals the shared file", async () => {
+    const { shared, vscode } = seedClineFiles();
+    // A copy the sweep cannot read INTO is named as such rather than folded
+    // into "nothing stale here": the user may be sitting on a dead entry in
+    // it. One bad copy must not stop the shared file being repaired.
+    writeFileSync(vscode, '{ "mcpServers": { "mcp": \n');
+    const r = await healResult({ os: "linux" });
+    expect(r.healed.filter((h) => h.clientId === "cline").map((h) => h.path)).toEqual([shared]);
+    const bad = r.unhealable.filter((u) => u.clientId === "cline");
+    expect(bad.map((u) => u.path)).toEqual([vscode]);
+    expect(bad[0].reason).toBe("malformed");
   });
 });
