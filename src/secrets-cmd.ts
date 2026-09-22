@@ -666,13 +666,14 @@ function schemaBehindNotice(io: SecretsIo, vault: VaultFile, path: string, json:
 
 /** Read the passphrase. Env var wins; falls back to a stdin prompt
  *  that disables terminal echo via raw mode. Returns null when no
- *  passphrase can be obtained (non-TTY + no env), or CANCELLED when the
- *  user hit ^C at the prompt. */
+ *  passphrase can be obtained (non-TTY + no env), CANCELLED when the
+ *  user hit ^C at the prompt, or NO_ECHO when the terminal would not turn
+ *  echo off (nothing was read). */
 async function resolvePassphrase(
   opts: SecretsCommandOptions,
   io: SecretsIo,
   confirm = false,
-): Promise<string | null | Cancelled> {
+): Promise<string | null | Cancelled | NoEcho> {
   if (opts.passphrase !== undefined) return opts.passphrase.length > 0 ? opts.passphrase : null;
   const fromEnv = process.env.YAW_MCP_VAULT_PASSPHRASE;
   // An empty env var ("") is treated the same as absent -- deriving a key
@@ -693,13 +694,13 @@ async function resolvePassphrase(
   if (confirm) {
     for (let attempt = 0; attempt < MAX_PASSPHRASE_PROMPTS; attempt++) {
       const first = await readLineFromTTY(stdin as NodeJS.ReadStream, stdout, "Vault passphrase: ");
-      if (first === CANCELLED) return CANCELLED;
+      if (first === CANCELLED || first === NO_ECHO) return first;
       if (first.length === 0) {
         stdout.write("Passphrase cannot be empty.\n");
         continue;
       }
       const second = await readLineFromTTY(stdin as NodeJS.ReadStream, stdout, "Confirm passphrase: ");
-      if (second === CANCELLED) return CANCELLED;
+      if (second === CANCELLED || second === NO_ECHO) return second;
       if (first === second) {
         // This is the ONE prompt where a human picks the vault's passphrase
         // for good -- warn here or the weak choice is never mentioned.
@@ -715,7 +716,7 @@ async function resolvePassphrase(
   // to a few times, then give up so we never spin forever on a closed pipe.
   for (let attempt = 0; attempt < MAX_PASSPHRASE_PROMPTS; attempt++) {
     const entered = await readLineFromTTY(stdin as NodeJS.ReadStream, stdout);
-    if (entered === CANCELLED) return CANCELLED;
+    if (entered === CANCELLED || entered === NO_ECHO) return entered;
     if (entered.length > 0) {
       // Unlocking an EXISTING vault. unlock() has NOT run yet, so this string
       // is just what was typed -- it may be a typo that is about to be rejected.
@@ -742,9 +743,13 @@ async function resolvePassphrase(
  *    2. YAW_MCP_VAULT_PASSPHRASE_NEW env var
  *    3. TTY confirm-twice prompt (must match; non-empty)
  *  Returns null when none can be obtained (non-TTY + no env) or the two
- *  TTY entries disagree after the allowed prompts, and CANCELLED when the
- *  user hit ^C at either prompt. */
-async function resolveNewPassphrase(opts: SecretsCommandOptions, io: SecretsIo): Promise<string | null | Cancelled> {
+ *  TTY entries disagree after the allowed prompts, CANCELLED when the
+ *  user hit ^C at either prompt, and NO_ECHO when the terminal would not
+ *  turn echo off. */
+async function resolveNewPassphrase(
+  opts: SecretsCommandOptions,
+  io: SecretsIo,
+): Promise<string | null | Cancelled | NoEcho> {
   if (opts.newPassphrase !== undefined) return opts.newPassphrase.length > 0 ? opts.newPassphrase : null;
   const fromEnv = process.env.YAW_MCP_VAULT_PASSPHRASE_NEW;
   if (typeof fromEnv === "string" && fromEnv.length > 0) {
@@ -756,13 +761,13 @@ async function resolveNewPassphrase(opts: SecretsCommandOptions, io: SecretsIo):
   if (!isInteractiveTTY(opts)) return null;
   for (let attempt = 0; attempt < MAX_PASSPHRASE_PROMPTS; attempt++) {
     const first = await readLineFromTTY(stdin as NodeJS.ReadStream, stdout, "New vault passphrase: ");
-    if (first === CANCELLED) return CANCELLED;
+    if (first === CANCELLED || first === NO_ECHO) return first;
     if (first.length === 0) {
       stdout.write("Passphrase cannot be empty.\n");
       continue;
     }
     const second = await readLineFromTTY(stdin as NodeJS.ReadStream, stdout, "Confirm new passphrase: ");
-    if (second === CANCELLED) return CANCELLED;
+    if (second === CANCELLED || second === NO_ECHO) return second;
     if (first === second) {
       warnIfShortPassphrase(io, first, "the new passphrase");
       return first;
@@ -789,27 +794,71 @@ const CTRL_D = "\x04"; // EOT -- cancel this entry (caller re-prompts)
 const DEL = "\x7f"; // what most terminals send for Backspace
 const ESC = "\x1b"; // opens a key sequence (arrow, Alt chord) -- never input
 
+/** Returned by the no-echo reads when the terminal could not be switched to
+ *  raw mode. Raw mode is what turns echo OFF: without it the read would be
+ *  line-buffered by the terminal, which ECHOES every character -- the secret
+ *  on screen, in plain text, for anyone walking by. So the no-echo prompts
+ *  refuse instead (see noEchoRefusal). Distinct from CANCELLED (the user
+ *  did nothing) and from null (no prompt was possible at all). */
+const NO_ECHO: unique symbol = Symbol("yaw-mcp:no-echo-unavailable");
+type NoEcho = typeof NO_ECHO;
+
+/** The refusal for NO_ECHO, worded like promptUnavailableMessage: what was
+ *  required, why the prompt would not run, and the non-interactive way in. */
+function noEchoRefusal(required: string, remedy: string): string {
+  return `${required} Refusing to prompt: this terminal would not turn echo off, so what you type would be shown on screen. ${remedy}`;
+}
+
 /** Raw-mode line reader for the controlling TTY. Shared by the passphrase
  *  prompts (echo OFF -- the default), the destructive-action confirmation
  *  (echo ON, so the user can see the y/n they typed), and -- via
  *  readAnswerFromTTY below -- `yaw-mcp trust`'s approval prompt. One reader
  *  means ^C / ^D / Backspace / a stray ESC behave identically at every
- *  prompt in the product. */
+ *  prompt in the product.
+ *
+ *  A no-echo read that cannot enter raw mode resolves NO_ECHO without
+ *  writing the prompt or reading a byte. An echo read carries on
+ *  line-buffered: its answer was going to be shown anyway. */
+function readLineFromTTY(
+  stdin: NodeJS.ReadStream,
+  stdout: NodeJS.WritableStream,
+  prompt: string,
+  echo: true,
+): Promise<string | Cancelled>;
+function readLineFromTTY(
+  stdin: NodeJS.ReadStream,
+  stdout: NodeJS.WritableStream,
+  prompt?: string,
+  echo?: false,
+): Promise<string | Cancelled | NoEcho>;
 function readLineFromTTY(
   stdin: NodeJS.ReadStream,
   stdout: NodeJS.WritableStream,
   prompt = "Vault passphrase: ",
   echo = false,
-): Promise<string | Cancelled> {
-  stdout.write(prompt);
-  return new Promise<string | Cancelled>((resolve) => {
+): Promise<string | Cancelled | NoEcho> {
+  return new Promise<string | Cancelled | NoEcho>((resolve) => {
     const chunks: string[] = [];
     const wasRaw = stdin.isRaw === true;
+    // Raw mode BEFORE the prompt is written, so a refused no-echo read leaves
+    // no dangling "Vault passphrase: " on the line. A stream with no
+    // setRawMode at all is treated as a failure on the no-echo path too:
+    // every no-echo caller reads only when stdin.isTTY is true, and a TTY
+    // that cannot be put in raw mode echoes.
+    let raw = false;
     try {
-      stdin.setRawMode?.(true);
+      if (typeof stdin.setRawMode === "function") {
+        stdin.setRawMode(true);
+        raw = true;
+      }
     } catch {
-      // not a TTY, fall through to line-buffered read
+      // Raw mode refused; handled just below.
     }
+    if (!raw && !echo) {
+      resolve(NO_ECHO);
+      return;
+    }
+    stdout.write(prompt);
     stdin.resume();
     stdin.setEncoding("utf8");
     // Single teardown path: detach the listener, restore the previous raw
@@ -962,7 +1011,7 @@ type PromptImpossible = typeof PROMPT_IMPOSSIBLE;
 async function readStdinValue(
   io?: SecretsCommandOptions["io"],
   forceRaw?: boolean,
-): Promise<string | Cancelled | PromptImpossible> {
+): Promise<string | Cancelled | PromptImpossible | NoEcho> {
   const stdin = io?.stdin ?? process.stdin;
   const stdout = io?.stdout ?? process.stdout;
   const stdinIsTTY = (stdin as { isTTY?: boolean }).isTTY === true;
@@ -1148,6 +1197,12 @@ export async function runSecrets(
 
   const passphrase = await resolvePassphrase(opts, io, creatingVault);
   if (passphrase === CANCELLED) return cancelledResult(io, opts.json);
+  if (passphrase === NO_ECHO) {
+    const msg = noEchoRefusal("Passphrase required.", "Set YAW_MCP_VAULT_PASSPHRASE instead.");
+    if (opts.json) io.err(`${JSON.stringify({ ok: false, error: msg })}\n`);
+    else io.err(`yaw-mcp secrets: ${msg}\n`);
+    return { exitCode: 1 };
+  }
   if (passphrase === null) {
     const msg = promptUnavailableMessage(opts, "Passphrase required.", "YAW_MCP_VAULT_PASSPHRASE");
     if (opts.json) io.err(`${JSON.stringify({ ok: false, error: msg })}\n`);
@@ -1173,6 +1228,12 @@ export async function runSecrets(
     else {
       const entered = await readStdinValue(opts.io, opts.fromStdin);
       if (entered === CANCELLED) return cancelledResult(io, opts.json);
+      if (entered === NO_ECHO) {
+        const msg = noEchoRefusal("Secret value required.", "Pipe the value in with --stdin instead.");
+        if (opts.json) io.err(`${JSON.stringify({ ok: false, error: msg })}\n`);
+        else io.err(`yaw-mcp secrets set: ${msg}\n`);
+        return { exitCode: 1 };
+      }
       if (entered === PROMPT_IMPOSSIBLE) {
         const msg =
           "cannot prompt for the value: stdin is a TTY but stdout is not, so the prompt would be written into the redirect instead of shown. Pass --value <v>, or pipe the value in with --stdin.";
@@ -1317,6 +1378,12 @@ async function runSecretsRotate(opts: SecretsCommandOptions, io: SecretsIo): Pro
 
   const currentPassphrase = await resolvePassphrase(opts, io);
   if (currentPassphrase === CANCELLED) return cancelledResult(io, opts.json);
+  if (currentPassphrase === NO_ECHO) {
+    const msg = noEchoRefusal("Current passphrase required.", "Set YAW_MCP_VAULT_PASSPHRASE instead.");
+    if (opts.json) io.err(`${JSON.stringify({ ok: false, error: msg })}\n`);
+    else io.err(`yaw-mcp secrets rotate: ${msg}\n`);
+    return { exitCode: 1 };
+  }
   if (currentPassphrase === null) {
     const msg = promptUnavailableMessage(opts, "Current passphrase required.", "YAW_MCP_VAULT_PASSPHRASE");
     if (opts.json) io.err(`${JSON.stringify({ ok: false, error: msg })}\n`);
@@ -1336,6 +1403,12 @@ async function runSecretsRotate(opts: SecretsCommandOptions, io: SecretsIo): Pro
 
   const newPassphrase = await resolveNewPassphrase(opts, io);
   if (newPassphrase === CANCELLED) return cancelledResult(io, opts.json);
+  if (newPassphrase === NO_ECHO) {
+    const msg = noEchoRefusal("New passphrase required.", "Set YAW_MCP_VAULT_PASSPHRASE_NEW instead.");
+    if (opts.json) io.err(`${JSON.stringify({ ok: false, error: msg })}\n`);
+    else io.err(`yaw-mcp secrets rotate: ${msg}\n`);
+    return { exitCode: 1 };
+  }
   if (newPassphrase === null) {
     const msg = promptUnavailableMessage(
       opts,
