@@ -26,9 +26,12 @@ import { cacheDir } from "./paths.js";
 /**
  * The uv release this bootstrap downloads.
  *
- * POLICY: this tracks the LATEST uv release (same policy as MIN_OAM_VERSION in
- * oam-spawn.ts -- bump it with every uv release we notice, not only when a
- * release happens to fix something this code hit). The install dir is keyed by
+ * POLICY: this tracks the LATEST uv release -- bump it with every uv release
+ * we notice, not only when a release happens to fix something this code hit.
+ * (MIN_OAM_VERSION in oam-spawn.ts used to share this policy and no longer
+ * does: it moves only to a release `npm run verify:oam-floor` passed on. uv
+ * has no such check, and a stale uv pin costs more than a stale oam floor --
+ * see below -- so tracking latest is still right here.) The install dir is keyed by
  * this constant, so a stale pin does not merely download an old build once --
  * it keeps every user on that build indefinitely, because the cached binary
  * short-circuits the download forever. There is no auto-upgrade hook; a human

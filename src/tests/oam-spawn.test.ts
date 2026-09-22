@@ -2282,23 +2282,22 @@ describe("MIN_OAM_VERSION freshness floor", () => {
   const FLOOR = "0.16.3";
 
   it(`is at least ${FLOOR} (bump this literal when you bump the floor)`, () => {
-    // POLICY (see the constant's doc): the floor tracks the LATEST oam
-    // release, bumped with every release. This literal-floor pin mirrors
-    // the UV_VERSION freshness test in uv-bootstrap.test.ts: every other
-    // MIN_OAM_VERSION assertion derives its fixture FROM the constant, so
-    // without this a stale floor was invisible to the suite. That makes this
-    // the ONE deliberate exception to the derive-from-constant rule: a floor
-    // derived from the constant would assert the constant against itself.
-    // The contract is ONE-directional: the constant can never drop below
-    // this literal (a revert fails here); raising the constant without the
-    // literal passes and merely leaves this pin weak, so bump BOTH together.
-    // Catching a NEW upstream release is release.sh's job, not this suite's:
-    // its pre-flight reads the latest oam release from GitHub, and on a release
-    // not yet tagged or on npm, the block ahead of step 1 moves the constant AND
-    // this literal to it before the gates run (a tagged or published release,
-    // or ALLOW_STALE_OAM_FLOOR=1 when GitHub is unreadable, leaves both where
-    // they are). The suite itself stays off the network (see the doctor-cmd
-    // stance on network in tests).
+    // POLICY (see the constant's doc): the floor is the last oam release the
+    // hosting check was verified on, and only `npm run verify:oam-floor --
+    // --raise` moves it. This literal-floor pin mirrors the UV_VERSION
+    // freshness test in uv-bootstrap.test.ts: every other MIN_OAM_VERSION
+    // assertion derives its fixture FROM the constant, so without this a
+    // reverted floor was invisible to the suite. That makes this the ONE
+    // deliberate exception to the derive-from-constant rule: a floor derived
+    // from the constant would assert the constant against itself. The
+    // contract is ONE-directional: the constant can never drop below this
+    // literal (a revert fails here); raising the constant without the literal
+    // passes and merely leaves this pin weak, which is why the raise rewrites
+    // both in one go (and refuses to run when either line is not exactly
+    // where it expects it). Nothing here or in release.sh watches oam's
+    // release feed any more: a new oam release is a reason to RUN the
+    // verifier, not evidence on its own. The suite itself stays off the
+    // network (see the doctor-cmd stance on network in tests).
     expect(compareVersions(MIN_OAM_VERSION, FLOOR)).toBeGreaterThanOrEqual(0);
   });
 });

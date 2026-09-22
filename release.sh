@@ -2,10 +2,11 @@
 # =============================================================================
 # Release Script -- Bump, tag, publish to npm + MCP registry.
 #
-# Single-machine flow: move the oam floor to the latest oam release when it
-# is behind, lint + typecheck + tests, bump package.json +
-# server.json in lockstep, commit + tag + push, publish to npm via
-# ~/.npmrc, publish server.json to the MCP registry via mcp-publisher.
+# Single-machine flow: lint + typecheck + tests + the oam floor check (npm run
+# verify:oam-floor, which hosts a stdio SDK server on this machine's oam and
+# never moves the floor), bump package.json + server.json in lockstep, commit +
+# tag + push, publish to npm via ~/.npmrc, publish server.json to the MCP
+# registry via mcp-publisher.
 # No GitHub release creation, no per-platform build orchestration, no
 # SEA binaries. Install story is `npm install -g @yawlabs/mcp` (or
 # `npx -y @yawlabs/mcp`) -- see docs/v0.70.3-binary-track-decision.md
@@ -64,31 +65,37 @@
 #                                    ordering guard for that run. Implied on a
 #                                    resume, where the version was already
 #                                    chosen by the earlier run.
-#   ALLOW_STALE_OAM_FLOOR=1          Proceed when the latest oam release
-#                                    cannot be read from GitHub, releasing on
-#                                    the current MIN_OAM_VERSION unchecked.
-#                                    Implied once v<version> is tagged or on
-#                                    npm: the floor is not moved then, so an
-#                                    unreadable GitHub only warns.
+#   SKIP_OAM_FLOOR_VERIFY=1          DISABLES THE OAM FLOOR GATE -- step 1's
+#                                    `npm run verify:oam-floor`, which hosts a
+#                                    stdio @modelcontextprotocol/sdk server on
+#                                    this machine's oam through `oam run` and
+#                                    fails when oam is absent, cannot host it,
+#                                    or is below MIN_OAM_VERSION. A last resort
+#                                    for a release that has to go out from a
+#                                    machine without a working oam: the floor
+#                                    then ships re-verified by nobody. The gate
+#                                    never moves the floor either way -- only
+#                                    `npm run verify:oam-floor -- --raise`, run
+#                                    by hand and committed like any change,
+#                                    does that (see scripts/verify-oam-floor.mjs
+#                                    for why release.sh stopped moving it).
 #   GITHUB_TOKEN=<pat>               GitHub token for the step-5 MCP-registry
 #                                    login (needs publish rights on
 #                                    io.github.YawLabs/*). Step 5 reads it only
 #                                    when the persisted registry JWT is
-#                                    missing/expired. The pre-flight's read of
-#                                    the latest oam release also sends it (on
-#                                    curl's stdin, not its command line), and
-#                                    retries that read once without it if the
-#                                    authenticated read fails.
+#                                    missing/expired.
 #   MCP_REGISTRY_TOKEN=<pat>         second-choice spelling of the same token;
 #                                    read only when GITHUB_TOKEN is unset. If
 #                                    neither is set, `gh auth token` is tried.
 #
-# Required tools on PATH: node, npm, git, curl, tar, sha256sum (or shasum).
+# Required tools on PATH: node, npm, git, curl, tar, sha256sum (or shasum),
+# and oam (or OAM_BIN naming it) for step 1's oam floor gate -- the gate
+# installs nothing and fails by name when it is missing; SKIP_OAM_FLOOR_VERIFY=1
+# above is the way past it.
 # Optional but load-bearing in practice: gh -- the step-5 registry-auth
 # fallback, used whenever GITHUB_TOKEN and MCP_REGISTRY_TOKEN are unset, which
 # is every release on this workstation, since the persisted registry JWT's
-# 300-second TTL never survives steps 1-4. The same fallback supplies the token
-# for the pre-flight's read of the latest oam release.
+# 300-second TTL never survives steps 1-4.
 # The first run also needs `mcp-publisher` (downloaded to a temp dir on
 # demand, sha256-verified against the registry's per-release
 # `registry_<ver>_checksums.txt`) and a one-time `mcp-publisher login
@@ -329,7 +336,7 @@ command -v git  >/dev/null || fail "git not installed"
 # AFTER the tag push and the irreversible npm publish, so discovering one
 # missing there strands the release at the registry step. sha256 accepts
 # either binary -- macOS ships shasum, not sha256sum.
-command -v curl >/dev/null || fail "curl not installed (needed for the oam floor check and for step 5, the MCP registry publish)"
+command -v curl >/dev/null || fail "curl not installed (needed for step 5, the MCP registry publish)"
 command -v tar  >/dev/null || fail "tar not installed (needed for step 5, the MCP registry publish)"
 { command -v sha256sum >/dev/null || command -v shasum >/dev/null; } \
   || fail "sha256sum/shasum not installed (needed for step 5, the MCP registry publish)"
@@ -437,9 +444,8 @@ current_branch() { git rev-parse --abbrev-ref HEAD; }
 # TTL (measured 2026-09-06: iat 14:35:51Z, exp 14:40:51Z), and no release gets
 # through steps 1-4 inside five minutes, so the "reuse the persisted token"
 # branch in step 5 is dead in practice and THIS is the load-bearing credential
-# on every run. Kept as a helper so the pre-flight probe, the read of the latest
-# oam release (latest_oam_release) and the step-5 call site resolve it
-# identically and cannot drift.
+# on every run. Kept as a helper so the pre-flight probe and the step-5 call
+# site resolve it identically and cannot drift.
 #
 # stdout must carry ONLY the token: every caller captures it in a command
 # substitution, so any info()/warn() belongs at the call site, never in here.
@@ -500,314 +506,6 @@ registry_has_version() {
 write_server_version() {
   node -e "const fs=require('fs'); const j=JSON.parse(fs.readFileSync('server.json','utf-8')); j.version=process.argv[1]; if(j.packages&&j.packages[0]) j.packages[0].version=process.argv[1]; fs.writeFileSync('server.json', JSON.stringify(j, null, 2) + '\n');" "$1"
 }
-
-# >>> oam floor helpers
-# The oam floor. POLICY (the MIN_OAM_VERSION doc in src/oam-spawn.ts): it
-# tracks the LATEST oam release and moves with every one, with no judgement
-# about whether a given release "needs" the move. Moving it used to be a manual
-# step, so nothing stopped a release from shipping on a stale floor. The
-# pre-flight below reads the latest oam release, and unless v<version> is
-# already tagged or on npm, the block ahead of step 1 moves the floor to it.
-#
-# Three things move together, or the ratchet test and the changelog drift from
-# the constant: the constant, the one `const FLOOR = "X.Y.Z";` literal in
-# src/tests/oam-spawn.test.ts that pins it from below, and a block in the
-# changelog section this release ships under.
-OAM_FLOOR_SRC="src/oam-spawn.ts"
-OAM_FLOOR_TEST="src/tests/oam-spawn.test.ts"
-OAM_RELEASES_API="https://api.github.com/repos/YawLabs/oam/releases/latest"
-
-# stdout: the X.Y.Z of the ONE `export const MIN_OAM_VERSION = "X.Y.Z";` line.
-# Returns non-zero, saying why on stderr, when there is not exactly one.
-current_oam_floor() {
-  node -e '
-    const src = require("fs").readFileSync(process.argv[1], "utf8");
-    const hits = [...src.matchAll(/^export const MIN_OAM_VERSION = "(\d+\.\d+\.\d+)";\r?$/gm)];
-    if (hits.length !== 1) {
-      console.error(process.argv[1] + ": expected exactly one MIN_OAM_VERSION line, found " + hits.length);
-      process.exit(1);
-    }
-    process.stdout.write(hits[0][1]);
-  ' "$OAM_FLOOR_SRC"
-}
-
-# stdout: "X.Y.Z YYYY-MM-DD" -- the latest oam release and the day it was
-# published. GitHub's /releases/latest already leaves out drafts and
-# prereleases; both are rejected here too, so a change on GitHub's side cannot
-# hand the floor a prerelease. Any failure prints nothing on stdout and returns
-# 1, and the pre-flight decides what that means. WHY it failed goes to stderr,
-# which the pre-flight's $(...) does not capture, so it reaches the terminal:
-# curl's own -S line for a request that failed (offline, a 403 or 429 rate
-# limit), or one line from the parser for a body it rejects. Discarding that
-# line left the pre-flight naming three possible causes with no way to tell
-# which one it was.
-#
-# Authenticated when mcp_registry_gh_token resolves a token: GitHub allows 60
-# unauthenticated reads an hour per IP, and a token lifts that to 5000
-# (measured 2026-09-13), so a rate limit no longer means waiting out the hour.
-# The token reaches curl as a config file on stdin (-K -), never on its command
-# line, where the process list can show it. A token GitHub refuses (a bad Bearer
-# token gets 401 even on this public repo, measured) must not turn a read that
-# works unauthenticated into a hard stop, so a failed authenticated read is
-# retried once without the token. Returns 1 when the parser rejects the body,
-# whichever read fetched it (a rejected body is not retried: the read itself
-# worked), when the read fails and there is no token, or when the authenticated
-# read and the retry without the token both fail.
-latest_oam_release() {
-  local body="" t
-  t=$(mcp_registry_gh_token)
-  if [ -n "$t" ] && body=$(printf 'header = "Authorization: Bearer %s"\n' "$t" \
-    | curl -fsSL --max-time 20 -K - -H 'Accept: application/vnd.github+json' "$OAM_RELEASES_API"); then
-    :
-  else
-    if [ -n "$t" ]; then
-      echo "  The authenticated read of ${OAM_RELEASES_API} failed (see above) -- retrying once without the token" >&2
-    fi
-    body=$(curl -fsSL --max-time 20 -H 'Accept: application/vnd.github+json' "$OAM_RELEASES_API") || return 1
-  fi
-  printf %s "$body" | node -e '
-    let s = "";
-    process.stdin.on("data", (d) => { s += d; });
-    process.stdin.on("end", () => {
-      const reject = (why) => {
-        console.error("latest_oam_release: " + why);
-        process.exit(1);
-      };
-      let j = null;
-      try {
-        j = JSON.parse(s);
-      } catch {
-        reject("the response from GitHub is not JSON");
-      }
-      if (j === null || typeof j !== "object") reject("the response from GitHub is not a JSON object");
-      const tag = /^v?(\d+\.\d+\.\d+)$/.exec(typeof j.tag_name === "string" ? j.tag_name : "");
-      if (!tag) reject("its tag_name " + JSON.stringify(j.tag_name) + " is not X.Y.Z or vX.Y.Z");
-      if (j.draft) reject("v" + tag[1] + " is marked as a draft");
-      if (j.prerelease) reject("v" + tag[1] + " is marked as a prerelease");
-      const day = /^\d{4}-\d{2}-\d{2}/.exec(typeof j.published_at === "string" ? j.published_at : "");
-      if (!day) reject("v" + tag[1] + " has no published_at date");
-      process.stdout.write(tag[1] + " " + day[0]);
-    });
-  '
-}
-
-# stdout: -1, 0 or 1 as X.Y.Z $1 is below, equal to or above X.Y.Z $2,
-# comparing each part as a number (0.10.0 is above 0.9.9).
-semver_cmp() {
-  node -e '
-    const a = process.argv[1].split(".").map(Number);
-    const b = process.argv[2].split(".").map(Number);
-    for (let i = 0; i < 3; i++) {
-      if (a[i] !== b[i]) {
-        process.stdout.write(a[i] < b[i] ? "-1" : "1");
-        process.exit(0);
-      }
-    }
-    process.stdout.write("0");
-  ' "$1" "$2"
-}
-
-# Returns 0 when HEAD is ahead of $1 (a commit HEAD descends from) ONLY by
-# commits the oam floor move below makes: the subject "fix(oam): move the floor
-# to X.Y.Z", touching exactly CHANGELOG.md and the two floor files. One or more
-# of them, so an oam release landing between two failed runs still qualifies.
-# Any commit ahead with another subject or another set of paths returns 1 (a
-# merge lists no paths here, so it cannot match), as does nothing ahead at all.
-# The origin/main sync guard uses it to let a re-run carry on over the floor
-# commit an earlier failed run left on local main. That guard's diverged stop
-# and the pre-flight's floor-ahead stop use it to decide when a bare
-# git reset --keep origin/main would drop nothing but floor commits.
-oam_floor_commits_only() {
-  local base="$1" c subj paths n=0
-  local subj_re='^fix\(oam\): move the floor to [0-9]+\.[0-9]+\.[0-9]+$'
-  local want="CHANGELOG.md ${OAM_FLOOR_SRC} ${OAM_FLOOR_TEST} "
-  for c in $(git rev-list "${base}..HEAD" 2>/dev/null); do
-    n=$((n + 1))
-    subj=$(git log -1 --format=%s "$c")
-    [[ "$subj" =~ $subj_re ]] || return 1
-    paths=$(git diff-tree --no-commit-id --name-only -r "$c" | LC_ALL=C sort | tr '\n' ' ')
-    [ "$paths" = "$want" ] || return 1
-  done
-  [ "$n" -ge 1 ]
-}
-
-# Move the floor in all three places, or with --check, only prove all three can
-# be moved. ONE script for both modes, so the pre-flight cannot pass a shape the
-# write then trips over. --write validates every target before writing any of
-# them, so a target that does not validate leaves all three files untouched.
-# --check also prints, on stdout, the changelog block the write would put in
-# place. The block is rendered by one function for that output and for both
-# ways the write places it (appended, or replacing an earlier block), so the
-# text the behaviour-change gate is shown and the text the move writes come
-# from the same template. --write prints nothing on stdout.
-#   $1 --check|--write  $2 source  $3 ratchet test  $4 changelog
-#   $5 new floor  $6 old floor  $7 day the new release was published  $8 VERSION
-oam_floor_rewrite() {
-  node -e '
-    const fs = require("fs");
-    const [mode, srcPath, testPath, logPath, next, prev, day, version] = process.argv.slice(1);
-    const problems = [];
-    const read = (p) => {
-      try {
-        return fs.readFileSync(p, "utf8");
-      } catch (e) {
-        problems.push(p + ": " + e.message);
-        return null;
-      }
-    };
-    // Exactly one line matching `re` (flags gm, version in group 1), with that
-    // version swapped for the new floor. Nothing else on the line changes.
-    const moveOne = (p, text, re, what) => {
-      if (text === null) return null;
-      const hits = text.match(re) || [];
-      if (hits.length !== 1) {
-        problems.push(p + ": expected exactly one " + what + " line, found " + hits.length);
-        return null;
-      }
-      return text.replace(re, (line, v) => line.replace("\"" + v + "\"", "\"" + next + "\""));
-    };
-    const src = moveOne(srcPath, read(srcPath), /^export const MIN_OAM_VERSION = "(\d+\.\d+\.\d+)";\r?$/gm, "MIN_OAM_VERSION");
-    const test = moveOne(testPath, read(testPath), /^[ \t]*const FLOOR = "(\d+\.\d+\.\d+)";\r?$/gm, "const FLOOR");
-
-    // The block goes at the END of the first ## section, which has to be the
-    // section this release ships under: ## Unreleased, or ## <VERSION> when the
-    // heading was already renamed. Any other first section is a changelog this
-    // script does not understand, and guessing would file the move under a
-    // release that already shipped.
-    //
-    // A floor block already in that section may be one a release SHIPPED:
-    // this repo has tagged releases with the first section still headed
-    // ## Unreleased (v1.0.0 and v1.0.1 both were). So git decides. A block
-    // has shipped when its heading line is in the CHANGELOG.md of the most
-    // recent v* tag reachable from HEAD. A shipped block is never rewritten.
-    // When every floor block in the section has shipped, the new block is
-    // added at the end of the section, naming the floor on disk as the one
-    // before. ONE block that has not shipped -- the shape an earlier run of
-    // this release leaves when it moves the floor, fails before its tag, and
-    // oam releases again before the re-run -- is rewritten in place rather
-    // than joined by a second one, and keeps the floor it names as the one
-    // before. Two that have not shipped is not a shape this script leaves, so
-    // it stops rather than guess which one is true. Matching on the heading
-    // errs one way only: a new block whose heading an older release also used
-    // reads as shipped, and is added to rather than rewritten. Git is asked
-    // only when the section holds a floor block, and when it cannot answer,
-    // the run stops. Blocks under any other section are never looked at.
-    //
-    // A ## line or a block heading inside a ``` or ~~~ code fence is not a
-    // real one, so the scan skips fenced lines. A fence closes only on a line
-    // of the same character at least as long as the one that opened it. A
-    // fence that never closes stops the run wherever it opened: if it opened
-    // in the first section, every heading after it would read as fenced, and
-    // the block would land under the oldest release in the file.
-    const BLOCK_HEAD = "**Changed -- the oam floor moves to ";
-    const render = (was) => [
-      BLOCK_HEAD + next + "**",
-      "",
-      "`MIN_OAM_VERSION` tracks the latest oam release as policy, and v" + next + " is now current (published " + day + "); the floor was " + was + ". A machine whose oam is older hosts its node/npx sidecars on node instead, and logs a warning naming both versions, `oam self-update` as the fix, and that yaw-mcp needs a restart afterwards. `release.sh` moved the floor and wrote this block; it did not re-run the oam hosting check that `src/oam-spawn.ts` describes.",
-    ];
-    // The heading lines a release already shipped, as { tag, lines } where
-    // tag is null when no v* tag is reachable from HEAD. null, with a problem
-    // pushed, when git cannot answer.
-    const shippedLines = () => {
-      const git = (args) => {
-        const r = require("child_process").spawnSync("git", args, { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
-        if (r.status === 0) return r.stdout;
-        const why = r.error ? r.error.message : (r.stderr || "").trim() || "exit " + r.status;
-        problems.push(logPath + ": cannot tell whether its oam floor block already shipped: git " + args.join(" ") + " failed: " + why);
-        return null;
-      };
-      const tags = git(["tag", "--list", "v*", "--merged", "HEAD"]);
-      if (tags === null) return null;
-      if (tags.trim() === "") return { tag: null, lines: new Set() };
-      const described = git(["describe", "--tags", "--abbrev=0", "--match", "v*", "HEAD"]);
-      if (described === null) return null;
-      const tag = described.trim();
-      const shipped = git(["show", tag + ":./" + logPath]);
-      if (shipped === null) return null;
-      return { tag, lines: new Set(shipped.split(/\r?\n/)) };
-    };
-    let block = null;
-    let log = read(logPath);
-    if (log !== null) {
-      const eol = log.includes("\r\n") ? "\r\n" : "\n";
-      const lines = log.split(/\r?\n/);
-      const heads = [];
-      const blocks = [];
-      let fence = null;
-      lines.forEach((l, i) => {
-        const m = /^ {0,3}(`{3,}|~{3,})/.exec(l);
-        if (fence !== null) {
-          if (m && m[1][0] === fence[0] && m[1].length >= fence.length && l.trim() === m[1]) fence = null;
-          return;
-        }
-        if (m) {
-          fence = m[1];
-          return;
-        }
-        if (l.startsWith("## ")) heads.push(i);
-        if (l.startsWith(BLOCK_HEAD)) blocks.push(i);
-      });
-      const first = heads.length > 0 ? heads[0] : -1;
-      const heading = first === -1 ? "" : lines[first];
-      const ours = /^## [Uu]nreleased\b/.test(heading) || heading === "## " + version || heading.startsWith("## " + version + " ");
-      if (fence !== null) {
-        problems.push(logPath + ": a code fence opened with " + fence + " never closes, so no heading after it can be trusted as a section boundary; close the fence");
-        log = null;
-      } else if (!ours) {
-        problems.push(logPath + ": its first ## section is " + JSON.stringify(heading || "(none)") + ", not ## Unreleased or ## " + version + ", so there is no section to record the floor move in");
-        log = null;
-      } else {
-        let end = heads.find((i) => i > first);
-        if (end === undefined) end = lines.length;
-        const inSection = blocks.filter((i) => i > first && i < end);
-        const shipped = inSection.length > 0 ? shippedLines() : { tag: null, lines: new Set() };
-        const mine = shipped === null ? [] : inSection.filter((i) => !shipped.lines.has(lines[i]));
-        if (shipped === null) {
-          log = null;
-        } else if (mine.length > 1) {
-          const unshipped = shipped.tag === null ? "no v* tag reachable from HEAD has shipped" : "the CHANGELOG.md of " + shipped.tag + " does not hold";
-          problems.push(logPath + ": " + mine.length + " oam floor blocks in " + JSON.stringify(heading) + " that " + unshipped + "; merge them by hand");
-          log = null;
-        } else if (mine.length === 1) {
-          const h = mine[0];
-          const was = h + 2 < end && lines[h + 1].trim() === "" ? /the floor was (\d+\.\d+\.\d+)\./.exec(lines[h + 2]) : null;
-          if (!was) {
-            problems.push(logPath + ": the oam floor block on line " + (h + 1) + " is not the shape this script writes (a blank line, then a paragraph naming the floor was X.Y.Z.), so it cannot be updated in place; move the floor by hand");
-            log = null;
-          } else {
-            block = render(was[1]);
-            lines.splice(h, 3, ...block);
-            log = lines.join(eol);
-          }
-        } else {
-          block = render(prev);
-          let at = end;
-          while (at > first + 1 && lines[at - 1].trim() === "") at--;
-          lines.splice(at, end - at, "", ...block, "");
-          log = lines.join(eol);
-        }
-      }
-    }
-
-    if (problems.length > 0) {
-      for (const p of problems) console.error(p);
-      process.exit(1);
-    }
-    if (mode === "--write") {
-      fs.writeFileSync(srcPath, src);
-      fs.writeFileSync(testPath, test);
-      fs.writeFileSync(logPath, log);
-    } else if (mode === "--check") {
-      process.stdout.write(block.join("\n") + "\n");
-    } else {
-      console.error("oam_floor_rewrite: mode must be --check or --write, got " + JSON.stringify(mode));
-      process.exit(1);
-    }
-  ' -- "$@"
-  # `--` is load-bearing: without it node reads a leading --check as its OWN
-  # `node --check` flag and refuses to run the script at all.
-}
-# <<< oam floor helpers
 
 # ---------- Main path: full release -------------------------------------------
 # 5 steps. The build is just `npm run build` (tsup -> dist/index.js); npm
@@ -929,21 +627,12 @@ else
   REMOTE_HEAD=$(git rev-parse origin/main 2>/dev/null || echo "")
 fi
 if [ -n "$REMOTE_HEAD" ] && [ "$LOCAL_HEAD" != "$REMOTE_HEAD" ]; then
-  # The subjects of the commits local main has and origin/main lacks. One with
-  # the oam floor move's subject is, in the ordinary case, the floor commit an
-  # earlier failed run left (see below), whose gates may never have passed, so
-  # no stop here advises pushing it, and when main has diverged, pulling cannot
-  # fast-forward over it. Its undo is git reset --keep origin/main, after which
-  # the re-run's pre-flight moves the floor again if it is still behind. That
-  # reset also DISCARDS every other commit origin/main lacks, so a stop that
-  # names it while other commits are present lists them and says how to keep
-  # them.
-  LOCAL_ONLY_SUBJECTS=$(git log --format=%s "${REMOTE_HEAD}..HEAD" 2>/dev/null || echo "")
-  LOCAL_ONLY_FLOOR=false
-  if [[ $'\n'"$LOCAL_ONLY_SUBJECTS" == *$'\n''fix(oam): move the floor to '* ]]; then
-    LOCAL_ONLY_FLOOR=true
-  fi
-  KEEP_MINE="To keep your own commits: git branch keep-mine HEAD, then git reset --keep origin/main, then cherry-pick your own commits back from keep-mine (leaving out every floor commit) and land them on origin/main before re-running ./release.sh ${VERSION}, which moves the floor again if it is still behind. A bare git reset --keep origin/main DISCARDS every commit listed."
+  # Nothing this script commits ahead of step 3 any more: until 1.0.11 the oam
+  # floor move committed before step 1, and a failed gate left that commit on
+  # local main for the re-run to carry over, which needed a whole branch of
+  # exceptions here. The floor now moves only by hand (npm run
+  # verify:oam-floor -- --raise), landed like any other change, so every
+  # commit local main has and origin/main lacks is the operator's own.
   if [ "$RESUMING" = true ]; then
     info "Local HEAD differs from origin/main (resuming after a prior push) -- proceeding"
   elif git merge-base --is-ancestor "$REMOTE_HEAD" "$LOCAL_HEAD" 2>/dev/null; then
@@ -951,38 +640,8 @@ if [ -n "$REMOTE_HEAD" ] && [ "$LOCAL_HEAD" != "$REMOTE_HEAD" ]; then
     # to pull. Telling the operator to `git pull --ff-only` here is the wrong
     # instruction (it is a no-op) and hides the real state -- unpushed commits
     # that steps 3-5 would publish from a tree the remote has never seen.
-    #
-    # One shape of "ahead" is this script's own doing. The oam floor move
-    # commits ahead of step 1, so a run that fails after it and before step 3's
-    # bump commit leaves that commit on local main with package.json unbumped,
-    # and the re-run -- fresh, not a resume -- lands here. Refusing it broke the
-    # header's re-run-with-the-same-version promise, and advising a push would
-    # put a commit whose gates just failed on protected main. So when
-    # every commit ahead is a floor commit (oam_floor_commits_only), carry on:
-    # step 1's gates run over it, and step 3's push carries it with the bump.
-    if oam_floor_commits_only "$REMOTE_HEAD"; then
-      warn "Local main is ahead of origin/main only by release.sh's own oam floor commit(s) from an earlier failed run -- continuing; the gates re-run over it and step 3 pushes it with the bump"
-    elif [ "$LOCAL_ONLY_FLOOR" = true ]; then
-      # A floor commit among OTHER unpushed commits is still refused, and the
-      # stop does not advise a push: it would carry a floor commit whose gates
-      # may never have passed. It names the undo and what the undo discards.
-      fail "Local main is AHEAD of origin/main, and its unpushed commits include release.sh's oam floor commit from an earlier failed run, whose gates may not have passed -- do not push them as they are. Unpushed commits, newest first: ${LOCAL_ONLY_SUBJECTS//$'\n'/; }. ${KEEP_MINE}"
-    else
-      fail "Local main is AHEAD of origin/main (unpushed commits). Push them first: git push origin main"
-    fi
+    fail "Local main is AHEAD of origin/main (unpushed commits). Push them first: git push origin main"
   else
-    # Behind or diverged. Local main still carrying a floor commit means it has
-    # diverged (a branch that is only behind has no commits of its own) -- for
-    # instance, the fix for the failed gate landed on origin/main through a PR.
-    # git pull --ff-only cannot fast-forward over that, so its advice would
-    # fail. The reset is named bare only when floor commits
-    # (oam_floor_commits_only) are all local main has since the merge base.
-    LOCAL_BASE=$(git merge-base "$REMOTE_HEAD" "$LOCAL_HEAD" 2>/dev/null || echo "")
-    if [ "$LOCAL_ONLY_FLOOR" = true ] && [ -n "$LOCAL_BASE" ] && oam_floor_commits_only "$LOCAL_BASE"; then
-      fail "Local main has diverged from origin/main, and the only commits origin/main lacks are release.sh's own oam floor commit(s) from an earlier failed run. git pull --ff-only cannot fast-forward over them: git reset --keep origin/main and re-run ./release.sh ${VERSION}, which moves the floor again if it is still behind."
-    elif [ "$LOCAL_ONLY_FLOOR" = true ]; then
-      fail "Local main has diverged from origin/main, and the commits origin/main lacks include release.sh's oam floor commit from an earlier failed run, whose gates may not have passed -- git pull --ff-only cannot fast-forward over them, and they should not be pushed as they are. Commits origin/main lacks, newest first: ${LOCAL_ONLY_SUBJECTS//$'\n'/; }. ${KEEP_MINE}"
-    fi
     fail "Local main is not at origin/main (behind or diverged). Pull first: git pull --ff-only origin main"
   fi
 fi
@@ -1091,104 +750,10 @@ if [ "$RESUMING" != true ] && git rev-parse -q --verify "refs/tags/v${VERSION}" 
   fail "Tag v${VERSION} already exists (at ${EXISTING_TAG_COMMIT:0:9}) -- refusing to reuse an existing release number on a new commit. Pick an unused version, or delete the stale tag if it is wrong."
 fi
 
-# >>> oam floor pre-flight
-# --- Guard: the oam floor is the latest oam release (see the oam floor helpers
-# above). Read-only: it only decides, and the block ahead of step 1 does the
-# move. It runs HERE, before the confirm prompt, so the prompt can say the floor
-# is about to move, and so a changelog or source shape the move cannot handle
-# stops the run before any file is written.
-#
-# A release that can still move the floor fails CLOSED when GitHub cannot be
-# read. The floor policy has no exceptions, and this is the only point in the
-# release that checks it, so an unreadable API silently waving the release
-# through would ship the stale floor the policy exists to prevent.
-# ALLOW_STALE_OAM_FLOOR=1 is the deliberate way past it.
-#
-# Whether the floor can still move is OAM_FLOOR_LOCKED: the tag v${VERSION}
-# exists, or ${VERSION} is already on npm. It is NOT RESUMING, which only means
-# package.json already reads VERSION. A hand-run `npm version`, a bump committed
-# to main ahead of the release (648fa15 did exactly that for 0.77.0), and a run
-# that died in step 3 before tagging all look like a resume while nothing
-# irreversible has happened, and keying on RESUMING shipped each of them on a
-# stale floor with only a warning. Once the tag or the npm version exists, a
-# move is wrong: with the tag at the bump commit and the version unpublished,
-# the floor commit would sit between the tag and HEAD, which step 3 refuses;
-# with the version published, step 4 packs nothing, so the move would never
-# reach npm. The collision guard above already refuses an existing tag on a
-# fresh run, so the tag half only decides anything on a resume.
-#
-# So on a locked release nothing GitHub reports stops the run: an unreadable
-# API, a floor behind the latest oam release, and a floor ahead of it are all
-# warnings. Reading MIN_OAM_VERSION out of the source still fails on a locked
-# release, as does a comparison that errors: the first needs that line
-# reshaped, and the second needs node itself to fail, since both sides are
-# X.Y.Z by then.
-OAM_FLOOR_TARGET=""
-OAM_FLOOR_DATE=""
-# The changelog block the move will write, as --check rendered it. The
-# behaviour-change gate below reads it, because the block is not on disk until
-# the move runs, after that gate.
-OAM_FLOOR_BLOCK=""
-OAM_FLOOR_LOCKED=false
-if git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null 2>&1 || [ "${ALREADY_PUBLISHED:-}" = "$VERSION" ]; then
-  OAM_FLOOR_LOCKED=true
-fi
-OAM_FLOOR_NOW=$(current_oam_floor) || fail "Could not read the oam floor out of ${OAM_FLOOR_SRC} (see above) -- expected exactly one line of the form: export const MIN_OAM_VERSION = \"X.Y.Z\";"
-OAM_LATEST_READ=$(latest_oam_release || echo "")
-if [ -z "$OAM_LATEST_READ" ]; then
-  if [ "$OAM_FLOOR_LOCKED" = true ] || [ "${ALLOW_STALE_OAM_FLOOR:-}" = "1" ]; then
-    warn "Could not read the latest oam release from GitHub (see above) -- the oam floor stays at ${OAM_FLOOR_NOW}, UNCHECKED, for this run"
-  else
-    fail "Could not read the latest oam release from ${OAM_RELEASES_API} (the curl or parser error above says why), so the oam floor (${OAM_FLOOR_NOW}) cannot be checked against it. Retry; for a 403 or 429 rate limit, give the read a token first (export GITHUB_TOKEN, or \`gh auth login\`). Or set ALLOW_STALE_OAM_FLOOR=1 to release on the current floor deliberately."
-  fi
-else
-  OAM_LATEST="${OAM_LATEST_READ%% *}"
-  OAM_LATEST_DAY="${OAM_LATEST_READ#* }"
-  OAM_FLOOR_CMP=$(semver_cmp "$OAM_FLOOR_NOW" "$OAM_LATEST" || echo "")
-  case "$OAM_FLOOR_CMP" in
-    0)
-      info "oam floor ${OAM_FLOOR_NOW} is the latest oam release"
-      ;;
-    -1)
-      if [ "$OAM_FLOOR_LOCKED" = true ]; then
-        warn "oam ${OAM_LATEST} is out and the oam floor is still ${OAM_FLOOR_NOW} -- v${VERSION} is already tagged or on npm, so this run does not move it. The next release moves it."
-      else
-        OAM_FLOOR_BLOCK=$(oam_floor_rewrite --check "$OAM_FLOOR_SRC" "$OAM_FLOOR_TEST" CHANGELOG.md "$OAM_LATEST" "$OAM_FLOOR_NOW" "$OAM_LATEST_DAY" "$VERSION") \
-          || fail "oam ${OAM_LATEST} is out and the oam floor is ${OAM_FLOOR_NOW}, but this script cannot move it (see above). Fix what is named there, or move the floor by hand, then re-run."
-        OAM_FLOOR_TARGET="$OAM_LATEST"
-        OAM_FLOOR_DATE="$OAM_LATEST_DAY"
-        info "oam floor ${OAM_FLOOR_NOW} is behind oam ${OAM_LATEST} (published ${OAM_LATEST_DAY}) -- it moves before step 1"
-      fi
-      ;;
-    1)
-      if [ "$OAM_FLOOR_LOCKED" = true ]; then
-        warn "The oam floor ${OAM_FLOOR_NOW} is AHEAD of the latest oam release ${OAM_LATEST} -- v${VERSION} is already tagged or on npm, so this run does not change it. Before the next release, lower MIN_OAM_VERSION in ${OAM_FLOOR_SRC} and the const FLOOR literal in ${OAM_FLOOR_TEST}, or, if a lower release took GitHub's latest marker, re-mark v${OAM_FLOOR_NOW} as latest on YawLabs/oam."
-      elif [ -n "${REMOTE_HEAD:-}" ] && oam_floor_commits_only "$REMOTE_HEAD"; then
-        # The sync guard carried on because local main is ahead only by the
-        # floor commit(s) an earlier failed run left, so one of them may be
-        # what put the floor ahead (oam released, the run failed, and the
-        # release was pulled or lost GitHub's latest marker before the re-run).
-        # Lowering by hand, committing and pushing -- the advice below -- would
-        # push those commits too, and their gates may never have passed.
-        fail "The oam floor ${OAM_FLOOR_NOW} is AHEAD of the latest oam release ${OAM_LATEST}, and local main is ahead of origin/main only by release.sh's own unpushed oam floor commit(s) from an earlier failed run, which may be what moved it there. Do not push them. If a lower release took GitHub's latest marker by mistake, re-mark v${OAM_FLOOR_NOW}: gh release edit v${OAM_FLOOR_NOW} --repo YawLabs/oam --latest, then re-run. Otherwise drop the floor commit(s): git reset --keep origin/main (only those commits are ahead, so no other commit is lost) and re-run ./release.sh ${VERSION}, whose pre-flight then compares the floor origin/main holds with ${OAM_LATEST} instead."
-      else
-        fail "The oam floor ${OAM_FLOOR_NOW} is AHEAD of the latest oam release ${OAM_LATEST}, and oam's installer and self-update install that same latest release -- so a fresh or updated oam would count as too old and its sidecars would fall back to node. Either the floor was mistyped, oam ${OAM_FLOOR_NOW} was pulled, or a lower release took GitHub's latest marker (a backport, or ${OAM_FLOOR_NOW} published with make_latest=false). In that last case re-mark it rather than lowering the floor: gh release edit v${OAM_FLOOR_NOW} --repo YawLabs/oam --latest, then re-run. Otherwise lower MIN_OAM_VERSION in ${OAM_FLOOR_SRC} AND the const FLOOR literal in ${OAM_FLOOR_TEST} to ${OAM_LATEST} (the ratchet test fails if only the constant drops), add a note to CHANGELOG.md's Unreleased section saying the floor was lowered, then commit, push and re-run."
-      fi
-      ;;
-    *)
-      fail "Could not compare the oam floor ${OAM_FLOOR_NOW} with the latest oam release ${OAM_LATEST}"
-      ;;
-  esac
-fi
-# <<< oam floor pre-flight
-
 if [ "$SKIP_CONFIRM" != "true" ] && [ "$RESUMING" != "true" ]; then
   echo ""
   echo -e "${YELLOW}About to release v${VERSION}. This will:${NC}"
-  if [ -n "$OAM_FLOOR_TARGET" ]; then
-    echo "  0. Move the oam floor ${OAM_FLOOR_NOW} -> ${OAM_FLOOR_TARGET} (MIN_OAM_VERSION, its test ratchet, a CHANGELOG block) and commit it"
-  fi
-  echo "  1. Run lint + typecheck + tests"
+  echo "  1. Run lint + typecheck + tests, and verify the oam floor on this machine's oam"
   echo "  2. Build the bundled CLI (npm run build)"
   echo "  3. Bump version in package.json + server.json, commit, tag, push"
   echo "  4. Publish to npm (using ~/.npmrc automation token)"
@@ -1221,13 +786,11 @@ if [ "$SKIP_CONFIRM" != "true" ] && [ "$RESUMING" != "true" ]; then
   # so -y / SKIP_CONFIRM=1 skips it exactly like the confirm below.
   echo -e "${YELLOW}Does v${VERSION} change behaviour for an EXISTING user who opts into nothing?${NC}"
   echo "  A new default, a new ceiling, a changed threshold, a newly-enforced rule."
-  # A floor move IS a changed threshold, so a truthful answer to the question
-  # above is yes whenever one is planned. Say so, and say that its way back is
-  # already covered, or the operator either answers no or is aborted for not
-  # having documented what the script is about to document.
-  if [ -n "$OAM_FLOOR_TARGET" ]; then
-    echo "  This release also moves the oam floor ${OAM_FLOOR_NOW} -> ${OAM_FLOOR_TARGET}: a machine whose oam is older hosts its node/npx sidecars on node. That counts as a changed threshold; its way back (oam self-update) is in the CHANGELOG block the move writes, so naming it here is accepted."
-  fi
+  # A floor move (MIN_OAM_VERSION raised by `npm run verify:oam-floor --
+  # --raise` since the last release) IS a changed threshold, so a truthful
+  # answer is yes when one is in this release. Its way back is `oam
+  # self-update`, which the CHANGELOG block the raise writes already names, so
+  # answering with that passes the check below.
   # A WHOLE LINE, not `read -n 1`. The sibling confirm below reads one
   # character safely because nothing reads after it; this one is followed by a
   # second prompt, and `-n 1` on an answer of "yes" leaves "es" in the buffer
@@ -1249,13 +812,6 @@ if [ "$SKIP_CONFIRM" != "true" ] && [ "$RESUMING" != "true" ]; then
     # satisfied by a name mentioned three releases ago, which is exactly the
     # case where the operator most needs to be stopped.
     UNRELEASED_BODY=$(awk '/^## [Uu]nreleased/ { inside = 1; next } inside && /^## / { exit } inside { print }' CHANGELOG.md 2>/dev/null || true)
-    # The floor move writes its CHANGELOG block AFTER this gate (the move block
-    # ahead of step 1), so the file on disk does not have it yet. Add the block
-    # the pre-flight's --check rendered, from the same template the move writes
-    # with.
-    if [ -n "$OAM_FLOOR_TARGET" ]; then
-      UNRELEASED_BODY="${UNRELEASED_BODY}"$'\n'"${OAM_FLOOR_BLOCK}"
-    fi
     # `-e` so a flag-shaped switch is a PATTERN, not an option. Without it
     # `grep -qF "--no-cap"` exits 2 with "unknown option", and the message
     # below then told the operator the name was absent from a file that
@@ -1283,58 +839,33 @@ if [ "$SKIP_CONFIRM" != "true" ] && [ "$RESUMING" != "true" ]; then
   fi
 fi
 
-# >>> oam floor move
-# The move the pre-flight planned, committed on its own AHEAD of step 1 so that
-# lint, typecheck and the full suite run over the new floor. Step 3's push then
-# carries this commit along with the version bump.
-#
-# The prompts sit between the pre-flight and here, so the three files are
-# checked again before anything is written. Uncommitted changes in any of them
-# stop the run: `git commit -- <paths>` commits each path's whole working-tree
-# state, so a half-written edit would ride inside the floor commit, and the
-# nothing-to-move branch would leave an uncommitted floor edit that the build
-# packs and the tag does not contain. That check comes BEFORE the re-read so it
-# covers that branch too.
-#
-# The floor is then re-read rather than trusted from the pre-flight, per the
-# re-read-at-every-step-boundary rule, and it must still be BELOW the target: a
-# floor that moved ahead of it since the pre-flight would otherwise be silently
-# lowered, which the pre-flight refuses. `git commit -- <paths>` commits exactly
-# the three files, whatever else the index holds.
-if [ -n "$OAM_FLOOR_TARGET" ]; then
-  echo -e "\n${CYAN}=== Move the oam floor to ${OAM_FLOOR_TARGET} (ahead of step 1, so its gates run over it) ===${NC}"
-  OAM_FLOOR_DIRT=$(git status --porcelain -- "$OAM_FLOOR_SRC" "$OAM_FLOOR_TEST" CHANGELOG.md)
-  if [ -n "$OAM_FLOOR_DIRT" ]; then
-    printf '%s\n' "$OAM_FLOOR_DIRT" >&2
-    fail "Uncommitted changes appeared in the oam floor files since the pre-flight (listed above) -- the floor commit would carry them. Commit or drop them, then re-run ./release.sh ${VERSION}."
-  fi
-  OAM_FLOOR_NOW=$(current_oam_floor) || fail "Could not re-read the oam floor out of ${OAM_FLOOR_SRC} (see above)"
-  OAM_FLOOR_RECMP=$(semver_cmp "$OAM_FLOOR_NOW" "$OAM_FLOOR_TARGET" || echo "")
-  if [ "$OAM_FLOOR_RECMP" = "0" ]; then
-    info "oam floor already at ${OAM_FLOOR_TARGET} -- nothing to move"
-  elif [ "$OAM_FLOOR_RECMP" != "-1" ]; then
-    fail "The oam floor now reads ${OAM_FLOOR_NOW}, not below ${OAM_FLOOR_TARGET} as the pre-flight planned -- it changed during the run (or the comparison itself failed, see above). Re-run ./release.sh ${VERSION}."
-  else
-    oam_floor_rewrite --write "$OAM_FLOOR_SRC" "$OAM_FLOOR_TEST" CHANGELOG.md "$OAM_FLOOR_TARGET" "$OAM_FLOOR_NOW" "$OAM_FLOOR_DATE" "$VERSION" \
-      || fail "Could not move the oam floor to ${OAM_FLOOR_TARGET} (see above)"
-    OAM_FLOOR_WRITTEN=$(current_oam_floor) || fail "Could not re-read the oam floor out of ${OAM_FLOOR_SRC} after moving it (see above)"
-    [ "$OAM_FLOOR_WRITTEN" = "$OAM_FLOOR_TARGET" ] \
-      || fail "MIN_OAM_VERSION reads ${OAM_FLOOR_WRITTEN} after the move, not ${OAM_FLOOR_TARGET} -- refusing to commit"
-    # Hook-free with MSYS_NO_PATHCONV=1, like step 3's bump (see there for why
-    # the pin is load-bearing), so a local hook cannot rewrite or reject it.
-    # Unlike the bump, step 1 has not run yet: its gates run over this commit
-    # next, on a tree the pre-flight's dirty-tree guards have already checked.
-    MSYS_NO_PATHCONV=1 git -c core.hooksPath=/dev/null commit -m "fix(oam): move the floor to ${OAM_FLOOR_TARGET}" -- "$OAM_FLOOR_SRC" "$OAM_FLOOR_TEST" CHANGELOG.md
-    info "oam floor ${OAM_FLOOR_NOW} -> ${OAM_FLOOR_TARGET}, committed"
-    warn "Not re-run by this script: the oam hosting check src/oam-spawn.ts describes for each floor move."
-    warn "If a later step fails before step 3's push, this commit stays on local main. Re-running ./release.sh ${VERSION} carries on over it, provided nothing else is committed on top and origin/main has not moved; otherwise the re-run stops at the origin/main sync guard, which names git reset --keep origin/main and anything that reset would discard."
-  fi
-fi
-# <<< oam floor move
-
-step 1 "Lint + typecheck + tests"
+step 1 "Lint + typecheck + tests + oam floor"
 run_npm_check "Lint" lint 'Found [0-9]+ error' 'Checked [0-9]+ files'  # done_re is inert -- run_npm_check's lint-crash guard hard-fails every 139/134 before the ARM64 tolerance block that would read it; kept so narrowing that guard re-arms it.
 run_npm_check "Type check" typecheck 'error TS[0-9]' '' 'npx tsc --noEmit'
+# >>> oam floor gate
+# scripts/verify-oam-floor.mjs hosts a stdio @modelcontextprotocol/sdk server
+# on THIS machine's oam through `oam run`, completes initialize + tools/list +
+# tools/call, and fails when oam is absent, cannot host it, or is below
+# MIN_OAM_VERSION. It reads nothing from GitHub and moves nothing: the floor is
+# the last release that check passed on, and only `npm run verify:oam-floor --
+# --raise`, run by hand and committed like any other change, raises it. Until
+# 1.0.11 this script moved the floor to GitHub's latest oam release in a commit
+# of its own without running the check -- three moves in five days, each
+# costing every machine that had not run `oam self-update` its oam hosting
+# for nothing.
+#
+# The script prints exactly one `[verify:oam-floor] OK` or `FAIL` line, so
+# fail_re and done_re anchor on those the way the test gate anchors on
+# vitest's summary. A node_modules without the SDK lands in run_npm_check's
+# toolchain message. SKIP_OAM_FLOOR_VERIFY=1 is the documented last resort
+# (see the header) and it is checked here rather than inside run_npm_check,
+# whose SKIP_LINT branch keys on the script name.
+if [ "${SKIP_OAM_FLOOR_VERIFY:-}" = "1" ]; then
+  warn "SKIP_OAM_FLOOR_VERIFY=1 -- skipping 'oam floor' (MIN_OAM_VERSION in src/oam-spawn.ts ships re-verified by nobody; the last resort for a machine without a working oam)"
+else
+  run_npm_check "oam floor" verify:oam-floor '^\[verify:oam-floor\] FAIL' '^\[verify:oam-floor\] OK'
+fi
+# <<< oam floor gate
 # Tests go through the same wrapper as lint/typecheck: `npm test` is an
 # npm-run script on the same host that segfaults (139/134) in npm's exit
 # cleanup AFTER the tool has printed its report, so a bare `npm test || fail`
@@ -1351,7 +882,7 @@ run_npm_check "Type check" typecheck 'error TS[0-9]' '' 'npx tsc --noEmit'
 # rows; what keeps a test that echoes captured output from false-matching it
 # is the trailing `[0-9]+ error` shape, not the spacing.
 run_npm_check "Tests" test 'Test Files +[0-9]+ failed|Tests +[0-9]+ failed|Errors +[0-9]+ error' 'Test Files +[0-9]+ passed'
-info "Lint + typecheck + tests passed"
+info "Lint + typecheck + tests + oam floor passed"
 
 step 2 "Build"
 # This build is deliberately belt-and-braces: package.json's `prepublishOnly`
