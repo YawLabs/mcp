@@ -559,12 +559,17 @@ describe("readLineFromTTY -- a terminal that will not turn echo off", () => {
     (stdout.write as unknown as ReturnType<typeof vi.fn>).mockReset();
     lock();
     delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    // Two rotate tests below reach the NEW-passphrase prompt; a leaked
+    // YAW_MCP_VAULT_PASSPHRASE_NEW would take the env path and never reach
+    // the refused prompt.
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE_NEW;
     home = makeHome();
     await mkdir(nodePath.join(home, ".yaw-mcp"), { recursive: true });
   });
 
   afterEach(() => {
     rmSync(home, { recursive: true, force: true });
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
     lock();
   });
 
@@ -671,6 +676,66 @@ describe("readLineFromTTY -- a terminal that will not turn echo off", () => {
     expect(errText()).toContain("Current passphrase required.");
     expect(errText()).toContain("would not turn echo off");
     expect(stdin.pending).toBe(1);
+  });
+
+  it("refuses rotate's NEW-passphrase prompt when the env supplied the current one -- vault byte-identical", async () => {
+    expect(
+      (await runSecrets({ action: "set", name: "first", value: "v1", passphrase: "a-long-passphrase", home }, io))
+        .exitCode,
+    ).toBe(0);
+    io.err.mockReset();
+    lock();
+    const before = readFileSync(vaultPath(home), "utf8");
+
+    // The CURRENT passphrase comes from the env, so rotate unlocks the vault
+    // without a prompt and the NEW-passphrase prompt is its first no-echo
+    // read -- the one this terminal refuses.
+    process.env.YAW_MCP_VAULT_PASSPHRASE = "a-long-passphrase";
+    const stdin = new RawRefusingTTYStdin(["new-in-the-clear\n", "new-in-the-clear\n"]);
+    const r = await runSecrets(
+      { action: "rotate", home, io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout } },
+      io,
+    );
+    expect(r.exitCode).toBe(1);
+    expect(errText()).toContain("New passphrase required.");
+    expect(errText()).toContain("would not turn echo off");
+    expect(errText()).toContain("Set YAW_MCP_VAULT_PASSPHRASE_NEW instead.");
+    // The refusal is at the NEW prompt: the current passphrase was taken
+    // from the env, so it was neither prompted for nor refused.
+    expect(errText()).not.toContain("Current passphrase required");
+    expect(written()).not.toContain("Vault passphrase: ");
+    // Nothing was read: stdin was never resumed, both queued entries are
+    // still pending, and the prompt was never even written.
+    expect(stdin.resumes).toBe(0);
+    expect(stdin.pending).toBe(2);
+    expect(written()).not.toContain("New vault passphrase: ");
+    // Unlocked, then refused before any re-key: not one byte changed.
+    expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
+  });
+
+  it("refuses rotate's NEW-passphrase prompt the same way under --json, as one parseable envelope", async () => {
+    expect(
+      (await runSecrets({ action: "set", name: "first", value: "v1", passphrase: "a-long-passphrase", home }, io))
+        .exitCode,
+    ).toBe(0);
+    io.err.mockReset();
+    lock();
+    const before = readFileSync(vaultPath(home), "utf8");
+
+    process.env.YAW_MCP_VAULT_PASSPHRASE = "a-long-passphrase";
+    const stdin = new RawRefusingTTYStdin(["new-in-the-clear\n"]);
+    const r = await runSecrets(
+      { action: "rotate", json: true, home, io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout } },
+      io,
+    );
+    expect(r.exitCode).toBe(1);
+    const envelope = JSON.parse(errText().trim());
+    expect(envelope.ok).toBe(false);
+    expect(envelope.error).toContain("New passphrase required.");
+    expect(envelope.error).toContain("would not turn echo off");
+    expect(envelope.error).toContain("YAW_MCP_VAULT_PASSPHRASE_NEW");
+    expect(stdin.pending).toBe(1);
+    expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
   });
 
   it("still reads a y/N confirmation line-buffered -- that answer is meant to be seen", async () => {

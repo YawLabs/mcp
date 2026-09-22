@@ -1,8 +1,16 @@
+import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { EventEmitter } from "node:events";
+import { existsSync } from "node:fs";
 import { request } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   browserCommand,
   describeTtl,
+  type LauncherSpawn,
+  openInSystemBrowser,
   openSecretEntryPage,
   type SecretEntryOutcome,
   type SecretEntryPage,
@@ -135,6 +143,31 @@ describe("secret entry page: accepts and rejects", () => {
     expect(res.body).toContain("Received for the test.");
     expect(res.body).not.toContain("correct horse");
     await expect(page.result).resolves.toEqual({ kind: "submitted", values: { passphrase: "correct horse" } });
+  });
+
+  it("decodes a browser's form encoding back to the exact value typed", async () => {
+    const reserved = "p+w&d=100% off";
+    const unicode = "café ünïcode 🔑";
+    const cases: Array<{ body: string; expected: string }> = [
+      // encodeURIComponent: every reserved byte escaped, a space as %20.
+      { body: `passphrase=${encodeURIComponent(reserved)}`, expected: reserved },
+      { body: `passphrase=${encodeURIComponent(unicode)}`, expected: unicode },
+      // URLSearchParams serialises the way a browser form does: a space as
+      // `+`, a typed `+` as %2B, non-ASCII as its UTF-8 bytes.
+      { body: new URLSearchParams({ passphrase: reserved }).toString(), expected: reserved },
+      { body: new URLSearchParams({ passphrase: unicode }).toString(), expected: unicode },
+      // A bare `+` on the wire is a space, which is what a browser form sends.
+      { body: "passphrase=correct+horse", expected: "correct horse" },
+    ];
+    for (const { body, expected } of cases) {
+      // What crosses the socket is the encoded form, not the value.
+      expect(body, body).not.toContain(expected);
+      const page = await open();
+      const { port, path, origin } = parts(page);
+      const res = await raw({ port, path, method: "POST", headers: { ...FORM, Origin: origin }, body });
+      expect(res.status, body).toBe(200);
+      await expect(page.result, body).resolves.toEqual({ kind: "submitted", values: { passphrase: expected } });
+    }
   });
 
   it("refuses a wrong token and stays open for the right one", async () => {
@@ -362,5 +395,91 @@ describe("browserCommand", () => {
     // terminal to draw on.
     expect(browserCommand(url, "linux", {})).toBeNull();
     expect(browserCommand(url, "freebsd", {})).toBeNull();
+  });
+});
+
+describe("openInSystemBrowser", () => {
+  const url = "http://127.0.0.1:1234/0123456789abcdef";
+
+  /** Run `fn` with `overrides` set in process.env, then put every touched
+   *  key back the way it was (a key that was unset is deleted again). */
+  async function withEnv<T>(overrides: Record<string, string>, fn: () => Promise<T>): Promise<T> {
+    const before = new Map(Object.keys(overrides).map((k) => [k, process.env[k]]));
+    Object.assign(process.env, overrides);
+    try {
+      return await fn();
+    } finally {
+      for (const [k, v] of before) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  }
+
+  // browserCommand reads process.env, and on Linux answers null when there is
+  // no graphical session -- then nothing is spawned at all. Keep DISPLAY set
+  // while these run so the spawn seam is reached on a headless Linux box too;
+  // browserCommand does not read DISPLAY on win32 or darwin.
+  const graphical = { DISPLAY: process.env.DISPLAY ?? ":0" };
+
+  /** A child that reports "started" and is not a process. */
+  class LauncherStub extends EventEmitter {
+    unref(): void {}
+  }
+
+  it("resolves false, without throwing or writing to stdout, when the launcher cannot start", async () => {
+    const stdout = vi.spyOn(process.stdout, "write");
+    const stderr = vi.spyOn(process.stderr, "write");
+    // A launcher that does not exist: spawn reports ENOENT through the
+    // child's "error" event, the same path a missing system launcher takes.
+    const missing = join(tmpdir(), `yaw-mcp-test-${randomUUID()}`, "launcher");
+    expect(existsSync(missing)).toBe(false);
+    const spawnMissing: LauncherSpawn = (_command, args, options) => spawn(missing, args, options);
+    await withEnv(graphical, async () => {
+      // `resolves` fails on a rejection, and a synchronous throw fails the
+      // test outright: nothing escapes either way.
+      await expect(openInSystemBrowser(url, spawnMissing)).resolves.toBe(false);
+    });
+    // stdout is the broker's JSON-RPC channel.
+    expect(stdout).not.toHaveBeenCalled();
+    // The failure is logged with the command, never with the URL and its token.
+    const logged = stderr.mock.calls.map((c) => String(c[0])).join("");
+    expect(logged).not.toContain(url);
+  });
+
+  it("hands the launcher an env without yaw-mcp's own secrets", async () => {
+    const calls: Array<{ command: string; args: readonly string[]; env: NodeJS.ProcessEnv | undefined }> = [];
+    const spawnCapturing: LauncherSpawn = (command, args, options) => {
+      calls.push({ command, args, env: options.env });
+      const child = new LauncherStub();
+      process.nextTick(() => child.emit("spawn"));
+      return child;
+    };
+    await withEnv(
+      {
+        ...graphical,
+        YAW_MCP_VAULT_PASSPHRASE: "live-passphrase-s3cret",
+        YAW_MCP_VAULT_PASSPHRASE_NEW: "next-passphrase-s3cret",
+        SECRET_ENTRY_PAGE_TEST_UNRELATED: "still-here",
+      },
+      async () => {
+        await expect(openInSystemBrowser(url, spawnCapturing)).resolves.toBe(true);
+      },
+    );
+    expect(calls).toHaveLength(1);
+    const { args, env } = calls[0];
+    expect(args).toContain(url);
+    // An env was passed at all: with `env` left undefined, spawn hands the
+    // child this process's env, secrets included.
+    expect(env).toBeDefined();
+    const passed = env ?? {};
+    // Windows env keys are case-insensitive, so the strip matches
+    // case-insensitively too; check the same way, then check the values.
+    const keys = Object.keys(passed).map((k) => k.toUpperCase());
+    expect(keys).not.toContain("YAW_MCP_VAULT_PASSPHRASE");
+    expect(keys).not.toContain("YAW_MCP_VAULT_PASSPHRASE_NEW");
+    expect(Object.values(passed)).not.toContain("live-passphrase-s3cret");
+    expect(Object.values(passed)).not.toContain("next-passphrase-s3cret");
+    expect(passed.SECRET_ENTRY_PAGE_TEST_UNRELATED).toBe("still-here");
   });
 });

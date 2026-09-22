@@ -50,7 +50,7 @@
 // unref() (probed on oam 0.16.3), so a listener left open keeps the process
 // alive, and a request left unanswered can keep it alive after close().
 
-import { spawn } from "node:child_process";
+import { type SpawnOptions, spawn } from "node:child_process";
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -202,6 +202,20 @@ export function browserCommand(
   return { command: "xdg-open", args: [url] };
 }
 
+/** What openInSystemBrowser needs from the process it starts: the "spawn" or
+ *  "error" event that says whether the launcher started, and unref() to let
+ *  go of it afterwards. node's ChildProcess satisfies it. */
+export interface LauncherChild {
+  once(event: "spawn", listener: () => void): unknown;
+  once(event: "error", listener: (err: Error) => void): unknown;
+  unref(): void;
+}
+
+/** The one spawn overload openInSystemBrowser calls. The `spawn` imported
+ *  above is the default; a test passes a stand-in to watch the failure path
+ *  and the env the launcher receives without a browser being opened. */
+export type LauncherSpawn = (command: string, args: readonly string[], options: SpawnOptions) => LauncherChild;
+
 /** Ask the OS to open `url` in the default browser. True when the launcher
  *  started, false when there is no launcher or it failed to start -- which
  *  is all that can be known: whether a window actually appeared is not
@@ -212,17 +226,21 @@ export function browserCommand(
  *  JSON-RPC channel: a launcher that prints anything would corrupt it. The
  *  env is stripped of yaw-mcp's own secrets like every other child the
  *  broker spawns -- the "invalid passphrase" prompt runs while
- *  YAW_MCP_VAULT_PASSPHRASE is set. */
-export function openInSystemBrowser(url: string): Promise<boolean> {
+ *  YAW_MCP_VAULT_PASSPHRASE is set.
+ *
+ *  `spawnLauncher` is a test seam (see LauncherSpawn). server.ts calls this
+ *  with the URL alone, so the launch there goes through the `spawn` imported
+ *  above. */
+export function openInSystemBrowser(url: string, spawnLauncher: LauncherSpawn = spawn): Promise<boolean> {
   const launch = browserCommand(url);
   if (!launch) {
     log("info", "No graphical session to open the secret entry page in");
     return Promise.resolve(false);
   }
   return new Promise<boolean>((resolve) => {
-    let child: ReturnType<typeof spawn>;
+    let child: LauncherChild;
     try {
-      child = spawn(launch.command, launch.args, {
+      child = spawnLauncher(launch.command, launch.args, {
         stdio: "ignore",
         detached: true,
         windowsHide: true,

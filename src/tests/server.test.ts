@@ -7116,6 +7116,169 @@ describe("vault passphrase elicitation", () => {
     expect(vaultPassphrase()).toBeUndefined();
   });
 
+  /** elicitInput rejects when the SDK's request timeout (60s by default)
+   *  passes with no answer from the client, and when the client refuses the
+   *  request. Both land in the same catch, on a page that was opened BEFORE
+   *  the request went out. One client declaration per call: each caller gets
+   *  a fresh broker from beforeEach, because the ask budget
+   *  (MAX_VAULT_PASSPHRASE_PROMPTS) is per ConnectServer and a second prompt
+   *  on the same one would be the latching ask. */
+  async function promptRequestRejects(caps: Record<string, unknown>) {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    priv.server.getClientCapabilities = () => caps;
+    priv.server.elicitInput = vi.fn().mockRejectedValue(new Error("Request timed out"));
+    const opened = pagesTyping(priv, "never-reached");
+    vi.mocked(connectToUpstream).mockRejectedValue(lockedVaultError("gh"));
+
+    const result = await priv.activateOne("gh");
+
+    expect(result.ok).toBe(false);
+    expect(priv.server.elicitInput).toHaveBeenCalledTimes(1);
+    // The page was listening before the request went out, and nothing else
+    // closes it: left open it listens until its TTL, and under oam (no unref
+    // on http.Server) holds the process open for as long.
+    expect(opened).toHaveLength(1);
+    expect(opened[0].close).toHaveBeenCalled();
+    expect(priv.secretEntryPages.size).toBe(0);
+    // A browser is opened (form mode only) after an accepted consent, and
+    // there was none.
+    expect(priv.openBrowser).not.toHaveBeenCalled();
+    // Counted BEFORE the round-trip: a client failing the request in a loop
+    // would otherwise be re-prompted on every server with vault refs.
+    expect(priv.vaultPassphrasePrompts).toBe(1);
+    expect(vaultPassphrase()).toBeUndefined();
+  }
+
+  it("a vault prompt whose request times out closes the page, opens no browser, and spends one ask (form-only client)", async () => {
+    await promptRequestRejects({ elicitation: {} });
+  });
+
+  it("a vault prompt whose request times out closes the page, opens no browser, and spends one ask (URL-mode client)", async () => {
+    await promptRequestRejects({ elicitation: { url: {} } });
+  });
+
+  it("URL mode: a completion notification the client rejects does not fail the unlock", async () => {
+    // notifications/elicitation/complete is a courtesy the spec lets a
+    // server skip (MAY). It goes out after the page has taken the passphrase
+    // and before that is verified, so a client that errors on it must not
+    // cost the user an entry the page already has in hand.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    priv.server.getClientCapabilities = () => ({ elicitation: { url: {} } });
+    priv.server.elicitInput = accept();
+    const notify = vi.fn().mockRejectedValue(new Error("Method not found"));
+    priv.server.createElicitationCompletionNotifier = vi.fn(() => notify);
+    pagesTyping(priv, "typed-before-the-notification");
+    vi.mocked(connectToUpstream)
+      .mockRejectedValueOnce(lockedVaultError("gh"))
+      .mockImplementationOnce(async (cfg: UpstreamServerConfig) => makeConnection(cfg.namespace, ["t"]));
+
+    const result = await priv.activateOne("gh");
+
+    expect(result.ok).toBe(true);
+    expect(vaultPassphrase()).toBe("typed-before-the-notification");
+    // The notification was sent and rejected: this is the error path, not a
+    // notification that was skipped.
+    expect(notify).toHaveBeenCalledTimes(1);
+  });
+
+  it("URL mode: a completion notifier factory that throws does not fail the unlock", async () => {
+    // The SDK's createElicitationCompletionNotifier can throw synchronously
+    // (it guards on the client's url capability) instead of returning a
+    // notifier whose promise rejects -- and a throw happens before there is
+    // a promise to put a catch on, so the rejection handler alone would not
+    // cover it.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    priv.server.getClientCapabilities = () => ({ elicitation: { url: {} } });
+    priv.server.elicitInput = accept();
+    priv.server.createElicitationCompletionNotifier = vi.fn(() => {
+      throw new Error("Client does not support URL elicitation");
+    });
+    pagesTyping(priv, "typed-before-the-throw");
+    vi.mocked(connectToUpstream)
+      .mockRejectedValueOnce(lockedVaultError("gh"))
+      .mockImplementationOnce(async (cfg: UpstreamServerConfig) => makeConnection(cfg.namespace, ["t"]));
+
+    const result = await priv.activateOne("gh");
+
+    expect(result.ok).toBe(true);
+    expect(vaultPassphrase()).toBe("typed-before-the-throw");
+    expect(priv.server.createElicitationCompletionNotifier).toHaveBeenCalledTimes(1);
+  });
+
+  it("URL mode: an expired page still sends the completion notification for its elicitationId", async () => {
+    // The client opened the link and is showing whatever "waiting" state it
+    // has for it. Expiry ends the out-of-band step just as a submission does,
+    // so the client is told either way -- by the elicitationId the URL
+    // elicitation carried, which is the page's own.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    priv.server.getClientCapabilities = () => ({ elicitation: { form: {}, url: {} } });
+    priv.server.elicitInput = accept();
+    const notify = vi.fn().mockResolvedValue(undefined);
+    priv.server.createElicitationCompletionNotifier = vi.fn(() => notify);
+    const opened = pagesTyping(priv, null);
+    vi.mocked(connectToUpstream).mockRejectedValue(lockedVaultError("gh"));
+
+    const result = await priv.activateOne("gh");
+
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain("expired");
+    const params = vi.mocked(priv.server.elicitInput).mock.calls[0][0] as any;
+    expect(params.elicitationId).toBe(opened[0].page.elicitationId);
+    expect(priv.server.createElicitationCompletionNotifier).toHaveBeenCalledWith(params.elicitationId);
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(priv.openBrowser).not.toHaveBeenCalled();
+    expect(opened[0].close).toHaveBeenCalled();
+    expect(vaultPassphrase()).toBeUndefined();
+  });
+
+  it("URL mode: a page closed by shutdown sends no completion notification", async () => {
+    // shutdown() closes the page under the wait, and the transport is going
+    // with it. "closed" is the one page outcome that skips the notification.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    priv.server.getClientCapabilities = () => ({ elicitation: { form: {}, url: {} } });
+    priv.server.elicitInput = accept();
+    const notify = vi.fn().mockResolvedValue(undefined);
+    priv.server.createElicitationCompletionNotifier = vi.fn(() => notify);
+    priv.openBrowser = vi.fn().mockResolvedValue(true);
+    // A page nobody submits: its result settles only when it is closed.
+    let settle: (o: unknown) => void = () => {};
+    const close = vi.fn(() => settle({ kind: "closed" }));
+    priv.openSecretPage = vi.fn(async () => ({
+      url: `http://127.0.0.1:5555/${"e".repeat(64)}`,
+      elicitationId: "elicit-url-shutdown",
+      result: new Promise((r) => {
+        settle = r;
+      }),
+      close,
+    }));
+    vi.mocked(connectToUpstream).mockRejectedValue(lockedVaultError("gh"));
+
+    // URL mode opens no browser, so the marker the form-mode shutdown test
+    // above waits on never comes. The progress line before the wait on the
+    // page is emitted in the same synchronous run that starts that wait, so
+    // once it has been seen the page is being waited on.
+    const messages: string[] = [];
+    const pending = priv.activateOne("gh", (m: string) => messages.push(m));
+    await until(() => messages.some((m) => m.includes("Waiting for the masked entry page")));
+    expect(priv.secretEntryPages.size).toBe(1);
+
+    await server.shutdown();
+    expect(close).toHaveBeenCalled();
+    const result = await pending;
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain("shutting down");
+    expect(priv.server.createElicitationCompletionNotifier).not.toHaveBeenCalled();
+    expect(notify).not.toHaveBeenCalled();
+    expect(priv.openBrowser).not.toHaveBeenCalled();
+    expect(priv.secretEntryPages.size).toBe(0);
+    expect(vaultPassphrase()).toBeUndefined();
+  });
+
   it("does not burn a retry on a refusal that cannot change in a second", async () => {
     // The vault verdict is reached before any child spawns, from state a 1s
     // sleep cannot alter. Retrying it costs that sleep plus a warn line that
