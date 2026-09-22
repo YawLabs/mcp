@@ -38,9 +38,30 @@ vi.mock("../upstream.js", async (importOriginal) => {
   };
 });
 
+// The masked-entry page and the browser launcher are real side effects: a
+// listener on 127.0.0.1 and a `rundll32 url.dll,FileProtocolHandler` (or
+// `open` / `xdg-open`) that puts a tab up on the developer's desktop. A test
+// that reaches the vault prompt without faking them (the ConnectServer fields
+// openSecretPage / openBrowser) used to do both and then wait on a page nobody
+// would submit. Fail such a test loudly instead. The page's own behaviour is
+// covered over real sockets in secret-entry-page.test.ts.
+vi.mock("../secret-entry-page.js", async (importOriginal) => {
+  const actual = (await importOriginal()) as any;
+  return {
+    ...actual,
+    openSecretEntryPage: vi.fn(async () => {
+      throw new Error("server.test.ts: fake the page (priv.openSecretPage) -- the real one is never opened here");
+    }),
+    openInSystemBrowser: vi.fn(async () => {
+      throw new Error("server.test.ts: fake the browser (priv.openBrowser) -- the real one is never launched here");
+    }),
+  };
+});
+
 import { CONFIG_DIRNAME } from "../paths.js";
 import { isRoutingFaultResult } from "../proxy.js";
 import { capContent } from "../result-cap.js";
+import type { SecretEntryPage, SecretEntryPageOptions } from "../secret-entry-page.js";
 import {
   ConnectServer,
   computeToolOverlaps,
@@ -5873,18 +5894,30 @@ describe("shutdown drains and refuses activations", () => {
     }
   });
 
-  it("refuses an elicitation re-entry that arrives after the latch", async () => {
+  it("refuses a vault prompt answered after the latch, and opens no browser for it", async () => {
     const priv = getPrivate(server);
     priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
     priv.server.getClientCapabilities = () => ({ elicitation: {} });
-    // The user answers the vault prompt AFTER shutdown latched. The modal is
-    // a round-trip of up to 60s, so this is the common shape of a SIGTERM
-    // mid-prompt; the re-entry calls runActivateOne directly and never
-    // passes activateOne's gate, so runActivateOne has to refuse it itself.
+    // The user answers the vault prompt's consent dialog AFTER shutdown
+    // latched. The modal is a round-trip of up to 60s, so this is the common
+    // shape of a SIGTERM mid-prompt. The prompt path calls runActivateOne
+    // directly and never passes activateOne's gate, so the refusal has to
+    // come from inside it: nothing may be spawned, and -- now that a yes
+    // opens the masked-entry page in a browser -- no tab may be launched
+    // onto a page shutdown() has already closed.
     priv.server.elicitInput = vi.fn().mockImplementation(async () => {
       priv.shuttingDown = true;
-      return { action: "accept", content: { YAW_MCP_VAULT_PASSPHRASE: "session-only" } };
+      return { action: "accept" };
     });
+    const close = vi.fn();
+    priv.openSecretPage = vi.fn(async () => ({
+      url: `http://127.0.0.1:5555/${"e".repeat(64)}`,
+      elicitationId: "elicit-latched",
+      // Never settles on its own: a page nobody submits.
+      result: new Promise(() => {}),
+      close,
+    }));
+    priv.openBrowser = vi.fn().mockResolvedValue(true);
     vi.mocked(connectToUpstream).mockRejectedValueOnce(
       new VaultPassphraseRequiredError("vault locked", "gh", ["GITHUB_TOKEN"], "missing"),
     );
@@ -5893,15 +5926,63 @@ describe("shutdown drains and refuses activations", () => {
       const result = await withoutRetryBackoff(() => priv.activateOne("gh"));
 
       // Prove the prompt ran, so the single connect below is the refused
-      // re-entry and not a path that never re-entered at all.
+      // path and not one that never prompted at all.
       expect(priv.server.elicitInput).toHaveBeenCalledTimes(1);
       expect(result.ok).toBe(false);
       expect(result.message).toContain("shutting down");
       expect(vi.mocked(connectToUpstream)).toHaveBeenCalledTimes(1);
       expect(priv.connections.size).toBe(0);
+      expect(priv.openBrowser).not.toHaveBeenCalled();
+      expect(close).toHaveBeenCalled();
+      expect(priv.secretEntryPages.size).toBe(0);
+      // Not the server's fault, and not worth a dispatch penalty in a
+      // session that is ending.
+      expect(priv.activationFailures.size).toBe(0);
     } finally {
-      // The accepted prompt installed a module-level session passphrase;
-      // shutdown() is what clears it, and this describe has no afterEach.
+      // This describe has no afterEach; shutdown() is what clears the
+      // module-level session passphrase, had one been installed.
+      await server.shutdown();
+      clearSessionVaultPassphrase();
+    }
+  });
+
+  it("refuses a vault prompt whose page was still being opened when the latch went down", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+    priv.server.getClientCapabilities = () => ({ elicitation: {} });
+    priv.server.elicitInput = vi.fn().mockResolvedValue({ action: "accept" });
+    // shutdown() sweeps the open pages synchronously. A page that is still
+    // starting when it does joins the set afterwards, so the sweep never sees
+    // it: the prompt path has to notice the latch itself, or the page sits
+    // listening until its TTL with nobody to close it.
+    const close = vi.fn();
+    priv.openSecretPage = vi.fn(async () => {
+      priv.shuttingDown = true;
+      return {
+        url: `http://127.0.0.1:5555/${"d".repeat(64)}`,
+        elicitationId: "elicit-late-page",
+        result: new Promise(() => {}),
+        close,
+      };
+    });
+    priv.openBrowser = vi.fn().mockResolvedValue(true);
+    vi.mocked(connectToUpstream).mockRejectedValueOnce(
+      new VaultPassphraseRequiredError("vault locked", "gh", ["GITHUB_TOKEN"], "missing"),
+    );
+
+    try {
+      const result = await withoutRetryBackoff(() => priv.activateOne("gh"));
+
+      expect(result.ok).toBe(false);
+      expect(result.message).toContain("shutting down");
+      // No dialog for a session that is ending, no browser, and the page
+      // closed by the path that opened it.
+      expect(priv.server.elicitInput).not.toHaveBeenCalled();
+      expect(priv.openBrowser).not.toHaveBeenCalled();
+      expect(close).toHaveBeenCalled();
+      expect(priv.secretEntryPages.size).toBe(0);
+      expect(vi.mocked(connectToUpstream)).toHaveBeenCalledTimes(1);
+    } finally {
       await server.shutdown();
       clearSessionVaultPassphrase();
     }
@@ -6696,6 +6777,12 @@ describe("response pruning respects structuredContent", () => {
 // resolveServerEnv reads yaw-mcp's own. The prompt appeared, the user typed
 // the right passphrase, and the spawn failed identically. These cover the
 // routing fix and the phishing/leak guard that comes with it.
+//
+// The passphrase itself is never typed into the client's dialog: it goes into
+// a masked field on the loopback page (secret-entry-page.ts, which has its own
+// suite over real sockets). Here the page and the browser launcher are fakes,
+// so what is asserted is the broker's side -- which elicitation it sends,
+// what it opens, and what it does with what the page returns.
 // ---------------------------------------------------------------------------
 
 describe("vault passphrase elicitation", () => {
@@ -6736,14 +6823,44 @@ describe("vault passphrase elicitation", () => {
     );
   }
 
+  interface OpenedPage {
+    opts: SecretEntryPageOptions;
+    page: SecretEntryPage;
+    close: ReturnType<typeof vi.fn>;
+  }
+
+  /** Stand-in for the masked-entry page. `entries[i]` is what the user types
+   *  on the i-th page opened; null (or running out of entries) means that
+   *  page expires with nothing submitted. Also installs a browser launcher
+   *  that succeeds, so a form-only client gets as far as the page. */
+  function pagesTyping(priv: any, ...entries: Array<string | null>) {
+    const opened: OpenedPage[] = [];
+    priv.openSecretPage = vi.fn(async (opts: SecretEntryPageOptions) => {
+      const entry = entries[opened.length] ?? null;
+      const close = vi.fn();
+      const page: SecretEntryPage = {
+        url: `http://127.0.0.1:5555/${String(opened.length).repeat(64)}`,
+        elicitationId: `elicit-${opened.length}`,
+        result: Promise.resolve(
+          entry === null ? { kind: "expired" as const } : { kind: "submitted" as const, values: { passphrase: entry } },
+        ),
+        close,
+      };
+      opened.push({ opts, page, close });
+      return page;
+    });
+    priv.openBrowser = vi.fn().mockResolvedValue(true);
+    return opened;
+  }
+
+  const accept = () => vi.fn().mockResolvedValue({ action: "accept" });
+
   it("prompts for the passphrase, installs it, and the retry succeeds", async () => {
     const priv = getPrivate(server);
     priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
     priv.server.getClientCapabilities = () => ({ elicitation: {} });
-    priv.server.elicitInput = vi.fn().mockResolvedValue({
-      action: "accept",
-      content: { YAW_MCP_VAULT_PASSPHRASE: "correct-horse-battery-staple" },
-    });
+    priv.server.elicitInput = accept();
+    pagesTyping(priv, "correct-horse-battery-staple");
     // ONE rejection: a vault refusal short-circuits the retry loop, so the
     // second connect is the post-elicitation retry, not attempt 2.
     vi.mocked(connectToUpstream)
@@ -6756,6 +6873,178 @@ describe("vault passphrase elicitation", () => {
     // The value reached the module-level session slot -- which is what
     // resolveServerEnv actually reads.
     expect(vaultPassphrase()).toBe("correct-horse-battery-staple");
+  });
+
+  it("form-only client: the dialog carries NO field, and the passphrase comes from a masked page it opens", async () => {
+    // The exposure this guards: a form-mode string field is an ordinary
+    // visible input, so the passphrase used to sit on screen while typed.
+    // `elicitation: {}` is what a form-only client (Claude Code) declares.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    priv.server.getClientCapabilities = () => ({ elicitation: {} });
+    priv.server.elicitInput = accept();
+    const opened = pagesTyping(priv, "typed-on-the-page");
+    vi.mocked(connectToUpstream)
+      .mockRejectedValueOnce(lockedVaultError("gh"))
+      .mockImplementationOnce(async (cfg: UpstreamServerConfig) => makeConnection(cfg.namespace, ["t"]));
+
+    const result = await priv.activateOne("gh");
+    expect(result.ok).toBe(true);
+    expect(vaultPassphrase()).toBe("typed-on-the-page");
+
+    expect(priv.server.elicitInput).toHaveBeenCalledTimes(1);
+    const params = vi.mocked(priv.server.elicitInput).mock.calls[0][0] as any;
+    // Form mode (no mode, or "form") -- never URL mode to a client that did
+    // not declare it.
+    expect(params.mode === undefined || params.mode === "form").toBe(true);
+    // A consent with no field in it: nothing for a passphrase to be typed into.
+    expect(params.requestedSchema).toEqual({ type: "object", properties: {} });
+    expect(params.message).toContain("masked field");
+    expect(JSON.stringify(params)).not.toContain("typed-on-the-page");
+
+    // The page is where the passphrase went: one masked field, opened in the
+    // system browser only after the user said yes, and closed afterwards.
+    expect(opened).toHaveLength(1);
+    expect(opened[0].opts.fields).toEqual([{ name: "passphrase", label: "Vault passphrase" }]);
+    expect(priv.openBrowser).toHaveBeenCalledWith(opened[0].page.url);
+    expect(opened[0].close).toHaveBeenCalled();
+  });
+
+  it("URL-mode client: sends a URL elicitation for the page and does not open a browser itself", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    // Declares both: URL mode wins, because the spec requires it for secrets.
+    priv.server.getClientCapabilities = () => ({ elicitation: { form: {}, url: {} } });
+    priv.server.elicitInput = accept();
+    const notify = vi.fn().mockResolvedValue(undefined);
+    priv.server.createElicitationCompletionNotifier = vi.fn(() => notify);
+    const opened = pagesTyping(priv, "via-url-mode");
+    vi.mocked(connectToUpstream)
+      .mockRejectedValueOnce(lockedVaultError("gh"))
+      .mockImplementationOnce(async (cfg: UpstreamServerConfig) => makeConnection(cfg.namespace, ["t"]));
+
+    const result = await priv.activateOne("gh");
+    expect(result.ok).toBe(true);
+    expect(vaultPassphrase()).toBe("via-url-mode");
+
+    const params = vi.mocked(priv.server.elicitInput).mock.calls[0][0] as any;
+    expect(params.mode).toBe("url");
+    expect(params.url).toBe(opened[0].page.url);
+    expect(params.elicitationId).toBe(opened[0].page.elicitationId);
+    expect(params.requestedSchema).toBeUndefined();
+    // The client opens the link; the broker must not open a second tab.
+    expect(priv.openBrowser).not.toHaveBeenCalled();
+    // And it is told the out-of-band step finished.
+    expect(priv.server.createElicitationCompletionNotifier).toHaveBeenCalledWith(opened[0].page.elicitationId);
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(opened[0].close).toHaveBeenCalled();
+  });
+
+  it("form-only client with no browser to open: says so, names the env var, and stops asking", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([
+      makeServerConfig({ namespace: "gh", name: "GitHub" }),
+      makeServerConfig({ namespace: "linear", name: "Linear" }),
+    ]);
+    priv.server.getClientCapabilities = () => ({ elicitation: {} });
+    priv.server.elicitInput = accept();
+    const opened = pagesTyping(priv, "never-typed");
+    priv.openBrowser = vi.fn().mockResolvedValue(false);
+    vi.mocked(connectToUpstream).mockImplementation((async (cfg: UpstreamServerConfig) => {
+      throw lockedVaultError(cfg.namespace);
+    }) as unknown as typeof connectToUpstream);
+
+    const first = await priv.activateOne("gh");
+    expect(first.ok).toBe(false);
+    expect(first.message).toContain("could not open a browser");
+    expect(first.message).toContain("YAW_MCP_VAULT_PASSPHRASE");
+    expect(first.message).toContain("No further prompts this session");
+    expect(vaultPassphrase()).toBeUndefined();
+    expect(opened[0].close).toHaveBeenCalled();
+    // Not the server's fault: no dispatch penalty.
+    expect(priv.activationFailures.size).toBe(0);
+
+    // Another prompt would hit the same wall, so there is not one.
+    await priv.activateOne("linear");
+    expect(priv.server.elicitInput).toHaveBeenCalledTimes(1);
+  });
+
+  it("an expired page says so and leaves the second try on the budget", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    priv.server.getClientCapabilities = () => ({ elicitation: {} });
+    priv.server.elicitInput = accept();
+    const opened = pagesTyping(priv, null, "second-page");
+    vi.mocked(connectToUpstream)
+      .mockRejectedValueOnce(lockedVaultError("gh"))
+      .mockRejectedValueOnce(lockedVaultError("gh"))
+      .mockImplementationOnce(async (cfg: UpstreamServerConfig) => makeConnection(cfg.namespace, ["t"]));
+
+    const first = await priv.activateOne("gh");
+    expect(first.ok).toBe(false);
+    expect(first.message).toContain("expired");
+    expect(first.message).toContain('Activate "gh" again');
+    expect(vaultPassphrase()).toBeUndefined();
+
+    const second = await priv.activateOne("gh");
+    expect(second.ok).toBe(true);
+    expect(vaultPassphrase()).toBe("second-page");
+    expect(opened).toHaveLength(2);
+    // A fresh page each time -- the first page's URL is dead.
+    expect(opened[1].page.url).not.toBe(opened[0].page.url);
+  });
+
+  it("a page that cannot start is reported without putting up a prompt", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    priv.server.getClientCapabilities = () => ({ elicitation: {} });
+    priv.server.elicitInput = accept();
+    priv.openSecretPage = vi.fn().mockRejectedValue(new Error("listen EADDRNOTAVAIL"));
+    priv.openBrowser = vi.fn().mockResolvedValue(true);
+    vi.mocked(connectToUpstream).mockRejectedValue(lockedVaultError("gh"));
+
+    const result = await priv.activateOne("gh");
+
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain("could not start the local page");
+    expect(priv.server.elicitInput).not.toHaveBeenCalled();
+    expect(priv.openBrowser).not.toHaveBeenCalled();
+    expect(vaultPassphrase()).toBeUndefined();
+  });
+
+  it("shutdown closes a page that is still waiting for the passphrase", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    priv.server.getClientCapabilities = () => ({ elicitation: {} });
+    priv.server.elicitInput = accept();
+    priv.openBrowser = vi.fn().mockResolvedValue(true);
+    // A page nobody submits: its result settles only when it is closed.
+    let settle: (o: unknown) => void = () => {};
+    const close = vi.fn(() => settle({ kind: "closed" }));
+    priv.openSecretPage = vi.fn(async () => ({
+      url: `http://127.0.0.1:5555/${"f".repeat(64)}`,
+      elicitationId: "elicit-shutdown",
+      result: new Promise((r) => {
+        settle = r;
+      }),
+      close,
+    }));
+    vi.mocked(connectToUpstream).mockRejectedValue(lockedVaultError("gh"));
+
+    const pending = priv.activateOne("gh");
+    await until(() => vi.mocked(priv.openBrowser).mock.calls.length > 0);
+    expect(priv.secretEntryPages.size).toBe(1);
+
+    await server.shutdown();
+    expect(close).toHaveBeenCalled();
+    const result = await pending;
+    expect(result.ok).toBe(false);
+    // The words every shutdown gate uses -- not "vault locked", which would
+    // book a dispatch penalty and invite a retry in a session that is over.
+    expect(result.message).toContain("shutting down");
+    expect(priv.activationFailures.size).toBe(0);
+    expect(priv.secretEntryPages.size).toBe(0);
+    expect(vaultPassphrase()).toBeUndefined();
   });
 
   it("does not burn a retry on a refusal that cannot change in a second", async () => {
@@ -6774,16 +7063,14 @@ describe("vault passphrase elicitation", () => {
   });
 
   it("re-asks after a wrong passphrase instead of spending the session on a typo", async () => {
-    // The value is typed into a no-echo field. Before verification it was
-    // stored unverified AND latched, so one transposed character meant every
-    // vault-backed server failed until the client restarted.
+    // Before verification the value was stored unverified AND latched, so one
+    // transposed character meant every vault-backed server failed until the
+    // client restarted.
     const priv = getPrivate(server);
     priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
     priv.server.getClientCapabilities = () => ({ elicitation: {} });
-    priv.server.elicitInput = vi
-      .fn()
-      .mockResolvedValueOnce({ action: "accept", content: { YAW_MCP_VAULT_PASSPHRASE: "typo" } })
-      .mockResolvedValueOnce({ action: "accept", content: { YAW_MCP_VAULT_PASSPHRASE: "the-right-one" } });
+    priv.server.elicitInput = accept();
+    pagesTyping(priv, "typo", "the-right-one");
     vi.mocked(verifyVaultPassphrase).mockResolvedValueOnce(false).mockResolvedValueOnce(true);
     vi.mocked(connectToUpstream)
       .mockRejectedValueOnce(lockedVaultError("gh"))
@@ -6805,9 +7092,8 @@ describe("vault passphrase elicitation", () => {
     const priv = getPrivate(server);
     priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
     priv.server.getClientCapabilities = () => ({ elicitation: {} });
-    priv.server.elicitInput = vi
-      .fn()
-      .mockResolvedValue({ action: "accept", content: { YAW_MCP_VAULT_PASSPHRASE: "still-wrong" } });
+    priv.server.elicitInput = accept();
+    const opened = pagesTyping(priv, "still-wrong", "still-wrong", "still-wrong");
     vi.mocked(verifyVaultPassphrase).mockResolvedValue(false);
     vi.mocked(connectToUpstream).mockRejectedValue(lockedVaultError("gh"));
 
@@ -6815,8 +7101,10 @@ describe("vault passphrase elicitation", () => {
     await priv.activateOne("gh");
     await priv.activateOne("gh");
 
-    // An elicitation is a modal interruption; bounded, not endless.
+    // An elicitation is a modal interruption; bounded, not endless -- and so
+    // is the number of pages opened.
     expect(priv.server.elicitInput).toHaveBeenCalledTimes(MAX_VAULT_PASSPHRASE_PROMPTS);
+    expect(opened).toHaveLength(MAX_VAULT_PASSPHRASE_PROMPTS);
     expect(vaultPassphrase()).toBeUndefined();
   });
 
@@ -6827,10 +7115,8 @@ describe("vault passphrase elicitation", () => {
     const priv = getPrivate(server);
     priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
     priv.server.getClientCapabilities = () => ({ elicitation: {} });
-    priv.server.elicitInput = vi.fn().mockResolvedValue({
-      action: "accept",
-      content: { YAW_MCP_VAULT_PASSPHRASE: "the-real-passphrase" },
-    });
+    priv.server.elicitInput = accept();
+    const opened = pagesTyping(priv, "the-real-passphrase");
     vi.mocked(connectToUpstream)
       .mockRejectedValueOnce(lockedVaultError("gh", "invalid"))
       .mockImplementationOnce(async (cfg: UpstreamServerConfig) => makeConnection(cfg.namespace, ["t"]));
@@ -6839,10 +7125,12 @@ describe("vault passphrase elicitation", () => {
 
     expect(result.ok).toBe(true);
     expect(vaultPassphrase()).toBe("the-real-passphrase");
-    // The prompt must not tell a user who DID set the var that it is unset.
+    // The prompt must not tell a user who DID set the var that it is unset --
+    // neither in the client's dialog nor on the page.
     const msg = vi.mocked(priv.server.elicitInput).mock.calls[0][0].message as string;
     expect(msg).toContain("does not unlock");
     expect(msg).not.toContain("which is locked");
+    expect(opened[0].opts.intro).toContain("does not unlock");
   });
 
   it("clears the module-level passphrase on shutdown", async () => {
@@ -6852,10 +7140,8 @@ describe("vault passphrase elicitation", () => {
     const priv = getPrivate(server);
     priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
     priv.server.getClientCapabilities = () => ({ elicitation: {} });
-    priv.server.elicitInput = vi.fn().mockResolvedValue({
-      action: "accept",
-      content: { YAW_MCP_VAULT_PASSPHRASE: "session-only" },
-    });
+    priv.server.elicitInput = accept();
+    pagesTyping(priv, "session-only");
     vi.mocked(connectToUpstream)
       .mockRejectedValueOnce(lockedVaultError("gh"))
       .mockImplementationOnce(async (cfg: UpstreamServerConfig) => makeConnection(cfg.namespace, ["t"]));
@@ -6874,10 +7160,8 @@ describe("vault passphrase elicitation", () => {
     const priv = getPrivate(server);
     priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
     priv.server.getClientCapabilities = () => ({ elicitation: {} });
-    priv.server.elicitInput = vi.fn().mockResolvedValue({
-      action: "accept",
-      content: { YAW_MCP_VAULT_PASSPHRASE: "s3kr1t" },
-    });
+    priv.server.elicitInput = accept();
+    pagesTyping(priv, "s3kr1t");
     vi.mocked(connectToUpstream)
       .mockRejectedValueOnce(lockedVaultError("gh"))
       .mockImplementationOnce(async (cfg: UpstreamServerConfig) => makeConnection(cfg.namespace, ["t"]));
@@ -6899,7 +7183,7 @@ describe("vault passphrase elicitation", () => {
     expect(spawnedEnv).not.toHaveProperty("YAW_MCP_VAULT_PASSPHRASE");
   });
 
-  it("treats a decline as final, across different servers", async () => {
+  it("treats a decline as final, across different servers, and never opens the page in a browser", async () => {
     // One vault, one passphrase. A decline is a decision, not a slip, so it
     // must not re-prompt on the next server that touches the vault -- unlike
     // a rejected typo, which gets one more try.
@@ -6910,12 +7194,16 @@ describe("vault passphrase elicitation", () => {
     ]);
     priv.server.getClientCapabilities = () => ({ elicitation: {} });
     priv.server.elicitInput = vi.fn().mockResolvedValue({ action: "decline" });
+    const opened = pagesTyping(priv, "unused");
     vi.mocked(connectToUpstream).mockRejectedValue(lockedVaultError("gh"));
 
     await priv.activateOne("gh");
     await priv.activateOne("slack");
 
     expect(priv.server.elicitInput).toHaveBeenCalledTimes(1);
+    expect(priv.openBrowser).not.toHaveBeenCalled();
+    expect(opened[0].close).toHaveBeenCalled();
+    expect(vaultPassphrase()).toBeUndefined();
   });
 
   it("does not prompt when the client cannot elicit", async () => {
@@ -6923,12 +7211,15 @@ describe("vault passphrase elicitation", () => {
     priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
     priv.server.getClientCapabilities = () => ({});
     priv.server.elicitInput = vi.fn();
+    const opened = pagesTyping(priv, "unused");
     vi.mocked(connectToUpstream).mockRejectedValue(lockedVaultError("gh"));
 
     const result = await priv.activateOne("gh");
 
     expect(result.ok).toBe(false);
     expect(priv.server.elicitInput).not.toHaveBeenCalled();
+    // No page either: nothing would ever tell the user it was there.
+    expect(opened).toHaveLength(0);
     expect(vaultPassphrase()).toBeUndefined();
   });
 
@@ -6943,6 +7234,7 @@ describe("vault passphrase elicitation", () => {
     priv.config = makeConfig([makeServerConfig({ namespace: "evil", name: "Evil" })]);
     priv.server.getClientCapabilities = () => ({ elicitation: {} });
     priv.server.elicitInput = vi.fn();
+    const opened = pagesTyping(priv, "unused");
     vi.mocked(connectToUpstream).mockRejectedValue(
       new ActivationError("spawn failed", "unknown", "YAW_MCP_VAULT_PASSPHRASE is not set\n"),
     );
@@ -6951,6 +7243,7 @@ describe("vault passphrase elicitation", () => {
 
     expect(result.ok).toBe(false);
     expect(priv.server.elicitInput).not.toHaveBeenCalled();
+    expect(opened).toHaveLength(0);
     expect(priv.elicitedEnv.get("evil")).toBeUndefined();
     expect(vaultPassphrase()).toBeUndefined();
   });
@@ -6992,6 +7285,7 @@ describe("vault passphrase elicitation", () => {
       makeServerConfig({ namespace: "linear", name: "Linear" }),
     ]);
     priv.server.getClientCapabilities = () => ({ elicitation: {} });
+    const opened = pagesTyping(priv, "s3kr1t");
 
     // The modal stays open until BOTH activations are parked on it. A prompt
     // that resolves immediately would let the winner finish before the
@@ -7012,11 +7306,12 @@ describe("vault passphrase elicitation", () => {
 
     const both = Promise.all([priv.activateOne("gh"), priv.activateOne("linear")]);
     await until(() => vi.mocked(priv.server.elicitInput).mock.calls.length > 0);
-    answer({ action: "accept", content: { YAW_MCP_VAULT_PASSPHRASE: "s3kr1t" } });
+    answer({ action: "accept" });
     const [gh, linear] = await both;
 
-    // One question, one modal.
+    // One question, one modal, one page.
     expect(priv.server.elicitInput).toHaveBeenCalledTimes(1);
+    expect(opened).toHaveLength(1);
     // And the follower gets the benefit: it retries on the winner's answer
     // rather than failing with the stale "vault is locked" error.
     expect(gh.ok).toBe(true);
@@ -7038,6 +7333,7 @@ describe("vault passphrase elicitation", () => {
       makeServerConfig({ namespace: "linear", name: "Linear" }),
     ]);
     priv.server.getClientCapabilities = () => ({ elicitation: {} });
+    pagesTyping(priv, "wrong");
     let answer: (result: unknown) => void = () => {};
     const answered = new Promise((resolve) => {
       answer = resolve;
@@ -7050,7 +7346,7 @@ describe("vault passphrase elicitation", () => {
 
     const both = Promise.all([priv.activateOne("gh"), priv.activateOne("linear")]);
     await until(() => vi.mocked(priv.server.elicitInput).mock.calls.length > 0);
-    answer({ action: "accept", content: { YAW_MCP_VAULT_PASSPHRASE: "wrong" } });
+    answer({ action: "accept" });
     const [gh, linear] = await both;
 
     expect(priv.server.elicitInput).toHaveBeenCalledTimes(1);
@@ -7061,6 +7357,37 @@ describe("vault passphrase elicitation", () => {
     }
     expect(priv.activationFailures.size).toBe(0);
     expect(vaultPassphrase()).toBeUndefined();
+  });
+
+  it("a follower on a shared page that EXPIRED gets the winner's words and no penalty", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([
+      makeServerConfig({ namespace: "gh", name: "GitHub" }),
+      makeServerConfig({ namespace: "linear", name: "Linear" }),
+    ]);
+    priv.server.getClientCapabilities = () => ({ elicitation: {} });
+    pagesTyping(priv, null);
+    let answer: (result: unknown) => void = () => {};
+    const answered = new Promise((resolve) => {
+      answer = resolve;
+    });
+    priv.server.elicitInput = vi.fn().mockReturnValue(answered);
+    vi.mocked(connectToUpstream).mockImplementation((async (cfg: UpstreamServerConfig) => {
+      throw lockedVaultError(cfg.namespace);
+    }) as unknown as typeof connectToUpstream);
+
+    const both = Promise.all([priv.activateOne("gh"), priv.activateOne("linear")]);
+    await until(() => vi.mocked(priv.server.elicitInput).mock.calls.length > 0);
+    answer({ action: "accept" });
+    const [gh, linear] = await both;
+
+    expect(priv.server.elicitInput).toHaveBeenCalledTimes(1);
+    for (const r of [gh, linear]) {
+      expect(r.ok).toBe(false);
+      expect(r.message).toContain("expired");
+      expect(r.message).not.toContain("vault locked");
+    }
+    expect(priv.activationFailures.size).toBe(0);
   });
 });
 

@@ -1,4 +1,5 @@
 import { homedir } from "node:os";
+import { getSupportedElicitationModes } from "@modelcontextprotocol/sdk/client/index.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -91,6 +92,13 @@ import {
   sampleCountForEffort,
   shouldSample,
 } from "./sampling-rank.js";
+import {
+  openInSystemBrowser,
+  openSecretEntryPage,
+  SECRET_ENTRY_PAGE_TTL_MS,
+  type SecretEntryPage,
+  type SecretEntryPageOptions,
+} from "./secret-entry-page.js";
 import { listKeys, loadVault, vaultPath } from "./secrets-vault.js";
 import {
   type CapDecision,
@@ -217,7 +225,7 @@ export function resolveToolExposure(): ToolExposure {
 export const DEFAULT_IDLE_CALL_THRESHOLD = 10;
 
 /** How many times one session may ask for the vault passphrase, across every
- *  namespace. Two, not one: the value is typed by a human into a no-echo
+ *  namespace. Two, not one: the value is typed by a human into a masked
  *  field, and each entry is verified before it is stored, so the second ask
  *  exists purely to make a transposed character cost a retry instead of the
  *  session. Not higher -- an elicitation is a modal interruption in the
@@ -228,6 +236,11 @@ export const DEFAULT_IDLE_CALL_THRESHOLD = 10;
  *  a different failure and a different number. The shared idea is only
  *  "bound the asking". */
 export const MAX_VAULT_PASSPHRASE_PROMPTS = 2;
+
+/** Form field name of the vault passphrase on the masked-entry page. Only
+ *  the page and the code reading its submission see it -- no client dialog
+ *  ever carries a field for the passphrase. */
+const VAULT_PAGE_FIELD = "passphrase";
 
 /** How many times one session may ask for a given namespace's MISSING CHILD
  *  credentials. Two, for the reason the vault budget above is two: the value
@@ -549,12 +562,33 @@ export function computeToolOverlaps(
   return overlaps;
 }
 
-/** What one vault-passphrase elicitation round produced. Three states, not a
- *  boolean, because a REJECTED entry (the user typed something and it did not
- *  verify) needs different words from an UNAVAILABLE one (declined, empty, or
- *  the request itself failed) -- and only the first of those is worth telling
- *  the caller a retry is still on offer. */
-type VaultPromptOutcome = "unlocked" | "rejected" | "unavailable";
+/** What one vault-passphrase elicitation round produced. Not a boolean,
+ *  because a REJECTED entry (the user typed something and it did not verify)
+ *  needs different words from an UNAVAILABLE one (declined, empty, or the
+ *  request itself failed) -- and only the first of those is worth telling the
+ *  caller a retry is still on offer. UNREACHABLE is the masked-entry page's
+ *  own failure: the page could not start, no browser could be opened for it,
+ *  or it expired with nothing submitted. The user may have said yes to the
+ *  prompt and then had nowhere to type, so it gets words of its own too. */
+type VaultPromptOutcome =
+  | { kind: "unlocked" }
+  | { kind: "rejected" }
+  | { kind: "unavailable" }
+  | { kind: "unreachable"; reason: SecretPageFailure };
+
+/** Why the masked-entry page could not take a secret. See
+ *  collectSecretOnLoopbackPage. */
+type SecretPageFailure = "no-page" | "no-browser" | "expired";
+
+/** What collectSecretOnLoopbackPage came back with. "failed" means the
+ *  prompt never got an answer from the user: the client declares no
+ *  elicitation mode, the request errored or timed out, or shutdown closed the
+ *  page under it -- as opposed to "declined", which IS the user's answer. */
+type LoopbackEntryResult =
+  | { kind: "submitted"; values: Record<string, string> }
+  | { kind: "declined" }
+  | { kind: "unreachable"; reason: SecretPageFailure }
+  | { kind: "failed" };
 
 export class ConnectServer {
   private server: Server;
@@ -692,6 +726,17 @@ export class ConnectServer {
   // MAX_VAULT_PASSPHRASE_PROMPTS budget in a single round. Followers await
   // this instead of prompting. Cleared when the prompt settles.
   private vaultElicitInflight: Promise<VaultPromptOutcome> | null = null;
+  // Masked-entry pages currently listening (see collectSecretOnLoopbackPage).
+  // Tracked so shutdown() can close them: a listener keeps the process alive
+  // under oam, whose http.Server has no unref().
+  private secretEntryPages = new Set<SecretEntryPage>();
+  // The page opener, the browser launcher and the page TTL. Instance fields
+  // (not direct calls) purely so tests can substitute a fake page and a fake
+  // browser, the same reason activationRetryDelayMs is one; production never
+  // changes them.
+  private openSecretPage: (opts: SecretEntryPageOptions) => Promise<SecretEntryPage> = openSecretEntryPage;
+  private openBrowser: (url: string) => Promise<boolean> = openInSystemBrowser;
+  private secretEntryPageTtlMs = SECRET_ENTRY_PAGE_TTL_MS;
   // How many times we have asked for a given NAMESPACE's missing child
   // credentials. Per-namespace (unlike the vault counter) because these are
   // the child's own secrets. Bounds the re-ask that replaced the old
@@ -4503,8 +4548,15 @@ export class ConnectServer {
   // the retry hinges on a process-wide session value instead of a per-server
   // override.
   //
+  // WHERE the passphrase is typed: never into the client's own dialog. A
+  // form-mode elicitation field is an ordinary visible text input -- the
+  // passphrase used to sit on screen, in plain text, while it was typed --
+  // and the spec forbids form mode for secrets anyway. It is typed into a
+  // masked field on a one-shot page this process serves on 127.0.0.1; see
+  // collectSecretOnLoopbackPage for how the user gets there.
+  //
   // Bounded by attempts rather than latched after one ask, because the value
-  // is typed by a human into a no-echo field: a single transposed character
+  // is typed by a human into a masked field: a single transposed character
   // otherwise cost the entire session. Each entry is VERIFIED against the
   // vault before it is stored (see verifyVaultPassphrase), so a wrong one is
   // rejected without ever becoming the session passphrase, and the user gets
@@ -4538,7 +4590,9 @@ export class ConnectServer {
     if (joined) {
       progress?.("Waiting for the vault passphrase prompt already in flight");
       const outcome = await joined;
-      if (outcome === "unlocked") return this.runActivateOne(namespace, progress, fromPrewarm, /* skipCap */ true);
+      // Same gate as the winner's below, for the same reason.
+      if (this.shuttingDown) return this.shuttingDownRefusal(namespace);
+      if (outcome.kind === "unlocked") return this.runActivateOne(namespace, progress, fromPrewarm, /* skipCap */ true);
       // The follower saw the SAME rejected entry the winner did, so it gets
       // the same words and the same no-penalty exit. Returning null here
       // instead sent it down runActivateOne's give-up path, which logged the
@@ -4546,7 +4600,10 @@ export class ConnectServer {
       // down-ranked the server in dispatch for the TTL, and told the user
       // YAW_MCP_VAULT_PASSPHRASE was not set when they had just typed one --
       // for every namespace in the batch but the winner.
-      if (outcome === "rejected") return this.vaultPassphraseRejected(namespace, lastError);
+      if (outcome.kind === "rejected") return this.vaultPassphraseRejected(namespace, lastError);
+      // Same reasoning for a page that never took the passphrase: the
+      // follower was waiting on that very page.
+      if (outcome.kind === "unreachable") return this.vaultPassphraseUnreachable(namespace, lastError, outcome.reason);
       return null;
     }
 
@@ -4573,7 +4630,15 @@ export class ConnectServer {
       if (this.vaultElicitInflight === prompt) this.vaultElicitInflight = null;
     }
 
-    if (outcome === "unlocked") {
+    // shutdown() latched while the prompt was up. Refuse the way every other
+    // shutdown gate does, whatever the prompt produced: an unlocked vault
+    // would only be refused again by runActivateOne's per-attempt gate, and
+    // every other outcome's words -- a rejected entry, a page that never took
+    // one, the give-up path's "vault locked" with its dispatch penalty --
+    // invite a retry in a session that is ending.
+    if (this.shuttingDown) return this.shuttingDownRefusal(namespace);
+
+    if (outcome.kind === "unlocked") {
       progress?.("Got the passphrase -- retrying load");
       // skipCap: this namespace already cleared the cap and still holds its
       // reservation; re-checking after a modal the user just answered could
@@ -4581,7 +4646,8 @@ export class ConnectServer {
       return this.runActivateOne(namespace, progress, fromPrewarm, /* skipCap */ true);
     }
 
-    if (outcome === "rejected") return this.vaultPassphraseRejected(namespace, lastError);
+    if (outcome.kind === "rejected") return this.vaultPassphraseRejected(namespace, lastError);
+    if (outcome.kind === "unreachable") return this.vaultPassphraseUnreachable(namespace, lastError, outcome.reason);
 
     return null;
   }
@@ -4608,13 +4674,168 @@ export class ConnectServer {
     };
   }
 
+  // The result for a prompt whose masked-entry page never took a passphrase.
+  // Shared by the winner and its followers, like vaultPassphraseRejected, and
+  // for the same reason it skips runActivateOne's give-up path: nothing is
+  // wrong with the server, and the original "vault locked" text would not
+  // tell a user who said yes to the prompt that there was then nowhere to
+  // type. The retry hint reads the latch, which promptForVaultPassphrase sets
+  // for the two failures another prompt cannot fix (no page, no browser).
+  private vaultPassphraseUnreachable(
+    namespace: string,
+    lastError: VaultPassphraseRequiredError,
+    reason: SecretPageFailure,
+  ): { ok: false; message: string; isChanged: false } {
+    const what =
+      reason === "no-browser"
+        ? "yaw-mcp could not open a browser on this machine for the page that takes the passphrase in a masked field"
+        : reason === "no-page"
+          ? "yaw-mcp could not start the local page that takes the passphrase in a masked field"
+          : "the passphrase page expired with nothing submitted";
+    const retryHint = this.vaultPassphraseElicited
+      ? " No further prompts this session: set YAW_MCP_VAULT_PASSPHRASE in yaw-mcp's own env and restart this MCP client."
+      : ` Activate "${namespace}" again for a new page, or set YAW_MCP_VAULT_PASSPHRASE in yaw-mcp's own env and restart this MCP client.`;
+    return {
+      ok: false,
+      isChanged: false,
+      message: `Could not load "${namespace}": ${what}, so your local secret vault, which its env (${lastError.refKeys.join(", ")}) references, is still locked.${retryHint}`,
+    };
+  }
+
+  // Collect secret values WITHOUT them ever being typed into the client's
+  // own dialog. They are typed into masked fields on a one-shot page this
+  // process serves on 127.0.0.1 (secret-entry-page.ts, which carries the
+  // page's hardening), and the client is only told how to get the user
+  // there:
+  //
+  //   * URL mode, when the client declares it (capabilities.elicitation.url).
+  //     It is what the spec (2025-11-25) requires for secrets: servers MUST
+  //     NOT use form mode for passwords or tokens, and MUST use URL mode. The
+  //     client shows the link, asks, and opens it. Its "accept" means the
+  //     user consented, NOT that anything was submitted, so the page's own
+  //     result is what this waits on.
+  //   * Form mode, when that is all the client has. Claude Code (2.1.278, the
+  //     build checked) declares `elicitation: {}`, which the spec and the SDK
+  //     read as form only -- and its own client refuses a url-mode request
+  //     against that declaration, so url mode cannot be tried on it. The form
+  //     carries NO field -- it is a yes/no consent, which that build renders
+  //     with Accept focused -- and on a yes this process opens the page in
+  //     the system browser itself. A visible field is never the fallback:
+  //     that is exactly the exposure this replaces.
+  //
+  // Nothing here is vault-specific. The missing-credential prompt
+  // (maybeElicitAndRetry, which still asks in a visible form field) can move
+  // onto it by supplying its own words and fields.
+  private async collectSecretOnLoopbackPage(request: {
+    namespace: string;
+    /** Lead of the client dialog: what needs the secret, and why. */
+    why: string;
+    /** The secret as the dialog's instruction names it, e.g. "your vault
+     *  passphrase". */
+    secretNoun: string;
+    page: Omit<SecretEntryPageOptions, "ttlMs">;
+    progress?: ProgressReporter;
+  }): Promise<LoopbackEntryResult> {
+    const { namespace, why, secretNoun, progress } = request;
+    // The SDK's own reading of the capability. Its initialize schema rewrites
+    // an empty `elicitation: {}` on the wire into `{ form: {} }` before it is
+    // stored (ElicitationCapabilitySchema in the SDK's types), which is what
+    // elicitInput's own per-mode guard then checks; this helper reads a bare
+    // `{}` the same way, so the two cannot disagree.
+    const modes = getSupportedElicitationModes(this.server.getClientCapabilities()?.elicitation);
+    if (!modes.supportsUrlMode && !modes.supportsFormMode) return { kind: "failed" };
+    const mode = modes.supportsUrlMode ? "url" : "form";
+
+    let page: SecretEntryPage;
+    try {
+      page = await this.openSecretPage({ ...request.page, ttlMs: this.secretEntryPageTtlMs });
+    } catch (err) {
+      log("warn", "Could not start the secret entry page", {
+        namespace,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return { kind: "unreachable", reason: "no-page" };
+    }
+    this.secretEntryPages.add(page);
+    try {
+      // shutdown() sweeps secretEntryPages synchronously, and this page was
+      // still being opened when it did: nothing else will ever close it, so
+      // the finally below has to, now, rather than after a prompt nobody is
+      // going to answer in a session that is ending.
+      if (this.shuttingDown) return { kind: "failed" };
+      let result: Awaited<ReturnType<Server["elicitInput"]>>;
+      try {
+        result =
+          mode === "url"
+            ? await this.server.elicitInput({
+                mode: "url",
+                message: `${why} Open the link to type ${secretNoun} into a masked field on a page yaw-mcp serves on this computer -- it never passes through this client. Decline to cancel.`,
+                elicitationId: page.elicitationId,
+                url: page.url,
+              })
+            : await this.server.elicitInput({
+                message: `${why} Accept to open a page yaw-mcp serves on this computer (127.0.0.1) in your browser, and type ${secretNoun} into its masked field there -- it is never typed into this dialog. Decline to cancel.`,
+                requestedSchema: { type: "object", properties: {} },
+              });
+      } catch (err) {
+        log("warn", "Secret entry elicitation failed", {
+          namespace,
+          mode,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        return { kind: "failed" };
+      }
+      if (result.action !== "accept") {
+        log("info", "User declined the secret entry prompt", { namespace, mode, action: result.action });
+        return { kind: "declined" };
+      }
+      // The latch went down while the dialog was up (a SIGTERM mid-prompt:
+      // the round-trip is up to 60s). shutdown() has already closed the page,
+      // so there is nothing to open a browser onto and nothing to wait for --
+      // a tab launched now would land on a refused connection.
+      if (this.shuttingDown) return { kind: "failed" };
+      if (mode === "form" && !(await this.openBrowser(page.url))) return { kind: "unreachable", reason: "no-browser" };
+
+      progress?.("Waiting for the masked entry page in your browser");
+      const outcome = await page.result;
+      // URL mode: tell the client the out-of-band step is over, so it can drop
+      // whatever "waiting" state it shows. Not sent when the page was closed
+      // under us -- that is shutdown, and the transport is going with it.
+      if (mode === "url" && outcome.kind !== "closed") this.notifyElicitationComplete(page.elicitationId, namespace);
+      if (outcome.kind === "submitted") return { kind: "submitted", values: outcome.values };
+      if (outcome.kind === "expired") return { kind: "unreachable", reason: "expired" };
+      return { kind: "failed" };
+    } finally {
+      page.close();
+      this.secretEntryPages.delete(page);
+    }
+  }
+
+  // notifications/elicitation/complete for a URL-mode elicitation. Best
+  // effort and never awaited: the notification is a courtesy the spec lets a
+  // server skip (MAY), so a client that errors on it must not fail the unlock.
+  private notifyElicitationComplete(elicitationId: string, namespace: string): void {
+    const onError = (err: unknown): void => {
+      log("debug", "Could not send the elicitation completion notification", {
+        namespace,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    };
+    try {
+      this.server.createElicitationCompletionNotifier(elicitationId)().catch(onError);
+    } catch (err) {
+      onError(err);
+    }
+  }
+
   // The prompt half of the vault path, split out so concurrent callers can
   // await ONE of them (see vaultElicitInflight). Owns the ask budget, the
   // latch, verification, and storing the verified value; tells the caller
-  // which of the three things happened, because they need different words:
-  //   "unlocked"    -- verified and stored; retry the activation.
-  //   "rejected"    -- the user typed a passphrase and it did not verify.
-  //   "unavailable" -- declined, empty, or the elicitation request failed.
+  // which of these happened, because they need different words:
+  //   unlocked    -- verified and stored; retry the activation.
+  //   rejected    -- the user typed a passphrase and it did not verify.
+  //   unavailable -- declined, empty, or the elicitation request failed.
+  //   unreachable -- the masked-entry page never took a passphrase.
   private async promptForVaultPassphrase(
     namespace: string,
     lastError: VaultPassphraseRequiredError,
@@ -4630,45 +4851,46 @@ export class ConnectServer {
     // The two reasons need different words. "invalid" means a passphrase IS
     // configured and does not work; telling that user the vault is merely
     // "locked" reads as though they forgot to set something they did set.
-    const why =
-      lastError.reason === "invalid"
-        ? `the vault passphrase yaw-mcp has does not unlock your local secret vault (${lastError.refKeys.join(", ")} reference it). Enter the correct passphrase to use for this session, or decline to cancel. The value in YAW_MCP_VAULT_PASSPHRASE is wrong or belongs to a different vault -- fix it there to stop this recurring.`
-        : `its env (${lastError.refKeys.join(", ")}) references your local secret vault, which is locked. Enter your vault passphrase to unlock it for this session, or decline to cancel. Set YAW_MCP_VAULT_PASSPHRASE in yaw-mcp's own env to skip this prompt in future sessions.`;
+    const invalid = lastError.reason === "invalid";
+    const keys = lastError.refKeys.join(", ");
+    const why = invalid
+      ? `"${namespace}" cannot start: the vault passphrase yaw-mcp has does not unlock your local secret vault (${keys} reference it). The value in YAW_MCP_VAULT_PASSPHRASE is wrong or belongs to a different vault -- fix it there to stop this recurring.`
+      : `"${namespace}" cannot start: its env (${keys}) references your local secret vault, which is locked. Set YAW_MCP_VAULT_PASSPHRASE in yaw-mcp's own env to skip this prompt in future sessions.`;
+    const keep =
+      "yaw-mcp keeps it in memory for this session only -- it is never written to disk, and never passed to the server being started.";
 
-    let result: Awaited<ReturnType<Server["elicitInput"]>>;
-    try {
-      result = await this.server.elicitInput({
-        message: `"${namespace}" cannot start: ${why}`,
-        requestedSchema: {
-          type: "object",
-          properties: {
-            YAW_MCP_VAULT_PASSPHRASE: {
-              type: "string",
-              title: "Vault passphrase",
-              description:
-                "Unlocks ~/.yaw-mcp/secrets.json. Kept in memory for this session only -- never written to disk, and never passed to the server being started.",
-            },
-          },
-          required: ["YAW_MCP_VAULT_PASSPHRASE"],
-        },
-      });
-    } catch (err) {
-      log("warn", "Vault passphrase elicitation failed", {
-        namespace,
-        error: err instanceof Error ? err.message : String(err),
-      });
-      return "unavailable";
-    }
+    const entry = await this.collectSecretOnLoopbackPage({
+      namespace,
+      why,
+      secretNoun: invalid ? "the correct vault passphrase" : "your vault passphrase",
+      page: {
+        title: "Unlock your yaw-mcp secret vault",
+        intro: invalid
+          ? `The passphrase yaw-mcp was given does not unlock your local secret vault (~/.yaw-mcp/secrets.json), and "${namespace}" needs it. Type the correct passphrase below. ${keep}`
+          : `"${namespace}" needs your local secret vault (~/.yaw-mcp/secrets.json) unlocked. Type its passphrase below. ${keep}`,
+        fields: [{ name: VAULT_PAGE_FIELD, label: "Vault passphrase" }],
+        doneMessage: "Received. You can close this tab and return to your MCP client.",
+      },
+      progress,
+    });
 
-    if (result.action !== "accept" || !result.content) {
+    if (entry.kind === "failed") return { kind: "unavailable" };
+    if (entry.kind === "declined") {
       // An explicit decline is a decision, not a slip -- stop asking.
       this.vaultPassphraseElicited = true;
-      log("info", "User declined vault passphrase elicitation", { namespace, action: result.action });
-      return "unavailable";
+      return { kind: "unavailable" };
+    }
+    if (entry.kind === "unreachable") {
+      // No page, or no browser to show it in: asking again this session
+      // would put up the same prompt and hit the same wall. An expired page
+      // is different -- the user may simply have been away -- so it keeps
+      // whatever budget is left.
+      if (entry.reason !== "expired") this.vaultPassphraseElicited = true;
+      return { kind: "unreachable", reason: entry.reason };
     }
 
-    const value = result.content.YAW_MCP_VAULT_PASSPHRASE;
-    if (typeof value !== "string" || value.length === 0) return "unavailable";
+    const value = entry.values[VAULT_PAGE_FIELD];
+    if (typeof value !== "string" || value.length === 0) return { kind: "unavailable" };
 
     // VERIFY before storing. setSessionVaultPassphrase writes module-global
     // state that shadows the env var for every later resolve, so an unverified
@@ -4680,7 +4902,7 @@ export class ConnectServer {
         attempt: this.vaultPassphrasePrompts,
       });
       progress?.("That passphrase did not unlock the vault");
-      return "rejected";
+      return { kind: "rejected" };
     }
 
     // Into the module-level session slot, deliberately NOT into elicitedEnv:
@@ -4690,7 +4912,7 @@ export class ConnectServer {
     setSessionVaultPassphrase(value);
     // Verified, so no further asking is warranted whatever happens next.
     this.vaultPassphraseElicited = true;
-    return "unlocked";
+    return { kind: "unlocked" };
   }
 
   private async handleActivate(
@@ -6497,6 +6719,13 @@ export class ConnectServer {
     // it, so nothing new can land in this.connections behind the teardown
     // below.
     this.shuttingDown = true;
+
+    // Close any masked-entry page still listening. Its prompt resolves
+    // "closed" at once instead of holding an activation open until the page's
+    // TTL -- which the bounded drain below would not wait for anyway -- and
+    // under oam, whose http.Server has no unref(), a listener left open would
+    // keep the process alive.
+    for (const page of this.secretEntryPages) page.close();
 
     // Flush any pending state save before we stop accepting writes.
     // Cancels the debounce timer so no stale snapshot writes after.

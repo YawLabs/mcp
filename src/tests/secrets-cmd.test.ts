@@ -493,6 +493,211 @@ describe("readLineFromTTY -- Ctrl-D cancel", () => {
 });
 
 // -----------------------------------------------------------------------
+// Raw mode is what turns echo OFF. When the terminal refuses it, the old
+// reader fell through to a line-buffered read -- and a line-buffered TTY
+// ECHOES, so the passphrase appeared on screen in plain text. The no-echo
+// prompts now refuse instead; the echo prompts (y/n) carry on as before.
+// -----------------------------------------------------------------------
+
+/** A TTY whose raw mode cannot be engaged: setRawMode throws, or -- with
+ *  `noRawMode` -- does not exist at all. Records what the reader did with it,
+ *  so a test can prove nothing was read. */
+class RawRefusingTTYStdin {
+  isTTY = true;
+  isRaw = false;
+  resumes = 0;
+  private listener: ((chunk: string) => void) | null = null;
+  private queue: string[];
+  setRawMode?: (v: boolean) => this;
+  constructor(chunks: string[], noRawMode = false) {
+    this.queue = [...chunks];
+    if (!noRawMode) {
+      this.setRawMode = () => {
+        throw new Error("EIO: i/o error, setRawMode");
+      };
+    }
+  }
+  get pending(): number {
+    return this.queue.length;
+  }
+  setEncoding(): this {
+    return this;
+  }
+  on(event: string, cb: (chunk: string) => void): this {
+    if (event === "data") this.listener = cb;
+    return this;
+  }
+  removeListener(event: string, cb: (chunk: string) => void): this {
+    if (event === "data" && this.listener === cb) this.listener = null;
+    return this;
+  }
+  resume(): this {
+    this.resumes++;
+    const next = this.queue.shift();
+    if (next !== undefined) queueMicrotask(() => this.listener?.(next));
+    return this;
+  }
+  pause(): this {
+    return this;
+  }
+  unshift(chunk: string): void {
+    this.queue.unshift(chunk);
+  }
+}
+
+describe("readLineFromTTY -- a terminal that will not turn echo off", () => {
+  const io = { out: vi.fn(), err: vi.fn() };
+  const stdout = { isTTY: true, write: vi.fn() } as unknown as NodeJS.WritableStream;
+  const written = (): string =>
+    (stdout.write as unknown as ReturnType<typeof vi.fn>).mock.calls.map((c) => String(c[0])).join("");
+  const errText = (): string => io.err.mock.calls.map((c) => c[0] as string).join("");
+  let home: string;
+
+  beforeEach(async () => {
+    io.out.mockReset();
+    io.err.mockReset();
+    (stdout.write as unknown as ReturnType<typeof vi.fn>).mockReset();
+    lock();
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    home = makeHome();
+    await mkdir(nodePath.join(home, ".yaw-mcp"), { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+    lock();
+  });
+
+  it("refuses the passphrase prompt instead of reading it with echo on", async () => {
+    const stdin = new RawRefusingTTYStdin(["typed-in-the-clear\n", "typed-in-the-clear\n"]);
+    const r = await runSecrets(
+      {
+        action: "set",
+        name: "github",
+        value: "ghp_abc",
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(1);
+    expect(errText()).toContain("would not turn echo off");
+    expect(errText()).toContain("Set YAW_MCP_VAULT_PASSPHRASE");
+    // Nothing was read: stdin was never resumed, every keystroke is still
+    // queued, and the prompt was never even written.
+    expect(stdin.resumes).toBe(0);
+    expect(stdin.pending).toBe(2);
+    expect(written()).not.toContain("Vault passphrase: ");
+    expect(existsSync(vaultPath(home))).toBe(false);
+  });
+
+  it("refuses the same way under --json, as one parseable envelope", async () => {
+    const stdin = new RawRefusingTTYStdin(["typed-in-the-clear\n"]);
+    const r = await runSecrets(
+      {
+        action: "set",
+        name: "github",
+        value: "ghp_abc",
+        json: true,
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(1);
+    const envelope = JSON.parse(errText().trim());
+    expect(envelope.ok).toBe(false);
+    expect(envelope.error).toContain("would not turn echo off");
+  });
+
+  it("treats a TTY with no setRawMode at all as one that cannot turn echo off", async () => {
+    const stdin = new RawRefusingTTYStdin(["typed-in-the-clear\n"], /* noRawMode */ true);
+    const r = await runSecrets(
+      {
+        action: "set",
+        name: "github",
+        value: "ghp_abc",
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(1);
+    expect(errText()).toContain("would not turn echo off");
+    expect(stdin.resumes).toBe(0);
+  });
+
+  it("refuses the secret VALUE prompt too, pointing at --stdin", async () => {
+    // A vault to add to, created non-interactively.
+    expect(
+      (await runSecrets({ action: "set", name: "first", value: "v1", passphrase: "a-long-passphrase", home }, io))
+        .exitCode,
+    ).toBe(0);
+    io.err.mockReset();
+    lock();
+
+    const stdin = new RawRefusingTTYStdin(["value-in-the-clear\n"]);
+    const r = await runSecrets(
+      {
+        action: "set",
+        name: "second",
+        passphrase: "a-long-passphrase",
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(1);
+    expect(errText()).toContain("would not turn echo off");
+    expect(errText()).toContain("--stdin");
+    expect(stdin.pending).toBe(1);
+    expect(written()).not.toContain("Secret value: ");
+  });
+
+  it("refuses rotate's current-passphrase prompt", async () => {
+    expect(
+      (await runSecrets({ action: "set", name: "first", value: "v1", passphrase: "a-long-passphrase", home }, io))
+        .exitCode,
+    ).toBe(0);
+    io.err.mockReset();
+    lock();
+
+    const stdin = new RawRefusingTTYStdin(["a-long-passphrase\n"]);
+    const r = await runSecrets(
+      { action: "rotate", home, io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout } },
+      io,
+    );
+    expect(r.exitCode).toBe(1);
+    expect(errText()).toContain("Current passphrase required.");
+    expect(errText()).toContain("would not turn echo off");
+    expect(stdin.pending).toBe(1);
+  });
+
+  it("still reads a y/N confirmation line-buffered -- that answer is meant to be seen", async () => {
+    expect(
+      (await runSecrets({ action: "set", name: "first", value: "v1", passphrase: "a-long-passphrase", home }, io))
+        .exitCode,
+    ).toBe(0);
+    io.err.mockReset();
+    lock();
+
+    // "y" answers the delete confirmation (echo ON, so raw mode is not
+    // required); the passphrase prompt that follows is then refused.
+    const stdin = new RawRefusingTTYStdin(["y\n", "a-long-passphrase\n"]);
+    const r = await runSecrets(
+      { action: "remove", name: "first", home, io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout } },
+      io,
+    );
+    expect(written()).toContain("[y/N]");
+    expect(stdin.resumes).toBe(1);
+    expect(r.exitCode).toBe(1);
+    expect(errText()).toContain("would not turn echo off");
+    // The passphrase line was never consumed.
+    expect(stdin.pending).toBe(1);
+  });
+});
+
+// -----------------------------------------------------------------------
 // A terminal paste arrives as ONE chunk. The reader must consume exactly
 // through its line terminator and re-buffer the rest for the next prompt --
 // dropping it meant a pasted "passphrase\nvalue\n" lost the value line and

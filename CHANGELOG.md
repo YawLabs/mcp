@@ -52,6 +52,25 @@ A `config.toml` that really does not parse is reported in TOML words by `doctor`
 
 `add`'s "no client is wired" nudge stops for a user whose only wired client is Codex CLI. `try` without `--client` still does not pick a `config.toml`: a trial marker cannot yet clean one up, so auto-detect keeps to JSON-family files. `doctor --json`'s `clients[]` slots gain three additive fields: `syntax` (`"JSON"` or `"TOML"`), `entryUnspliceable` (`{ reason, fix }` for an `mcp` entry install will not edit, or `null`) and `containerUnspliceable` (the same shape for a container that cannot take the entry, or `null`). Every JSON-family slot carries `"JSON"` and two `null`s, so a reader that ignores unknown keys sees no other change; the text CLIENTS lines and the `install --list` rows for JSON and JSONC clients are byte-identical to 1.0.4's.
 
+**Fixed -- the in-session vault passphrase prompt stops showing the passphrase in plain text while it is typed**
+
+When a server's env references `${secret:NAME}` and the vault is locked, the broker asks for the passphrase in-session. It asked with a form-mode MCP elicitation carrying a string field, and a client renders that as an ordinary visible text input: the passphrase sat on screen, in plain text, while it was typed. The MCP specification (2025-11-25) says servers must not use form mode for passwords or tokens.
+
+The passphrase is now typed into a masked field (`<input type="password">`) on a one-shot page the broker serves on `127.0.0.1`, and no client dialog carries a field for it:
+
+- A client that declares URL-mode elicitation gets a URL-mode prompt for the page, and opens it itself. When the page takes a passphrase or expires, the broker sends `notifications/elicitation/complete`.
+- A client with form mode only -- Claude Code 2.1.278 declares `elicitation: {}` -- gets a form with no fields, as a yes/no consent. On yes, the broker opens the page in the default browser: `%SystemRoot%\System32\rundll32.exe url.dll,FileProtocolHandler` on Windows, `/usr/bin/open` on macOS, `xdg-open` elsewhere when `DISPLAY` or `WAYLAND_DISPLAY` is set. When no browser can be opened, the activation fails with a message naming `YAW_MCP_VAULT_PASSPHRASE`, and the session does not ask again.
+
+The page listens on a random port with a 256-bit random token as its path. It refuses a Host header other than `127.0.0.1:<port>` (DNS rebinding) and a cross-origin POST, reads the value from a form POST body only -- never from a query string -- takes one submission, and closes after 3 minutes if nobody submits. It sends no CORS headers, `Cache-Control: no-store`, and a CSP that allows no script and no framing. Neither the request body nor the token is logged, and nothing is written to stdout. Shutdown closes a page that is still waiting, opens no browser for it, and refuses the activation with the usual `yaw-mcp is shutting down` message rather than reporting a locked vault.
+
+Unchanged: the passphrase is verified before it is stored, held in memory for the session only, and never reaches the server being started; a session asks at most twice (a rejected typo gets the second ask); a decline ends the asking; concurrent activations share one prompt. An expired page says so and leaves the second ask. A page that cannot start, or a browser that cannot be opened, ends the asking for the session.
+
+The prompt for a child server's own missing credential (`GITHUB_TOKEN is required` and the like) still asks in a visible form field. Moving it onto the same page is a follow-up.
+
+**Fixed -- `yaw-mcp secrets` refuses to prompt when the terminal will not turn echo off**
+
+The CLI's passphrase and secret-value prompts turn echo off by putting the terminal in raw mode. When that failed, the reader fell through to a line-buffered read, and the terminal echoed the passphrase in plain text. A no-echo prompt now refuses before writing the prompt or reading a byte: ``Passphrase required. Refusing to prompt: this terminal would not turn echo off, so what you type would be shown on screen. Set YAW_MCP_VAULT_PASSPHRASE instead.`` It exits 1, and under `--json` writes one `{"ok":false,...}` envelope. The value prompt points at `--stdin` instead, and `rotate`'s new-passphrase prompt at `YAW_MCP_VAULT_PASSPHRASE_NEW`. The y/N confirmations, which echo on purpose, are unchanged.
+
 **Changed -- the oam floor moves to 0.16.1**
 
 `MIN_OAM_VERSION` tracks the latest oam release as policy, and v0.16.1 is now current (published 2026-09-15); the floor was 0.15.2. A machine whose oam is older hosts its node/npx sidecars on node instead, and logs a warning naming both versions, `oam self-update` as the fix, and that yaw-mcp needs a restart afterwards. `release.sh` moved the floor and wrote this block; it did not re-run the oam hosting check that `src/oam-spawn.ts` describes.
