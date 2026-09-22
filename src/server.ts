@@ -10,7 +10,6 @@ import {
   ListToolsRequestSchema,
   ReadResourceRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { maybeAutoPrewarmNpxCache } from "./auto-prewarm.js";
 import { maybeAutoUpgrade } from "./auto-upgrade.js";
 import { bundleActivateHint, CURATED_BUNDLES, matchBundles, topPartialBundles } from "./bundles.js";
 import { formatShadowLine, installTargetForCli } from "./cli-shadows.js";
@@ -49,6 +48,7 @@ import { LearningStore, PENALTY_RATE_THRESHOLD } from "./learning.js";
 import { bundlesSignature, loadLocalBundles } from "./local-bundles.js";
 import { log } from "./logger.js";
 import { computeSecretsReport, META_TOOL_NAMES, META_TOOLS, SERVER_INSTRUCTIONS } from "./meta-tools.js";
+import { isFeatureDisabled } from "./opt-out-env.js";
 import { PackDetector } from "./pack-detect.js";
 import { isPersistenceDisabled, loadState, type PersistedToolCacheEntry, saveState } from "./persistence.js";
 import { createProgressReporter, isProgressRequested, type ProgressReporter } from "./progress.js";
@@ -173,14 +173,11 @@ export function isAutoLoadEnabled(): boolean {
 // server itself -- it reads getProfiledActiveServers, not the tool cache --
 // and activating it by namespace works exactly as before.
 export function isPrewarmEnabled(): boolean {
-  // `0` and `false` are the two off spellings YAW_MCP_AUTO_UPGRADE and
-  // YAW_MCP_CONFIG_RELOAD already accept; anything else, including unset,
-  // leaves pre-warm on. Trimmed -- which widens nothing, both off spellings
-  // are still exactly those two -- for the cmd.exe reason isAutoLoadEnabled
-  // documents: `set VAR=0 && yaw-mcp serve` delivers "0 ", and a check that
-  // did not trim would silently ignore the opt-out on Windows.
-  const raw = process.env.YAW_MCP_PREWARM?.trim().toLowerCase();
-  return !(raw === "0" || raw === "false");
+  // The shared opt-out parse (opt-out-env.ts): `0` and `false`, trimmed, turn
+  // it off; anything else, including unset, leaves pre-warm on. Kept as a
+  // named wrapper because the tests and the prewarm path read it by this
+  // name, and because "enabled" is the question this call site asks.
+  return !isFeatureDisabled("YAW_MCP_PREWARM");
 }
 
 // Last unrecognized YAW_MCP_TOOL_EXPOSURE value the warning in
@@ -1327,10 +1324,9 @@ export class ConnectServer {
     // whatever the file says at the next boundary, rather than treating edits
     // made while it was off as already-seen.
     //
-    // `0` and `false` are the two spellings YAW_MCP_AUTO_UPGRADE already
-    // accepts; anything else, including unset, leaves reload on.
-    const reloadOptOut = process.env.YAW_MCP_CONFIG_RELOAD;
-    if (reloadOptOut === "0" || reloadOptOut?.toLowerCase() === "false") return;
+    // The shared opt-out parse (opt-out-env.ts): `0` and `false`, trimmed,
+    // turn it off; anything else, including unset, leaves reload on.
+    if (isFeatureDisabled("YAW_MCP_CONFIG_RELOAD")) return;
 
     // A reload during teardown would spawn nothing but could still notify a
     // closing transport, and shuttingDown is the latch every other
@@ -1793,25 +1789,18 @@ export class ConnectServer {
     // serializes itself with its own lockfile.
     maybeRefreshSidecars().catch((err: Error) => log("warn", "Sidecar refresh check failed", { error: err?.message }));
 
-    // Pre-warm `~/.npm/_npx/<hash>/node_modules/<pkg>` for every active
-    // `npx -y <pkg>@latest` server, so the user's first `initialize` for that
-    // server does not pay the cold-cache tax. Without this, a fresh
-    // `_npx` cache makes a single spawn do registry + tar + child initialize,
-    // which is reliably >30s -- exceeding the downstream MCP client's
-    // `initialize` deadline and surfacing as "MCP request initialize to server
-    // mcp timed out after 30000ms". The prime runs `npx -y <pkg>@latest
-    // --version` once per unique package, in parallel, and resolves in <30s
-    // in the worst case. No-op when the user opts out
-    // (YAW_MCP_AUTO_PREWARM=0) or has no npx servers. Shares the sidecars lock
-    // with `maybeRefreshSidecars` so a manual `sidecars install` running at
-    // startup defers this pass and vice versa.
-    //
-    // Fire-and-forget for its siblings' reasons: the work it can trigger is
-    // a parallel batch of `npx` downloads, gated on the network, that the
-    // serve hot path must not block on. Ordering does not matter -- the
-    // prewarm touches `~/.npm/`, the sidecar refresh touches
-    // `~/.yaw-mcp/sidecars/`, and the upgrade touches the global prefix.
-    maybeAutoPrewarmNpxCache().catch((err: Error) => log("warn", "Auto-prewarm check failed", { error: err?.message }));
+    // There is deliberately NO npx-cache pre-warm here. 1.0.7 added a
+    // fire-and-forget `npx -y <pkg>@latest --version` pass at this point
+    // (auto-prewarm.ts, since deleted) to spare the first activation the
+    // cold-cache tax. It never ran: the call passed no server list, so the
+    // pass saw zero npx packages and returned on every start. Wiring it up
+    // for real would have spawned up to twenty parallel npx children -- a
+    // registry hit and a package boot each -- on EVERY broker start, and Yaw
+    // Terminal starts one broker per pane. Its stated goal was unreachable
+    // from here anyway: `server.connect` above has already completed, so the
+    // handshake this was meant to protect is over before the pass fires. A
+    // once-a-day warm belongs in an explicit verb the app runs at launch, not
+    // on the serve hot path.
 
     // Re-point any client entry whose baked launch file an app upgrade
     // deleted. CROSS-CLIENT on purpose, and that is the whole point: the

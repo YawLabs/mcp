@@ -1080,17 +1080,23 @@ describe("ConnectServer -- live bundles.json reload", () => {
     expect(namespacesOf(priv).sort()).toEqual(["gh", "linear"]);
   });
 
-  it("accepts `false` as well as `0`, the two spellings AUTO_UPGRADE takes", async () => {
+  it("accepts `false` as well as `0`, and a padded `0 `, the spellings every YAW_MCP_* opt-out takes", async () => {
     writeBundles(synthHome, [serverEntry("gh")]);
     const { priv, prewarmed } = await startServer();
     await prewarmed;
 
-    for (const spelling of ["false", "FALSE", "False"]) {
+    // "0 " is what cmd.exe's `set VAR=0 && yaw-mcp serve` delivers; this gate
+    // used to compare untrimmed and ran the reload anyway. The shared parser
+    // (opt-out-env.ts) trims for every feature. The namespace is derived from
+    // the index rather than the spelling because a padded value is not a
+    // legal namespace.
+    const spellings = ["false", "FALSE", "False", "0 "];
+    for (const [i, spelling] of spellings.entries()) {
       process.env.YAW_MCP_CONFIG_RELOAD = spelling;
       const applied = vi.spyOn(priv, "applyReloadedBundles");
-      rewriteBundles(synthHome, [serverEntry("gh"), serverEntry(`ns${spelling.toLowerCase()}`)]);
+      rewriteBundles(synthHome, [serverEntry("gh"), serverEntry(`ns${i}`)]);
       await priv.handleToolCall("mcp_connect_discover", {});
-      expect(applied, `${spelling} did not turn reload off`).not.toHaveBeenCalled();
+      expect(applied, `${JSON.stringify(spelling)} did not turn reload off`).not.toHaveBeenCalled();
       applied.mockRestore();
     }
 

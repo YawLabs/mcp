@@ -101,6 +101,29 @@ describe("maybeAutoUpgrade", () => {
     }
   });
 
+  it("YAW_MCP_AUTO_UPGRADE='0 ' (cmd.exe's trailing space) opts out -- the parse is the shared, trimmed one", async () => {
+    // `set YAW_MCP_AUTO_UPGRADE=0 && yaw-mcp serve` in cmd.exe keeps the
+    // space before `&&`. This reader used to compare untrimmed, so the
+    // documented opt-out silently ran the upgrade on Windows.
+    const prev = process.env.YAW_MCP_AUTO_UPGRADE;
+    process.env.YAW_MCP_AUTO_UPGRADE = "0 ";
+    try {
+      const fetchLatestImpl = vi.fn();
+      const spawnImpl = vi.fn();
+      await maybeAutoUpgrade({
+        currentVersion: "0.47.0",
+        argvPath: GLOBAL_NPM_PATH,
+        fetchLatestImpl,
+        spawnImpl,
+      });
+      expect(fetchLatestImpl).not.toHaveBeenCalled();
+      expect(spawnImpl).not.toHaveBeenCalled();
+    } finally {
+      if (prev === undefined) delete process.env.YAW_MCP_AUTO_UPGRADE;
+      else process.env.YAW_MCP_AUTO_UPGRADE = prev;
+    }
+  });
+
   it("YAW_MCP_AUTO_UPGRADE=1 / =true does NOT opt out -- only `0`/`false` disable", async () => {
     // Defends the opt-OUT contract against a user who reads the env var
     // as opt-in and sets `1`/`true` expecting it to enable -- the
