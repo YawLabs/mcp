@@ -3799,3 +3799,152 @@ describe("runList -- an unreadable bundles.json is not an empty one", () => {
     expect(io.text()).toContain("No local servers configured");
   });
 });
+
+// The catalog's `"optional": true` flag on a requiredEnv entry (see the
+// CatalogRequiredEnv doc in catalog.ts): declared, so the entry carries the
+// key, but never gated on. Own fixture rather than rows in CATALOG so the
+// counts and orderings the suites above assert on stay untouched.
+describe("runAdd optional env", () => {
+  const OPTIONAL_CATALOG: CatalogServer[] = [
+    {
+      slug: "terraform",
+      name: "Terraform",
+      install: { command: "docker run -i --rm -e TFE_TOKEN hashicorp/terraform-mcp-server", runtime: "other" },
+      requiredEnv: [{ key: "TFE_TOKEN", label: "HCP Terraform token", optional: true }],
+    },
+    {
+      slug: "consul",
+      name: "Consul",
+      install: { command: "docker run -i --rm hashicorp/consul-mcp-server", runtime: "other" },
+      requiredEnv: [
+        { key: "CONSUL_HTTP_ADDR", label: "address" },
+        { key: "CONSUL_HTTP_TOKEN", label: "ACL token", optional: true },
+      ],
+    },
+  ];
+  const fetchOptional: FetchCatalog = async () => OPTIONAL_CATALOG;
+  // The loader drops a blank seed (validateEntry), so the seeded "" slot is
+  // only visible in the file as written.
+  const rawEnv = (namespace: string): Record<string, string> | undefined => {
+    const file = JSON.parse(readFileSync(join(synthHome, CONFIG_DIRNAME, "bundles.json"), "utf8")) as {
+      servers: Array<{ namespace: string; env?: Record<string, string> }>;
+    };
+    return file.servers.find((s) => s.namespace === namespace)?.env;
+  };
+
+  it("adds an all-optional server with nothing set, seeding the key EMPTY for a later fill", async () => {
+    const io = captureIO();
+    const r = await runAdd({
+      slug: "terraform",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      fetchCatalog: fetchOptional,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(io.errText()).not.toMatch(/needs the following env var/);
+    expect(rawEnv("terraform")).toEqual({ TFE_TOKEN: "" });
+    // One note, in the optional voice, naming the `set` remedy -- not the
+    // required note's "depends on that var", which is false here.
+    expect(io.errText()).toContain("TFE_TOKEN is optional and not set; the server runs without it.");
+    expect(io.errText()).toContain("yaw-mcp set terraform env.TFE_TOKEN=...");
+    expect(io.errText()).not.toMatch(/depends on/);
+  });
+
+  it("refuses a mixed server on the REQUIRED key only, naming the optional one apart and out of the re-run line", async () => {
+    const io = captureIO();
+    const r = await runAdd({
+      slug: "consul",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      fetchCatalog: fetchOptional,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(1);
+    const err = io.errText();
+    expect(err).toContain("  - CONSUL_HTTP_ADDR");
+    expect(err).not.toContain("  - CONSUL_HTTP_TOKEN");
+    expect(err).toContain("Optional, not needed to run: CONSUL_HTTP_TOKEN");
+    expect(err).toContain("yaw-mcp add consul --env CONSUL_HTTP_ADDR=...");
+    expect(err).not.toContain("--env CONSUL_HTTP_TOKEN");
+    const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(loaded.config).toBeNull();
+  });
+
+  it("writes both keys once the required one is supplied, the optional one seeded empty", async () => {
+    const io = captureIO();
+    const r = await runAdd({
+      slug: "consul",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      envOverrides: { CONSUL_HTTP_ADDR: "http://127.0.0.1:8500" },
+      fetchCatalog: fetchOptional,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(rawEnv("consul")).toEqual({ CONSUL_HTTP_ADDR: "http://127.0.0.1:8500", CONSUL_HTTP_TOKEN: "" });
+    expect(io.errText()).toContain("CONSUL_HTTP_TOKEN is optional and not set");
+  });
+
+  it("persists an optional value given via --env and then says nothing about it", async () => {
+    const io = captureIO();
+    const r = await runAdd({
+      slug: "terraform",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      envOverrides: { TFE_TOKEN: "tfe-stored" },
+      fetchCatalog: fetchOptional,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(rawEnv("terraform")).toEqual({ TFE_TOKEN: "tfe-stored" });
+    expect(io.errText()).not.toMatch(/optional/);
+  });
+
+  it("does not persist an ambient optional value, and marks the not-persisted note (optional)", async () => {
+    const io = captureIO();
+    const r = await runAdd({
+      slug: "terraform",
+      home: synthHome,
+      cwd: synthCwd,
+      env: { TFE_TOKEN: "tfe-ambient" },
+      fetchCatalog: fetchOptional,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(rawEnv("terraform")).toEqual({ TFE_TOKEN: "" });
+    expect(io.errText()).toContain("TFE_TOKEN (optional) was read from your shell env and NOT persisted");
+    // The unset note must not ALSO fire: the shell does set it.
+    expect(io.errText()).not.toMatch(/optional and not set/);
+  });
+
+  it("--dry-run marks the optional key in the env keys preview and keeps the unset note indicative", async () => {
+    const io = captureIO();
+    const r = await runAdd({
+      slug: "terraform",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      dryRun: true,
+      fetchCatalog: fetchOptional,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(io.text()).toContain("env keys: TFE_TOKEN (optional)");
+    // "would be optional" would read as if the flag depended on the run.
+    expect(io.errText()).toContain("TFE_TOKEN is optional and not set");
+    expect(io.errText()).not.toMatch(/would be optional/);
+    const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(loaded.config).toBeNull();
+  });
+});

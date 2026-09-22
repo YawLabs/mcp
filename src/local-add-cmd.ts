@@ -331,19 +331,40 @@ function jsonEntry(entry: Partial<UpstreamServerConfig>): Record<string, unknown
   return out;
 }
 
-/** Required keys with no stored value while the shell HAS one: the value
+/** Declared keys with no stored value while the shell HAS one: the value
  *  came from the ambient env, not --env, and was deliberately not persisted
  *  (see the seeding note in runAdd). Computed from the entry as written -- or
  *  as the dry run would write it -- never from the flags, so a re-add over an
  *  entry that already carries a stored value stays quiet instead of claiming
- *  nothing was persisted. */
-function ambientOnlyRequiredKeys(
-  requiredKeys: string[],
-  entry: Partial<UpstreamServerConfig>,
-  env: NodeJS.ProcessEnv,
-): string[] {
+ *  nothing was persisted.
+ *
+ *  Key-agnostic: the callers pass the catalog's REQUIRED list and its
+ *  OPTIONAL list separately, because the two earn different notes (a required
+ *  var the server depends on; an optional one it merely reads when present)
+ *  and this test is the same for both. */
+function ambientOnlyKeys(keys: string[], entry: Partial<UpstreamServerConfig>, env: NodeJS.ProcessEnv): string[] {
   const stored = (entry.env ?? {}) as Record<string, string>;
-  return requiredKeys.filter((k) => (stored[k] ?? "").trim() === "" && (env[k] ?? "").trim() !== "");
+  return keys.filter((k) => (stored[k] ?? "").trim() === "" && (env[k] ?? "").trim() !== "");
+}
+
+/** Optional keys the entry carries EMPTY that the shell does not set either:
+ *  seeded by `add` as a slot to fill (see the seeding note in runAdd), and
+ *  worth one line so the user knows the slot exists and what fills it. Same
+ *  as-written source as ambientOnlyKeys, for the same reason: a re-add over an
+ *  entry whose optional value was filled since must not call it unset. */
+function unsetOptionalKeys(keys: string[], entry: Partial<UpstreamServerConfig>, env: NodeJS.ProcessEnv): string[] {
+  const stored = (entry.env ?? {}) as Record<string, string>;
+  return keys.filter((k) => (stored[k] ?? "").trim() === "" && (env[k] ?? "").trim() === "");
+}
+
+/** The dry run's `env keys:` line, with each optional key marked. The seeded
+ *  slot for an optional var is a key like any other in the entry, and the
+ *  preview is what a user reads to learn whether the add asks for anything,
+ *  so an unmarked slot reads as a credential the server needs. */
+function renderEnvKeys(env: Record<string, string>, optionalKeys: string[]): string {
+  return Object.keys(env)
+    .map((k) => (optionalKeys.includes(k) ? `${k} (optional)` : k))
+    .join(", ");
 }
 
 /** The two stderr notes that follow a write -- in the conditional voice for a
@@ -391,6 +412,13 @@ async function printPostWriteNotes(
   printErr: (s: string) => void,
   opts: {
     ambientOnly: string[];
+    /** The catalog's optional vars, split by what the written entry and the
+     *  shell hold: `ambient` mirrors ambientOnly (read from the shell, not
+     *  persisted), `unset` is nowhere at all. Each gets its own note, in the
+     *  optional voice -- the required note says the server DEPENDS on the
+     *  var, and that claim is false for these. `namespace` is the one the
+     *  file holds (or would), for the `yaw-mcp set` remedy. */
+    optional: { ambient: string[]; unset: string[]; namespace: string };
     cwd: string;
     home: string;
     /** %APPDATA% for the client probe, resolved by the caller from the RAW
@@ -437,6 +465,35 @@ async function printPostWriteNotes(
       `Note: ${ambientOnly.join(", ")} ${verb} read from your shell env and NOT persisted; the server depends on ${
         one ? "that var" : "those vars"
       } being present wherever yaw-mcp launches. Pass --env ${ambientOnly[0]}=... to persist a value.`,
+    );
+  }
+  // The optional vars, after the required note and never merged into it:
+  // "depends on that var" is exactly what the server does NOT do with these.
+  // Two lines at most, and only when there is something to say -- a server
+  // whose optional var is already stored, or that declares none, adds nothing
+  // to the output it had before the flag existed.
+  const optAmbient = opts.optional.ambient;
+  if (optAmbient.length > 0) {
+    const one = optAmbient.length === 1;
+    const verb = dryRun ? "would be" : one ? "was" : "were";
+    printErr(
+      `Note: ${optAmbient.join(", ")} (optional) ${verb} read from your shell env and NOT persisted; the server reads ${
+        one ? "it" : "them"
+      } only where your shell sets ${one ? "it" : "them"}. Pass --env ${optAmbient[0]}=... to persist a value.`,
+    );
+  }
+  const optUnset = opts.optional.unset;
+  if (optUnset.length > 0) {
+    const one = optUnset.length === 1;
+    // Indicative even on a dry run, unlike the two ambient notes above: they
+    // describe the write ("would be read ... and NOT persisted"), while this
+    // one describes the var (optional) and the shell (unset), both true now.
+    // "TFE_TOKEN would be optional" reads as if the flag depended on the run.
+    const verb = one ? "is" : "are";
+    printErr(
+      `Note: ${optUnset.join(", ")} ${verb} optional and not set; the server runs without ${
+        one ? "it" : "them"
+      }. Set ${one ? "it" : "each"} later with \`yaw-mcp set ${opts.optional.namespace} env.${optUnset[0]}=...\`.`,
     );
   }
   // Honest warning: a project-local bundles.json shadows the user-global file.
@@ -629,6 +686,7 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
       // Nothing declares a requirement for a hand-defined server, so there is
       // no required-env gate to fail: whatever --env carries is all there is.
       requiredEnvKeys: [],
+      optionalEnvKeys: [],
       description: opts.description,
     };
   } else {
@@ -656,6 +714,13 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
   // Required-env gate: refuse with a re-run hint when a required var has no
   // value in --env or the shell. Same posture as `yaw-mcp try` so the two
   // commands behave alike. (The GUI provides the richer fill-in-the-blank UX.)
+  //
+  // REQUIRED keys only. A var the catalog flags `"optional": true` is declared
+  // so the entry carries the key (seeded below), but the server runs without
+  // it, so refusing on it would make a "no credentials needed" server refuse
+  // to add -- the contradiction the flag exists to remove. The refusal still
+  // NAMES the optional vars, apart and marked, because this is the one place
+  // the user sees what the server takes before the write happens.
   const supplied = { ...env, ...(opts.envOverrides ?? {}) } as Record<string, string | undefined>;
   // Trim before the emptiness test so a whitespace-only value (FOO=" ") counts
   // as missing instead of slipping through and persisting a blank-ish secret to
@@ -666,6 +731,11 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
   if (missing.length > 0) {
     printErr(`yaw-mcp add: ${server.name} needs the following env var(s) before it can run:`);
     for (const k of missing) printErr(`  - ${k}`);
+    if (server.optionalEnvKeys.length > 0) {
+      // Not in the re-run line below: that line is the command that gets the
+      // add past the gate, and an optional var is not part of the gate.
+      printErr(`Optional, not needed to run: ${server.optionalEnvKeys.join(", ")}`);
+    }
     printErr("");
     printErr("Provide them with --env KEY=value (repeatable) or your shell, then re-run:");
     printErr(`  yaw-mcp add ${slug} ${missing.map((k) => `--env ${k}=...`).join(" ")}`);
@@ -679,8 +749,13 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
   // at runtime WITHOUT being copied to disk -- matching the app's one-click
   // posture ("env values are not pulled from your shell") and avoiding writing
   // an ambient secret into bundles.json the user never asked to persist.
+  //
+  // Optional keys are seeded the same way. Declared-but-optional means the
+  // entry still carries the key, so the app's env editor and `yaw-mcp set
+  // <ns> env.KEY=...` have a slot to fill later; an empty seed is dropped by
+  // the loader (see validateEntry), so it never blanks a shell value either.
   const entryEnv: Record<string, string> = {};
-  for (const k of server.requiredEnvKeys) entryEnv[k] = "";
+  for (const k of [...server.requiredEnvKeys, ...server.optionalEnvKeys]) entryEnv[k] = "";
   // Trim each --env value before persisting: a whitespace-only value is treated
   // as missing (a required key stays seeded EMPTY; a non-required key is skipped
   // entirely) so it never lands as a blank-ish secret in bundles.json --
@@ -817,7 +892,7 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
       // the three shapes (argv, url, neither) and is what the removal preview
       // and the trust gate print, so the preview now agrees with them.
       print(`  launch: ${renderLaunch(previewEntry)}`);
-      if (previewEntry.env) print(`  env keys: ${Object.keys(previewEntry.env).join(", ")}`);
+      if (previewEntry.env) print(`  env keys: ${renderEnvKeys(previewEntry.env, server.optionalEnvKeys)}`);
       // Header NAMES only. A --header value can be a live bearer token, and
       // --dry-run exists to be pasted into a bug report -- the same reason
       // env is printed by key here and redacted in the --json envelope.
@@ -833,7 +908,12 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
       }
     }
     await printPostWriteNotes(printErr, {
-      ambientOnly: ambientOnlyRequiredKeys(server.requiredEnvKeys, previewEntry, env),
+      ambientOnly: ambientOnlyKeys(server.requiredEnvKeys, previewEntry, env),
+      optional: {
+        ambient: ambientOnlyKeys(server.optionalEnvKeys, previewEntry, env),
+        unset: unsetOptionalKeys(server.optionalEnvKeys, previewEntry, env),
+        namespace: previewNamespace,
+      },
       // Previewed from the entry the run WOULD write, so --dry-run reports the
       // same dangling refs the real run would.
       dangling: await danglingSecretRefs(previewEntry, home),
@@ -918,11 +998,17 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
   }
 
   // Required keys that passed the gate but landed on disk EMPTY (the value
-  // came from the ambient shell, not --env), and the project file that would
-  // shadow this write -- see printPostWriteNotes. Computed from the WRITTEN
-  // entry, never the pre-merge input.
+  // came from the ambient shell, not --env), the optional keys seeded empty,
+  // and the project file that would shadow this write -- see
+  // printPostWriteNotes. Computed from the WRITTEN entry, never the pre-merge
+  // input.
   await printPostWriteNotes(printErr, {
-    ambientOnly: ambientOnlyRequiredKeys(server.requiredEnvKeys, written, env),
+    ambientOnly: ambientOnlyKeys(server.requiredEnvKeys, written, env),
+    optional: {
+      ambient: ambientOnlyKeys(server.optionalEnvKeys, written, env),
+      unset: unsetOptionalKeys(server.optionalEnvKeys, written, env),
+      namespace: finalNamespace,
+    },
     // From the entry as WRITTEN, not from the flags: a re-add merges with what
     // was already on disk, so the stored refs are what will actually resolve.
     dangling: await danglingSecretRefs(written, home),

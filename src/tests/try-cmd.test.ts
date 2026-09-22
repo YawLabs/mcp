@@ -2929,3 +2929,85 @@ describe("trial provenance -- the entry at the name may not be OURS any more", (
     expect(typeof marker.entryFingerprint).toBe("string");
   });
 });
+
+// The catalog's `"optional": true` flag, as the explore response carries it
+// (optionalEnvVars, split from requiredEnvVars by resolveCatalogSlug). The
+// server runs without these, so the trial never refuses over one -- but a
+// value the shell or --env holds still reaches the directly-launched trial
+// inline, exactly as a required one does.
+describe("runTry -- optional env vars", () => {
+  const base = () => ({
+    slug: "demo",
+    clientId: "claude-code" as const,
+    home: synthHome,
+    cwd: synthCwd,
+    os: "linux" as const,
+  });
+
+  it("wires an all-optional server with nothing set, and writes no env at all", async () => {
+    const cap = captureIO();
+    const r = await runTry({
+      ...base(),
+      env: {},
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: [], optionalEnvVars: ["FOO_TOKEN"] }),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.errText()).not.toMatch(/needs the following env var/);
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    // Never seeded "" the way `add` does: several upstreams read an
+    // explicitly-empty var as configured.
+    expect(client.mcpServers["yaw-mcp-try-demo"].env).toBeUndefined();
+  });
+
+  it("refuses on the required var only, naming the optional one apart and out of the re-run line", async () => {
+    const cap = captureIO();
+    const r = await runTry({
+      ...base(),
+      env: {},
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["REQ"], optionalEnvVars: ["OPT"] }),
+    });
+    expect(r.exitCode).toBe(1);
+    const err = cap.errText();
+    expect(err).toContain("  - REQ");
+    expect(err).not.toContain("  - OPT");
+    expect(err).toContain("Optional, not needed to run: OPT");
+    expect(err).toContain("yaw-mcp try demo --env REQ=...");
+    expect(err).not.toContain("--env OPT");
+    expect(existsSync(join(synthHome, ".claude.json"))).toBe(false);
+  });
+
+  it("carries an ambient optional value inline and marks it (optional) in the shell-sourced note", async () => {
+    const cap = captureIO();
+    const r = await runTry({
+      ...base(),
+      env: { FOO_TOKEN: "ambient-secret" },
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: [], optionalEnvVars: ["FOO_TOKEN"] }),
+    });
+    expect(r.exitCode).toBe(0);
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(client.mcpServers["yaw-mcp-try-demo"].env).toEqual({ FOO_TOKEN: "ambient-secret" });
+    expect(cap.errText()).toContain("FOO_TOKEN (optional) was read from your shell env");
+  });
+
+  it("--dry-run marks the optional key in the env keys preview", async () => {
+    const cap = captureIO();
+    const r = await runTry({
+      ...base(),
+      dryRun: true,
+      env: {},
+      envOverrides: { FOO_TOKEN: "given", LOG_LEVEL: "debug" },
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: [], optionalEnvVars: ["FOO_TOKEN"] }),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.text()).toMatch(/env keys:\s+FOO_TOKEN \(optional\), LOG_LEVEL\b/);
+    expect(cap.text()).not.toContain("given");
+  });
+});

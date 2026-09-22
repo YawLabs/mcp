@@ -104,13 +104,34 @@ export function parseSearchArgs(
   return { ok: true, options: opts };
 }
 
-/** Names, never values -- and the catalog holds no values anyway. */
-function requiredEnvKeys(entry: CatalogServer): string[] {
+/** Names, never values -- and the catalog holds no values anyway.
+ *
+ *  Split the way resolveCatalogSlug splits them (catalog.ts): `required` is
+ *  what `add` refuses without, `optional` is what the catalog flags
+ *  `"optional": true` -- declared, written into the entry, never gated on.
+ *  Read as `=== true` for the same reason as there: this is remote data, and
+ *  a truthy read would let a string `"false"` lift a var out of the gate. A
+ *  bare-string entry (a shape this listing tolerates and the resolver does
+ *  not) cannot carry the flag, so it is required. */
+function catalogEnvKeys(entry: CatalogServer): { required: string[]; optional: string[] } {
   const raw = (entry as { requiredEnv?: unknown }).requiredEnv;
-  if (!Array.isArray(raw)) return [];
-  return raw
-    .map((r) => (typeof r === "string" ? r : (r as { key?: unknown } | null)?.key))
-    .filter((k): k is string => typeof k === "string" && k !== "");
+  const required: string[] = [];
+  const optional: string[] = [];
+  if (!Array.isArray(raw)) return { required, optional };
+  for (const r of raw) {
+    const key = typeof r === "string" ? r : (r as { key?: unknown } | null)?.key;
+    if (typeof key !== "string" || key === "") continue;
+    const flagged = typeof r === "object" && r !== null && (r as { optional?: unknown }).optional === true;
+    (flagged ? optional : required).push(key);
+  }
+  return { required, optional };
+}
+
+/** The two key lists under the names the --json envelope has always used
+ *  (plus the new one), spread into a result row. */
+function catalogEnvKeysJson(entry: CatalogServer): { requiredEnvKeys: string[]; optionalEnvKeys: string[] } {
+  const { required, optional } = catalogEnvKeys(entry);
+  return { requiredEnvKeys: required, optionalEnvKeys: optional };
 }
 
 function truncate(text: string, cap: number): string {
@@ -128,11 +149,18 @@ function metaLine(entry: CatalogServer): string {
   const parts: string[] = [`runtime ${typeof install.runtime === "string" ? install.runtime : "unknown"}`];
   const toolCount = (entry as { toolCount?: unknown }).toolCount;
   if (typeof toolCount === "number") parts.push(`${toolCount} ${toolCount === 1 ? "tool" : "tools"}`);
-  const keys = requiredEnvKeys(entry);
-  if (keys.length > 0) parts.push(`needs ${keys.join(", ")}`);
+  const { required, optional } = catalogEnvKeys(entry);
+  if (required.length > 0) parts.push(`needs ${required.join(", ")}`);
   else if ((entry as { requiresSetup?: unknown }).requiresSetup === true)
-    parts.push("needs setup (no env keys listed)");
+    // The parenthetical is only true when nothing at all is listed; with an
+    // optional key on the way it would contradict the next part.
+    parts.push(optional.length > 0 ? "needs setup" : "needs setup (no env keys listed)");
   else parts.push("no credentials");
+  // A part of its own, after the verdict, never folded into `needs`: "needs
+  // X, Y (optional)" reads as two things the add will ask for, and the add
+  // asks for neither the second nor -- on an all-optional server -- anything.
+  // "no credentials | optional TFE_TOKEN" is the honest line for that one.
+  if (optional.length > 0) parts.push(`optional ${optional.join(", ")}`);
   // `add` refuses a remote entry, so saying so here saves the round trip.
   const runtime = typeof install.runtime === "string" ? install.runtime.toLowerCase() : "";
   if (install.url || install.type === "remote" || /^(remote|https?|sse|url)$/.test(runtime)) {
@@ -165,7 +193,10 @@ function renderJson(
         tags: (entry as { tags?: unknown }).tags,
         runtime: entry.install?.runtime,
         command: entry.install?.command,
-        requiredEnvKeys: requiredEnvKeys(entry),
+        // `requiredEnvKeys` keeps its pre-flag meaning (what `add` refuses
+        // without) so a script gating on it does not start refusing servers
+        // it used to accept; the optional keys ride in their own field.
+        ...catalogEnvKeysJson(entry),
         toolCount: (entry as { toolCount?: unknown }).toolCount,
         estimatedTokens: (entry as { estimatedTokens?: unknown }).estimatedTokens,
         repo: entry.repo,
