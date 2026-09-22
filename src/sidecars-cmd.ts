@@ -701,7 +701,7 @@ export function parseSidecarsArgs(
  * `sidecars install --json` and would otherwise read a full `installed` array
  * with `error: null` as a healthy install on a machine where every server still
  * resolves through the npx cache. probeOam is process-cached, so the cost is one
- * `oam --version` per run.
+ * probe per run: a single `oam --version`, or two when the first times out.
  *
  * `bundles` is the load the runner ALREADY did. describeDefaultRuntime reads the
  * same file, so letting it do its own read meant bundles.json parsed twice per
@@ -785,7 +785,7 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
       print(`  note: ${k.namespace} launches ${k.spec}, not a registry package; it keeps using npx`);
     }
     for (const k of ranges) {
-      print(`  note: ${k.namespace} launches ${k.spec}, a version range oam cannot resolve; it keeps using npx`);
+      print(`  note: ${k.namespace} launches ${k.spec}, a version range yaw-mcp does not evaluate; it keeps using npx`);
     }
   };
 

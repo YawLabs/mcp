@@ -8,15 +8,17 @@ import {
   healStaleBrokerEntries,
   maybeHealStaleBrokerEntries,
 } from "../heal-entries.js";
-import type { OamProbe } from "../oam-spawn.js";
+import { MIN_OAM_VERSION, type OamProbe } from "../oam-spawn.js";
 
 /** An oam that is installed and healthy, at a path we never have to create:
- *  buildLaunchEntry only requires the string be absolute. */
+ *  buildLaunchEntry only requires the string be absolute. The version is
+ *  derived from MIN_OAM_VERSION, as the other usable fixtures are, so it stays
+ *  a state probeOam can produce; heal reads only binPath, so it is inert here. */
 const OAM_BIN = process.platform === "win32" ? "C:\\tools\\oam.exe" : "/usr/local/bin/oam";
 const probe = (): OamProbe => ({
   bin: "oam",
   binPath: OAM_BIN,
-  version: "0.16.2",
+  version: MIN_OAM_VERSION,
   belowMin: false,
   failure: null,
   failureDetail: null,

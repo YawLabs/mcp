@@ -812,6 +812,12 @@ async function oamFloorLines(probe?: UpgradeCommandOptions["oamProbe"]): Promise
       "         requires, so MCP sidecars run on node instead of oam. Update it:",
       "",
       "  oam self-update",
+      "",
+      // A broker already running keeps the probe's cached answer for its
+      // lifetime (probeOam), so without a restart it stays on node after the
+      // update; the broker's own warn says so, but MCP clients hide stderr.
+      "         then restart yaw-mcp: a running broker keeps its oam probe for its",
+      "         lifetime, so it stays on node until it does.",
     ];
   } catch {
     return [];

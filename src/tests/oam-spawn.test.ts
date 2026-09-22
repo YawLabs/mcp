@@ -1996,8 +1996,9 @@ describe("resolveNpmEntry", () => {
 // binary on the upstream connect path of a single-threaded broker cannot hold
 // the hub. (It was execFileSync until #91, and a synchronous probe with a
 // `timeout` still hung on an unkillable child -- see spawnVersionProbe.) These
-// pin both halves of the contract: the bound exists, and exceeding it degrades
-// to the same node fallback that an absent oam already produces.
+// pin the contract: the bound exists, a timeout is retried exactly once, and
+// a retry that times out too degrades to the same node fallback that an absent
+// oam already produces.
 describe("probeOam timeout", () => {
   beforeEach(() => resetOamBinCache());
   afterEach(() => resetOamBinCache());
@@ -2037,14 +2038,71 @@ describe("probeOam timeout", () => {
     });
     expect(rewritten).toEqual(original);
   });
+
+  it("retries a timed-out probe once, so one slow start does not pin the process to node", async () => {
+    // The probe result is cached for the process lifetime, so before the retry
+    // a single `--version` that lapsed on a saturated machine sent every
+    // sidecar to node until the broker restarted. The FIRST call is the one
+    // asserted: it is the call whose answer gets cached.
+    let calls = 0;
+    const run = async () => {
+      calls++;
+      if (calls === 1) {
+        const err = new Error(`oam --version exceeded ${OAM_PROBE_TIMEOUT_MS}ms`) as Error & { code?: string };
+        err.code = "ETIMEDOUT";
+        throw err;
+      }
+      return `oam ${MIN_OAM_VERSION}\n`;
+    };
+    const probe = await probeOam(run);
+    expect(probe.bin).not.toBeNull();
+    expect(probe.version).toBe(MIN_OAM_VERSION);
+    expect(probe.failure).toBeNull();
+    expect(calls).toBe(2);
+    // The retry's answer is what got cached, not the timeout.
+    expect(await probeOam(run)).toBe(probe);
+    expect(calls).toBe(2);
+  });
+
+  it("falls back only after the retry times out as well, and stops there", async () => {
+    // Exactly one retry: a wedged binary costs two probe windows, not an
+    // unbounded run of them.
+    let calls = 0;
+    const probe = await probeOam(async () => {
+      calls++;
+      const err = new Error(`oam --version exceeded ${OAM_PROBE_TIMEOUT_MS}ms`) as Error & { code?: string };
+      err.code = "ETIMEDOUT";
+      throw err;
+    });
+    expect(calls).toBe(2);
+    expect(probe.bin).toBeNull();
+    expect(probe.failure).toBe("timeout");
+  });
+
+  it("does not retry a failure that is already an answer", async () => {
+    // ENOENT (absent), a non-zero exit and EACCES (broken) are real results.
+    // Retrying them could not change the answer, and for ENOENT it would add a
+    // spawn to the first connect on every machine without oam.
+    for (const code of ["ENOENT", "EOAMEXIT", "EACCES"]) {
+      resetOamBinCache();
+      let calls = 0;
+      await probeOam(async () => {
+        calls++;
+        const err = new Error(`probe failed with ${code}`) as Error & { code?: string };
+        err.code = code;
+        throw err;
+      });
+      expect(calls, `${code} was retried`).toBe(1);
+    }
+  });
 });
 
 // A timeout is not the same event as "oam is not installed", even though both
-// land on the same node fallback. oam IS on disk and did not answer in time --
-// and because the probe result is cached for the process lifetime, that one
-// slow moment downgrades every opted-in server until restart. Without a log
-// there is nothing to tell the user why their oam-hosted servers stopped
-// using oam.
+// land on the same node fallback. oam IS on disk and did not answer in time on
+// either attempt -- and because the probe result is cached for the process
+// lifetime, that outcome downgrades every opted-in server until restart.
+// Without a log there is nothing to tell the user why their oam-hosted servers
+// stopped using oam.
 describe("probeOam timeout diagnostics", () => {
   beforeEach(() => resetOamBinCache());
   afterEach(() => resetOamBinCache());
@@ -2080,6 +2138,25 @@ describe("probeOam timeout diagnostics", () => {
     const warn = lines.find((l) => l.msg?.includes("did not respond to --version"));
     expect(warn).toBeDefined();
     expect(warn?.level).toBe("warn");
+  });
+
+  it("does not warn when the retry answers", async () => {
+    // The second attempt answered and nothing fell back to node, so a warn
+    // saying "falling back to node for this process" would be false.
+    let calls = 0;
+    const lines = await captureStderr(() =>
+      probeOam(async () => {
+        calls++;
+        if (calls === 1) {
+          const err = new Error("spawnSync oam ETIMEDOUT") as Error & { code?: string };
+          err.code = "ETIMEDOUT";
+          throw err;
+        }
+        return `oam ${MIN_OAM_VERSION}\n`;
+      }),
+    );
+    expect(calls).toBe(2);
+    expect(lines.filter((l) => l.level === "warn")).toEqual([]);
   });
 
   it("stays silent when oam is simply not installed", async () => {
