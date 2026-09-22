@@ -2,7 +2,9 @@
 
 All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented here. This project uses [semantic versioning](https://semver.org) and a script-gated release flow: `./release.sh <version>` runs lint + typecheck + tests + build, bumps, tags, publishes to npm, and publishes `server.json` to the MCP registry.
 
-## Unreleased
+## 1.0.11 -- the vault passphrase is never typed into a visible field, the oam floor is the last verified release rather than the latest one, and one slow `oam --version` no longer parks every sidecar on node
+
+Published 2026-09-21, the day after 1.0.10. Ten entries below: the startup heal gains its off switch and reads every client config `doctor` does (the npx-cache pre-warm it replaced never ran and is removed); `release.sh` stops moving `MIN_OAM_VERSION` to whatever oam last published and `npm run verify:oam-floor` becomes the one thing that raises it; the in-session vault prompt moves onto a masked page served on 127.0.0.1 and the CLI refuses to prompt where echo cannot be turned off; a timed-out oam probe is retried once, the heap-cap hint stops naming a default it cannot know, and the below-floor advice says to restart a running broker. This file and the README also catch up with 1.0.3 through 1.0.10, whose headings were written here, late.
 
 **Removed -- the startup npx-cache pre-warm, which never ran**
 
