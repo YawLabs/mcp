@@ -19,15 +19,17 @@
 // default-runtime.ts), not an opt-in tier -- that changed in #99, and this note
 // described the opt-in model for two releases after it.
 //
-// MEASURED: the SDK-hosting mechanism re-verified against oam 0.13.0 on
-// 2026-09-02, and the floor moved to 0.13.1 the same day without re-running
-// it -- 0.13.1 is a same-day patch on 0.13.0, so the mechanism check is
-// carried forward, not re-measured (a stdio @modelcontextprotocol/sdk server completes
-// initialize + tools/list + tools/call hosted on `oam run`); the full
-// per-server matrix below was last run against 0.11.0 on 2026-08-22
-// (first 0.9.0 on 2026-08-08). Re-run at least the mechanism check for
-// each floor move -- release.sh moves the floor on its own and does not run
-// it -- so nobody re-derives it: the
+// MEASURED: the SDK-hosting mechanism check -- a stdio @modelcontextprotocol/sdk
+// server completes initialize + tools/list + tools/call hosted on `oam run` --
+// is now `npm run verify:oam-floor` (scripts/verify-oam-floor.mjs): release.sh
+// runs it in step 1 against this machine's oam, and `--raise` is the only
+// thing that moves MIN_OAM_VERSION, so every floor from here on has that
+// check behind it by construction (0.16.3 itself: 2026-09-21, on the
+// verifier's first run). Before that the check was re-run by hand against
+// 0.13.0 on 2026-09-02 and carried forward, not re-measured, across the
+// 0.13.1 -> 0.16.3 moves release.sh made on its own. The full per-server
+// matrix below was last run against 0.11.0 on 2026-08-22 (first 0.9.0 on
+// 2026-08-08), and nothing re-runs it: the
 // pure-JS/SDK tier (memory, tailscale, lemonsqueezy, redis, postgres, ctxlint)
 // completes an MCP initialize handshake hosted on oam, AND so do both
 // bundled-browser servers -- @modelcontextprotocol/server-puppeteer and
@@ -218,24 +220,35 @@ export function npxSpec(args: readonly string[]): string | null {
 /**
  * Minimum oam version yaw-mcp will host sidecars on.
  *
- * POLICY: this tracks the LATEST oam release. Bump it with every oam release,
- * not only when a release happens to fix something this code noticed. oam is
- * pre-1.0 and moves fast, the install channel (oamjs.org) only ever hands out
- * the current release, and hosting sidecars on a runtime older than that means
- * debugging against a build nobody else is running. There is no support
- * commitment for older builds, so there is no reason to admit them.
+ * POLICY: this is the last oam release the hosting mechanism was VERIFIED on
+ * -- `npm run verify:oam-floor` (scripts/verify-oam-floor.mjs) hosted a stdio
+ * @modelcontextprotocol/sdk server on that oam through `oam run` and completed
+ * initialize + tools/list + tools/call. It moves only by `npm run
+ * verify:oam-floor -- --raise`, which runs that check against the oam on the
+ * machine and then rewrites this constant, the ratchet literal in
+ * oam-spawn.test.ts and a CHANGELOG block together; the operator commits the
+ * result like any other change. release.sh runs the check (never the raise)
+ * in step 1, so a release cannot ship a floor the check has not passed on
+ * the release machine.
  *
- * release.sh does the bump. It reads the latest oam release from GitHub before
- * its confirm prompt and, when this is behind and the version being released is
- * not yet tagged or on npm, moves it -- with the ratchet literal in
- * oam-spawn.test.ts and a CHANGELOG block -- in a commit made before its lint,
- * typecheck and test gates run.
+ * It used to track the LATEST oam release, moved by release.sh from GitHub's
+ * /releases/latest without running anything. That is not free: a machine
+ * whose oam is below the floor hosts its node/npx sidecars on node with a
+ * warning (resolveOamSpawn), and install/heal write npx entries for the
+ * broker instead of oam ones (install-targets.ts) -- the slow spawn shape
+ * this whole module exists to avoid -- and typed users hit the same fallback
+ * because typed's preload launches the same broker binary. 0.16.1 -> 0.16.2
+ * -> 0.16.3 in five days paid that on every machine that had not run `oam
+ * self-update`, for releases that changed nothing the mechanism depends on.
+ * A verified floor still moves forward -- oamjs.org only ever installs the
+ * current release, and there is no support commitment for older builds -- but
+ * each move is a measurement, not a mirror of the release feed.
  *
  * Below-min is treated the same as oam-absent: the spawn falls back to
  * node/npx with one warn log naming both versions. That is a safe outcome --
- * the user gets node, which is what they had before oam existed -- so an
- * aggressive floor costs nothing but a fallback, while a lax one silently
- * hosts production sidecars on a runtime that is no longer current.
+ * the user gets node, which is what they had before oam existed -- so a
+ * floor that is too high costs a fallback, while one that is too low hosts
+ * production sidecars on a build the check never ran on.
  */
 export const MIN_OAM_VERSION = "0.16.3";
 

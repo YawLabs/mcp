@@ -22,6 +22,7 @@
     "lint": "node scripts/lint.mjs check src/ tsup.config.ts vitest.config.ts tsconfig.json",
     "lint:fix": "node scripts/lint.mjs check --write src/ tsup.config.ts vitest.config.ts tsconfig.json",
     "typecheck": "tsc --noEmit",
+    "verify:oam-floor": "node scripts/verify-oam-floor.mjs",
     "test:dist": "npm run build && npm test",
     "preinstall": "node -e \"const major=Number(process.versions.node.split('.')[0]);if(major<20){console.error('@yawlabs/mcp requires Node 20 or newer; this is Node '+process.versions.node+'. Upgrade Node, then re-run the install.');process.exit(1);}\"",
     "prepublishOnly": "npm run build",
