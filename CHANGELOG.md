@@ -2,9 +2,9 @@
 
 All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented here. This project uses [semantic versioning](https://semver.org) and a script-gated release flow: `./release.sh <version>` runs lint + typecheck + tests + build, bumps, tags, publishes to npm, and publishes `server.json` to the MCP registry.
 
-## 1.0.11 -- the vault passphrase is never typed into a visible field, the oam floor is the last verified release rather than the latest one, and one slow `oam --version` no longer parks every sidecar on node
+## 1.0.11 -- the oam floor moves to 0.16.4, the vault passphrase is never typed into a visible field, and one slow `oam --version` no longer parks every sidecar on node
 
-Published 2026-09-21, the day after 1.0.10. Ten entries below: the startup heal gains its off switch and reads every client config `doctor` does (the npx-cache pre-warm it replaced never ran and is removed); `release.sh` stops moving `MIN_OAM_VERSION` to whatever oam last published and `npm run verify:oam-floor` becomes the one thing that raises it; the in-session vault prompt moves onto a masked page served on 127.0.0.1 and the CLI refuses to prompt where echo cannot be turned off; a timed-out oam probe is retried once, the heap-cap hint stops naming a default it cannot know, and the below-floor advice says to restart a running broker. This file and the README also catch up with 1.0.3 through 1.0.10, whose headings were written here, late.
+Published 2026-09-21, the day after 1.0.10, alongside oam 0.16.4. Eleven entries below: the floor moves to 0.16.4 -- the first move made by `npm run verify:oam-floor`, which now is the one thing that raises it, in place of `release.sh` mirroring whatever oam last published; the startup heal gains its off switch and reads every client config `doctor` does (the npx-cache pre-warm it replaced never ran and is removed); the in-session vault prompt moves onto a masked page served on 127.0.0.1 and the CLI refuses to prompt where echo cannot be turned off; a timed-out oam probe is retried once, the heap-cap hint stops naming a default it cannot know, and the below-floor advice says to restart a running broker. This file and the README also catch up with 1.0.3 through 1.0.10, whose headings were written here, late.
 
 **Removed -- the startup npx-cache pre-warm, which never ran**
 
@@ -62,6 +62,10 @@ The prompt for a child server's own missing credential (`GITHUB_TOKEN is require
 **Fixed -- `yaw-mcp secrets` refuses to prompt when the terminal will not turn echo off**
 
 The CLI's passphrase and secret-value prompts turn echo off by putting the terminal in raw mode. When that failed, the reader fell through to a line-buffered read, and the terminal echoed the passphrase in plain text. A no-echo prompt now refuses before writing the prompt or reading a byte: ``Passphrase required. Refusing to prompt: this terminal would not turn echo off, so what you type would be shown on screen. Set YAW_MCP_VAULT_PASSPHRASE instead.`` It exits 1, and under `--json` writes one `{"ok":false,...}` envelope. The value prompt points at `--stdin` instead, and `rotate`'s new-passphrase prompt at `YAW_MCP_VAULT_PASSPHRASE_NEW`. The y/N confirmations, which echo on purpose, are unchanged.
+
+**Changed -- the oam floor moves to 0.16.4**
+
+`npm run verify:oam-floor` hosted a stdio `@modelcontextprotocol/sdk` server on oam v0.16.4 through `oam run` on 2026-09-21 -- initialize, tools/list and tools/call all completed -- and raised `MIN_OAM_VERSION` to it; the floor was 0.16.3. A machine whose oam is older hosts its node/npx sidecars on node instead, and logs a warning naming both versions, `oam self-update` as the fix, and that yaw-mcp needs a restart afterwards.
 
 ## 1.0.10 -- the oam floor moves to 0.16.3
 
