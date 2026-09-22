@@ -3831,6 +3831,64 @@ describe("runAdd optional env", () => {
     };
     return file.servers.find((s) => s.namespace === namespace)?.env;
   };
+  const rawEntry = (namespace: string): Record<string, unknown> | undefined => {
+    const file = JSON.parse(readFileSync(join(synthHome, CONFIG_DIRNAME, "bundles.json"), "utf8")) as {
+      servers: Array<Record<string, unknown> & { namespace: string }>;
+    };
+    return file.servers.find((s) => s.namespace === namespace);
+  };
+
+  it("records which blank seeds are optional, so the Yaw app's panel does not read them as 'needs key'", async () => {
+    const io = captureIO();
+    const r = await runAdd({
+      slug: "consul",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      envOverrides: { CONSUL_HTTP_ADDR: "http://host.docker.internal:8500" },
+      fetchCatalog: fetchOptional,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+    // The marker names the optional half only; the required key is not in it.
+    expect(rawEntry("consul")?.optionalEnvKeys).toEqual(["CONSUL_HTTP_TOKEN"]);
+    expect(rawEnv("consul")).toEqual({ CONSUL_HTTP_ADDR: "http://host.docker.internal:8500", CONSUL_HTTP_TOKEN: "" });
+  });
+
+  it("writes no marker for a server with no optional vars, and clears a stale one on re-add", async () => {
+    // First add: terraform's TFE_TOKEN is optional -> marker present.
+    let r = await runAdd({
+      slug: "terraform",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      fetchCatalog: fetchOptional,
+      out: () => {},
+      err: () => {},
+    });
+    expect(r.exitCode).toBe(0);
+    expect(rawEntry("terraform")?.optionalEnvKeys).toEqual(["TFE_TOKEN"]);
+    // The catalog stops flagging it (the entry now lists it as required).
+    const unflagged: FetchCatalog = async () =>
+      OPTIONAL_CATALOG.map((s) =>
+        s.slug === "terraform" ? { ...s, requiredEnv: [{ key: "TFE_TOKEN", label: "token" }] } : s,
+      );
+    r = await runAdd({
+      slug: "terraform",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      envOverrides: { TFE_TOKEN: "x" },
+      fetchCatalog: unflagged,
+      out: () => {},
+      err: () => {},
+    });
+    expect(r.exitCode).toBe(0);
+    // Re-add merged onto the existing entry and DROPPED the stale marker rather
+    // than keeping it (an empty marker is never stored either).
+    expect(rawEntry("terraform")).not.toHaveProperty("optionalEnvKeys");
+  });
 
   it("adds an all-optional server with nothing set, seeding the key EMPTY for a later fill", async () => {
     const io = captureIO();

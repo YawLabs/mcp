@@ -775,7 +775,7 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
   // deriveNamespace("ga") could ever find it again. The write path round-trips
   // unknown per-server fields, so the slug survives later add/remove writes.
   const remote = opts.url !== undefined;
-  const entry: Partial<UpstreamServerConfig> & { slug: string } = {
+  const entry: Partial<UpstreamServerConfig> & { slug: string; optionalEnvKeys?: string[] } = {
     id: `local-${namespace}`,
     name: server.name,
     namespace,
@@ -796,6 +796,15 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
           command: server.command,
           args: server.args,
           env: Object.keys(entryEnv).length > 0 ? entryEnv : undefined,
+          // Which of the blank seeds above are optional. The entry env alone
+          // cannot say -- a required key and an optional one are both "" until
+          // filled -- and the Yaw app reads nothing but bundles.json when it
+          // decides whether a server "needs key". The app writes the same
+          // marker for the entries it adds; without ours, a server added here
+          // showed "needs key" in the panel until re-added from the app.
+          // Always an array so a re-add can CLEAR a stale marker (the merge
+          // drops an empty one); an explicit-command add carries none.
+          optionalEnvKeys: server.optionalEnvKeys,
         }),
     isActive: true,
     description: server.description,
