@@ -1559,7 +1559,7 @@ export const DOCTOR_ENV_VARS: ReadonlyArray<{ name: string; defaultHint: string 
   { name: "YAW_MCP_PRUNE_RESPONSES", defaultHint: "pruning active" },
   { name: "YAW_MCP_MAX_RESULT_BYTES", defaultHint: "default 100000" },
   { name: "YAW_MCP_DEFAULT_RUNTIME", defaultHint: "oam when installed" },
-  { name: "YAW_MCP_TOOL_EXPOSURE", defaultHint: "gateway" },
+  { name: "YAW_MCP_TOOL_EXPOSURE", defaultHint: "gateway; lite for typed-cli" },
   { name: "YAW_MCP_AUTO_UPGRADE", defaultHint: "default on" },
   { name: "YAW_MCP_AUTO_HEAL", defaultHint: "default on" },
   { name: "YAW_MCP_SIDECAR_REFRESH", defaultHint: "default on" },
@@ -2040,10 +2040,10 @@ function renderOamRuntimeSection(opts: {
   print("OAM RUNTIME");
   if (probe.belowMin) {
     print(`  binary:  installed (v${probe.version}) -- below min ${MIN_OAM_VERSION}; IGNORED, servers run on node`);
-    // The floor tracks the latest oam release, so "below min" is always
-    // "out of date" rather than "wrong build" -- and oam updates itself in
-    // place. Naming the one command that fixes it beats re-running an
-    // installer that has to be looked up.
+    // The floor is a released oam (the last one verify:oam-floor passed on),
+    // so "below min" is always "out of date" rather than "wrong build" -- and
+    // oam updates itself in place. Naming the one command that fixes it beats
+    // re-running an installer that has to be looked up.
     //
     // The restart line is here because this report is the one surface a
     // user reads: the broker's own warn names the restart too, but MCP

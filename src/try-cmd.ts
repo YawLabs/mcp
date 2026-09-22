@@ -195,6 +195,13 @@ export interface ExploreServerResponse {
    *  process.env, so the user sees the requirement up front instead of
    *  a silent runtime failure in the client. */
   requiredEnvVars?: string[];
+  /** Names of env vars the catalog declares `"optional": true`: the server
+   *  runs without them, so they never block the trial, but a value the
+   *  shell or --env holds is carried into the trial entry exactly as a
+   *  required one is (see the divergence note in runTry -- the client
+   *  launches the trial directly, so inline is the only way a value
+   *  reaches it). Absent means none. */
+  optionalEnvVars?: string[];
   docUrl?: string;
 }
 
@@ -723,6 +730,7 @@ async function defaultFetchExplore(slug: string, catalogUrl?: string): Promise<E
     args: resolved.args,
     requiredEnvVars: resolved.requiredEnvKeys,
   };
+  if (resolved.optionalEnvKeys.length > 0) out.optionalEnvVars = resolved.optionalEnvKeys;
   if (resolved.docUrl) out.docUrl = resolved.docUrl;
   return out;
 }
@@ -954,7 +962,9 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   // Step 4: required-env-var check. Anything in requiredEnvVars not
   // supplied via --env AND not in the current process env blocks the
   // trial — silent runtime failure inside the client is worse than a
-  // clear "you need to set FOO" up front.
+  // clear "you need to set FOO" up front. optionalEnvVars is not part of
+  // the check: the server runs without those, so a trial of a "no
+  // credentials needed" server must not refuse over one.
   //
   // A LOOKUP, not a merged object. Spreading `env` into a plain object drops
   // whatever lookup semantics the source had -- and on Windows process.env is
@@ -972,6 +982,11 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   if (missing.length > 0) {
     printErr(`yaw-mcp try: ${server.name} needs the following env var(s) before it can run:`);
     for (const k of missing) printErr(`  - ${k}`);
+    // Named apart and marked, never in the re-run line: that line is what
+    // gets the trial past the gate, and an optional var is not in the gate.
+    if ((server.optionalEnvVars ?? []).length > 0) {
+      printErr(`Optional, not needed to run: ${(server.optionalEnvVars ?? []).join(", ")}`);
+    }
     printErr("");
     printErr("Set them via --env KEY=value (repeatable) or your shell, then re-run:");
     const example = missing.map((k) => `--env ${k}=...`).join(" ");
@@ -986,7 +1001,9 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   // requiredEnvVars + any --env overrides the user supplied); we don't
   // want to leak every var in the user's shell into the entry.
   //
-  // INTENTIONAL DIVERGENCE from `yaw-mcp add` (local-add-cmd.ts:174-190):
+  // INTENTIONAL DIVERGENCE from `yaw-mcp add` (the seeding note in runAdd,
+  // local-add-cmd.ts -- named by function, since the line it used to cite
+  // drifted):
   // `add` seeds required keys EMPTY and persists a value ONLY for explicit
   // --env, deliberately NOT copying ambient-shell secrets to disk (yaw-mcp
   // inherits the shell env at spawn time). `try` cannot do that -- the trial
@@ -995,15 +1012,24 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   // value (including an ambient-shell secret) MUST be written inline or the
   // server has no way to see it. The ambientOnlyRequired note below warns the
   // user when a value was sourced from the shell rather than --env.
+  //
+  // Optional vars go through the same loop: a value the shell holds for one
+  // reaches a directly-launched trial only if it is written inline, and a
+  // user with TFE_TOKEN exported is trialling the server WITH the tools it
+  // unlocks. One that is unset is simply absent from the entry -- never
+  // seeded "" the way `add` does, because several upstreams read an
+  // explicitly-empty var as configured (see the --env note below).
+  const declaredEnvVars = [...(server.requiredEnvVars ?? []), ...(server.optionalEnvVars ?? [])];
   const trialEnv: Record<string, string> = {};
-  for (const k of server.requiredEnvVars ?? []) {
+  for (const k of declaredEnvVars) {
     // Use the trimmed value so a padded entry doesn't carry surrounding
     // whitespace into the secret (the missing-check above already trims).
     const v = (lookup(k) ?? "").trim();
     if (v) trialEnv[k] = v;
   }
-  // Honor any --env overrides for keys NOT in requiredEnvVars too --
-  // some servers have optional env knobs (LOG_LEVEL, DATABASE_URL).
+  // Honor any --env overrides for keys NOT declared by the catalog too --
+  // some servers have env knobs the catalog does not list (LOG_LEVEL,
+  // DATABASE_URL).
   // Trimmed and emptiness-gated on the same terms as the required keys above:
   // `--env LOG_LEVEL=` (or a whitespace-only value) is the user clearing a
   // knob, not asking for a blank one, and persisting "" into the trial entry
@@ -1021,10 +1047,17 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   // `!overrides[k]` alone covers both "key absent" and "key present but empty"
   // -- "" is falsy, so the old `|| overrides[k] === ""` disjunct could never
   // add a case the first one had not already caught.
+  //
+  // An optional var copied the same way is listed the same way, MARKED: the
+  // fact the note reports (a shell secret now sits in the client config on
+  // disk) is as true of it, and the mark is what tells the user the trial
+  // would have run without it.
   const overrides = opts.envOverrides ?? {};
-  const ambientOnlyRequired = (server.requiredEnvVars ?? []).filter(
-    (k) => !overrides[k] && (lookup(k) ?? "").trim() !== "",
-  );
+  const ambientOnly = (k: string): boolean => !overrides[k] && (lookup(k) ?? "").trim() !== "";
+  const ambientOnlyRequired = [
+    ...(server.requiredEnvVars ?? []).filter(ambientOnly),
+    ...(server.optionalEnvVars ?? []).filter(ambientOnly).map((k) => `${k} (optional)`),
+  ];
   const entry = buildLaunchEntry({
     os,
     upstream: {
@@ -1239,7 +1272,18 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
     print(`yaw-mcp try (dry-run): would write ${resolved.absolute}`);
     print(`  entry name: ${entryName}`);
     print(`  command:    ${entry.command} ${entry.args.join(" ")}`);
-    if (entry.env) print(`  env keys:   ${Object.keys(entry.env).join(", ")}`);
+    // An optional key only reaches the trial env when a value exists (see the
+    // declaredEnvVars loop), so every key printed here IS being written --
+    // marked, as `add --dry-run` marks its seeds, so the preview does not read
+    // as a credential the trial could not have run without.
+    if (entry.env) {
+      const optional = server.optionalEnvVars ?? [];
+      print(
+        `  env keys:   ${Object.keys(entry.env)
+          .map((k) => (optional.includes(k) ? `${k} (optional)` : k))
+          .join(", ")}`,
+      );
+    }
     print(`  expires:    ${new Date(expiresAt).toISOString()}`);
     print(`  marker:     ${trialMarkerPath(slug, home)}`);
     if (replacesEntryInPlace) {

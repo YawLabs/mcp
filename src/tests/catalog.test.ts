@@ -220,6 +220,98 @@ describe("resolveCatalogSlug", () => {
   });
 
   // -------------------------------------------------------------------------
+  // The `optional` flag. Every gate in add / try / search reads the split
+  // made here, so this is where the wire contract is pinned: the field is
+  // named `optional`, lives on an individual requiredEnv entry, and only the
+  // boolean `true` lifts a key out of requiredEnvKeys.
+  // -------------------------------------------------------------------------
+
+  it("splits requiredEnv into required and optional keys on `optional: true`", async () => {
+    const servers: CatalogServer[] = [
+      {
+        slug: "consul",
+        install: { command: "docker run consul" },
+        requiredEnv: [
+          { key: "CONSUL_HTTP_ADDR", label: "address" },
+          { key: "CONSUL_HTTP_TOKEN", label: "token", optional: true },
+        ],
+      },
+    ];
+    const result = await resolveCatalogSlug("consul", { fetchCatalog: makeFetch(servers) });
+    expect(result.requiredEnvKeys).toEqual(["CONSUL_HTTP_ADDR"]);
+    expect(result.optionalEnvKeys).toEqual(["CONSUL_HTTP_TOKEN"]);
+  });
+
+  it("resolves an all-optional server with an EMPTY requiredEnvKeys list, like one that declares nothing", async () => {
+    const servers: CatalogServer[] = [
+      {
+        slug: "terraform",
+        install: { command: "docker run terraform" },
+        requiredEnv: [{ key: "TFE_TOKEN", optional: true }],
+      },
+      { slug: "none", install: { command: "npx none" } },
+    ];
+    const fetchCatalog = makeFetch(servers);
+    const tf = await resolveCatalogSlug("terraform", { fetchCatalog });
+    expect(tf.requiredEnvKeys).toEqual([]);
+    expect(tf.optionalEnvKeys).toEqual(["TFE_TOKEN"]);
+    const none = await resolveCatalogSlug("none", { fetchCatalog });
+    expect(none.requiredEnvKeys).toEqual([]);
+    expect(none.optionalEnvKeys).toEqual([]);
+  });
+
+  it('reads anything but the boolean `true` as required (remote data: a truthy read would let "false" through)', async () => {
+    const servers: CatalogServer[] = [
+      {
+        slug: "strict",
+        install: { command: "npx strict" },
+        requiredEnv: [
+          { key: "ABSENT" },
+          { key: "FALSE", optional: false },
+          { key: "STRING_TRUE", optional: "true" as never },
+          { key: "STRING_FALSE", optional: "false" as never },
+          { key: "ONE", optional: 1 as never },
+          { key: "NULL", optional: null as never },
+          { key: "OBJECT", optional: {} as never },
+        ],
+      },
+    ];
+    const result = await resolveCatalogSlug("strict", { fetchCatalog: makeFetch(servers) });
+    expect(result.requiredEnvKeys).toEqual(["ABSENT", "FALSE", "STRING_TRUE", "STRING_FALSE", "ONE", "NULL", "OBJECT"]);
+    expect(result.optionalEnvKeys).toEqual([]);
+  });
+
+  it("applies the same identifier filter to optional keys, so a malformed one is dropped rather than seeded", async () => {
+    const servers: CatalogServer[] = [
+      {
+        slug: "envy",
+        install: { command: "npx envy" },
+        requiredEnv: [
+          { key: "GOOD_OPT", optional: true },
+          { key: "HAS-DASH", optional: true },
+          { key: "", optional: true },
+        ],
+      },
+    ];
+    const result = await resolveCatalogSlug("envy", { fetchCatalog: makeFetch(servers) });
+    expect(result.optionalEnvKeys).toEqual(["GOOD_OPT"]);
+    expect(result.requiredEnvKeys).toEqual([]);
+  });
+
+  it("lets required win when the same key is listed both ways, so it is gated on and never printed twice", async () => {
+    const servers: CatalogServer[] = [
+      {
+        slug: "dupe",
+        install: { command: "npx dupe" },
+        requiredEnv: [{ key: "K", optional: true }, { key: "K" }],
+      },
+    ];
+    const result = await resolveCatalogSlug("dupe", { fetchCatalog: makeFetch(servers) });
+    expect(result.requiredEnvKeys).toEqual(["K"]);
+    expect(result.optionalEnvKeys).toEqual([]);
+  });
+
+  // -------------------------------------------------------------------------
   // Name / source fallbacks.
   // -------------------------------------------------------------------------
 

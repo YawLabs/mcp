@@ -41,6 +41,8 @@ Your MCP client (Claude Code, Cursor, ...)
 | `mcp_connect_secrets` | Show which local-vault secrets each server's `${secret:NAME}` refs resolve to -- by name only, never a value. |
 | `mcp_connect_health` | Call counts, error rates, and latency per loaded server. |
 
+**What `tools/list` carries.** By default (`gateway`) it is the meta-tools above plus the tools of the servers loaded *this session* -- never the whole catalog, which on a large install ran to ~27,000 tokens before the first prompt. The routing advice (dispatch for a concrete task, discover to browse, exec for a known chain, loading is per session) is sent once as the server's MCP `instructions`, which Claude Code puts in the system prompt, so the per-tool descriptions stay short. A client that cannot defer tool descriptions and inlines every listed tool into every request gets `lite` instead: only `mcp_connect_exec`, `mcp_connect_find_tool` and `mcp_connect_read_tool` are listed, which between them find, describe and call any installed tool (exec loads a cached server on first use). yaw-mcp picks `lite` on its own when the client identifies itself as `typed-cli` in the MCP `initialize` handshake; the unlisted meta-tools stay callable by name. `YAW_MCP_TOOL_EXPOSURE` overrides either default.
+
 **Ranking.** dispatch/discover rank with BM25, computed locally. On top of the ranker, three signals adjust scores:
 
 - **Health-aware** -- servers that recently failed or error often get down-ranked (never boosted above raw).
@@ -100,7 +102,7 @@ yaw-mcp can host itself on [oam](https://oamjs.org), a Rust+V8 JavaScript runtim
 
 `yaw-mcp install` writes the oam entry for you when two things are true:
 
-- **oam is installed** — `curl -fsSL https://oamjs.org/install.sh | sh`, or `irm https://oamjs.org/install.ps1 | iex` on Windows. Those install the current release, which always satisfies the minimum. An older build is refused rather than silently used: the floor tracks the latest oam release, so anything below it is a build that has fallen behind. `yaw-mcp doctor` prints the exact minimum under OAM RUNTIME.
+- **oam is installed** — `curl -fsSL https://oamjs.org/install.sh | sh`, or `irm https://oamjs.org/install.ps1 | iex` on Windows. Those install the current release, which always satisfies the minimum. An older build is refused rather than silently used: the minimum is the last oam release yaw-mcp's own check (`npm run verify:oam-floor` in the repo) hosted a real MCP server on -- not the latest release, so a new oam release does not by itself raise it -- and nothing older than that is supported. `yaw-mcp doctor` prints the exact minimum under OAM RUNTIME, and `oam self-update` is the fix when yours is below it.
 - **yaw-mcp is durably installed** — `npm i -g @yawlabs/mcp`, or a project `node_modules`. A path in the npx cache is deliberately not used: that directory is evictable, and an entry pointing into it breaks the moment npm cleans it.
 
 Neither is required, and nothing breaks without them — the npx entry is written as before, and install tells you which one you got. Afterwards `yaw-mcp doctor` marks a client whose entry launches the broker on oam with `(runs on oam)`, and its OAM RUNTIME section reports the binary, version, and minimum.
@@ -115,7 +117,7 @@ The entry it writes:
 }
 ```
 
-Two consequences worth knowing. It pins a path, so it does not re-resolve `@latest` on every spawn the way the npx entry does — `npm update -g` still picks up new versions, because it rewrites that path in place. And this setting is about the **broker itself**; which runtime the *sidecars* get is decided separately, below.
+Two consequences worth knowing. It pins a path, so it does not re-resolve `@latest` on every spawn the way the npx entry does — `npm update -g` still picks up new versions, because it rewrites that path in place, and an app upgrade that deletes the directory the path named (a scoop `current` junction is used instead, where one exists) is repaired by the broker's startup sweep or by `yaw-mcp heal`. And this setting is about the **broker itself**; which runtime the *sidecars* get is decided separately, below.
 
 ### Which runtime the sidecars get
 
@@ -224,6 +226,7 @@ It gets the same policy a proxied call gets, and gets it *before* the server is 
 ```bash
 yaw-mcp bundles [list|match] [--json]  # browse curated bundles; match partitions against your enabled servers
 yaw-mcp upgrade [--run] [--json]       # show (or run) the command that bumps @yawlabs/mcp
+yaw-mcp heal [--dry-run] [--json]      # re-point yaw-mcp client entries whose launch file an app upgrade deleted (runs at startup too)
 yaw-mcp reset-learning                 # clear cross-session learning (~/.yaw-mcp/state.json)
 yaw-mcp completion <bash|zsh|fish|powershell>   # print a shell-completion script
 ```
@@ -234,6 +237,8 @@ yaw-mcp completion <bash|zsh|fish|powershell>   # print a shell-completion scrip
 yaw-mcp compliance <target>   # run the 88-test compliance suite against a server
 yaw-mcp audit <namespace>     # audit a stdio server from bundles.json, cache its A-F grade in grades.json
 ```
+
+`heal` exists for the entry that pins a path (see [Running yaw-mcp on oam](#running-yaw-mcp-on-oam)): an app upgrade that deletes the directory the path named leaves the client unable to start the broker, and the client cannot report that because it cannot start the thing that would. The broker runs the same sweep at every startup, cross-client, so a client whose entry still works repairs the ones that do not; `heal` is for the machine whose only configured client is the broken one. It touches only an entry yaw-mcp wrote that is currently broken -- a working entry is never rewritten, however unusual it looks -- and prints each old and new path. `--dry-run` reports without writing; `--quiet` keeps the exit code and `--json` and drops the transcript. `YAW_MCP_AUTO_HEAL=0` turns the startup sweep off; `YAW_MCP_READONLY_DIAGNOSTICS=1` turns both off.
 
 To install completion, redirect to your shell's completions dir, e.g. `yaw-mcp completion zsh > "${fpath[1]}/_yaw-mcp"`, or `yaw-mcp completion powershell >> $PROFILE`.
 
@@ -405,6 +410,7 @@ Common ones (run `yaw-mcp --help` for the full list):
 | `YAW_MCP_TRUST_PROJECT` | `1` skips the consent check on a project-local `.yaw-mcp/bundles.json` and loads it unconditionally. CI/automation only -- it lets any repo you run yaw-mcp inside spawn commands as you. Default: the file must be approved with `yaw-mcp trust`. |
 | `YAW_MCP_AUTO_ACTIVATE` | `0` disables discover auto-loading a clearly-winning server. Default on. |
 | `YAW_MCP_AUTO_UPGRADE` | `0` disables the background self-upgrade check at startup. Default on. |
+| `YAW_MCP_AUTO_HEAL` | `0` disables the startup pass that re-points client entries whose launch file no longer exists -- what an app upgrade leaves behind when it deletes the directory the entry named. The pass only rewrites an entry yaw-mcp wrote that is currently broken; `yaw-mcp heal` is the same sweep on demand and ignores this variable. Default on. |
 | `YAW_MCP_SIDECAR_REFRESH` | `0` disables the daily background check that keeps managed sidecars current. Only ever runs if you have run `yaw-mcp sidecars install`; explicit pins and semver ranges are never moved. Default on. |
 | `YAW_MCP_PREWARM` | `0` stops yaw-mcp spawning a server at startup just to learn its tool list. Learning is rare -- the list persists and is only re-learned once it ages out -- but the session that does it starts the upstream twice, once to read the list and once for the activate that follows, which matters if the server startup is not idempotent. Off, a server whose tools are not already known shows none of them until you activate it; `discover` still lists it. Default on. |
 | `YAW_MCP_AUTO_PREWARM` | `0` disables the once-per-startup `npx -y <pkg>@latest` cache pre-warm that primes `~/.npm/_npx/<hash>/node_modules/<pkg>` for every active npx server. The pre-warm runs `npx ... --version` once per unique package in parallel, in a 30s budget per package, and resolves before the user's first `initialize` for that server lands. Without it, a fresh `_npx` cache makes a single spawn do a registry round-trip + a tar download + the child's own initialize -- reliably >30s, which exceeds the MCP client's `initialize` deadline and surfaces as "MCP request initialize to server mcp timed out after 30000ms". Default on. |
@@ -416,12 +422,13 @@ Common ones (run `yaw-mcp --help` for the full list):
 | `YAW_MCP_PRUNE_RESPONSES` | `0` disables response pruning. Default on. |
 | `YAW_MCP_MAX_RESULT_BYTES` | Ceiling on a single proxied tool result. Over it, the reply is cut and carries a marker saying so, with the byte total and what was dropped -- a silently truncated result reads to the model as a complete one. Default `100000` (~25k tokens); `0` disables. `structuredContent` is passed through verbatim and is never cut. |
 | `YAW_MCP_TOOL_TOKEN_CAP` | Ceiling on the estimated tokens of the whole loaded tool surface, checked alongside `YAW_MCP_SERVER_CAP` when a server is activated. The server cap counts servers, which says nothing about their size: six 3-tool servers and six 60-tool servers both sit at a cap of `6`. Default off. |
+| `YAW_MCP_TOOL_EXPOSURE` | How much of the catalog `tools/list` advertises. `gateway`: the meta-tools plus the servers loaded this session. `lite`: only `mcp_connect_exec` / `find_tool` / `read_tool` plus the loaded servers, for a client that inlines every listed tool into every request; the other meta-tools stay callable by name. `full`: the pre-gateway surface, with a placeholder for every cached-but-unloaded tool. Unset, yaw-mcp picks `lite` when the client's MCP `clientInfo.name` is `typed-cli` and `gateway` otherwise; a set value always wins over that. Re-read on every `tools/list`, so a change lands without a restart. An unrecognised value logs a warning once and falls back to the client default. |
 | `MCP_CONNECT_TIMEOUT` | Milliseconds to wait for a server's MCP handshake. Default `15000`; a server's own `connectTimeoutMs` in `bundles.json` always wins. Whole milliseconds in `1..2147483647` -- anything else falls back to the default with one warn. |
 | `MCP_LIST_TIMEOUT` | Milliseconds to wait for a server's tool/resource/prompt inventory calls after the handshake. Default `15000`; same `1..2147483647` whole-millisecond parse, invalid values fall back with one warn. |
 | `MCP_CALL_TIMEOUT` | Milliseconds to wait for a single proxied `tools/call`. Default `60000` (the SDK's own bound); raise it for legitimately slow servers. Same `1..2147483647` whole-millisecond parse, invalid values fall back with one warn. |
 | `YAW_MCP_IDLE_THRESHOLD` | Non-matching tool calls a loaded server tolerates before it is unloaded. Default `10`; bursty servers earn more patience automatically. The older name `MCP_CONNECT_IDLE_THRESHOLD` still works as a fallback. |
 | `YAW_MCP_DISABLE_PERSISTENCE` | `1` keeps learning + pack history process-scoped (CI, containers). Default off. |
-| `YAW_MCP_READONLY_DIAGNOSTICS` | `1` makes `doctor` (text and `--json`) and `bundles` write nothing, for a caller that runs them in the background on a timer. `doctor` still scans `yaw-mcp try` trials but does not sweep expired ones out of your client configs: each is reported as a warning (so the run exits 2) and listed in `--json`'s `trials.unswept`, with `trials.sweepHint` naming the fix -- a plain `yaw-mcp doctor` with the variable unset, or `yaw-mcp try-cleanup <slug>`. A pre-0.12 `~/.yaw-mcp.json` or project `.yaw-mcp.json` / `.yaw-mcp.local.json` is not moved into `.yaw-mcp/`; each is reported as a warning instead (its settings are not loaded for that run). `--json` carries `"readOnly": true` on such a run. `status` never writes, so it is unaffected. Default off. |
+| `YAW_MCP_READONLY_DIAGNOSTICS` | `1` makes `doctor` (text and `--json`), `bundles`, `yaw-mcp heal` and the broker's startup heal pass write nothing, for a caller that runs them in the background on a timer. `doctor` still scans `yaw-mcp try` trials but does not sweep expired ones out of your client configs: each is reported as a warning (so the run exits 2) and listed in `--json`'s `trials.unswept`, with `trials.sweepHint` naming the fix -- a plain `yaw-mcp doctor` with the variable unset, or `yaw-mcp try-cleanup <slug>`. A pre-0.12 `~/.yaw-mcp.json` or project `.yaw-mcp.json` / `.yaw-mcp.local.json` is not moved into `.yaw-mcp/`; each is reported as a warning instead (its settings are not loaded for that run). `--json` carries `"readOnly": true` on such a run. `status` never writes, so it is unaffected. Default off. |
 | `LOG_LEVEL` | `debug` \| `info` \| `warn` \| `error`. Default `info`. |
 
 ## Requirements

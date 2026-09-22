@@ -5988,6 +5988,53 @@ describe("resolveToolExposure", () => {
     expect(resolveToolExposure()).toBe("full");
   });
 
+  it("honors an explicit lite for any client", () => {
+    vi.stubEnv("YAW_MCP_TOOL_EXPOSURE", " Lite ");
+    expect(resolveToolExposure()).toBe("lite");
+    expect(resolveToolExposure({ name: "claude-code" })).toBe("lite");
+  });
+
+  it("defaults to lite when the client identifies as typed-cli, gateway for anyone else", () => {
+    // typed-cli inlines every advertised tool into every request and has no
+    // deferred loading; its yaw-mcp entry usually comes from ~/.claude.json,
+    // which it cannot add an env var to, so clientInfo is the only signal.
+    vi.stubEnv("YAW_MCP_TOOL_EXPOSURE", "");
+    expect(resolveToolExposure({ name: "typed-cli" })).toBe("lite");
+    expect(resolveToolExposure({ name: "claude-code" })).toBe("gateway");
+    expect(resolveToolExposure({ name: undefined })).toBe("gateway");
+    expect(resolveToolExposure(undefined)).toBe("gateway");
+    // Exact match: a near-name is not a client anyone measured.
+    expect(resolveToolExposure({ name: "typed-cli-fork" })).toBe("gateway");
+    expect(resolveToolExposure({ name: "Typed-CLI" })).toBe("gateway");
+  });
+
+  it("lets an explicit env value win over the typed-cli default, in every direction", () => {
+    vi.stubEnv("YAW_MCP_TOOL_EXPOSURE", "gateway");
+    expect(resolveToolExposure({ name: "typed-cli" })).toBe("gateway");
+    vi.stubEnv("YAW_MCP_TOOL_EXPOSURE", "full");
+    expect(resolveToolExposure({ name: "typed-cli" })).toBe("full");
+  });
+
+  it("falls back to the CLIENT's default on an unrecognized value, and the warning names it", () => {
+    // Same recoverable direction as the gateway case below, one step
+    // further for typed-cli: the smaller surface for THIS client is lite.
+    const written: string[] = [];
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(((chunk: unknown) => {
+      written.push(String(chunk));
+      return true;
+    }) as never);
+    try {
+      vi.stubEnv("LOG_LEVEL", "");
+      vi.stubEnv("YAW_MCP_TOOL_EXPOSURE", "litee");
+      expect(resolveToolExposure({ name: "typed-cli" })).toBe("lite");
+      const warn = written.find((l) => l.includes('"raw":"litee"'));
+      expect(warn).toBeDefined();
+      expect(warn).toContain('using \\"lite\\"');
+    } finally {
+      stderr.mockRestore();
+    }
+  });
+
   it("falls back to gateway on an unrecognized value, not to the full surface", () => {
     // A typo must not silently restore the ~27,000-token catalog; failing
     // toward the smaller surface is the recoverable direction.

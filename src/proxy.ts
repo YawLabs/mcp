@@ -1,6 +1,6 @@
 import { scrubForWarning } from "./health-score.js";
 import { log } from "./logger.js";
-import { META_TOOLS } from "./meta-tools.js";
+import { LITE_META_TOOL_NAMES, META_TOOLS } from "./meta-tools.js";
 import type { UpstreamConnection, UpstreamServerConfig } from "./types.js";
 import { resolveTimeoutEnv } from "./upstream.js";
 
@@ -65,8 +65,26 @@ export interface BuiltinResource {
  *
  * - `gateway` (default): the meta-tools, plus the tools of namespaces
  *   activated THIS SESSION. Nothing else — no deferred placeholders.
+ * - `lite`: gateway, minus every meta-tool except exec / find_tool /
+ *   read_tool (LITE_META_TOOL_NAMES). The default for typed-cli, by
+ *   clientInfo -- see resolveToolExposure in server.ts.
  * - `full`: the historical behavior — meta-tools, every active upstream's
  *   tools, and a deferred placeholder for every cached-but-inactive one.
+ *
+ * WHY LITE EXISTS. Gateway assumes the client can afford the eleven
+ * meta-tools once. typed-cli cannot defer anything: every advertised tool's
+ * name, description and schema is inlined into EVERY request (its
+ * budget.ts), so the meta-tools alone rode every turn -- 17,929 wire chars
+ * (~5.1k tokens) before the descriptions were trimmed, still ~11.6k after.
+ * Its own gateway logic already treats exec / find_tool / read_tool as the
+ * only three it must keep when it has to cap (client.ts
+ * yawGatewayCapPriority), because between them they reach any installed tool
+ * without the client's tool list ever changing: find_tool names it,
+ * read_tool describes it, exec calls it and loads its server on first use.
+ * Advertising only those three is that cap applied at the source, so the
+ * uncapped hosted tiers stop paying for the other eight too. The unlisted
+ * meta-tools stay callable by name -- lite narrows tools/list, never
+ * handleToolCall -- and upstream tools are gated exactly as under gateway.
  *
  * WHY GATEWAY IS THE DEFAULT. Deferring only the SCHEMA is not enough to make
  * a large catalog affordable. Measured 2026-08-09 against this install:
@@ -85,7 +103,7 @@ export interface BuiltinResource {
  * mcp_connect_dispatch still reaches any tool by name without it ever having
  * been advertised.
  */
-export type ToolExposure = "gateway" | "full";
+export type ToolExposure = "gateway" | "lite" | "full";
 
 export function buildToolList(
   activeConnections: Map<string, UpstreamConnection>,
@@ -103,7 +121,7 @@ export function buildToolList(
   // silently lose its tools.
   exposure: ToolExposure = "full",
   // Namespaces the client explicitly activated this session. Only consulted
-  // in gateway mode; `full` advertises everything regardless.
+  // under gateway and lite; `full` advertises everything regardless.
   exposedNamespaces?: ReadonlySet<string>,
   // Per-TOOL deny predicate, taking the flattened wire name. Distinct from
   // toolFilters above in both key and intent: filters are the model's own
@@ -131,8 +149,11 @@ export function buildToolList(
   }> = [];
   const seen = new Set<string>();
 
-  // Meta-tools first
+  // Meta-tools first. Lite advertises only the exec-route three; the rest
+  // are still dispatched by name in handleToolCall, so this is a list
+  // narrowing, not a capability one (see ToolExposure).
   for (const meta of Object.values(META_TOOLS)) {
+    if (exposure === "lite" && !LITE_META_TOOL_NAMES.has(meta.name)) continue;
     tools.push({
       name: meta.name,
       description: meta.description,
@@ -150,12 +171,14 @@ export function buildToolList(
   // arbitrarily or error). First writer wins here, matching the meta-tool
   // precedence above; buildToolRoutes logs the collision.
   for (const conn of activeConnections.values()) {
-    // Gateway mode advertises a namespace only once the client has asked for
-    // it. A server that is merely CONNECTED does not qualify: yaw-mcp
-    // pre-warms dormant servers on its own (prewarmDormantServers), so
-    // keying on connectedness would re-advertise the whole catalog through
-    // the back door and undo the point of the mode.
-    if (exposure === "gateway" && !exposedNamespaces?.has(conn.config.namespace)) continue;
+    // Gateway (and lite, which is gateway with fewer meta-tools) advertises
+    // a namespace only once the client has asked for it. A server that is
+    // merely CONNECTED does not qualify: yaw-mcp pre-warms dormant servers
+    // on its own (prewarmDormantServers), so keying on connectedness would
+    // re-advertise the whole catalog through the back door and undo the
+    // point of the mode. Written as `!== "full"` so a future exposure that
+    // forgets this gate fails toward the smaller surface.
+    if (exposure !== "full" && !exposedNamespaces?.has(conn.config.namespace)) continue;
     const filter = toolFilters?.get(conn.config.namespace);
     for (const tool of conn.tools) {
       if (filter && !filter.has(tool.name)) continue;
@@ -191,8 +214,9 @@ export function buildToolList(
     // These placeholders ARE the ~27,000 tokens gateway mode exists to
     // remove. Withholding them costs nothing in reach: buildToolRoutes
     // ignores exposure, so mcp_connect_dispatch and a first tools/call
-    // still activate the server and re-dispatch.
-    if (exposure === "gateway") continue;
+    // still activate the server and re-dispatch. Lite withholds them for
+    // the same reason.
+    if (exposure !== "full") continue;
     const filter = toolFilters?.get(server.namespace);
     for (const cached of server.toolCache) {
       if (filter && !filter.has(cached.name)) continue;
@@ -334,7 +358,7 @@ export function buildResourceList(
     seen.add(b.uri);
   }
   for (const conn of activeConnections.values()) {
-    if (exposure === "gateway" && !exposedNamespaces?.has(conn.config.namespace)) continue;
+    if (exposure !== "full" && !exposedNamespaces?.has(conn.config.namespace)) continue;
     for (const r of conn.resources) {
       if (seen.has(r.namespacedUri)) continue;
       // title / _meta ride along, same as buildToolList: an upstream that
@@ -408,7 +432,7 @@ export function buildPromptList(
   // writer wins, and buildPromptRoutes agrees on that winner.
   const seen = new Set<string>();
   for (const conn of activeConnections.values()) {
-    if (exposure === "gateway" && !exposedNamespaces?.has(conn.config.namespace)) continue;
+    if (exposure !== "full" && !exposedNamespaces?.has(conn.config.namespace)) continue;
     for (const p of conn.prompts) {
       if (seen.has(p.namespacedName)) continue;
       // title / _meta forwarded, same rationale as buildResourceList.

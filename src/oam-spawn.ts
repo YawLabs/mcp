@@ -25,28 +25,37 @@
 // default-runtime.ts), not an opt-in tier -- that changed in #99, and this note
 // described the opt-in model for two releases after it.
 //
-// VERIFIED ON THE OAM SIDE, per release: oam's scripts/mcp-sidecar-matrix.mjs
-// reproduces this rewrite (`npx [-y] <pkg> [...rest]` -> `oam run <resolved
-// bin> [-- ...rest]`, the bin read from the package's own package.json) and,
-// for each sidecar in it, runs initialize, tools/list and a real tool call on
-// oam and again on a node control. oam's scripts/release-local.sh runs it
-// against the freshly built native (Windows arm64) release asset before
-// `gh release create`: a failure on oam that the node control does not
-// reproduce stops the release, while a run that cannot answer for a sidecar
-// (an install failure, a broken upstream, a missing fixture) only warns. Read
-// that matrix, not a dated measurement here -- release.sh moves
-// MIN_OAM_VERSION to the latest oam release on its own and runs no hosting
-// check, so the dated note this replaced went stale at every floor move.
-//
-// Both bundled-browser servers are rows in that matrix:
-// @modelcontextprotocol/server-puppeteer and @playwright/mcp each drive a real
-// browser to a loopback page on oam. An earlier note here called bundled
-// browsers "not oam-hostable yet"; that was true and is no longer. oam 0.9.0 is
-// what changed it: before that release `child_process` ignored `stdio`
-// entirely ('inherit'/'ignore' both behaved as 'pipe'), which is precisely the
-// npm bin-shim shape every sidecar launches through -- they booted and then sat
-// mute forever while the launcher reported success. MIN_OAM_VERSION gates that
-// fix in, so a machine below the floor gets node.
+// MEASURED: the SDK-hosting mechanism check -- a stdio @modelcontextprotocol/sdk
+// server completes initialize + tools/list + tools/call hosted on `oam run` --
+// is now `npm run verify:oam-floor` (scripts/verify-oam-floor.mjs): release.sh
+// runs it in step 1 against this machine's oam, and `--raise` is the only
+// thing that moves MIN_OAM_VERSION, so every floor from here on has that
+// check behind it by construction (0.16.3 itself: 2026-09-21, on the
+// verifier's first run). Before that the check was re-run by hand against
+// 0.13.0 on 2026-09-02 and carried forward, not re-measured, across the
+// 0.13.1 -> 0.16.3 moves release.sh made on its own. The full per-server
+// matrix below was last run against 0.11.0 on 2026-08-22 (first 0.9.0 on
+// 2026-08-08), and nothing in THIS repo re-runs it. oam's own release gate
+// does, per oam release: its scripts/mcp-sidecar-matrix.mjs reproduces this
+// rewrite (`npx [-y] <pkg> [...rest]` -> `oam run <resolved bin> [-- ...rest]`,
+// the bin read from the package's own package.json) and, for each sidecar in
+// it, runs initialize, tools/list and a real tool call on oam and again on a
+// node control; oam's scripts/release-local.sh runs that against the freshly
+// built native (Windows arm64) release asset before `gh release create`, a
+// failure on oam that the node control does not reproduce stops that release,
+// and a run that cannot answer for a sidecar (an install failure, a broken
+// upstream, a missing fixture) only warns. What the 0.11.0 run here measured:
+// the pure-JS/SDK tier (memory, tailscale, lemonsqueezy, redis, postgres,
+// ctxlint) completes an MCP initialize handshake hosted on oam, AND so do both
+// bundled-browser servers -- @modelcontextprotocol/server-puppeteer and
+// @playwright/mcp each launched a real Chromium and served a real
+// tools/call navigate on oam, matching the node control. An earlier note here
+// called bundled browsers "not oam-hostable yet"; that was true and is no
+// longer. oam 0.9.0 is what changed it: before that release `child_process`
+// ignored `stdio` entirely ('inherit'/'ignore' both behaved as 'pipe'), which
+// is precisely the npm bin-shim shape every sidecar launches through -- they
+// booted and then sat mute forever while the launcher reported success.
+// MIN_OAM_VERSION gates that fix in, so a machine below the floor gets node.
 //
 // One browser mode is still NOT hostable: @playwright/mcp with --isolated boots
 // and lists its tools on oam, but every browser tool errors (measured on
@@ -54,10 +63,10 @@
 // client for a named pipe or a Unix-domain socket -- net.connect({path}) fails
 // with ERR_FEATURE_UNAVAILABLE_ON_PLATFORM. oam never had such a client: up to
 // 0.16.2 it dialled host:port instead, and a844903 (first in 0.16.3) only
-// replaced that silent misconnect with the refusal. The matrix's playwright row
-// runs with a persistent profile, so it does not cover this mode. The boot is
-// healthy, so the boot-scoped node downgrade below never fires; `"runtime":
-// "node"` for that server is the escape.
+// replaced that silent misconnect with the refusal. Neither the 0.11.0 run nor
+// oam's matrix covers this mode (its playwright row runs with a persistent
+// profile). The boot is healthy, so the boot-scoped node downgrade below never
+// fires; `"runtime": "node"` for that server is the escape.
 //
 // Native addons: oam refuses to dlopen a .node addon by default, throwing a
 // CATCHABLE error with code OAM-NATIVE0001 (OAM_ENABLE_NATIVE_ADDONS=1 opts
@@ -241,24 +250,35 @@ export function npxSpec(args: readonly string[]): string | null {
 /**
  * Minimum oam version yaw-mcp will host sidecars on.
  *
- * POLICY: this tracks the LATEST oam release. Bump it with every oam release,
- * not only when a release happens to fix something this code noticed. oam is
- * pre-1.0 and moves fast, the install channel (oamjs.org) only ever hands out
- * the current release, and hosting sidecars on a runtime older than that means
- * debugging against a build nobody else is running. There is no support
- * commitment for older builds, so there is no reason to admit them.
+ * POLICY: this is the last oam release the hosting mechanism was VERIFIED on
+ * -- `npm run verify:oam-floor` (scripts/verify-oam-floor.mjs) hosted a stdio
+ * @modelcontextprotocol/sdk server on that oam through `oam run` and completed
+ * initialize + tools/list + tools/call. It moves only by `npm run
+ * verify:oam-floor -- --raise`, which runs that check against the oam on the
+ * machine and then rewrites this constant, the ratchet literal in
+ * oam-spawn.test.ts and a CHANGELOG block together; the operator commits the
+ * result like any other change. release.sh runs the check (never the raise)
+ * in step 1, so a release cannot ship a floor the check has not passed on
+ * the release machine.
  *
- * release.sh does the bump. It reads the latest oam release from GitHub before
- * its confirm prompt and, when this is behind and the version being released is
- * not yet tagged or on npm, moves it -- with the ratchet literal in
- * oam-spawn.test.ts and a CHANGELOG block -- in a commit made before its lint,
- * typecheck and test gates run.
+ * It used to track the LATEST oam release, moved by release.sh from GitHub's
+ * /releases/latest without running anything. That is not free: a machine
+ * whose oam is below the floor hosts its node/npx sidecars on node with a
+ * warning (resolveOamSpawn), and install/heal write npx entries for the
+ * broker instead of oam ones (install-targets.ts) -- the slow spawn shape
+ * this whole module exists to avoid -- and typed users hit the same fallback
+ * because typed's preload launches the same broker binary. 0.16.1 -> 0.16.2
+ * -> 0.16.3 in five days paid that on every machine that had not run `oam
+ * self-update`, for releases that changed nothing the mechanism depends on.
+ * A verified floor still moves forward -- oamjs.org only ever installs the
+ * current release, and there is no support commitment for older builds -- but
+ * each move is a measurement, not a mirror of the release feed.
  *
  * Below-min is treated the same as oam-absent: the spawn falls back to
  * node/npx with one warn log naming both versions. That is a safe outcome --
- * the user gets node, which is what they had before oam existed -- so an
- * aggressive floor costs nothing but a fallback, while a lax one silently
- * hosts production sidecars on a runtime that is no longer current.
+ * the user gets node, which is what they had before oam existed -- so a
+ * floor that is too high costs a fallback, while one that is too low hosts
+ * production sidecars on a build the check never ran on.
  */
 export const MIN_OAM_VERSION = "0.16.3";
 
@@ -1015,8 +1035,9 @@ async function probeOamUncached(run: (bin: string) => Promise<string>, generatio
         // make this line look like a comparator bug.
         oamVersion: version,
         minVersion: MIN_OAM_VERSION,
-        // The floor tracks the latest release, so below-min always means out
-        // of date, and oam updates itself in place.
+        // The floor is a released oam (the last one verify:oam-floor passed
+        // on), so below-min always means out of date, and oam updates itself
+        // in place.
         updateWith: "oam self-update",
         // ...but updating alone changes nothing here. oamProbeCache is written
         // once per process and only ever cleared by a test hook, so every

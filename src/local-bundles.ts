@@ -1286,6 +1286,11 @@ function mergeServerEntry(
     merged[k] = v;
   }
   if (base.isActive === false && incoming.isActive !== false) merged.isActive = false;
+  // `optionalEnvKeys` marks which blank env seeds are optional (see
+  // local-add-cmd's entry). An add writes it as an ARRAY every time so a
+  // catalog that stopped flagging a var clears the old marker on re-add; an
+  // empty array carries no information, so it is dropped rather than stored.
+  if (Array.isArray(merged.optionalEnvKeys) && merged.optionalEnvKeys.length === 0) delete merged.optionalEnvKeys;
   // The mirror of the rule below, and it has to exist for the same reason:
   // the two launch shapes are exclusive, and half-converting leaves an entry
   // whose renderers disagree with what it does. Without this, `add <name>
