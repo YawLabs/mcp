@@ -395,6 +395,17 @@ describe("maybeRefreshSidecars", () => {
     // accepts "FALSE" and the two features must not disagree about it.
   });
 
+  it("does nothing when YAW_MCP_SIDECAR_REFRESH='0 ' -- cmd.exe's trailing space is trimmed", async () => {
+    // `set VAR=0 && yaw-mcp serve` keeps the space before `&&`. This reader
+    // used to compare untrimmed, so the documented opt-out was ignored on
+    // Windows; the shared parser (opt-out-env.ts) trims for every feature.
+    process.env.YAW_MCP_SIDECAR_REFRESH = "0 ";
+    const h = harness();
+    await maybeRefreshSidecars(h.deps);
+    expect(h.hasManagedSidecarsImpl).not.toHaveBeenCalled();
+    expect(h.spawnRefreshImpl).not.toHaveBeenCalled();
+  });
+
   it("still runs for an unrelated value of the opt-out var", async () => {
     // Only "0" and "false" disable it; a stray "1"/"yes"/"" must not.
     process.env.YAW_MCP_SIDECAR_REFRESH = "1";

@@ -126,8 +126,10 @@
 //     process tree takes a half-finished install with it. Recovery is a manual
 //     `yaw-mcp sidecars install`; nothing here repairs a partial tree.
 //
-// Opt-out: YAW_MCP_SIDECAR_REFRESH=0 (or =false), parsed exactly like
-// auto-upgrade's YAW_MCP_AUTO_UPGRADE.
+// Opt-out: YAW_MCP_SIDECAR_REFRESH=0 (or =false), through the ONE parser every
+// YAW_MCP_* opt-out shares (isFeatureDisabled, opt-out-env.ts) -- so it is
+// the same spellings, and the same trim, as YAW_MCP_AUTO_UPGRADE by
+// construction rather than by promise.
 
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -136,6 +138,7 @@ import { atomicWriteFile } from "./atomic-write.js";
 import { loadLocalBundles } from "./local-bundles.js";
 import { log } from "./logger.js";
 import { compareVersions } from "./oam-spawn.js";
+import { isFeatureDisabled } from "./opt-out-env.js";
 import { CONFIG_DIRNAME, sidecarsRoot } from "./paths.js";
 import {
   acquireSidecarsLock,
@@ -646,23 +649,23 @@ function defaultInstalledVersion(pkg: string, home: string): string | null {
 
 /**
  * Is the background refresh switched off? `YAW_MCP_SIDECAR_REFRESH=0` or
- * `=false`, case-insensitively -- the same parse auto-upgrade uses for
- * YAW_MCP_AUTO_UPGRADE, so one habit ("=0 or =false turns it off") covers both
- * background features.
+ * `=false`, case-insensitively and whitespace-trimmed -- the one parse every
+ * YAW_MCP_* opt-out goes through (isFeatureDisabled, opt-out-env.ts), so one
+ * habit ("=0 or =false turns it off") covers every background feature.
  *
- * Exported because this module is not the only place that has to answer the
- * question: doctor-cmd re-derives it to decide whether to describe a stale
- * package as one the refresher will carry forward (saying so on a machine where
- * the user turned the refresher off is simply false, to exactly the reader who
- * most needs to be told to run `sidecars install` by hand). That copy, and
- * auto-upgrade's for its own variable, should call this rather than re-spelling
- * the parse -- three hand-copies each carrying a comment promising to match the
- * others is how "=FALSE" ends up honoured by two of them and not the third.
- * `env` is a parameter for doctor's sake: it takes the environment as input.
+ * Kept as a named wrapper, and exported, because this module is not the only
+ * place that has to answer the question: doctor-cmd calls it to decide whether
+ * to describe a stale package as one the refresher will carry forward (saying
+ * so on a machine where the user turned the refresher off is simply false, to
+ * exactly the reader who most needs to be told to run `sidecars install` by
+ * hand). This used to be one of several hand-spelled copies, each carrying a
+ * comment promising to match the others -- which is how the copies came to
+ * disagree about trimming, and how "0 " from a cmd.exe `set VAR=0 && ...`
+ * was honoured by some of them and not the rest. `env` is a parameter for
+ * doctor's sake: it takes the environment as input.
  */
 export function isSidecarRefreshDisabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  const raw = env.YAW_MCP_SIDECAR_REFRESH;
-  return raw === "0" || raw?.toLowerCase() === "false";
+  return isFeatureDisabled("YAW_MCP_SIDECAR_REFRESH", env);
 }
 
 /**
