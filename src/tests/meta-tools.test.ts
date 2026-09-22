@@ -1,8 +1,111 @@
 import { describe, expect, it } from "vitest";
 import { MAX_EXEC_STEPS } from "../exec-engine.js";
 import { PENALTY_RATE_THRESHOLD } from "../learning.js";
-import { computeSecretsReport, META_TOOL_NAMES, META_TOOLS } from "../meta-tools.js";
+import {
+  computeSecretsReport,
+  LITE_META_TOOL_NAMES,
+  META_TOOL_NAMES,
+  META_TOOLS,
+  SERVER_INSTRUCTIONS,
+} from "../meta-tools.js";
+import { buildToolList } from "../proxy.js";
 import { MALFORMED_REF_MARKER, MALFORMED_REF_MAX_CHARS, SECRET_REF_RE } from "../secrets-vault.js";
+
+/** The tools/list wire JSON a client receives before any upstream is
+ *  activated, at the given exposure -- exactly what the server's handler
+ *  builds, serialized the way the SDK sends it. */
+function wire(exposure: "gateway" | "lite" | "full"): { total: number; perTool: Map<string, number> } {
+  const tools = buildToolList(new Map(), [], undefined, exposure, new Set());
+  return {
+    total: JSON.stringify({ tools }).length,
+    perTool: new Map(tools.map((t) => [t.name, JSON.stringify(t).length])),
+  };
+}
+
+describe("meta-tool wire size (tools/list before any activation)", () => {
+  // Measured 2026-09-21 on a bundle of src/meta-tools.ts: BEFORE the routing
+  // prose moved into SERVER_INSTRUCTIONS the eleven meta-tools were 17,929
+  // chars of tools/list wire JSON (~5.1k tokens at 3.5 chars/token), 10,849
+  // of them description text, exec alone 3,897 (2,162 description). AFTER:
+  // 11,590 total, 5,456 description, exec 2,806 (1,493 description), and the
+  // lite surface 4,567. These ceilings sit just above the AFTER numbers on
+  // purpose: a description is paid on every tools/list, and on a client
+  // with no deferred loading it is inlined into every request, so a
+  // sentence added to one "for clarity" is a per-turn tax nothing else
+  // would flag. Raise a ceiling only with a measurement in the commit.
+  const GATEWAY_WIRE_CEILING = 12_000;
+  const LITE_WIRE_CEILING = 4_800;
+  const EXEC_WIRE_CEILING = 2_900;
+  const EXEC_DESCRIPTION_CEILING = 1_500;
+  const DESCRIPTION_TOTAL_CEILING = 5_600;
+  const INSTRUCTIONS_CEILING = 600;
+
+  it("keeps the whole gateway surface under the ceiling", () => {
+    expect(wire("gateway").total).toBeLessThanOrEqual(GATEWAY_WIRE_CEILING);
+  });
+
+  it("keeps the lite surface under its ceiling", () => {
+    expect(wire("lite").total).toBeLessThanOrEqual(LITE_WIRE_CEILING);
+  });
+
+  it("keeps exec, the largest tool, under its own ceiling", () => {
+    // Exec is a third of the surface by itself and the one tool every
+    // exposure lists, so it gets a per-tool pin the others do not need.
+    expect(wire("gateway").perTool.get(META_TOOLS.exec.name)).toBeLessThanOrEqual(EXEC_WIRE_CEILING);
+    expect(META_TOOLS.exec.description.length).toBeLessThanOrEqual(EXEC_DESCRIPTION_CEILING);
+  });
+
+  it("keeps the summed description text under the ceiling", () => {
+    const total = Object.values(META_TOOLS).reduce((n, m) => n + m.description.length, 0);
+    expect(total).toBeLessThanOrEqual(DESCRIPTION_TOTAL_CEILING);
+  });
+
+  it("keeps the server instructions short: they land in the system prompt of every session", () => {
+    expect(SERVER_INSTRUCTIONS.length).toBeLessThanOrEqual(INSTRUCTIONS_CEILING);
+  });
+
+  it("gateway and full list the same meta-tools; full differs only in upstream placeholders", () => {
+    expect(wire("full").total).toBe(wire("gateway").total);
+  });
+});
+
+describe("SERVER_INSTRUCTIONS carries the routing advice the descriptions no longer repeat", () => {
+  it("names the three routing entry points, the per-session unload, and the guide", () => {
+    for (const needle of [
+      META_TOOLS.dispatch.name,
+      META_TOOLS.discover.name,
+      META_TOOLS.exec.name,
+      META_TOOLS.deactivate.name,
+      "yaw-mcp://guide",
+    ]) {
+      expect(SERVER_INSTRUCTIONS).toContain(needle);
+    }
+  });
+
+  it("is the ONLY home of the guide pointer and the dispatch-vs-discover routing rule", () => {
+    // The regression this guards is the prose creeping back: before the
+    // split discover, dispatch and exec each carried "read the guide first"
+    // and "prefer dispatch when the task is concrete" in their own words.
+    for (const meta of Object.values(META_TOOLS)) {
+      expect(meta.description, meta.name).not.toContain("yaw-mcp://guide");
+      expect(meta.description, meta.name).not.toMatch(/PREFERRED entry point/i);
+      expect(meta.description, meta.name).not.toMatch(/prefer `mcp_connect_dispatch`/);
+    }
+  });
+});
+
+describe("LITE_META_TOOL_NAMES", () => {
+  it("is exactly the exec-route three, and every one is a real meta-tool", () => {
+    // typed-cli's yawGatewayCapPriority keeps exactly these three when it
+    // has to cap; lite is that choice applied at the source, so the set
+    // must not drift from it in either direction.
+    expect([...LITE_META_TOOL_NAMES].sort()).toEqual(
+      [META_TOOLS.exec.name, META_TOOLS.findTool.name, META_TOOLS.read_tool.name].sort(),
+    );
+    // Cast as server.ts does: META_TOOL_NAMES is typed over the literal names.
+    for (const name of LITE_META_TOOL_NAMES) expect((META_TOOL_NAMES as Set<string>).has(name)).toBe(true);
+  });
+});
 
 describe("mcp_connect_secrets meta-tool definition", () => {
   it("is registered with values-free annotations", () => {

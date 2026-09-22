@@ -481,10 +481,14 @@ if (subcommand === "compliance") {
                                \`0\` disables).
     YAW_MCP_TOOL_EXPOSURE         How much of the catalog tools/list advertises.
                                \`gateway\` (default) exposes the meta-tools
-                               plus loaded servers only; \`full\` restores the
+                               plus loaded servers only; \`lite\` (the default
+                               when the client is typed-cli) exposes only
+                               mcp_connect_exec / find_tool / read_tool plus
+                               loaded servers; \`full\` restores the
                                pre-gateway behavior and inlines the whole
-                               catalog. Re-read per call -- a change lands on
-                               the next tools/list without a restart.
+                               catalog. Set, it wins over the client default.
+                               Re-read per call -- a change lands on the next
+                               tools/list without a restart.
     YAW_MCP_ROUTE_EFFORT          How hard dispatch tries to break ranking ties
                                with the client LLM: \`off\` | \`auto\` |
                                \`aggressive\` (default auto). The dispatch

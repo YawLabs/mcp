@@ -1559,7 +1559,7 @@ export const DOCTOR_ENV_VARS: ReadonlyArray<{ name: string; defaultHint: string 
   { name: "YAW_MCP_PRUNE_RESPONSES", defaultHint: "pruning active" },
   { name: "YAW_MCP_MAX_RESULT_BYTES", defaultHint: "default 100000" },
   { name: "YAW_MCP_DEFAULT_RUNTIME", defaultHint: "oam when installed" },
-  { name: "YAW_MCP_TOOL_EXPOSURE", defaultHint: "gateway" },
+  { name: "YAW_MCP_TOOL_EXPOSURE", defaultHint: "gateway; lite for typed-cli" },
   { name: "YAW_MCP_AUTO_UPGRADE", defaultHint: "default on" },
   { name: "YAW_MCP_AUTO_HEAL", defaultHint: "default on" },
   { name: "YAW_MCP_SIDECAR_REFRESH", defaultHint: "default on" },

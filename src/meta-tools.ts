@@ -18,23 +18,47 @@ import { isRemoteEntry } from "./types.js";
 // a hardcoded "<80%" or "Max 16 steps" is a lie the moment either moves.
 const PENALTY_RATE_PCT = Math.round(PENALTY_RATE_THRESHOLD * 100);
 
+/**
+ * The server-level `instructions` string sent once in the initialize result.
+ *
+ * This is where the ROUTING advice lives -- when to dispatch vs discover vs
+ * exec, that loading is per session, that the guide resource comes first.
+ * It used to be repeated inside the discover, dispatch, exec, suggest and
+ * bundles descriptions, and a description is paid on every tools/list (and,
+ * on a client with no deferred loading, inlined into EVERY request), while
+ * Claude Code injects `instructions` into the system prompt exactly once.
+ * Measured before the split: the eleven meta-tools were 17,929 chars of
+ * tools/list wire JSON, 10,849 of them description text. The per-tool
+ * descriptions below now say only what each tool DOES, and
+ * meta-tools.test.ts pins both this string and the wire total so neither
+ * silently regrows.
+ *
+ * Kept exposure-neutral: a `lite` session (proxy.ts ToolExposure) advertises
+ * only exec / find_tool / read_tool, but every meta-tool named here is still
+ * callable by name, so nothing below is untrue for it.
+ */
+export const SERVER_INSTRUCTIONS = [
+  "yaw-mcp fronts every MCP server the user installed; tools/list shows the mcp_connect_* meta-tools plus servers loaded THIS session. Each load adds tools to your context: unload (mcp_connect_deactivate) when done.",
+  "Concrete task: mcp_connect_dispatch loads the best server in one call. Browsing: mcp_connect_discover. Known 2-4 step chain: mcp_connect_exec (calls a cached server's tool by name, no load needed).",
+  "Prefer a server over the CLI it shadows. Read yaw-mcp://guide first when listed: this project's routing rules.",
+].join(" ");
+
 export const META_TOOLS = {
   discover: {
     name: "mcp_connect_discover",
     description:
-      'List the MCP servers configured in the user\'s local ~/.yaw-mcp/bundles.json and ready to use. Call this when browsing what\'s available or when the task isn\'t specific yet. If the task is already clear ("file a github issue", "query postgres", "post to slack"), prefer `mcp_connect_dispatch` — it picks the right server and loads its tools in one call. Load only the servers the CURRENT task needs; each one adds tools to your context. Shows names, namespaces, tool counts, a token-cost estimate per server (e.g. "22 tools, ~2.8k tokens") so you can budget context before activating — tilde values are estimates based on cached tool metadata, unprefixed values reflect live tool schemas. Tool-name lists are truncated to the first few names per server; pass `server` to see the full list for one server. Scored servers carry an inline `[A]`–`[F]` compliance grade from the Yaw MCP test suite — treat it as a trust signal and prefer higher-graded alternatives when otherwise equivalent (ungraded servers are unmarked, not penalized). Also surfaces whether each server is loaded, any local CLI it shadows (prefer the MCP tools over the CLI when a shadow is listed), and usage hints ("used Nx" or "often loaded with X") when the signals are present (counts persist across yaw-mcp restarts). Recurring packs that have been loaded together ≥2 times get their own block at the top with a ready-to-run `activate` call — skip the extra `mcp_connect_suggest` round-trip when the signal is already there. If a `yaw-mcp://guide` resource is listed, read it FIRST: it carries project/user-specific routing rules and credential conventions that override generic defaults.',
+      "List the MCP servers installed in the user's ~/.yaw-mcp/bundles.json: name, namespace, tool count, an estimated token cost (a tilde marks an estimate from cached metadata), whether it is loaded, any local CLI it shadows, an inline `[A]`-`[F]` compliance grade when scored (ungraded is unmarked, not penalized), and usage hints. Tool-name lists are truncated; pass `server` for one server's full card. Recurring packs get a ready-to-run `mcp_connect_activate` call at the top.",
     inputSchema: {
       type: "object" as const,
       properties: {
         context: {
           type: "string",
-          description:
-            "Optional: describe the current task or conversation context. Servers will be sorted by relevance to help you pick the right one.",
+          description: "Optional: the current task. Servers are sorted by relevance to it.",
         },
         server: {
           type: "string",
           description:
-            "Optional: one namespace to report on in full. Returns just that server's card with its complete tool list, and none of the cross-server blocks.",
+            "Optional: one namespace to report on in full -- just that server's card, with its complete tool list.",
         },
       },
     },
@@ -49,7 +73,7 @@ export const META_TOOLS = {
   activate: {
     name: "mcp_connect_activate",
     description:
-      'Load one or more installed MCP servers\' tools into the current session by namespace. Each server adds its tools to your context, so load only what the current task needs. When you move on, unload servers you\'re done with via `mcp_connect_deactivate` before loading new ones. Tools are prefixed by namespace (e.g., "gh_create_issue"). Pass "server" for one or "servers" for multiple. Optionally pass `tools: [...]` to expose only those tools by name — the rest stay proxyable via mcp_connect_dispatch. If `YAW_MCP_MIN_COMPLIANCE` is set, activation refuses servers whose reported grade is below the floor (ungraded servers always pass); the refusal message names the grade and the env var to unset.',
+      "Load one or more installed servers' tools into this session by namespace; tools are prefixed by it (e.g. \"gh_create_issue\"). Pass `server` for one or `servers` for several. `tools: [...]` (single server only) advertises just those tools; the rest stay callable by name. Refused when YAW_MCP_MIN_COMPLIANCE is set and the server's grade is below it (ungraded always passes); the message names the grade and the variable.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -66,7 +90,7 @@ export const META_TOOLS = {
           type: "array",
           items: { type: "string" },
           description:
-            "Optional per-server tool filter (bare tool names, not namespace-prefixed). When set, only the listed tools surface in tools/list — others stay reachable via mcp_connect_dispatch. Omit (or re-activate without it) to expose the full tool set. Only applied when activating a single server.",
+            "Optional per-server tool filter (bare names, not namespace-prefixed). Only the listed tools surface in tools/list; the rest stay callable by name. Omit, or re-activate without it, for the full set. Single-server activation only.",
         },
       },
     },
@@ -81,7 +105,7 @@ export const META_TOOLS = {
   deactivate: {
     name: "mcp_connect_deactivate",
     description:
-      'Unload one or more MCP servers\' tools from the current session to free context. The server stays configured in ~/.yaw-mcp/bundles.json and can be reloaded via `mcp_connect_activate` when needed again. Unload servers you\'re done with; yaw-mcp also auto-unloads a server after a stretch of tool calls to other servers (baseline set by YAW_MCP_IDLE_THRESHOLD, raised for a server used in bursts). Pass "server" for one or "servers" for multiple.',
+      "Unload one or more loaded servers' tools from this session to free context. The server stays installed and can be reloaded with `mcp_connect_activate`. yaw-mcp also auto-unloads a server after a run of calls to other servers (baseline YAW_MCP_IDLE_THRESHOLD, raised for a server used in bursts).",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -106,7 +130,7 @@ export const META_TOOLS = {
   },
   health: {
     name: "mcp_connect_health",
-    description: `Show health stats for MCP servers loaded in the current session: total calls, error count, average latency, and last error. Per-call telemetry covers LOADED servers only; installed-but-unloaded servers with a poor persisted success rate (<${PENALTY_RATE_PCT}% across sessions) are listed in a separate cross-session reliability block — do NOT load a server just to see its history, loading it resets the in-session counters to zero.`,
+    description: `Health stats for the servers loaded this session: total calls, error count, average latency, last error. Installed-but-unloaded servers with a poor persisted success rate (<${PENALTY_RATE_PCT}% across sessions) are listed in a separate block -- do NOT load a server just to see its history, loading resets its in-session counters.`,
     inputSchema: {
       type: "object" as const,
       properties: {},
@@ -122,7 +146,7 @@ export const META_TOOLS = {
   dispatch: {
     name: "mcp_connect_dispatch",
     description:
-      'PREFERRED entry point when the task is already concrete. Picks the best-matching installed MCP server(s) for a natural-language task and loads their tools in ONE call — no separate discover + load step. Describe what you want to do ("create a github issue for the login bug", "post a summary to slack", "query the prod postgres") and yaw-mcp will rank the user\'s installed servers with BM25, load the top match into the session, and expose its tools so you can call them. Use `mcp_connect_discover` only when browsing what\'s installed without a specific task. When an installed MCP server shadows a local CLI (e.g. npmjs shadows `npm`, tailscale shadows `tailscale`, github shadows `gh`), prefer dispatching to the server over running the CLI via Bash. Default budget is 1 to keep the tool list focused; raise it only if the task genuinely spans multiple servers. If `yaw-mcp://guide` is listed as a resource, read it first — the project may have explicit routing rules (e.g. "use `gh` not bash for GitHub").',
+      'Pick the best-matching installed server(s) for a natural-language task and load their tools in one call. Describe the task ("create a github issue for the login bug", "query the prod postgres"); yaw-mcp ranks the installed servers with BM25 and loads the top match. `budget` defaults to 1; raise it only when one task genuinely spans several servers.',
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -141,14 +165,13 @@ export const META_TOOLS = {
           minimum: 1,
           maximum: 10,
           default: 1,
-          description:
-            "How many top-ranked servers to load into the session. Defaults to 1. Cap is 10. Raise only when one task genuinely spans multiple servers.",
+          description: "How many top-ranked servers to load. Default 1, cap 10.",
         },
         routeEffort: {
           type: "string",
           enum: ["off", "auto", "aggressive"],
           description:
-            'Per-call override of the routing-effort dial. "off" never asks the client LLM to break ranking ties; "auto" (the default) asks once only on genuine ambiguity; "aggressive" samples best-of-3 on milder ambiguity. Falls back to the YAW_MCP_ROUTE_EFFORT env var when omitted. Only meaningful at budget 1.',
+            'Per-call routing-effort dial: "off" never asks the client LLM to break a ranking tie, "auto" (default) asks once on genuine ambiguity, "aggressive" samples best-of-3 on milder ambiguity. Falls back to YAW_MCP_ROUTE_EFFORT. Budget 1 only.',
         },
       },
       required: ["intent"],
@@ -164,7 +187,7 @@ export const META_TOOLS = {
   read_tool: {
     name: "mcp_connect_read_tool",
     description:
-      "Return one tool's full input schema without loading its server into the session. Use this when you need to inspect an MCP tool's arguments before deciding whether to activate its server, or to compare schemas across two tools. For already-loaded servers this is free (schema is in memory). For not-loaded servers yaw-mcp spawns a transient upstream connection, reads the schema, and tears the connection down — no tools are added to your context, and `mcp_connect_health` will not show the server as loaded. When you're ready to actually call the tool, pass the server namespace to `mcp_connect_activate` (or use `mcp_connect_dispatch` with the task intent).",
+      "Return one tool's full input schema without loading its server. Free for a loaded server; for an unloaded one yaw-mcp opens a transient connection, reads the schema and closes it -- nothing is added to the session. To call the tool, load its server with `mcp_connect_activate` or call it by name from `mcp_connect_exec`.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -174,8 +197,7 @@ export const META_TOOLS = {
         },
         tool: {
           type: "string",
-          description:
-            'Tool name. The namespace prefix is optional — both "create_issue" and "gh_create_issue" are accepted.',
+          description: 'Tool name; the namespace prefix is optional ("create_issue" and "gh_create_issue" both work).',
         },
       },
       required: ["server", "tool"],
@@ -191,14 +213,14 @@ export const META_TOOLS = {
   findTool: {
     name: "mcp_connect_find_tool",
     description:
-      'Search for a TOOL across every configured server by what it DOES, when you do not know which server has it. Ranks tool names and descriptions from all servers -- loaded and not -- and returns the matches with the namespace to activate. Nothing is loaded and no server is contacted, so this costs no context beyond the reply. Use it when the capability is clear but its home is not ("something that can resize an image", "a way to list pull requests"); use `mcp_connect_dispatch` instead when you want the right server LOADED in one step, and `mcp_connect_read_tool` when you already know both the server and the tool and just want its schema. A match on a loaded server carries its full input schema; a match on a server that has never been loaded carries name and description only, from cache -- activate it, or call `mcp_connect_read_tool`, to see the arguments.',
+      'Search every installed server\'s tools by what they DO ("resize an image", "list pull requests") when you do not know which server has it. Ranks tool names and descriptions across loaded and unloaded servers from cache; nothing is loaded and no server is contacted. A match on a loaded server carries its full input schema; one on a never-loaded server carries name and description only -- `mcp_connect_read_tool` returns its arguments.',
     inputSchema: {
       type: "object" as const,
       properties: {
         query: {
           type: "string",
           description:
-            'What the tool should DO, in plain words -- "create a github issue", "query postgres", "resize an image". Matched against every configured server tool name and description.',
+            'What the tool should DO, in plain words -- "create a github issue", "query postgres", "resize an image".',
         },
         limit: {
           type: "number",
@@ -218,7 +240,7 @@ export const META_TOOLS = {
   suggest: {
     name: "mcp_connect_suggest",
     description:
-      "Surface recurring multi-server tool-call patterns as suggested 'packs' to activate in one step. Observation-only — this never loads or unloads anything. When the same 2-3 servers get used together in short bursts more than once, the pattern is surfaced here so the next workflow can call `mcp_connect_activate` once with the whole pack's namespaces instead of juggling discover + load for each server. Patterns persist across yaw-mcp restarts (via ~/.yaw-mcp/state.json) so a fresh process already knows what you usually use together. As a general rule: prefer loaded MCP servers over matching local CLIs (a loaded `npmjs` server replaces `npm audit`, `tailscale` replaces the `tailscale` CLI, etc.) — see `mcp_connect_discover` for which CLIs each installed server shadows. Returns a friendly 'no patterns yet' message when nothing has recurred.",
+      "Surface recurring multi-server 'packs' -- servers used together in short bursts more than once -- each as a ready-to-run `mcp_connect_activate` call with all its namespaces. Observation-only: loads and unloads nothing. Patterns persist across yaw-mcp restarts. Returns a 'no patterns yet' message when nothing has recurred.",
     inputSchema: {
       type: "object" as const,
       properties: {},
@@ -234,15 +256,14 @@ export const META_TOOLS = {
   bundles: {
     name: "mcp_connect_bundles",
     description:
-      'List curated multi-server \'bundles\' — presets like `pr-review` (github + linear) or `devops-incident` (github + pagerduty + slack) that commonly ship together. Routing order is `mcp_connect_dispatch` > this > `mcp_connect_discover`: when the task is one concrete action ("file a github issue"), dispatch still comes first. Reach for bundles when the intent maps to a known multi-server WORKFLOW (on-call triage, PR review, data pipeline debugging) rather than a single call, and before `mcp_connect_discover` — it returns a ready-to-run `mcp_connect_activate namespaces=[...]` call per bundle. With `action="match"` (recommended after the user\'s installed list is known) the response partitions bundles into READY (every namespace already in the user\'s bundles.json — activate now) and PARTIAL (some present, some missing — names the missing namespaces so you can tell the user to run `yaw-mcp add <slug>`; the slug catalog is at https://yaw.sh/mcp/catalog/). With `action="list"` (default) it returns the full curated catalog. Bundles are static client-side data, not a network call.',
+      'List curated multi-server \'bundles\' (`pr-review` = github + linear, `devops-incident` = github + pagerduty + slack, ...) for a known multi-server WORKFLOW, each with a ready-to-run `mcp_connect_activate namespaces=[...]` call. `action="match"` partitions them against the installed servers into READY (activate now) and PARTIAL (names the missing namespaces; `yaw-mcp add <slug>` installs one, catalog at https://yaw.sh/mcp/catalog/). `action="list"` (default) returns the whole catalog. Static data, no network call.',
     inputSchema: {
       type: "object" as const,
       properties: {
         action: {
           type: "string",
           enum: ["list", "match"],
-          description:
-            'Either "list" (return the full curated catalog; default) or "match" (partition bundles against installed servers into ready-to-activate vs partially-installed).',
+          description: '"list" (default): the full curated catalog. "match": partition against installed servers.',
         },
       },
     },
@@ -257,14 +278,14 @@ export const META_TOOLS = {
   secrets: {
     name: "mcp_connect_secrets",
     description:
-      "List, per installed server, which local-vault secrets its `${secret:NAME}` env references resolve to — by NAME only, never a value. Use this to confirm a server will get the credentials it needs before activating it, or to spot a typo'd / un-set secret reference. `injectedSecrets` are the names the local vault HAS and the server references; `missing` are names the server references but the vault LACKS (set them via `yaw-mcp secrets set <name>`); `malformed` are `${secret:` references that do not PARSE (a space in the name, a missing `}`), quoted in bounded form behind a `<malformed ref>` marker -- yaw-mcp refuses to start the server over one exactly as over a missing name, so the fix is editing the reference in the server's env. This is a values-free preview: it reads the vault's KEY LIST and the server's env-reference NAMES, and never decrypts or returns any secret value. Servers with no `${secret:...}` references (well-formed or malformed) are omitted. Requires no passphrase (no decryption happens).",
+      "Report, per installed server, which local-vault secrets its `${secret:NAME}` references resolve to -- NAMES only, never a value. `injectedSecrets`: names the vault has. `missing`: names it lacks (`yaw-mcp secrets set <name>`). `malformed`: references that do not parse (a space in the name, a missing `}`), quoted in bounded form behind a `<malformed ref>` marker. yaw-mcp refuses to start a server over a missing or malformed reference. Servers with no references are omitted. Decrypts nothing; needs no passphrase.",
     inputSchema: {
       type: "object" as const,
       properties: {
         server: {
           type: "string",
           description:
-            'Optional: restrict the report to a single server namespace (e.g. "gh"). Omit to report every installed server that references a vault secret.',
+            'Optional: one server namespace (e.g. "gh"). Omit for every server that references a vault secret.',
         },
       },
     },
@@ -281,9 +302,9 @@ export const META_TOOLS = {
     // Joined rather than one literal so the step cap can be interpolated from
     // MAX_EXEC_STEPS -- the constant validateExecRequest actually enforces.
     description: [
-      "Run a short DECLARATIVE pipeline of upstream tool calls in a single round-trip. Use this when you already know the exact 2-4 tool calls to make and one call's output feeds another's args — e.g. `a = gh_list_prs(); b = gh_get_pr(a[0].number); return b`. NOT a code sandbox: there is no expression language, no loops, no branching, no arithmetic. The only control flow is sequential step execution; the only data-flow primitive is `{\"$ref\": \"<stepId>[.path.to.value]\"}` which substitutes a prior step's output (or a nested field of it) into the next step's args. Paths support dot keys and `[N]` / `.N` array indexing. Each step's `tool` is a namespaced upstream tool name: an already-loaded server is called directly, and a not-yet-loaded server whose tools are known from cache is loaded on first use exactly as a direct tools/call would be — that adds its tools to this session, and can still be refused. A POLICY refusal (server disabled, project profile, compliance floor) is decided before step 0 runs and refuses the whole pipeline with nothing done, so fixing it and re-running costs no repeated side effect; a server-cap refusal is only knowable when the step is reached and fails it there, with `partial` holding what already ran. A name that is neither loaded nor cached also fails the step.",
+      "Run a short DECLARATIVE pipeline of upstream tool calls in one round-trip, when you already know the 2-4 calls and one step's output feeds another's args -- e.g. `a = gh_list_prs(); b = gh_get_pr(a[0].number); return b`. NOT a code sandbox: no expressions, loops, branching or arithmetic. Steps run in order; the only data flow is `{\"$ref\": \"<stepId>[.path.to.value]\"}` (dot keys, `[N]` / `.N` array indexing), which substitutes a prior step's output into a later step's args. Each `tool` is a namespaced upstream name: a loaded server is called directly; a not-yet-loaded server whose tools are cached is loaded on first use, as a direct tools/call would (its tools join this session; it can still be refused). A POLICY refusal (server disabled, project profile, compliance floor) is decided before step 0 runs and refuses the whole pipeline with nothing done, so fixing it and re-running costs no repeated side effect; a server-cap refusal is only knowable when the step is reached and fails it there, with `partial` holding what already ran. A name neither loaded nor cached fails its step.",
       `Max ${MAX_EXEC_STEPS} steps per exec.`,
-      "If any step fails, the whole pipeline fails and returns `{ ok: false, failedStep, error, partial: { ...completed outputs } }`. On success the shape depends on whether you named a `return`: WITH one you get `{ ok: true, result: <that step's output>, stepKeys: [...] }` — plus `steps` as well while the intermediate outputs stay small (about 4 KB), so a created issue's id survives while a long list you skipped is not replayed at you; WITHOUT one you get `{ ok: true, result: <last step's output>, steps: { ...all outputs } }`. Name a `return` whenever you only need one value: it is what stops a LARGE intermediate output (a long list you only wanted one element of) from being replayed back into your context. Prefer this over back-to-back tool calls when the chain is deterministic — it saves prompt-token replay and client round-trips.",
+      "Any failure returns `{ ok: false, failedStep, error, partial }`. Success returns `{ ok: true, result, steps }`; with a named `return`, `result` is that step's output, `stepKeys` is added, and `steps` is dropped once the intermediate outputs exceed about 4 KB. Name a `return` whenever one value is enough: it stops a large intermediate output being replayed into your context.",
     ].join(" "),
     inputSchema: {
       type: "object" as const,
@@ -291,24 +312,24 @@ export const META_TOOLS = {
         steps: {
           type: "array",
           description:
-            'Ordered list of tool calls to run. Each step is `{ id?: string, tool: string, args?: object }`. `args` values may be `{"$ref": "<stepId>.path"}` to inject a prior step\'s output.',
+            'Ordered tool calls, each `{ id?: string, tool: string, args?: object }`. `args` values may be `{"$ref": "<stepId>.path"}`.',
           items: {
             type: "object",
             properties: {
               id: {
                 type: "string",
                 description:
-                  "Optional binding name for this step's output. Later steps reference it via `$ref`. Defaults to the step's positional index as a string.",
+                  "Optional name for this step's output, used by later `$ref`s. Defaults to the positional index as a string.",
               },
               tool: {
                 type: "string",
                 description:
-                  'Namespaced tool name (e.g. "gh_list_prs"). Loaded servers are called directly; a not-yet-loaded server whose tools are known from cache is loaded on first use, adding its tools to the session. A name that is neither loaded nor cached fails the step. Meta-tools (mcp_connect_*) are not callable from exec.',
+                  'Namespaced tool name (e.g. "gh_list_prs"); a cached-but-unloaded server is loaded on first use. Meta-tools (mcp_connect_*) are not callable from exec.',
               },
               args: {
                 type: "object",
                 description:
-                  'Arguments for the tool call. Any value (including deeply nested) may be `{"$ref": "<stepId>[.path]"}` to substitute a prior step\'s output at that position.',
+                  'Arguments for the tool call. Any value, however nested, may be `{"$ref": "<stepId>[.path]"}` to substitute a prior step\'s output.',
                 additionalProperties: true,
               },
             },
@@ -325,7 +346,7 @@ export const META_TOOLS = {
         return: {
           type: "string",
           description:
-            "Optional: id of the step whose output should be surfaced as `result`. Defaults to the last step's id (or its positional index). Naming a step is NOT just a selection: it also adds `stepKeys`, and once the intermediate outputs exceed roughly 4 KB it drops `steps` from the response so a large payload you skipped is not replayed back to you. Below that they are all still returned.",
+            "Optional: id of the step whose output becomes `result` (default: the last step). Naming one adds `stepKeys` and drops `steps` once the intermediate outputs exceed about 4 KB, so a large payload you skipped is not replayed.",
         },
       },
       required: ["steps"],
@@ -339,6 +360,22 @@ export const META_TOOLS = {
     },
   },
 } as const;
+
+/**
+ * The meta-tools a `lite` exposure (proxy.ts ToolExposure) advertises: the
+ * three that reach any installed tool WITHOUT the client's tool list having
+ * to change. exec calls a loaded or cache-known tool by name and loads its
+ * server on first use; find_tool returns the exact name; read_tool returns
+ * the schema. Every other meta-tool stays callable by name -- lite narrows
+ * what tools/list advertises, not what handleToolCall accepts -- so a client
+ * that knows the names loses nothing. Derived from META_TOOLS, same as
+ * META_TOOL_NAMES below, so a renamed tool cannot leave a stale entry here.
+ */
+export const LITE_META_TOOL_NAMES: ReadonlySet<string> = new Set([
+  META_TOOLS.exec.name,
+  META_TOOLS.findTool.name,
+  META_TOOLS.read_tool.name,
+]);
 
 export interface SecretsReportRow {
   server: string;
