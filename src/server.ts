@@ -4590,7 +4590,14 @@ export class ConnectServer {
     const joined = this.vaultElicitInflight;
     if (joined) {
       progress?.("Waiting for the vault passphrase prompt already in flight");
-      const outcome = await joined;
+      // The winner's wait on the page is heartbeated (collectSecretOnLoopbackPage)
+      // and can run the page's whole TTL; a follower parked on it for that
+      // long needs the same ticks, for the same reason.
+      const outcome = await withHeartbeat(
+        progress,
+        (elapsed) => `Still waiting on the vault passphrase prompt already in flight -- ${elapsed}s so far`,
+        () => joined,
+      );
       // Same gate as the winner's below, for the same reason.
       if (this.shuttingDown) return this.shuttingDownRefusal(namespace);
       if (outcome.kind === "unlocked") return this.runActivateOne(namespace, progress, fromPrewarm, /* skipCap */ true);
@@ -4757,6 +4764,11 @@ export class ConnectServer {
       });
       return { kind: "unreachable", reason: "no-page" };
     }
+    // The page's TTL runs from here, not from when the wait on it begins:
+    // the consent round-trip below sits in between (up to the SDK's 60s), and
+    // a "seconds left" figure counted from the wait would overstate it by
+    // however long that took.
+    const openedAt = Date.now();
     this.secretEntryPages.add(page);
     try {
       // shutdown() sweeps secretEntryPages synchronously, and this page was
@@ -4804,11 +4816,12 @@ export class ConnectServer {
       // on the activation while the user is still typing. The tick names
       // the deadline, so the reader knows whether waiting longer can still
       // work.
-      const ttlSeconds = Math.round(this.secretEntryPageTtlMs / 1000);
       const outcome = await withHeartbeat(
         progress,
-        (elapsed) =>
-          `Still waiting for the masked entry page -- ${elapsed}s so far, ${Math.max(0, ttlSeconds - elapsed)}s before it expires`,
+        (elapsed) => {
+          const left = Math.max(0, Math.round((openedAt + this.secretEntryPageTtlMs - Date.now()) / 1000));
+          return `Still waiting for the masked entry page -- ${elapsed}s so far, ${left}s before it expires`;
+        },
         () => page.result,
       );
       // URL mode: tell the client the out-of-band step is over, so it can drop

@@ -6921,7 +6921,16 @@ describe("vault passphrase elicitation", () => {
       const priv = getPrivate(server);
       priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
       priv.server.getClientCapabilities = () => ({ elicitation: {} });
-      priv.server.elicitInput = accept();
+      // The consent takes 20s to answer. The page's TTL has been running
+      // since the page was opened, BEFORE the dialog, so the "before it
+      // expires" figure has to count from there, not from the wait.
+      let consent: () => void = () => {};
+      priv.server.elicitInput = vi.fn(
+        () =>
+          new Promise((resolve) => {
+            consent = () => resolve({ action: "accept" });
+          }),
+      );
       priv.secretEntryPageTtlMs = 60_000;
       let submit: (value: string) => void = () => {};
       priv.openSecretPage = vi.fn(async () => ({
@@ -6939,7 +6948,11 @@ describe("vault passphrase elicitation", () => {
       const messages: string[] = [];
       const activation = priv.activateOne("gh", (m: string) => messages.push(m));
 
-      // Let the prompt reach the page wait, then run two heartbeats.
+      // The page is open and the dialog is up: 20s pass before the user
+      // accepts. No page ticks yet -- nothing is waiting on the page.
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(messages.filter((m) => m.includes("Still waiting"))).toEqual([]);
+      consent();
       await vi.advanceTimersByTimeAsync(0);
       const before = messages.length;
       await vi.advanceTimersByTimeAsync(PROGRESS_HEARTBEAT_MS);
@@ -6947,9 +6960,12 @@ describe("vault passphrase elicitation", () => {
       const ticks = messages.slice(before);
       expect(ticks).toHaveLength(2);
       expect(ticks[0]).toContain("Still waiting for the masked entry page");
+      // Elapsed counts the wait; the time left counts from the page's open:
+      // 60s TTL - 20s consent - 5s waited = 35s, not 55s.
       expect(ticks[0]).toContain("5s so far");
-      expect(ticks[0]).toContain("55s before it expires");
+      expect(ticks[0]).toContain("35s before it expires");
       expect(ticks[1]).toContain("10s so far");
+      expect(ticks[1]).toContain("30s before it expires");
 
       // ...and it stops once the page answers.
       submit("typed-eventually");
@@ -7370,6 +7386,66 @@ describe("vault passphrase elicitation", () => {
     expect(gh.ok).toBe(true);
     expect(linear.ok).toBe(true);
     expect(vaultPassphrase()).toBe("s3kr1t");
+  });
+
+  it("a follower parked on the shared prompt keeps reporting progress while the page waits", async () => {
+    // The follower's own tool call sits on the winner's page for as long as
+    // the winner's does, so it needs the same heartbeat: one "waiting" line
+    // and then silence for up to the page's TTL is the gap the winner's wait
+    // closed.
+    vi.useFakeTimers();
+    try {
+      const priv = getPrivate(server);
+      priv.config = makeConfig([
+        makeServerConfig({ namespace: "gh", name: "GitHub" }),
+        makeServerConfig({ namespace: "linear", name: "Linear" }),
+      ]);
+      priv.server.getClientCapabilities = () => ({ elicitation: {} });
+      priv.server.elicitInput = accept();
+      let submit: (value: string) => void = () => {};
+      priv.openSecretPage = vi.fn(async () => ({
+        url: `http://127.0.0.1:5555/${"b".repeat(64)}`,
+        elicitationId: "elicit-shared",
+        result: new Promise((resolve) => {
+          submit = (value) => resolve({ kind: "submitted", values: { passphrase: value } });
+        }),
+        close: vi.fn(),
+      }));
+      priv.openBrowser = vi.fn().mockResolvedValue(true);
+      vi.mocked(connectToUpstream).mockImplementation((async (cfg: UpstreamServerConfig) => {
+        if (vaultPassphrase() === undefined) throw lockedVaultError(cfg.namespace);
+        return makeConnection(cfg.namespace, ["t"]);
+      }) as unknown as typeof connectToUpstream);
+
+      const winnerMessages: string[] = [];
+      const followerMessages: string[] = [];
+      const gh = priv.activateOne("gh", (m: string) => winnerMessages.push(m));
+      await vi.advanceTimersByTimeAsync(0);
+      const linear = priv.activateOne("linear", (m: string) => followerMessages.push(m));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(followerMessages).toContain("Waiting for the vault passphrase prompt already in flight");
+      // One prompt, one page: the follower joined rather than asking again.
+      expect(priv.server.elicitInput).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(PROGRESS_HEARTBEAT_MS);
+      await vi.advanceTimersByTimeAsync(PROGRESS_HEARTBEAT_MS);
+      const ticks = followerMessages.filter((m) => m.includes("already in flight -- "));
+      expect(ticks).toHaveLength(2);
+      expect(ticks[0]).toContain("5s so far");
+      expect(ticks[1]).toContain("10s so far");
+      // The winner's own ticks are its own, not the follower's.
+      expect(winnerMessages.filter((m) => m.includes("masked entry page --"))).toHaveLength(2);
+
+      submit("shared-answer");
+      const [ghResult, linearResult] = await Promise.all([gh, linear]);
+      expect(ghResult.ok).toBe(true);
+      expect(linearResult.ok).toBe(true);
+      const settledAt = followerMessages.length;
+      await vi.advanceTimersByTimeAsync(PROGRESS_HEARTBEAT_MS * 2);
+      expect(followerMessages.slice(settledAt).filter((m) => m.includes("Still waiting"))).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("a follower on a REJECTED shared prompt gets the winner's words and no penalty", async () => {
