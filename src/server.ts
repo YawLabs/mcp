@@ -47,7 +47,7 @@ import { setJsonKey } from "./json-key.js";
 import { LearningStore, PENALTY_RATE_THRESHOLD } from "./learning.js";
 import { bundlesSignature, loadLocalBundles } from "./local-bundles.js";
 import { log } from "./logger.js";
-import { computeSecretsReport, META_TOOL_NAMES, META_TOOLS } from "./meta-tools.js";
+import { computeSecretsReport, META_TOOL_NAMES, META_TOOLS, SERVER_INSTRUCTIONS } from "./meta-tools.js";
 import { isFeatureDisabled } from "./opt-out-env.js";
 import { PackDetector } from "./pack-detect.js";
 import { isPersistenceDisabled, loadState, type PersistedToolCacheEntry, saveState } from "./persistence.js";
@@ -184,28 +184,53 @@ export function isPrewarmEnabled(): boolean {
 // resolveToolExposure fired for. Null means "nothing warned about yet".
 let exposureWarnedFor: string | null = null;
 
+/** `clientInfo.name` values for which an UNSET `YAW_MCP_TOOL_EXPOSURE` means
+ *  `lite` rather than `gateway` -- see ToolExposure in proxy.ts for why lite
+ *  exists. typed-cli sends `clientInfo: { name: 'typed-cli' }` on initialize
+ *  (typed apps/cli/src/mcp/client.ts) and inlines every advertised tool into
+ *  every request, with no deferred loading to hide the eight meta-tools it
+ *  never needs. Detected here, from clientInfo, rather than by an env var
+ *  typed could set: in the common Yaw Terminal case the yaw-mcp entry comes
+ *  from `~/.claude.json`, which typed reads but cannot add an env var to, so
+ *  broker-side detection is the only path that covers it. Exact match on
+ *  the name as sent -- a prefix or case-insensitive match would widen this
+ *  to clients nobody measured. */
+export const LITE_BY_DEFAULT_CLIENTS: ReadonlySet<string> = new Set(["typed-cli"]);
+
 // How much of the catalog tools/list advertises. Gateway by default -- see
-// ToolExposure in proxy.ts for the measurement that made it the default.
-// YAW_MCP_TOOL_EXPOSURE=full restores the previous behavior for a client that
-// genuinely wants the whole catalog inlined. Re-read per call, same discipline
-// as resolveMinCompliance, so a mid-session change lands on the next
-// tools/list instead of needing a restart.
-export function resolveToolExposure(): ToolExposure {
+// ToolExposure in proxy.ts for the measurement that made it the default --
+// and lite by default for the clients in LITE_BY_DEFAULT_CLIENTS, which is
+// why the connected client's `clientInfo` is a parameter: the handlers pass
+// `this.server.getClientVersion()`, populated by the SDK from the initialize
+// request (undefined before it, and in a unit test that never handshakes,
+// which lands on gateway). An explicit YAW_MCP_TOOL_EXPOSURE always wins over
+// that default: `full` restores the previous behavior for a client that
+// genuinely wants the whole catalog inlined, `lite` opts any client into the
+// three-tool surface, `gateway` pins a typed-cli session to the full
+// meta-tool set. Re-read per call, same discipline as resolveMinCompliance,
+// so a mid-session change lands on the next tools/list instead of needing a
+// restart.
+export function resolveToolExposure(clientInfo?: { name?: string }): ToolExposure {
+  const fallback: ToolExposure =
+    clientInfo?.name !== undefined && LITE_BY_DEFAULT_CLIENTS.has(clientInfo.name) ? "lite" : "gateway";
   const raw = process.env.YAW_MCP_TOOL_EXPOSURE?.trim().toLowerCase();
   if (raw === "full") return "full";
-  if (raw === undefined || raw === "" || raw === "gateway") return "gateway";
+  if (raw === "lite") return "lite";
+  if (raw === "gateway") return "gateway";
+  if (raw === undefined || raw === "") return fallback;
   // Unknown value: an operator who mistyped should not silently get the
-  // 27,000-token surface back. Said once per distinct bad value, not once
-  // per call: this resolver runs from all three list handlers, so an
-  // unconditional warn is three lines per client refresh and three more
-  // after every list_changed notification. Keyed on the VALUE (same
-  // discipline as idleThresholdClampWarnedFor below) so a session that
-  // swaps one typo for another is still told.
+  // 27,000-token surface back, so it lands on the same default an unset
+  // value would -- the smaller surface for THIS client. Said once per
+  // distinct bad value, not once per call: this resolver runs from all
+  // three list handlers, so an unconditional warn is three lines per client
+  // refresh and three more after every list_changed notification. Keyed on
+  // the VALUE (same discipline as idleThresholdClampWarnedFor below) so a
+  // session that swaps one typo for another is still told.
   if (exposureWarnedFor !== raw) {
     exposureWarnedFor = raw;
-    log("warn", `unrecognized YAW_MCP_TOOL_EXPOSURE "${raw}"; using "gateway"`, { raw });
+    log("warn", `unrecognized YAW_MCP_TOOL_EXPOSURE "${raw}"; using "${fallback}"`, { raw });
   }
-  return "gateway";
+  return fallback;
 }
 
 // Baseline number of non-matching tool calls a namespace tolerates before
@@ -824,6 +849,12 @@ export class ConnectServer {
           resources: { listChanged: true },
           prompts: { listChanged: true },
         },
+        // Returned once, in the initialize result, and injected by Claude
+        // Code into the system prompt as a "# MCP Server Instructions"
+        // block. This is where the routing prose the meta-tool descriptions
+        // used to repeat now lives -- a description is paid on every
+        // tools/list, this is paid once. See SERVER_INSTRUCTIONS.
+        instructions: SERVER_INSTRUCTIONS,
       },
     );
     // yaw-mcp itself does not handle elicitation or sampling requests; it
@@ -882,13 +913,24 @@ export class ConnectServer {
     return map;
   }
 
+  /** The exposure THIS session's lists are served at: the env when set,
+   *  else the default for the connected client (lite for typed-cli, gateway
+   *  otherwise -- see resolveToolExposure). The one place the client's
+   *  identity is read, so the three list handlers and discover's "in
+   *  context" summary cannot disagree about which surface they describe.
+   *  getClientVersion() is the SDK's copy of the initialize request's
+   *  clientInfo and is undefined before the handshake. */
+  private currentExposure(): ToolExposure {
+    return resolveToolExposure(this.server.getClientVersion());
+  }
+
   private setupHandlers(): void {
     this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
       tools: buildToolList(
         this.connections,
         this.getDeferredServers(),
         this.toolFilters,
-        resolveToolExposure(),
+        this.currentExposure(),
         this.sessionActivated,
         // Hidden here, refused at the gate, but still ROUTED: dropping the
         // route instead would make a call by name return `Unknown tool`,
@@ -907,7 +949,7 @@ export class ConnectServer {
       resources: buildResourceList(
         this.connections,
         this.getBuiltinResources(),
-        resolveToolExposure(),
+        this.currentExposure(),
         this.sessionActivated,
       ),
     }));
@@ -929,7 +971,7 @@ export class ConnectServer {
     });
 
     this.server.setRequestHandler(ListPromptsRequestSchema, async () => ({
-      prompts: buildPromptList(this.connections, resolveToolExposure(), this.sessionActivated),
+      prompts: buildPromptList(this.connections, this.currentExposure(), this.sessionActivated),
     }));
 
     this.server.setRequestHandler(GetPromptRequestSchema, async (request) => {
@@ -3285,7 +3327,7 @@ export class ConnectServer {
     // accumulator, the session tool total -- keys on this predicate so the
     // summary means what it says. Resolved once per discover; the whole
     // body is rendered from one snapshot.
-    const exposure = resolveToolExposure();
+    const exposure = this.currentExposure();
     const isAdvertised = (namespace: string): boolean => exposure === "full" || this.sessionActivated.has(namespace);
 
     // The SESSION token total, computed over every live connection rather than

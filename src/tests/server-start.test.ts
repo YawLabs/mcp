@@ -109,6 +109,7 @@ vi.mock("../local-bundles.js", async (importOriginal) => {
 import { CONFIG_FILENAME, type ResolvedConfig } from "../config-loader.js";
 import { gradesCachePath } from "../grades-cache.js";
 import { localBundlesPath } from "../local-bundles.js";
+import { LITE_META_TOOL_NAMES, META_TOOL_NAMES, SERVER_INSTRUCTIONS } from "../meta-tools.js";
 import { CONFIG_DIRNAME } from "../paths.js";
 import { STATE_FILENAME } from "../persistence.js";
 import { ConnectServer } from "../server.js";
@@ -285,6 +286,9 @@ interface Started {
 async function driveInitialize(
   transport: { onmessage?: (msg: unknown) => void },
   capabilities: Record<string, unknown> = {},
+  // The name the client reports in clientInfo. resolveToolExposure keys the
+  // lite default on it, so the exposure tests below hand over "typed-cli".
+  clientName = "test-client",
 ): Promise<void> {
   transport.onmessage?.({
     jsonrpc: "2.0",
@@ -293,7 +297,7 @@ async function driveInitialize(
     params: {
       protocolVersion: "2025-06-18",
       capabilities,
-      clientInfo: { name: "test-client", version: "0.0.0" },
+      clientInfo: { name: clientName, version: "0.0.0" },
     },
   });
   // Let the initialize response settle before announcing initialized,
@@ -308,8 +312,11 @@ async function driveInitialize(
  *  default the downstream initialize handshake is driven too;
  *  `handshake: false` leaves the client un-initialized so the gating
  *  itself can be observed. `config` is handed to start() the way index.ts
- *  hands its already-loaded ResolvedConfig in. */
-async function startServer(opts: { handshake?: boolean; config?: ResolvedConfig } = {}): Promise<Started> {
+ *  hands its already-loaded ResolvedConfig in. `clientName` is what the
+ *  handshake reports in clientInfo (see driveInitialize). */
+async function startServer(
+  opts: { handshake?: boolean; config?: ResolvedConfig; clientName?: string } = {},
+): Promise<Started> {
   const server = new ConnectServer();
   servers.push(server);
   const priv = server as any;
@@ -341,7 +348,7 @@ async function startServer(opts: { handshake?: boolean; config?: ResolvedConfig 
   await server.start(opts.config ? { config: opts.config } : {});
   const transport = hoisted.transports[hoisted.transports.length - 1];
   if (opts.handshake !== false) {
-    await driveInitialize(transport as any);
+    await driveInitialize(transport as any, {}, opts.clientName);
   }
   return {
     server,
@@ -762,6 +769,82 @@ describe("ConnectServer.start() — startup activation waits for the initialize 
     const caps = capsAtConnect[0] as { elicitation?: unknown; sampling?: unknown };
     expect(caps.elicitation).toBeDefined();
     expect(caps.sampling).toBeDefined();
+  });
+});
+
+describe("ConnectServer.start() — what the initialize handshake decides", () => {
+  // Both halves here run through the REAL SDK handshake over the fake
+  // transport, not through resolveToolExposure() with a hand-built
+  // clientInfo: the wiring under test is that the Server was constructed
+  // with `instructions`, and that the tools/list handler reads the client
+  // name the SDK captured from initialize -- neither of which a unit test
+  // of the pure resolver can fail.
+
+  /** The initialize result the client received, from the fake transport's
+   *  outbound log. Matched on the request id driveInitialize uses. */
+  function initializeResult(transport: { sent: unknown[] }): Record<string, unknown> {
+    const reply = transport.sent.find((m) => (m as { id?: unknown }).id === 0) as { result?: Record<string, unknown> };
+    expect(reply?.result).toBeDefined();
+    return reply.result as Record<string, unknown>;
+  }
+
+  /** Every tools/list name, meta-tools included -- listedUpstreamTools
+   *  filters the meta-tools out, and they are the subject here. */
+  async function listedToolNames(priv: any): Promise<string[]> {
+    const handler = priv.server._requestHandlers.get("tools/list");
+    const res = await handler({ method: "tools/list", params: {} }, {} as never);
+    return res.tools.map((t: { name: string }) => t.name);
+  }
+
+  it("sends the routing instructions once, in the initialize result", async () => {
+    writeBundles(synthHome, [serverEntry("gh")]);
+    const { transport } = await startServer();
+    // Verbatim: this is the string Claude Code puts in the system prompt,
+    // and the string meta-tools.test.ts pins the length of.
+    expect(initializeResult(transport).instructions).toBe(SERVER_INSTRUCTIONS);
+  });
+
+  it("serves the full meta-tool set to a client that is not typed-cli", async () => {
+    writeBundles(synthHome, [serverEntry("gh")]);
+    const { priv } = await startServer();
+    expect((await listedToolNames(priv)).sort()).toEqual([...META_TOOL_NAMES].sort());
+  });
+
+  it("serves only exec / find_tool / read_tool to a client whose clientInfo.name is typed-cli", async () => {
+    // The broker-side detection. typed-cli's yaw-mcp entry usually comes
+    // from ~/.claude.json, which typed cannot add an env var to, so the
+    // clientInfo it sends on initialize is the only signal there is.
+    writeBundles(synthHome, [serverEntry("gh")]);
+    const { priv } = await startServer({ clientName: "typed-cli" });
+    expect((await listedToolNames(priv)).sort()).toEqual([...LITE_META_TOOL_NAMES].sort());
+  });
+
+  it("lets an explicit YAW_MCP_TOOL_EXPOSURE=gateway win over the typed-cli default", async () => {
+    writeBundles(synthHome, [serverEntry("gh")]);
+    process.env.YAW_MCP_TOOL_EXPOSURE = "gateway";
+    const { priv } = await startServer({ clientName: "typed-cli" });
+    expect((await listedToolNames(priv)).sort()).toEqual([...META_TOOL_NAMES].sort());
+  });
+
+  it("keeps the unlisted meta-tools callable by name under lite", async () => {
+    // Lite narrows tools/list, never tools/call: a typed-cli session that
+    // knows the name can still discover. The regression this guards is a
+    // future "refuse what is not advertised" gate landing on the meta-tools.
+    writeBundles(synthHome, [serverEntry("gh")]);
+    const { priv } = await startServer({ clientName: "typed-cli" });
+    const res = await priv.handleToolCall("mcp_connect_discover", {});
+    expect(res.isError).not.toBe(true);
+    expect(res.content[0]?.text).toContain("gh");
+  });
+
+  it("still advertises a server the client activated under lite, alongside the three", async () => {
+    writeBundles(synthHome, [serverEntry("gh")]);
+    const { priv, prewarmed } = await startServer({ clientName: "typed-cli" });
+    await prewarmed;
+    await priv.handleToolCall("mcp_connect_activate", { server: "gh" });
+    const names = await listedToolNames(priv);
+    expect(names).toContain("gh_gh_live");
+    expect(names.filter((n) => n.startsWith("mcp_connect_")).sort()).toEqual([...LITE_META_TOOL_NAMES].sort());
   });
 });
 

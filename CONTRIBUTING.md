@@ -40,6 +40,7 @@ npm test
 | `npm test` | Run the test suite |
 | `npm run lint` | Check for lint errors |
 | `npm run lint:fix` | Auto-fix lint and formatting |
+| `npm run verify:oam-floor` | Host a real MCP server on this machine's oam and check it against `MIN_OAM_VERSION`; `release.sh` runs it. `-- --raise` is the only way the floor moves (see `scripts/verify-oam-floor.mjs`) |
 
 ## Code Style
 
