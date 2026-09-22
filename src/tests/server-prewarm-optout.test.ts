@@ -98,8 +98,10 @@ afterEach(async () => {
 });
 
 describe("isPrewarmEnabled", () => {
-  // The convention YAW_MCP_AUTO_UPGRADE and YAW_MCP_CONFIG_RELOAD set: two
-  // off spellings, everything else on.
+  // The convention every YAW_MCP_* opt-out shares through isFeatureDisabled
+  // (opt-out-env.ts): two off spellings, trimmed, everything else on. Pinned
+  // here as well as in opt-out-env.test.ts so a wrapper that stopped calling
+  // the shared parser would be caught at the feature.
   it.each(["0", "false", "False", "FALSE"])("is off for %j", (value) => {
     vi.stubEnv("YAW_MCP_PREWARM", value);
     expect(isPrewarmEnabled()).toBe(false);

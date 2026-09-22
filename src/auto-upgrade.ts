@@ -78,7 +78,9 @@
 //
 // Opt-out: set YAW_MCP_AUTO_UPGRADE=0 (or =false) to suppress the check
 // entirely -- useful for pinned-version setups or sudo-installed
-// globals where `npm install -g` would always EACCES.
+// globals where `npm install -g` would always EACCES. Parsed by the ONE
+// helper every YAW_MCP_* opt-out shares (isFeatureDisabled, opt-out-env.ts),
+// so the spellings and the whitespace trim are the same as its siblings'.
 
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -98,6 +100,7 @@ import { dirname, join, sep } from "node:path";
 import { isWin32TransientFsError } from "./atomic-write.js";
 import { stripInternalSecretsFromEnv } from "./internal-secret-env.js";
 import { log } from "./logger.js";
+import { isFeatureDisabled } from "./opt-out-env.js";
 import {
   buildUpgradePlan,
   comparablePath,
@@ -776,8 +779,7 @@ function defaultSpawn(cmd: string, args: string[], onDone: () => void = () => {}
 export async function maybeAutoUpgrade(deps: AutoUpgradeDeps = {}): Promise<void> {
   // Opt-out escape hatch -- checked before everything else so pinned-
   // version users / sudo-installed globals can suppress with one env var.
-  const optOut = process.env.YAW_MCP_AUTO_UPGRADE;
-  if (optOut === "0" || optOut?.toLowerCase() === "false") return;
+  if (isFeatureDisabled("YAW_MCP_AUTO_UPGRADE")) return;
 
   const current = deps.currentVersion ?? (typeof __VERSION__ !== "undefined" ? __VERSION__ : "dev");
   // An unbuilt checkout has no real version to compare; never touch it.

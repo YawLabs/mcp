@@ -50,24 +50,29 @@ import { atomicWriteFile } from "./atomic-write.js";
 import {
   addressOf,
   applyClientConfigEdits,
+  type ConfigSite,
   carriedFieldsOf,
   carryableEnvOf,
   composeEntry,
   launchOf,
   readClientConfigFile,
+  readClientEnv,
+  selectSites,
 } from "./client-config.js";
 import { isReadOnlyDiagnostics } from "./config-loader.js";
 import { isForeignAbsoluteLaunch, oamRunEntryPath } from "./doctor-cmd.js";
-import { ENTRY_NAME } from "./install-target-model.js";
+import { ENTRY_NAME, resolveAppDataDir } from "./install-target-model.js";
 import {
   buildLaunchEntry,
   CURRENT_OS,
   INSTALL_TARGETS,
   type InstallOS,
+  type InstallTarget,
   resolveInstallSites,
 } from "./install-targets.js";
 import { log } from "./logger.js";
 import { type OamProbe, probeOam, resolveStableNpmEntry } from "./oam-spawn.js";
+import { isFeatureDisabled } from "./opt-out-env.js";
 
 /** One entry this pass re-pointed. */
 export interface HealedEntry {
@@ -104,9 +109,18 @@ export interface HealResult {
 export interface HealOptions {
   os?: InstallOS;
   home?: string;
+  /** Windows `%APPDATA%`. Left unset, it is chosen exactly as doctor chooses
+   *  it -- `resolveAppDataDir({ home, env })` -- so an overridden `home` keeps
+   *  a hermetic run inside that home and an ambient redirect is honoured. */
   appData?: string;
   cwd?: string;
+  /** Claude Code's `CLAUDE_CONFIG_DIR`. Left unset, it is read from `env`
+   *  through `readClientEnv`, along with every other client's redirect. */
   claudeConfigDir?: string;
+  /** The environment the sweep reads its gates AND its client redirects from:
+   *  YAW_MCP_READONLY_DIAGNOSTICS, YAW_MCP_AUTO_HEAL, and -- through the one
+   *  reader doctor and install use -- CLAUDE_CONFIG_DIR, CODEX_HOME, the
+   *  CLINE_* trio, CONTINUE_GLOBAL_DIR, XDG_CONFIG_HOME and %APPDATA%. */
   env?: NodeJS.ProcessEnv;
   /** Path SEMANTICS of the machine doing the inspecting -- never the `os`
    *  option, which picks which client layout to look at. Same seam and same
@@ -222,6 +236,25 @@ export async function healStaleBrokerEntries(opts: HealOptions = {}): Promise<He
     return replacement;
   };
 
+  // Where every client's config lives, resolved the way DOCTOR resolves it and
+  // for the same reason install threads the same values: every client env var
+  // goes through the ONE reader (`readClientEnv`), and %APPDATA% through the
+  // one helper that reads it (`resolveAppDataDir`). This pass used to build
+  // its sites from `opts.claudeConfigDir` / `opts.appData` alone, and neither
+  // caller supplied them -- so under CLAUDE_CONFIG_DIR (every Yaw pane),
+  // CODEX_HOME, a redirected %APPDATA%, the CLINE_* trio or
+  // CONTINUE_GLOBAL_DIR, the sweep inspected the DEFAULT file, reported "no
+  // stale entries", and doctor went on flagging the redirected one. An
+  // explicit option still wins, so a test can pin a path without an env.
+  //
+  // `home` is deliberately NOT defaulted here: `resolveInstallSites` falls
+  // back to os.homedir() itself, and `resolveAppDataDir` reads the ambient
+  // %APPDATA% only when no home was given -- which keeps a test that passes
+  // `home` hermetic and a real run on the redirected directory.
+  const clientEnv = readClientEnv(env);
+  const appData = resolveAppDataDir({ appData: opts.appData, home: opts.home, env });
+  const claudeConfigDir = opts.claudeConfigDir ?? clientEnv.claudeConfigDir;
+
   // One physical entry, healed once. Codex CLI's user and project scopes
   // resolve to the SAME file AND the same container when the process cwd is
   // the home directory -- which is exactly what happens under Yaw Terminal,
@@ -229,121 +262,137 @@ export async function healStaleBrokerEntries(opts: HealOptions = {}): Promise<He
   // the file the first pass just rewrote and report a phantom second repair.
   const seen = new Set<string>();
 
+  /** The sweep over ONE file: read it, apply the four gates, rewrite if every
+   *  one passes. Never throws for a per-file problem. */
+  const healSite = async (target: InstallTarget, scope: string, site: ConfigSite) => {
+    try {
+      // Same transform install reads with, so carried fields and the
+      // normalised view match what install would compute for this row.
+      const view = await readClientConfigFile(site, { transform: target.entry });
+      if (view.read.kind !== "ok") {
+        // A file this pass DECLINED to look inside is not the same as a file
+        // with nothing wrong, and reporting "no stale entries found" for one
+        // is the misleading half of a silent skip. `unspliceable` is the one
+        // that bites in practice -- a TOML root-level inline
+        // `mcp_servers = { ... }` parses fine and holds our entry, but the
+        // splicer will not edit it -- so the user can be sitting on a dead
+        // entry this pass will never repair and never mention. Collected and
+        // surfaced by the caller; doctor still explains each one in full.
+        if (view.read.kind !== "absent") {
+          unhealable.push({
+            clientId: target.clientId,
+            scope,
+            path: site.resolved.absolute,
+            reason: view.read.kind,
+          });
+        }
+        return;
+      }
+      const stored = view.read.entries.find((e) => e.key === ENTRY_NAME);
+      if (stored === undefined) return;
+
+      const launch = stored.launch ?? launchOf(stored.value);
+      if (launch === null) return;
+
+      // Gate 1: an oam launch, pointing into our own package tree.
+      const entryPath = oamRunEntryPath(launch.command, launch.args);
+      if (entryPath === null || !isOwnBrokerEntry(entryPath)) return;
+
+      // Written for another OS than the one inspecting: unverifiable here,
+      // never broken. See isForeignEntry -- this is the WSL case, and it is
+      // checked BEFORE gate 2, because gate 2 is exactly what gets it wrong.
+      if (isForeignEntry(launch.command, entryPath, platform)) return;
+
+      // Gate 2: only a BROKEN entry is ever rewritten.
+      //
+      // A FILE, not merely something at that path: `existsSync` is true for a
+      // directory, and `oam run <a directory>` cannot start the broker any
+      // more than a missing path can -- so testing existence alone declared
+      // an unstartable entry healthy and left it that way. statSync follows
+      // symlinks, which is what we want: a link to a real file is fine, and a
+      // dangling one throws and counts as broken.
+      if (isLaunchableFile(entryPath)) return;
+
+      const { oamBinPath, oamEntry } = await replacementFor();
+      const base = buildLaunchEntry({
+        os,
+        oamBinPath,
+        oamEntry,
+        windowsWrap: target.entry?.windowsLaunch?.broker !== "bare",
+      });
+      const next = composeEntry({
+        base,
+        transform: target.entry,
+        os,
+        purpose: "broker",
+        env: carryableEnvOf(stored.value),
+        carried: carriedFieldsOf(stored.value, target.entry),
+      });
+
+      // Belt and braces: if the rebuild names the same dead path, writing it
+      // changes nothing and would make the pass look productive when it is
+      // not. It cannot happen today -- the resolver existsSync-checks its own
+      // answer -- but the cost of being wrong here is an endless rewrite.
+      const nextLaunch = launchOf(next);
+      const nextEntry = nextLaunch === null ? null : oamRunEntryPath(nextLaunch.command, nextLaunch.args);
+      if (nextEntry !== null && norm(nextEntry, platform) === norm(entryPath, platform)) return;
+
+      if (opts.dryRun !== true) {
+        const text = applyClientConfigEdits(view, [{ op: "upsert", key: ENTRY_NAME, entry: next }], site);
+        await atomicWriteFile(site.resolved.absolute, text);
+      }
+
+      healed.push({
+        clientId: target.clientId,
+        scope,
+        path: site.resolved.absolute,
+        from: entryPath,
+        to: nextEntry ?? "npx",
+      });
+    } catch (err) {
+      // One bad config must not stop the sweep.
+      log("warn", "Could not heal a stale yaw-mcp entry", {
+        path: site.resolved.absolute,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  };
+
   for (const target of INSTALL_TARGETS) {
     for (const scope of target.scopes) {
-      let site: ReturnType<typeof resolveInstallSites>[number] | undefined;
+      let sites: ConfigSite[];
       try {
-        site = resolveInstallSites({
-          clientId: target.clientId,
-          scope: scope.scope,
-          os,
-          home: opts.home,
-          appData: opts.appData,
-          projectDir: scope.requiresProjectDir ? (opts.cwd ?? process.cwd()) : undefined,
-          claudeConfigDir: opts.claudeConfigDir,
-        })[0];
+        // EVERY site the row declares that this machine has, not the first
+        // one. One row -- Cline -- fans a single (client, scope) out to a
+        // shared file plus one copy per editor its extension has run in, and
+        // install writes all of them; a sweep that read only `[0]` left a
+        // dead entry in every editor copy it never looked at. `selectSites`
+        // is install's own filter: a conditional copy counts only when its
+        // editor's storage directory exists, which is also what makes the
+        // file exist at all.
+        sites = selectSites(
+          resolveInstallSites({
+            clientId: target.clientId,
+            scope: scope.scope,
+            os,
+            home: opts.home,
+            appData,
+            projectDir: scope.requiresProjectDir ? (opts.cwd ?? process.cwd()) : undefined,
+            claudeConfigDir,
+            clientEnv,
+          }),
+        );
       } catch {
         // A scope that needs a project dir we cannot supply is simply not a
         // slot on this machine.
         continue;
       }
-      if (site === undefined) continue;
-      const resolvedSite = site;
 
-      const key = `${norm(resolvedSite.resolved.absolute, platform)}::${addressOf(resolvedSite).containerPath.join(".")}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-
-      try {
-        // Same transform install reads with, so carried fields and the
-        // normalised view match what install would compute for this row.
-        const view = await readClientConfigFile(resolvedSite, { transform: target.entry });
-        if (view.read.kind !== "ok") {
-          // A file this pass DECLINED to look inside is not the same as a file
-          // with nothing wrong, and reporting "no stale entries found" for one
-          // is the misleading half of a silent skip. `unspliceable` is the one
-          // that bites in practice -- a TOML root-level inline
-          // `mcp_servers = { ... }` parses fine and holds our entry, but the
-          // splicer will not edit it -- so the user can be sitting on a dead
-          // entry this pass will never repair and never mention. Collected and
-          // surfaced by the caller; doctor still explains each one in full.
-          if (view.read.kind !== "absent") {
-            unhealable.push({
-              clientId: target.clientId,
-              scope: scope.scope,
-              path: resolvedSite.resolved.absolute,
-              reason: view.read.kind,
-            });
-          }
-          continue;
-        }
-        const stored = view.read.entries.find((e) => e.key === ENTRY_NAME);
-        if (stored === undefined) continue;
-
-        const launch = stored.launch ?? launchOf(stored.value);
-        if (launch === null) continue;
-
-        // Gate 1: an oam launch, pointing into our own package tree.
-        const entryPath = oamRunEntryPath(launch.command, launch.args);
-        if (entryPath === null || !isOwnBrokerEntry(entryPath)) continue;
-
-        // Written for another OS than the one inspecting: unverifiable here,
-        // never broken. See isForeignEntry -- this is the WSL case, and it is
-        // checked BEFORE gate 2, because gate 2 is exactly what gets it wrong.
-        if (isForeignEntry(launch.command, entryPath, platform)) continue;
-
-        // Gate 2: only a BROKEN entry is ever rewritten.
-        //
-        // A FILE, not merely something at that path: `existsSync` is true for a
-        // directory, and `oam run <a directory>` cannot start the broker any
-        // more than a missing path can -- so testing existence alone declared
-        // an unstartable entry healthy and left it that way. statSync follows
-        // symlinks, which is what we want: a link to a real file is fine, and a
-        // dangling one throws and counts as broken.
-        if (isLaunchableFile(entryPath)) continue;
-
-        const { oamBinPath, oamEntry } = await replacementFor();
-        const base = buildLaunchEntry({
-          os,
-          oamBinPath,
-          oamEntry,
-          windowsWrap: target.entry?.windowsLaunch?.broker !== "bare",
-        });
-        const next = composeEntry({
-          base,
-          transform: target.entry,
-          os,
-          purpose: "broker",
-          env: carryableEnvOf(stored.value),
-          carried: carriedFieldsOf(stored.value, target.entry),
-        });
-
-        // Belt and braces: if the rebuild names the same dead path, writing it
-        // changes nothing and would make the pass look productive when it is
-        // not. It cannot happen today -- the resolver existsSync-checks its own
-        // answer -- but the cost of being wrong here is an endless rewrite.
-        const nextLaunch = launchOf(next);
-        const nextEntry = nextLaunch === null ? null : oamRunEntryPath(nextLaunch.command, nextLaunch.args);
-        if (nextEntry !== null && norm(nextEntry, platform) === norm(entryPath, platform)) continue;
-
-        if (opts.dryRun !== true) {
-          const text = applyClientConfigEdits(view, [{ op: "upsert", key: ENTRY_NAME, entry: next }], resolvedSite);
-          await atomicWriteFile(resolvedSite.resolved.absolute, text);
-        }
-
-        healed.push({
-          clientId: target.clientId,
-          scope: scope.scope,
-          path: resolvedSite.resolved.absolute,
-          from: entryPath,
-          to: nextEntry ?? "npx",
-        });
-      } catch (err) {
-        // One bad config must not stop the sweep.
-        log("warn", "Could not heal a stale yaw-mcp entry", {
-          path: resolvedSite.resolved.absolute,
-          error: err instanceof Error ? err.message : String(err),
-        });
+      for (const site of sites) {
+        const key = `${norm(site.resolved.absolute, platform)}::${addressOf(site).containerPath.join(".")}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        await healSite(target, scope.scope, site);
       }
     }
   }
@@ -363,8 +412,13 @@ export async function healStaleBrokerEntries(opts: HealOptions = {}): Promise<He
  */
 export async function maybeHealStaleBrokerEntries(opts: HealOptions = {}): Promise<HealResult> {
   const env = opts.env ?? process.env;
-  // Same shape as YAW_MCP_AUTO_PREWARM: an explicit "0" turns it off.
-  if (env.YAW_MCP_AUTO_HEAL === "0") return { healed: [], unhealable: [] };
+  // The one opt-out parse every YAW_MCP_* background feature shares
+  // (opt-out-env.ts): `0` or `false`, trimmed. This used to be a bare
+  // `=== "0"` under a comment claiming it matched its siblings -- so `false`
+  // did nothing here, and neither did the "0 " that cmd.exe's
+  // `set YAW_MCP_AUTO_HEAL=0 && ...` delivers: a Windows user who opted out
+  // the documented way was still healed.
+  if (isFeatureDisabled("YAW_MCP_AUTO_HEAL", env)) return { healed: [], unhealable: [] };
   try {
     return await healStaleBrokerEntries(opts);
   } catch (err) {
