@@ -765,6 +765,15 @@ export class ConnectServer {
   // the child's own secrets. Bounds the re-ask that replaced the old
   // "already elicited, never ask again" latch -- see MAX_CREDENTIAL_PROMPTS.
   private credentialPrompts = new Map<string, number>();
+  // Latch: namespaces that have answered this prompt in a way that ends the
+  // asking for the session (decline, no-page, no-browser). Matches the vault
+  // path's `vaultPassphraseElicited` for the same three reasons. The
+  // budget counter above is the SECOND line of defence -- this is the
+  // FIRST, because each of these is a wall a second prompt would hit
+  // identically, and a wall wastes a budget slot the user could spend on
+  // a real reason to ask again. Cleared on shutdown with the rest of the
+  // session-scoped state.
+  private credentialElicited = new Set<string>();
   // In-flight activation promises, keyed by namespace. Dedupes
   // concurrent activation attempts for the same namespace so that two
   // tool calls landing on a disconnected upstream don't each spawn
@@ -4485,6 +4494,17 @@ export class ConnectServer {
     // failure the vault path was redesigned away from. Re-ask instead,
     // bounded by MAX_CREDENTIAL_PROMPTS per namespace so a server failing
     // for an unrelated reason cannot turn every activation into a modal.
+    // Latch BEFORE the budget check, the way the vault does it: a decline,
+    // a no-page or a no-browser is a wall a second prompt would hit
+    // identically, and a wall wastes a budget slot the user could spend on
+    // a real reason to ask again.
+    if (this.credentialElicited.has(namespace)) {
+      log("info", "Namespace already declined or unreachable for credential prompt; not asking again", {
+        namespace,
+        missing,
+      });
+      return null;
+    }
     const asked = this.credentialPrompts.get(namespace) ?? 0;
     if (asked >= MAX_CREDENTIAL_PROMPTS) {
       log("info", "Missing credentials persist after the prompt budget; not asking again", {
@@ -4504,53 +4524,91 @@ export class ConnectServer {
       return null;
     }
 
-    // Build an object-schema elicitation with one string field per missing
-    // credential. Descriptions are minimal on purpose — we don't know the
-    // semantic purpose of each env var.
-    const properties: Record<string, { type: "string"; title: string; description: string }> = {};
-    for (const key of missing) {
-      properties[key] = {
-        type: "string",
-        title: key,
-        description: `The value for ${key} required by "${namespace}". Stored only for this yaw-mcp session.`,
-      };
-    }
-
+    // The values are typed on a masked page served on 127.0.0.1, not into the
+    // client's own dialog: a form-mode string field is an ordinary visible
+    // text input, so an API token typed there sits on screen in plain text --
+    // and the MCP spec (2025-11-25) forbids form mode for secrets anyway.
+    // collectSecretOnLoopbackPage handles both the URL-mode and the
+    // form-only consent paths and the browser open that follows; it was
+    // written vault-agnostic for this prompt and a follow-up moved the
+    // generic path onto it.
     progress?.(`Asking for ${missing.length === 1 ? "credential" : "credentials"}: ${missing.join(", ")}`);
     // Count the ask BEFORE the round-trip, for the reason the vault path
     // does: an elicitInput that throws must still spend an attempt, or a
     // client failing that request in a loop re-prompts on every activation.
     this.credentialPrompts.set(namespace, asked + 1);
 
-    let result: Awaited<ReturnType<Server["elicitInput"]>>;
-    try {
-      result = await this.server.elicitInput({
-        message: `"${namespace}" can't start without ${missing.join(", ")}. Provide ${missing.length === 1 ? "it" : "them"} to retry, or decline to cancel.`,
-        requestedSchema: {
-          type: "object",
-          properties,
-          required: missing,
-        },
-      });
-    } catch (err) {
-      log("warn", "Elicitation request failed", {
+    const isPlural = missing.length !== 1;
+    const what = isPlural ? "them" : "it";
+    const pronoun = isPlural ? "their" : "its";
+    const why = `"${namespace}" cannot start: it reports ${missing.join(", ")} missing. Set ${what} in this server's "env" in ~/.yaw-mcp/bundles.json to skip this prompt in future sessions.`;
+    const entry = await this.collectSecretOnLoopbackPage({
+      namespace,
+      why,
+      secretNoun: isPlural ? `the values of ${missing.join(", ")}` : `the value of ${missing[0]}`,
+      page: {
+        title: `"${namespace}" needs ${isPlural ? "credentials" : "a credential"} to start`,
+        intro: `"${namespace}" cannot start without ${missing.join(", ")} and reported ${pronoun} missing key${isPlural ? "s" : ""} on ${pronoun} own. Type ${isPlural ? "each value" : "the value"} below. yaw-mcp keeps ${what} in memory for this session only -- never written to disk, and never passed to anything other than "${namespace}".`,
+        fields: missing.map((name) => ({ name, label: name })),
+        doneMessage: "Received. You can close this tab and return to your MCP client.",
+      },
+      progress,
+    });
+
+    if (entry.kind === "failed") {
+      log("info", "Credential elicitation did not complete", { namespace, missing });
+      // shutdown() latched while the prompt was up. Refuse the way every
+      // other shutdown gate does, with the same words: the give-up path's
+      // "spawn failed" invites a retry in a session that is ending.
+      if (this.shuttingDown) return this.shuttingDownRefusal(namespace);
+      return null;
+    }
+    if (entry.kind === "declined") {
+      log("info", "User declined credential elicitation", { namespace });
+      if (this.shuttingDown) return this.shuttingDownRefusal(namespace);
+      // A decline is a decision, not a slip. Latch for the session the
+      // way the vault does: a re-ask would put up the same modal and
+      // hit the same answer.
+      this.credentialElicited.add(namespace);
+      return null;
+    }
+    if (entry.kind === "unreachable") {
+      // Same latch rules as the vault path: no-page and no-browser are a
+      // wall a second prompt will hit identically, so ask again wastes a
+      // round-trip; expired is a user-away state and gets the remaining
+      // budget. The ask was already counted above, which is what makes
+      // this the latch for those two reasons.
+      log("info", "Credential masked-entry page was unreachable", {
         namespace,
-        error: err instanceof Error ? err.message : String(err),
+        missing,
+        reason: entry.reason,
       });
+      if (this.shuttingDown) return this.shuttingDownRefusal(namespace);
+      if (entry.reason !== "expired") {
+        this.credentialElicited.add(namespace);
+        return this.credentialUnreachableRefusal(namespace, missing, entry.reason, asked + 1);
+      }
       return null;
     }
 
-    if (result.action !== "accept" || !result.content) {
-      log("info", "User declined credential elicitation", { namespace, action: result.action });
-      return null;
-    }
-
+    // entry.kind === "submitted". Pick the keys we actually asked for -- a
+    // page with extra fields would carry extras we did not elicit, and an
+    // empty value on a field the page did show reads as a deliberate blank
+    // (the user typed and deleted), so it does not override supplied.
     const values: Record<string, string> = {};
     for (const key of missing) {
-      const v = result.content[key];
+      const v = entry.values[key];
       if (typeof v === "string" && v.length > 0) values[key] = v;
     }
-    if (Object.keys(values).length === 0) return null;
+    if (Object.keys(values).length === 0) {
+      // User opened the page and submitted nothing (or every field blank).
+      // Same as a decline for the user's purposes: they engaged with the
+      // prompt and chose to send no value. Latch and let the give-up path
+      // surface the spawn error rather than a second identical modal.
+      log("info", "Credential masked-entry page returned no values", { namespace, missing });
+      this.credentialElicited.add(namespace);
+      return null;
+    }
 
     this.elicitedEnv.set(namespace, { ...supplied, ...values });
     progress?.("Got credentials — retrying load");
@@ -4741,6 +4799,35 @@ export class ConnectServer {
     };
   }
 
+  // The result for a missing-credential prompt whose masked-entry page never
+  // took a value. Only called for no-page and no-browser -- expired keeps
+  // the budget and falls through to runActivateOne's give-up, since the user
+  // may simply have been away. The shape mirrors vaultPassphraseUnreachable
+  // so a user who saw the vault message once recognises this one: explain
+  // what could not happen, name the env-var path as the long-term fix, and
+  // name the budget so a future activate that hits the latch isn't a
+  // surprise.
+  private credentialUnreachableRefusal(
+    namespace: string,
+    missing: string[],
+    reason: SecretPageFailure,
+    promptsSoFar: number,
+  ): { ok: false; message: string; isChanged: false } {
+    const what =
+      reason === "no-browser"
+        ? "yaw-mcp could not open a browser on this machine for the page that takes the credential in a masked field"
+        : "yaw-mcp could not start the local page that takes the credential in a masked field";
+    const retryHint =
+      promptsSoFar >= MAX_CREDENTIAL_PROMPTS
+        ? ` No further prompts for "${namespace}" this session: set ${missing.join(", ")} in its "env" in ~/.yaw-mcp/bundles.json and activate again -- the edit is picked up on the next mcp_connect_* call, with no client restart.`
+        : ` Activate "${namespace}" again for a new page, or set ${missing.join(", ")} in its "env" in ~/.yaw-mcp/bundles.json and skip the prompt in future sessions.`;
+    return {
+      ok: false,
+      isChanged: false,
+      message: `Could not load "${namespace}": ${what}, so ${missing.join(", ")} is still missing.${retryHint}`,
+    };
+  }
+
   // Collect secret values WITHOUT them ever being typed into the client's
   // own dialog. They are typed into masked fields on a one-shot page this
   // process serves on 127.0.0.1 (secret-entry-page.ts, which carries the
@@ -4763,8 +4850,8 @@ export class ConnectServer {
   //     that is exactly the exposure this replaces.
   //
   // Nothing here is vault-specific. The missing-credential prompt
-  // (maybeElicitAndRetry, which still asks in a visible form field) can move
-  // onto it by supplying its own words and fields.
+  // (maybeElicitAndRetry) supplies its own words and fields and goes through
+  // the same page.
   private async collectSecretOnLoopbackPage(request: {
     namespace: string;
     /** Lead of the client dialog: what needs the secret, and why. */
@@ -6863,6 +6950,7 @@ export class ConnectServer {
     // embedded or test host that wants another session constructs another
     // ConnectServer.
     this.elicitedEnv.clear();
+    this.credentialElicited.clear();
     // Same contract, one scope wider. The vault passphrase lives in a MODULE
     // variable in upstream.ts (so no child env can ever inherit it), which
     // means it outlives this instance rather than being collected with it --

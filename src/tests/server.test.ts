@@ -4406,10 +4406,15 @@ describe("prewarmDormantServers", () => {
     // First spawn fails naming a missing credential; the elicited retry
     // succeeds. Elicitation needs the client capability + a bridge answer.
     priv.server.getClientCapabilities = () => ({ elicitation: {} });
-    priv.server.elicitInput = vi.fn().mockResolvedValue({
-      action: "accept",
-      content: { GITHUB_TOKEN: "ghp_x" },
+    priv.server.elicitInput = vi.fn().mockResolvedValue({ action: "accept" });
+    // The credential is typed on the masked-entry page, not in the dialog.
+    priv.openSecretPage = vi.fn().mockResolvedValue({
+      url: `http://127.0.0.1:5555/${"p".repeat(64)}`,
+      elicitationId: "elicit-prewarm",
+      result: Promise.resolve({ kind: "submitted", values: { GITHUB_TOKEN: "ghp_x" } }),
+      close: vi.fn(),
     });
+    priv.openBrowser = vi.fn().mockResolvedValue(true);
     vi.mocked(connectToUpstream)
       .mockRejectedValueOnce(new Error("GITHUB_TOKEN is required"))
       .mockRejectedValueOnce(new Error("GITHUB_TOKEN is required"))
@@ -7533,10 +7538,15 @@ describe("vault passphrase elicitation", () => {
     const priv = getPrivate(server);
     priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
     priv.server.getClientCapabilities = () => ({ elicitation: {} });
-    priv.server.elicitInput = vi.fn().mockResolvedValue({
-      action: "accept",
-      content: { GITHUB_TOKEN: "ghp_x" },
+    priv.server.elicitInput = vi.fn().mockResolvedValue({ action: "accept" });
+    // The credential is typed on the masked-entry page, not in the dialog.
+    priv.openSecretPage = vi.fn().mockResolvedValue({
+      url: `http://127.0.0.1:5555/${"g".repeat(64)}`,
+      elicitationId: "elicit-gh",
+      result: Promise.resolve({ kind: "submitted", values: { GITHUB_TOKEN: "ghp_x" } }),
+      close: vi.fn(),
     });
+    priv.openBrowser = vi.fn().mockResolvedValue(true);
     vi.mocked(connectToUpstream)
       .mockRejectedValueOnce(new ActivationError("boom", "unknown", "GITHUB_TOKEN is required\n"))
       .mockRejectedValueOnce(new ActivationError("boom", "unknown", "GITHUB_TOKEN is required\n"))
@@ -7727,6 +7737,493 @@ describe("vault passphrase elicitation", () => {
       expect(r.message).not.toContain("vault locked");
     }
     expect(priv.activationFailures.size).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Missing-credential elicitation. A child server's stderr naming a credential
+// the broker does not have ("GITHUB_TOKEN is required" and the like) used to
+// be answered in a form-mode string field, which the spec (2025-11-25) forbids
+// for secrets: a form-mode field is an ordinary visible text input, so an API
+// token typed there sits on screen in plain text. The values are now typed on
+// the same masked-entry page on 127.0.0.1 the vault passphrase uses, with one
+// field per missing key, and the rest of the path mirrors the vault: budget,
+// latch, decline handling, URL-mode and form-mode paths, expiry, browser and
+// page failures, shutdown mid-prompt, and the heartbeat while the page waits.
+// The values land in elicitedEnv for the child's env, never the vault slot.
+// ---------------------------------------------------------------------------
+
+describe("missing-credential elicitation", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.mocked(connectToUpstream).mockReset();
+    vi.mocked(disconnectFromUpstream).mockReset();
+    vi.clearAllMocks();
+    server = new ConnectServer();
+  });
+
+  afterEach(async () => {
+    await server.shutdown();
+  });
+
+  function missingCredential(_namespace: string, ...keys: string[]): ActivationError {
+    return new ActivationError("spawn failed", "unknown", `${keys.map((k) => `${k} is required`).join("\n")}\n`);
+  }
+
+  interface OpenedPage {
+    opts: SecretEntryPageOptions;
+    page: SecretEntryPage;
+    close: ReturnType<typeof vi.fn>;
+  }
+
+  /** Stand-in for the masked-entry page. `entries[i]` is the values object the
+   *  page returns on the i-th open; null means that page expires empty. */
+  function pagesTyping(priv: any, ...entries: Array<Record<string, string> | null>) {
+    const opened: OpenedPage[] = [];
+    priv.openSecretPage = vi.fn(async (opts: SecretEntryPageOptions) => {
+      const entry = entries[opened.length] ?? null;
+      const close = vi.fn();
+      const page: SecretEntryPage = {
+        url: `http://127.0.0.1:6666/${String(opened.length).repeat(64)}`,
+        elicitationId: `elicit-creds-${opened.length}`,
+        result: Promise.resolve(
+          entry === null ? { kind: "expired" as const } : { kind: "submitted" as const, values: entry },
+        ),
+        close,
+      };
+      opened.push({ opts, page, close });
+      return page;
+    });
+    priv.openBrowser = vi.fn().mockResolvedValue(true);
+    return opened;
+  }
+
+  const accept = () => vi.fn().mockResolvedValue({ action: "accept" });
+
+  it("prompts for the credential, stores it in elicitedEnv, and the retry succeeds", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    priv.server.getClientCapabilities = () => ({ elicitation: {} });
+    priv.server.elicitInput = accept();
+    pagesTyping(priv, { GITHUB_TOKEN: "ghp_x" });
+    // runActivateOne retries once on its own; the third call is the
+    // post-elicitation retry.
+    vi.mocked(connectToUpstream)
+      .mockRejectedValueOnce(missingCredential("gh", "GITHUB_TOKEN"))
+      .mockRejectedValueOnce(missingCredential("gh", "GITHUB_TOKEN"))
+      .mockImplementationOnce(async (cfg: UpstreamServerConfig) => makeConnection(cfg.namespace, ["t"]));
+
+    const result = await priv.activateOne("gh");
+
+    expect(result.ok).toBe(true);
+    // The value reached elicitedEnv, which is what the child retry reads.
+    expect(priv.elicitedEnv.get("gh")).toEqual({ GITHUB_TOKEN: "ghp_x" });
+    // And it did NOT reach the vault slot.
+    expect(vaultPassphrase()).toBeUndefined();
+  });
+
+  it("form-only client: the dialog carries NO field, and the credential comes from a masked page it opens", async () => {
+    // The exposure this guards: a form-mode string field is an ordinary
+    // visible input, so an API token typed there sat on screen while typed.
+    // `elicitation: {}` is what a form-only client (Claude Code) declares.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    priv.server.getClientCapabilities = () => ({ elicitation: {} });
+    priv.server.elicitInput = accept();
+    const opened = pagesTyping(priv, { GITHUB_TOKEN: "typed-on-the-page" });
+    vi.mocked(connectToUpstream)
+      .mockRejectedValueOnce(missingCredential("gh", "GITHUB_TOKEN"))
+      .mockRejectedValueOnce(missingCredential("gh", "GITHUB_TOKEN"))
+      .mockImplementationOnce(async (cfg: UpstreamServerConfig) => makeConnection(cfg.namespace, ["t"]));
+
+    const result = await priv.activateOne("gh");
+    expect(result.ok).toBe(true);
+    expect(priv.elicitedEnv.get("gh")).toEqual({ GITHUB_TOKEN: "typed-on-the-page" });
+
+    expect(priv.server.elicitInput).toHaveBeenCalledTimes(1);
+    const params = vi.mocked(priv.server.elicitInput).mock.calls[0][0] as any;
+    // Form mode (no mode, or "form") -- never URL mode to a client that did
+    // not declare it.
+    expect(params.mode === undefined || params.mode === "form").toBe(true);
+    // A consent with no field in it: nothing for a token to be typed into.
+    expect(params.requestedSchema).toEqual({ type: "object", properties: {} });
+    expect(params.message).toContain("masked field");
+    // The token is nowhere in the dialog payload.
+    expect(JSON.stringify(params)).not.toContain("typed-on-the-page");
+
+    // The page is where the credential went: one masked field per missing
+    // key, opened in the system browser only after the user said yes, and
+    // closed afterwards.
+    expect(opened).toHaveLength(1);
+    expect(opened[0].opts.fields).toEqual([{ name: "GITHUB_TOKEN", label: "GITHUB_TOKEN" }]);
+    expect(priv.openBrowser).toHaveBeenCalledWith(opened[0].page.url);
+    expect(opened[0].close).toHaveBeenCalled();
+  });
+
+  it("asks for every missing key as a separate field on one page, and merges them into elicitedEnv", async () => {
+    // A child that names more than one missing key gets one masked field per
+    // key on a single page; the broker stores them all into elicitedEnv so
+    // the retry sees a complete env.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "aws", name: "AWS" })]);
+    priv.server.getClientCapabilities = () => ({ elicitation: {} });
+    priv.server.elicitInput = accept();
+    const opened = pagesTyping(priv, { AWS_ACCESS_KEY_ID: "AKIA", AWS_SECRET_ACCESS_KEY: "s3cr3t" });
+    vi.mocked(connectToUpstream)
+      .mockRejectedValueOnce(missingCredential("aws", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"))
+      .mockRejectedValueOnce(missingCredential("aws", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"))
+      .mockImplementationOnce(async (cfg: UpstreamServerConfig) => makeConnection(cfg.namespace, ["t"]));
+
+    const result = await priv.activateOne("aws");
+
+    expect(result.ok).toBe(true);
+    expect(opened).toHaveLength(1);
+    expect(opened[0].opts.fields.map((f) => f.name)).toEqual(["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]);
+    expect(priv.elicitedEnv.get("aws")).toEqual({
+      AWS_ACCESS_KEY_ID: "AKIA",
+      AWS_SECRET_ACCESS_KEY: "s3cr3t",
+    });
+  });
+
+  it("URL-mode client: sends a URL elicitation for the page and does not open a browser itself", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    // Declares both: URL mode wins, because the spec requires it for secrets.
+    priv.server.getClientCapabilities = () => ({ elicitation: { form: {}, url: {} } });
+    priv.server.elicitInput = accept();
+    const notify = vi.fn().mockResolvedValue(undefined);
+    priv.server.createElicitationCompletionNotifier = vi.fn(() => notify);
+    const opened = pagesTyping(priv, { GITHUB_TOKEN: "via-url-mode" });
+    vi.mocked(connectToUpstream)
+      .mockRejectedValueOnce(missingCredential("gh", "GITHUB_TOKEN"))
+      .mockRejectedValueOnce(missingCredential("gh", "GITHUB_TOKEN"))
+      .mockImplementationOnce(async (cfg: UpstreamServerConfig) => makeConnection(cfg.namespace, ["t"]));
+
+    const result = await priv.activateOne("gh");
+    expect(result.ok).toBe(true);
+    expect(priv.elicitedEnv.get("gh")).toEqual({ GITHUB_TOKEN: "via-url-mode" });
+
+    const params = vi.mocked(priv.server.elicitInput).mock.calls[0][0] as any;
+    expect(params.mode).toBe("url");
+    expect(params.url).toBe(opened[0].page.url);
+    expect(params.elicitationId).toBe(opened[0].page.elicitationId);
+    expect(params.requestedSchema).toBeUndefined();
+    // The client opens the link; the broker must not open a second tab.
+    expect(priv.openBrowser).not.toHaveBeenCalled();
+    // And it is told the out-of-band step finished.
+    expect(priv.server.createElicitationCompletionNotifier).toHaveBeenCalledWith(opened[0].page.elicitationId);
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(opened[0].close).toHaveBeenCalled();
+  });
+
+  it("keeps reporting progress while the page waits, naming the time left before it expires", async () => {
+    // The wait on the page can run its whole TTL. A client that keeps a tool
+    // call alive by resetting its timeout on progress (the pattern the
+    // connect path's heartbeat serves) would otherwise give up on the
+    // activation while the user is still typing in the browser.
+    vi.useFakeTimers();
+    try {
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+      priv.server.getClientCapabilities = () => ({ elicitation: {} });
+      let consent: () => void = () => {};
+      priv.server.elicitInput = vi.fn(
+        () =>
+          new Promise((resolve) => {
+            consent = () => resolve({ action: "accept" });
+          }),
+      );
+      priv.secretEntryPageTtlMs = 60_000;
+      let submit: (values: Record<string, string>) => void = () => {};
+      priv.openSecretPage = vi.fn(async () => ({
+        url: `http://127.0.0.1:6666/${"m".repeat(64)}`,
+        elicitationId: "elicit-creds-slow",
+        result: new Promise((resolve) => {
+          submit = (values) => resolve({ kind: "submitted", values });
+        }),
+        close: vi.fn(),
+      }));
+      priv.openBrowser = vi.fn().mockResolvedValue(true);
+      vi.mocked(connectToUpstream)
+        .mockRejectedValueOnce(missingCredential("gh", "GITHUB_TOKEN"))
+        .mockRejectedValueOnce(missingCredential("gh", "GITHUB_TOKEN"))
+        .mockImplementationOnce(async (cfg: UpstreamServerConfig) => makeConnection(cfg.namespace, ["t"]));
+      const messages: string[] = [];
+      const activation = priv.activateOne("gh", (m: string) => messages.push(m));
+
+      await vi.advanceTimersByTimeAsync(20_000);
+      consent();
+      await vi.advanceTimersByTimeAsync(0);
+      const before = messages.length;
+      await vi.advanceTimersByTimeAsync(PROGRESS_HEARTBEAT_MS);
+      await vi.advanceTimersByTimeAsync(PROGRESS_HEARTBEAT_MS);
+      const ticks = messages.slice(before);
+      expect(ticks).toHaveLength(2);
+      expect(ticks[0]).toContain("Still waiting for the masked entry page");
+      // Elapsed counts the wait; the time left counts from the page's open.
+      // Exact second depends on rounding, but the values must be close to
+      // 60s TTL - 20s consent - 5s/10s waited -- and MUST not be the
+      // 55s/50s the wait-alone arithmetic would give.
+      expect(ticks[0]).toContain("5s so far");
+      expect(ticks[0]).not.toContain("55s before it expires");
+      expect(ticks[0].match(/(\d+)s before it expires/)?.[1]).toMatch(/^3[4-6]$/);
+      expect(ticks[1]).toContain("10s so far");
+      expect(ticks[1].match(/(\d+)s before it expires/)?.[1]).toMatch(/^2[8-9]$|^3[01]$/);
+
+      submit({ GITHUB_TOKEN: "typed-eventually" });
+      const result = await activation;
+      expect(result.ok).toBe(true);
+      const settledAt = messages.length;
+      await vi.advanceTimersByTimeAsync(PROGRESS_HEARTBEAT_MS * 3);
+      expect(messages.slice(settledAt).filter((m) => m.includes("Still waiting"))).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a decline latches the asking for the session, the way the vault does", async () => {
+    // A decline is a decision, not a slip. The vault path latches
+    // immediately on decline; this path latches the same way. The budget
+    // counter is a SECOND line of defence (for unrelated spawn failures
+    // that don't answer the prompt), the latch is the FIRST.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    priv.server.getClientCapabilities = () => ({ elicitation: {} });
+    priv.server.elicitInput = vi.fn().mockResolvedValue({ action: "decline" });
+    pagesTyping(priv, { GITHUB_TOKEN: "never-typed" });
+    vi.mocked(connectToUpstream).mockRejectedValue(missingCredential("gh", "GITHUB_TOKEN"));
+
+    const first = await priv.activateOne("gh");
+    expect(first.ok).toBe(false);
+    expect(priv.server.elicitInput).toHaveBeenCalledTimes(1);
+    // No page ever opened in a browser when the user said no.
+    expect(priv.openBrowser).not.toHaveBeenCalled();
+    // The latch is set; a second activate does not re-ask.
+    expect(priv.credentialElicited.has("gh")).toBe(true);
+
+    // The second activate goes straight to the give-up without an
+    // elicitation, and the message points at the env-var path.
+    const second = await priv.activateOne("gh");
+    expect(second.ok).toBe(false);
+    expect(priv.server.elicitInput).toHaveBeenCalledTimes(1);
+  });
+
+  it("a no-page page also latches the asking for the session, with the env-var hint", async () => {
+    // The two wall-shaped failures (no-page and no-browser) end the asking
+    // for the session, the way a decline does. Expired is different -- a
+    // user-away state -- and that test follows.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    priv.server.getClientCapabilities = () => ({ elicitation: {} });
+    priv.server.elicitInput = accept();
+    priv.openSecretPage = vi.fn().mockRejectedValue(new Error("listen EADDRNOTAVAIL"));
+    priv.openBrowser = vi.fn().mockResolvedValue(true);
+    vi.mocked(connectToUpstream).mockRejectedValue(missingCredential("gh", "GITHUB_TOKEN"));
+
+    const result = await priv.activateOne("gh");
+
+    expect(result.ok).toBe(false);
+    expect(priv.server.elicitInput).not.toHaveBeenCalled();
+    expect(priv.openBrowser).not.toHaveBeenCalled();
+    expect(priv.elicitedEnv.get("gh")).toBeUndefined();
+    // The refusal names what went wrong AND the env-var path that would
+    // skip the prompt, so a user who saw the vault message once recognises
+    // the shape.
+    expect(result.message).toContain("could not start the local page");
+    expect(result.message).toContain("GITHUB_TOKEN");
+    expect(result.message).toContain('bundles.json');
+    expect(priv.credentialElicited.has("gh")).toBe(true);
+  });
+
+  it("an expired page keeps the budget for the next activate", async () => {
+    // Expired is a user-away state. The user may simply have been away from
+    // the keyboard when the TTL ran out, so the next activate gets to ask
+    // once more. Mirrors the vault path's expired-leaves-budget behaviour.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    priv.server.getClientCapabilities = () => ({ elicitation: {} });
+    priv.server.elicitInput = accept();
+    // First page expires; second takes the value.
+    pagesTyping(priv, null, { GITHUB_TOKEN: "typed-on-the-second-page" });
+    // First activate: two rejections from runActivateOne, then the
+    // post-elicitation retry (3rd call) -- the page expired, so the
+    // credential never lands. Second activate: same first two rejections,
+    // then a successful spawn.
+    vi.mocked(connectToUpstream)
+      .mockRejectedValueOnce(missingCredential("gh", "GITHUB_TOKEN"))
+      .mockRejectedValueOnce(missingCredential("gh", "GITHUB_TOKEN"))
+      .mockRejectedValueOnce(missingCredential("gh", "GITHUB_TOKEN"))
+      .mockRejectedValueOnce(missingCredential("gh", "GITHUB_TOKEN"))
+      .mockImplementationOnce(async (cfg: UpstreamServerConfig) => makeConnection(cfg.namespace, ["t"]));
+
+    const first = await priv.activateOne("gh");
+    expect(first.ok).toBe(false);
+    expect(priv.server.elicitInput).toHaveBeenCalledTimes(1);
+    // No latch: expired keeps the budget intact.
+    expect(priv.credentialElicited.has("gh")).toBe(false);
+
+    // The second activate gets another page (and a new opportunity to type).
+    const second = await priv.activateOne("gh");
+    expect(second.ok).toBe(true);
+    expect(priv.server.elicitInput).toHaveBeenCalledTimes(2);
+    expect(priv.elicitedEnv.get("gh")).toEqual({ GITHUB_TOKEN: "typed-on-the-second-page" });
+  });
+
+  it("a page that cannot start latches and reports the env-var fix, so a follow-up activate skips the ask", async () => {
+    // The two wall-shaped failures (no-page and no-browser) end the asking
+    // for the session, the way a decline does. Expired is different -- a
+    // user-away state -- and that test follows.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    priv.server.getClientCapabilities = () => ({ elicitation: {} });
+    priv.server.elicitInput = accept();
+    priv.openSecretPage = vi.fn().mockRejectedValue(new Error("listen EADDRNOTAVAIL"));
+    priv.openBrowser = vi.fn().mockResolvedValue(true);
+    vi.mocked(connectToUpstream).mockRejectedValue(missingCredential("gh", "GITHUB_TOKEN"));
+
+    const result = await priv.activateOne("gh");
+
+    expect(result.ok).toBe(false);
+    expect(priv.server.elicitInput).not.toHaveBeenCalled();
+    expect(priv.openBrowser).not.toHaveBeenCalled();
+    expect(priv.elicitedEnv.get("gh")).toBeUndefined();
+    // The refusal names what went wrong AND the env-var path that would
+    // skip the prompt, so a user who saw the vault message once recognises
+    // the shape.
+    expect(result.message).toContain("could not start the local page");
+    expect(result.message).toContain("GITHUB_TOKEN");
+    expect(result.message).toContain("bundles.json");
+    expect(priv.credentialElicited.has("gh")).toBe(true);
+
+    // A second activate does not re-ask; the latch holds.
+    const second = await priv.activateOne("gh");
+    expect(second.ok).toBe(false);
+    expect(priv.server.elicitInput).toHaveBeenCalledTimes(0);
+  });
+
+  it("shutdown closes a page that is still waiting for the credential", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    priv.server.getClientCapabilities = () => ({ elicitation: {} });
+    priv.server.elicitInput = accept();
+    priv.openBrowser = vi.fn().mockResolvedValue(true);
+    // runActivateOne sleeps 1s between its two attempts; the page's wait
+    // would never let the test proceed anyway, so collapse the sleep to 0
+    // and let the page's never-settling result hold the activation open.
+    priv.activationRetryDelayMs = 0;
+    let settle: (o: unknown) => void = () => {};
+    const close = vi.fn(() => settle({ kind: "closed" }));
+    priv.openSecretPage = vi.fn(async () => ({
+      url: `http://127.0.0.1:6666/${"c".repeat(64)}`,
+      elicitationId: "elicit-creds-shutdown",
+      result: new Promise((r) => {
+        settle = r;
+      }),
+      close,
+    }));
+    vi.mocked(connectToUpstream).mockRejectedValue(missingCredential("gh", "GITHUB_TOKEN"));
+
+    const pending = priv.activateOne("gh");
+    // Wait for the form-mode consent to fire and the browser to be opened:
+    // the page is registered on the instance set the moment the prompt
+    // opens it (line 4803), but the form-mode path opens the browser
+    // AFTER the consent round-trip, so polling for the page being in the
+    // set alone is not enough. Polling for `openBrowser.mock.calls.length`
+    // matches what the vault shutdown test does and is deterministic.
+    // A setTimeout(10) yield before polling gives the two spawn rejections,
+    // the 0ms retry sleep, the page open, and the consent round-trip a
+    // chance to resolve -- the `until` helper's microtask-only polling
+    // does not advance setTimeout-driven work.
+    await new Promise((r) => setTimeout(r, 10));
+    await until(() => vi.mocked(priv.openBrowser).mock.calls.length > 0);
+    expect(priv.secretEntryPages.size).toBe(1);
+
+    await server.shutdown();
+    expect(close).toHaveBeenCalled();
+    const result = await pending;
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain("shutting down");
+    expect(priv.activationFailures.size).toBe(0);
+    expect(priv.secretEntryPages.size).toBe(0);
+    expect(priv.elicitedEnv.get("gh")).toBeUndefined();
+  });
+
+  it("never logs the submitted values, even when the spawn keeps rejecting the same key", async () => {
+    // The page is the only place the values are typed; the broker must not
+    // echo them into a log line that could outlive the session. Two paths
+    // exercise log(): the happy retry (logs the credential prompt's success
+    // and the spawn retry), and the rejected-after-elicitation path (logs
+    // the activation failure with the original stderr tail). Neither path
+    // may carry the value -- the page is the only place it should appear.
+    const logSpy = vi.spyOn(await import("../logger.js"), "log");
+    try {
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+      priv.server.getClientCapabilities = () => ({ elicitation: {} });
+      priv.server.elicitInput = accept();
+      const secretValue = "ghp_supersecret_token_value";
+      pagesTyping(priv, { GITHUB_TOKEN: secretValue });
+      // The child keeps rejecting with the same missing-credential error
+      // after the user supplies the value -- the path that drives the
+      // isElicitRetry branch's "values not accepted" message and the
+      // activationFailures log line.
+      vi.mocked(connectToUpstream).mockRejectedValue(missingCredential("gh", "GITHUB_TOKEN"));
+
+      await priv.activateOne("gh");
+
+      // Every JSON-encoded arg passed to log() across the test. The token
+      // must appear in none of them -- anything written there is on disk.
+      const blob = logSpy.mock.calls.map((args) => JSON.stringify(args)).join("\n");
+      expect(blob).not.toContain(secretValue);
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it("the prompt names the server and the missing key, with agreement for one or many", async () => {
+    // The page intro is what the user reads before typing -- it must name the
+    // server so a multi-server user knows which prompt they are looking at,
+    // and the missing keys so they know what is being asked for. The wording
+    // also has to read correctly for one key and for several: a single
+    // missing key should not say "set them" or "on their own".
+    const priv = getPrivate(server);
+    priv.config = makeConfig([
+      makeServerConfig({ namespace: "gh", name: "GitHub" }),
+      makeServerConfig({ namespace: "aws", name: "AWS" }),
+    ]);
+    priv.server.getClientCapabilities = () => ({ elicitation: {} });
+    priv.server.elicitInput = accept();
+
+    // One missing key: singular pronouns.
+    const openedOne = pagesTyping(priv, { GITHUB_TOKEN: "x" });
+    vi.mocked(connectToUpstream).mockReset();
+    vi.mocked(connectToUpstream)
+      .mockRejectedValueOnce(missingCredential("gh", "GITHUB_TOKEN"))
+      .mockRejectedValueOnce(missingCredential("gh", "GITHUB_TOKEN"))
+      .mockImplementationOnce(async (cfg: UpstreamServerConfig) => makeConnection(cfg.namespace, ["t"]));
+    await priv.activateOne("gh");
+    const introOne = openedOne[0].opts.intro;
+    expect(introOne).toContain("gh");
+    expect(introOne).toContain("GITHUB_TOKEN");
+    expect(introOne).toContain("its");
+    expect(introOne).not.toContain("their");
+    expect(openedOne[0].opts.title).toContain("a credential");
+    expect(openedOne[0].opts.title).not.toContain("credentials");
+
+    // Two missing keys: plural pronouns.
+    const openedMany = pagesTyping(priv, { AWS_ACCESS_KEY_ID: "AKIA", AWS_SECRET_ACCESS_KEY: "s3cr3t" });
+    vi.mocked(connectToUpstream).mockReset();
+    vi.mocked(connectToUpstream)
+      .mockRejectedValueOnce(missingCredential("aws", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"))
+      .mockRejectedValueOnce(missingCredential("aws", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"))
+      .mockImplementationOnce(async (cfg: UpstreamServerConfig) => makeConnection(cfg.namespace, ["t"]));
+    await priv.activateOne("aws");
+    const introMany = openedMany[0].opts.intro;
+    expect(introMany).toContain("their");
+    expect(introMany).not.toContain("on its own");
+    expect(introMany).toContain("keys");
+    expect(openedMany[0].opts.title).toContain("credentials");
   });
 });
 
@@ -7976,8 +8473,16 @@ describe("elicitation retry vs the concurrent-server cap", () => {
       // The window the finding is about: an unrelated namespace takes the
       // last slot while the modal is up. gh cleared the cap on the way in.
       priv.connections.set("busy", makeConnection("busy", ["t"]));
-      return { action: "accept", content: { GITHUB_TOKEN: "ghp_x" } };
+      return { action: "accept" };
     });
+    // The credential is typed on the masked-entry page, not in the dialog.
+    priv.openSecretPage = vi.fn().mockResolvedValue({
+      url: `http://127.0.0.1:5555/${"c".repeat(64)}`,
+      elicitationId: "elicit-cap",
+      result: Promise.resolve({ kind: "submitted", values: { GITHUB_TOKEN: "ghp_x" } }),
+      close: vi.fn(),
+    });
+    priv.openBrowser = vi.fn().mockResolvedValue(true);
     // Both attempts of the first pass fail naming the credential; the elicited
     // retry is the third call and succeeds.
     vi.mocked(connectToUpstream)
@@ -8009,10 +8514,15 @@ describe("elicitation retry vs the concurrent-server cap", () => {
     const priv = getPrivate(server);
     priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
     priv.server.getClientCapabilities = () => ({ elicitation: {} });
-    priv.server.elicitInput = vi.fn().mockResolvedValue({
-      action: "accept",
-      content: { GITHUB_TOKEN: "ghp_x" },
+    priv.server.elicitInput = vi.fn().mockResolvedValue({ action: "accept" });
+    // The credential is typed on the masked-entry page, not in the dialog.
+    priv.openSecretPage = vi.fn().mockResolvedValue({
+      url: `http://127.0.0.1:5555/${"k".repeat(64)}`,
+      elicitationId: "elicit-still-missing",
+      result: Promise.resolve({ kind: "submitted", values: { GITHUB_TOKEN: "ghp_x" } }),
+      close: vi.fn(),
     });
+    priv.openBrowser = vi.fn().mockResolvedValue(true);
     // The child never accepts the value: every spawn reports the same key.
     const stillMissing = new ActivationError("boom", "unknown", "GITHUB_TOKEN is required\n");
     vi.mocked(connectToUpstream).mockRejectedValue(stillMissing);
@@ -8053,10 +8563,15 @@ describe("elicitation retry vs the concurrent-server cap", () => {
     const priv = getPrivate(server);
     priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
     priv.server.getClientCapabilities = () => ({ elicitation: {} });
-    priv.server.elicitInput = vi.fn().mockResolvedValue({
-      action: "accept",
-      content: { GITHUB_TOKEN: "ghp_x" },
+    priv.server.elicitInput = vi.fn().mockResolvedValue({ action: "accept" });
+    // The credential is typed on the masked-entry page, not in the dialog.
+    priv.openSecretPage = vi.fn().mockResolvedValue({
+      url: `http://127.0.0.1:5555/${"b".repeat(64)}`,
+      elicitationId: "elicit-book",
+      result: Promise.resolve({ kind: "submitted", values: { GITHUB_TOKEN: "ghp_x" } }),
+      close: vi.fn(),
     });
+    priv.openBrowser = vi.fn().mockResolvedValue(true);
     vi.mocked(connectToUpstream).mockRejectedValue(
       new ActivationError("boom", "unknown", "GITHUB_TOKEN is required\n"),
     );
@@ -8086,11 +8601,24 @@ describe("elicitation retry vs the concurrent-server cap", () => {
     const priv = getPrivate(server);
     priv.config = makeConfig([makeServerConfig({ namespace: "aws" })]);
     priv.server.getClientCapabilities = () => ({ elicitation: {} });
-    const elicit = vi
-      .fn()
-      .mockResolvedValueOnce({ action: "accept", content: { AWS_ACCESS_KEY_ID: "AKIA" } })
-      .mockResolvedValueOnce({ action: "accept", content: { AWS_SECRET_ACCESS_KEY: "s3cr3t" } });
+    const elicit = vi.fn().mockResolvedValue({ action: "accept" });
     priv.server.elicitInput = elicit;
+    // The credentials are typed on the masked-entry page, not in the dialog.
+    // The first page takes the key id; the second takes the secret. The order
+    // mirrors the elicitations the broker opens above, since both consume a
+    // separate `openSecretPage` call.
+    let opened = 0;
+    priv.openSecretPage = vi.fn().mockImplementation(() => {
+      const i = opened++;
+      const values = i === 0 ? { AWS_ACCESS_KEY_ID: "AKIA" } : { AWS_SECRET_ACCESS_KEY: "s3cr3t" };
+      return Promise.resolve({
+        url: `http://127.0.0.1:5555/${String.fromCharCode(97 + i).repeat(64)}`,
+        elicitationId: `elicit-aws-${i}`,
+        result: Promise.resolve({ kind: "submitted", values }),
+        close: vi.fn(),
+      });
+    });
+    priv.openBrowser = vi.fn().mockResolvedValue(true);
     const noKeyId = new ActivationError("boom", "unknown", "AWS_ACCESS_KEY_ID is required\n");
     const noSecret = new ActivationError("boom", "unknown", "AWS_SECRET_ACCESS_KEY is required\n");
     vi.mocked(connectToUpstream)
@@ -8108,8 +8636,10 @@ describe("elicitation retry vs the concurrent-server cap", () => {
     expect(result.ok).toBe(true);
     expect(result.message).not.toContain("were not accepted");
     expect(elicit).toHaveBeenCalledTimes(2);
-    // The second modal names the new key, not a re-run of the first.
-    expect(elicit.mock.calls[1][0].requestedSchema.required).toEqual(["AWS_SECRET_ACCESS_KEY"]);
+    expect(priv.openSecretPage).toHaveBeenCalledTimes(2);
+    // The second page names the new key, not a re-run of the first.
+    const secondPageOpts = vi.mocked(priv.openSecretPage).mock.calls[1][0];
+    expect(secondPageOpts.fields.map((f: { name: string }) => f.name)).toEqual(["AWS_SECRET_ACCESS_KEY"]);
     // Both values survived into the env the working spawn was given.
     expect(priv.elicitedEnv.get("aws")).toEqual({
       AWS_ACCESS_KEY_ID: "AKIA",
