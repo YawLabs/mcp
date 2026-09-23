@@ -2,7 +2,9 @@
 
 All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented here. This project uses [semantic versioning](https://semver.org) and a script-gated release flow: `./release.sh <version>` runs lint + typecheck + tests + build, bumps, tags, publishes to npm, and publishes `server.json` to the MCP registry.
 
-## Unreleased
+## 1.0.12 -- `yaw-mcp secrets reset` is the way out of a forgotten vault passphrase, and `doctor` says whether the passphrase it sees unlocks the vault
+
+Published 2026-09-23, two days after 1.0.11. Three entries below: the new `secrets reset` verb (#167), which moves the vault aside, lists its entry names and starts a new one under a new passphrase, and refuses when the passphrase it is given already opens the vault; the SECRET VAULT passphrase line in `doctor` gains its unlocks / does-not-unlock / marker-corrupt states; and under `--json` the two stderr warnings that were still prose become JSON lines.
 
 **Added -- `yaw-mcp secrets reset`: the way out of a forgotten vault passphrase**
 
