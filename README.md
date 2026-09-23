@@ -359,7 +359,7 @@ Headers are resolved through the same fail-closed path: a missing or malformed r
 2. **An in-session prompt.** If your client supports MCP [elicitation](https://modelcontextprotocol.io/specification/server/elicitation), a locked vault asks for the passphrase and retries the server. The passphrase is never typed into your client's dialog: it goes into a masked field on a one-shot page yaw-mcp serves on `127.0.0.1`. A client with URL-mode elicitation opens that page from its own prompt. A client with form mode only (Claude Code, for one) asks whether to open it, and on yes yaw-mcp opens it in your default browser; with no browser to open (no graphical session), the call fails and names the env var instead. The page takes one submission and expires after 3 minutes. A mistyped passphrase gets one more try per session; a decline stops the asking. It's held in memory for that session only -- never written to disk, and never handed to the server being started.
 3. **The CLI prompt**, for `yaw-mcp secrets` runs: no-echo on a real TTY. If the terminal will not switch echo off, the prompt refuses rather than show what you type. Note that Git Bash/MSYS can't offer one (Node sees pipes, not a TTY) -- use PowerShell, `winpty`, or the env var there.
 
-`yaw-mcp doctor` has a **SECRET VAULT** section showing what's stored, which servers reference it, and whether a passphrase is available -- start there when a server won't load. It reports names and a yes/no, never a value.
+`yaw-mcp doctor` has a **SECRET VAULT** section showing what's stored, which servers reference it, and whether the passphrase it can see is set and unlocks the vault -- start there when a server won't load. It reports names and a yes/no, never a value.
 
 ```bash
 yaw-mcp secrets set <name>      # store a value (no-echo prompt, or --value/--stdin)
@@ -368,10 +368,13 @@ yaw-mcp secrets list            # show entry NAMES only (values stay encrypted)
 yaw-mcp secrets remove <name>   # delete an entry
 yaw-mcp secrets lock            # forget this process's cached passphrase -- effectively a no-op from the CLI; cannot reach a running server or change the vault
 yaw-mcp secrets rotate          # re-encrypt the whole vault under a NEW passphrase
+yaw-mcp secrets reset           # forgot the passphrase? move the vault aside, list its entry names, start a new one
 yaw-mcp secrets audit [--secret NAME] [--server NS] [--json]   # who consumed which secret, when
 ```
 
 The passphrase derives the key via scrypt and is cached in memory for one process; the on-disk file holds only ciphertext (AES-256-GCM, per-entry IV + tag, one vault salt). `rotate` decrypts every entry first and aborts untouched if any fails -- and it re-wraps the **encryption**, not the underlying tokens (a leaked token is still leaked; rotate it at its source). `audit` reads an append-only `0600` NDJSON log of secret NAME + namespace + timestamp -- never a value -- and writes fail-open so a broken log never blocks a spawn.
+
+**Forgot the passphrase?** There is no recovery: the file holds only ciphertext under a key derived from the passphrase, and nothing else -- no server, no recovery key -- can open it. `yaw-mcp secrets reset` is the way back to a working vault. It prints the entry names the vault holds (plaintext keys, so no passphrase is needed) so you know what to set again, asks you to type `RESET` (or takes `--force` from a script; without it, no TTY means a refusal), moves the old file aside as `secrets.json.reset-<timestamp>` next to the vault -- it still opens under the old passphrase, should that turn up -- and creates an empty vault under a new passphrase, confirmed twice on a TTY or taken from `YAW_MCP_VAULT_PASSPHRASE` when it is set. It refuses when the passphrase it is given already opens the vault: that is `rotate`, not a reset. Afterwards, a yaw-mcp server that is already running keeps the passphrase it started with and needs a restart, and a `YAW_MCP_VAULT_PASSPHRASE` in a client config's `env` block still holds the old value. `yaw-mcp doctor` says whether the passphrase it can see unlocks the vault.
 
 **Threat model.** The vault protects the on-disk file against offline brute-force after exfiltration (stolen laptop, leaked backup): useless without the passphrase, tamper-evident via GCM. It does **not** defend against a process running as you while the passphrase is cached, a keylogger, or a value already leaked at its source.
 
@@ -406,7 +409,7 @@ Common ones (run `yaw-mcp --help` for the full list):
 |----------|-------------|
 | `YAW_MCP_SERVER_CAP` | Max concurrently active servers. Default `6`; `0` disables the cap. Counts servers that are loaded and advertising tools, not upstream processes: startup pre-warm briefly spawns servers it never advertises (see `YAW_MCP_PREWARM`), so on a first session the live child count can exceed this by up to the pre-warm batch size of three, each extra child closing as soon as its tool list is read. |
 | `YAW_MCP_MIN_COMPLIANCE` | Minimum grade (`A`-`F`) an installed server must report before `activate` loads it. |
-| `YAW_MCP_VAULT_PASSPHRASE` | Passphrase for the local secret vault. Required for spawn-time `${secret:NAME}` substitution -- set it in yaw-mcp's own env, not the upstream server's. Clients supporting elicitation prompt for it instead. |
+| `YAW_MCP_VAULT_PASSPHRASE` | Passphrase for the local secret vault. Required for spawn-time `${secret:NAME}` substitution -- set it in yaw-mcp's own env, not the upstream server's. Clients supporting elicitation prompt for it instead. When set, `yaw-mcp secrets reset` keys the fresh vault it creates under it. |
 | `YAW_MCP_TRUST_PROJECT` | `1` skips the consent check on a project-local `.yaw-mcp/bundles.json` and loads it unconditionally. CI/automation only -- it lets any repo you run yaw-mcp inside spawn commands as you. Default: the file must be approved with `yaw-mcp trust`. |
 | `YAW_MCP_AUTO_ACTIVATE` | `0` disables discover auto-loading a clearly-winning server. Default on. |
 | `YAW_MCP_AUTO_UPGRADE` | `0` disables the background self-upgrade check at startup. Default on. |
