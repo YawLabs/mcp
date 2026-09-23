@@ -7849,6 +7849,12 @@ describe("missing-credential elicitation", () => {
     // A consent with no field in it: nothing for a token to be typed into.
     expect(params.requestedSchema).toEqual({ type: "object", properties: {} });
     expect(params.message).toContain("masked field");
+    // The consent message is the only dialog text a user sees in form mode;
+    // it has to carry the env-var fix or the broker reverts to the old
+    // "type it into the dialog" UX. The page intro carries the same
+    // wording -- assert both.
+    expect(params.message).toContain("bundles.json");
+    expect(opened[0].opts.intro).toContain("bundles.json");
     // The token is nowhere in the dialog payload.
     expect(JSON.stringify(params)).not.toContain("typed-on-the-page");
 
@@ -8096,10 +8102,49 @@ describe("missing-credential elicitation", () => {
     expect(result.message).toContain("bundles.json");
     expect(priv.credentialElicited.has("gh")).toBe(true);
 
-    // A second activate does not re-ask; the latch holds.
+    // A second activate does not re-ask; the latch holds. The wall is
+    // a real failure that keeps biting, so the helpful env-var message
+    // must come back -- not the raw "spawn failed" the user saw first.
     const second = await priv.activateOne("gh");
     expect(second.ok).toBe(false);
     expect(priv.server.elicitInput).toHaveBeenCalledTimes(0);
+    expect(second.message).toContain("could not start the local page");
+    expect(second.message).toContain("GITHUB_TOKEN");
+    expect(second.message).toContain("bundles.json");
+  });
+
+  it("a browser that cannot be opened latches and reports the same env-var fix", async () => {
+    // The no-browser shape is the OTHER wall, distinct from no-page: the
+    // page started, the user said yes, the system browser launcher
+    // returned false. The same latch semantics, the same helpful message,
+    // and a follow-up activate re-renders the same refusal -- not the raw
+    // "spawn failed".
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    priv.server.getClientCapabilities = () => ({ elicitation: {} });
+    priv.server.elicitInput = accept();
+    pagesTyping(priv, { GITHUB_TOKEN: "never-reached" });
+    priv.openBrowser = vi.fn().mockResolvedValue(false);
+    vi.mocked(connectToUpstream).mockRejectedValue(missingCredential("gh", "GITHUB_TOKEN"));
+
+    const result = await priv.activateOne("gh");
+
+    expect(result.ok).toBe(false);
+    expect(priv.server.elicitInput).toHaveBeenCalledTimes(1);
+    // The page opened (the user said yes to the consent) but the
+    // browser launcher refused -- the page's own result never fires.
+    expect(priv.openBrowser).toHaveBeenCalledTimes(1);
+    expect(result.message).toContain("could not open a browser");
+    expect(result.message).toContain("GITHUB_TOKEN");
+    expect(result.message).toContain("bundles.json");
+    expect(priv.credentialElicited.get("gh")).toBe("no-browser");
+
+    // Follow-up activate: latch holds, same helpful message comes back.
+    const second = await priv.activateOne("gh");
+    expect(second.ok).toBe(false);
+    expect(priv.server.elicitInput).toHaveBeenCalledTimes(1);
+    expect(second.message).toContain("could not open a browser");
+    expect(second.message).toContain("bundles.json");
   });
 
   it("shutdown closes a page that is still waiting for the credential", async () => {
@@ -8125,19 +8170,23 @@ describe("missing-credential elicitation", () => {
     vi.mocked(connectToUpstream).mockRejectedValue(missingCredential("gh", "GITHUB_TOKEN"));
 
     const pending = priv.activateOne("gh");
-    // Wait for the form-mode consent to fire and the browser to be opened:
-    // the page is registered on the instance set the moment the prompt
-    // opens it (line 4803), but the form-mode path opens the browser
-    // AFTER the consent round-trip, so polling for the page being in the
-    // set alone is not enough. Polling for `openBrowser.mock.calls.length`
-    // matches what the vault shutdown test does and is deterministic.
-    // A setTimeout(10) yield before polling gives the two spawn rejections,
-    // the 0ms retry sleep, the page open, and the consent round-trip a
-    // chance to resolve -- the `until` helper's microtask-only polling
-    // does not advance setTimeout-driven work.
+    // Wait for the form-mode consent to fire and the browser to be opened.
+    // The page is registered on the instance set the moment the prompt
+    // opens it, but the form-mode path opens the browser AFTER the consent
+    // round-trip, so polling for the page alone is not enough. Polling
+    // for `openBrowser.mock.calls.length` matches the vault shutdown test
+    // and is deterministic once the consent has resolved.
+    //
+    // The setTimeout(10) yield before polling is load-bearing: the path
+    // runs two spawn rejections, a 0ms retry sleep (collapsed via
+    // activationRetryDelayMs = 0), an openSecretPage await, the consent
+    // round-trip, and an openBrowser call. The `until` helper's microtask
+    // loop does not advance setTimeout-driven work, so on a slow CI
+    // machine the 200-tick budget can be exhausted before the page ever
+    // opens. Yielding once to the macrotask queue first lets the chain
+    // settle. Don't drop this without a deterministic alternative.
     await new Promise((r) => setTimeout(r, 10));
-    await until(() => vi.mocked(priv.openBrowser).mock.calls.length > 0);
-    expect(priv.secretEntryPages.size).toBe(1);
+    await until(() => priv.secretEntryPages.size > 0 && vi.mocked(priv.openBrowser).mock.calls.length > 0);
 
     await server.shutdown();
     expect(close).toHaveBeenCalled();

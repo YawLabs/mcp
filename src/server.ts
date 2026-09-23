@@ -765,15 +765,22 @@ export class ConnectServer {
   // the child's own secrets. Bounds the re-ask that replaced the old
   // "already elicited, never ask again" latch -- see MAX_CREDENTIAL_PROMPTS.
   private credentialPrompts = new Map<string, number>();
-  // Latch: namespaces that have answered this prompt in a way that ends the
-  // asking for the session (decline, no-page, no-browser). Matches the vault
-  // path's `vaultPassphraseElicited` for the same three reasons. The
-  // budget counter above is the SECOND line of defence -- this is the
-  // FIRST, because each of these is a wall a second prompt would hit
-  // identically, and a wall wastes a budget slot the user could spend on
-  // a real reason to ask again. Cleared on shutdown with the rest of the
-  // session-scoped state.
-  private credentialElicited = new Set<string>();
+  // Latch: namespaces whose prompt has ended the asking for the session,
+  // keyed by the REASON so a follow-up activate can surface the right
+  // refusal. The vault uses a single boolean (`vaultPassphraseElicited`)
+  // and the same shaped message regardless of why; here, "decline" and
+  // "empty submission" are user decisions (return the raw spawn error,
+  // the user knows what they did) while "no-page" / "no-browser" are
+  // wall-shaped failures a follow-up activate would hit identically, and
+  // the user still needs the bundles.json hint on every attempt.
+  //
+  // Follow-up: the vault has `clearSessionVaultPassphrase` for an external
+  // caller (the `yaw-mcp secrets reset` CLI verb) to clear the latch
+  // WITHOUT a process restart. There is no equivalent here today -- a
+  // namespace that latches a no-browser stays latched until shutdown.
+  // Not worth building until a verb that needs it (e.g. a per-server
+  // "forget I asked") actually lands.
+  private credentialElicited = new Map<string, "declined" | "empty" | SecretPageFailure>();
   // In-flight activation promises, keyed by namespace. Dedupes
   // concurrent activation attempts for the same namespace so that two
   // tool calls landing on a disconnected upstream don't each spawn
@@ -4499,10 +4506,21 @@ export class ConnectServer {
     // identically, and a wall wastes a budget slot the user could spend on
     // a real reason to ask again.
     if (this.credentialElicited.has(namespace)) {
-      log("info", "Namespace already declined or unreachable for credential prompt; not asking again", {
+      const reason = this.credentialElicited.get(namespace);
+      log("debug", "Namespace already declined or unreachable for credential prompt; not asking again", {
         namespace,
         missing,
+        reason,
       });
+      // Wall-shaped latches get the same helpful refusal on every follow-up
+      // activate: the user is going to keep trying (it's an automation /
+      // a script that retries, or the user hitting activate again) and
+      // they need the bundles.json hint each time. Decline and empty
+      // submission are user decisions -- return the raw spawn error so
+      // the user sees what their action caused, not the workaround.
+      if (reason === "no-page" || reason === "no-browser") {
+        return this.credentialUnreachableRefusal(namespace, missing, reason);
+      }
       return null;
     }
     const asked = this.credentialPrompts.get(namespace) ?? 0;
@@ -4527,7 +4545,10 @@ export class ConnectServer {
     // The values are typed on a masked page served on 127.0.0.1, not into the
     // client's own dialog: a form-mode string field is an ordinary visible
     // text input, so an API token typed there sits on screen in plain text --
-    // and the MCP spec (2025-11-25) forbids form mode for secrets anyway.
+    // and the MCP spec (2025-11-25 release of modelcontextprotocol.io/specification
+    // -- pinned by date so a future reader can re-verify; the prohibition is
+    // on servers using form-mode elicitation for passwords / API keys /
+    // access tokens) forbids form mode for secrets anyway.
     // collectSecretOnLoopbackPage handles both the URL-mode and the
     // form-only consent paths and the browser open that follows; it was
     // written vault-agnostic for this prompt and a follow-up moved the
@@ -4541,14 +4562,21 @@ export class ConnectServer {
     const isPlural = missing.length !== 1;
     const what = isPlural ? "them" : "it";
     const pronoun = isPlural ? "their" : "its";
-    const why = `"${namespace}" cannot start: it reports ${missing.join(", ")} missing. Set ${what} in this server's "env" in ~/.yaw-mcp/bundles.json to skip this prompt in future sessions.`;
+    // The bundles.json hint appears in both places a user reads text on this
+    // path: the dialog message (form mode) or the URL-mode prompt's lead
+    // (URL mode) -- the `why` field -- AND the page itself once it opens.
+    // Dropping it from either side is a regression to the pre-#168 UX, where
+    // a user with no working memory of the vault-style hint had to discover
+    // the env path by reading the source.
+    const fixHint = `Set ${what} in this server's "env" in ~/.yaw-mcp/bundles.json to skip this prompt in future sessions.`;
+    const why = `"${namespace}" cannot start: it reports ${missing.join(", ")} missing. ${fixHint}`;
     const entry = await this.collectSecretOnLoopbackPage({
       namespace,
       why,
       secretNoun: isPlural ? `the values of ${missing.join(", ")}` : `the value of ${missing[0]}`,
       page: {
         title: `"${namespace}" needs ${isPlural ? "credentials" : "a credential"} to start`,
-        intro: `"${namespace}" cannot start without ${missing.join(", ")} and reported ${pronoun} missing key${isPlural ? "s" : ""} on ${pronoun} own. Type ${isPlural ? "each value" : "the value"} below. yaw-mcp keeps ${what} in memory for this session only -- never written to disk, and never passed to anything other than "${namespace}".`,
+        intro: `"${namespace}" cannot start without ${missing.join(", ")} and reported ${pronoun} missing key${isPlural ? "s" : ""} on ${pronoun} own. Type ${isPlural ? "each value" : "the value"} below. yaw-mcp keeps ${what} in memory for this session only -- never written to disk, and never passed to anything other than "${namespace}". ${fixHint}`,
         fields: missing.map((name) => ({ name, label: name })),
         doneMessage: "Received. You can close this tab and return to your MCP client.",
       },
@@ -4568,16 +4596,18 @@ export class ConnectServer {
       if (this.shuttingDown) return this.shuttingDownRefusal(namespace);
       // A decline is a decision, not a slip. Latch for the session the
       // way the vault does: a re-ask would put up the same modal and
-      // hit the same answer.
-      this.credentialElicited.add(namespace);
+      // hit the same answer. The early check above renders the raw
+      // spawn error on follow-up -- a user who said no wants the
+      // original "could not load" message, not a workaround hint.
+      this.credentialElicited.set(namespace, "declined");
       return null;
     }
     if (entry.kind === "unreachable") {
       // Same latch rules as the vault path: no-page and no-browser are a
-      // wall a second prompt will hit identically, so ask again wastes a
-      // round-trip; expired is a user-away state and gets the remaining
-      // budget. The ask was already counted above, which is what makes
-      // this the latch for those two reasons.
+      // wall a second prompt would hit identically, so ask again wastes
+      // a round-trip. Expired is a user-away state and gets the remaining
+      // budget -- the user may simply have been away. Match vault wording
+      // so a user who saw the vault message once recognises the shape.
       log("info", "Credential masked-entry page was unreachable", {
         namespace,
         missing,
@@ -4585,8 +4615,14 @@ export class ConnectServer {
       });
       if (this.shuttingDown) return this.shuttingDownRefusal(namespace);
       if (entry.reason !== "expired") {
-        this.credentialElicited.add(namespace);
-        return this.credentialUnreachableRefusal(namespace, missing, entry.reason, asked + 1);
+        // Explicit latch: the early check at the top of this function
+        // already accounts for the no-page / no-browser wall. Without an
+        // add here, the next activate would burn a budget slot on the
+        // SAME wall, not a new reason to ask. The latch carries the
+        // reason so the early check can re-render the same refusal on a
+        // follow-up activate.
+        this.credentialElicited.set(namespace, entry.reason);
+        return this.credentialUnreachableRefusal(namespace, missing, entry.reason);
       }
       return null;
     }
@@ -4603,10 +4639,14 @@ export class ConnectServer {
     if (Object.keys(values).length === 0) {
       // User opened the page and submitted nothing (or every field blank).
       // Same as a decline for the user's purposes: they engaged with the
-      // prompt and chose to send no value. Latch and let the give-up path
-      // surface the spawn error rather than a second identical modal.
+      // prompt and chose to send no value. Latch here so a follow-up
+      // activate hits the early check at the top of this function and
+      // does not re-open the page -- this return-null is for THIS
+      // activate only; the latch owns the next ask. The "empty" reason
+      // makes the early check fall through to the raw spawn error,
+      // the same as a decline: this was a user decision, not a wall.
       log("info", "Credential masked-entry page returned no values", { namespace, missing });
-      this.credentialElicited.add(namespace);
+      this.credentialElicited.set(namespace, "empty");
       return null;
     }
 
@@ -4804,23 +4844,32 @@ export class ConnectServer {
   // the budget and falls through to runActivateOne's give-up, since the user
   // may simply have been away. The shape mirrors vaultPassphraseUnreachable
   // so a user who saw the vault message once recognises this one: explain
-  // what could not happen, name the env-var path as the long-term fix, and
-  // name the budget so a future activate that hits the latch isn't a
-  // surprise.
+  // what could not happen, then point at the bundles.json env path as the
+  // long-term fix. The retry hint is the same shape for both reasons: the
+  // latch above this branch (no-page / no-browser) means a second activate
+  // goes straight to the give-up, so a "no further prompts" line on the
+  // first prompt would be inaccurate.
   private credentialUnreachableRefusal(
     namespace: string,
     missing: string[],
     reason: SecretPageFailure,
-    promptsSoFar: number,
   ): { ok: false; message: string; isChanged: false } {
-    const what =
-      reason === "no-browser"
-        ? "yaw-mcp could not open a browser on this machine for the page that takes the credential in a masked field"
-        : "yaw-mcp could not start the local page that takes the credential in a masked field";
-    const retryHint =
-      promptsSoFar >= MAX_CREDENTIAL_PROMPTS
-        ? ` No further prompts for "${namespace}" this session: set ${missing.join(", ")} in its "env" in ~/.yaw-mcp/bundles.json and activate again -- the edit is picked up on the next mcp_connect_* call, with no client restart.`
-        : ` Activate "${namespace}" again for a new page, or set ${missing.join(", ")} in its "env" in ~/.yaw-mcp/bundles.json and skip the prompt in future sessions.`;
+    let what: string;
+    switch (reason) {
+      case "no-browser":
+        what = "yaw-mcp could not open a browser on this machine for the page that takes the credential in a masked field";
+        break;
+      case "no-page":
+        what = "yaw-mcp could not start the local page that takes the credential in a masked field";
+        break;
+      case "expired":
+        // Caller-side: the unreachable branch returns null for expired
+        // before this helper runs, so seeing it here is a logic bug. Let
+        // the type system flag a future addition to SecretPageFailure
+        // instead of silently mis-rendering.
+        throw new Error(`credentialUnreachableRefusal called with reason "expired" -- the caller should have returned null`);
+    }
+    const retryHint = ` Activate "${namespace}" again for a new page, or set ${missing.join(", ")} in its "env" in ~/.yaw-mcp/bundles.json to skip the prompt in future sessions.`;
     return {
       ok: false,
       isChanged: false,
