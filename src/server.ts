@@ -4857,7 +4857,8 @@ export class ConnectServer {
     let what: string;
     switch (reason) {
       case "no-browser":
-        what = "yaw-mcp could not open a browser on this machine for the page that takes the credential in a masked field";
+        what =
+          "yaw-mcp could not open a browser on this machine for the page that takes the credential in a masked field";
         break;
       case "no-page":
         what = "yaw-mcp could not start the local page that takes the credential in a masked field";
@@ -4867,7 +4868,9 @@ export class ConnectServer {
         // before this helper runs, so seeing it here is a logic bug. Let
         // the type system flag a future addition to SecretPageFailure
         // instead of silently mis-rendering.
-        throw new Error(`credentialUnreachableRefusal called with reason "expired" -- the caller should have returned null`);
+        throw new Error(
+          `credentialUnreachableRefusal called with reason "expired" -- the caller should have returned null`,
+        );
     }
     const retryHint = ` Activate "${namespace}" again for a new page, or set ${missing.join(", ")} in its "env" in ~/.yaw-mcp/bundles.json to skip the prompt in future sessions.`;
     return {

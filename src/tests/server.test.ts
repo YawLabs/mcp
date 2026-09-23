@@ -8038,7 +8038,7 @@ describe("missing-credential elicitation", () => {
     // the shape.
     expect(result.message).toContain("could not start the local page");
     expect(result.message).toContain("GITHUB_TOKEN");
-    expect(result.message).toContain('bundles.json');
+    expect(result.message).toContain("bundles.json");
     expect(priv.credentialElicited.has("gh")).toBe(true);
   });
 
@@ -8325,7 +8325,9 @@ describe("missing-credential elicitation", () => {
     expect(priv.server.elicitInput).toHaveBeenCalledTimes(1);
     // The completion notification was sent for the expired page's
     // elicitationId -- the client can drop its "waiting" state.
-    expect(priv.server.createElicitationCompletionNotifier).toHaveBeenCalledWith(expect.stringMatching(/^elicit-creds-0$/));
+    expect(priv.server.createElicitationCompletionNotifier).toHaveBeenCalledWith(
+      expect.stringMatching(/^elicit-creds-0$/),
+    );
     expect(notify).toHaveBeenCalledTimes(1);
     // No latch: expired keeps the budget intact.
     expect(priv.credentialElicited.has("gh")).toBe(false);
@@ -8464,9 +8466,7 @@ describe("missing-credential elicitation", () => {
     // and is dropped. The non-empty value reaches elicitedEnv; the
     // blank one does not.
     const priv = getPrivate(server);
-    priv.config = makeConfig([
-      makeServerConfig({ namespace: "aws", name: "AWS" }),
-    ]);
+    priv.config = makeConfig([makeServerConfig({ namespace: "aws", name: "AWS" })]);
     priv.server.getClientCapabilities = () => ({ elicitation: {} });
     priv.server.elicitInput = accept();
     pagesTyping(priv, { AWS_ACCESS_KEY_ID: "AKIA", AWS_SECRET_ACCESS_KEY: "" });
@@ -8512,9 +8512,7 @@ describe("missing-credential elicitation", () => {
     // The early check's filter on `v.length > 0` is what makes this
     // work; pin it.
     const priv = getPrivate(server);
-    priv.config = makeConfig([
-      makeServerConfig({ namespace: "aws", name: "AWS" }),
-    ]);
+    priv.config = makeConfig([makeServerConfig({ namespace: "aws", name: "AWS" })]);
     priv.server.getClientCapabilities = () => ({ elicitation: {} });
     priv.server.elicitInput = accept();
     // First page: only AWS_ACCESS_KEY_ID. Second page: only
