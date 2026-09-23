@@ -392,7 +392,7 @@ if (subcommand === "compliance") {
 
   Secrets:
     secrets <action>         Manage the local encrypted secret vault: set,
-                             get, list, remove, lock, rotate, audit.
+                             get, list, remove, lock, rotate, reset, audit.
                              Reference a stored value from any server's env
                              as \${secret:NAME}.
 
@@ -528,7 +528,8 @@ if (subcommand === "compliance") {
                                from every child env. A client that supports
                                MCP elicitation prompts for it instead, for
                                that session only. Manage entries with
-                               \`yaw-mcp secrets\`.
+                               \`yaw-mcp secrets\`; when it is set, \`secrets
+                               reset\` keys the fresh vault it creates under it.
     YAW_MCP_VAULT_PASSPHRASE_NEW  The NEW passphrase for \`yaw-mcp secrets
                                rotate\`, so a re-wrap can run without a TTY.
                                Read only by \`rotate\`; without it (and

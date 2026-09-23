@@ -46,7 +46,15 @@ import {
 } from "../install-targets.js";
 import { isOamLaunch, MIN_OAM_VERSION, OAM_INSTALL_PS1, OAM_INSTALL_SH } from "../oam-spawn.js";
 import { STATE_FILENAME, STATE_SCHEMA_VERSION } from "../persistence.js";
-import { SECRETS_SCHEMA_VERSION } from "../secrets-vault.js";
+import {
+  createEmptyVault,
+  isUnlocked,
+  lock,
+  SECRETS_SCHEMA_VERSION,
+  saveVault,
+  setSecret,
+  unlock,
+} from "../secrets-vault.js";
 
 // An UNREADABLE project bundles.json is a doctor branch of its own (the
 // "could not be read" line, and the approved-but-unreadable "loads NO
@@ -3639,7 +3647,12 @@ describe("runDoctor — SECRET VAULT", () => {
     const txt = cap.text();
     expect(txt).toContain("SECRET VAULT");
     expect(txt).toContain("2 -- gh, tailscale");
-    expect(txt).toContain("passphrase: set in this environment");
+    // The fixture's entries decrypt under no key and it carries no check
+    // marker, so this is the one test that reaches verifyKey's check-absent
+    // branch and vaultVerifiesPassphrases' entries arm: the line it produces
+    // is "does NOT unlock", and that exact line is pinned so the verdict
+    // cannot quietly flip for older, marker-less vaults.
+    expect(txt).toContain("passphrase: set in this environment, but it does NOT unlock the vault");
     // The passphrase is itself a credential and doctor output is the
     // paste-into-a-ticket surface. It must NEVER be echoed.
     expect(txt).not.toContain("hunter2-do-not-leak");
@@ -3844,11 +3857,163 @@ describe("runDoctor — SECRET VAULT", () => {
       entries: ["gh"],
       unreadable: null,
       passphraseSet: true,
+      passphraseUnlocks: false,
+      checkMarkerCorrupt: false,
       refs: [{ namespace: "gh", secretNames: ["gh"] }],
       missing: [],
     });
     // Boolean, not the value -- and nowhere else in the blob either.
     expect(r.lines[0]).not.toContain("hunter2-do-not-leak");
+  });
+
+  it("says whether the passphrase it can see UNLOCKS the vault, and points a wrong one at reset", async () => {
+    // A real vault, not the writeVault fixture: its fake entries decrypt
+    // under no key, so it can only ever demonstrate the "does NOT" line.
+    const file = join(synthHome, ".yaw-mcp", "secrets.json");
+    await saveVault(file, await createEmptyVault("the-real-passphrase-xyz"));
+
+    const right = captureOut();
+    const ok = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_VAULT_PASSPHRASE: "the-real-passphrase-xyz" },
+      os: "linux",
+      out: right.out,
+    });
+    expect(right.text()).toContain("passphrase: set in this environment, and it unlocks the vault");
+    expect(right.text()).not.toContain("secrets reset");
+    expect(right.text()).not.toContain("the-real-passphrase-xyz");
+    expect(ok.exitCode).toBe(0);
+    // The derivation's key is dropped: doctor has no use for it.
+    expect(isUnlocked()).toBe(false);
+
+    const wrong = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_VAULT_PASSPHRASE: "not-the-one-anymore" },
+      os: "linux",
+      out: wrong.out,
+    });
+    const txt = wrong.text();
+    expect(txt).toContain("passphrase: set in this environment, but it does NOT unlock the vault");
+    expect(txt).toContain("`env` block of your client config");
+    expect(txt).toContain("`yaw-mcp secrets reset`");
+    expect(txt).not.toContain("not-the-one-anymore");
+    // Informational, like the rest of the section: a stale value in THIS
+    // shell says nothing about the client's env.
+    expect(r.exitCode).toBe(0);
+    expect(txt).not.toMatch(/WARNINGS/);
+    expect(isUnlocked()).toBe(false);
+  });
+
+  it("tells a right passphrase apart from a corrupt check marker, and never points that user at reset", async () => {
+    // The marker fails to decrypt but an entry does: the passphrase is RIGHT
+    // and the marker is damaged. unlock() still fails (the broker refuses the
+    // spawn), so passphraseUnlocks stays false -- but the line must say what
+    // to delete, not send the user to a `reset` that would move an intact
+    // vault aside, nor to a `rotate` that refuses it.
+    const pass = "the-real-passphrase-xyz";
+    const empty = await createEmptyVault(pass);
+    const key = await unlock(empty, pass);
+    const vault = setSecret(empty, key, "gh", "ghp_value");
+    lock();
+    const tampered = {
+      ...vault,
+      check: {
+        ...(vault.check as NonNullable<typeof vault.check>),
+        ciphertext: Buffer.from("tampered").toString("base64"),
+      },
+    };
+    const file = join(synthHome, ".yaw-mcp", "secrets.json");
+    await saveVault(file, tampered);
+
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_VAULT_PASSPHRASE: pass },
+      os: "linux",
+      out: cap.out,
+    });
+    const txt = cap.text();
+    expect(txt).toContain("passphrase: set in this environment, and it is the vault's -- but the vault's check");
+    expect(txt).toContain('delete the "check" key from');
+    expect(txt).toContain(file);
+    expect(txt).not.toContain("secrets reset");
+    expect(txt).not.toContain("does NOT unlock");
+    expect(txt).not.toContain(pass);
+    expect(r.exitCode).toBe(0);
+    expect(isUnlocked()).toBe(false);
+
+    const jsonCap = captureOut();
+    const j = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_VAULT_PASSPHRASE: pass },
+      os: "linux",
+      out: jsonCap.out,
+      json: true,
+      skipRegistryCheck: true,
+    });
+    expect(JSON.parse(j.lines[0]).vault).toMatchObject({
+      passphraseSet: true,
+      passphraseUnlocks: false,
+      checkMarkerCorrupt: true,
+    });
+  });
+
+  it("does not claim a verdict when there is nothing to check the passphrase against", async () => {
+    // An empty, marker-less vault accepts every passphrase; "it unlocks"
+    // would be a claim about nothing. The bare line, and null in --json.
+    writeVault({});
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_VAULT_PASSPHRASE: "whatever-it-is" },
+      os: "linux",
+      out: cap.out,
+      json: true,
+      skipRegistryCheck: true,
+    });
+    expect(JSON.parse(r.lines[0]).vault).toMatchObject({ passphraseSet: true, passphraseUnlocks: null });
+    const text = captureOut();
+    await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_VAULT_PASSPHRASE: "whatever-it-is" },
+      os: "linux",
+      out: text.out,
+    });
+    expect(text.text()).toContain("passphrase: set in this environment\n");
+  });
+
+  it("carries passphraseUnlocks in --json: true, false, or null with no passphrase", async () => {
+    const file = join(synthHome, ".yaw-mcp", "secrets.json");
+    await saveVault(file, await createEmptyVault("the-real-passphrase-xyz"));
+    const vaultBlock = async (env: Record<string, string>): Promise<Record<string, unknown>> => {
+      const cap = captureOut();
+      const r = await runDoctor({
+        cwd: synthCwd,
+        home: synthHome,
+        env,
+        os: "linux",
+        out: cap.out,
+        json: true,
+        skipRegistryCheck: true,
+      });
+      return JSON.parse(r.lines[0]).vault;
+    };
+    expect(await vaultBlock({ YAW_MCP_VAULT_PASSPHRASE: "the-real-passphrase-xyz" })).toMatchObject({
+      passphraseSet: true,
+      passphraseUnlocks: true,
+    });
+    expect(await vaultBlock({ YAW_MCP_VAULT_PASSPHRASE: "nope-nope-nope" })).toMatchObject({
+      passphraseSet: true,
+      passphraseUnlocks: false,
+    });
+    expect(await vaultBlock({})).toMatchObject({ passphraseSet: false, passphraseUnlocks: null });
   });
 
   it("emits the vault block in --json even when no vault exists", async () => {

@@ -11,9 +11,9 @@
 // short-circuits earlier with a different message). Every other export passes
 // through to the real module, including the module-scoped key cache.
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { injected } = vi.hoisted(() => ({
@@ -129,6 +129,29 @@ describe("runSecrets -- a failed vault write stays inside the command's error en
     // caller was just told nothing was saved, so this process must not keep
     // holding a derived key for the vault it failed to replace.
     expect(isUnlocked()).toBe(false);
+  });
+
+  it("reset leaves the old vault untouched and removes its copy when the new vault cannot be written", async () => {
+    await seed();
+    const before = readFileSync(vaultPath(home), "utf8");
+    injected.code = "EACCES";
+    const r = await runSecrets({ action: "reset", force: true, passphrase: NEW_PASS, home, json: true }, io);
+    expect(r.exitCode).toBe(1);
+    const parsed = errJson();
+    expect(parsed.ok).toBe(false);
+    expect(parsed.error).toContain("EACCES");
+    expect(parsed.error).toContain(vaultPath(home));
+    // Not "nothing was saved": that sentence is false here (a copy was
+    // taken), and the one true statement is that the old vault is as it was
+    // -- the new one is written over it atomically, so a failed write never
+    // touches it.
+    expect(parsed.error).toContain("the old vault is untouched");
+    expect(parsed.error).not.toContain("nothing was saved");
+    expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
+    // The copy taken before the write is removed again: no `.reset-` sibling
+    // survives a failed reset.
+    expect(readdirSync(dirname(vaultPath(home))).filter((f) => f.includes(".reset-"))).toEqual([]);
+    expect(io.out).not.toHaveBeenCalled();
   });
 
   it("falls back to the error MESSAGE when the write failure carries no errno", async () => {

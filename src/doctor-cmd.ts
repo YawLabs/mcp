@@ -130,12 +130,17 @@ import {
   STATE_SCHEMA_VERSION,
 } from "./persistence.js";
 import {
+  checkVaultPassphrase,
   collectMalformedSecretRefs,
   collectSecretRefNames,
   listKeys,
   loadVault,
+  lock,
   SECRETS_SCHEMA_VERSION,
+  type VaultFile,
+  vaultCheckCorruptHint,
   vaultPath,
+  vaultVerifiesPassphrases,
 } from "./secrets-vault.js";
 import { buildRefreshPlan, isSidecarRefreshDisabled } from "./sidecar-refresh.js";
 import {
@@ -1592,10 +1597,17 @@ function renderEnvSection(opts: { env: NodeJS.ProcessEnv; print: (s?: string) =>
 
 /** Everything the SECRET VAULT section (text) / `vault` block (json) needs.
  *
- *  Secret VALUES are never read, decrypted, or reported -- entry NAMES only,
- *  which is exactly what `yaw-mcp secrets list` already prints without a
- *  passphrase (the vault stores them as plaintext object keys; only the
- *  values are ciphertext). `passphraseSet` is a boolean for the same reason
+ *  Secret VALUES are never reported, and never decrypted for their own sake
+ *  -- entry NAMES only, which is exactly what `yaw-mcp secrets list` already
+ *  prints without a passphrase (the vault stores them as plaintext object
+ *  keys; only the values are ciphertext). The one exception is the
+ *  passphraseUnlocks check: on a vault with no check marker (legacy) or one
+ *  whose marker does not match, unlock's verifyKey tries entries in order
+ *  until one decrypts, as a canary for the key -- so one value can exist in
+ *  memory, inside secrets-vault's canDecrypt, for the length of that call.
+ *  It is discarded there (a JS string, released, not zeroized), never
+ *  surfaces in this status or its rendering, and the derived key is zeroed
+ *  by lock() before the status is returned. `passphraseSet` is a boolean for the same reason
  *  YAW_MCP_VAULT_PASSPHRASE is deliberately absent from DOCTOR_ENV_VARS,
  *  which prints raw values: doctor output is the paste-into-a-ticket surface,
  *  and the one env var here that is itself a credential must never be in it.
@@ -1616,6 +1628,22 @@ export interface VaultStatus {
   schemaVersion: number | null;
   /** Whether a passphrase is present in this process's env. NEVER the value. */
   passphraseSet: boolean;
+  /** Whether that passphrase OPENS the vault: true, false, or null when there
+   *  was nothing to check -- no passphrase in the env, no readable vault, or a
+   *  vault with no check marker and no entries (unlock accepts any passphrase
+   *  there, so "it unlocked" would claim what was never tested). Costs one
+   *  scrypt derivation (~100 ms) when it runs; the derived key is dropped
+   *  before the status is returned. This is the line that separates "the
+   *  value is wrong or stale" from "it is forgotten" -- the second is what
+   *  `secrets reset` is for. Additive JSON field. */
+  passphraseUnlocks: boolean | null;
+  /** True when the passphrase is RIGHT but the vault's check marker is
+   *  corrupt: an entry decrypts under the key, the marker does not, so
+   *  `passphraseUnlocks` is false (unlock() really does fail, and the broker
+   *  refuses the spawn) while the fix is the marker, not the passphrase --
+   *  see vaultCheckCorruptHint. Only ever true beside `passphraseUnlocks:
+   *  false`. Additive JSON field. */
+  checkMarkerCorrupt: boolean;
   /** Servers whose configured env carries `${secret:NAME}` refs. */
   refs: Array<{ namespace: string; secretNames: string[] }>;
   /** Servers whose credential map carries a ${secret:...} span that does not parse (env for a local server, headers for a remote one).
@@ -1641,9 +1669,10 @@ async function collectVaultStatus(opts: {
   let entries: string[] | null = exists ? null : [];
   let unreadable: string | null = null;
   let schemaVersion: number | null = null;
+  let vault: VaultFile | null = null;
   if (exists) {
     try {
-      const vault = await loadVault(path);
+      vault = await loadVault(path);
       // loadVault returns null only for ENOENT, which existsSync just ruled
       // out -- but a race between the two is possible, and "no entries" is
       // the honest reading of a vault file that vanished mid-run.
@@ -1652,6 +1681,22 @@ async function collectVaultStatus(opts: {
     } catch (err) {
       unreadable = err instanceof Error ? err.message : String(err);
     }
+  }
+
+  // Does the passphrase in THIS env open the vault? Only asked when there is
+  // one, the vault was read, and the vault can actually verify a passphrase
+  // (an empty check-less vault accepts every one -- see
+  // vaultVerifiesPassphrases). The one scrypt derivation this costs leaves a
+  // key in the module cache that doctor has no use for, so it is dropped at
+  // once. The value itself is never rendered anywhere: see passphraseSet.
+  const passphrase = opts.env.YAW_MCP_VAULT_PASSPHRASE ?? "";
+  let passphraseUnlocks: boolean | null = null;
+  let checkMarkerCorrupt = false;
+  if (passphrase !== "" && vault !== null && vaultVerifiesPassphrases(vault)) {
+    const verdict = await checkVaultPassphrase(vault, passphrase);
+    lock();
+    passphraseUnlocks = verdict === "opens";
+    checkMarkerCorrupt = verdict === "marker-corrupt";
   }
 
   const refs: VaultStatus["refs"] = [];
@@ -1694,7 +1739,9 @@ async function collectVaultStatus(opts: {
     entries,
     unreadable,
     schemaVersion,
-    passphraseSet: (opts.env.YAW_MCP_VAULT_PASSPHRASE ?? "") !== "",
+    passphraseSet: passphrase !== "",
+    passphraseUnlocks,
+    checkMarkerCorrupt,
     refs,
     malformed,
     missing,
@@ -1734,7 +1781,32 @@ function renderVaultSection(opts: { status: VaultStatus; print: (s?: string) => 
       print(`  schema:     v${status.schemaVersion}`);
     }
   }
-  print(`  passphrase: ${status.passphraseSet ? "set in this environment" : "not set in this environment"}`);
+  // Three states, not two: set-and-opens, set-but-does-not, and set-but-
+  // unverifiable (no readable vault, or nothing in it to check against). The
+  // "does NOT" line is the only surface that tells a stale or forgotten
+  // passphrase apart from an absent one -- the spawn error says "does not
+  // unlock" but nothing there pointed at the way out.
+  if (!status.passphraseSet) {
+    print("  passphrase: not set in this environment");
+  } else if (status.passphraseUnlocks === true) {
+    print("  passphrase: set in this environment, and it unlocks the vault");
+  } else if (status.checkMarkerCorrupt) {
+    // Before the generic "does NOT" branch: the passphrase is right here, and
+    // pointing this user at `secrets reset` would move a vault aside that
+    // needs one key deleted from it.
+    print("  passphrase: set in this environment, and it is the vault's -- but the vault's check");
+    print("              marker is corrupt, so nothing opens until it is repaired.");
+    print(`              ${vaultCheckCorruptHint(status.path)}`);
+  } else if (status.passphraseUnlocks === false) {
+    print("  passphrase: set in this environment, but it does NOT unlock the vault");
+    print("              a server whose env references the vault fails to start or connect with it.");
+    print("              Check the value in the `env` block of your client config (doctor sees THIS");
+    print("              shell's, which can differ). If the passphrase is forgotten,");
+    print("              `yaw-mcp secrets reset` moves the vault aside, lists its entry names, and");
+    print("              starts a new one under a passphrase you choose.");
+  } else {
+    print("  passphrase: set in this environment");
+  }
   if (status.refs.length === 0) {
     // Says what was actually scanned. "no server env or headers reference"
     // claimed BOTH maps were read on every server, which the shape-selective

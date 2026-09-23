@@ -375,7 +375,7 @@ describe("renderScript — powershell", () => {
     expect(s).toContain("if ($argIndex -eq 0) { $completions += @('list', 'match') }");
     expect(s).toContain("if ($argIndex -eq 0) { $completions += @('export') }");
     expect(s).toContain(
-      "if ($argIndex -eq 0) { $completions += @('set', 'get', 'list', 'remove', 'lock', 'rotate', 'audit') }",
+      "if ($argIndex -eq 0) { $completions += @('set', 'get', 'list', 'remove', 'lock', 'rotate', 'reset', 'audit') }",
     );
   });
 
@@ -551,10 +551,11 @@ describe("SUBCOMMAND_SPEC coverage", () => {
   it("keeps the secrets entry in sync with parseSecretsArgs (rotate/audit/--force in, push/pull out)", () => {
     const secrets = SUBCOMMAND_SPEC.find((s) => s.name === "secrets");
     expect(secrets).toBeDefined();
-    expect(secrets?.positional?.[0]).toEqual(["set", "get", "list", "remove", "lock", "rotate", "audit"]);
-    // --force gates the destructive paths (`remove`, and a `set` that
-    // overwrites an existing name), so it MUST be completable -- a user who
-    // cannot tab it will not discover the only way to script a remove.
+    expect(secrets?.positional?.[0]).toEqual(["set", "get", "list", "remove", "lock", "rotate", "reset", "audit"]);
+    // --force gates the destructive paths (`remove`, `reset`, and a `set`
+    // that overwrites an existing name), so it MUST be completable -- a user
+    // who cannot tab it will not discover the only way to script a remove or
+    // reset.
     expect(secrets?.flags).toEqual(
       expect.arrayContaining(["--value", "--stdin", "--force", "--secret", "--server", "--json"]),
     );

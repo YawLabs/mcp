@@ -1,9 +1,21 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { mkdir } from "node:fs/promises";
 import os from "node:os";
 import nodePath from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { parseSecretsArgs, runSecrets, SECRETS_USAGE } from "../secrets-cmd.js";
+import { setLogSurface } from "../logger.js";
+import { parseSecretsArgs, resetBackupPath, runSecrets, SECRETS_USAGE } from "../secrets-cmd.js";
 import { deriveKey, type EncryptedEntry, encryptEntry, generateSalt, LEGACY_KDF } from "../secrets-crypto.js";
 import {
   isUnlocked,
@@ -182,6 +194,32 @@ describe("parseSecretsArgs", () => {
     const r = parseSecretsArgs(["rotate"]);
     expect(r.ok).toBe(true);
     if (r.ok) expect(r.options.action).toBe("rotate");
+  });
+
+  it("reset action parses without a name, and takes --force / --json", () => {
+    const r = parseSecretsArgs(["reset", "--force", "--json"]);
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.options).toMatchObject({ action: "reset", force: true, json: true });
+  });
+
+  it("rejects a positional on reset, and the set-only / audit-only flags", () => {
+    const pos = parseSecretsArgs(["reset", "GH"]);
+    expect(pos.ok).toBe(false);
+    if (!pos.ok) expect(pos.error).toMatch(/reset takes no <name>/);
+    const val = parseSecretsArgs(["reset", "--value", "x"]);
+    expect(val.ok).toBe(false);
+    if (!val.ok) expect(val.error).toMatch(/--value applies to `set` only/);
+    const filt = parseSecretsArgs(["reset", "--secret", "GH"]);
+    expect(filt.ok).toBe(false);
+    if (!filt.ok) expect(filt.error).toMatch(/--secret applies to `audit` only/);
+  });
+
+  it("documents reset, and the way out of a forgotten passphrase, in the usage text", () => {
+    expect(SECRETS_USAGE).toMatch(/^ {2}reset {2}/m);
+    expect(SECRETS_USAGE).toContain("Forgot the passphrase?");
+    expect(SECRETS_USAGE).toContain("secrets.json.reset-<timestamp>");
+    // --force is the scripted way through reset's gate too.
+    expect(SECRETS_USAGE).toMatch(/Required for remove and reset/);
   });
 
   it("audit action parses with filters", () => {
@@ -3484,5 +3522,684 @@ describe("runSecrets -- a schema-v1 vault is reported once per command, and only
     const r = await runSecrets({ action: "list", home }, io);
     expect(r.exitCode).toBe(0);
     expect(errText()).toBe("");
+  });
+});
+
+// -----------------------------------------------------------------------
+// runSecrets reset -- the way out of a forgotten passphrase (#167). The old
+// vault is copied aside and an empty one is written over it under a NEW
+// passphrase; the old entries are never read back out. The one decryption on
+// this path is the already-opens guard's key check (verifyKey), which tries
+// entry values as canaries when the check marker is absent or damaged and
+// discards the result.
+// -----------------------------------------------------------------------
+
+/** Whether this runner can create a file symlink at all (Windows refuses
+ *  without Developer Mode). Probed once so the symlink case reports SKIPPED
+ *  rather than passing on a bare return. Same probe as atomic-write.test.ts. */
+function symlinksAvailable(): boolean {
+  const probe = mkdtempSync(nodePath.join(os.tmpdir(), "yaw-mcp-reset-symlink-probe-"));
+  try {
+    symlinkSync(nodePath.join(probe, "target.txt"), nodePath.join(probe, "link.txt"), "file");
+    return true;
+  } catch {
+    return false;
+  } finally {
+    rmSync(probe, { recursive: true, force: true });
+  }
+}
+const SYMLINKS_AVAILABLE = symlinksAvailable();
+
+describe("runSecrets reset", () => {
+  const OLD_PASS = "the-passphrase-nobody-remembers";
+  const NEW_PASS = "a-brand-new-long-passphrase";
+  const io = { out: vi.fn(), err: vi.fn() };
+  let home: string;
+  let savedEnv: string | undefined;
+
+  const outText = (): string => io.out.mock.calls.map((c) => c[0] as string).join("");
+  const errText = (): string => io.err.mock.calls.map((c) => c[0] as string).join("");
+  const ttyStdout = (): NodeJS.WritableStream => ({ isTTY: true, write: vi.fn() }) as unknown as NodeJS.WritableStream;
+  const promptText = (stdout: NodeJS.WritableStream): string =>
+    (stdout.write as unknown as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0] as string).join("");
+  const nonTTY = (): NonNullable<Parameters<typeof runSecrets>[0]["io"]> => ({
+    stdin: { isTTY: false } as unknown as NodeJS.ReadableStream,
+    stdout: { isTTY: false, write: vi.fn() } as unknown as NodeJS.WritableStream,
+  });
+  /** The `.reset-*` siblings of the vault, as full paths, sorted. */
+  const backups = (): string[] => {
+    const dir = nodePath.dirname(vaultPath(home));
+    return readdirSync(dir)
+      .filter((f) => f.startsWith("secrets.json.reset-"))
+      .sort()
+      .map((f) => nodePath.join(dir, f));
+  };
+
+  /** Seed a two-entry vault under OLD_PASS and return its exact on-disk bytes. */
+  async function seed(): Promise<string> {
+    for (const [name, value] of [
+      ["NPM_TOKEN", "npm_2"],
+      ["GH_TOKEN", "ghp_1"],
+    ]) {
+      const probe = { out: vi.fn(), err: vi.fn() };
+      const r = await runSecrets({ action: "set", name, value, passphrase: OLD_PASS, home }, probe);
+      expect(r.exitCode).toBe(0);
+    }
+    lock();
+    return readFileSync(vaultPath(home), "utf8");
+  }
+
+  /** Whether the vault file at `file` opens under `passphrase`. */
+  async function opensWith(file: string, passphrase: string): Promise<boolean> {
+    const vault = await loadVault(file);
+    if (!vault) throw new Error(`no vault at ${file}`);
+    lock();
+    try {
+      await unlock(vault, passphrase);
+      return true;
+    } catch {
+      return false;
+    } finally {
+      lock();
+    }
+  }
+
+  beforeEach(async () => {
+    io.out.mockReset();
+    io.err.mockReset();
+    lock();
+    savedEnv = process.env.YAW_MCP_VAULT_PASSPHRASE;
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    home = makeHome();
+    await mkdir(nodePath.join(home, ".yaw-mcp"), { recursive: true });
+  });
+
+  afterEach(() => {
+    if (savedEnv === undefined) delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    else process.env.YAW_MCP_VAULT_PASSPHRASE = savedEnv;
+    vi.useRealTimers();
+    rmSync(home, { recursive: true, force: true });
+    lock();
+  });
+
+  it("names the backup after the vault with an ISO instant that has no colons (NTFS cannot take them)", () => {
+    const at = new Date("2026-09-23T10:04:05.678Z");
+    expect(resetBackupPath("/v/secrets.json", at)).toBe("/v/secrets.json.reset-2026-09-23T10-04-05.678Z");
+    expect(resetBackupPath("/v/secrets.json", at, 2)).toBe("/v/secrets.json.reset-2026-09-23T10-04-05.678Z-2");
+  });
+
+  it("errors when there is no vault to reset", async () => {
+    const r = await runSecrets({ action: "reset", force: true, passphrase: NEW_PASS, home }, io);
+    expect(r.exitCode).toBe(1);
+    expect(errText()).toContain(`No vault at ${vaultPath(home)} to reset`);
+    expect(backups()).toEqual([]);
+  });
+
+  it("non-TTY without --force refuses (exit 2), names the flag, and moves nothing", async () => {
+    const before = await seed();
+    const r = await runSecrets({ action: "reset", passphrase: NEW_PASS, home, io: nonTTY() }, io);
+    expect(r.exitCode).toBe(2);
+    expect(errText()).toContain("refusing to reset the vault without confirmation");
+    expect(errText()).toContain("neither stdin nor stdout is a TTY");
+    expect(errText()).toContain("--force");
+    expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
+    expect(backups()).toEqual([]);
+  });
+
+  it("TTY: lists the entries, takes RESET, confirms the NEW passphrase twice, moves the vault aside and starts an empty one", async () => {
+    const before = await seed();
+    const stdin = new FakeTTYStdin(["RESET\r", `${NEW_PASS}\r`, `${NEW_PASS}\r`]);
+    const stdout = ttyStdout();
+    const r = await runSecrets(
+      { action: "reset", home, io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout } },
+      io,
+    );
+    expect(r.exitCode).toBe(0);
+
+    // The dialogue: names first (they are what the decision is about), then
+    // the typed word, then rotate's NEW-passphrase labels -- never the bare
+    // "Vault passphrase: " an unlock prompt opens with.
+    const dialogue = promptText(stdout);
+    expect(dialogue).toContain("holds 2 entries: GH_TOKEN, NPM_TOKEN");
+    expect(dialogue).toContain("Type RESET to continue: ");
+    expect(dialogue).toContain("New vault passphrase: ");
+    expect(dialogue).toContain("Confirm new passphrase: ");
+    expect(dialogue).not.toContain("Vault passphrase: ");
+    expect(dialogue.indexOf("GH_TOKEN")).toBeLessThan(dialogue.indexOf("Type RESET"));
+    expect(dialogue.indexOf("Type RESET")).toBeLessThan(dialogue.indexOf("New vault passphrase: "));
+
+    // The old vault is byte-identical at its backup name, and still opens
+    // under the old passphrase.
+    const [backup] = backups();
+    expect(backups()).toHaveLength(1);
+    expect(nodePath.basename(backup)).toMatch(/^secrets\.json\.reset-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.\d{3}Z$/);
+    expect(readFileSync(backup, "utf8")).toBe(before);
+    expect(await opensWith(backup, OLD_PASS)).toBe(true);
+
+    // The new vault is empty, carries its check marker, opens under the new
+    // passphrase and refuses the old one.
+    const fresh = await loadVault(vaultPath(home));
+    expect(fresh?.entries).toEqual({});
+    expect(fresh?.check).toBeDefined();
+    expect(fresh?.salt).not.toBe(JSON.parse(before).salt);
+    expect(await opensWith(vaultPath(home), NEW_PASS)).toBe(true);
+    expect(await opensWith(vaultPath(home), OLD_PASS)).toBe(false);
+
+    const out = outText();
+    expect(out).toContain(`Moved the old vault to ${backup}`);
+    expect(out).toContain(`Created an empty vault at ${vaultPath(home)} under the new passphrase.`);
+    expect(out).toContain("Entries to set again (2): GH_TOKEN, NPM_TOKEN");
+    expect(out).toContain("yaw-mcp secrets set <name>");
+    // The nudge: a running server and a client config both still hold the
+    // OLD passphrase, and doctor is where to check.
+    const err = errText();
+    expect(err).toContain("was reset");
+    expect(err).toContain("restart");
+    expect(err).toContain("YAW_MCP_VAULT_PASSPHRASE");
+    expect(err).toContain("yaw-mcp doctor");
+  });
+
+  it.each([
+    "\r",
+    "y\r",
+    "yes\r",
+    "RESE\r",
+  ])("aborts on %j at the RESET prompt -- no passphrase asked, nothing moved", async (answer) => {
+    const before = await seed();
+    const stdin = new FakeTTYStdin([answer]);
+    const stdout = ttyStdout();
+    const r = await runSecrets(
+      { action: "reset", home, io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout } },
+      io,
+    );
+    expect(r.exitCode).toBe(1);
+    expect(errText()).toContain("Aborted.");
+    expect(promptText(stdout)).not.toContain("New vault passphrase: ");
+    expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
+    expect(backups()).toEqual([]);
+  });
+
+  it("takes the word in any case: a lowercase `reset` proceeds", async () => {
+    await seed();
+    const stdin = new FakeTTYStdin(["reset\r", `${NEW_PASS}\r`, `${NEW_PASS}\r`]);
+    const r = await runSecrets(
+      { action: "reset", home, io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout: ttyStdout() } },
+      io,
+    );
+    expect(r.exitCode).toBe(0);
+    expect(backups()).toHaveLength(1);
+    expect(await opensWith(vaultPath(home), NEW_PASS)).toBe(true);
+  });
+
+  it("^C at the RESET prompt cancels with 130 and moves nothing", async () => {
+    const before = await seed();
+    const stdin = new FakeTTYStdin([String.fromCharCode(3)]);
+    const r = await runSecrets(
+      { action: "reset", home, io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout: ttyStdout() } },
+      io,
+    );
+    expect(r.exitCode).toBe(130);
+    expect(errText()).toContain("Cancelled.");
+    expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
+    expect(backups()).toEqual([]);
+  });
+
+  it("--force off a TTY resets without a prompt, and --json pins the envelope and the one warning line", async () => {
+    await seed();
+    const r = await runSecrets(
+      { action: "reset", force: true, passphrase: NEW_PASS, home, json: true, io: nonTTY() },
+      io,
+    );
+    expect(r.exitCode).toBe(0);
+    const [backup] = backups();
+    expect(JSON.parse(outText())).toEqual({
+      ok: true,
+      path: vaultPath(home),
+      moved_to: backup,
+      entries: ["GH_TOKEN", "NPM_TOKEN"],
+      unreadable: null,
+    });
+    // stderr under --json is JSON lines, and the nudge is one of them.
+    const errLines = errText().trim().split("\n");
+    expect(errLines).toHaveLength(1);
+    expect(JSON.parse(errLines[0])).toMatchObject({ warning: "vault-reset", path: vaultPath(home) });
+    expect(await opensWith(vaultPath(home), NEW_PASS)).toBe(true);
+  });
+
+  it("refuses, before asking for RESET, when YAW_MCP_VAULT_PASSPHRASE already opens the vault", async () => {
+    const before = await seed();
+    process.env.YAW_MCP_VAULT_PASSPHRASE = OLD_PASS;
+    const stdin = new FakeTTYStdin([]);
+    const stdout = ttyStdout();
+    const r = await runSecrets(
+      { action: "reset", home, io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout } },
+      io,
+    );
+    expect(r.exitCode).toBe(1);
+    expect(errText()).toContain("YAW_MCP_VAULT_PASSPHRASE already opens the vault");
+    expect(errText()).toContain("nothing to reset");
+    expect(errText()).toContain("yaw-mcp secrets rotate");
+    // Never asked: the refusal costs no typing.
+    expect(promptText(stdout)).toBe("");
+    expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
+    expect(backups()).toEqual([]);
+  });
+
+  it("refuses when the passphrase TYPED at the new-passphrase prompt is the old one", async () => {
+    // "Forgot it", confirmed RESET, then typed it from memory: the vault
+    // works, and must not be moved aside for an empty one under the same key.
+    const before = await seed();
+    const stdin = new FakeTTYStdin(["RESET\r", `${OLD_PASS}\r`, `${OLD_PASS}\r`]);
+    const r = await runSecrets(
+      { action: "reset", home, io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout: ttyStdout() } },
+      io,
+    );
+    expect(r.exitCode).toBe(1);
+    expect(errText()).toContain("that passphrase already opens the vault");
+    expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
+    expect(backups()).toEqual([]);
+  });
+
+  it("keys the new vault under YAW_MCP_VAULT_PASSPHRASE when it is set and does not open the old vault, and says so", async () => {
+    await seed();
+    process.env.YAW_MCP_VAULT_PASSPHRASE = NEW_PASS;
+    const stdin = new FakeTTYStdin(["RESET\r"]);
+    const stdout = ttyStdout();
+    const r = await runSecrets(
+      { action: "reset", home, io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout } },
+      io,
+    );
+    expect(r.exitCode).toBe(0);
+    // The preamble says where the passphrase comes from, and no prompt fires.
+    expect(promptText(stdout)).toContain("keyed under the passphrase in YAW_MCP_VAULT_PASSPHRASE");
+    expect(promptText(stdout)).not.toContain("New vault passphrase: ");
+    expect(outText()).toContain("under the passphrase in YAW_MCP_VAULT_PASSPHRASE");
+    expect(errText()).toContain("THIS shell");
+    expect(await opensWith(vaultPath(home), NEW_PASS)).toBe(true);
+    expect(await opensWith(backups()[0], OLD_PASS)).toBe(true);
+  });
+
+  it("resets a vault the other commands refuse as corrupt, reading the names it can", async () => {
+    // One entry is missing its ciphertext, so loadVault throws and every
+    // sibling action fails until the file is fixed by hand -- the state the
+    // corrupt-entry hint sends to reset.
+    const salt = Buffer.alloc(16, 9).toString("base64");
+    writeFileSync(
+      vaultPath(home),
+      JSON.stringify({
+        version: 2,
+        salt,
+        entries: { ZETA: { iv: "x" }, ALPHA: { iv: "x", ciphertext: "y", authTag: "z" } },
+      }),
+    );
+    const r = await runSecrets(
+      { action: "reset", force: true, passphrase: NEW_PASS, home, json: true, io: nonTTY() },
+      io,
+    );
+    expect(r.exitCode).toBe(0);
+    expect(JSON.parse(outText())).toMatchObject({ ok: true, entries: ["ALPHA", "ZETA"], unreadable: null });
+    expect(backups()).toHaveLength(1);
+    expect(await opensWith(vaultPath(home), NEW_PASS)).toBe(true);
+  });
+
+  it("resets a vault that is not even JSON, and says the names could not be read rather than listing none", async () => {
+    writeFileSync(vaultPath(home), "{ not json at all");
+    const r = await runSecrets({ action: "reset", force: true, passphrase: NEW_PASS, home, io: nonTTY() }, io);
+    expect(r.exitCode).toBe(0);
+    expect(outText()).toContain("Could not read the old vault's entry names (not valid JSON");
+    expect(outText()).not.toContain("Entries to set again");
+    const [backup] = backups();
+    expect(readFileSync(backup, "utf8")).toBe("{ not json at all");
+
+    io.out.mockReset();
+    // And --json carries null entries plus the reason, never an empty list.
+    writeFileSync(vaultPath(home), "{ not json at all");
+    const j = await runSecrets(
+      { action: "reset", force: true, passphrase: NEW_PASS, home, json: true, io: nonTTY() },
+      io,
+    );
+    expect(j.exitCode).toBe(0);
+    const parsed = JSON.parse(outText());
+    expect(parsed.entries).toBeNull();
+    expect(parsed.unreadable).toMatch(/not valid JSON/);
+  });
+
+  it("does not claim an empty, marker-less vault is opened by the passphrase, and stamps the marker on the new one", async () => {
+    // Nothing in such a vault can verify a passphrase (unlock accepts any),
+    // so the "already opens it" guard must not fire on it.
+    const salt = Buffer.alloc(16, 5).toString("base64");
+    writeFileSync(vaultPath(home), JSON.stringify({ version: 2, salt, kdf: { N: 16384, r: 8, p: 1 }, entries: {} }));
+    process.env.YAW_MCP_VAULT_PASSPHRASE = NEW_PASS;
+    const r = await runSecrets({ action: "reset", force: true, home, io: nonTTY() }, io);
+    expect(r.exitCode).toBe(0);
+    expect(outText()).toContain("The old vault held no entries.");
+    const fresh = await loadVault(vaultPath(home));
+    expect(fresh?.check).toBeDefined();
+    expect(await opensWith(vaultPath(home), NEW_PASS)).toBe(true);
+    expect(await opensWith(vaultPath(home), "anything-else-at-all")).toBe(false);
+  });
+
+  it("keeps stderr to JSON lines under --json even on a vault that is not JSON (no logger prose)", async () => {
+    // loadVault logs a warn line to process.stderr before it throws on a
+    // file that is not JSON; the CLI renders that as prose. reset is the one
+    // action documented to SUCCEED on that file, so it must not ask loadVault
+    // about it at all: a --json wrapper keys on every stderr line.
+    writeFileSync(vaultPath(home), "{ not json at all");
+    const stderrWrites: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => {
+      if (typeof chunk === "string") stderrWrites.push(chunk);
+      return true;
+    });
+    setLogSurface("cli");
+    try {
+      const r = await runSecrets(
+        { action: "reset", force: true, passphrase: NEW_PASS, home, json: true, io: nonTTY() },
+        io,
+      );
+      expect(r.exitCode).toBe(0);
+      expect(stderrWrites).toEqual([]);
+      for (const line of errText().trim().split("\n")) expect(JSON.parse(line)).toHaveProperty("warning");
+    } finally {
+      spy.mockRestore();
+      setLogSurface("server");
+    }
+  });
+
+  it("refuses a RIGHT passphrase on a vault whose check marker is corrupt, with the hand-fix and never a pointer at rotate", async () => {
+    // The marker fails to decrypt but an entry does: the passphrase is the
+    // vault's, and moving that vault aside would cost the user intact
+    // entries over one damaged key. `rotate` refuses that vault too, so the
+    // refusal must name the fix, not the sibling.
+    const before = await seed();
+    const onDisk = JSON.parse(before) as VaultFile;
+    onDisk.check = {
+      ...(onDisk.check as EncryptedEntry),
+      ciphertext: Buffer.from("tampered-check-marker").toString("base64"),
+    };
+    writeFileSync(vaultPath(home), `${JSON.stringify(onDisk, null, 2)}\n`, "utf8");
+    const tampered = readFileSync(vaultPath(home), "utf8");
+
+    // From the env, before RESET is asked for...
+    process.env.YAW_MCP_VAULT_PASSPHRASE = OLD_PASS;
+    const stdout = ttyStdout();
+    const env = await runSecrets(
+      { action: "reset", home, io: { stdin: new FakeTTYStdin([]) as unknown as NodeJS.ReadableStream, stdout } },
+      io,
+    );
+    expect(env.exitCode).toBe(1);
+    expect(errText()).toContain("YAW_MCP_VAULT_PASSPHRASE is this vault's passphrase");
+    expect(errText()).toContain('delete the "check" key from');
+    expect(errText()).not.toContain("secrets rotate");
+    expect(promptText(stdout)).toBe("");
+    expect(backups()).toEqual([]);
+
+    // ...and typed at the new-passphrase prompt.
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    io.err.mockReset();
+    const typed = await runSecrets(
+      {
+        action: "reset",
+        home,
+        io: {
+          stdin: new FakeTTYStdin(["RESET\r", `${OLD_PASS}\r`, `${OLD_PASS}\r`]) as unknown as NodeJS.ReadableStream,
+          stdout: ttyStdout(),
+        },
+      },
+      io,
+    );
+    expect(typed.exitCode).toBe(1);
+    expect(errText()).toContain("that passphrase is this vault's passphrase");
+    expect(errText()).toContain('delete the "check" key from');
+    expect(readFileSync(vaultPath(home), "utf8")).toBe(tampered);
+    expect(backups()).toEqual([]);
+  });
+
+  it("refuses to proceed when the vault changed while waiting at the RESET prompt", async () => {
+    const before = await seed();
+    const file = vaultPath(home);
+    let mutatedBytes: Buffer | null = null;
+    const stdin = new FakeTTYStdin(["RESET\r", `${NEW_PASS}\r`, `${NEW_PASS}\r`]);
+    const deliver = stdin.resume.bind(stdin);
+    stdin.resume = () => {
+      if (mutatedBytes === null) {
+        writeFileSync(file, `${before}\n`);
+        mutatedBytes = readFileSync(file);
+      }
+      return deliver();
+    };
+    const r = await runSecrets(
+      { action: "reset", home, io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout: ttyStdout() } },
+      io,
+    );
+    expect(r.exitCode).toBe(1);
+    expect(errText()).toMatch(/changed on disk/);
+    expect(mutatedBytes).not.toBeNull();
+    expect(readFileSync(file)).toEqual(mutatedBytes);
+    expect(backups()).toEqual([]);
+  });
+
+  it("refuses the new-passphrase prompt on a terminal that will not turn echo off, and moves nothing", async () => {
+    const before = await seed();
+    // The RESET question is an echo read and carries on line-buffered; the
+    // no-echo passphrase read is what refuses, without reading a byte.
+    const stdin = new RawRefusingTTYStdin(["RESET\r", `${NEW_PASS}\r`]);
+    const r = await runSecrets(
+      { action: "reset", home, io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout: ttyStdout() } },
+      io,
+    );
+    expect(r.exitCode).toBe(1);
+    expect(errText()).toContain("New passphrase required.");
+    expect(errText()).toContain("would not turn echo off");
+    expect(errText()).toContain("YAW_MCP_VAULT_PASSPHRASE");
+    expect(stdin.pending).toBe(1);
+    expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
+    expect(backups()).toEqual([]);
+  });
+
+  it("refuses when no new passphrase can be obtained (non-TTY, no env) -- vault untouched", async () => {
+    const before = await seed();
+    const r = await runSecrets({ action: "reset", force: true, home, json: true, io: nonTTY() }, io);
+    expect(r.exitCode).toBe(1);
+    expect(JSON.parse(errText())).toMatchObject({ ok: false });
+    expect(errText()).toContain("New passphrase required");
+    expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
+    expect(backups()).toEqual([]);
+  });
+
+  it("two resets in the same millisecond land on distinct backups", async () => {
+    await seed();
+    vi.setSystemTime(new Date("2026-09-23T10:00:00.000Z"));
+    const first = await runSecrets({ action: "reset", force: true, passphrase: NEW_PASS, home, io: nonTTY() }, io);
+    expect(first.exitCode).toBe(0);
+    const second = await runSecrets(
+      { action: "reset", force: true, passphrase: "a-third-passphrase-entirely", home, io: nonTTY() },
+      io,
+    );
+    expect(second.exitCode).toBe(0);
+    expect(backups().map((b) => nodePath.basename(b))).toEqual([
+      "secrets.json.reset-2026-09-23T10-00-00.000Z",
+      "secrets.json.reset-2026-09-23T10-00-00.000Z-2",
+    ]);
+  });
+
+  it("the next set verifies against the passphrase chosen at reset, and a wrong one is pointed at reset", async () => {
+    await seed();
+    const r = await runSecrets({ action: "reset", force: true, passphrase: NEW_PASS, home, io: nonTTY() }, io);
+    expect(r.exitCode).toBe(0);
+    lock();
+    io.err.mockReset();
+    const wrong = await runSecrets(
+      { action: "set", name: "GH_TOKEN", value: "ghp_new", passphrase: OLD_PASS, home },
+      io,
+    );
+    expect(wrong.exitCode).toBe(1);
+    expect(errText()).toContain("wrong passphrase");
+    expect(errText()).toContain("yaw-mcp secrets reset");
+    lock();
+    io.out.mockReset();
+    const right = await runSecrets(
+      { action: "set", name: "GH_TOKEN", value: "ghp_new", passphrase: NEW_PASS, home },
+      io,
+    );
+    expect(right.exitCode).toBe(0);
+    // Not "Created vault and": the reset already created it, marker and all.
+    expect(outText()).toBe('Stored secret "GH_TOKEN".\n');
+  });
+
+  it.skipIf(!SYMLINKS_AVAILABLE)("writes THROUGH a symlinked vault and parks the backup next to the link", async () => {
+    // The dotfiles shape atomic-write.ts exists for: the real file lives in
+    // a checkout, ~/.yaw-mcp/secrets.json is a link to it. A reset must leave
+    // the link pointing at the LIVE vault (the new one), not sever it, and
+    // must not drop an untracked ciphertext copy into the checkout.
+    const before = await seed();
+    const link = vaultPath(home);
+    const checkout = nodePath.join(home, "dotfiles");
+    mkdirSync(checkout, { recursive: true });
+    const real = nodePath.join(checkout, "secrets.json");
+    renameSync(link, real);
+    symlinkSync(real, link, "file");
+
+    const r = await runSecrets({ action: "reset", force: true, passphrase: NEW_PASS, home, io: nonTTY() }, io);
+    expect(r.exitCode).toBe(0);
+    expect(lstatSync(link).isSymbolicLink()).toBe(true);
+    expect(await opensWith(real, NEW_PASS)).toBe(true);
+    const [backup] = backups();
+    expect(nodePath.dirname(backup)).toBe(nodePath.dirname(link));
+    expect(readFileSync(backup, "utf8")).toBe(before);
+    expect(readdirSync(checkout)).toEqual(["secrets.json"]);
+  });
+});
+
+// -----------------------------------------------------------------------
+// Under --json, stderr is one JSON object per line -- the promise
+// SECRETS_USAGE makes. The short-passphrase warning and the fresh-vault
+// nudge were the two prose lines that broke it, and the first fires at the
+// passphrase step, AHEAD of any {"ok":false} envelope a later step emits.
+// -----------------------------------------------------------------------
+
+describe("runSecrets --json -- every stderr line is a JSON object", () => {
+  const io = { out: vi.fn(), err: vi.fn() };
+  let home: string;
+  let savedEnv: string | undefined;
+  let savedNew: string | undefined;
+
+  const outText = (): string => io.out.mock.calls.map((c) => c[0] as string).join("");
+  const errText = (): string => io.err.mock.calls.map((c) => c[0] as string).join("");
+  const errLines = (): Array<Record<string, unknown>> =>
+    errText()
+      .split("\n")
+      .filter((l) => l.length > 0)
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+  const nonTTY = (): NonNullable<Parameters<typeof runSecrets>[0]["io"]> => ({
+    stdin: { isTTY: false } as unknown as NodeJS.ReadableStream,
+    stdout: { isTTY: false, write: vi.fn() } as unknown as NodeJS.WritableStream,
+  });
+  const ttyIo = (stdin: FakeTTYStdin): NonNullable<Parameters<typeof runSecrets>[0]["io"]> => ({
+    stdin: stdin as unknown as NodeJS.ReadableStream,
+    stdout: { isTTY: true, write: vi.fn() } as unknown as NodeJS.WritableStream,
+  });
+
+  beforeEach(async () => {
+    io.out.mockReset();
+    io.err.mockReset();
+    lock();
+    savedEnv = process.env.YAW_MCP_VAULT_PASSPHRASE;
+    savedNew = process.env.YAW_MCP_VAULT_PASSPHRASE_NEW;
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE_NEW;
+    home = makeHome();
+    await mkdir(nodePath.join(home, ".yaw-mcp"), { recursive: true });
+  });
+
+  afterEach(() => {
+    if (savedEnv === undefined) delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    else process.env.YAW_MCP_VAULT_PASSPHRASE = savedEnv;
+    if (savedNew === undefined) delete process.env.YAW_MCP_VAULT_PASSPHRASE_NEW;
+    else process.env.YAW_MCP_VAULT_PASSPHRASE_NEW = savedNew;
+    rmSync(home, { recursive: true, force: true });
+    lock();
+  });
+
+  it("a first set under a short env passphrase: short-passphrase, then vault-created, in that order", async () => {
+    process.env.YAW_MCP_VAULT_PASSPHRASE = "abc";
+    const r = await runSecrets({ action: "set", name: "GH", value: "ghp", home, json: true, io: nonTTY() }, io);
+    expect(r.exitCode).toBe(0);
+    const lines = errLines();
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toMatchObject({
+      warning: "short-passphrase",
+      subject: "YAW_MCP_VAULT_PASSPHRASE",
+      min_length: 12,
+    });
+    expect(lines[0]).not.toHaveProperty("ok");
+    expect(lines[1]).toMatchObject({ warning: "vault-created", path: vaultPath(home), env_set_here: true });
+    expect(typeof lines[1].hint).toBe("string");
+    expect(JSON.parse(outText())).toMatchObject({ ok: true, fresh_vault: true });
+  });
+
+  it("the TTY creation prompt: the chosen-passphrase warning and the nudge are JSON lines too", async () => {
+    const r = await runSecrets(
+      { action: "set", name: "GH", value: "ghp", home, json: true, io: ttyIo(new FakeTTYStdin(["abc\r", "abc\r"])) },
+      io,
+    );
+    expect(r.exitCode).toBe(0);
+    const lines = errLines();
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toMatchObject({
+      warning: "short-passphrase",
+      subject: "the passphrase you chose",
+      min_length: 12,
+    });
+    expect(lines[1]).toMatchObject({ warning: "vault-created", path: vaultPath(home), env_set_here: false });
+  });
+
+  it("the unlock prompt's warning carries its rotate hint as a field, AHEAD of the ok:false envelope it precedes", async () => {
+    const seeded = await runSecrets(
+      { action: "set", name: "GH", value: "ghp", passphrase: "a-long-enough-passphrase", home },
+      { out: vi.fn(), err: vi.fn() },
+    );
+    expect(seeded.exitCode).toBe(0);
+    lock();
+    // A short, WRONG passphrase at the unlock prompt: the warning fires
+    // before unlock() rejects it, so the two lines land in this order -- the
+    // exact shape a prose warning used to make unparseable.
+    const r = await runSecrets(
+      { action: "get", name: "GH", home, json: true, io: ttyIo(new FakeTTYStdin(["abc\r"])) },
+      io,
+    );
+    expect(r.exitCode).toBe(1);
+    const lines = errLines();
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toMatchObject({ warning: "short-passphrase", subject: "the passphrase you entered" });
+    expect(lines[0].hint).toContain("yaw-mcp secrets rotate");
+    expect(lines[1]).toMatchObject({ ok: false });
+  });
+
+  it("rotate's YAW_MCP_VAULT_PASSPHRASE_NEW warning is a JSON line", async () => {
+    const seeded = await runSecrets(
+      { action: "set", name: "GH", value: "ghp", passphrase: "a-long-enough-passphrase", home },
+      { out: vi.fn(), err: vi.fn() },
+    );
+    expect(seeded.exitCode).toBe(0);
+    lock();
+    process.env.YAW_MCP_VAULT_PASSPHRASE_NEW = "abc";
+    const r = await runSecrets(
+      { action: "rotate", passphrase: "a-long-enough-passphrase", home, json: true, io: nonTTY() },
+      io,
+    );
+    expect(r.exitCode).toBe(0);
+    const lines = errLines();
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({ warning: "short-passphrase", subject: "the new passphrase", min_length: 12 });
+    expect(JSON.parse(outText())).toMatchObject({ ok: true, rotated: true });
+  });
+
+  it("without --json the same warnings stay prose", async () => {
+    process.env.YAW_MCP_VAULT_PASSPHRASE = "abc";
+    const r = await runSecrets({ action: "set", name: "GH", value: "ghp", home, io: nonTTY() }, io);
+    expect(r.exitCode).toBe(0);
+    expect(errText()).toContain("YAW_MCP_VAULT_PASSPHRASE is shorter than 12 characters");
+    expect(errText()).toContain("created the vault at");
+    expect(() => JSON.parse(errText().split("\n")[0])).toThrow();
   });
 });

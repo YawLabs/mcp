@@ -107,6 +107,12 @@ export const VAULT_CHECK_PLAINTEXT = "yaw-mcp-vault-v1";
 export const VAULT_CHECK_CORRUPT_ERROR =
   'vault verification token ("check") is corrupt -- the passphrase is correct, but the check marker does not decrypt';
 
+/** Thrown by unlock() when NOTHING in the vault decrypts under the supplied
+ *  passphrase. Exported for the same reason as VAULT_CHECK_CORRUPT_ERROR: the
+ *  CLI attaches the "forgot it? `secrets reset`" pointer by comparing against
+ *  this constant, never by sniffing the message text. */
+export const VAULT_WRONG_PASSPHRASE_ERROR = "wrong passphrase for this vault (decryption failed)";
+
 export function vaultPath(home: string = homedir()): string {
   return join(home, CONFIG_DIRNAME, SECRETS_FILENAME);
 }
@@ -448,11 +454,11 @@ function verifyKey(vault: VaultFile, key: Buffer): void {
   if (vault.check) {
     if (checkMarkerMatches(vault, key)) return;
     if (someEntryDecrypts()) throw new Error(VAULT_CHECK_CORRUPT_ERROR);
-    throw new Error("wrong passphrase for this vault (decryption failed)");
+    throw new Error(VAULT_WRONG_PASSPHRASE_ERROR);
   }
   if (entries.length === 0) return; // fresh/empty vault -- nothing to verify yet
   if (someEntryDecrypts()) return;
-  throw new Error("wrong passphrase for this vault (decryption failed)");
+  throw new Error(VAULT_WRONG_PASSPHRASE_ERROR);
 }
 
 /** True iff the vault's check marker decrypts under `key` AND holds the
@@ -468,9 +474,10 @@ function checkMarkerMatches(vault: VaultFile, key: Buffer): boolean {
 
 /** Return a vault guaranteed to carry a verification token under `key`.
  *  Encrypts VAULT_CHECK_PLAINTEXT when vault.check is absent; otherwise
- *  returns the vault unchanged. Called on the mutate path so every saved
- *  vault has a check future unlocks can verify against. Module-private:
- *  setSecret below is its only caller. */
+ *  returns the vault unchanged. Called on every path that produces a vault
+ *  to save, so every saved vault has a check future unlocks can verify
+ *  against. Module-private: setSecret and createEmptyVault below are its
+ *  only callers. */
 function ensureCheck(vault: VaultFile, key: Buffer): VaultFile {
   if (vault.check) return vault;
   return { ...vault, check: encryptEntry(VAULT_CHECK_PLAINTEXT, key, VAULT_CHECK_AAD) };
@@ -479,6 +486,90 @@ function ensureCheck(vault: VaultFile, key: Buffer): VaultFile {
 /** True iff an unlock has been performed in this process. */
 export function isUnlocked(): boolean {
   return cachedKey !== null;
+}
+
+/** Does `vault` hold anything a passphrase can be checked AGAINST? A vault
+ *  with no check marker and no entries has nothing for unlock() to verify, so
+ *  it accepts every passphrase -- and "it unlocked" means nothing there. The
+ *  callers that turn checkVaultPassphrase into a claim ("this passphrase is
+ *  the vault's": doctor's line, `secrets reset`'s refusal) must skip the
+ *  check on such a vault rather than report a match that was never tested. */
+export function vaultVerifiesPassphrases(vault: VaultFile): boolean {
+  return vault.check !== undefined || Object.keys(vault.entries).length > 0;
+}
+
+/** The three answers to "is `passphrase` this vault's passphrase?":
+ *    "opens"          -- unlock() succeeds.
+ *    "marker-corrupt" -- unlock() fails ONLY because the check marker is
+ *                        damaged (VAULT_CHECK_CORRUPT_ERROR: an entry decrypts
+ *                        under the key, the marker does not -- see verifyKey).
+ *                        The passphrase is RIGHT, and nothing opens until the
+ *                        marker is repaired (vaultCheckCorruptHint); `rotate`
+ *                        refuses that vault too (rotateVault checks the marker
+ *                        first).
+ *    "wrong"          -- anything else.
+ *  Three values rather than a boolean because the callers say different
+ *  things in the middle case: doctor must not print a green "unlocks" for a
+ *  vault the broker refuses, and `secrets reset` must not send that user to
+ *  `rotate`. */
+export type VaultPassphraseVerdict = "opens" | "marker-corrupt" | "wrong";
+
+/** Which of the three `passphrase` is for `vault`.
+ *
+ *  One spelling for the CLI: doctor's "does the configured passphrase open it"
+ *  line and `secrets reset`'s refusal to move a vault this passphrase already
+ *  opens ask the same question, and two hand copies of "unlock, but read the
+ *  corrupt-marker error as a right passphrase" drift -- one would read it as
+ *  wrong. upstream.ts's verifyVaultPassphrase asks it too, on its own unlock()
+ *  call: its suite mocks this module export by export and pins that call, so
+ *  it is deliberately not routed through here.
+ *
+ *  A successful unlock() leaves the derived key in the module cache, as any
+ *  unlock does; a caller with no further use for it should lock(). Only
+ *  meaningful on a vault vaultVerifiesPassphrases() is true for. */
+export async function checkVaultPassphrase(vault: VaultFile, passphrase: string): Promise<VaultPassphraseVerdict> {
+  if (passphrase.length === 0) return "wrong";
+  try {
+    (await unlock(vault, passphrase)).fill(0);
+    return "opens";
+  } catch (err) {
+    return (err instanceof Error ? err.message : String(err)) === VAULT_CHECK_CORRUPT_ERROR
+      ? "marker-corrupt"
+      : "wrong";
+  }
+}
+
+/** The hand-fix for a corrupt check marker, worded once: the CLI's unlock
+ *  error, doctor's passphrase line and `secrets reset`'s refusal all print
+ *  it, and they must agree on what to delete. This module cannot name the
+ *  file (unlock() never sees the path), so the caller passes it. */
+export function vaultCheckCorruptHint(path: string): string {
+  return `Your entries are intact: delete the "check" key from ${path} by hand and re-run -- the next \`yaw-mcp secrets set\` re-stamps it.`;
+}
+
+/** A fresh, EMPTY vault that already carries its verification marker under
+ *  `passphrase` -- what `secrets reset` writes in place of the vault it moves
+ *  aside.
+ *
+ *  newVault() alone is not enough for that: an empty vault with no `check`
+ *  has nothing for unlock() to verify against, so it accepts ANY passphrase
+ *  and the next `secrets set` would silently establish whatever was typed
+ *  then (running the confirm-twice creation prompt a second time). Stamping
+ *  the marker here makes the passphrase chosen at reset THE passphrase: the
+ *  next command verifies against it. setSecret's ensureCheck path is what
+ *  stamps it on a first `set`; this is the same marker without an entry.
+ *
+ *  Derives under DEFAULT_KDF, which is what emptyVault() records in the file,
+ *  so the recorded parameters and the marker's key agree. Touches neither
+ *  disk nor the module key cache; the derived key is zeroed before return. */
+export async function createEmptyVault(passphrase: string): Promise<VaultFile> {
+  const vault = emptyVault();
+  const key = await deriveKey(passphrase, Buffer.from(vault.salt, "base64"), DEFAULT_KDF);
+  try {
+    return ensureCheck(vault, key);
+  } finally {
+    key.fill(0);
+  }
 }
 
 /**

@@ -251,7 +251,7 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
   {
     name: "secrets",
     description: "Manage stored secrets",
-    positional: [["set", "get", "list", "remove", "lock", "rotate", "audit"], ["<name>"]],
+    positional: [["set", "get", "list", "remove", "lock", "rotate", "reset", "audit"], ["<name>"]],
     flags: ["--value", "--stdin", "--force", "--secret", "--server", "--json", "--help"],
   },
   // Other.
