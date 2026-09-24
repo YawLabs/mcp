@@ -2,7 +2,9 @@
 
 All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented here. This project uses [semantic versioning](https://semver.org) and a script-gated release flow: `./release.sh <version>` runs lint + typecheck + tests + build, bumps, tags, publishes to npm, and publishes `server.json` to the MCP registry.
 
-## Unreleased
+## 1.0.13 -- Codex CLI works again: `install codex-cli` under smol-toml 1.9.0, and Codex can call the tools it loads
+
+Published 2026-09-24, the day after 1.0.12. Five entries below, all measured against real Codex 0.144.0 and 0.156.1. `mcp_connect_exec` reaches a cached tool from the first call of a session. On a fresh install, `find_tool` and `exec` wait for the startup pre-warm. Codex, which never re-lists tools, is told to call loaded tools through `mcp_connect_exec` (#172). The TOML codec accepts smol-toml 1.9.0's null-prototype tables, which had broken `install codex-cli`, `doctor`, `install --list` and `heal` for every Codex config. It also refuses a doubled BOM the way Codex does, and pins the parser to 1.9 patch releases (#171).
 
 **Fixed -- `mcp_connect_exec` reaches a cached tool from the first call of a session**
 
