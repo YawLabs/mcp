@@ -172,9 +172,20 @@ function raiseParse(reason: string, line: unknown, column: unknown): never {
  *  use safely and this one cannot: smol-toml returns a datetime as `TomlDate`,
  *  a Date subclass, so `mcp_servers = 1979-05-27` would pass as a container
  *  and the splice would append a `[mcp_servers.mcp]` header to a file Codex
- *  already refuses to load. */
+ *  already refuses to load.
+ *
+ *  A plain object has one of TWO prototypes, and both are tables. smol-toml
+ *  1.8 built its tables with `{}` (Object.prototype); 1.9.0 (2026-09-22)
+ *  builds them with a NULL prototype. Testing for Object.prototype alone read
+ *  every 1.9.0 table -- the document root included -- as "a object, not a
+ *  table", so `install codex-cli` refused to write even a new file and doctor
+ *  and heal called every valid config.toml malformed, for every user whose
+ *  install resolved `^1.8.0` to 1.9.0. Arrays and `TomlDate` carry their own
+ *  prototypes and still fail both tests. */
 export function isTomlTable(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && Object.getPrototypeOf(value) === Object.prototype;
+  if (typeof value !== "object" || value === null) return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
 }
 
 /** How to name a non-table container value in a message. Shape, not contents:

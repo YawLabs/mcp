@@ -279,6 +279,29 @@ describe("parse and classify", () => {
     expect(describeTomlShape([])).toBe("an empty array");
   });
 
+  it("takes a table of EITHER plain-object prototype, whatever smol-toml version is installed", () => {
+    // smol-toml 1.8 built tables on Object.prototype; 1.9.0 builds them on a
+    // NULL prototype. A check for Object.prototype alone read every 1.9.0
+    // table as "a object, not a table" and broke every Codex install. Both
+    // shapes are pinned here directly, not only through whichever parser the
+    // lockfile happens to resolve -- the lockfile is what hid the break.
+    const nullProto = Object.create(null) as Record<string, unknown>;
+    nullProto.command = "npx";
+    expect(isTomlTable(nullProto)).toBe(true);
+    expect(isTomlTable({ command: "npx" })).toBe(true);
+    expect(describeTomlShape(nullProto)).toBe("a table");
+    // What neither prototype admits: the non-table values a TOML value can be.
+    expect(isTomlTable([])).toBe(false);
+    expect(isTomlTable((parseTomlConfig(lf("d = 1979-05-27")) as Record<string, unknown>).d)).toBe(false);
+    expect(isTomlTable(null)).toBe(false);
+    expect(isTomlTable("x")).toBe(false);
+    // And an empty document through the parser the suite actually runs: the
+    // root is the table every splice starts from.
+    expect(isTomlTable(parseTomlConfig(""))).toBe(true);
+    const read = readTomlConfig(lf("[mcp_servers.mcp]", 'command = "npx"'), CONTAINER, [ENTRY]);
+    expect(read.kind).toBe("ok");
+  });
+
   it("reads a file with no mcp_servers at all as ok-but-absent (g12)", () => {
     const read = readTomlConfig(fixture("g12-no-container", "input.toml"), CONTAINER, [ENTRY]);
     expect(read).toEqual({ kind: "ok", containerPresent: false, entries: [], containerUnspliceable: null });
