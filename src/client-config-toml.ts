@@ -133,11 +133,13 @@ function bomOffset(text: string): number {
   return text.charCodeAt(0) === 0xfeff ? 1 : 0;
 }
 
-/** Strip ONE leading U+FEFF. smol-toml rejects a BOM ("only letter, numbers,
- *  dashes and underscores are allowed in keys", line 1 column 1 -- measured on
- *  1.8.0) while Codex accepts it, and Notepad writes one by default. The strip
- *  is for the PARSER only: the splice keeps the byte, which is why every
- *  offset below is taken against the ORIGINAL text. */
+/** Strip ONE leading U+FEFF. Codex accepts one BOM and Notepad writes one by
+ *  default. smol-toml 1.8 rejected it ("only letter, numbers, dashes and
+ *  underscores are allowed in keys", line 1 column 1); 1.9.0 strips one
+ *  itself. The strip stays anyway, so parser positions are measured against
+ *  the same text on either version. It is for the PARSER only: the splice
+ *  keeps the byte, which is why every offset below is taken against the
+ *  ORIGINAL text. */
 function stripBom(raw: string): string {
   return raw.slice(bomOffset(raw));
 }
@@ -146,8 +148,18 @@ function stripBom(raw: string): string {
  *  error type -- so callers have the line, the column and the reason as
  *  separate fields. */
 export function parseTomlConfig(raw: string): unknown {
+  const text = stripBom(raw);
+  // smol-toml >= 1.9.0 strips one leading BOM itself, so a SECOND one that
+  // survived the strip above would parse -- and Codex refuses that file
+  // ("key with no value, expected `=`" at 1:3). Refuse it the way Codex does,
+  // or doctor calls a file healthy that Codex will not load and install
+  // writes into it. Line and column are against the stripped text, like
+  // every other error here.
+  if (text.charCodeAt(0) === 0xfeff) {
+    return raiseParse("a second byte-order mark (U+FEFF) opens the file; Codex refuses it -- delete it", 1, 1);
+  }
   try {
-    return parseTomlText(stripBom(raw), PARSE_OPTIONS);
+    return parseTomlText(text, PARSE_OPTIONS);
   } catch (e) {
     if (e instanceof TomlError) {
       // smol-toml's `message` is "Invalid TOML document: <reason>" followed by

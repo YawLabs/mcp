@@ -179,7 +179,9 @@ function classifyToml(raw: string, addr: EntryAddress, transform?: EntryTransfor
     default:
       // `unloadable` is a strict-JSON concept: a comment makes a .mcp.json
       // unreadable to its client. TOML has no such gap -- what smol-toml
-      // accepts here, Codex's `toml` crate accepts -- so it is always null.
+      // accepts here, Codex's `toml` crate accepts (parseTomlConfig refuses
+      // the one input 1.9.0 alone takes, a doubled BOM) -- so it is always
+      // null.
       // An inline root container rides along the same way, so the one surface
       // that would send the user to install (doctor) can say the run is
       // refused; every other consumer reads a healthy file, which it is.

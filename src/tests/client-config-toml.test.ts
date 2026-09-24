@@ -2072,6 +2072,22 @@ describe("codex agreement table", () => {
       kind: "ok",
     },
     { shape: "leading BOM", toml: `${BOM}${lf("[mcp_servers.mcp]", 'command = "npx"')}`, codexLoads: true, kind: "ok" },
+    // Measured 2026-09-24 against codex-cli 0.144.0: two BOMs fail at 1:3 with
+    // "key with no value, expected `=`". smol-toml 1.9.0 strips one BOM
+    // itself, so without parseTomlConfig's own guard the codec loaded this
+    // file and install wrote into a config Codex refuses.
+    {
+      shape: "two leading BOMs",
+      toml: `${BOM}${BOM}${lf("[mcp_servers.mcp]", 'command = "npx"')}`,
+      codexLoads: false,
+      kind: "malformed",
+    },
+    {
+      shape: "three leading BOMs",
+      toml: `${BOM}${BOM}${BOM}${lf("[mcp_servers.mcp]", 'command = "npx"')}`,
+      codexLoads: false,
+      kind: "malformed",
+    },
     { shape: "CRLF", toml: '[mcp_servers.mcp]\r\ncommand = "npx"\r\n', codexLoads: true, kind: "ok" },
     {
       shape: "sub-table before its parent",
@@ -2137,6 +2153,14 @@ describe("codex agreement table", () => {
       expect(readTomlConfig(row.toml, CONTAINER, [ENTRY]).kind).toBe(row.kind);
     });
   }
+
+  it("refuses to splice into a file opened by two BOMs, and names the second one", () => {
+    const raw = `${BOM}${BOM}${lf("[mcp_servers.sib]", 'command = "node"')}`;
+    expect(() => upsertTomlEntry(raw, CONTAINER, ENTRY, { command: "npx" })).toThrow();
+    expect(() => parseTomlConfig(raw)).toThrow(/second byte-order mark/);
+    // One BOM is still ordinary: Notepad writes it.
+    expect(() => parseTomlConfig(`${BOM}${lf("[mcp_servers.sib]", 'command = "node"')}`)).not.toThrow();
+  });
 
   it("the two rows where a valid-TOML file is still one Codex refuses are typed, not parsed, problems", () => {
     // `[[mcp_servers]]` and `mcp_servers = "none"` are VALID TOML: smol-toml
