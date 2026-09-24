@@ -36,10 +36,12 @@ export const AUDIT_TAIL_CAP = 5000;
 /** How far below the cap a trim cuts. The gap is HYSTERESIS, and it is the
  *  whole point: trimming back to exactly AUDIT_TAIL_CAP leaves the file at
  *  the trigger threshold, so the very next append is over the cap again and
- *  re-reads plus atomically rewrites the whole ~400-500 KB log -- forever,
- *  once per spawned secret. Cutting 500 lines deeper amortizes that rewrite
- *  over ~500 appends. The READ cap is unchanged (a trim still triggers only
- *  above AUDIT_TAIL_CAP); this only decides how much is kept once one runs. */
+ *  atomically rewrites the whole ~400-500 KB log -- forever, once per spawned
+ *  secret. Cutting 500 lines deeper amortizes that rewrite over ~500 appends.
+ *  (It does not amortize the READ: once a log has trimmed, every append
+ *  re-reads it -- see trimToTailCap's size gate.) The trigger is unchanged (a
+ *  trim still runs only above AUDIT_TAIL_CAP); this only decides how much is
+ *  kept once one runs. */
 const AUDIT_TRIM_TO = AUDIT_TAIL_CAP - 500;
 
 export type AuditEventKind = "injected" | "missing";
@@ -112,12 +114,17 @@ const MIN_AUDIT_LINE_BYTES = 64;
  *  AUDIT_TAIL_CAP. Best-effort and swallowed by the caller's try/catch. */
 async function trimToTailCap(path: string): Promise<void> {
   // Cheap size gate first: a file smaller than cap * MIN_AUDIT_LINE_BYTES
-  // cannot hold more than AUDIT_TAIL_CAP of our lines, so skip the read
-  // entirely. Without it every single append re-read the whole log (a few
-  // hundred KB once the file is near the cap) just to discover it was
-  // under. Caveat: hand-appended lines shorter than the bound could push
-  // the LINE count over the cap while the file stays under the byte gate.
-  // The cap is a best-effort size guard, not an invariant.
+  // (320,000 bytes) cannot hold more than AUDIT_TAIL_CAP of our lines, so skip
+  // the read entirely. That only covers a log that has NEVER reached the cap:
+  // a trim leaves AUDIT_TRIM_TO lines, which at even the 76-byte minimum line
+  // is 342,000 bytes, so from the first trim on the gate never fires and every
+  // append re-reads the whole log (~400 KB at realistic line lengths) to count
+  // it. Accepted: one page-cached read per injected secret per spawn, and a
+  // post-trim threshold would be per-process state that another yaw-mcp
+  // process's trim or append silently invalidates. Caveat: hand-appended
+  // lines shorter than the bound could push the LINE count over the cap while
+  // the file stays under the byte gate. The cap is a best-effort size guard,
+  // not an invariant.
   const { size } = await stat(path);
   if (size < AUDIT_TAIL_CAP * MIN_AUDIT_LINE_BYTES) return;
   const raw = await readFile(path, "utf8");
@@ -134,8 +141,9 @@ async function trimToTailCap(path: string): Promise<void> {
   // and the rename is cleanly LOST, but the file is always a complete, valid
   // NDJSON snapshot, never torn. The cost is at most a few dropped audit
   // lines, never a secret (the file holds names only), and readAuditLog
-  // skips any malformed line regardless. The size gate above keeps even that
-  // window rare: it opens only when the log is genuinely over the cap.
+  // skips any malformed line regardless. The window is rare: it opens only
+  // when this rewrite runs, i.e. the log is genuinely over the cap, which the
+  // AUDIT_TRIM_TO hysteresis makes about once per 500 appends.
   await atomicWriteFile(path, `${kept.join("\n")}\n`, "utf8", 0o600);
 }
 

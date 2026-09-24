@@ -548,7 +548,9 @@ describe("handleDiscoverWithAutoWarm", () => {
     expect(priv.sessionActivated.has("gh")).toBe(true);
     const text = result.content[0].text;
     expect(text).toContain('Auto-loaded "gh"');
-    expect(text).toContain('"nope" is not in ~/.yaw-mcp/bundles.json');
+    expect(text).toContain(
+      '"nope" is not in the bundles.json in effect (~/.yaw-mcp/bundles.json, or a trusted project-local .yaw-mcp/bundles.json)',
+    );
   });
 
   it("does not auto-activate when no context is provided", async () => {

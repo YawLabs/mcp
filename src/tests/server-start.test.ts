@@ -137,6 +137,11 @@ const ENV_KEYS = [
   // pass -- the assertions are mostly "the config moved", and a session that
   // never reloads cannot move it.
   "YAW_MCP_CONFIG_RELOAD",
+  // The pre-warm opt-out. Every "pre-warm spawned X" assertion below assumes
+  // it is on, so a developer's exported YAW_MCP_PREWARM=0 would otherwise fail
+  // them for a reason no test here is about; the one test that turns it off
+  // sets it itself.
+  "YAW_MCP_PREWARM",
 ] as const;
 
 let synthHome: string;
@@ -169,6 +174,7 @@ beforeEach(() => {
   delete process.env.YAW_MCP_TRUST_PROJECT;
   delete process.env.YAW_MCP_TOOL_EXPOSURE;
   delete process.env.YAW_MCP_CONFIG_RELOAD;
+  delete process.env.YAW_MCP_PREWARM;
 
   cwdSpy = vi.spyOn(process, "cwd").mockReturnValue(synthCwd);
 
@@ -693,6 +699,77 @@ describe("ConnectServer.start() — persisted state hydration", () => {
     expect(priv.learning.exportSnapshot()).toEqual({});
     // "known" is no longer known, so pre-warm has to spawn it.
     expect(spawnedNamespaces()).toEqual(["fresh", "known"]);
+  });
+
+  /** Spawn "known" with the tool its learned list promised, answering calls. */
+  function knownAnswers(text: string): void {
+    vi.mocked(connectToUpstream).mockImplementation((async (config: UpstreamServerConfig) => {
+      const conn = fakeConnection(config, ["cached_tool"]);
+      vi.mocked(conn.client.callTool).mockResolvedValue({ content: [{ type: "text", text }] } as never);
+      return conn;
+    }) as unknown as typeof connectToUpstream);
+  }
+
+  it("routes a learned server's deferred tools from start() when nothing is dormant", async () => {
+    // The steady state of every session after the first: each configured
+    // server's learned list is inside the weekly refresh window, so pre-warm
+    // finds nothing dormant and returns before ITS route rebuild. The routes
+    // must exist anyway. tools/list advertises deferred tools straight off
+    // getDeferredServers(), and a tools/call on one with no route skipped the
+    // lazy-activation branch and answered `Unknown tool` -- which is how
+    // every test above passed while this broke: each keeps a server dormant,
+    // so pre-warm's rebuild built the table as a side effect.
+    writeBundles(synthHome, [serverEntry("known")]);
+    writeV2StateWithCache();
+    knownAnswers("from the upstream");
+
+    const { priv, prewarmed } = await startServer();
+    await prewarmed;
+
+    expect(spawnedNamespaces()).toEqual([]);
+    // Everything tools/list advertises at full exposure is routed.
+    const advertised = await atFullExposure(() => listedUpstreamTools(priv));
+    expect(advertised).toEqual(["known_cached_tool"]);
+    for (const name of advertised) {
+      expect(priv.toolRoutes.get(name)).toMatchObject({ namespace: "known", deferred: true });
+    }
+
+    // And the first tools/call, through the real handler, lazily loads the
+    // server and returns the upstream's answer rather than `Unknown tool`.
+    const call = priv.server._requestHandlers.get("tools/call");
+    const res = await call({ method: "tools/call", params: { name: "known_cached_tool", arguments: {} } }, {} as never);
+    expect(res.isError).toBeFalsy();
+    expect(res.content[0].text).toBe("from the upstream");
+    expect(spawnedNamespaces()).toEqual(["known"]);
+  });
+
+  it("routes deferred tools before the handshake, and with YAW_MCP_PREWARM=0 serves an exec step", async () => {
+    // Pre-warm switched off: the other way a session starts with no startup
+    // route rebuild at all. The table is asserted BEFORE the client's
+    // initialize, so it can only have come from start() itself. "fresh" has
+    // no learned list, so it is neither advertised nor routed.
+    writeBundles(synthHome, [serverEntry("known"), serverEntry("fresh")]);
+    writeV2StateWithCache();
+    process.env.YAW_MCP_PREWARM = "0";
+    knownAnswers("exec reached it");
+
+    const { priv, transport, prewarmed } = await startServer({ handshake: false });
+    expect([...priv.toolRoutes.keys()]).toEqual(["known_cached_tool"]);
+    expect(priv.toolRoutes.get("known_cached_tool")).toMatchObject({ namespace: "known", deferred: true });
+
+    await driveInitialize(transport as never);
+    await prewarmed;
+    expect(spawnedNamespaces()).toEqual([]);
+
+    // mcp_connect_exec is the advertised "no load needed" path for a cached
+    // server's tool, and it resolves each step through the same table.
+    const res = await priv.handleToolCall("mcp_connect_exec", {
+      steps: [{ id: "a", tool: "known_cached_tool", args: {} }],
+    });
+    const parsed = JSON.parse(res.content[0].text);
+    expect(parsed.ok).toBe(true);
+    expect(JSON.stringify(parsed)).toContain("exec reached it");
+    expect(spawnedNamespaces()).toEqual(["known"]);
   });
 });
 
@@ -1573,11 +1650,12 @@ describe("ConnectServer -- the discover memo vs. a config that broke under it", 
 
 describe("ConnectServer -- recovery from a bad entry needs no restart", () => {
   // The behavioural half of the string audit. Every activation and connect
-  // failure carries "Fix in ~/.yaw-mcp/bundles.json under <ns>, then restart
-  // this MCP client" (upstream.ts, withConfigPointer) into the text the LLM
-  // reads and relays to the user. This is the test that says the second half
-  // of that sentence is false: fix the entry on disk, send activate again,
-  // and it loads.
+  // failure used to carry "Fix in ~/.yaw-mcp/bundles.json under <ns>, then
+  // restart this MCP client" into the text the LLM reads and relays to the
+  // user; withConfigPointer (upstream.ts) now says 'Fix "<ns>" in the
+  // bundles.json that defines it (...), then activate it again'. This is the
+  // test that says dropping the restart was right: fix the entry on disk,
+  // send activate again, and it loads.
 
   it("loads a server after its bundles.json entry is fixed, without a restart", async () => {
     writeBundles(synthHome, [serverEntry("brokensrv", { command: "definitely-not-a-binary" })]);

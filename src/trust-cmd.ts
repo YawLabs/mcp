@@ -26,8 +26,9 @@ import { localBundlesPath, previewBundlesContent, probeProjectTrust } from "./lo
 import { createStreamWriter } from "./logger.js";
 import { isRegistrySpec, specConstraint } from "./oam-spawn.js";
 import { ALLOW_UNOWNED_ENV, CONFIG_DIRNAME } from "./paths.js";
-// One prompt reader for the whole product -- see askYesNo at the bottom of
-// this file for why this crosses a command boundary.
+import { askYesNo } from "./readline-question.js";
+// One prompt reader shared with `secrets` -- see readTrustAnswer at the bottom
+// of this file for why this crosses a command boundary.
 import { readAnswerFromTTY } from "./secrets-cmd.js";
 import {
   grantTrust,
@@ -328,7 +329,7 @@ async function runTrustGrant(opts: TrustCommandOptions): Promise<TrustCommandRes
       serverCount === 0
         ? "  Approve this file? It defines no servers. [y/N] "
         : `  Read ${serverCount === 1 ? "the 1 command" : `all ${serverCount} commands`} above. Approve this file? [y/N] `;
-    const answer = await askYesNo(opts, question);
+    const answer = await askYesNo(opts, question, readTrustAnswer);
     if (answer !== "y" && answer !== "yes") {
       printErr("yaw-mcp trust: Aborted. Nothing was approved.");
       return { exitCode: 1 };
@@ -915,8 +916,11 @@ function isInteractive(opts: TrustCommandOptions): boolean {
   return Boolean(process.stdin.isTTY) && Boolean(process.stdout.isTTY);
 }
 
-/** Ask the confirmation. Defaults to NO -- only an explicit y/yes proceeds,
- *  so a bare Enter (or ^D, or a stray keystroke) leaves the file unapproved.
+/** The reader the approval prompt hands askYesNo in place of its readline
+ *  default; askYesNo still owns the promptAnswer short-circuit and the
+ *  trimmed, lower-cased answer. The prompt defaults to NO -- only an explicit
+ *  y/yes proceeds, so a bare Enter (or ^D, or a stray keystroke) leaves the
+ *  file unapproved.
  *
  *  Routed through secrets-cmd's reader rather than node:readline so both of
  *  the product's confirmation prompts behave identically: control bytes are
@@ -924,13 +928,15 @@ function isInteractive(opts: TrustCommandOptions): boolean {
  *  at this prompt from repainting the screen AND leaving an invisible byte in
  *  the answer ("\x1by" is not "y", so the approval silently flipped to a
  *  decline). Two implementations of "read one confirmation" drift; there is
- *  now one. */
-async function askYesNo(opts: TrustCommandOptions, question: string): Promise<string> {
-  if (opts.promptAnswer !== undefined) return opts.promptAnswer.trim().toLowerCase();
-  const input = opts.io?.stdin ?? process.stdin;
-  const output = opts.io?.stdout ?? process.stdout;
-  // null = ^C. The prompt already defaults to NO, so a cancel lands on the
-  // same "Aborted. Nothing was approved." path as any other non-y answer.
-  const answer = await readAnswerFromTTY(input, output, question);
-  return (answer ?? "").trim().toLowerCase();
+ *  now one.
+ *
+ *  null = ^C, handed on as "": the prompt already defaults to NO, so a cancel
+ *  lands on the same "Aborted. Nothing was approved." path as any other non-y
+ *  answer, never on askYesNo's QUESTION_CANCELLED. */
+async function readTrustAnswer(
+  input: NodeJS.ReadableStream,
+  output: NodeJS.WritableStream,
+  question: string,
+): Promise<string> {
+  return (await readAnswerFromTTY(input, output, question)) ?? "";
 }

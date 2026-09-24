@@ -65,7 +65,6 @@ import { existsSync } from "node:fs";
 import { chmod, mkdir, readdir, readFile, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { createInterface } from "node:readline/promises";
 import { atomicWriteFile } from "./atomic-write.js";
 import { CATALOG_SLUG_RE, resolveCatalogSlug } from "./catalog.js";
 import { clientChoices, resolveClientArg } from "./client-aliases.js";
@@ -94,7 +93,7 @@ import {
 } from "./install-targets.js";
 import { createStreamWriter, log } from "./logger.js";
 import { CONFIG_DIRNAME } from "./paths.js";
-import { QUESTION_CANCELLED, type QuestionCancelled, questionOrEmpty } from "./readline-question.js";
+import { askYesNo, QUESTION_CANCELLED } from "./readline-question.js";
 
 // The --client line is derived from the same table parseTryArgs validates
 // against (and that completion-cmd builds INSTALL_CLIENTS from), not a
@@ -1482,24 +1481,6 @@ function isInteractive(opts: TryCleanupOptions): boolean {
   if (opts.isTTY !== undefined) return opts.isTTY;
   if (opts.promptAnswer !== undefined) return true;
   return Boolean(process.stdin.isTTY) && Boolean(process.stdout.isTTY);
-}
-
-/** Ask the confirmation. Defaults to NO -- a bare Enter, a stray keystroke, or
- *  EOF (^D, a piped stdin running dry) leaves the client config alone.
- *  questionOrEmpty is what makes EOF an answer at all: a bare rl.question()
- *  never settles once its input closes. */
-async function askYesNo(opts: TryCleanupOptions, question: string): Promise<string | QuestionCancelled> {
-  if (opts.promptAnswer !== undefined) return opts.promptAnswer.trim().toLowerCase();
-  const input = opts.io?.stdin ?? process.stdin;
-  const output = opts.io?.stdout ?? process.stdout;
-  const rl = createInterface({ input, output, terminal: opts.io?.terminal });
-  try {
-    const raw = await questionOrEmpty(rl, question);
-    // Ctrl+C is not "no": it is the user leaving, and the exit code says so.
-    return raw === QUESTION_CANCELLED ? raw : raw.trim().toLowerCase();
-  } finally {
-    rl.close();
-  }
 }
 
 export async function runTryCleanup(opts: TryCleanupOptions): Promise<TryCommandResult> {

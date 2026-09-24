@@ -1,7 +1,7 @@
 import { createInterface } from "node:readline/promises";
 import { PassThrough } from "node:stream";
-import { describe, expect, it } from "vitest";
-import { QUESTION_CANCELLED, questionOrEmpty } from "../readline-question.js";
+import { describe, expect, it, vi } from "vitest";
+import { type AnswerReader, askYesNo, QUESTION_CANCELLED, questionOrEmpty } from "../readline-question.js";
 
 function makeRl(): { rl: ReturnType<typeof createInterface>; input: PassThrough; output: PassThrough } {
   const input = new PassThrough();
@@ -79,5 +79,94 @@ describe("questionOrEmpty", () => {
     const pending = questionOrEmpty(rl, "Remove? [y/N] ");
     input.end();
     await expect(pending).resolves.toBe("");
+  });
+});
+
+// The [y/N] confirmation import, remove, set, reset-learning, try-cleanup and
+// trust all call. These pin the contract each of those commands relied on
+// when it had its own copy.
+describe("askYesNo", () => {
+  function streams(): { input: PassThrough; output: PassThrough; written: () => string } {
+    const input = new PassThrough();
+    const output = new PassThrough();
+    let text = "";
+    output.on("data", (c: Buffer) => {
+      text += c.toString("utf8");
+    });
+    return { input, output, written: () => text };
+  }
+
+  it("returns promptAnswer trimmed and lower-cased without asking anything", async () => {
+    const { input, output, written } = streams();
+    const read = vi.fn<AnswerReader>();
+    await expect(
+      askYesNo({ promptAnswer: "  YeS \n", io: { stdin: input, stdout: output } }, "Remove? [y/N] ", read),
+    ).resolves.toBe("yes");
+    expect(read).not.toHaveBeenCalled();
+    expect(written()).toBe("");
+    expect(input.listenerCount("data")).toBe(0);
+  });
+
+  it("asks on the io streams and returns the typed line trimmed and lower-cased", async () => {
+    const { input, output, written } = streams();
+    const pending = askYesNo({ io: { stdin: input, stdout: output } }, "Remove? [y/N] ");
+    input.write("  Y \n");
+    await expect(pending).resolves.toBe("y");
+    expect(written()).toContain("Remove? [y/N] ");
+  });
+
+  it("closes the interface it opened, whatever the answer", async () => {
+    // A readline interface left open keeps its listeners on stdin, and on a
+    // real stdin that holds the process open after the command is done.
+    const { input, output } = streams();
+    const pending = askYesNo({ io: { stdin: input, stdout: output } }, "? ");
+    expect(input.listenerCount("data")).toBeGreaterThan(0);
+    input.write("n\n");
+    await expect(pending).resolves.toBe("n");
+    expect(input.listenerCount("data")).toBe(0);
+  });
+
+  it("reads EOF as the empty answer, which every caller takes as NO", async () => {
+    const { input, output } = streams();
+    const pending = askYesNo({ io: { stdin: input, stdout: output } }, "Remove? [y/N] ");
+    input.end();
+    await expect(pending).resolves.toBe("");
+  });
+
+  it("returns QUESTION_CANCELLED on Ctrl+C, not the empty default", async () => {
+    // terminal:true so readline owns the keypress, as on a TTY; ETX (code 3)
+    // is what the terminal delivers for Ctrl+C.
+    const { input, output } = streams();
+    const pending = askYesNo({ io: { stdin: input, stdout: output, terminal: true } }, "Remove? [y/N] ");
+    input.write(String.fromCharCode(3));
+    await expect(pending).resolves.toBe(QUESTION_CANCELLED);
+    // Closed on this path too. A terminal-mode interface reads keypresses, and
+    // its keypress listener is what close() removes; the byte decoder
+    // emitKeypressEvents put on the stream's "data" stays by node's design.
+    expect(input.listenerCount("keypress")).toBe(0);
+  });
+
+  it("hands a custom reader the streams, question and terminal flag, and normalizes its answer", async () => {
+    const { input, output } = streams();
+    const read = vi.fn<AnswerReader>(async () => "  YES ");
+    await expect(
+      askYesNo({ io: { stdin: input, stdout: output, terminal: false } }, "Approve? [y/N] ", read),
+    ).resolves.toBe("yes");
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(read).toHaveBeenCalledWith(input, output, "Approve? [y/N] ", false);
+  });
+
+  it("passes a custom reader's QUESTION_CANCELLED through unchanged", async () => {
+    const read = vi.fn<AnswerReader>(async () => QUESTION_CANCELLED);
+    await expect(askYesNo({ io: { stdin: new PassThrough(), stdout: new PassThrough() } }, "? ", read)).resolves.toBe(
+      QUESTION_CANCELLED,
+    );
+  });
+
+  it("falls back to process.stdin and process.stdout when no io is given", async () => {
+    // Through a stand-in reader, so nothing actually reads the test runner's stdin.
+    const read = vi.fn<AnswerReader>(async () => "no");
+    await expect(askYesNo({}, "? ", read)).resolves.toBe("no");
+    expect(read).toHaveBeenCalledWith(process.stdin, process.stdout, "? ", undefined);
   });
 });

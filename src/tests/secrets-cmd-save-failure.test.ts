@@ -10,6 +10,12 @@
 // trick that makes the write fail also makes the pre-write READ fail, which
 // short-circuits earlier with a different message). Every other export passes
 // through to the real module, including the module-scoped key cache.
+//
+// The last block injects a failed READ at the loadVault boundary the same
+// way, for the errnos a directory fixture cannot give (it only ever yields
+// EISDIR): EIO and EACCES on list and get, and a load that fails on `set`
+// after its baseline read passed -- the one read failure set's fail-fast
+// cannot catch.
 
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -17,13 +23,24 @@ import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { injected } = vi.hoisted(() => ({
-  injected: { code: null as string | null, message: null as string | null },
+  injected: { code: null as string | null, message: null as string | null, loadCode: null as string | null },
 }));
 
 vi.mock("../secrets-vault.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../secrets-vault.js")>();
   return {
     ...actual,
+    loadVault: async (path: string, opts?: Parameters<typeof actual.loadVault>[1]) => {
+      if (injected.loadCode !== null) {
+        // Node's shape for a read-phase errno ("EIO: i/o error, read"): the
+        // code and the syscall, and no path -- so a path in the refusal can
+        // only have come from the CLI.
+        const err: NodeJS.ErrnoException = new Error(`${injected.loadCode}: injected read failure, read`);
+        err.code = injected.loadCode;
+        throw err;
+      }
+      return actual.loadVault(path, opts);
+    },
     saveVault: async (path: string, vault: Parameters<typeof actual.saveVault>[1]) => {
       if (injected.code !== null || injected.message !== null) {
         // The default message deliberately does NOT repeat the errno. When it
@@ -50,13 +67,34 @@ describe("runSecrets -- a failed vault write stays inside the command's error en
   let home: string;
   const io = { out: vi.fn(), err: vi.fn() };
 
-  const errJson = (): { ok: boolean; error: string } =>
-    JSON.parse(
-      io.err.mock.calls
-        .map((c) => c[0] as string)
-        .join("")
-        .trim(),
-    );
+  /** Every stderr line, each parsed as JSON; a line that is not JSON fails
+   *  naming it, rather than as a bare SyntaxError over the joined stream. */
+  const errLines = (): Array<Record<string, unknown>> =>
+    io.err.mock.calls
+      .map((c) => c[0] as string)
+      .join("")
+      .split("\n")
+      .filter((l) => l.length > 0)
+      .map((l) => {
+        try {
+          return JSON.parse(l) as Record<string, unknown>;
+        } catch {
+          throw new Error(`stderr line is not JSON: ${l}`);
+        }
+      });
+
+  /** The {"ok":false} envelope, which ends stderr. Warning lines may come
+   *  first -- SECRETS_USAGE: key on "warning" vs "ok", never on line
+   *  position -- so this parses the LAST line and requires `warning` on any
+   *  before it, instead of assuming the envelope is the only line. */
+  const errJson = (): { ok: boolean; error: string } => {
+    const lines = errLines();
+    expect(lines.length, "no JSON line on stderr").toBeGreaterThan(0);
+    const envelope = lines[lines.length - 1];
+    expect(envelope).toHaveProperty("ok", false);
+    for (const line of lines.slice(0, -1)) expect(line).toHaveProperty("warning");
+    return envelope as { ok: boolean; error: string };
+  };
 
   beforeEach(() => {
     io.out.mockReset();
@@ -154,6 +192,24 @@ describe("runSecrets -- a failed vault write stays inside the command's error en
     expect(io.out).not.toHaveBeenCalled();
   });
 
+  it("keeps the envelope last when a warning line precedes it (a short env passphrase)", async () => {
+    // The warning fires at the passphrase step, ahead of the failed write:
+    // the documented shape, and the one a join-and-parse helper choked on.
+    process.env.YAW_MCP_VAULT_PASSPHRASE = "abc";
+    try {
+      injected.code = "EACCES";
+      const r = await runSecrets({ action: "set", name: "GH", value: "ghp", home, json: true }, io);
+      expect(r.exitCode).toBe(1);
+      const lines = errLines();
+      expect(lines).toHaveLength(2);
+      expect(lines[0]).toMatchObject({ warning: "short-passphrase", subject: "YAW_MCP_VAULT_PASSPHRASE" });
+      expect(errJson().error).toContain("EACCES");
+      expect(io.out).not.toHaveBeenCalled();
+    } finally {
+      delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    }
+  });
+
   it("falls back to the error MESSAGE when the write failure carries no errno", async () => {
     // saveVaultOrReport reads `e.code` first. A rejection with no `code` (a
     // wrapper's plain Error, an EXDEV re-thrown by a helper) has to surface
@@ -175,6 +231,65 @@ describe("runSecrets -- a failed vault write stays inside the command's error en
     const text = io.err.mock.calls.map((c) => c[0] as string).join("");
     expect(text.startsWith("yaw-mcp secrets set:")).toBe(true);
     expect(text).toContain("EACCES");
+    expect(io.out).not.toHaveBeenCalled();
+  });
+});
+
+describe("runSecrets -- a failed vault read names the vault file", () => {
+  let home: string;
+  const io = { out: vi.fn(), err: vi.fn() };
+  const errText = (): string => io.err.mock.calls.map((c) => c[0] as string).join("");
+
+  beforeEach(() => {
+    io.out.mockReset();
+    io.err.mockReset();
+    injected.loadCode = null;
+    lock();
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    home = mkdtempSync(join(tmpdir(), "yaw-mcp-readfail-"));
+  });
+
+  afterEach(() => {
+    injected.loadCode = null;
+    rmSync(home, { recursive: true, force: true });
+    lock();
+  });
+
+  // list and get take no baseline read, so loadVault's read is the only one
+  // they make, and its error used to be printed as Node worded it: the errno
+  // and the syscall, with no file named anywhere.
+  it.each([
+    ["list", "EIO"],
+    ["get", "EACCES"],
+  ] as const)("%s --json on a %s read names the vault path and the errno", async (action, code) => {
+    injected.loadCode = code;
+    const r = await runSecrets(
+      action === "list" ? { action, home, json: true } : { action, name: "TOKEN", passphrase: PASS, home, json: true },
+      io,
+    );
+    expect(r.exitCode).toBe(1);
+    expect(errText()).toBe(
+      `${JSON.stringify({ ok: false, error: `could not read the vault file at ${vaultPath(home)} (${code}) -- fix that and re-run.` })}\n`,
+    );
+    expect(io.out).not.toHaveBeenCalled();
+  });
+
+  it("set names the file in the same sentence when the load's read fails after the baseline read passed", async () => {
+    const probe = { out: vi.fn(), err: vi.fn() };
+    expect(
+      (await runSecrets({ action: "set", name: "TOKEN", value: "v1", passphrase: PASS, home }, probe)).exitCode,
+    ).toBe(0);
+    lock();
+    const before = readFileSync(vaultPath(home), "utf8");
+    injected.loadCode = "EIO";
+    const r = await runSecrets({ action: "set", name: "GH", value: "ghp", passphrase: PASS, home }, io);
+    expect(r.exitCode).toBe(1);
+    // Without the fail-fast's closing "Nothing was written.": that refusal
+    // is the baseline read's, and this baseline read succeeded.
+    expect(errText()).toBe(
+      `yaw-mcp secrets set: could not read the vault file at ${vaultPath(home)} (EIO) -- fix that and re-run.\n`,
+    );
+    expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
     expect(io.out).not.toHaveBeenCalled();
   });
 });

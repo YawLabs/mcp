@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { atomicWriteFile } from "../atomic-write.js";
+import { symlinksAvailable } from "./symlinks.js";
 
 // The permission behaviour below is asserted through the ARGUMENTS this module
 // hands node:fs, not through stat().mode on the finished file. The mode it
@@ -398,24 +399,8 @@ describe("atomicWriteFile", () => {
   });
 });
 
-/** Whether this runner can create a symlink at all -- Windows refuses without
- *  Developer Mode / SeCreateSymbolicLinkPrivilege. Probed ONCE, in a temp dir
- *  of its own, so the two tests below can report SKIPPED rather than each
- *  bailing with a bare `return` that vitest scores as a PASS: the severed-link
- *  regression they exist for would otherwise read as covered on every Windows
- *  box that cannot make links. */
-function symlinksAvailable(): boolean {
-  const probe = mkdtempSync(join(tmpdir(), "yaw-mcp-atomic-symlink-probe-"));
-  try {
-    symlinkSync(join(probe, "target.txt"), join(probe, "link.txt"), "file");
-    return true;
-  } catch {
-    return false;
-  } finally {
-    rmSync(probe, { recursive: true, force: true });
-  }
-}
-
+// Probed ONCE so the two tests below report SKIPPED, not a vacuous PASS, on a
+// runner that cannot make links (see symlinksAvailable).
 const SYMLINKS_AVAILABLE = symlinksAvailable();
 
 // Regression: rename() publishes at the path it is handed, so renaming the

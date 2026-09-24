@@ -42,11 +42,10 @@
 import { existsSync } from "node:fs";
 import { unlink } from "node:fs/promises";
 import { homedir } from "node:os";
-import { createInterface } from "node:readline/promises";
 import { createStreamWriter } from "./logger.js";
 import { userConfigDir } from "./paths.js";
 import { isFileNotFound, isPersistenceDisabled, loadStateClassified, statePath } from "./persistence.js";
-import { QUESTION_CANCELLED, questionOrEmpty } from "./readline-question.js";
+import { askYesNo, QUESTION_CANCELLED } from "./readline-question.js";
 
 export const RESET_LEARNING_USAGE = `Usage: yaw-mcp reset-learning
 
@@ -155,25 +154,6 @@ function isInteractive(opts: ResetLearningOptions): boolean {
   if (opts.isTTY !== undefined) return opts.isTTY;
   if (opts.promptAnswer !== undefined) return true;
   return Boolean(process.stdin.isTTY) && Boolean(process.stdout.isTTY);
-}
-
-/** Ask the confirmation. Defaults to NO -- only an explicit y/yes proceeds, so
- *  a bare Enter, a stray keystroke, or EOF (^D, a piped stdin running dry)
- *  leaves state.json where it is. EOF is questionOrEmpty's job: a bare
- *  rl.question() never settles once its input closes, which would leave this
- *  hanging with no answer and no exit. */
-async function askYesNo(opts: ResetLearningOptions, question: string): Promise<string | typeof QUESTION_CANCELLED> {
-  if (opts.promptAnswer !== undefined) return opts.promptAnswer.trim().toLowerCase();
-  const input = opts.io?.stdin ?? process.stdin;
-  const output = opts.io?.stdout ?? process.stdout;
-  const rl = createInterface({ input, output, terminal: opts.io?.terminal });
-  try {
-    const raw = await questionOrEmpty(rl, question);
-    // Ctrl+C is not "no": it is the user leaving, and the exit code says so.
-    return raw === QUESTION_CANCELLED ? raw : raw.trim().toLowerCase();
-  } finally {
-    rl.close();
-  }
 }
 
 export async function runResetLearning(opts: ResetLearningOptions = {}): Promise<ResetLearningResult> {

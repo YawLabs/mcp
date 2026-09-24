@@ -119,10 +119,16 @@ describe("secret entry page: shape and headers", () => {
     // Caller text is escaped, never rendered as markup.
     expect(res.body).toContain("&lt;b&gt;not markup&lt;/b&gt;");
     expect(res.headers["cache-control"]).toBe("no-store");
-    expect(res.headers["access-control-allow-origin"]).toBeUndefined();
+    // No CORS header of any kind, not just the one a browser checks first.
+    expect(Object.keys(res.headers).filter((h) => h.startsWith("access-control-"))).toEqual([]);
     expect(res.headers["x-frame-options"]).toBe("DENY");
-    expect(String(res.headers["content-security-policy"])).toContain("form-action 'self'");
-    expect(String(res.headers["content-security-policy"])).toContain("default-src 'none'");
+    const csp = String(res.headers["content-security-policy"]);
+    expect(csp).toContain("form-action 'self'");
+    expect(csp).toContain("default-src 'none'");
+    // No script, pinned directly: the `default-src 'none'` check above still
+    // passes with a `script-src` appended to the policy, which would let one run.
+    expect(csp).not.toContain("script-src");
+    expect(res.body).not.toMatch(/<script/i);
     expect(res.headers.connection).toBe("close");
     expect(await settled(page.result)).toBe("pending");
   });
@@ -359,6 +365,21 @@ describe("secret entry page: single use, expiry, close", () => {
       openSecretEntryPage({ title: "t", intro: "i", fields: [], doneMessage: "d", ttlMs: 1000 }),
     ).rejects.toThrow(/at least one field/);
   });
+
+  it("rejects two fields sharing a name, which would hand both the first value", async () => {
+    await expect(
+      openSecretEntryPage({
+        title: "t",
+        intro: "i",
+        fields: [
+          { name: "API_KEY", label: "API key" },
+          { name: "API_KEY", label: "API key again" },
+        ],
+        doneMessage: "d",
+        ttlMs: 1000,
+      }),
+    ).rejects.toThrow(/must be unique/);
+  });
 });
 
 describe("describeTtl", () => {
@@ -386,6 +407,8 @@ describe("browserCommand", () => {
   });
 
   it("uses xdg-open only when there is a graphical session", () => {
+    // By bare name on purpose: xdg-open has no fixed path across distros (see
+    // browserCommand).
     expect(browserCommand(url, "linux", { DISPLAY: ":0" })).toEqual({ command: "xdg-open", args: [url] });
     expect(browserCommand(url, "linux", { WAYLAND_DISPLAY: "wayland-0" })).toEqual({
       command: "xdg-open",

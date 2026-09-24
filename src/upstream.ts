@@ -18,6 +18,7 @@ import {
   ResourceListChangedNotificationSchema,
   ToolListChangedNotificationSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import { bundlesFileHint } from "./bundles-hint.js";
 import { isCredentialEnvName } from "./credentials.js";
 import { defaultRuntime } from "./default-runtime.js";
 import {
@@ -29,6 +30,7 @@ import { log } from "./logger.js";
 import { oamHeapOomHint, probeOam, resolveOamSpawn } from "./oam-spawn.js";
 import { appendAuditEvent } from "./secrets-audit.js";
 import {
+  checkVaultPassphrase,
   collectSecretRefNames,
   hasSecretRefs,
   loadVault,
@@ -145,7 +147,15 @@ export function clearSessionVaultPassphrase(): void {
  *  refusal for that case ("no vault exists yet") belongs to resolveServerEnv.
  *  Never throws: an unreadable or corrupt vault is not the typed passphrase's
  *  fault, so it verifies as true and lets the resolve path report the real
- *  error with its own wording. */
+ *  error with its own wording.
+ *
+ *  The verdict itself is secrets-vault's checkVaultPassphrase, the one
+ *  spelling of "unlock, but read a corrupt check marker as a RIGHT
+ *  passphrase": "opens" and "marker-corrupt" both accept what the user typed
+ *  (a damaged marker would fail a retype identically). A check that throws
+ *  -- a key-derivation failure, which says nothing about the passphrase --
+ *  answers false, like a wrong passphrase, so the elicitation path reports it
+ *  as a passphrase that did not unlock the vault. */
 export async function verifyVaultPassphrase(passphrase: string): Promise<boolean> {
   if (passphrase.length === 0) return false;
   let vault: Awaited<ReturnType<typeof loadVault>>;
@@ -156,12 +166,9 @@ export async function verifyVaultPassphrase(passphrase: string): Promise<boolean
   }
   if (!vault) return true;
   try {
-    await unlock(vault, passphrase);
-    return true;
-  } catch (err) {
-    // The passphrase is right; the check marker is damaged. Not a reason to
-    // reject what the user typed.
-    return (err instanceof Error ? err.message : String(err)) === VAULT_CHECK_CORRUPT_ERROR;
+    return (await checkVaultPassphrase(vault, passphrase)) !== "wrong";
+  } catch {
+    return false;
   }
 }
 
@@ -924,6 +931,13 @@ function redactSecretsInOutput(text: string, env: Record<string, string>): strin
  * file and namespace is both accurate and more actionable -- the LLM can tell
  * the user exactly what to open.
  *
+ * The file is named through bundlesFileHint("defines-it"), the same two-location
+ * spelling server.ts's own messages use, not a bare ~/.yaw-mcp/bundles.json: a
+ * trusted project-local .yaw-mcp/bundles.json replaces the user-global file
+ * outright while it is in effect (local-bundles.ts -- no merge), so a pointer
+ * at the global file sends a project-local server's fix to a file this session
+ * never reads.
+ *
  * It does NOT order a restart. This suffix rides every activation and connect
  * failure into the text the LLM reads and relays, so it is the most-read
  * sentence yaw-mcp prints -- and "then restart this MCP client" stopped being
@@ -936,7 +950,7 @@ function withConfigPointer(message: string, config: UpstreamServerConfig): strin
   // ASCII arrow on purpose: this suffix rides every activation error into the
   // stderr log, and a `->` survives a Windows console codepage where the
   // Unicode arrow renders as mojibake and then gets pasted into bug reports.
-  return `${message} -> Fix in ~/.yaw-mcp/bundles.json under "${config.namespace}", then activate it again -- the edit is picked up on the next mcp_connect_* call, with no client restart.`;
+  return `${message} -> Fix "${config.namespace}" in ${bundlesFileHint("defines-it")}, then activate it again -- the edit is picked up on the next mcp_connect_* call, with no client restart.`;
 }
 
 function categorizeSpawnError(err: unknown): ActivationFailureCategory {
@@ -1257,8 +1271,9 @@ export async function connectToUpstream(
 // The internal-secret strip (INTERNAL_SECRET_ENV_KEYS and the two helpers
 // built on it) lives in internal-secret-env.ts now, so the self-upgrade spawns
 // in auto-upgrade.ts / upgrade-cmd.ts can share it without loading the MCP
-// SDK. Re-exported under the same names: server.ts, audit-cmd.ts and the tests
-// import them from here.
+// SDK. Re-exported under the same names for the importers that still reach
+// them through here (audit-cmd.ts and upstream's tests); server.ts and every
+// other consumer import internal-secret-env.ts directly.
 export { INTERNAL_SECRET_ENV_KEYS, scrubInternalSecretsFromProcessEnv, stripInternalSecretsFromEnv };
 
 async function connectToUpstreamOnce(
@@ -1358,9 +1373,9 @@ async function connectToUpstreamOnce(
     // try/catch further down wraps client.connect() ONLY -- so classify and
     // wrap here. Without this the failure escapes connectToUpstreamOnce as a
     // bare Error: no category, no stderr tail, and none of the
-    // `-> Fix in ~/.yaw-mcp/bundles.json` pointer every other local spawn
-    // failure carries (server.ts's activation handler adds nothing on the
-    // raw-Error branch).
+    // `-> Fix "<namespace>" in the bundles.json that defines it` pointer
+    // (withConfigPointer) every other local spawn failure carries (server.ts's
+    // activation handler adds nothing on the raw-Error branch).
     let resolved: { command: string; args: string[] };
     try {
       resolved = await resolveUvSpawn(config.command, config.args ?? []);
@@ -1386,8 +1401,9 @@ async function connectToUpstreamOnce(
       // fetch. A sidecar that boots clean on oam and breaks only later (a
       // bundled browser that fails when a tool call launches it, a native addon
       // loaded lazily) gets no automatic fallback: every reconnect re-hosts it
-      // on oam until someone sets `runtime: "node"` for that server in
-      // ~/.yaw-mcp/bundles.json or flips the config-level default.
+      // on oam until someone sets `runtime: "node"` for that server in the
+      // bundles.json that defines it (~/.yaw-mcp/bundles.json, or a trusted
+      // project-local .yaw-mcp/bundles.json) or flips the config-level default.
       const configured = config.runtime ?? (await defaultRuntime());
       const optedIn = configured !== null;
       const effectiveRuntime = configured ?? "oam";
@@ -1494,7 +1510,7 @@ async function connectToUpstreamOnce(
 
     // A scheme-less or otherwise malformed url ("localhost:3000", a stray
     // space) makes the URL constructor throw a bare TypeError("Invalid URL"):
-    // no category, no namespace, no url, and none of the "Fix in ..." pointer
+    // no category, no namespace, no url, and none of the `-> Fix ...` pointer
     // every other connect failure carries -- and server.ts spends its retry on
     // what is a permanent config error. Classify it here instead.
     let url: URL;

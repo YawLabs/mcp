@@ -13,9 +13,12 @@ import {
   LEGACY_KDF,
 } from "../secrets-crypto.js";
 import {
+  checkVaultPassphrase,
   collectMalformedSecretRefs,
+  createEmptyVault,
   getSecret,
   hasSecretRefs,
+  isUnlocked,
   listKeys,
   loadVault,
   lock,
@@ -34,8 +37,10 @@ import {
   VAULT_CHECK_AAD,
   VAULT_CHECK_CORRUPT_ERROR,
   VAULT_CHECK_PLAINTEXT,
+  VAULT_WRONG_PASSPHRASE_ERROR,
   VaultEntryCorruptError,
   type VaultFile,
+  type VaultLoadWarning,
   vaultPath,
 } from "../secrets-vault.js";
 
@@ -181,9 +186,10 @@ describe("secrets-vault: set/get/list/remove", () => {
   it("saveVault asks for a 0o600 file inside a 0o700 .yaw-mcp/ that it creates itself", async () => {
     // Fresh home: neither the vault nor its parent .yaw-mcp/ exists, so this
     // save takes atomicWriteFile's create path -- the file born 0o600 and the
-    // directory born 0o700. Every other save in this file pre-creates the
+    // directory born 0o700. Most other saves in this file pre-create the
     // directory (contrary to saveVault's own MUST NOT note), which turns the
-    // dirMode into a no-op and left the request itself unpinned. Mirrors
+    // dirMode into a no-op, and none spies on the call, so the request itself
+    // was unpinned. Mirrors
     // secrets-audit.test.ts: the MODES REQUESTED are this module's decision;
     // whether the filesystem honours POSIX bits is the OS's business (Windows
     // reports a synthetic 0o666), so statting the result proves nothing here.
@@ -428,8 +434,8 @@ describe("SECRET_REF_RE is exported and matches ${secret:NAME}", () => {
   it("captures the name", () => {
     // NOT a fresh regex: matchAll seeds its internal clone FROM this shared
     // object's lastIndex, so it resets nothing. Nothing above advances it, so
-    // it is still 0 here -- the real callers re-instantiate rather than lean
-    // on that (see doctor-cmd.ts, meta-tools.ts, upstream.ts).
+    // it is still 0 here -- the real callers do not lean on that: they go
+    // through collectSecretRefNames (secrets-vault.ts), which re-instantiates.
     const m = [...`x ${"${secret:gh}"} y`.matchAll(SECRET_REF_RE)];
     expect(m[0][1]).toBe("gh");
   });
@@ -514,6 +520,52 @@ describe("rotateVault", () => {
     await expect(rotateVault(corrupted, oldKey, "new-passphrase")).rejects.toThrow(/failed to decrypt/i);
     // The input vault object is not mutated by the abort.
     expect(JSON.stringify(corrupted)).toBe(snapshot);
+  });
+
+  it("names a corrupt entry as corrupt -- not a wrong passphrase -- when the check marker proved the key", async () => {
+    // Step 1 verified the marker under this key, so the passphrase is right
+    // and only the entry can be at fault. Blaming the passphrase sent the user
+    // to `secrets reset`, which refuses a passphrase that opens the vault.
+    let vault = newVault();
+    const oldKey = await unlock(vault, "old-passphrase");
+    vault = setSecret(vault, oldKey, "github", "ghp_abc");
+    expect(vault.check).toBeDefined();
+    const corrupted: VaultFile = {
+      ...vault,
+      entries: {
+        ...vault.entries,
+        github: { ...vault.entries.github, ciphertext: Buffer.from("tampered").toString("base64") },
+      },
+    };
+
+    const err = await rotateVault(corrupted, oldKey, "new-passphrase").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(Error);
+    const msg = (err as Error).message;
+    expect(msg).toMatch(/entry "github" failed to decrypt/);
+    expect(msg).toMatch(/the passphrase is right/);
+    expect(msg).toContain("`yaw-mcp secrets remove github`");
+    expect(msg).not.toMatch(/under the current passphrase/);
+  });
+
+  it("keeps the passphrase wording for a check-LESS vault, where nothing has proved the key", async () => {
+    // A legacy vault with no marker: step 1 has nothing to check, so a failed
+    // entry may well mean the key is wrong -- the one case the old wording fits.
+    let vault = newVault();
+    const oldKey = await unlock(vault, "old-passphrase");
+    vault = setSecret(vault, oldKey, "github", "ghp_abc");
+    const checkless: VaultFile = {
+      version: vault.version,
+      salt: vault.salt,
+      kdf: vault.kdf,
+      entries: {
+        github: { ...vault.entries.github, ciphertext: Buffer.from("tampered").toString("base64") },
+      },
+    };
+
+    const err = await rotateVault(checkless, oldKey, "new-passphrase").catch((e: unknown) => e);
+    expect((err as Error).message).toBe(
+      'rotate aborted: entry "github" failed to decrypt under the current passphrase',
+    );
   });
 
   it("aborts when the current key is wrong (check marker fails), nothing re-encrypted", async () => {
@@ -941,7 +993,10 @@ describe("secrets-vault v2: recorded KDF parameters", () => {
       entries: { github: encryptEntry("ghp_legacy", legacyKey) },
     };
 
-    // Stand in for a future release raising the cost factor.
+    // Stand in for a future release raising the cost factor. The in-place
+    // mutation is what lets this test fail: while DEFAULT_KDF equals
+    // LEGACY_KDF, an unlock() that fell back to DEFAULT_KDF would pass. That
+    // is why DEFAULT_KDF is left unfrozen (see its doc in secrets-crypto.ts).
     const originalN = DEFAULT_KDF.N;
     DEFAULT_KDF.N = 1 << 14;
     try {
@@ -1007,6 +1062,23 @@ describe("secrets-vault v2: recorded KDF parameters", () => {
     writeFileSync(path, `${JSON.stringify(atCap)}\n`);
     await expect(loadVault(path)).resolves.toBeDefined();
   });
+
+  it("refuses an N/r pair node's scrypt rejects, at load rather than as a raw error from unlock", async () => {
+    // r=1 caps N below 2^16 in OpenSSL, well inside every bound above. Such a
+    // vault used to load, then fail unlock() with ERR_CRYPTO_INVALID_SCRYPT_PARAMS
+    // -- which the broker reported as a wrong passphrase.
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    const path = vaultPath(synthHome);
+    const bad = {
+      version: 2,
+      salt: generateSalt().toString("base64"),
+      kdf: { N: 1 << 16, r: 1, p: 1 },
+      entries: {},
+    };
+    writeFileSync(path, `${JSON.stringify(bad)}\n`);
+    await expect(loadVault(path)).rejects.toThrow(/invalid kdf/i);
+  });
 });
 
 describe("secrets-vault v2: ciphertexts are bound to their entry name", () => {
@@ -1070,9 +1142,11 @@ describe("secrets-vault: passphrase normalization", () => {
 
   it("still opens a legacy vault keyed on the UN-normalized bytes", async () => {
     // What a vault created before normalization looks like: the key came from
-    // the decomposed bytes exactly as typed.
+    // the decomposed bytes exactly as typed. LEGACY_KDF, not DEFAULT_KDF: the
+    // fixture is kdf-less, which unlock() derives under LEGACY_KDF, and the two
+    // being equal today is the only reason DEFAULT_KDF ever passed here.
     const salt = generateSalt();
-    const legacyKey = await deriveKey(DECOMPOSED, salt, DEFAULT_KDF, false);
+    const legacyKey = await deriveKey(DECOMPOSED, salt, LEGACY_KDF, false);
     const vault: VaultFile = {
       version: 1,
       salt: salt.toString("base64"),
@@ -1149,5 +1223,191 @@ describe("secrets-vault: loadVault error shapes", () => {
     const bad = { version: "99", salt: generateSalt().toString("base64"), entries: {} };
     writeFileSync(path, `${JSON.stringify(bad)}\n`);
     await expect(loadVault(path)).rejects.toThrow(/"version" must be a number/);
+  });
+
+  it("refuses an ARRAY `entries` like a missing one, as the lenient reader in secrets-cmd.ts does", async () => {
+    // `[]` used to load as an empty vault, and `["x"]` failed as "vault
+    // corrupt at entry 0" -- naming a key that is not in the file.
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    const path = vaultPath(synthHome);
+    for (const entries of [[], ["x"]]) {
+      writeFileSync(path, `${JSON.stringify({ version: 2, salt: generateSalt().toString("base64"), entries })}\n`);
+      const err = await loadVault(path).catch((e: unknown) => e);
+      expect(err, JSON.stringify(entries)).toBeInstanceOf(Error);
+      expect(err, JSON.stringify(entries)).not.toBeInstanceOf(VaultEntryCorruptError);
+      expect((err as Error).message, JSON.stringify(entries)).toMatch(/corrupt: missing or invalid salt\/entries/);
+    }
+  });
+});
+
+describe("loadVault: warnings go to onWarning when given, to the log when not", () => {
+  // The CLI surface renders log("warn") as a prose line on stderr, so under
+  // `--json` a warn line from loadVault broke the one-JSON-object-per-line
+  // promise. onWarning lets such a caller render the warning itself; without
+  // it, every line stays where the server surface relies on it.
+  async function writeRaw(text: string): Promise<string> {
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    const path = vaultPath(synthHome);
+    writeFileSync(path, text);
+    return path;
+  }
+  const malformedCheck = () =>
+    `${JSON.stringify({ version: 2, salt: generateSalt().toString("base64"), entries: {}, check: { iv: "x" } })}\n`;
+
+  it("without options: a malformed check, an unreadable file and a not-JSON file each log one warn line", async () => {
+    const logger = await import("../logger.js");
+    const logSpy = vi.spyOn(logger, "log").mockImplementation(() => {});
+
+    const path = await writeRaw(malformedCheck());
+    const vault = await loadVault(path);
+    expect(vault?.check).toBeUndefined();
+    expect(logSpy).toHaveBeenCalledTimes(1);
+    expect(logSpy.mock.calls[0][0]).toBe("warn");
+    expect(logSpy.mock.calls[0][1]).toMatch(/verification token is malformed/);
+    expect(logSpy.mock.calls[0][2]).toEqual({ path });
+
+    logSpy.mockClear();
+    await writeRaw("{ not json");
+    await expect(loadVault(path)).rejects.toThrow(/not valid JSON/);
+    expect(logSpy).toHaveBeenCalledTimes(1);
+    expect(logSpy.mock.calls[0][1]).toBe("Vault file is not valid JSON");
+
+    logSpy.mockClear();
+    const dirPath = join(synthHome, "a-directory");
+    const { mkdirSync } = await import("node:fs");
+    mkdirSync(dirPath);
+    await expect(loadVault(dirPath)).rejects.toThrow();
+    expect(logSpy).toHaveBeenCalledTimes(1);
+    expect(logSpy.mock.calls[0][1]).toBe("Failed to read vault");
+  });
+
+  it("with onWarning: the malformed check reaches the callback, and nothing is logged on any path", async () => {
+    const logger = await import("../logger.js");
+    const logSpy = vi.spyOn(logger, "log").mockImplementation(() => {});
+    const warnings: VaultLoadWarning[] = [];
+    const onWarning = (w: VaultLoadWarning) => warnings.push(w);
+
+    const path = await writeRaw(malformedCheck());
+    const vault = await loadVault(path, { onWarning });
+    expect(vault?.check).toBeUndefined();
+    expect(warnings).toEqual([{ kind: "check-malformed", path, message: expect.stringMatching(/malformed/) }]);
+
+    // The two failures loadVault throws for are not logged first: the thrown
+    // error carries the message, and the caller renders it.
+    await writeRaw("{ not json");
+    await expect(loadVault(path, { onWarning })).rejects.toThrow(/not valid JSON/);
+    const dirPath = join(synthHome, "a-directory");
+    const { mkdirSync } = await import("node:fs");
+    mkdirSync(dirPath);
+    await expect(loadVault(dirPath, { onWarning })).rejects.toThrow();
+
+    expect(logSpy).not.toHaveBeenCalled();
+    // Only the malformed check is a warning; the throws are not reported twice.
+    expect(warnings).toHaveLength(1);
+  });
+
+  it("with onWarning on a clean vault: no callback, no log", async () => {
+    const logger = await import("../logger.js");
+    const logSpy = vi.spyOn(logger, "log").mockImplementation(() => {});
+    const onWarning = vi.fn();
+    const path = await writeRaw(
+      `${JSON.stringify({ version: 2, salt: generateSalt().toString("base64"), entries: {} })}\n`,
+    );
+    await expect(loadVault(path, { onWarning })).resolves.not.toBeNull();
+    expect(onWarning).not.toHaveBeenCalled();
+    expect(logSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe("checkVaultPassphrase", () => {
+  it("answers opens / wrong / marker-corrupt, and wrong for an empty passphrase", async () => {
+    let vault = newVault();
+    const key = await unlock(vault, "hunter2");
+    vault = setSecret(vault, key, "github", "ghp_abc");
+    lock();
+    expect(await checkVaultPassphrase(vault, "hunter2")).toBe("opens");
+    lock();
+    expect(await checkVaultPassphrase(vault, "hunter3")).toBe("wrong");
+    expect(await checkVaultPassphrase(vault, "")).toBe("wrong");
+    const damaged: VaultFile = {
+      ...vault,
+      check: { ...(vault.check as EncryptedEntry), ciphertext: Buffer.from("tampered").toString("base64") },
+    };
+    expect(await checkVaultPassphrase(damaged, "hunter2")).toBe("marker-corrupt");
+  });
+
+  it("THROWS a key-derivation failure instead of calling the passphrase wrong", async () => {
+    // Nothing about the passphrase is known when scrypt itself fails, and
+    // "wrong" made doctor print "does NOT unlock" and `secrets reset` treat the
+    // vault as one to move aside. The kdf here is refused by node's scrypt
+    // (r=1 caps N below 2^16); loadVault would never hand it over, which is
+    // why the vault is built in memory -- it stands in for any derivation
+    // failure (the host out of memory is the realistic one).
+    const vault: VaultFile = {
+      version: 2,
+      salt: generateSalt().toString("base64"),
+      kdf: { N: 1 << 16, r: 1, p: 1 },
+      entries: { github: { iv: "x", ciphertext: "y", authTag: "z" } },
+    };
+    const err = await checkVaultPassphrase(vault, "hunter2").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).not.toBe(VAULT_WRONG_PASSPHRASE_ERROR);
+    expect((err as NodeJS.ErrnoException).code).toBe("ERR_CRYPTO_INVALID_SCRYPT_PARAMS");
+    expect(isUnlocked()).toBe(false);
+  });
+});
+
+describe("newVault and createEmptyVault: only the second verifies passphrases", () => {
+  it("newVault carries no marker (any passphrase opens it); createEmptyVault's marker pins the one it was given", async () => {
+    const bare = newVault();
+    expect(bare.check).toBeUndefined();
+    await expect(unlock(bare, "anything")).resolves.toBeInstanceOf(Buffer);
+    lock();
+
+    const stamped = await createEmptyVault("chosen-at-reset");
+    expect(stamped.entries).toEqual({});
+    expect(stamped.version).toBe(SECRETS_SCHEMA_VERSION);
+    // Recorded parameters and the marker's key agree: both DEFAULT_KDF.
+    expect(stamped.kdf).toEqual(DEFAULT_KDF);
+    expect(stamped.check).toBeDefined();
+    await expect(unlock(stamped, "something-else")).rejects.toThrow(/wrong passphrase/i);
+    await expect(unlock(stamped, "chosen-at-reset")).resolves.toBeInstanceOf(Buffer);
+  });
+});
+
+describe("a golden v1 vault, written once under the historical derivation", () => {
+  // Produced OUTSIDE this module with raw node:crypto -- scrypt N=2^15, r=8,
+  // p=1, keylen 32; AES-256-GCM with a 12-byte IV and no AAD -- and checked in
+  // as literals. Every other legacy fixture in the suite derives its key from
+  // LEGACY_KDF at test time, so an edit of that constant re-keys the fixture
+  // with it and still passes. This one cannot move: it is the only test that
+  // sees a re-key of the kdf-less vaults already on users' disks.
+  const GOLDEN_V1 = {
+    version: 1,
+    salt: "gCHjA2qy+iUTFVuKxdHLnw==",
+    entries: {
+      github: {
+        iv: "V6SeIg4rB9/9eMnw",
+        ciphertext: "MpoOrNin4zfeftx1XKlIPi4+8g==",
+        authTag: "hX2JD8wLMzeEMEmHavEXZg==",
+      },
+    },
+  };
+
+  it("loads from disk, unlocks under its passphrase, and yields the value it was written with", async () => {
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    const path = vaultPath(synthHome);
+    writeFileSync(path, `${JSON.stringify(GOLDEN_V1, null, 2)}\n`);
+
+    const loaded = (await loadVault(path)) as VaultFile;
+    expect(loaded.version).toBe(1);
+    expect(loaded.kdf).toBeUndefined();
+    const key = await unlock(loaded, "golden-v1-passphrase");
+    expect(getSecret(loaded, key, "github")).toBe("ghp_golden_v1_value");
+    lock();
+    await expect(unlock(loaded, "not-the-golden-passphrase")).rejects.toThrow(/wrong passphrase/i);
   });
 });

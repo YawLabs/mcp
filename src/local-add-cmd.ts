@@ -17,7 +17,6 @@
 
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { createInterface } from "node:readline/promises";
 import { CATALOG_SLUG_RE, type FetchCatalog, resolveCatalogSlug, tokenizeCommand } from "./catalog.js";
 import { readClientEnv } from "./client-config.js";
 import { probeClientsAsync } from "./doctor-cmd.js";
@@ -43,7 +42,7 @@ import {
 } from "./local-bundles.js";
 import { createStreamWriter } from "./logger.js";
 import { userConfigDir } from "./paths.js";
-import { QUESTION_CANCELLED, type QuestionCancelled, questionOrEmpty } from "./readline-question.js";
+import { askYesNo, QUESTION_CANCELLED } from "./readline-question.js";
 import { collectMalformedSecretRefs, collectSecretRefNames, listKeys, loadVault, vaultPath } from "./secrets-vault.js";
 // The removal preview renders command / args / url / name straight out of
 // bundles.json immediately above a [y/N] prompt, so it needs the same
@@ -1273,29 +1272,6 @@ function isInteractive(opts: RemoveCommandOptions): boolean {
   if (opts.isTTY !== undefined) return opts.isTTY;
   if (opts.promptAnswer !== undefined) return true;
   return Boolean(process.stdin.isTTY) && Boolean(process.stdout.isTTY);
-}
-
-/** Ask the confirmation. Defaults to NO -- only an explicit y/yes proceeds, so
- *  a bare Enter, a stray keystroke, or EOF (^D, a piped stdin running dry)
- *  leaves bundles.json untouched. EOF is questionOrEmpty's job: a bare
- *  rl.question() never settles once its input closes, which left this promise
- *  pending forever -- no "Aborted", no exit 1, the process ending by
- *  event-loop drain at status 0 with a wrapper reading the decline as
- *  success. */
-async function askYesNo(opts: RemoveCommandOptions, question: string): Promise<string | QuestionCancelled> {
-  if (opts.promptAnswer !== undefined) return opts.promptAnswer.trim().toLowerCase();
-  const input = opts.io?.stdin ?? process.stdin;
-  const output = opts.io?.stdout ?? process.stdout;
-  // `terminal` is readline's own default (output.isTTY) unless a test forces
-  // it; on a real TTY that is what makes readline own the Ctrl+C keypress.
-  const rl = createInterface({ input, output, terminal: opts.io?.terminal });
-  try {
-    const raw = await questionOrEmpty(rl, question);
-    // Ctrl+C is not "no": it is the user leaving, and the exit code says so.
-    return raw === QUESTION_CANCELLED ? raw : raw.trim().toLowerCase();
-  } finally {
-    rl.close();
-  }
 }
 
 export async function runRemove(opts: RemoveCommandOptions): Promise<AddCommandResult> {

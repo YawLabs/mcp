@@ -451,11 +451,12 @@ interface KillableChild {
   kill: () => boolean;
 }
 
-/** Spawn shape used only for the taskkill escape hatch below. */
+/** Spawn shape used only for the taskkill escape hatch below. `env` is part
+ *  of it so a test can see the strip every spawn in this package applies. */
 type TreeKillSpawn = (
   cmd: string,
   args: string[],
-  opts: { stdio: "ignore" },
+  opts: { stdio: "ignore"; env: NodeJS.ProcessEnv },
 ) => { on(event: string, listener: (...args: any[]) => void): unknown };
 
 /** Kill a probe child and, on win32, everything it spawned.
@@ -481,8 +482,13 @@ export function killProcessTree(
 ): void {
   if (platform === "win32" && child.pid !== undefined) {
     try {
-      // /T walks the process tree, /F forces termination of each node.
-      spawnImpl("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore" }).on("error", () => {});
+      // /T walks the process tree, /F forces termination of each node. A
+      // system binary, but still a child: yaw-mcp's own secrets stay out of
+      // its env (see internal-secret-env.ts).
+      spawnImpl("taskkill", ["/pid", String(child.pid), "/T", "/F"], {
+        stdio: "ignore",
+        env: stripInternalSecretsFromEnv(process.env),
+      }).on("error", () => {});
     } catch {
       // taskkill missing or unspawnable -- fall through to the plain kill.
     }

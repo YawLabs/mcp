@@ -12,8 +12,9 @@
 // client opens the link) or, on a client that only speaks form mode, by the
 // broker opening the system browser after the user consents
 // (openInSystemBrowser below). server.ts owns that choice; this module is the
-// page and the browser launcher, and knows nothing about vaults, so the same
-// page can take a missing child credential later.
+// page and the browser launcher, and knows nothing about vaults or child
+// servers -- server.ts opens the same page for the vault passphrase and for
+// a child server's missing credentials.
 //
 // Hardening, each item because of a specific attack or leak:
 //   * 127.0.0.1 only, random port. Nothing off this machine can reach it.
@@ -199,6 +200,12 @@ export function browserCommand(
   // "no browser" instead, so the caller can say so rather than wait out the
   // page's TTL on a tab nobody can see.
   if (!env.DISPLAY && !env.WAYLAND_DISPLAY) return null;
+  // By bare name, unlike rundll32 and open above: xdg-open has no fixed home
+  // (the BSDs' packages put it under /usr/local or /usr/pkg, NixOS and Guix
+  // outside /usr entirely), so any one absolute path would break it
+  // somewhere. The PATH lookup that leaves is the same one every command the
+  // user types goes through, so steering it takes write access to a
+  // directory on the user's PATH -- access that hijacks those commands too.
   return { command: "xdg-open", args: [url] };
 }
 
@@ -268,10 +275,18 @@ export function openInSystemBrowser(url: string, spawnLauncher: LauncherSpawn = 
   });
 }
 
-/** Start a page and resolve once it is listening. Rejects only when the
+/** Start a page and resolve once it is listening. Rejects when the fields
+ *  are unusable -- none at all, or two sharing a name -- and when the
  *  listener cannot be started (no loopback interface, no free port). */
 export function openSecretEntryPage(opts: SecretEntryPageOptions): Promise<SecretEntryPage> {
   if (opts.fields.length === 0) return Promise.reject(new Error("a secret entry page needs at least one field"));
+  // A field's name is the key its value comes back under. Two inputs sharing
+  // one would both post under it, and the handler below would read the first
+  // value for both and drop the second. Refused here rather than trusted to
+  // the caller.
+  if (new Set(opts.fields.map((f) => f.name)).size !== opts.fields.length) {
+    return Promise.reject(new Error("secret entry page field names must be unique"));
+  }
   const ttlMs = opts.ttlMs ?? SECRET_ENTRY_PAGE_TTL_MS;
   const token = randomBytes(32).toString("hex");
   const expectedPath = Buffer.from(`/${token}`, "utf8");

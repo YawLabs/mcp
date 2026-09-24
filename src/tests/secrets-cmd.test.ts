@@ -29,6 +29,7 @@ import {
   type VaultFile,
   vaultPath,
 } from "../secrets-vault.js";
+import { symlinksAvailable } from "./symlinks.js";
 
 describe("parseSecretsArgs", () => {
   it("rejects missing action", () => {
@@ -347,7 +348,91 @@ describe("parseSecretsArgs", () => {
   it("the --value usage names the argv/ps exposure, not just shell history", () => {
     expect(SECRETS_USAGE).toMatch(/argv/);
     expect(SECRETS_USAGE).toMatch(/ps \/ \/proc/);
-    expect(SECRETS_USAGE).toMatch(/For scripting use --stdin/);
+    expect(SECRETS_USAGE).toMatch(/For scripting pipe the value in on stdin/);
+  });
+
+  // A pipe takes the raw read with or without --stdin (readStdinValue), so
+  // the flag only matters at a terminal -- where the read is line-buffered
+  // and ECHOED. The usage used to sell it as "the scripting-safe
+  // alternative", as if a script needed it, and described the set prompt as
+  // the only way a value is read.
+  it("the --stdin and set usage say what --stdin changes and what a pipe gets without it", () => {
+    expect(SECRETS_USAGE).toMatch(/even when stdin is a\s+terminal/);
+    expect(SECRETS_USAGE).toMatch(/terminal echoes it/);
+    expect(SECRETS_USAGE).toMatch(/A piped stdin is read\s+that way without the flag/);
+    expect(SECRETS_USAGE).toMatch(/minus one trailing newline/);
+    expect(SECRETS_USAGE).not.toMatch(/scripting-safe alternative/);
+  });
+
+  // index.ts's shared run() writes a parse failure's `error` to stderr
+  // verbatim (exit 2). Under --json that has to be the same one-line
+  // {"ok":false} envelope a runtime failure emits -- the usage text promises
+  // stderr is one JSON object per line -- not prose with the usage appended.
+  it.each([
+    [["get", "--json"], "<name> is required"],
+    [["set", "my token", "--json"], 'invalid secret name "my token"'],
+    [["set", "GH", "--value", "", "--json"], "Secret value cannot be empty."],
+    [["list", "--bogus", "--json"], 'unknown flag "--bogus"'],
+    [["--json", "nuke"], 'unknown action "nuke"'],
+    [["audit", "GH", "--json"], "audit takes no <name>"],
+    [["set", "GH", "--value", "--json"], "--value requires a value"],
+    [["audit", "--server", "--json"], "--server requires a value"],
+    [["get", "a", "b", "--json"], 'unexpected positional argument "b"'],
+  ])("under --json, %j is refused as one JSON envelope with no usage text", (argv, fragment) => {
+    const r = parseSecretsArgs(argv);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.help).toBeUndefined();
+    expect(r.error).not.toContain("\n");
+    expect(r.error).not.toContain("Usage:");
+    const envelope = JSON.parse(r.error) as { ok: boolean; error: string };
+    expect(envelope.ok).toBe(false);
+    expect(envelope.error).toContain(fragment);
+    // The message alone, like every runtime envelope: the prose
+    // `yaw-mcp secrets <action>:` label is for the human rendering.
+    expect(envelope.error).not.toContain("yaw-mcp secrets");
+  });
+
+  it("without --json the same refusal stays prose with the usage appended, and --help stays usage", () => {
+    const r = parseSecretsArgs(["list", "--bogus"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.startsWith('yaw-mcp secrets list: unknown flag "--bogus"')).toBe(true);
+      expect(r.error).toContain(SECRETS_USAGE);
+    }
+    const help = parseSecretsArgs(["--json", "--help"]);
+    expect(help.ok).toBe(false);
+    if (!help.ok) {
+      expect(help.help).toBe(true);
+      expect(help.error).toBe(SECRETS_USAGE);
+    }
+  });
+
+  // A prose argument refusal names the action once the parser has read it,
+  // the label runSecrets's own refusals carry. The first four used to read
+  // `yaw-mcp secrets:` with the action already known -- `set X --bogus` and
+  // `set X --value ""` labelled two refusals of one `set` two ways. Only a
+  // refusal made before the action is parsed keeps the bare label.
+  it.each([
+    [["set", "X", "--bogus"], 'yaw-mcp secrets set: unknown flag "--bogus"'],
+    [["set", "X", "--value"], "yaw-mcp secrets set: --value requires a value (for a dash-leading value use --stdin)"],
+    [["audit", "--secret"], "yaw-mcp secrets audit: --secret requires a value"],
+    [["get", "a", "b"], 'yaw-mcp secrets get: unexpected positional argument "b"'],
+    [["reset", "GH"], 'yaw-mcp secrets reset: unexpected argument "GH" -- reset takes no <name>'],
+    [["get", "gh", "--stdin"], "yaw-mcp secrets get: --stdin applies to `set` only"],
+    [["list", "--server", "github"], "yaw-mcp secrets list: --server applies to `audit` only"],
+    [["remove"], "yaw-mcp secrets remove: <name> is required"],
+    [["set", "GH", "--value", ""], "yaw-mcp secrets set: Secret value cannot be empty."],
+    [["--bogus", "set", "X"], 'yaw-mcp secrets: unknown flag "--bogus"'],
+    [["--value"], "yaw-mcp secrets: --value requires a value (for a dash-leading value use --stdin)"],
+    [["nuke"], 'yaw-mcp secrets: unknown action "nuke"'],
+    [[], "yaw-mcp secrets: missing action"],
+  ])("without --json, %j is refused as %j plus the usage text", (argv, line) => {
+    const r = parseSecretsArgs(argv);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.help).toBeUndefined();
+    expect(r.error).toBe(`${line}\n\n${SECRETS_USAGE}`);
   });
 });
 
@@ -361,6 +446,62 @@ describe("parseSecretsArgs", () => {
 function makeHome(): string {
   const dir = mkdtempSync(nodePath.join(os.tmpdir(), "yaw-mcp-cmd-"));
   return dir;
+}
+
+/** Every line written to `io.err`, each parsed as JSON. A line that is not
+ *  JSON fails NAMING that line -- JSON.parse over the joined stream fails
+ *  with a bare SyntaxError the moment a second line (a warning ahead of the
+ *  envelope, which SECRETS_USAGE allows) is written. */
+function errJsonLines(io: { err: ReturnType<typeof vi.fn> }): Array<Record<string, unknown>> {
+  return io.err.mock.calls
+    .map((c) => c[0] as string)
+    .join("")
+    .split("\n")
+    .filter((l) => l.length > 0)
+    .map((l) => {
+      try {
+        return JSON.parse(l) as Record<string, unknown>;
+      } catch {
+        throw new Error(`stderr line is not JSON: ${l}`);
+      }
+    });
+}
+
+/** The `{"ok":false}` envelope a failing --json run ends stderr with. Any
+ *  line before it must be a `{"warning":...}` line -- the contract is "key on
+ *  warning vs ok, never on line position", so this does not assume the
+ *  envelope is the only line. */
+function errEnvelope(io: { err: ReturnType<typeof vi.fn> }): Record<string, unknown> {
+  const lines = errJsonLines(io);
+  expect(lines.length, "no JSON line on stderr").toBeGreaterThan(0);
+  const envelope = lines[lines.length - 1];
+  expect(envelope).toHaveProperty("ok", false);
+  for (const line of lines.slice(0, -1)) expect(line).toHaveProperty("warning");
+  return envelope;
+}
+
+/** Non-TTY stdin/stdout pair, so a test never depends on whether the vitest
+ *  worker's process.stdin happens to be a TTY. */
+function nonTTYIo(): {
+  stdin: NodeJS.ReadableStream;
+  stdout: NodeJS.WritableStream;
+} {
+  return {
+    stdin: { isTTY: false } as unknown as NodeJS.ReadableStream,
+    stdout: { isTTY: false, write: vi.fn() } as unknown as NodeJS.WritableStream,
+  };
+}
+
+/** Read one secret back from the vault under `home` with a fresh derivation
+ *  (the key cache is dropped first). undefined when the read failed: a wrong
+ *  passphrase, a corrupt entry, a missing name. */
+async function readBackFrom(home: string, name: string, passphrase: string): Promise<string | undefined> {
+  lock();
+  const probe = { out: vi.fn(), err: vi.fn() };
+  const r = await runSecrets({ action: "get", name, passphrase, home, json: true }, probe);
+  if (r.exitCode !== 0) return undefined;
+  const line = probe.out.mock.calls.map((c) => c[0] as string).find((s) => s.trim().startsWith("{"));
+  return line ? (JSON.parse(line).value as string) : undefined;
 }
 
 // -----------------------------------------------------------------------
@@ -419,18 +560,25 @@ describe("runSecrets set -- passphrase guards", () => {
 
 /** Minimal controllable fake of a TTY ReadStream for the passphrase reader.
  *  Each `resume()` (one per prompt) flushes the next queued chunk to the
- *  registered "data" listener on the next microtask. */
+ *  registered "data" listener on the next microtask. Records what the reader
+ *  did with it (`resumes`, `pending`), so a test can prove nothing was read. */
 class FakeTTYStdin {
   isTTY = true;
   isRaw = false;
+  resumes = 0;
   private listener: ((chunk: string) => void) | null = null;
   private queue: string[];
+  /** A property, not a method, so RawRefusingTTYStdin can replace it with
+   *  one that throws, or remove it -- the reader probes it with typeof. */
+  setRawMode?: (v: boolean) => this = (v) => {
+    this.isRaw = v;
+    return this;
+  };
   constructor(chunks: string[]) {
     this.queue = [...chunks];
   }
-  setRawMode(v: boolean): this {
-    this.isRaw = v;
-    return this;
+  get pending(): number {
+    return this.queue.length;
   }
   setEncoding(): this {
     return this;
@@ -444,6 +592,7 @@ class FakeTTYStdin {
     return this;
   }
   resume(): this {
+    this.resumes++;
     // Deliver the next chunk after the current synchronous frame so the
     // reader's "data" listener (attached AFTER resume() in the reader) is
     // already registered. Read this.listener lazily inside the microtask.
@@ -538,48 +687,16 @@ describe("readLineFromTTY -- Ctrl-D cancel", () => {
 // -----------------------------------------------------------------------
 
 /** A TTY whose raw mode cannot be engaged: setRawMode throws, or -- with
- *  `noRawMode` -- does not exist at all. Records what the reader did with it,
- *  so a test can prove nothing was read. */
-class RawRefusingTTYStdin {
-  isTTY = true;
-  isRaw = false;
-  resumes = 0;
-  private listener: ((chunk: string) => void) | null = null;
-  private queue: string[];
-  setRawMode?: (v: boolean) => this;
+ *  `noRawMode` -- does not exist at all. Everything else is FakeTTYStdin's,
+ *  so both suites share one delivery model. */
+class RawRefusingTTYStdin extends FakeTTYStdin {
   constructor(chunks: string[], noRawMode = false) {
-    this.queue = [...chunks];
-    if (!noRawMode) {
-      this.setRawMode = () => {
-        throw new Error("EIO: i/o error, setRawMode");
-      };
-    }
-  }
-  get pending(): number {
-    return this.queue.length;
-  }
-  setEncoding(): this {
-    return this;
-  }
-  on(event: string, cb: (chunk: string) => void): this {
-    if (event === "data") this.listener = cb;
-    return this;
-  }
-  removeListener(event: string, cb: (chunk: string) => void): this {
-    if (event === "data" && this.listener === cb) this.listener = null;
-    return this;
-  }
-  resume(): this {
-    this.resumes++;
-    const next = this.queue.shift();
-    if (next !== undefined) queueMicrotask(() => this.listener?.(next));
-    return this;
-  }
-  pause(): this {
-    return this;
-  }
-  unshift(chunk: string): void {
-    this.queue.unshift(chunk);
+    super(chunks);
+    this.setRawMode = noRawMode
+      ? undefined
+      : () => {
+          throw new Error("EIO: i/o error, setRawMode");
+        };
   }
 }
 
@@ -648,8 +765,7 @@ describe("readLineFromTTY -- a terminal that will not turn echo off", () => {
       io,
     );
     expect(r.exitCode).toBe(1);
-    const envelope = JSON.parse(errText().trim());
-    expect(envelope.ok).toBe(false);
+    const envelope = errEnvelope(io);
     expect(envelope.error).toContain("would not turn echo off");
   });
 
@@ -767,8 +883,7 @@ describe("readLineFromTTY -- a terminal that will not turn echo off", () => {
       io,
     );
     expect(r.exitCode).toBe(1);
-    const envelope = JSON.parse(errText().trim());
-    expect(envelope.ok).toBe(false);
+    const envelope = errEnvelope(io);
     expect(envelope.error).toContain("New passphrase required.");
     expect(envelope.error).toContain("would not turn echo off");
     expect(envelope.error).toContain("YAW_MCP_VAULT_PASSPHRASE_NEW");
@@ -1424,18 +1539,6 @@ describe("runSecrets audit", () => {
 
 const CONFIRM_PASS = "confirm-passphrase-xyz";
 
-/** Non-TTY stdin/stdout pair, so these tests never depend on whether the
- *  vitest worker's process.stdin happens to be a TTY. */
-function nonTTYIo(): {
-  stdin: NodeJS.ReadableStream;
-  stdout: NodeJS.WritableStream;
-} {
-  return {
-    stdin: { isTTY: false } as unknown as NodeJS.ReadableStream,
-    stdout: { isTTY: false, write: vi.fn() } as unknown as NodeJS.WritableStream,
-  };
-}
-
 describe("runSecrets remove -- confirmation gate", () => {
   const io = { out: vi.fn(), err: vi.fn() };
   const stdout = { isTTY: true, write: vi.fn() } as unknown as NodeJS.WritableStream;
@@ -1710,6 +1813,36 @@ describe("runSecrets remove -- confirmation gate", () => {
     expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
   });
 
+  // `remove NAME --json | jq` is the shape the stdout-not-a-TTY refusal is
+  // worded for (nonTTYEnds), so the --json twin of each outcome is pinned
+  // too: the refusal envelope still names the flag, and the success
+  // envelope's `removed` field is what a jq consumer keys on.
+  it("non-TTY without --force under --json: one envelope naming the flag, exit 2, vault byte-identical", async () => {
+    const before = await seed();
+    const r = await runSecrets(
+      { action: "remove", name: "TOKEN", passphrase: CONFIRM_PASS, home, json: true, io: nonTTYIo() },
+      io,
+    );
+    expect(r.exitCode).toBe(2);
+    expect(errJsonLines(io)).toHaveLength(1);
+    const envelope = errEnvelope(io);
+    expect(envelope.error).toContain("neither stdin nor stdout is a TTY");
+    expect(envelope.error).toContain("Re-run with --force to delete it.");
+    expect(outText()).toBe("");
+    expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
+  });
+
+  it("non-TTY with --force under --json prints the {ok, removed} envelope on stdout", async () => {
+    await seed();
+    const r = await runSecrets(
+      { action: "remove", name: "TOKEN", passphrase: CONFIRM_PASS, force: true, home, json: true, io: nonTTYIo() },
+      io,
+    );
+    expect(r.exitCode).toBe(0);
+    expect(JSON.parse(outText())).toEqual({ ok: true, removed: "TOKEN" });
+    expect(errText()).toBe("");
+  });
+
   it("non-TTY with --force deletes", async () => {
     await seed();
     const r = await runSecrets(
@@ -1800,14 +1933,7 @@ describe("runSecrets set -- overwrite confirmation and Replaced/Stored split", (
     return readFileSync(vaultPath(home), "utf8");
   }
 
-  async function readBack(): Promise<string | undefined> {
-    lock();
-    const probe = { out: vi.fn(), err: vi.fn() };
-    const r = await runSecrets({ action: "get", name: "TOKEN", passphrase: CONFIRM_PASS, home, json: true }, probe);
-    if (r.exitCode !== 0) return undefined;
-    const line = probe.out.mock.calls.map((c) => c[0] as string).find((s) => s.trim().startsWith("{"));
-    return line ? (JSON.parse(line).value as string) : undefined;
-  }
+  const readBack = (): Promise<string | undefined> => readBackFrom(home, "TOKEN", CONFIRM_PASS);
 
   beforeEach(async () => {
     io.out.mockReset();
@@ -2008,16 +2134,8 @@ describe("runSecrets rotate -- abort paths leave the vault byte-identical", () =
     return readFileSync(vaultPath(home), "utf8");
   }
 
-  /** Read one secret back with a fresh derivation. Returns undefined when
-   *  the read failed (wrong passphrase, corrupt entry, missing name). */
-  async function readBack(name: string, passphrase: string): Promise<string | undefined> {
-    lock();
-    const probe = { out: vi.fn(), err: vi.fn() };
-    const r = await runSecrets({ action: "get", name, passphrase, home, json: true }, probe);
-    if (r.exitCode !== 0) return undefined;
-    const line = probe.out.mock.calls.map((c) => c[0] as string).find((s) => s.trim().startsWith("{"));
-    return line ? (JSON.parse(line).value as string) : undefined;
-  }
+  const readBack = (name: string, passphrase: string): Promise<string | undefined> =>
+    readBackFrom(home, name, passphrase);
 
   beforeEach(async () => {
     io.out.mockReset();
@@ -2125,8 +2243,13 @@ describe("runSecrets rotate -- abort paths leave the vault byte-identical", () =
     const r = await runSecrets({ action: "rotate", passphrase: ROT_PASS, newPassphrase: ROT_NEW, home }, io);
 
     expect(r.exitCode).toBe(1);
-    expect(errText()).toContain("rotate");
-    expect(errText()).toContain("WRECKED");
+    // The rotate label AND the shared hint, as the list sibling pins it: a
+    // rotate-only raw loadVault in a local catch would still print the label
+    // and the entry name (VaultEntryCorruptError's message carries it), and
+    // lose only the pointer at the fix.
+    expect(errText()).toContain("yaw-mcp secrets rotate: secret entry WRECKED is corrupt");
+    expect(errText()).toContain("is corrupt, and every secrets command fails");
+    expect(errText()).toContain("yaw-mcp secrets reset");
     expect(readFileSync(path, "utf8")).toBe(raw);
   });
 
@@ -2274,14 +2397,8 @@ describe("runSecrets rotate -- the success path re-keys EVERY entry", () => {
 
   const outText = (): string => io.out.mock.calls.map((c) => c[0] as string).join("");
 
-  async function readBack(name: string, passphrase: string): Promise<string | undefined> {
-    lock();
-    const probe = { out: vi.fn(), err: vi.fn() };
-    const r = await runSecrets({ action: "get", name, passphrase, home, json: true }, probe);
-    if (r.exitCode !== 0) return undefined;
-    const line = probe.out.mock.calls.map((c) => c[0] as string).find((s) => s.trim().startsWith("{"));
-    return line ? (JSON.parse(line).value as string) : undefined;
-  }
+  const readBack = (name: string, passphrase: string): Promise<string | undefined> =>
+    readBackFrom(home, name, passphrase);
 
   beforeEach(async () => {
     io.out.mockReset();
@@ -2467,6 +2584,17 @@ describe("runSecrets audit -- human render, filters, and read failure", () => {
     expect(JSON.parse(outText())).toMatchObject({ ok: true, count: 0, events: [] });
   });
 
+  // Every --json envelope is one compact line: audit's and list's used to be
+  // pretty-printed, so `... --json | head -1` read `{` for those two alone.
+  it("--json writes the envelope as ONE line on stdout", async () => {
+    await seedTrail();
+    const r = await runSecrets({ action: "audit", home, json: true }, io);
+    expect(r.exitCode).toBe(0);
+    const lines = outText().split("\n");
+    expect(lines).toEqual([expect.any(String), ""]);
+    expect(JSON.parse(lines[0])).toMatchObject({ ok: true, count: 3 });
+  });
+
   it("--json on an empty trail still emits the ok:true envelope (not the prose line)", async () => {
     const r = await runSecrets({ action: "audit", home, json: true }, io);
     expect(r.exitCode).toBe(0);
@@ -2495,8 +2623,7 @@ describe("runSecrets audit -- human render, filters, and read failure", () => {
     io.err.mockReset();
     const r2 = await runSecrets({ action: "audit", home, json: true }, io);
     expect(r2.exitCode).toBe(1);
-    const parsed = JSON.parse(errText());
-    expect(parsed).toMatchObject({ ok: false });
+    const parsed = errEnvelope(io);
     expect(parsed.error).toContain("could not read the audit log");
     expect(parsed.error).toContain("EISDIR");
   });
@@ -2612,6 +2739,10 @@ describe("runSecrets -- concurrent-writer guard", () => {
     );
     expect(r.exitCode).toBe(0);
     expect(JSON.parse(readFileSync(vaultPath(home), "utf8")).entries.SECOND).toBeDefined();
+    // The value is what was piped minus its trailing newline: a stored
+    // "value-two\n" fails auth wherever it is injected, and `get` would hide
+    // it behind its own newline.
+    expect(await readBackFrom(home, "SECOND", "a-long-passphrase")).toBe("value-two");
   });
 
   // The remove and rotate sites carry their own re-check; each is driven
@@ -2749,11 +2880,14 @@ describe("runSecrets -- concurrent-writer guard", () => {
   // loadVault's raw errno via safeLoadVault. The wasted-prompts shape needs
   // a file that is unreadable for the baseline read but readable a moment
   // later, which no fixture can stage deterministically. What IS pinned:
-  // the fail-fast fires (its own message, not safeLoadVault's), at BOTH
-  // sites, and it names the errno the way get/list do for the same state.
+  // the fail-fast fires at all three sites -- runSecrets's (set/remove),
+  // rotate's and reset's -- told apart from safeLoadVault's refusal by its
+  // closing "Nothing was written.", and it names the path and the errno in
+  // the sentence get/list print for the same state.
   it.each([
     "set",
     "rotate",
+    "reset",
   ] as const)("%s fails fast, naming the errno, when the vault file exists but cannot be read", async (action) => {
     const file = vaultPath(home);
     mkdirSync(file, { recursive: true });
@@ -2761,15 +2895,71 @@ describe("runSecrets -- concurrent-writer guard", () => {
     const r = await runSecrets(
       action === "set"
         ? { action, name: "TOKEN", value: "one", passphrase: "a-long-passphrase", home, json: true }
-        : { action, passphrase: "a-long-passphrase", newPassphrase: "another-long-passphrase", home, json: true },
+        : action === "rotate"
+          ? { action, passphrase: "a-long-passphrase", newPassphrase: "another-long-passphrase", home, json: true }
+          : { action, force: true, passphrase: "a-long-passphrase", home, json: true, io: nonTTYIo() },
       io,
     );
     expect(r.exitCode).toBe(1);
-    const errOutput = io.err.mock.calls.map((c) => c[0] as string).join("");
-    const parsed = JSON.parse(errOutput.trim());
-    expect(parsed.ok).toBe(false);
-    expect(parsed.error).toMatch(/could not read the vault file/);
-    expect(parsed.error).toMatch(/EISDIR/);
+    expect(errJsonLines(io)).toHaveLength(1);
+    const parsed = errEnvelope(io);
+    expect(parsed.error).toBe(
+      `could not read the vault file at ${file} (EISDIR) -- fix that and re-run. Nothing was written.`,
+    );
+  });
+
+  // Same fixture on the actions that go through loadVault itself (list has
+  // no baseline read, get skips it): the read failure used to be logged by
+  // loadVault straight to process.stderr -- prose on the CLI surface --
+  // ahead of the {"ok":false} envelope. Now it arrives as the envelope alone,
+  // and that envelope names the file: Node's EISDIR message does not, and
+  // the log line that did is no longer written.
+  it.each([
+    "list",
+    "get",
+  ] as const)("%s --json on an unreadable vault puts only the envelope on stderr, never a logger line", async (action) => {
+    mkdirSync(vaultPath(home), { recursive: true });
+    const io = { out: vi.fn(), err: vi.fn() };
+    const stderrWrites: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => {
+      if (typeof chunk === "string") stderrWrites.push(chunk);
+      return true;
+    });
+    setLogSurface("cli");
+    try {
+      const r = await runSecrets(
+        action === "list"
+          ? { action, home, json: true }
+          : { action, name: "TOKEN", passphrase: "a-long-passphrase", home, json: true },
+        io,
+      );
+      expect(r.exitCode).toBe(1);
+      expect(stderrWrites).toEqual([]);
+      expect(errJsonLines(io)).toHaveLength(1);
+      expect(errEnvelope(io).error).toBe(
+        `could not read the vault file at ${vaultPath(home)} (EISDIR) -- fix that and re-run.`,
+      );
+    } finally {
+      spy.mockRestore();
+      setLogSurface("server");
+    }
+  });
+
+  it.each([
+    "list",
+    "get",
+  ] as const)("%s in prose on an unreadable vault names the file and the errno, on one line", async (action) => {
+    mkdirSync(vaultPath(home), { recursive: true });
+    const io = { out: vi.fn(), err: vi.fn() };
+    const r = await runSecrets(
+      action === "list" ? { action, home } : { action, name: "TOKEN", passphrase: "a-long-passphrase", home },
+      io,
+    );
+    expect(r.exitCode).toBe(1);
+    expect(io.out).not.toHaveBeenCalled();
+    expect(io.err.mock.calls.map((c) => c[0] as string).join("")).toBe(
+      `yaw-mcp secrets ${action}: could not read the vault file at ${vaultPath(home)} (EISDIR) -- fix that and re-run.\n`,
+    );
   });
 });
 
@@ -2845,18 +3035,33 @@ describe("runSecrets set -- the value prompt refuses a redirected stdout", () =>
     expect(r.exitCode).toBe(0);
   });
 
-  it("still reads piped stdin when stdout is redirected (the scripted path)", async () => {
-    // Not a TTY at either end: this is `echo v | yaw-mcp secrets set GH > f`,
-    // which must keep working.
+  // Not a TTY at either end: this is `echo v | yaw-mcp secrets set GH > f`,
+  // which must keep working -- with or without --stdin, which only changes
+  // the TTY case. ONE trailing newline is stripped, LF or CRLF (PowerShell
+  // and cmd pipe `echo v` as "v\r\n"); anything before it is the value.
+  it.each([
+    ["piped-value\n", undefined, "piped-value"],
+    ["piped-value\r\n", undefined, "piped-value"],
+    ["piped-value\r\n", true, "piped-value"],
+    ["line-one\nline-two\n\n", undefined, "line-one\nline-two\n"],
+  ] as const)("reads piped stdin %j (--stdin: %s) as %j when stdout is redirected", async (piped, fromStdin, stored) => {
     const { Readable } = await import("node:stream");
-    const stdin = Readable.from(["piped-value\n"]) as unknown as NodeJS.ReadableStream;
+    const stdin = Readable.from([piped]) as unknown as NodeJS.ReadableStream;
     (stdin as { isTTY?: boolean }).isTTY = false;
     const stdout = { isTTY: false, write: vi.fn() } as unknown as NodeJS.WritableStream;
     const r = await runSecrets(
-      { action: "set", name: "GH", passphrase: "a-long-passphrase", home, io: { stdin, stdout } },
+      {
+        action: "set",
+        name: "GH",
+        passphrase: "a-long-passphrase",
+        home,
+        ...(fromStdin ? { fromStdin } : {}),
+        io: { stdin, stdout },
+      },
       io,
     );
     expect(r.exitCode).toBe(0);
+    expect(await readBackFrom(home, "GH", "a-long-passphrase")).toBe(stored);
   });
 });
 
@@ -2892,12 +3097,7 @@ describe("readLineFromTTY -- key sequences never reach a no-echo prompt's value"
       io,
     );
     if (r.exitCode !== 0) return undefined;
-    lock();
-    const probe = { out: vi.fn(), err: vi.fn() };
-    const got = await runSecrets({ action: "get", name: "GH", passphrase: KEYS_PASS, home, json: true }, probe);
-    if (got.exitCode !== 0) return undefined;
-    const line = probe.out.mock.calls.map((c) => c[0] as string).find((s) => s.trim().startsWith("{"));
-    return line ? (JSON.parse(line).value as string) : undefined;
+    return readBackFrom(home, "GH", KEYS_PASS);
   }
 
   beforeEach(async () => {
@@ -2955,6 +3155,38 @@ describe("readLineFromTTY -- key sequences never reach a no-echo prompt's value"
     expect(await storeViaPrompt(stdin)).toBe("ghp_abc");
   });
 
+  // Every other control byte is dropped, but a Tab in a pasted token is part
+  // of the token: dropping it stored a different secret behind a green
+  // "Stored secret", with nothing on the no-echo line to show it -- while a
+  // piped value always kept it.
+  const TAB = String.fromCharCode(9);
+  const BS = String.fromCharCode(8);
+
+  it("a Tab pasted into the value is kept", async () => {
+    expect(await storeViaPrompt(new FakeTTYStdin([`ghp${TAB}abc\r`]))).toBe(`ghp${TAB}abc`);
+  });
+
+  it("the passphrase prompt still drops a Tab (a vault keyed under the Tab-less entry must keep opening)", async () => {
+    const seeded = await runSecrets({ action: "set", name: "GH", value: "ghp_abc", passphrase: KEYS_PASS, home }, io);
+    expect(seeded.exitCode).toBe(0);
+    lock();
+    io.out.mockReset();
+    const stdin = new FakeTTYStdin([`a-long-${TAB}passphrase\r`]);
+    const r = await runSecrets(
+      { action: "get", name: "GH", home, json: true, io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout } },
+      io,
+    );
+    expect(r.exitCode).toBe(0);
+    const line = io.out.mock.calls.map((c) => c[0] as string).find((s) => s.trim().startsWith("{"));
+    expect(line && JSON.parse(line).value).toBe("ghp_abc");
+  });
+
+  it("an 0x08 Backspace edits the value the way DEL does", async () => {
+    // Most terminals send DEL (0x7f) for Backspace; some send BS (0x08). Both
+    // arms of the reader's Backspace case, not just DEL.
+    expect(await storeViaPrompt(new FakeTTYStdin([`ghp_abx${BS}c\r`]))).toBe("ghp_abc");
+  });
+
   it("the passphrase prompt gets the same treatment", async () => {
     // Seed off-TTY, then unlock through the TTY prompt with a Left arrow in
     // the middle of the typed passphrase. Buffered as "[D" it would be a
@@ -2971,6 +3203,97 @@ describe("readLineFromTTY -- key sequences never reach a no-echo prompt's value"
     expect(r.exitCode).toBe(0);
     const line = io.out.mock.calls.map((c) => c[0] as string).find((s) => s.trim().startsWith("{"));
     expect(line && JSON.parse(line).value).toBe("ghp_abc");
+  });
+});
+
+// -----------------------------------------------------------------------
+// An EMPTY entry at the "Secret value:" prompt asks again, the way every
+// passphrase prompt does. It used to refuse on the first bare Enter -- after
+// the passphrase entry and the scrypt derivation had already been paid, the
+// cost parseSecretsArgs refuses `--value ""` early to avoid.
+// -----------------------------------------------------------------------
+
+describe("runSecrets set -- an empty value entry re-prompts", () => {
+  const io = { out: vi.fn(), err: vi.fn() };
+  const stdout = { isTTY: true, write: vi.fn() } as unknown as NodeJS.WritableStream;
+  const PASS = "a-long-passphrase";
+  let home: string;
+
+  const promptText = (): string =>
+    (stdout.write as unknown as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0] as string).join("");
+  const valuePrompts = (): number => promptText().split("Secret value: ").length - 1;
+
+  beforeEach(async () => {
+    io.out.mockReset();
+    io.err.mockReset();
+    (stdout.write as unknown as ReturnType<typeof vi.fn>).mockReset();
+    lock();
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    home = makeHome();
+    await mkdir(nodePath.join(home, ".yaw-mcp"), { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+    lock();
+  });
+
+  it.each([
+    ["a bare Enter", "\r"],
+    ["^D", String.fromCharCode(4)],
+  ])("%s at the value prompt asks again, and the next entry is stored", async (_label, empty) => {
+    const stdin = new FakeTTYStdin([empty, "ghp_abc\r"]);
+    const r = await runSecrets(
+      {
+        action: "set",
+        name: "GH",
+        passphrase: PASS,
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(0);
+    expect(valuePrompts()).toBe(2);
+    expect(promptText()).toContain("Secret value cannot be empty.");
+    expect(await readBackFrom(home, "GH", PASS)).toBe("ghp_abc");
+  });
+
+  it("three empty entries exhaust the budget: exit 1, nothing written, no fourth prompt", async () => {
+    const stdin = new FakeTTYStdin(["\r", "\r", "\r", "never-read\r"]);
+    const r = await runSecrets(
+      {
+        action: "set",
+        name: "GH",
+        passphrase: PASS,
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(1);
+    expect(io.err.mock.calls.map((c) => c[0] as string).join("")).toBe(
+      "yaw-mcp secrets set: Secret value cannot be empty.\n",
+    );
+    expect(valuePrompts()).toBe(3);
+    expect(stdin.pending).toBe(1);
+    expect(existsSync(vaultPath(home))).toBe(false);
+  });
+
+  it("^C at a re-prompt still cancels the command (130)", async () => {
+    const stdin = new FakeTTYStdin(["\r", String.fromCharCode(3)]);
+    const r = await runSecrets(
+      {
+        action: "set",
+        name: "GH",
+        passphrase: PASS,
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(130);
+    expect(existsSync(vaultPath(home))).toBe(false);
   });
 });
 
@@ -3008,12 +3331,7 @@ describe("runSecrets -- corrupt-entry hint survives an awkward entry name", () =
     writeFileSync(vaultPath(home), `${JSON.stringify(corrupt)}\n`);
     const r = await runSecrets({ action: "list", home, json: true }, io);
     expect(r.exitCode).toBe(1);
-    const parsed = JSON.parse(
-      io.err.mock.calls
-        .map((c) => c[0] as string)
-        .join("")
-        .trim(),
-    );
+    const parsed = errEnvelope(io);
     expect(parsed.error).toContain("is corrupt, and every secrets command fails");
     expect(parsed.error).toContain(badName);
     expect(parsed.error).toContain(vaultPath(home));
@@ -3271,7 +3589,11 @@ describe("runSecrets -- the prose arms and the get side channels", () => {
   it("set refuses an empty value in prose, writing no vault", async () => {
     const r = await runSecrets({ action: "set", name: "GH", value: "", passphrase: PROSE_PASS, home }, io);
     expect(r.exitCode).toBe(1);
-    expect(errText()).toBe("yaw-mcp secrets: Secret value cannot be empty.\n");
+    // Labelled with the action, like the parser's copy of this refusal and
+    // every other refusal a `set` run prints once the parser has read the
+    // action (one refused before that, `secrets --bogus set GH`, reads
+    // `yaw-mcp secrets:`). It used to be the set block's one `secrets:` line.
+    expect(errText()).toBe("yaw-mcp secrets set: Secret value cannot be empty.\n");
     expect(outText()).toBe("");
     // An empty value must not create the vault (nor its nudge) as a side effect.
     expect(existsSync(vaultPath(home))).toBe(false);
@@ -3280,7 +3602,7 @@ describe("runSecrets -- the prose arms and the get side channels", () => {
   it("set refuses an empty value as a JSON envelope too", async () => {
     const r = await runSecrets({ action: "set", name: "GH", value: "", passphrase: PROSE_PASS, home, json: true }, io);
     expect(r.exitCode).toBe(1);
-    expect(JSON.parse(errText())).toEqual({ ok: false, error: "Secret value cannot be empty." });
+    expect(errJsonLines(io)).toEqual([{ ok: false, error: "Secret value cannot be empty." }]);
     expect(outText()).toBe("");
     expect(existsSync(vaultPath(home))).toBe(false);
   });
@@ -3384,14 +3706,40 @@ describe("runSecrets -- the prose arms and the get side channels", () => {
       io,
     );
     expect(r.exitCode).toBe(1);
-    const parsed = JSON.parse(errText());
-    expect(parsed.ok).toBe(false);
+    const parsed = errEnvelope(io);
     // `error` stays the raw crypto failure; the actionable half is its own
     // field so a --json consumer can surface it without parsing prose.
     expect(typeof parsed.error).toBe("string");
+    expect(parsed.error).not.toContain("failed to decrypt: it is corrupt");
     expect(parsed.hint).toContain('Entry "BAD" failed to decrypt');
     expect(parsed.hint).toContain("Remove it and set it again.");
     expect(outText()).toBe("");
+  });
+
+  it("get --json on a TTY stdout: the cleartext warning is a JSON line too, and stdout stays the envelope", async () => {
+    const seeded = await runSecrets({ action: "set", name: "GH", value: "ghp_abc", passphrase: PROSE_PASS, home }, io);
+    expect(seeded.exitCode).toBe(0);
+    lock();
+    io.out.mockReset();
+    io.err.mockReset();
+
+    const r = await runSecrets(
+      {
+        action: "get",
+        name: "GH",
+        passphrase: PROSE_PASS,
+        home,
+        json: true,
+        io: { stdin: idleStdin, stdout: ttyStdout },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(0);
+    expect(JSON.parse(outText())).toEqual({ ok: true, name: "GH", value: "ghp_abc" });
+    // The one warning in the command that had no --json branch: a pty-driven
+    // wrapper parsing stderr per SECRETS_USAGE got a prose line here.
+    expect(errJsonLines(io)).toEqual([{ warning: "cleartext-on-tty", name: "GH" }]);
+    expect(errText()).not.toContain("ghp_abc");
   });
 });
 
@@ -3458,17 +3806,23 @@ describe("runSecrets -- a schema-v1 vault is reported once per command, and only
     await writeV1Vault();
     const r = await runSecrets({ action: "list", home, json: true }, io);
     expect(r.exitCode).toBe(0);
-    // One parseable line on stdout; the notice must never land there.
-    expect(JSON.parse(outText())).toMatchObject({ ok: true, vault: true, keys: ["GH"] });
+    // One parseable line on stdout -- list's envelope is compact like every
+    // other one (it used to be pretty-printed) -- and the notice must never
+    // land there.
+    const outLines = outText().split("\n");
+    expect(outLines).toEqual([expect.any(String), ""]);
+    expect(JSON.parse(outLines[0])).toMatchObject({ ok: true, vault: true, keys: ["GH"] });
     // ...and under --json the notice is JSON too, not prose: the error
     // envelopes share this stream, so a wrapper parses it line by line.
-    expect(JSON.parse(errText())).toEqual({
-      warning: "schema-behind",
-      schema: 1,
-      current: SECRETS_SCHEMA_VERSION,
-      upgrade: "yaw-mcp secrets rotate",
-      path: vaultPath(home),
-    });
+    expect(errJsonLines(io)).toEqual([
+      {
+        warning: "schema-behind",
+        schema: 1,
+        current: SECRETS_SCHEMA_VERSION,
+        upgrade: "yaw-mcp secrets rotate",
+        path: vaultPath(home),
+      },
+    ]);
   });
 
   it("under --json a FAILING command on a v1 vault leaves stderr parseable line by line", async () => {
@@ -3534,20 +3888,8 @@ describe("runSecrets -- a schema-v1 vault is reported once per command, and only
 // discards the result.
 // -----------------------------------------------------------------------
 
-/** Whether this runner can create a file symlink at all (Windows refuses
- *  without Developer Mode). Probed once so the symlink case reports SKIPPED
- *  rather than passing on a bare return. Same probe as atomic-write.test.ts. */
-function symlinksAvailable(): boolean {
-  const probe = mkdtempSync(nodePath.join(os.tmpdir(), "yaw-mcp-reset-symlink-probe-"));
-  try {
-    symlinkSync(nodePath.join(probe, "target.txt"), nodePath.join(probe, "link.txt"), "file");
-    return true;
-  } catch {
-    return false;
-  } finally {
-    rmSync(probe, { recursive: true, force: true });
-  }
-}
+// Probed once so the symlink case reports SKIPPED, not a vacuous PASS, on a
+// runner that cannot make links (see symlinksAvailable).
 const SYMLINKS_AVAILABLE = symlinksAvailable();
 
 describe("runSecrets reset", () => {
@@ -3562,10 +3904,6 @@ describe("runSecrets reset", () => {
   const ttyStdout = (): NodeJS.WritableStream => ({ isTTY: true, write: vi.fn() }) as unknown as NodeJS.WritableStream;
   const promptText = (stdout: NodeJS.WritableStream): string =>
     (stdout.write as unknown as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0] as string).join("");
-  const nonTTY = (): NonNullable<Parameters<typeof runSecrets>[0]["io"]> => ({
-    stdin: { isTTY: false } as unknown as NodeJS.ReadableStream,
-    stdout: { isTTY: false, write: vi.fn() } as unknown as NodeJS.WritableStream,
-  });
   /** The `.reset-*` siblings of the vault, as full paths, sorted. */
   const backups = (): string[] => {
     const dir = nodePath.dirname(vaultPath(home));
@@ -3637,7 +3975,7 @@ describe("runSecrets reset", () => {
 
   it("non-TTY without --force refuses (exit 2), names the flag, and moves nothing", async () => {
     const before = await seed();
-    const r = await runSecrets({ action: "reset", passphrase: NEW_PASS, home, io: nonTTY() }, io);
+    const r = await runSecrets({ action: "reset", passphrase: NEW_PASS, home, io: nonTTYIo() }, io);
     expect(r.exitCode).toBe(2);
     expect(errText()).toContain("refusing to reset the vault without confirmation");
     expect(errText()).toContain("neither stdin nor stdout is a TTY");
@@ -3747,7 +4085,7 @@ describe("runSecrets reset", () => {
   it("--force off a TTY resets without a prompt, and --json pins the envelope and the one warning line", async () => {
     await seed();
     const r = await runSecrets(
-      { action: "reset", force: true, passphrase: NEW_PASS, home, json: true, io: nonTTY() },
+      { action: "reset", force: true, passphrase: NEW_PASS, home, json: true, io: nonTTYIo() },
       io,
     );
     expect(r.exitCode).toBe(0);
@@ -3759,11 +4097,84 @@ describe("runSecrets reset", () => {
       entries: ["GH_TOKEN", "NPM_TOKEN"],
       unreadable: null,
     });
-    // stderr under --json is JSON lines, and the nudge is one of them.
-    const errLines = errText().trim().split("\n");
+    // stderr under --json is JSON lines, and the nudge is one of them. The
+    // passphrase came from the opts hook, which is reported as "prompt":
+    // only YAW_MCP_VAULT_PASSPHRASE itself reads as "env" (see the next
+    // test), since the success line and the nudge say where the new
+    // passphrase lives.
+    const errLines = errJsonLines(io);
     expect(errLines).toHaveLength(1);
-    expect(JSON.parse(errLines[0])).toMatchObject({ warning: "vault-reset", path: vaultPath(home) });
+    expect(errLines[0]).toMatchObject({ warning: "vault-reset", path: vaultPath(home), passphrase_source: "prompt" });
     expect(await opensWith(vaultPath(home), NEW_PASS)).toBe(true);
+  });
+
+  it("--json reports passphrase_source env when YAW_MCP_VAULT_PASSPHRASE keyed the new vault", async () => {
+    await seed();
+    process.env.YAW_MCP_VAULT_PASSPHRASE = NEW_PASS;
+    const r = await runSecrets({ action: "reset", force: true, home, json: true, io: nonTTYIo() }, io);
+    expect(r.exitCode).toBe(0);
+    expect(errJsonLines(io)).toEqual([
+      expect.objectContaining({ warning: "vault-reset", path: vaultPath(home), passphrase_source: "env" }),
+    ]);
+    expect(await opensWith(vaultPath(home), NEW_PASS)).toBe(true);
+  });
+
+  it("non-TTY without --force under --json: one envelope naming the flag, exit 2, nothing moved", async () => {
+    const before = await seed();
+    const r = await runSecrets({ action: "reset", passphrase: NEW_PASS, home, json: true, io: nonTTYIo() }, io);
+    expect(r.exitCode).toBe(2);
+    expect(errJsonLines(io)).toHaveLength(1);
+    const envelope = errEnvelope(io);
+    expect(envelope.error).toContain("refusing to reset the vault without confirmation");
+    expect(envelope.error).toContain("Re-run with --force to reset it.");
+    expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
+    expect(backups()).toEqual([]);
+  });
+
+  // checkVaultPassphrase THROWS when the check itself cannot run (a scrypt
+  // failure, which says nothing about the passphrase). Uncaught, that
+  // reached the dispatcher as a prose line -- a non-JSON line on stderr
+  // under --json. No kdf loadVault accepts fails to derive, so the failure is
+  // injected at the call. Both guard sites: the scripted passphrase before
+  // RESET is asked for, and the one typed at the new-passphrase prompt.
+  it("refuses, moving nothing, when the already-opens check cannot run -- scripted and typed", async () => {
+    const before = await seed();
+    const vaultModule = await import("../secrets-vault.js");
+    const spy = vi
+      .spyOn(vaultModule, "checkVaultPassphrase")
+      .mockRejectedValue(new Error("Invalid scrypt params: memory limit exceeded"));
+    try {
+      const scripted = await runSecrets(
+        { action: "reset", force: true, passphrase: NEW_PASS, home, json: true, io: nonTTYIo() },
+        io,
+      );
+      expect(scripted.exitCode).toBe(1);
+      const envelope = errEnvelope(io);
+      expect(envelope.error).toContain("could not check YAW_MCP_VAULT_PASSPHRASE against the vault");
+      expect(envelope.error).toContain("memory limit exceeded");
+      expect(envelope.error).toContain("nothing was changed");
+
+      io.err.mockReset();
+      const typed = await runSecrets(
+        {
+          action: "reset",
+          home,
+          io: {
+            stdin: new FakeTTYStdin(["RESET\r", `${NEW_PASS}\r`, `${NEW_PASS}\r`]) as unknown as NodeJS.ReadableStream,
+            stdout: ttyStdout(),
+          },
+        },
+        io,
+      );
+      expect(typed.exitCode).toBe(1);
+      expect(errText()).toContain("yaw-mcp secrets reset: could not check that passphrase against the vault");
+      expect(spy).toHaveBeenCalledTimes(2);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(isUnlocked()).toBe(false);
+    expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
+    expect(backups()).toEqual([]);
   });
 
   it("refuses, before asking for RESET, when YAW_MCP_VAULT_PASSPHRASE already opens the vault", async () => {
@@ -3833,7 +4244,7 @@ describe("runSecrets reset", () => {
       }),
     );
     const r = await runSecrets(
-      { action: "reset", force: true, passphrase: NEW_PASS, home, json: true, io: nonTTY() },
+      { action: "reset", force: true, passphrase: NEW_PASS, home, json: true, io: nonTTYIo() },
       io,
     );
     expect(r.exitCode).toBe(0);
@@ -3844,7 +4255,7 @@ describe("runSecrets reset", () => {
 
   it("resets a vault that is not even JSON, and says the names could not be read rather than listing none", async () => {
     writeFileSync(vaultPath(home), "{ not json at all");
-    const r = await runSecrets({ action: "reset", force: true, passphrase: NEW_PASS, home, io: nonTTY() }, io);
+    const r = await runSecrets({ action: "reset", force: true, passphrase: NEW_PASS, home, io: nonTTYIo() }, io);
     expect(r.exitCode).toBe(0);
     expect(outText()).toContain("Could not read the old vault's entry names (not valid JSON");
     expect(outText()).not.toContain("Entries to set again");
@@ -3855,7 +4266,7 @@ describe("runSecrets reset", () => {
     // And --json carries null entries plus the reason, never an empty list.
     writeFileSync(vaultPath(home), "{ not json at all");
     const j = await runSecrets(
-      { action: "reset", force: true, passphrase: NEW_PASS, home, json: true, io: nonTTY() },
+      { action: "reset", force: true, passphrase: NEW_PASS, home, json: true, io: nonTTYIo() },
       io,
     );
     expect(j.exitCode).toBe(0);
@@ -3870,7 +4281,7 @@ describe("runSecrets reset", () => {
     const salt = Buffer.alloc(16, 5).toString("base64");
     writeFileSync(vaultPath(home), JSON.stringify({ version: 2, salt, kdf: { N: 16384, r: 8, p: 1 }, entries: {} }));
     process.env.YAW_MCP_VAULT_PASSPHRASE = NEW_PASS;
-    const r = await runSecrets({ action: "reset", force: true, home, io: nonTTY() }, io);
+    const r = await runSecrets({ action: "reset", force: true, home, io: nonTTYIo() }, io);
     expect(r.exitCode).toBe(0);
     expect(outText()).toContain("The old vault held no entries.");
     const fresh = await loadVault(vaultPath(home));
@@ -3880,10 +4291,10 @@ describe("runSecrets reset", () => {
   });
 
   it("keeps stderr to JSON lines under --json even on a vault that is not JSON (no logger prose)", async () => {
-    // loadVault logs a warn line to process.stderr before it throws on a
-    // file that is not JSON; the CLI renders that as prose. reset is the one
-    // action documented to SUCCEED on that file, so it must not ask loadVault
-    // about it at all: a --json wrapper keys on every stderr line.
+    // Without onWarning, loadVault logs a warn line to process.stderr before
+    // it throws on a file that is not JSON; the CLI renders that as prose.
+    // reset is the one action documented to SUCCEED on that file, and a
+    // --json wrapper keys on every stderr line.
     writeFileSync(vaultPath(home), "{ not json at all");
     const stderrWrites: string[] = [];
     const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => {
@@ -3893,7 +4304,7 @@ describe("runSecrets reset", () => {
     setLogSurface("cli");
     try {
       const r = await runSecrets(
-        { action: "reset", force: true, passphrase: NEW_PASS, home, json: true, io: nonTTY() },
+        { action: "reset", force: true, passphrase: NEW_PASS, home, json: true, io: nonTTYIo() },
         io,
       );
       expect(r.exitCode).toBe(0);
@@ -3998,7 +4409,7 @@ describe("runSecrets reset", () => {
 
   it("refuses when no new passphrase can be obtained (non-TTY, no env) -- vault untouched", async () => {
     const before = await seed();
-    const r = await runSecrets({ action: "reset", force: true, home, json: true, io: nonTTY() }, io);
+    const r = await runSecrets({ action: "reset", force: true, home, json: true, io: nonTTYIo() }, io);
     expect(r.exitCode).toBe(1);
     expect(JSON.parse(errText())).toMatchObject({ ok: false });
     expect(errText()).toContain("New passphrase required");
@@ -4009,10 +4420,10 @@ describe("runSecrets reset", () => {
   it("two resets in the same millisecond land on distinct backups", async () => {
     await seed();
     vi.setSystemTime(new Date("2026-09-23T10:00:00.000Z"));
-    const first = await runSecrets({ action: "reset", force: true, passphrase: NEW_PASS, home, io: nonTTY() }, io);
+    const first = await runSecrets({ action: "reset", force: true, passphrase: NEW_PASS, home, io: nonTTYIo() }, io);
     expect(first.exitCode).toBe(0);
     const second = await runSecrets(
-      { action: "reset", force: true, passphrase: "a-third-passphrase-entirely", home, io: nonTTY() },
+      { action: "reset", force: true, passphrase: "a-third-passphrase-entirely", home, io: nonTTYIo() },
       io,
     );
     expect(second.exitCode).toBe(0);
@@ -4024,7 +4435,7 @@ describe("runSecrets reset", () => {
 
   it("the next set verifies against the passphrase chosen at reset, and a wrong one is pointed at reset", async () => {
     await seed();
-    const r = await runSecrets({ action: "reset", force: true, passphrase: NEW_PASS, home, io: nonTTY() }, io);
+    const r = await runSecrets({ action: "reset", force: true, passphrase: NEW_PASS, home, io: nonTTYIo() }, io);
     expect(r.exitCode).toBe(0);
     lock();
     io.err.mockReset();
@@ -4059,7 +4470,7 @@ describe("runSecrets reset", () => {
     renameSync(link, real);
     symlinkSync(real, link, "file");
 
-    const r = await runSecrets({ action: "reset", force: true, passphrase: NEW_PASS, home, io: nonTTY() }, io);
+    const r = await runSecrets({ action: "reset", force: true, passphrase: NEW_PASS, home, io: nonTTYIo() }, io);
     expect(r.exitCode).toBe(0);
     expect(lstatSync(link).isSymbolicLink()).toBe(true);
     expect(await opensWith(real, NEW_PASS)).toBe(true);
@@ -4085,15 +4496,7 @@ describe("runSecrets --json -- every stderr line is a JSON object", () => {
 
   const outText = (): string => io.out.mock.calls.map((c) => c[0] as string).join("");
   const errText = (): string => io.err.mock.calls.map((c) => c[0] as string).join("");
-  const errLines = (): Array<Record<string, unknown>> =>
-    errText()
-      .split("\n")
-      .filter((l) => l.length > 0)
-      .map((l) => JSON.parse(l) as Record<string, unknown>);
-  const nonTTY = (): NonNullable<Parameters<typeof runSecrets>[0]["io"]> => ({
-    stdin: { isTTY: false } as unknown as NodeJS.ReadableStream,
-    stdout: { isTTY: false, write: vi.fn() } as unknown as NodeJS.WritableStream,
-  });
+  const errLines = (): Array<Record<string, unknown>> => errJsonLines(io);
   const ttyIo = (stdin: FakeTTYStdin): NonNullable<Parameters<typeof runSecrets>[0]["io"]> => ({
     stdin: stdin as unknown as NodeJS.ReadableStream,
     stdout: { isTTY: true, write: vi.fn() } as unknown as NodeJS.WritableStream,
@@ -4122,7 +4525,7 @@ describe("runSecrets --json -- every stderr line is a JSON object", () => {
 
   it("a first set under a short env passphrase: short-passphrase, then vault-created, in that order", async () => {
     process.env.YAW_MCP_VAULT_PASSPHRASE = "abc";
-    const r = await runSecrets({ action: "set", name: "GH", value: "ghp", home, json: true, io: nonTTY() }, io);
+    const r = await runSecrets({ action: "set", name: "GH", value: "ghp", home, json: true, io: nonTTYIo() }, io);
     expect(r.exitCode).toBe(0);
     const lines = errLines();
     expect(lines).toHaveLength(2);
@@ -4184,7 +4587,7 @@ describe("runSecrets --json -- every stderr line is a JSON object", () => {
     lock();
     process.env.YAW_MCP_VAULT_PASSPHRASE_NEW = "abc";
     const r = await runSecrets(
-      { action: "rotate", passphrase: "a-long-enough-passphrase", home, json: true, io: nonTTY() },
+      { action: "rotate", passphrase: "a-long-enough-passphrase", home, json: true, io: nonTTYIo() },
       io,
     );
     expect(r.exitCode).toBe(0);
@@ -4196,10 +4599,185 @@ describe("runSecrets --json -- every stderr line is a JSON object", () => {
 
   it("without --json the same warnings stay prose", async () => {
     process.env.YAW_MCP_VAULT_PASSPHRASE = "abc";
-    const r = await runSecrets({ action: "set", name: "GH", value: "ghp", home, io: nonTTY() }, io);
+    const r = await runSecrets({ action: "set", name: "GH", value: "ghp", home, io: nonTTYIo() }, io);
     expect(r.exitCode).toBe(0);
     expect(errText()).toContain("YAW_MCP_VAULT_PASSPHRASE is shorter than 12 characters");
     expect(errText()).toContain("created the vault at");
     expect(() => JSON.parse(errText().split("\n")[0])).toThrow();
   });
+
+  it("get --json at a terminal with the RIGHT passphrase: the cleartext warning is a JSON line", async () => {
+    // The near-miss above ("the unlock prompt's warning ...") types a WRONG
+    // passphrase, so unlock() rejects before the cleartext warning can fire.
+    const seeded = await runSecrets(
+      { action: "set", name: "GH", value: "ghp_abc", passphrase: "a-long-enough-passphrase", home },
+      { out: vi.fn(), err: vi.fn() },
+    );
+    expect(seeded.exitCode).toBe(0);
+    lock();
+    const r = await runSecrets(
+      { action: "get", name: "GH", home, json: true, io: ttyIo(new FakeTTYStdin(["a-long-enough-passphrase\r"])) },
+      io,
+    );
+    expect(r.exitCode).toBe(0);
+    expect(errLines()).toEqual([{ warning: "cleartext-on-tty", name: "GH" }]);
+    expect(JSON.parse(outText())).toEqual({ ok: true, name: "GH", value: "ghp_abc" });
+  });
+
+  // The ^C and declined-confirmation envelopes carry a discriminator
+  // (`cancelled` / `aborted`) beside ok:false; exit 130 vs 1 is pinned by
+  // the prose tests, the fields only here.
+  it.each([
+    ["remove, ^C at the confirmation", "remove", [String.fromCharCode(3)], 130, { cancelled: true }, "Cancelled."],
+    ["remove, n at the confirmation", "remove", ["n\r"], 1, { aborted: true }, "Aborted."],
+    ["set over an existing name, n", "set", ["n\r"], 1, { aborted: true }, "Aborted."],
+    ["reset, RESE at the RESET prompt", "reset", ["RESE\r"], 1, { aborted: true }, "Aborted."],
+    ["reset, ^C at the RESET prompt", "reset", [String.fromCharCode(3)], 130, { cancelled: true }, "Cancelled."],
+  ] as const)("%s: one {ok:false} envelope carrying its discriminator", async (_l, action, typed, exitCode, field, msg) => {
+    const seeded = await runSecrets(
+      { action: "set", name: "GH", value: "ghp", passphrase: "a-long-enough-passphrase", home },
+      { out: vi.fn(), err: vi.fn() },
+    );
+    expect(seeded.exitCode).toBe(0);
+    lock();
+    const before = readFileSync(vaultPath(home), "utf8");
+    const r = await runSecrets(
+      {
+        action,
+        ...(action === "reset" ? {} : { name: "GH" }),
+        ...(action === "set" ? { value: "ghp-new" } : {}),
+        // reset's passphrase is the NEW vault's: the old one would be
+        // refused by the already-opens guard before RESET is asked for.
+        passphrase: action === "reset" ? "a-brand-new-long-passphrase" : "a-long-enough-passphrase",
+        home,
+        json: true,
+        io: ttyIo(new FakeTTYStdin([...typed])),
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(exitCode);
+    expect(errLines()).toEqual([{ ok: false, error: msg, ...field }]);
+    expect(outText()).toBe("");
+    expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
+  });
+
+  // A malformed `check` marker is ignored by loadVault (the vault still
+  // loads), which used to say so with a log() line straight to
+  // process.stderr: prose on the CLI surface, on a command that SUCCEEDS, so
+  // a --json wrapper failed a good run on it. Every loadVault call in the
+  // command now takes the warning through the command's own sink.
+  describe("a malformed check marker", () => {
+    const PASS = "a-long-enough-passphrase";
+    let stderrWrites: string[];
+    let spy: { mockRestore: () => void };
+
+    beforeEach(async () => {
+      const seeded = await runSecrets(
+        { action: "set", name: "GH", value: "ghp", passphrase: PASS, home },
+        { out: vi.fn(), err: vi.fn() },
+      );
+      expect(seeded.exitCode).toBe(0);
+      lock();
+      const onDisk = JSON.parse(readFileSync(vaultPath(home), "utf8")) as Record<string, unknown>;
+      onDisk.check = { iv: 7 };
+      writeFileSync(vaultPath(home), `${JSON.stringify(onDisk, null, 2)}\n`, "utf8");
+      stderrWrites = [];
+      spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => {
+        if (typeof chunk === "string") stderrWrites.push(chunk);
+        return true;
+      });
+      setLogSurface("cli");
+    });
+
+    afterEach(() => {
+      spy.mockRestore();
+      setLogSurface("server");
+    });
+
+    it.each([
+      ["list", { action: "list" }],
+      ["get", { action: "get", name: "GH", passphrase: PASS, io: nonTTYIo() }],
+      ["set", { action: "set", name: "OTHER", value: "v", passphrase: PASS }],
+      ["remove", { action: "remove", name: "GH", force: true, passphrase: PASS, io: nonTTYIo() }],
+      ["rotate", { action: "rotate", passphrase: PASS, newPassphrase: "a-brand-new-long-passphrase" }],
+    ] as const)("%s --json succeeds with the warning as a JSON line, and nothing reaches process.stderr", async (_a, opts) => {
+      const r = await runSecrets({ ...opts, home, json: true }, io);
+      expect(r.exitCode).toBe(0);
+      expect(stderrWrites).toEqual([]);
+      expect(errLines()).toEqual([
+        {
+          warning: "check-malformed",
+          path: vaultPath(home),
+          message: expect.stringContaining("Vault verification token is malformed"),
+        },
+      ]);
+      expect(JSON.parse(outText())).toMatchObject({ ok: true });
+    });
+
+    it("reset's guard load reports it the same way", async () => {
+      const r = await runSecrets(
+        { action: "reset", force: true, passphrase: "a-brand-new-long-passphrase", home, json: true, io: nonTTYIo() },
+        io,
+      );
+      expect(r.exitCode).toBe(0);
+      expect(stderrWrites).toEqual([]);
+      expect(errLines().map((l) => l.warning)).toEqual(["check-malformed", "vault-reset"]);
+    });
+
+    it("without --json it is one prose warning line on the command's own sink, naming the file", async () => {
+      const r = await runSecrets({ action: "list", home }, io);
+      expect(r.exitCode).toBe(0);
+      expect(stderrWrites).toEqual([]);
+      expect(errText()).toBe(
+        `yaw-mcp secrets: warning -- ${vaultPath(home)}: Vault verification token is malformed; ignoring it (the next \`yaw-mcp secrets set\` re-stamps it).\n`,
+      );
+    });
+  });
+
+  // A vault that is not JSON: loadVault throws, and used to log first -- a
+  // prose line ahead of the envelope on every action but reset.
+  it("list --json on a vault that is not JSON: only the envelope reaches stderr", async () => {
+    writeFileSync(vaultPath(home), "{ not json at all");
+    const stderrWrites: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => {
+      if (typeof chunk === "string") stderrWrites.push(chunk);
+      return true;
+    });
+    setLogSurface("cli");
+    try {
+      const r = await runSecrets({ action: "list", home, json: true }, io);
+      expect(r.exitCode).toBe(1);
+      expect(stderrWrites).toEqual([]);
+      expect(errLines()).toHaveLength(1);
+      // loadVault's own message, path first -- an error with no errno is not
+      // a failed read, so it is never reworded as "could not read the vault
+      // file".
+      expect(errEnvelope(io).error).toMatch(/^vault at .+ is not valid JSON: /);
+    } finally {
+      spy.mockRestore();
+      setLogSurface("server");
+    }
+  });
+
+  // `action` is optional on the exported options. The fallthrough for one
+  // outside the eight used to sit at the bottom of runSecrets, AFTER the
+  // fingerprint, the load, the passphrase prompt and the scrypt derivation,
+  // and printed prose even under --json.
+  it.each([undefined, "nuke"])("action %j is refused first: exit 2, no prompt, no vault read", async (action) => {
+    // A directory at the vault path: any read of it would fail loudly with
+    // EISDIR instead of the unknown-action refusal.
+    mkdirSync(vaultPath(home), { recursive: true });
+    const stdin = new FakeTTYStdin(["a-long-enough-passphrase\r"]);
+    const r = await runSecrets({ action: action as SecretsActionForTest, home, json: true, io: ttyIo(stdin) }, io);
+    expect(r.exitCode).toBe(2);
+    expect(errLines()).toEqual([{ ok: false, error: `unknown action ${String(action)}` }]);
+    expect(stdin.resumes).toBe(0);
+
+    io.err.mockReset();
+    const prose = await runSecrets({ action: action as SecretsActionForTest, home, io: ttyIo(stdin) }, io);
+    expect(prose.exitCode).toBe(2);
+    expect(errText()).toBe(`yaw-mcp secrets: unknown action ${String(action)}\n`);
+  });
 });
+
+type SecretsActionForTest = NonNullable<Parameters<typeof runSecrets>[0]["action"]>;

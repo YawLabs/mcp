@@ -44,12 +44,18 @@ vi.mock("../secrets-vault.js", async (importOriginal) => {
     loadVault: vi.fn(),
     resolveSecretRefs: vi.fn(),
     unlock: vi.fn(),
+    // A stub, not the actual: the real checkVaultPassphrase calls secrets-vault's
+    // OWN unlock binding, which this mock cannot intercept, so the actual would
+    // run real scrypt against the fixtures below. Its verdict mapping (which
+    // unlock error means which answer) is tested in secrets-vault.test.ts; the
+    // verifyVaultPassphrase block here drives the verdicts directly.
+    checkVaultPassphrase: vi.fn(),
     vaultPath: vi.fn().mockReturnValue("/tmp/fake-vault.json"),
     // Real values, re-exported from the module itself rather than hand-copied.
     // The spawn audit scans the env with collectSecretRefNames (secrets-vault's
     // single source of truth for the `${secret:NAME}` shape, built on
-    // SECRET_REF_RE), and resolveServerEnv / verifyVaultPassphrase both compare
-    // an unlock failure's message against VAULT_CHECK_CORRUPT_ERROR to tell
+    // SECRET_REF_RE), and resolveServerEnv compares an unlock failure's
+    // message against VAULT_CHECK_CORRUPT_ERROR to tell
     // "the vault is damaged, the passphrase is fine" from "wrong passphrase".
     // Stubs would make those branches indistinguishable -- and a literal COPY
     // of any of them would silently go stale the day secrets-vault changes the
@@ -236,7 +242,14 @@ import { log } from "../logger.js";
 import { MIN_OAM_VERSION, resolveOamSpawn } from "../oam-spawn.js";
 import { appendAuditEvent } from "../secrets-audit.js";
 // Import the mocked secrets-vault module so individual tests can configure it.
-import { hasSecretRefs, loadVault, resolveSecretRefs, unlock, VAULT_CHECK_CORRUPT_ERROR } from "../secrets-vault.js";
+import {
+  checkVaultPassphrase,
+  hasSecretRefs,
+  loadVault,
+  resolveSecretRefs,
+  unlock,
+  VAULT_CHECK_CORRUPT_ERROR,
+} from "../secrets-vault.js";
 // Mocked uv resolver -- a test makes it THROW to exercise the resolver-failure
 // wrap (a checksum/download failure inside ensureUv reaches connectToUpstream
 // this way).
@@ -1406,11 +1419,14 @@ describe("redactSecretsInOutput", () => {
     // keeps ordinary diagnostic output readable: BYPASS and COMPASS contain
     // "PASS" and a naive /(TOKEN|SECRET|PASS|API_?KEY|CREDENTIAL)/i would
     // mangle both. So would MONKEY_CAGE on a bare "KEY" substring test.
+    // SSH_KEY_PATH has a whole KEY segment, but its value is a path: masking
+    // it rewrote an ordinary file path wherever the child printed it.
     const cases: Record<string, string> = {
       PROPAGATION_TEST_BYPASS_CACHE: "cache-bypass-mode-enabled",
       PROPAGATION_TEST_COMPASS_HOME: "/opt/compass/home",
       PROPAGATION_TEST_MONKEY_CAGE: "cage-number-eleven",
       PROPAGATION_TEST_PROJECT_DIR: "/srv/projects/alpha",
+      PROPAGATION_TEST_SSH_KEY_PATH: "/home/dev/.ssh/id_ed25519",
     };
     for (const [k, v] of Object.entries(cases)) process.env[k] = v;
     try {
@@ -1434,6 +1450,36 @@ describe("redactSecretsInOutput", () => {
       expect(err!.stderrTail).not.toContain("***");
     } finally {
       for (const k of Object.keys(cases)) delete process.env[k];
+    }
+  });
+
+  it("still redacts a parent credential whose name ends in _URL, which the locator rule must not reach", async () => {
+    // The classifier refuses a name whose LAST segment says where a thing
+    // lives (SSH_KEY_PATH above), but URL is deliberately not one of those: a
+    // connection string carries its password inline, so treating it as a
+    // locator would put that password in the ActivationError.
+    const dsn = "redis://:parent-shell-password-0001@cache.internal:6379/0";
+    process.env.PROPAGATION_TEST_REDIS_PASSWORD_URL = dsn;
+    try {
+      const config = makeLocalConfig({ env: {} });
+
+      _sdkBehavior.clientConnect = () => {
+        _sdkBehavior.stderrEmitter?.emit("data", Buffer.from(`connect failed: ${dsn}`));
+        return Promise.reject(new Error("handshake failed"));
+      };
+
+      let err: ActivationError | undefined;
+      try {
+        await connectToUpstream(config);
+      } catch (e) {
+        err = e as ActivationError;
+      }
+
+      expect(err).toBeInstanceOf(ActivationError);
+      expect(err!.stderrTail).not.toContain("parent-shell-password-0001");
+      expect(err!.stderrTail).toContain("***PROPAGATION_TEST_REDIS_PASSWORD_URL***");
+    } finally {
+      delete process.env.PROPAGATION_TEST_REDIS_PASSWORD_URL;
     }
   });
 
@@ -3115,6 +3161,15 @@ describe("connectToUpstream downstream capability bridge", () => {
 // your PATH" for a server that actually refused the handshake).
 // ---------------------------------------------------------------------------
 
+/** The pointer withConfigPointer appends to every activation and connect
+ *  failure of the "test" namespace. Written out here rather than built from
+ *  bundlesFileHint, so a drift back to a bare ~/.yaw-mcp/bundles.json fails a
+ *  test: a trusted project-local .yaw-mcp/bundles.json replaces the
+ *  user-global file while it is in effect, so the global file alone is the
+ *  wrong place to send a server that the project file defines. */
+const CONFIG_POINTER =
+  'Fix "test" in the bundles.json that defines it (~/.yaw-mcp/bundles.json, or a trusted project-local .yaw-mcp/bundles.json), then activate it again';
+
 /** Minimal remote server config (no command, no vault involvement). */
 function makeRemoteConfig(overrides: Record<string, unknown> = {}): any {
   return {
@@ -3173,7 +3228,7 @@ describe("connectToUpstream activation failure categories", () => {
     expect(err).toBeInstanceOf(ActivationError);
     expect(err.category).toBe("spawn_failure");
     expect(err.message).toContain("Command 'uvx' is not on PATH or is not executable.");
-    expect(err.message).toContain('Fix in ~/.yaw-mcp/bundles.json under "test"');
+    expect(err.message).toContain(CONFIG_POINTER);
     // The child never wrote to stderr, so there is no tail to attach.
     expect(err.stderrTail).toBeUndefined();
     expect((err.cause as Error).message).toBe("spawn uvx ENOENT");
@@ -3225,7 +3280,7 @@ describe("connectToUpstream activation failure categories", () => {
     // advice for a server that clearly started.
     expect(err.message).toContain("Error POSTing to endpoint (HTTP 500)");
     expect(err.message).not.toContain("is not on PATH");
-    expect(err.message).toContain('Fix in ~/.yaw-mcp/bundles.json under "test"');
+    expect(err.message).toContain(CONFIG_POINTER);
   });
 
   it("buckets a local handshake timeout as init_timeout and attaches the stderr tail", async () => {
@@ -3290,20 +3345,29 @@ describe("connectToUpstream activation failure categories", () => {
     // re-read at meta-tool boundaries. Fix the entry on disk, send activate
     // again, and it loads -- so the old wording was false at the exact moment
     // a user is most likely to act on it.
+    //
+    // "The file to edit" is the bundles.json that defines the server, which is
+    // not always ~/.yaw-mcp/bundles.json: a trusted project-local file replaces
+    // the user-global one outright (local-bundles.ts -- no merge), so a
+    // pointer at the global file alone sends a project-local server's fix to
+    // a file the session never reads.
     _sdkBehavior.clientConnect = () => Promise.reject(new Error("spawn nope ENOENT"));
 
     const err = await failedConnect(makeLocalConfig({ command: "nope" }));
 
-    expect(err.message).toContain('Fix in ~/.yaw-mcp/bundles.json under "test"');
+    expect(err.message).toContain(CONFIG_POINTER);
+    expect(err.message).not.toContain("Fix in ~/.yaw-mcp/bundles.json");
     expect(err.message).not.toMatch(/restart this MCP client/i);
-    expect(err.message).toContain("activate it again");
+    expect(err.message).toContain(
+      "then activate it again -- the edit is picked up on the next mcp_connect_* call, with no client restart.",
+    );
   });
 
   it("wraps a resolver failure as an ActivationError carrying the config pointer", async () => {
     // The connect try/catch wraps client.connect() ONLY, so a throw out of
     // resolveUvSpawn (ensureUv: unsupported platform, download or checksum
     // failure) or out of the oam machinery used to escape as a bare Error --
-    // no category, no stderr tail, and none of the "Fix in ..." pointer every
+    // no category, no stderr tail, and none of the `-> Fix ...` pointer every
     // other local spawn failure carries. Callers branching on
     // `err instanceof ActivationError` then treated it as a transport error.
     vi.mocked(resolveUvSpawn).mockRejectedValueOnce(
@@ -3315,7 +3379,7 @@ describe("connectToUpstream activation failure categories", () => {
     expect(err).toBeInstanceOf(ActivationError);
     expect(err.category).toBe("unknown");
     expect(err.message).toContain("uv archive checksum mismatch (expected abc123, got def456)");
-    expect(err.message).toContain('Fix in ~/.yaw-mcp/bundles.json under "test"');
+    expect(err.message).toContain(CONFIG_POINTER);
     // The resolver threw before any transport was constructed.
     expect(_sdkBehavior.stdioConstructions).toHaveLength(0);
   });
@@ -3358,6 +3422,8 @@ describe("connectToUpstream activation failure categories", () => {
 
     expect(err.category).toBe("protocol_error");
     expect(err.message).toContain("Remote server at https://mcp.example.test/mcp refused the connection.");
+    // A remote entry can live in a trusted project-local bundles.json too.
+    expect(err.message).toContain(CONFIG_POINTER);
   });
 
   it("selects the SSE transport only when transport is 'sse'", async () => {
@@ -3869,18 +3935,22 @@ describe("verifyVaultPassphrase", () => {
     clearSessionVaultPassphrase();
   });
 
-  it("returns true when the passphrase unlocks the vault", async () => {
+  // The verdict comes from checkVaultPassphrase (stubbed in the module mock at
+  // the top of this file; its own mapping is tested in secrets-vault.test.ts),
+  // so these drive its three answers -- and its throw -- directly.
+
+  it("returns true when the passphrase opens the vault", async () => {
     const fakeVault = { version: 1, salt: "abc", entries: { A: {} } } as any;
     vi.mocked(loadVault).mockResolvedValue(fakeVault);
-    vi.mocked(unlock).mockResolvedValue(Buffer.from("k"));
+    vi.mocked(checkVaultPassphrase).mockResolvedValue("opens");
 
     await expect(verifyVaultPassphrase("right")).resolves.toBe(true);
-    expect(vi.mocked(unlock)).toHaveBeenCalledWith(fakeVault, "right");
+    expect(vi.mocked(checkVaultPassphrase)).toHaveBeenCalledWith(fakeVault, "right");
   });
 
-  it("returns false when the passphrase does not unlock the vault", async () => {
+  it("returns false when the passphrase is wrong", async () => {
     vi.mocked(loadVault).mockResolvedValue({ version: 1, salt: "abc", entries: { A: {} } } as any);
-    vi.mocked(unlock).mockRejectedValue(new Error("wrong passphrase for this vault (decryption failed)"));
+    vi.mocked(checkVaultPassphrase).mockResolvedValue("wrong");
 
     await expect(verifyVaultPassphrase("wrong")).resolves.toBe(false);
   });
@@ -3888,16 +3958,28 @@ describe("verifyVaultPassphrase", () => {
   it("returns false for an empty passphrase without touching the vault", async () => {
     await expect(verifyVaultPassphrase("")).resolves.toBe(false);
     expect(vi.mocked(loadVault)).not.toHaveBeenCalled();
+    expect(vi.mocked(checkVaultPassphrase)).not.toHaveBeenCalled();
   });
 
   it("accepts the passphrase when the vault's CHECK MARKER is corrupt", async () => {
-    // That error means the passphrase is RIGHT and the marker is damaged.
+    // That verdict means the passphrase is RIGHT and the marker is damaged.
     // Rejecting it would ask the user to re-type something that was never
     // wrong, and the retype would fail identically.
     vi.mocked(loadVault).mockResolvedValue({ version: 1, salt: "abc", entries: { A: {} } } as any);
-    vi.mocked(unlock).mockRejectedValue(new Error(VAULT_CHECK_CORRUPT_ERROR));
+    vi.mocked(checkVaultPassphrase).mockResolvedValue("marker-corrupt");
 
     await expect(verifyVaultPassphrase("actually-correct")).resolves.toBe(true);
+  });
+
+  it("answers false, and does not throw, when the check itself fails", async () => {
+    // checkVaultPassphrase throws for a failure that is not a verdict (a
+    // key-derivation error). This function promises never to throw, and it
+    // folds that into false exactly as it did every non-marker unlock failure
+    // before it routed through checkVaultPassphrase.
+    vi.mocked(loadVault).mockResolvedValue({ version: 1, salt: "abc", entries: { A: {} } } as any);
+    vi.mocked(checkVaultPassphrase).mockRejectedValue(new Error("Invalid scrypt params: memory limit exceeded"));
+
+    await expect(verifyVaultPassphrase("anything")).resolves.toBe(false);
   });
 
   it("does not reject a passphrase when there is no vault to verify against", async () => {
@@ -3921,7 +4003,7 @@ describe("verifyVaultPassphrase", () => {
     // displace whatever the session (or the env var) already holds.
     setSessionVaultPassphrase("already-committed");
     vi.mocked(loadVault).mockResolvedValue({ version: 1, salt: "abc", entries: { A: {} } } as any);
-    vi.mocked(unlock).mockResolvedValue(Buffer.from("k"));
+    vi.mocked(checkVaultPassphrase).mockResolvedValue("opens");
 
     await expect(verifyVaultPassphrase("a-different-one")).resolves.toBe(true);
     expect(vaultPassphrase()).toBe("already-committed");
@@ -3932,7 +4014,7 @@ describe("verifyVaultPassphrase", () => {
     // passphrase would break every later resolve in the session.
     setSessionVaultPassphrase("already-committed");
     vi.mocked(loadVault).mockResolvedValue({ version: 1, salt: "abc", entries: { A: {} } } as any);
-    vi.mocked(unlock).mockRejectedValue(new Error("wrong passphrase for this vault (decryption failed)"));
+    vi.mocked(checkVaultPassphrase).mockResolvedValue("wrong");
 
     await expect(verifyVaultPassphrase("typo")).resolves.toBe(false);
     expect(vaultPassphrase()).toBe("already-committed");

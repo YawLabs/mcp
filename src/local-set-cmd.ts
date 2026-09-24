@@ -24,7 +24,6 @@
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { createInterface } from "node:readline/promises";
 import { atomicWriteFile } from "./atomic-write.js";
 import { editJsoncPath, parseJsonc } from "./jsonc.js";
 import {
@@ -37,7 +36,7 @@ import {
 } from "./local-bundles.js";
 import { createStreamWriter } from "./logger.js";
 import { userConfigDir } from "./paths.js";
-import { QUESTION_CANCELLED, type QuestionCancelled, questionOrEmpty } from "./readline-question.js";
+import { askYesNo, QUESTION_CANCELLED } from "./readline-question.js";
 import type { UpstreamServerConfig } from "./types.js";
 import { MAX_TIMEOUT_MS } from "./upstream.js";
 
@@ -302,21 +301,6 @@ function isInteractive(opts: SetCommandOptions): boolean {
   if (opts.isTTY !== undefined) return opts.isTTY;
   if (opts.promptAnswer !== undefined) return true;
   return Boolean(process.stdin.isTTY) && Boolean(process.stdout.isTTY);
-}
-
-/** Defaults to NO, and EOF is a decline rather than a hang -- the same
- *  contract `remove`'s confirmation documents. */
-async function askYesNo(opts: SetCommandOptions, question: string): Promise<string | QuestionCancelled> {
-  if (opts.promptAnswer !== undefined) return opts.promptAnswer.trim().toLowerCase();
-  const input = opts.io?.stdin ?? process.stdin;
-  const output = opts.io?.stdout ?? process.stdout;
-  const rl = createInterface({ input, output, terminal: opts.io?.terminal });
-  try {
-    const raw = await questionOrEmpty(rl, question);
-    return raw === QUESTION_CANCELLED ? raw : raw.trim().toLowerCase();
-  } finally {
-    rl.close();
-  }
 }
 
 function render(value: unknown): string {

@@ -13,6 +13,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { maybeAutoUpgrade } from "./auto-upgrade.js";
 import { bundleActivateHint, CURATED_BUNDLES, matchBundles, topPartialBundles } from "./bundles.js";
+import { bundlesFileHint } from "./bundles-hint.js";
 import { formatShadowLine, installTargetForCli } from "./cli-shadows.js";
 import { classifyGrade, passesMinCompliance } from "./compliance.js";
 import { loadYawMcpConfig, type Profile, profileAllows, type ResolvedConfig, toProfile } from "./config-loader.js";
@@ -44,6 +45,7 @@ import {
   type ToolCallRecord,
 } from "./idle-ttl.js";
 import { INSTALL_NUDGE_MIN_COUNT, installNudgeEnabled, recordNudges, shouldNudge } from "./install-nudge.js";
+import { isInternalSecretEnvKey } from "./internal-secret-env.js";
 import { setJsonKey } from "./json-key.js";
 import { LearningStore, PENALTY_RATE_THRESHOLD } from "./learning.js";
 import { bundlesSignature, loadLocalBundles } from "./local-bundles.js";
@@ -123,7 +125,6 @@ import {
   connectToUpstream,
   type DownstreamClientBridge,
   disconnectFromUpstream,
-  INTERNAL_SECRET_ENV_KEYS,
   setSessionVaultPassphrase,
   VaultPassphraseRequiredError,
   verifyVaultPassphrase,
@@ -272,7 +273,19 @@ const VAULT_PAGE_FIELD = "passphrase";
  *  skip the prompt entirely), so one slip cost every activation of that
  *  server until the client restarted. Per NAMESPACE, unlike the vault
  *  budget: these credentials are the child's, not yaw-mcp's, so a wrong
- *  GITHUB_TOKEN says nothing about the next server's. */
+ *  GITHUB_TOKEN says nothing about the next server's.
+ *
+ *  Startup prewarm asks too. prewarmDormantServers activates dormant servers
+ *  three at a time from oninitialized, and maybeElicitAndRetry does not branch
+ *  on fromPrewarm, so a fresh session with several servers missing their
+ *  tokens can put up one consent dialog per server (and, on a yes, one
+ *  masked-entry page in the browser per server) in its first seconds, for
+ *  servers the user has not called yet. Unlike the vault prompt
+ *  (vaultElicitInflight) there is no cross-namespace dedupe: each is a
+ *  different question. Each such ask spends one of that namespace's prompts,
+ *  and a decline latches it for the session exactly as an explicit activate's
+ *  decline would. A value typed there that the child accepts stays in
+ *  elicitedEnv after prewarm tears the child down, so the next launch uses it. */
 const MAX_CREDENTIAL_PROMPTS = 2;
 
 /** How many bytes of intermediate step output an exec echoes back when the
@@ -410,12 +423,13 @@ export function isRoutingFaultText(text: string): boolean {
 }
 
 // Launchers that FETCH before they run, keyed by the command basename, with
-// what each one fetches. Only these three: `npx` resolves a package into its
-// cache on a miss, `uvx` resolves and installs into uv's tool cache, and
-// `docker run` pulls a missing image -- each of them minutes of work on a cold
-// machine, before the server process exists. `node`, `python` and an absolute
-// path to a built entry run what is already on disk and are deliberately
-// absent: a hint on those would be noise on every fast spawn.
+// what each one fetches. Only these four: `npx` resolves a package into its
+// cache on a miss, `uvx` resolves and installs into uv's tool cache, `bunx`
+// resolves into bun's global cache, and `docker run` pulls a missing image --
+// each of them minutes of work on a cold machine, before the server process
+// exists. `node`, `python` and an absolute path to a built entry run what is
+// already on disk and are deliberately absent: a hint on those would be noise
+// on every fast spawn.
 const COLD_START_LAUNCHERS: Record<string, string> = {
   npx: "npx may download the package before the server starts",
   uvx: "uvx may download the package before the server starts",
@@ -605,13 +619,48 @@ type SecretPageFailure = "no-page" | "no-browser" | "expired";
 
 /** What collectSecretOnLoopbackPage came back with. "failed" means the
  *  prompt never got an answer from the user: the client declares no
- *  elicitation mode, the request errored or timed out, or shutdown closed the
- *  page under it -- as opposed to "declined", which IS the user's answer. */
+ *  elicitation mode, the request errored or timed out, or the page closed
+ *  under it (shutdown, or its listener failing after listen) -- as opposed to
+ *  "declined", which IS the user's answer. */
 type LoopbackEntryResult =
   | { kind: "submitted"; values: Record<string, string> }
   | { kind: "declined" }
   | { kind: "unreachable"; reason: SecretPageFailure }
   | { kind: "failed" };
+
+/** What one namespace's activation came back with -- activateOne,
+ *  runActivateOne, the shared in-flight promise, and the two elicit-and-retry
+ *  paths that stand in for runActivateOne's result. One declaration so a new
+ *  field reaches every one of them (`capped` once reached three of five).
+ *  `isChanged`: a new connection was made (false for already-loaded and for
+ *  every refusal). `capped`: the refusal was the concurrent-server cap, which
+ *  handleActivate and handleDispatch treat as informational beside a new
+ *  connection and as an error without one (explicitLoadIsError). */
+type ActivationResult = { ok: boolean; message: string; isChanged: boolean; serverId?: string; capped?: boolean };
+
+/** What a batch of explicit loads added up to -- see recordExplicitLoad. */
+interface ExplicitLoadTally {
+  /** Some namespace got a new connection, so the routes must be rebuilt. */
+  anyChanged: boolean;
+  /** Some refusal was NOT the server cap. */
+  anyError: boolean;
+  /** Some refusal WAS the server cap. */
+  anyCapped: boolean;
+  /** sessionActivated grew, which moves the gateway tools/list surface even
+   *  when no connection changed. */
+  advertisedGrew: boolean;
+}
+
+function newExplicitLoadTally(): ExplicitLoadTally {
+  return { anyChanged: false, anyError: false, anyCapped: false, advertisedGrew: false };
+}
+
+/** isError for an activate/dispatch reply: any refusal that was not the cap,
+ *  or cap refusals with no NEW connection beside them (a success that was
+ *  already loaded does not count as one). */
+function explicitLoadIsError(tally: ExplicitLoadTally): true | undefined {
+  return tally.anyError || (tally.anyCapped && !tally.anyChanged) ? true : undefined;
+}
 
 export class ConnectServer {
   private server: Server;
@@ -725,9 +774,12 @@ export class ConnectServer {
   // Short-term memory of activation failures; used by dispatch to
   // down-rank recently-flaky servers. Cleared on successful activation.
   private activationFailures = new Map<string, ActivationFailure>();
-  // Session-scoped credential overrides supplied by the user via MCP
-  // elicitation when a server's stderr indicated a missing env var.
-  // Cleared on shutdown — persistence belongs in the Yaw MCP
+  // Session-scoped credential values the user typed on the masked-entry page
+  // when a server's stderr named a missing env var (maybeElicitAndRetry).
+  // They fill in keys the server's bundles.json env leaves unset or empty; a
+  // non-empty value in the file wins (see effectiveEntry), and a value the
+  // child still rejects after the retry is dropped rather than kept to shadow
+  // a later fix. Cleared on shutdown — persistence belongs in the Yaw MCP
   // bundles.json, these are a "get me running now" shortcut.
   private elicitedEnv = new Map<string, Record<string, string>>();
   // Stop-asking latch for the VAULT PASSPHRASE elicitation. Not keyed by
@@ -764,33 +816,38 @@ export class ConnectServer {
   // credentials. Per-namespace (unlike the vault counter) because these are
   // the child's own secrets. Bounds the re-ask that replaced the old
   // "already elicited, never ask again" latch -- see MAX_CREDENTIAL_PROMPTS.
+  // An expired page spends its ask like any other; what sets an expiry apart
+  // is that it does not latch (below), so the next activate asks again while
+  // this count allows.
   private credentialPrompts = new Map<string, number>();
   // Latch: namespaces whose prompt has ended the asking for the session,
   // keyed by the REASON so a follow-up activate can surface the right
   // refusal. The vault uses a single boolean (`vaultPassphraseElicited`)
-  // and the same shaped message regardless of why; here, "decline" and
-  // "empty submission" are user decisions (return the raw spawn error,
-  // the user knows what they did) while "no-page" / "no-browser" are
-  // wall-shaped failures a follow-up activate would hit identically, and
-  // the user still needs the bundles.json hint on every attempt.
+  // and the same shaped message regardless of why; here, "declined" is a
+  // user decision (return the raw spawn error, the user knows what they
+  // did), "empty" is the defensive twin of it (a page result with no
+  // non-empty value, which the shipped page cannot produce -- see the
+  // submitted branch of maybeElicitAndRetry), and "no-page" / "no-browser"
+  // are wall-shaped failures a follow-up activate would hit identically,
+  // so the user gets the bundles.json hint on every attempt. An expired page
+  // never latches: the user may simply have been away.
   //
-  // Follow-up: the vault has `clearSessionVaultPassphrase` for an external
-  // caller (the `yaw-mcp secrets reset` CLI verb) to clear the latch
-  // WITHOUT a process restart. There is no equivalent here today -- a
-  // namespace that latches a no-browser stays latched until shutdown.
-  // Not worth building until a verb that needs it (e.g. a per-server
-  // "forget I asked") actually lands.
-  private credentialElicited = new Map<string, "declined" | "empty" | SecretPageFailure>();
+  // There is no reset for either prompt's latch short of a new ConnectServer.
+  // This one is cleared only by shutdown(); the vault's
+  // (`vaultPassphraseElicited`) is never cleared at all, and
+  // `clearSessionVaultPassphrase` -- called only from shutdown() and tests --
+  // clears the vault PASSPHRASE, not a latch. `yaw-mcp secrets reset` runs in
+  // its own process and cannot reach this one's state; it tells the user to
+  // restart a running server instead. Not worth building a reset until a verb
+  // that needs one (e.g. a per-server "forget I asked") actually lands.
+  private credentialElicited = new Map<string, "declined" | "empty" | Exclude<SecretPageFailure, "expired">>();
   // In-flight activation promises, keyed by namespace. Dedupes
   // concurrent activation attempts for the same namespace so that two
   // tool calls landing on a disconnected upstream don't each spawn
   // their own child process. Second and subsequent callers await the
   // same promise as the first; the entry is cleared when the promise
   // settles (success or failure).
-  private activationInflight = new Map<
-    string,
-    Promise<{ ok: boolean; message: string; isChanged: boolean; serverId?: string; capped?: boolean }>
-  >();
+  private activationInflight = new Map<string, Promise<ActivationResult>>();
   // Tracks namespaces whose current activationInflight was initiated by
   // prewarmDormantServers. An explicit mcp_connect_activate clears the
   // namespace from this set, which prevents prewarm from disconnecting a
@@ -853,8 +910,8 @@ export class ConnectServer {
   // Short-TTL dedup cache for discover output. Agents often call
   // discover twice in quick succession (e.g. once to list, again after
   // a failed activate) — the second call returns the same text if
-  // nothing has changed. Keyed on (configVersion, context, autoWarmed,
-  // active-namespace-set) so activate/deactivate naturally invalidates.
+  // nothing has changed. See discoverCacheKey for the key's components; the
+  // connected set is one, so activate/deactivate naturally invalidates.
   private discoverCache: {
     key: string;
     result: { content: Array<{ type: string; text: string }> };
@@ -1142,11 +1199,16 @@ export class ConnectServer {
   // show, so a curated list is still worth rendering over it.
   //
   // This is the ONE precedence rule for a cold server's tool list. Every
-  // reader goes through it -- getProfiledActiveServers merges once and the
-  // discover body reads the merged `server.toolCache`; rankableFor calls it
-  // for the BM25 corpus. Two more copies of the resolution used to live in
-  // those readers with `??` semantics (empty learned list WINS), so discover
-  // could rank a server on an empty list while listing its curated tools.
+  // reader of the LIST goes through it: getProfiledActiveServers merges once,
+  // and what reads its result (the discover body, getDeferredServers and so
+  // the deferred routes and tools/list, dispatch's sampling tiebreak) sees the
+  // merged `server.toolCache`; rankableFor (the BM25 corpus),
+  // estimateTokensFor, coldStartHint and unmatchedFilterNames call it
+  // directly. Copies of the resolution used to live in readers with `??`
+  // semantics (empty learned list WINS), so discover could rank a server on
+  // an empty list while listing its curated tools. hasKnownTools and
+  // isLearnedCacheStale read this.toolCache raw on purpose: they ask whether
+  // a list was OBSERVED, and an empty one was.
   //
   // Identity preservation: when both sides resolve to the same array
   // reference — which in practice means BOTH are undefined (server.ts
@@ -1484,18 +1546,47 @@ export class ConnectServer {
   }
 
   /** The entry as a fresh activation would actually launch it: the config
-   *  file's entry with any session-elicited credentials merged over its env.
+   *  file's entry with any session-elicited credentials filling in the env
+   *  keys the file leaves unset or empty.
    *
-   *  ONE copy, reached from both the activation path (which builds the child
-   *  from it) and the staleness check below (which compares a live child
-   *  against it). Two copies drifted the moment elicitation existed: a
-   *  connection is launched from the MERGED shape and remembers it as
-   *  connection.config, so comparing a freshly-parsed entry against it
-   *  directly reads every elicited server as "launch config changed" and
-   *  reaps a healthy child on the next unrelated edit. */
+   *  The FILE wins for a key it sets to a non-empty value. The give-up and
+   *  refusal messages tell the user to set the key in bundles.json and
+   *  activate again, and that edit has to be what the next launch uses:
+   *  with the elicited value merged on top, a value typed this session
+   *  shadowed the file for the rest of it, so the recommended fix did
+   *  nothing until a client restart -- and the staleness check below, which
+   *  compares through this same function, never saw the edit either, so it
+   *  left the child running on the typed value. With the file winning, a
+   *  file value that differs from the typed one moves the launch identity
+   *  like any other env edit, and reconcileConfig reaps the child so the next
+   *  activate launches it from the file.
+   *
+   *  ONE copy, reached from the activation path (which builds the child from
+   *  it), the staleness check below (which compares a live child against it)
+   *  and handleReadTool's transient connect (which must inspect the server
+   *  under the env an activation would give it). Copies drifted the moment
+   *  elicitation existed: a connection is launched from the MERGED shape and
+   *  remembers it as connection.config, so comparing a freshly-parsed entry
+   *  against it directly reads every elicited server as "launch config
+   *  changed" and reaps a healthy child on the next unrelated edit. */
   private effectiveEntry(entry: UpstreamServerConfig): UpstreamServerConfig {
     const elicited = this.elicitedEnv.get(entry.namespace);
-    return elicited ? { ...entry, env: { ...entry.env, ...elicited } } : entry;
+    if (!elicited) return entry;
+    const fillIns: Record<string, string> = {};
+    for (const [key, value] of Object.entries(elicited)) {
+      if (!this.entrySetsEnv(entry, key)) fillIns[key] = value;
+    }
+    return Object.keys(fillIns).length === 0 ? entry : { ...entry, env: { ...entry.env, ...fillIns } };
+  }
+
+  /** Does the config entry itself set `key` to a non-empty value? Such a key
+   *  belongs to the file: effectiveEntry never lets an elicited value replace
+   *  it, and maybeElicitAndRetry therefore never asks for it (the answer would
+   *  be ignored). An empty string counts as unset -- a `"GITHUB_TOKEN": ""`
+   *  placeholder is exactly the gap the prompt exists to fill. */
+  private entrySetsEnv(entry: UpstreamServerConfig | undefined, key: string): boolean {
+    const value = entry?.env?.[key];
+    return typeof value === "string" && value.length > 0;
   }
 
   /** Is this namespace exempt from the idle reaper (types.ts `pinned`)?
@@ -1760,6 +1851,17 @@ export class ConnectServer {
     // lives -- reconcileConfig is reached only from maybeReloadBundles, on
     // the meta-tool boundary, where a connected set genuinely does exist.
     await this.hydrateComplianceGrades();
+
+    // Build the routing table now, from the graded config and the hydrated
+    // learned tool lists. tools/list advertises deferred tools straight off
+    // getDeferredServers(), not off the routes, so a table left empty here
+    // turns the first tools/call (or exec step) on an advertised cached tool
+    // into `Unknown tool` instead of a lazy activation. Pre-warm's rebuild
+    // cannot stand in for this: it runs only when it populated something, and
+    // in the steady state (every learned list fresh, or YAW_MCP_PREWARM=0) it
+    // returns before that. No list_changed notification: the transport is not
+    // connected yet, so the client's first tools/list already sees this.
+    this.rebuildRoutes();
 
     // Prewarm the uv bootstrap if any configured server needs it. Fire
     // and forget — ensureUv() is memoized, so the first activation
@@ -3033,10 +3135,9 @@ export class ConnectServer {
     };
   }
 
-  // Drop the memoized discover body. The cache key only covers
-  // (configVersion, context, warmedNamespace, connected set, tool filters,
-  // advertised set), so state that
-  // discover RENDERS but the key does not see -- activation failures
+  // Drop the memoized discover body. The cache key covers only the components
+  // discoverCacheKey (below) lists and explains, so state that discover
+  // RENDERS but the key does not see -- activation failures
   // (formatHealthWarning) and learning counters (usage:/reliability: lines)
   // -- has to invalidate explicitly. Without this the exact case the cache
   // was built for ("discover, failed activate, discover again") replays the
@@ -3162,11 +3263,8 @@ export class ConnectServer {
       );
     }
     if (disabled.length > 0) {
-      // Not a hardcoded ~/.yaw-mcp/bundles.json: a trusted project-local
-      // .yaw-mcp/bundles.json defines servers too, and a disabled one may
-      // live only there.
       parts.push(
-        `Set "isActive": true for a server in the bundles.json that defines it (~/.yaw-mcp/bundles.json, or a trusted project-local .yaw-mcp/bundles.json); mcp_connect_discover lists what is installed but disabled. The edit is picked up on the next mcp_connect_* call, with no client restart.`,
+        `Set "isActive": true for a server in ${bundlesFileHint("defines-it")}; mcp_connect_discover lists what is installed but disabled. The edit is picked up on the next mcp_connect_* call, with no client restart.`,
       );
     }
     return parts.join(" ");
@@ -3224,7 +3322,7 @@ export class ConnectServer {
         const configured = this.config.servers.find((srv) => srv.namespace === focusNamespace);
         if (configured && configured.isActive === false) {
           return focusMiss(
-            `"${focusNamespace}" is installed but disabled ("isActive": false in ~/.yaw-mcp/bundles.json). Call mcp_connect_discover with no arguments to list what is available.`,
+            `"${focusNamespace}" is installed but disabled -- "isActive": false in ${bundlesFileHint("defines-it")}. Call mcp_connect_discover with no arguments to list what is available.`,
           );
         }
         if (configured) {
@@ -3237,8 +3335,8 @@ export class ConnectServer {
         )[0];
         return focusMiss(
           near
-            ? `"${focusNamespace}" is not in ~/.yaw-mcp/bundles.json. Did you mean: ${near}?`
-            : `"${focusNamespace}" is not in ~/.yaw-mcp/bundles.json. Call mcp_connect_discover with no arguments to list what is available.`,
+            ? `"${focusNamespace}" is not in ${bundlesFileHint("in-effect")}. Did you mean: ${near}?`
+            : `"${focusNamespace}" is not in ${bundlesFileHint("in-effect")}. Call mcp_connect_discover with no arguments to list what is available.`,
         );
       }
     }
@@ -3767,11 +3865,7 @@ export class ConnectServer {
   // Returns:
   //   { ok: true, message } — already connected or newly connected
   //   { ok: false, message, isChanged: false } — failed or not in config
-  private activateOne(
-    namespace: string,
-    progress?: ProgressReporter,
-    fromPrewarm = false,
-  ): Promise<{ ok: boolean; message: string; isChanged: boolean; serverId?: string; capped?: boolean }> {
+  private activateOne(namespace: string, progress?: ProgressReporter, fromPrewarm = false): Promise<ActivationResult> {
     // Refuse once shutdown() has latched. Anything spawned from here would
     // land in this.connections after the teardown snapshot and outlive the
     // process's own bookkeeping — a live child nothing will ever close.
@@ -3964,7 +4058,7 @@ export class ConnectServer {
     if (!refusal) return null;
     switch (refusal.kind) {
       case "disabled":
-        return `"${refusal.namespace}" is installed but disabled. Set "isActive": true for it in ~/.yaw-mcp/bundles.json and try again to ${purpose} -- the edit is picked up on the next mcp_connect_* call, with no client restart.`;
+        return `"${refusal.namespace}" is installed but disabled. Set "isActive": true for it in ${bundlesFileHint("defines-it")} and try again to ${purpose} -- the edit is picked up on the next mcp_connect_* call, with no client restart.`;
       case "profile":
         return `"${refusal.namespace}" is not allowed by the project profile at ${refusal.profilePath}.`;
       case "compliance":
@@ -4106,7 +4200,7 @@ export class ConnectServer {
    */
   private coldStartHint(server: UpstreamServerConfig): string {
     if (server.type !== "local" || server.command === undefined) return "";
-    const cached = this.toolCache.get(server.namespace) ?? server.toolCache;
+    const cached = this.mergeToolCache(server).toolCache;
     if (cached && cached.length > 0) return "";
     // The launcher basename, with the Windows extensions stripped the same way
     // nodeLaunchKind does it -- `npx.cmd`, `C:/.../uvx.exe` and a bare `npx`
@@ -4122,7 +4216,7 @@ export class ConnectServer {
     fromPrewarm = false,
     skipCap = false,
     isElicitRetry = false,
-  ): Promise<{ ok: boolean; message: string; isChanged: boolean; serverId?: string; capped?: boolean }> {
+  ): Promise<ActivationResult> {
     const existing = this.connections.get(namespace);
     if (existing && existing.status === "connected") {
       progress?.(`"${namespace}" already loaded`);
@@ -4155,8 +4249,8 @@ export class ConnectServer {
     if (!anyMatch) {
       // Split "not found" from "disabled" so the caller knows whether to
       // (a) fix a typo / install the server or (b) set "isActive": true
-      // for it in ~/.yaw-mcp/bundles.json. Fuzzy suggestions only when the
-      // input is a clear near-miss — noise-free by construction
+      // for it in the bundles.json that defines it. Fuzzy suggestions only
+      // when the input is a clear near-miss — noise-free by construction
       // (closestNames returns [] otherwise).
       const allNamespaces = this.config?.servers.map((s) => s.namespace) ?? [];
       const suggestions = closestNames(namespace, allNamespaces, 3);
@@ -4229,10 +4323,11 @@ export class ConnectServer {
     // the retry passes skipCap rather than relying on the reservation.
     this.pendingActivations.add(namespace);
     try {
-      // Merge any session-elicited env over the server's configured env.
-      // Elicited values only apply inside this yaw-mcp process lifetime.
-      // Through effectiveEntry so the staleness check below compares this
-      // child against the same shape it was launched from.
+      // Fill any env keys the config leaves unset or empty with
+      // session-elicited values (the file wins for a key it sets). Elicited
+      // values only apply inside this yaw-mcp process lifetime. Through
+      // effectiveEntry so the staleness check below compares this child
+      // against the same shape it was launched from.
       const effectiveConfig = this.effectiveEntry(serverConfig);
 
       let lastError: unknown = null;
@@ -4373,10 +4468,12 @@ export class ConnectServer {
 
       // Before giving up, see if the failure looks like a missing credential
       // and the client supports elicitation. If both hold, ask the user for
-      // the missing values and retry exactly once — one round-trip max.
-      //
-      // Guarded by the haven't-just-tried-this-credential check: if elicited
-      // values are already present for every detected name, don't ask twice.
+      // the missing values on the masked page and retry the activation with
+      // them. Inside the retry that ask bought, a child still naming only
+      // keys just supplied gets a message, not a second identical modal; one
+      // that names a key for the first time gets a fresh ask. Every ask, in
+      // one activate or across several, spends one of the namespace's
+      // MAX_CREDENTIAL_PROMPTS.
       const elicitedRetry = await this.maybeElicitAndRetry(namespace, lastError, progress, fromPrewarm, isElicitRetry);
       if (elicitedRetry) return elicitedRetry;
 
@@ -4414,16 +4511,21 @@ export class ConnectServer {
 
   // If the activation error names a missing credential (e.g. "GITHUB_TOKEN
   // is required") AND the client supports elicitation, ask the user for
-  // the values inline and retry activation once. Returns the retry result
-  // on success, or null when we can't/shouldn't elicit. Single-round only —
-  // we don't want to pester the user with a loop on every retry failure.
+  // the values on the masked loopback page and retry the activation with
+  // them. Returns the retry's result; a refusal that says what went wrong
+  // (the page could not start, could not be shown or expired; the values
+  // just typed were not accepted; shutdown); or null when we can't/shouldn't
+  // elicit and the caller's give-up path should report the raw spawn error.
+  // Bounded rather than single-round: inside the retry an ask bought, only a
+  // key nobody has typed yet gets another ask, and every ask spends one of
+  // the namespace's MAX_CREDENTIAL_PROMPTS for the session.
   private async maybeElicitAndRetry(
     namespace: string,
     lastError: unknown,
     progress?: ProgressReporter,
     fromPrewarm = false,
     isElicitRetry = false,
-  ): Promise<{ ok: boolean; message: string; isChanged: boolean; serverId?: string } | null> {
+  ): Promise<ActivationResult | null> {
     // yaw-mcp's OWN vault passphrase is a separate path, matched by ERROR
     // TYPE rather than by pattern-matching text. resolveServerEnv throws
     // before any child is spawned, so there is no child stderr in play and no
@@ -4443,7 +4545,17 @@ export class ConnectServer {
     // value lands in elicitedEnv and is merged into that same child's env on
     // retry, walking straight past stripInternalSecretsFromEnv. The genuine
     // case is the typed branch above.
-    const missing = detectMissingCredentials(haystack).filter((k) => !INTERNAL_SECRET_ENV_KEYS.has(k.toUpperCase()));
+    //
+    // A key the server's bundles.json entry already sets to a non-empty value
+    // is not asked for either: effectiveEntry lets the file win for it, so a
+    // value typed on the page would be stored and then ignored, and the retry
+    // would report it "not accepted" without ever having used it. The raw
+    // spawn error is the honest answer there -- the file's value is the one
+    // the child saw.
+    const liveEntry = this.config?.servers.find((s) => s.namespace === namespace);
+    const missing = detectMissingCredentials(haystack).filter(
+      (k) => !isInternalSecretEnvKey(k) && !this.entrySetsEnv(liveEntry, k),
+    );
     if (missing.length === 0) return null;
 
     // Only a key the prompt actually SUPPLIED can have been "not accepted".
@@ -4482,10 +4594,20 @@ export class ConnectServer {
       // The failure touches nothing in the discover cache key, so a
       // re-discover inside the 3s TTL would hand back the pre-failure text.
       this.invalidateDiscoverCache();
+      // Drop the rejected values. The child just said they do not work, yet
+      // effectiveEntry fills unset keys from this map, so a kept value rode
+      // along on every later launch of this server until a new ask replaced
+      // it -- and a plaintext secret nobody can use has no business sitting
+      // in memory for the rest of the session. Keys the child did not name
+      // again (accepted ones) stay.
+      const kept = { ...supplied };
+      for (const key of missing) delete kept[key];
+      if (Object.keys(kept).length === 0) this.elicitedEnv.delete(namespace);
+      else this.elicitedEnv.set(namespace, kept);
       const promptsSoFar = this.credentialPrompts.get(namespace) ?? 0;
       const retryHint =
         promptsSoFar >= MAX_CREDENTIAL_PROMPTS
-          ? ` No further prompts for "${namespace}" this session: set ${missing.join(", ")} in its "env" in ~/.yaw-mcp/bundles.json and activate again -- the edit is picked up on the next mcp_connect_* call, with no client restart.`
+          ? this.noFurtherCredentialPromptsHint(namespace, missing)
           : ` Activate "${namespace}" again to try new ones.`;
       return {
         ok: false,
@@ -4501,10 +4623,10 @@ export class ConnectServer {
     // failure the vault path was redesigned away from. Re-ask instead,
     // bounded by MAX_CREDENTIAL_PROMPTS per namespace so a server failing
     // for an unrelated reason cannot turn every activation into a modal.
-    // Latch BEFORE the budget check, the way the vault does it: a decline,
-    // a no-page or a no-browser is a wall a second prompt would hit
-    // identically, and a wall wastes a budget slot the user could spend on
-    // a real reason to ask again.
+    // Latch BEFORE the budget check, the way the vault does it: a decline is
+    // a decision and a no-page or no-browser is a wall a second prompt would
+    // hit identically -- either way a re-ask wastes a budget slot the user
+    // could spend on a real reason to ask again.
     if (this.credentialElicited.has(namespace)) {
       const reason = this.credentialElicited.get(namespace);
       log("debug", "Namespace already declined or unreachable for credential prompt; not asking again", {
@@ -4515,9 +4637,10 @@ export class ConnectServer {
       // Wall-shaped latches get the same helpful refusal on every follow-up
       // activate: the user is going to keep trying (it's an automation /
       // a script that retries, or the user hitting activate again) and
-      // they need the bundles.json hint each time. Decline and empty
-      // submission are user decisions -- return the raw spawn error so
-      // the user sees what their action caused, not the workaround.
+      // they need the bundles.json hint each time. A decline is a user
+      // decision -- return the raw spawn error so the user sees what their
+      // action caused, not the workaround -- and "empty" (defensive; see the
+      // submitted branch below) is treated the same way.
       if (reason === "no-page" || reason === "no-browser") {
         return this.credentialUnreachableRefusal(namespace, missing, reason);
       }
@@ -4561,14 +4684,13 @@ export class ConnectServer {
 
     const isPlural = missing.length !== 1;
     const what = isPlural ? "them" : "it";
-    const pronoun = isPlural ? "their" : "its";
     // The bundles.json hint appears in both places a user reads text on this
     // path: the dialog message (form mode) or the URL-mode prompt's lead
     // (URL mode) -- the `why` field -- AND the page itself once it opens.
     // Dropping it from either side is a regression to the pre-#168 UX, where
     // a user with no working memory of the vault-style hint had to discover
     // the env path by reading the source.
-    const fixHint = `Set ${what} in this server's "env" in ~/.yaw-mcp/bundles.json to skip this prompt in future sessions.`;
+    const fixHint = `Set ${what} in this server's "env" in ${bundlesFileHint("defines-it")} to skip this prompt in future sessions.`;
     const why = `"${namespace}" cannot start: it reports ${missing.join(", ")} missing. ${fixHint}`;
     const entry = await this.collectSecretOnLoopbackPage({
       namespace,
@@ -4576,7 +4698,9 @@ export class ConnectServer {
       secretNoun: isPlural ? `the values of ${missing.join(", ")}` : `the value of ${missing[0]}`,
       page: {
         title: `"${namespace}" needs ${isPlural ? "credentials" : "a credential"} to start`,
-        intro: `"${namespace}" cannot start without ${missing.join(", ")} and reported ${pronoun} missing key${isPlural ? "s" : ""} on ${pronoun} own. Type ${isPlural ? "each value" : "the value"} below. yaw-mcp keeps ${what} in memory for this session only -- never written to disk, and never passed to anything other than "${namespace}". ${fixHint}`,
+        // "its" in both slots: the subject is the one server, however many
+        // keys it named.
+        intro: `"${namespace}" cannot start without ${missing.join(", ")} and reported its missing key${isPlural ? "s" : ""} on its own. Type ${isPlural ? "each value" : "the value"} below. yaw-mcp keeps ${what} in memory for this session only -- never written to disk, and never passed to anything other than "${namespace}". ${fixHint}`,
         fields: missing.map((name) => ({ name, label: name })),
         doneMessage: "Received. You can close this tab and return to your MCP client.",
       },
@@ -4604,10 +4728,14 @@ export class ConnectServer {
     }
     if (entry.kind === "unreachable") {
       // Same latch rules as the vault path: no-page and no-browser are a
-      // wall a second prompt would hit identically, so ask again wastes
-      // a round-trip. Expired is a user-away state and gets the remaining
-      // budget -- the user may simply have been away. Match vault wording
-      // so a user who saw the vault message once recognises the shape.
+      // wall a second prompt would hit identically, so asking again wastes
+      // a round-trip. Expired is a user-away state and does not latch --
+      // the user may simply have been away -- so the next activate asks
+      // again while the budget lasts. All three return the refusal rather
+      // than null, as the vault does: it says what happened to the page,
+      // which the give-up path's raw "spawn failed" would not, and it skips
+      // that path's dispatch penalty against a server whose only problem
+      // is a value nobody got to type.
       log("info", "Credential masked-entry page was unreachable", {
         namespace,
         missing,
@@ -4622,29 +4750,32 @@ export class ConnectServer {
         // reason so the early check can re-render the same refusal on a
         // follow-up activate.
         this.credentialElicited.set(namespace, entry.reason);
-        return this.credentialUnreachableRefusal(namespace, missing, entry.reason);
       }
-      return null;
+      return this.credentialUnreachableRefusal(namespace, missing, entry.reason);
     }
 
-    // entry.kind === "submitted". Pick the keys we actually asked for -- a
-    // page with extra fields would carry extras we did not elicit, and an
-    // empty value on a field the page did show reads as a deliberate blank
-    // (the user typed and deleted), so it does not override supplied.
+    // entry.kind === "submitted". Pick the keys we actually asked for, and
+    // only non-empty strings. With the shipped page both filters are
+    // no-ops: its fields are exactly `missing`, every input is `required`,
+    // and its POST handler answers 400 "Every field is required." to a
+    // missing or empty field, so a submitted result carries every asked key
+    // non-empty (secret-entry-page.ts). They are defense in depth against a
+    // page implementation that drifts: an extra field would otherwise leak
+    // into this server's env, and a blank one would override a supplied
+    // value through the merge below.
     const values: Record<string, string> = {};
     for (const key of missing) {
       const v = entry.values[key];
       if (typeof v === "string" && v.length > 0) values[key] = v;
     }
     if (Object.keys(values).length === 0) {
-      // User opened the page and submitted nothing (or every field blank).
-      // Same as a decline for the user's purposes: they engaged with the
-      // prompt and chose to send no value. Latch here so a follow-up
-      // activate hits the early check at the top of this function and
-      // does not re-open the page -- this return-null is for THIS
-      // activate only; the latch owns the next ask. The "empty" reason
-      // makes the early check fall through to the raw spawn error,
-      // the same as a decline: this was a user decision, not a wall.
+      // Defensive, like the filter above: the shipped page cannot return a
+      // submission with no non-empty value. Should a drifted page do so,
+      // treat it like a decline -- latch so a follow-up activate hits the
+      // early check at the top of this function instead of re-opening the
+      // page, and let the "empty" reason fall through there to the raw
+      // spawn error, the same as a decline. This return-null is for THIS
+      // activate only; the latch owns the next ask.
       log("info", "Credential masked-entry page returned no values", { namespace, missing });
       this.credentialElicited.set(namespace, "empty");
       return null;
@@ -4652,7 +4783,8 @@ export class ConnectServer {
 
     this.elicitedEnv.set(namespace, { ...supplied, ...values });
     progress?.("Got credentials — retrying load");
-    // Recurse — runActivateOne merges elicitedEnv on this attempt.
+    // Recurse — runActivateOne fills the env from elicitedEnv on this
+    // attempt (through effectiveEntry).
     // Call runActivateOne directly (not activateOne) because we're
     // already inside the in-flight activation promise registered by
     // activateOne; going through the wrapper again would deadlock on
@@ -4703,7 +4835,7 @@ export class ConnectServer {
     lastError: VaultPassphraseRequiredError,
     progress?: ProgressReporter,
     fromPrewarm = false,
-  ): Promise<{ ok: boolean; message: string; isChanged: boolean; serverId?: string } | null> {
+  ): Promise<ActivationResult | null> {
     // Someone else is already asking. Join their prompt: on success retry
     // straight away (the vault is now unlocked for every namespace, which is
     // the whole point); on a rejected entry report it exactly as the winner
@@ -4840,44 +4972,59 @@ export class ConnectServer {
   }
 
   // The result for a missing-credential prompt whose masked-entry page never
-  // took a value. Only called for no-page and no-browser -- expired keeps
-  // the budget and falls through to runActivateOne's give-up, since the user
-  // may simply have been away. The shape mirrors vaultPassphraseUnreachable
-  // so a user who saw the vault message once recognises this one: explain
-  // what could not happen, then point at the bundles.json env path as the
-  // long-term fix. The retry hint is the same shape for both reasons: the
-  // latch above this branch (no-page / no-browser) means a second activate
-  // goes straight to the give-up, so a "no further prompts" line on the
-  // first prompt would be inaccurate.
+  // took a value: it could not start, no browser could be opened for it, or
+  // it expired with nothing submitted. The shape mirrors
+  // vaultPassphraseUnreachable so a user who saw the vault message once
+  // recognises this one: explain what could not happen, then say whether
+  // activating again will open a new page, and point at the bundles.json env
+  // path either way.
+  //
+  // The retry hint reads the latch and the budget, as the vault's reads its
+  // latch, because the two outcomes differ. No-page and no-browser latch the
+  // namespace before this runs (and the early check in maybeElicitAndRetry
+  // re-renders this same refusal on every follow-up activate), so for them a
+  // new page is never coming this session. An expired page does not latch:
+  // the next activate opens a new page if the namespace has an ask left under
+  // MAX_CREDENTIAL_PROMPTS, and returns the raw spawn error if it does not.
   private credentialUnreachableRefusal(
     namespace: string,
     missing: string[],
     reason: SecretPageFailure,
   ): { ok: false; message: string; isChanged: false } {
+    const isPlural = missing.length !== 1;
+    const noun = isPlural ? "credentials" : "credential";
     let what: string;
     switch (reason) {
       case "no-browser":
-        what =
-          "yaw-mcp could not open a browser on this machine for the page that takes the credential in a masked field";
+        what = `yaw-mcp could not open a browser on this machine for the page that takes the ${noun} in a masked field`;
         break;
       case "no-page":
-        what = "yaw-mcp could not start the local page that takes the credential in a masked field";
+        what = `yaw-mcp could not start the local page that takes the ${noun} in a masked field`;
         break;
       case "expired":
-        // Caller-side: the unreachable branch returns null for expired
-        // before this helper runs, so seeing it here is a logic bug. Let
-        // the type system flag a future addition to SecretPageFailure
-        // instead of silently mis-rendering.
-        throw new Error(
-          `credentialUnreachableRefusal called with reason "expired" -- the caller should have returned null`,
-        );
+        what = `the page that takes the ${noun} in a masked field expired with nothing submitted`;
+        break;
     }
-    const retryHint = ` Activate "${namespace}" again for a new page, or set ${missing.join(", ")} in its "env" in ~/.yaw-mcp/bundles.json to skip the prompt in future sessions.`;
+    const newPageComing =
+      !this.credentialElicited.has(namespace) && (this.credentialPrompts.get(namespace) ?? 0) < MAX_CREDENTIAL_PROMPTS;
+    const retryHint = newPageComing
+      ? ` Activate "${namespace}" again for a new page, or set ${missing.join(", ")} in its "env" in ${bundlesFileHint("defines-it")} -- the edit is picked up on the next mcp_connect_* call, with no client restart.`
+      : this.noFurtherCredentialPromptsHint(namespace, missing);
     return {
       ok: false,
       isChanged: false,
-      message: `Could not load "${namespace}": ${what}, so ${missing.join(", ")} is still missing.${retryHint}`,
+      message: `Could not load "${namespace}": ${what}, so ${missing.join(", ")} ${isPlural ? "are" : "is"} still missing.${retryHint}`,
     };
+  }
+
+  // The retry hint for a namespace this session will not prompt for again
+  // (latched, or MAX_CREDENTIAL_PROMPTS spent). One copy for every message
+  // that ends the asking, so they cannot drift. The bundles.json edit it
+  // recommends does get through: bundles.json is re-read at meta-tool
+  // boundaries, effectiveEntry lets the file's value win over any elicited
+  // one, and a spawn that succeeds never reaches the prompt or its latch.
+  private noFurtherCredentialPromptsHint(namespace: string, missing: string[]): string {
+    return ` No further prompts for "${namespace}" this session: set ${missing.join(", ")} in its "env" in ${bundlesFileHint("defines-it")} and activate again -- the edit is picked up on the next mcp_connect_* call, with no client restart.`;
   }
 
   // Collect secret values WITHOUT them ever being typed into the client's
@@ -4995,9 +5142,12 @@ export class ConnectServer {
         () => page.result,
       );
       // URL mode: tell the client the out-of-band step is over, so it can drop
-      // whatever "waiting" state it shows. Not sent when the page was closed
-      // under us -- that is shutdown, and the transport is going with it.
-      if (mode === "url" && outcome.kind !== "closed") this.notifyElicitationComplete(page.elicitationId, namespace);
+      // whatever "waiting" state it shows -- whatever ended it, a "closed"
+      // page included: the page module also ends with "closed" when its
+      // listener fails after listen, and that client is still there waiting.
+      // Not sent once shutdown() has latched, which is also what closes a
+      // page under the wait: the transport is going with it.
+      if (mode === "url" && !this.shuttingDown) this.notifyElicitationComplete(page.elicitationId, namespace);
       if (outcome.kind === "submitted") return { kind: "submitted", values: outcome.values };
       if (outcome.kind === "expired") return { kind: "unreachable", reason: "expired" };
       return { kind: "failed" };
@@ -5030,7 +5180,9 @@ export class ConnectServer {
   // which of these happened, because they need different words:
   //   unlocked    -- verified and stored; retry the activation.
   //   rejected    -- the user typed a passphrase and it did not verify.
-  //   unavailable -- declined, empty, or the elicitation request failed.
+  //   unavailable -- declined; no answer (the elicitation request failed,
+  //                  or the page closed under the wait); or, from a drifted
+  //                  page only, an empty submission.
   //   unreachable -- the masked-entry page never took a passphrase.
   private async promptForVaultPassphrase(
     namespace: string,
@@ -5085,6 +5237,10 @@ export class ConnectServer {
       return { kind: "unreachable", reason: entry.reason };
     }
 
+    // Defense in depth: the shipped page refuses an empty field with a 400
+    // before it settles (secret-entry-page.ts), so a submitted result always
+    // carries a non-empty passphrase. Only a drifted page implementation can
+    // reach this.
     const value = entry.values[VAULT_PAGE_FIELD];
     if (typeof value !== "string" || value.length === 0) return { kind: "unavailable" };
 
@@ -5102,13 +5258,58 @@ export class ConnectServer {
     }
 
     // Into the module-level session slot, deliberately NOT into elicitedEnv:
-    // runActivateOne merges that map over the server's configured env, so
+    // runActivateOne fills the child's env from that map, so
     // storing it there would hand the vault passphrase to the very child we
     // are unlocking the vault FOR.
     setSessionVaultPassphrase(value);
     // Verified, so no further asking is warranted whatever happens next.
     this.vaultPassphraseElicited = true;
     return { kind: "unlocked" };
+  }
+
+  // The bookkeeping the two meta-tools that load what the client ASKED for
+  // share -- handleActivate (by name) and handleDispatch (by intent). One
+  // copy, so a new per-namespace flag or notify condition cannot reach one of
+  // them and miss the other, which is how two hand-kept "mirrors
+  // handleActivate" loops drift. autoLoadRecurringPack and discover's
+  // auto-warm also add to sessionActivated but are deliberately not routed
+  // through here: they report no cap/error split and no isError. What each
+  // handler does beyond this -- activate's filter rollback and upstream
+  // `instructions`, dispatch's scored result lines -- stays in the handler.
+  //
+  // Gateway mode advertises a namespace only on a signal of what the user
+  // wants -- by name or by intent here, by discover's auto-warm and by replay
+  // of their recurring pack at those two sites -- never in activateOne, which
+  // the deferred first-call path and prewarm also route through: surfacing a
+  // whole namespace off those would grow the tool list as a side effect of
+  // one call. So the sessionActivated add lives here, on success only. A cap
+  // refusal is booked apart from every other refusal (its message says what
+  // to unload); explicitLoadIsError says what each means for the reply.
+  private recordExplicitLoad(tally: ExplicitLoadTally, namespace: string, r: ActivationResult): void {
+    if (r.isChanged) tally.anyChanged = true;
+    if (r.ok) {
+      if (!this.sessionActivated.has(namespace)) tally.advertisedGrew = true;
+      this.sessionActivated.add(namespace);
+    } else if (r.capped) {
+      tally.anyCapped = true;
+    } else {
+      tally.anyError = true;
+    }
+  }
+
+  // After the batch: a new connection needs the routes rebuilt AND the
+  // client told. An advertised set that grew with no new connection (a
+  // winner already connected but never advertised) -- or, for activate, a
+  // `tools` filter change on a connected server -- leaves the routes current
+  // but moves the tools/list surface, so the client still has to re-list.
+  // Without that arm a gateway client is told tools are "now callable" while
+  // its tools/list never learns they exist.
+  private async announceExplicitLoads(tally: ExplicitLoadTally, surfaceMoved = false): Promise<void> {
+    if (tally.anyChanged) {
+      await this.refreshRoutesAndNotify();
+    } else if (surfaceMoved || tally.advertisedGrew) {
+      await this.notifyAllListsChanged();
+    }
   }
 
   private async handleActivate(
@@ -5182,15 +5383,7 @@ export class ConnectServer {
     // Fenced upstream `instructions` blocks, appended after every broker line.
     // See the collection site in the loop below.
     const upstreamInstructions: string[] = [];
-    let anyChanged = false;
-    let anyError = false;
-    let anyCapped = false;
-    // Did sessionActivated actually GROW? A winner can succeed without a
-    // connection change (isChanged:false -- e.g. a namespace a deferred
-    // first tools/call connected, now being asked for by name). Under
-    // gateway exposure that still moves the tools/list surface, so the
-    // anyChanged-gated notify below is not enough on its own.
-    let advertisedGrew = false;
+    const tally = newExplicitLoadTally();
 
     // NB: no compliance pre-check here. The YAW_MCP_MIN_COMPLIANCE floor is
     // enforced once, inside runActivateOne, so every activation path shares
@@ -5200,7 +5393,8 @@ export class ConnectServer {
     // is also disabled or profile-blocked reported the compliance reason to
     // `activate` and the disabled/blocked reason to `dispatch`. Refusals are
     // still errors (not cap-style budgeting) because a failed activateOne
-    // returns ok:false with capped unset, which sets anyError below.
+    // returns ok:false with capped unset, which recordExplicitLoad books as
+    // an error.
     const total = namespaces.length;
     let i = 0;
     for (const namespace of namespaces) {
@@ -5208,18 +5402,9 @@ export class ConnectServer {
       progress?.(`Loading ${namespace} (${i}/${total})`, i - 1, total);
       const r = await this.activateOne(namespace, progress);
       results.push(r.message);
-      if (r.isChanged) anyChanged = true;
-      // Gateway mode advertises a namespace only after the USER asks for
-      // it -- BY NAME here, by INTENT in handleDispatch and discover's
-      // auto-warm, by REPLAY of their own recurring pack in
-      // autoLoadRecurringPack -- not in activateOne, which the deferred
-      // first-call path and prewarm also route through. Those reach a tool
-      // without the client having chosen the server, so surfacing the whole
-      // namespace off them would grow the tool list as a side effect of
-      // one call. Recorded on success only.
+      // Flags plus the sessionActivated add, shared with handleDispatch.
+      this.recordExplicitLoad(tally, namespace, r);
       if (r.ok) {
-        if (!this.sessionActivated.has(namespace)) advertisedGrew = true;
-        this.sessionActivated.add(namespace);
         // The server's own initialize-time `instructions`, if it sent any.
         // Collected here and rendered after the loop, so the broker's own
         // per-namespace lines come first and the third-party text is a
@@ -5238,12 +5423,7 @@ export class ConnectServer {
           upstreamInstructions.push(fenceUpstreamInstructions(namespace, captured));
         }
       }
-      // Cap refusals are tracked separately: alongside successes they are
-      // informational (the per-namespace message says what to unload), but
-      // when NOTHING loads the call did no work and must signal an error.
       if (!r.ok) {
-        if (r.capped) anyCapped = true;
-        else anyError = true;
         // Roll back a filter we installed for a namespace that never came
         // up. Otherwise the entry outlives this call and narrows the tool
         // surface of a LATER, successful activation nobody filtered — and
@@ -5270,18 +5450,10 @@ export class ConnectServer {
     // whole transport. The response itself IS the completion signal;
     // the tail-end progress would be redundant anyway.
 
-    if (anyChanged) {
-      await this.refreshRoutesAndNotify();
-    } else if (filtersChanged || advertisedGrew) {
-      // Filter changed, or the advertised set grew, on an already-connected
-      // server -- routes are unchanged (whoever connected it rebuilt them,
-      // and dispatch still reaches hidden tools) but the tools/list surface
-      // moved, so notify the client to re-list. Without the advertisedGrew
-      // arm, a gateway-exposure client that activates an auto-loaded-but-
-      // never-advertised namespace is told the tools are "now callable"
-      // while its tools/list never learns they exist.
-      await this.notifyAllListsChanged();
-    }
+    // A filter change on an already-connected server is the one surface move
+    // dispatch cannot make: routes are unchanged (whoever connected it rebuilt
+    // them, and dispatch still reaches hidden tools), but tools/list moved.
+    await this.announceExplicitLoads(tally, filtersChanged);
 
     // A filter name that matched NOTHING is a silent hole otherwise. The
     // filter narrows the advertised list by name (proxy.ts), so a typo or a
@@ -5324,7 +5496,7 @@ export class ConnectServer {
 
     return {
       content: [{ type: "text", text: results.join("\n") }],
-      isError: anyError || (anyCapped && !anyChanged) ? true : undefined,
+      isError: explicitLoadIsError(tally),
     };
   }
 
@@ -5336,10 +5508,14 @@ export class ConnectServer {
     const filter = this.toolFilters.get(namespace);
     if (!filter || filter.size === 0) return [];
     const conn = this.connections.get(namespace);
-    const known =
-      conn && conn.status === "connected"
-        ? conn.tools.map((t) => t.name)
-        : (this.toolCache.get(namespace) ?? []).map((t) => t.name);
+    let known: string[];
+    if (conn && conn.status === "connected") {
+      known = conn.tools.map((t) => t.name);
+    } else {
+      const config = this.config?.servers.find((s) => s.namespace === namespace);
+      const cache = config ? this.mergeToolCache(config).toolCache : this.toolCache.get(namespace);
+      known = (cache ?? []).map((t) => t.name);
+    }
     if (known.length === 0) return [];
     const have = new Set(known);
     return [...filter].filter((n) => !have.has(n)).sort();
@@ -5383,9 +5559,9 @@ export class ConnectServer {
   //
   // The three empty-state messages below are the fresh-install path (dispatch
   // is the documented first call), so each names the LOCAL fix -- `yaw-mcp
-  // add <slug>`, `"isActive": true` in ~/.yaw-mcp/bundles.json -- rather than
-  // the retired hosted add/enable UI at yaw.sh/mcp that discover and bundles
-  // were already migrated away from.
+  // add <slug>`, `"isActive": true` in the bundles.json that defines the
+  // server -- rather than the retired hosted add/enable UI at yaw.sh/mcp that
+  // discover and bundles were already migrated away from.
   private async handleDispatch(
     intent: string,
     budget: number,
@@ -5464,7 +5640,12 @@ export class ConnectServer {
     if (safeBudget === 1 && shouldSample(ranked, effort)) {
       progress?.("Top candidates close — asking LLM to pick…");
       const serversByNamespace = new Map(activeServers.map((s) => [s.namespace, s]));
-      const candidates = buildCandidates(ranked.slice(0, 3), serversByNamespace, this.toolCache);
+      // activeServers came through getProfiledActiveServers, so each one's
+      // toolCache is already mergeToolCache's answer. Handing the raw
+      // this.toolCache here instead let buildCandidates' `??` pick an EMPTY
+      // learned list over a curated one.
+      const mergedTools = new Map(activeServers.map((s) => [s.namespace, s.toolCache ?? []]));
+      const candidates = buildCandidates(ranked.slice(0, 3), serversByNamespace, mergedTools);
       const samples = sampleCountForEffort(effort);
       const picked = await bestOfNViaSampling(this.server, trimmed, candidates, samples);
       if (picked) {
@@ -5521,14 +5702,7 @@ export class ConnectServer {
     }
 
     const results: string[] = [];
-    let anyChanged = false;
-    let anyError = false;
-    let anyCapped = false;
-    // Same growth tracking as handleActivate: an already-connected winner
-    // (isChanged:false) can still be newly advertised, and the notify below
-    // must fire for that too or the "now callable" tools stay invisible to
-    // a list_changed-driven gateway client.
-    let advertisedGrew = false;
+    const tally = newExplicitLoadTally();
 
     let i = 0;
     for (const winner of winners) {
@@ -5536,27 +5710,12 @@ export class ConnectServer {
       progress?.(`Loading ${winner.namespace} (${i}/${winners.length})`, i - 1, winners.length);
       const r = await this.activateOne(winner.namespace, progress);
       results.push(`${winner.namespace} (score ${winner.score.toFixed(2)}): ${r.message}`);
-      if (r.isChanged) anyChanged = true;
-      // Gateway mode must advertise what dispatch just loaded: the client
-      // asked for a server for THIS intent (bounded by `budget`), and the
-      // response promises the tools are now callable ("no separate
-      // discover + load step" -- meta-tools.ts). Without this, the
-      // tools/list_changed fired below changes nothing under the default
-      // gateway exposure and the loaded tools stay invisible to any client
-      // that can only invoke advertised tools. Recorded on success only,
-      // mirroring handleActivate.
-      if (r.ok) {
-        if (!this.sessionActivated.has(winner.namespace)) advertisedGrew = true;
-        this.sessionActivated.add(winner.namespace);
-      }
-      // Cap refusals are expected when the budget exceeds the concurrent
-      // server cap -- informational alongside successes, but if NOTHING
-      // loaded the dispatch did no work and must signal (same rule as
-      // handleActivate).
-      if (!r.ok) {
-        if (r.capped) anyCapped = true;
-        else anyError = true;
-      }
+      // Shared with handleActivate. Dispatch has to advertise what it loaded:
+      // the client asked for a server for THIS intent (bounded by `budget`),
+      // and the reply promises the tools are now callable ("no separate
+      // discover + load step" -- meta-tools.ts). Cap refusals are expected
+      // when the budget exceeds the concurrent-server cap.
+      this.recordExplicitLoad(tally, winner.namespace, r);
       // Activation success is NOT recorded as a learning signal — that
       // would inflate "this server worked" into "every activation
       // counts as a successful tool call," which collapses the
@@ -5567,27 +5726,21 @@ export class ConnectServer {
     // No trailing "Dispatch complete" progress — see handleActivate for
     // the client-side race this avoids.
 
-    if (anyChanged) {
-      await this.refreshRoutesAndNotify();
-    } else if (advertisedGrew) {
-      // Advertised set grew without a connection change (winner already
-      // connected but never advertised) -- routes are current, but the
-      // tools/list surface moved. Mirrors handleActivate.
-      await this.notifyAllListsChanged();
-    }
+    await this.announceExplicitLoads(tally);
 
     const header = `Dispatched "${trimmed}" — loaded top ${winners.length} of ${ranked.length} matching server${ranked.length === 1 ? "" : "s"}.\n`;
     return {
       content: [{ type: "text", text: header + results.join("\n") }],
-      isError: anyError || (anyCapped && !anyChanged) ? true : undefined,
+      isError: explicitLoadIsError(tally),
     };
   }
 
   // Drop every per-namespace bit of session state after its connection has
-  // been closed. Called by BOTH teardown sites -- explicit deactivate and the
-  // idle reaper -- which used to carry identical copies of this list, so a
-  // new piece of per-namespace state had to be remembered in two places to
-  // avoid leaking into the next load of the same server.
+  // been closed. Called by all three teardown sites -- explicit deactivate,
+  // the idle reaper, and reconcileConfig's unload of a server a bundles.json
+  // reload changed or removed. The first two used to carry identical copies
+  // of this list, so a new piece of per-namespace state had to be remembered
+  // in each place to avoid leaking into the next load of the same server.
   //
   // Deliberately NOT cleared here: toolCache / toolCacheLearnedAt (what the
   // server offers survives an unload -- that is what makes it deferred
@@ -5799,8 +5952,8 @@ export class ConnectServer {
       }
       log("info", "Auto-deactivating idle server", { namespace: ns, idleCalls: this.idleCallCounts.get(ns) });
       await disconnectFromUpstream(connection);
-      // Same teardown as an explicit deactivate -- one copy, so the two can
-      // never drift over which per-namespace state survives an unload.
+      // Same teardown as an explicit deactivate -- one copy, so the three
+      // teardown sites can never drift over what survives an unload.
       this.forgetNamespace(ns);
       deactivated++;
     }
@@ -5850,7 +6003,7 @@ export class ConnectServer {
     // Look up WITHOUT the isActive filter, then split "not installed" from
     // "installed but disabled" exactly as runActivateOne does (fuzzy hint
     // included). Filtering on isActive in the find collapsed both cases into
-    // "not in ~/.yaw-mcp/bundles.json", which is a lie for a server that IS
+    // "not in <the bundles.json>", which is a lie for a server that IS
     // in the file with "isActive": false -- and it pointed the model at
     // installing something it already has instead of flipping the toggle.
     const serverConfig = this.config?.servers.find((s) => s.namespace === serverArg);
@@ -5865,7 +6018,7 @@ export class ConnectServer {
         content: [
           {
             type: "text",
-            text: `"${serverArg}" is not in ~/.yaw-mcp/bundles.json.${hint}`,
+            text: `"${serverArg}" is not in ${bundlesFileHint("in-effect")}.${hint}`,
           },
         ],
         isError: true,
@@ -5926,11 +6079,10 @@ export class ConnectServer {
     // Include any session-elicited credentials for this namespace so the
     // transient connect uses the same env as a persistent activation
     // would — otherwise schema inspection re-trips the missing-credential
-    // error the user already supplied a value for this session.
-    const elicitedForTransient = this.elicitedEnv.get(serverArg);
-    const transientConfig = elicitedForTransient
-      ? { ...serverConfig, env: { ...serverConfig.env, ...elicitedForTransient } }
-      : serverConfig;
+    // error the user already supplied a value for this session. Through
+    // effectiveEntry, the one copy of that merge, so the two cannot disagree
+    // on which of the file and the elicited value wins.
+    const transientConfig = this.effectiveEntry(serverConfig);
     try {
       // The connect / use / TEARDOWN shape lives in transient-upstream.ts:
       // `yaw-mcp call` needs the identical dance from a shell, where there is
@@ -6186,10 +6338,6 @@ export class ConnectServer {
     return { content: [{ type: "text", text: lines.join("\n") }] };
   }
 
-  // Pack suggestion. Surfaces recurring multi-server tool-call sequences
-  // observed in this session. Observation only — never activates
-  // anything. Ranked by frequency primarily, with recency as a tiebreak
-  // so the hottest-most-recent pattern sits at the top.
   /** Cap on what find_tool returns when the caller names no limit.
    *
    *  A number, not "everything that matched": the point of the tool is to
@@ -6285,6 +6433,12 @@ export class ConnectServer {
     );
     return { content: [{ type: "text", text: lines.join("\n") }] };
   }
+
+  // Pack suggestion. Surfaces recurring multi-server tool-call sequences from
+  // the pack history, which persists across restarts (see persistence.ts).
+  // Observation only — never activates anything. Ranked by frequency
+  // primarily, with recency as a tiebreak so the hottest-most-recent pattern
+  // sits at the top.
   private handleSuggest(): { content: Array<{ type: string; text: string }> } {
     const detected = this.packDetector.detectChains();
     if (detected.length === 0) {
@@ -6538,19 +6692,24 @@ export class ConnectServer {
     //
     // WHY IT IS SAFE TO HOIST, which is the whole question. spawnGateRefusal's
     // three conditions -- disabled, project profile, YAW_MCP_MIN_COMPLIANCE --
-    // are pure over `this.config`, `this.profile` and process.env, and all
-    // three are fixed for the life of the process: the config and profile are
-    // read once in start(), and an upstream tool cannot reach this process's
-    // env. Nothing a STEP can do moves them either -- meta-tools are refused
-    // from exec above, so no step can activate, block, or re-grade anything. A
-    // refusal decided now is therefore the same refusal step N would have hit,
-    // which is what makes hoisting it unable to false-refuse a pipeline that
-    // would have worked.
+    // are pure over `this.config`, `this.profile` and process.env. Nothing a
+    // STEP can do moves them: meta-tools are refused from exec above, so no
+    // step can activate, block, or re-grade anything; a step re-enters
+    // handleToolCall under a proxied name, so it never runs the bundles.json
+    // reload at the meta-tool boundary; and an upstream tool cannot reach this
+    // process's env. The profile is read once, in start().
     //
-    // That is the assumption to re-check first if config ever becomes
-    // reloadable mid-session: a reload landing between this pass and step N
-    // would break the equivalence, and the fix would be to re-evaluate the
-    // gate at the step as well, not to drop the preflight.
+    // The config is NOT fixed for the session, though. maybeReloadBundles
+    // re-reads bundles.json (and re-overlays grades.json) at every meta-tool
+    // boundary, and a CONCURRENT meta-tool call from the client can land that
+    // reload between this pass and step N. So this pass is a best-effort early
+    // refusal, not the authority. The authority is the same gate re-run at the
+    // step: runActivateOne calls spawnGateRefusal on every activation,
+    // including the deferred lazy-activation a step triggers. A reload inside
+    // the window can therefore cost a refusal here that step N would not have
+    // hit, never a step that gets past the gate. Keep both checks: the
+    // per-step one is not redundant with this one, and this pass's answer must
+    // not be cached per namespace.
     //
     // Two neighbouring refusals are deliberately NOT hoisted:
     //
@@ -6580,11 +6739,13 @@ export class ConnectServer {
       const route = this.toolRoutes.get(step.tool);
       if (!route?.deferred) continue;
       // A deferred route is built FROM a config entry, so a miss means the
-      // route table is stale relative to `this.config` -- the two are separate
-      // pieces of state and nothing forces a rebuild when the config is
-      // replaced. There is nothing to apply a policy to in that case, so fall
-      // through to the lazy path, which is where the step would have gone
-      // anyway and which re-resolves everything at dispatch time.
+      // route table is momentarily behind `this.config`: a reload adopts the
+      // new config first and rebuilds the routes only at the end of
+      // reconcileConfig, after the awaits in between (the grade overlay, the
+      // teardown of changed servers), so a concurrent exec can land there. There is nothing to apply a
+      // policy to in that case, so fall through to the lazy path, which is
+      // where the step would have gone anyway and which re-resolves everything
+      // at dispatch time.
       const serverConfig = this.config?.servers.find((sc) => sc.namespace === route.namespace);
       if (!serverConfig) continue;
       const gateRefusal = this.spawnGateRefusal(serverConfig, "activate");
@@ -6996,11 +7157,13 @@ export class ConnectServer {
     // single-use. `shuttingDown` is latched above and nothing ever clears it
     // (activateOne refuses from here on, permanently), and `this.server` is
     // closed below. The other session-lifecycle fields (sessionActivated,
-    // toolFilters, idleCallCounts, toolCache) are deliberately left as they
-    // are: clearing them would advertise a second-session path that the
-    // permanent latch and the closed transport cannot actually deliver. An
-    // embedded or test host that wants another session constructs another
-    // ConnectServer.
+    // toolFilters, idleCallCounts, toolCache, and the ask counters and
+    // latches credentialPrompts, vaultPassphrasePrompts and
+    // vaultPassphraseElicited -- counts and booleans, no plaintext) are
+    // deliberately left as they are: clearing them would advertise a
+    // second-session path that the permanent latch and the closed transport
+    // cannot actually deliver. An embedded or test host that wants another
+    // session constructs another ConnectServer.
     this.elicitedEnv.clear();
     this.credentialElicited.clear();
     // Same contract, one scope wider. The vault passphrase lives in a MODULE

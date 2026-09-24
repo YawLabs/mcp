@@ -1,17 +1,22 @@
 // yaw-mcp's OWN secrets, and the two helpers that keep them out of every
 // process this package spawns.
 //
-// Dependency-free on purpose. The strip has three callers with very different
-// import budgets: the broker's upstream spawn (upstream.ts, which pulls in the
-// whole MCP SDK), the background self-upgrade on the serve hot path
-// (auto-upgrade.ts) and the `yaw-mcp upgrade` CLI (upgrade-cmd.ts), which
-// should not have to load the SDK to print a command. Until this module
-// existed the helpers lived in upstream.ts and only the upstream spawn used
-// them: the two upgrade spawns inherited process.env untouched, so a
-// passphrase parked in yaw-mcp's env block -- exactly where README tells the
-// user to put it -- reached every pre/postinstall script in @yawlabs/mcp's
-// dependency tree through `npm install -g`. upstream.ts re-exports all three
-// names, so its importers (server.ts, audit-cmd.ts, the tests) are unchanged.
+// Dependency-free on purpose. The strip is called at every spawn site in src/
+// -- the broker's upstream spawn (upstream.ts, which pulls in the whole MCP
+// SDK), both self-upgrade paths (auto-upgrade.ts, upgrade-cmd.ts), the sidecar
+// npm run (sidecars-cmd.ts), the compliance suite (compliance-cmd.ts), the
+// oam and uv probes (oam-spawn.ts, uv-bootstrap.ts) and the browser launcher
+// (secret-entry-page.ts) -- and those have very different import budgets: the
+// `yaw-mcp upgrade` CLI should not have to load the SDK to print a command.
+// src/tests/internal-secret-env.test.ts scans for a spawn that forgets it.
+// Until this module existed the helpers lived in upstream.ts and only the
+// upstream spawn used them: the two upgrade spawns inherited process.env
+// untouched, so a passphrase parked in yaw-mcp's env block -- exactly where
+// README tells the user to put it -- reached every pre/postinstall script in
+// @yawlabs/mcp's dependency tree through `npm install -g`. upstream.ts
+// still re-exports the Set and both helpers for the importers that reach
+// them through it (audit-cmd.ts and upstream's tests); every other consumer,
+// server.ts included, imports from here.
 
 /** Env keys that are for THIS process only and must never leak into a
  *  spawned child -- an upstream server, or the package manager the
@@ -30,6 +35,15 @@ export const INTERNAL_SECRET_ENV_KEYS: ReadonlySet<string> = new Set([
   "YAW_MCP_VAULT_PASSPHRASE_NEW",
 ]);
 
+/** Is `key` one of yaw-mcp's own secrets, in ANY letter case? The one
+ *  membership test every consumer of INTERNAL_SECRET_ENV_KEYS should use: a
+ *  bare `INTERNAL_SECRET_ENV_KEYS.has(key)` is byte-exact and misses the
+ *  lowercase twin Windows env lookups honour -- see
+ *  stripInternalSecretsFromEnv for why that leaks the passphrase. */
+export function isInternalSecretEnvKey(key: string): boolean {
+  return INTERNAL_SECRET_ENV_KEYS.has(key.toUpperCase());
+}
+
 /** Delete yaw-mcp's own secrets from THIS process's env, in place. For the
  *  one-shot CLI paths that hand `process.env` to a third party that spawns a
  *  server with it (`yaw-mcp audit` -> @yawlabs/mcp-compliance spreads
@@ -39,7 +53,7 @@ export const INTERNAL_SECRET_ENV_KEYS: ReadonlySet<string> = new Set([
  *  server. Same case-insensitive match, for the same Windows reason. */
 export function scrubInternalSecretsFromProcessEnv(): void {
   for (const key of Object.keys(process.env)) {
-    if (INTERNAL_SECRET_ENV_KEYS.has(key.toUpperCase())) delete process.env[key];
+    if (isInternalSecretEnvKey(key)) delete process.env[key];
   }
 }
 
@@ -61,7 +75,7 @@ export function scrubInternalSecretsFromProcessEnv(): void {
 export function stripInternalSecretsFromEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const out: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(env)) {
-    if (INTERNAL_SECRET_ENV_KEYS.has(key.toUpperCase())) continue;
+    if (isInternalSecretEnvKey(key)) continue;
     out[key] = value;
   }
   return out;
