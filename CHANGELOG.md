@@ -2,7 +2,21 @@
 
 All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented here. This project uses [semantic versioning](https://semver.org) and a script-gated release flow: `./release.sh <version>` runs lint + typecheck + tests + build, bumps, tags, publishes to npm, and publishes `server.json` to the MCP registry.
 
-## Unreleased
+## 1.0.13 -- Codex CLI works again: `install codex-cli` under smol-toml 1.9.0, and Codex can call the tools it loads
+
+Published 2026-09-24, the day after 1.0.12. Five entries below, all measured against real Codex 0.144.0 and 0.156.1. `mcp_connect_exec` reaches a cached tool from the first call of a session. On a fresh install, `find_tool` and `exec` wait for the startup pre-warm. Codex, which never re-lists tools, is told to call loaded tools through `mcp_connect_exec` (#172). The TOML codec accepts smol-toml 1.9.0's null-prototype tables, which had broken `install codex-cli`, `doctor`, `install --list` and `heal` for every Codex config. It also refuses a doubled BOM the way Codex does, and pins the parser to 1.9 patch releases (#171).
+
+**Fixed -- `mcp_connect_exec` reaches a cached tool from the first call of a session**
+
+`start()` hydrated the persisted tool cache but never built the routing table from it. The later rebuilds all wait on an activation, a config change, auto-load, or a pre-warm that learns something new, so on a machine whose servers were all already cached the table stayed empty. exec looks its steps up there, so the documented "a cached-but-unloaded server is loaded on first use" answered `Unknown tool: <name>. Use mcp_connect_discover ...` instead, until an unrelated activation rebuilt it. The table is now built once `start()` has the config, the cache and the grades. exec is the only way a client that never re-lists tools reaches an upstream tool, and typed's lite `find_tool` -> `exec` flow hit the same wall.
+
+**Fixed -- on a fresh install, `find_tool` and `exec` wait for the startup pre-warm instead of answering "nothing"**
+
+With no `state.json`, the pre-warm that runs after `initialize` is what learns each server's tools, and nothing waited for it. A first `find_tool` said `No configured server has a tool matching ...` about a configured server's tool, and a first `exec` said `Unknown tool`. Both were measured 1.7 to 5 seconds into a session on real Codex 0.144.0. When the answer would otherwise be "none" and the pre-warm is still running, both now wait for it, for at most 20 seconds, then answer from what it learned. exec waits only after the refusals it decides from the pipeline's shape alone (a meta-tool step, a blocked tool, a bad `$ref`), stops waiting when the call is cancelled, and runs nothing then. The pre-warm rebuilds routes only when its whole sweep ends, so when the bound lapses first, exec rebuilds them from the servers already learned: one slow server no longer keeps a fast one out of reach.
+
+**Fixed -- Codex is told to call loaded tools through `mcp_connect_exec`**
+
+Codex (`clientInfo.name` `codex-mcp-client`; the CLI, its IDE extension and the ChatGPT desktop app's Codex mode) reads `tools/list` once and only logs `notifications/tools/list_changed`: `logging_client_handler.rs` in both rust-v0.144.0 and rust-v0.156.1. A tool that `mcp_connect_activate` or `mcp_connect_dispatch` loaded mid-session therefore never reached the model. The reply listed it as loaded, and the model's direct call failed inside Codex with `unsupported call: mcp__mcp<tool>`. Both were measured against real Codex 0.144.0 and 0.156.1. For a client in the new `NO_RELIST_CLIENTS` set, the replies of activate and dispatch, and discover's auto-load banner, now carry one line that says so, with an exec call. The call is for one of the tools just loaded, e.g. `{"steps":[{"tool":"memory_read_graph","args":{}}]}`. It names a tool that needs no arguments, a read-only one first, so the call runs as written. When every tool needs arguments, the line says to fill them in and points at `mcp_connect_read_tool`. Continue's IDE extension (`continue-client`) is in the set too. Its source registers no notification handler and lists tools only while connecting. That was read from source, not measured against a running Continue. Every other client's replies are unchanged.
 
 **Fixed -- Codex CLI works again under smol-toml 1.9.0: `install codex-cli` writes the file, and `doctor`, `install --list` and `heal` stop calling a valid config.toml malformed**
 
