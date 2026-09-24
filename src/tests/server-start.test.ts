@@ -654,6 +654,131 @@ describe("ConnectServer.start() — persisted state hydration", () => {
     ]);
   });
 
+  it("routes a cached tool from the first call, so exec lazy-loads it with no activation first", async () => {
+    // The session a client that never re-lists tools (Codex) starts every
+    // time: the tool cache is warm, nothing is loaded, and exec is the only
+    // way to reach an upstream tool. start() hydrated the cache but never
+    // built the routing table from it, and the only rebuilds that could
+    // follow were an activation, a config change, auto-load, or a pre-warm
+    // that learned something -- here there is nothing dormant to pre-warm --
+    // so exec answered "Unknown tool" for a tool it had just been told was
+    // cached, until something unrelated rebuilt the routes.
+    writeBundles(synthHome, [serverEntry("known")]);
+    writeV2StateWithCache();
+    const callTool = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "from the upstream" }] });
+    vi.mocked(connectToUpstream).mockImplementation((async (config: UpstreamServerConfig) => {
+      const conn = fakeConnection(config, ["cached_tool"]);
+      (conn.client as { callTool: unknown }).callTool = callTool;
+      return conn;
+    }) as unknown as typeof connectToUpstream);
+
+    const { priv, prewarmed } = await startServer();
+    await prewarmed;
+    expect(spawnedNamespaces()).toEqual([]);
+    expect(priv.toolRoutes.has("known_cached_tool")).toBe(true);
+
+    const res = await priv.handleToolCall("mcp_connect_exec", { steps: [{ tool: "known_cached_tool" }] });
+    expect(res.isError).not.toBe(true);
+    expect(res.content[0]?.text).toContain("from the upstream");
+    expect(spawnedNamespaces()).toEqual(["known"]);
+    expect(callTool).toHaveBeenCalledTimes(1);
+  });
+
+  /** An upstream whose connect waits for `release()`, so a test can land a
+   *  call while the startup pre-warm is still learning its tools. */
+  function gatedUpstream(): { release: () => void; callTool: ReturnType<typeof vi.fn> } {
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const callTool = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "from the upstream" }] });
+    vi.mocked(connectToUpstream).mockImplementation((async (config: UpstreamServerConfig) => {
+      await gate;
+      const conn = fakeConnection(config, ["live"]);
+      (conn.client as { callTool: unknown }).callTool = callTool;
+      return conn;
+    }) as unknown as typeof connectToUpstream);
+    return { release, callTool };
+  }
+
+  it("exec on a fresh install waits for the startup pre-warm instead of answering Unknown tool", async () => {
+    // No state.json: nothing is cached, so the pre-warm is what learns
+    // "fresh_live". A first exec used to land before it and get "Unknown
+    // tool" for a tool of a configured server.
+    writeBundles(synthHome, [serverEntry("fresh")]);
+    const { release, callTool } = gatedUpstream();
+    const { priv, prewarmed } = await startServer();
+
+    const pending = priv.handleToolCall("mcp_connect_exec", { steps: [{ tool: "fresh_live" }] });
+    release();
+    const res = await pending;
+    await prewarmed;
+    expect(res.isError).not.toBe(true);
+    expect(res.content[0]?.text).toContain("from the upstream");
+    expect(callTool).toHaveBeenCalledTimes(1);
+  });
+
+  it("exec past the wait bound still reaches a server the pre-warm already learned", async () => {
+    // The pre-warm rebuilds routes only when its WHOLE sweep ends. One slow
+    // server must not hold a fast one's tools out of reach: once the bound
+    // lapses, exec rebuilds from what the sweep has learned so far.
+    writeBundles(synthHome, [serverEntry("fast"), serverEntry("slow")]);
+    let releaseSlow: () => void = () => {};
+    const slowGate = new Promise<void>((resolve) => {
+      releaseSlow = resolve;
+    });
+    const callTool = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "from fast" }] });
+    vi.mocked(connectToUpstream).mockImplementation((async (config: UpstreamServerConfig) => {
+      if (config.namespace === "slow") await slowGate;
+      const conn = fakeConnection(config, ["live"]);
+      (conn.client as { callTool: unknown }).callTool = callTool;
+      return conn;
+    }) as unknown as typeof connectToUpstream);
+    const saved = (ConnectServer as any).STARTUP_PREWARM_WAIT_MS;
+    (ConnectServer as any).STARTUP_PREWARM_WAIT_MS = 100;
+    try {
+      const { priv, prewarmed } = await startServer();
+      // Let the fast server's pre-warm land while the slow one hangs.
+      await vi.waitFor(() => expect(priv.toolCache.has("fast")).toBe(true));
+      const res = await priv.handleToolCall("mcp_connect_exec", { steps: [{ tool: "fast_live" }] });
+      expect(res.isError).not.toBe(true);
+      expect(res.content[0]?.text).toContain("from fast");
+      releaseSlow();
+      await prewarmed;
+    } finally {
+      (ConnectServer as any).STARTUP_PREWARM_WAIT_MS = saved;
+      releaseSlow();
+    }
+  });
+
+  it("a cancelled exec stops waiting on the pre-warm and runs nothing", async () => {
+    writeBundles(synthHome, [serverEntry("fresh")]);
+    const { release, callTool } = gatedUpstream();
+    const { priv, prewarmed } = await startServer();
+    const controller = new AbortController();
+    const pending = priv.handleExec({ steps: [{ tool: "fresh_live" }] }, controller.signal);
+    controller.abort();
+    const res = await pending;
+    expect(res.isError).toBe(true);
+    expect(res.content[0]?.text).toContain("cancelled");
+    expect(callTool).not.toHaveBeenCalled();
+    release();
+    await prewarmed;
+  });
+
+  it("find_tool on a fresh install waits for the startup pre-warm instead of answering no match", async () => {
+    writeBundles(synthHome, [serverEntry("fresh")]);
+    const { release } = gatedUpstream();
+    const { priv, prewarmed } = await startServer();
+
+    const pending = priv.handleToolCall("mcp_connect_find_tool", { query: "live" });
+    release();
+    const res = await pending;
+    await prewarmed;
+    expect(res.content[0]?.text).not.toContain("No configured server has a tool matching");
+    expect(res.content[0]?.text).toContain("fresh_live");
+  });
+
   it("pre-warms EVERY server when there is no persisted tool cache", async () => {
     // Negative control for the skip above.
     writeBundles(synthHome, [serverEntry("known"), serverEntry("fresh")]);
@@ -716,9 +841,11 @@ describe("ConnectServer.start() — persisted state hydration", () => {
     // finds nothing dormant and returns before ITS route rebuild. The routes
     // must exist anyway. tools/list advertises deferred tools straight off
     // getDeferredServers(), and a tools/call on one with no route skipped the
-    // lazy-activation branch and answered `Unknown tool` -- which is how
-    // every test above passed while this broke: each keeps a server dormant,
-    // so pre-warm's rebuild built the table as a side effect.
+    // lazy-activation branch and answered `Unknown tool` -- which is how the
+    // pre-warm tests above passed while this broke: each keeps a server
+    // dormant, so pre-warm's rebuild built the table as a side effect. The
+    // first-call exec test earlier in this block pins the same start()
+    // rebuild from exec's side.
     writeBundles(synthHome, [serverEntry("known")]);
     writeV2StateWithCache();
     knownAnswers("from the upstream");
@@ -922,6 +1049,51 @@ describe("ConnectServer.start() — what the initialize handshake decides", () =
     const names = await listedToolNames(priv);
     expect(names).toContain("gh_gh_live");
     expect(names.filter((n) => n.startsWith("mcp_connect_")).sort()).toEqual([...LITE_META_TOOL_NAMES].sort());
+  });
+
+  // Codex reads tools/list once and ignores list_changed, so a tool loaded
+  // mid-session is never in the model's list and a direct call fails inside
+  // Codex ("unsupported call"). The load replies are the only place to say
+  // so, and they must name a call that really works.
+  const CODEX_EXEC_HINT = '{"steps":[{"tool":"gh_gh_live","args":{}}]}';
+
+  it("tells Codex to reach an activated server's tools through exec, with a runnable call", async () => {
+    writeBundles(synthHome, [serverEntry("gh")]);
+    vi.mocked(connectToUpstream).mockImplementation((async (config: UpstreamServerConfig) => {
+      const conn = fakeConnection(config, [`${config.namespace}_live`]);
+      (conn.client as { callTool: unknown }).callTool = vi
+        .fn()
+        .mockResolvedValue({ content: [{ type: "text", text: "ok" }] });
+      return conn;
+    }) as unknown as typeof connectToUpstream);
+    const { priv, prewarmed } = await startServer({ clientName: "codex-mcp-client" });
+    await prewarmed;
+    const res = await priv.handleToolCall("mcp_connect_activate", { server: "gh" });
+    expect(res.isError).not.toBe(true);
+    const text = res.content[0]?.text as string;
+    expect(text).toContain("mcp_connect_exec");
+    expect(text).toContain(CODEX_EXEC_HINT);
+    // The hint is runnable as written: exec on the named tool succeeds.
+    const run = await priv.handleToolCall("mcp_connect_exec", JSON.parse(CODEX_EXEC_HINT));
+    expect(run.isError).not.toBe(true);
+  });
+
+  it("tells Codex the same after dispatch", async () => {
+    writeBundles(synthHome, [serverEntry("gh")]);
+    const { priv, prewarmed } = await startServer({ clientName: "codex-mcp-client" });
+    await prewarmed;
+    const res = await priv.handleToolCall("mcp_connect_dispatch", { intent: "gh" });
+    expect(res.isError).not.toBe(true);
+    expect(res.content[0]?.text).toContain(CODEX_EXEC_HINT);
+  });
+
+  it("does not send the exec hint to a client that re-lists tools", async () => {
+    writeBundles(synthHome, [serverEntry("gh")]);
+    const { priv, prewarmed } = await startServer();
+    await prewarmed;
+    const res = await priv.handleToolCall("mcp_connect_activate", { server: "gh" });
+    expect(res.isError).not.toBe(true);
+    expect(res.content[0]?.text).not.toContain("keeps the tool list it read at startup");
   });
 });
 

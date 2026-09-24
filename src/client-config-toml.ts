@@ -133,11 +133,13 @@ function bomOffset(text: string): number {
   return text.charCodeAt(0) === 0xfeff ? 1 : 0;
 }
 
-/** Strip ONE leading U+FEFF. smol-toml rejects a BOM ("only letter, numbers,
- *  dashes and underscores are allowed in keys", line 1 column 1 -- measured on
- *  1.8.0) while Codex accepts it, and Notepad writes one by default. The strip
- *  is for the PARSER only: the splice keeps the byte, which is why every
- *  offset below is taken against the ORIGINAL text. */
+/** Strip ONE leading U+FEFF. Codex accepts one BOM and Notepad writes one by
+ *  default. smol-toml 1.8 rejected it ("only letter, numbers, dashes and
+ *  underscores are allowed in keys", line 1 column 1); 1.9.0 strips one
+ *  itself. The strip stays anyway, so parser positions are measured against
+ *  the same text on either version. It is for the PARSER only: the splice
+ *  keeps the byte, which is why every offset below is taken against the
+ *  ORIGINAL text. */
 function stripBom(raw: string): string {
   return raw.slice(bomOffset(raw));
 }
@@ -146,8 +148,18 @@ function stripBom(raw: string): string {
  *  error type -- so callers have the line, the column and the reason as
  *  separate fields. */
 export function parseTomlConfig(raw: string): unknown {
+  const text = stripBom(raw);
+  // smol-toml >= 1.9.0 strips one leading BOM itself, so a SECOND one that
+  // survived the strip above would parse -- and Codex refuses that file
+  // ("key with no value, expected `=`" at 1:3). Refuse it the way Codex does,
+  // or doctor calls a file healthy that Codex will not load and install
+  // writes into it. Line and column are against the stripped text, like
+  // every other error here.
+  if (text.charCodeAt(0) === 0xfeff) {
+    return raiseParse("a second byte-order mark (U+FEFF) opens the file; Codex refuses it -- delete it", 1, 1);
+  }
   try {
-    return parseTomlText(stripBom(raw), PARSE_OPTIONS);
+    return parseTomlText(text, PARSE_OPTIONS);
   } catch (e) {
     if (e instanceof TomlError) {
       // smol-toml's `message` is "Invalid TOML document: <reason>" followed by
@@ -172,9 +184,20 @@ function raiseParse(reason: string, line: unknown, column: unknown): never {
  *  use safely and this one cannot: smol-toml returns a datetime as `TomlDate`,
  *  a Date subclass, so `mcp_servers = 1979-05-27` would pass as a container
  *  and the splice would append a `[mcp_servers.mcp]` header to a file Codex
- *  already refuses to load. */
+ *  already refuses to load.
+ *
+ *  A plain object has one of TWO prototypes, and both are tables. smol-toml
+ *  1.8 built its tables with `{}` (Object.prototype); 1.9.0 (2026-09-22)
+ *  builds them with a NULL prototype. Testing for Object.prototype alone read
+ *  every 1.9.0 table -- the document root included -- as "a object, not a
+ *  table", so `install codex-cli` refused to write even a new file and doctor
+ *  and heal called every valid config.toml malformed, for every user whose
+ *  install resolved `^1.8.0` to 1.9.0. Arrays and `TomlDate` carry their own
+ *  prototypes and still fail both tests. */
 export function isTomlTable(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && Object.getPrototypeOf(value) === Object.prototype;
+  if (typeof value !== "object" || value === null) return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
 }
 
 /** How to name a non-table container value in a message. Shape, not contents:
