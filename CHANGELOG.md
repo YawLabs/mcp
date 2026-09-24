@@ -2,7 +2,9 @@
 
 All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented here. This project uses [semantic versioning](https://semver.org) and a script-gated release flow: `./release.sh <version>` runs lint + typecheck + tests + build, bumps, tags, publishes to npm, and publishes `server.json` to the MCP registry.
 
-## Unreleased
+## 1.0.14 -- the missing-credential prompt catches more servers and says what is true, and `yaw-mcp secrets --json` keeps stderr to one JSON object per line
+
+Published 2026-09-24, the same day as 1.0.13. Sixteen entries below, from a full pass over the secrets and missing-credential code (#173). The credential prompt recognises more of the ways a server says a key is missing, no longer asks for a key bundles.json already sets, drops a value the server rejects, and its refusals say what the next activate will do. `yaw-mcp secrets --json` keeps stderr to one JSON object per line, and its prose refusals name their action. Six of the changes alter behaviour for an existing setup that opts into nothing, and none sits behind a switch: `secrets list --json` and `secrets audit --json` print one line; an inherited value of a name ending in `_PATH`, `_FILE`, `_DIR`, `_HOST`, `_PORT`, `_PREFIX` or `_SIZE` is no longer masked in a child's stderr tail or prompted for; more stderr phrasings bring up the credential prompt; a non-empty bundles.json value wins over a typed one; a vault with an array `entries` or scrypt-invalid kdf parameters is refused at load; and a Tab pasted at the `secrets set` value prompt is kept.
 
 **Fixed -- the missing-credential page's refusals say whether activating again opens a new page, an expired page says it expired, and several missing keys are worded in the plural**
 
