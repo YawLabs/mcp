@@ -10063,12 +10063,12 @@ describe("empty states name the REAL reason", () => {
     expect(text).not.toContain("No servers enabled");
   });
 
-  it("find_tool tells a disabled setup to enable, not to install", () => {
+  it("find_tool tells a disabled setup to enable, not to install", async () => {
     // Its empty branch reads getProfiledActiveServers, so a fully-disabled
     // config reached the same "No servers installed ... add one" text.
     const priv = getPrivate(server);
     priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub", isActive: false })]);
-    const text = priv.handleFindTool("create an issue").content[0].text;
+    const text = (await priv.handleFindTool("create an issue")).content[0].text;
     expect(text).toContain("No servers enabled");
     expect(text).not.toContain("No servers installed");
   });

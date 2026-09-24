@@ -25,7 +25,7 @@ vi.mock("../upstream.js", async (importOriginal) => {
   };
 });
 
-import { ConnectServer } from "../server.js";
+import { ConnectServer, clientRelistsTools } from "../server.js";
 import type { UpstreamConnection, UpstreamServerConfig } from "../types.js";
 import { ActivationError, connectToUpstream, disconnectFromUpstream } from "../upstream.js";
 
@@ -738,5 +738,127 @@ describe("ActivationError", () => {
     const err = new ActivationError("timeout", "init_timeout");
     expect(err.stderrTail).toBeUndefined();
     expect(err.category).toBe("init_timeout");
+  });
+});
+
+describe("exec hint for a client that never re-lists tools (Codex)", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    vi.mocked(disconnectFromUpstream).mockResolvedValue(undefined);
+    server = new ConnectServer();
+  });
+
+  afterEach(async () => {
+    await server.shutdown();
+  });
+
+  /** Pose as the client whose initialize the SDK recorded. */
+  function asClient(priv: any, name: string): void {
+    priv.server.getClientVersion = () => ({ name, version: "0.0.0" });
+  }
+
+  function ghOnly(priv: any): void {
+    priv.config = {
+      configVersion: "v1",
+      servers: [
+        makeServerConfig({
+          id: "gh-id",
+          namespace: "gh",
+          name: "GitHub",
+          description: "Repos, issues, and pull requests on GitHub",
+        }),
+        makeServerConfig({
+          id: "fs-id",
+          namespace: "fs",
+          name: "Filesystem",
+          description: "Read and write local files",
+        }),
+      ],
+    };
+  }
+
+  /** A gh connection whose tools carry the given schemas and annotations. */
+  function ghWith(
+    tools: Array<{ name: string; required?: string[]; readOnly?: boolean }>,
+  ): (cfg: UpstreamServerConfig) => Promise<UpstreamConnection> {
+    return async (cfg) => {
+      const conn = makeConnection(
+        cfg.namespace,
+        tools.map((t) => ({ name: t.name })),
+      );
+      conn.tools.forEach((t, i) => {
+        const spec = tools[i];
+        if (spec.required) t.inputSchema = { type: "object", required: spec.required };
+        if (spec.readOnly) t.annotations = { readOnlyHint: true };
+      });
+      return conn;
+    };
+  }
+
+  it("rides along when discover(context) auto-loads a server", async () => {
+    const priv = getPrivate(server);
+    ghOnly(priv);
+    asClient(priv, "codex-mcp-client");
+    vi.mocked(connectToUpstream).mockImplementation(ghWith([{ name: "create_issue" }]));
+    const text = (await priv.handleDiscoverWithAutoWarm("file a github issue")).content[0].text;
+    expect(text).toContain('Auto-loaded "gh"');
+    expect(text).toContain('{"steps":[{"tool":"gh_create_issue","args":{}}]}');
+  });
+
+  it("is absent from the same auto-load for a client that re-lists", async () => {
+    const priv = getPrivate(server);
+    ghOnly(priv);
+    asClient(priv, "claude-code");
+    vi.mocked(connectToUpstream).mockImplementation(ghWith([{ name: "create_issue" }]));
+    const text = (await priv.handleDiscoverWithAutoWarm("file a github issue")).content[0].text;
+    expect(text).toContain('Auto-loaded "gh"');
+    expect(text).not.toContain("mcp_connect_exec instead");
+  });
+
+  it("names a read-only tool that needs no arguments, so the example runs as written", async () => {
+    const priv = getPrivate(server);
+    ghOnly(priv);
+    asClient(priv, "codex-mcp-client");
+    vi.mocked(connectToUpstream).mockImplementation(
+      ghWith([
+        { name: "create_issue", required: ["title"] },
+        { name: "delete_cache" },
+        { name: "list_issues", readOnly: true },
+      ]),
+    );
+    const text = (await priv.handleActivate(["gh"])).content[0].text;
+    expect(text).toContain('{"steps":[{"tool":"gh_list_issues","args":{}}]}');
+    expect(text).not.toContain("own arguments");
+  });
+
+  it("says to fill in the arguments when every tool needs some", async () => {
+    const priv = getPrivate(server);
+    ghOnly(priv);
+    asClient(priv, "codex-mcp-client");
+    vi.mocked(connectToUpstream).mockImplementation(
+      ghWith([
+        { name: "create_issue", required: ["title"] },
+        { name: "get_issue", required: ["number"] },
+      ]),
+    );
+    const text = (await priv.handleActivate(["gh"])).content[0].text;
+    expect(text).toContain('{"steps":[{"tool":"gh_create_issue","args":{}}]}');
+    expect(text).toContain(`with the tool's own arguments in "args"`);
+  });
+});
+
+describe("clientRelistsTools", () => {
+  it("is false for exactly the clients that read tools/list once (Codex, Continue)", () => {
+    expect(clientRelistsTools({ name: "codex-mcp-client" })).toBe(false);
+    expect(clientRelistsTools({ name: "continue-client" })).toBe(false);
+  });
+
+  it("is true for every other client, a near-miss name, and no clientInfo at all", () => {
+    expect(clientRelistsTools({ name: "claude-code" })).toBe(true);
+    expect(clientRelistsTools({ name: "Codex-MCP-Client" })).toBe(true);
+    expect(clientRelistsTools({})).toBe(true);
+    expect(clientRelistsTools(undefined)).toBe(true);
   });
 });

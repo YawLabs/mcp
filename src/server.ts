@@ -206,6 +206,39 @@ let exposureWarnedFor: string | null = null;
  *  to clients nobody measured. */
 export const LITE_BY_DEFAULT_CLIENTS: ReadonlySet<string> = new Set(["typed-cli"]);
 
+/** `clientInfo.name` values for clients that read tools/list ONCE, at startup,
+ *  and never again: they ignore notifications/tools/list_changed, so a tool
+ *  that activate or dispatch loads mid-session never reaches the model, and a
+ *  direct call to it fails in the client before yaw-mcp sees it. The one path
+ *  that works is mcp_connect_exec, which is listed from the start and reaches
+ *  a loaded (or cached) server's tools by name -- so for these clients the
+ *  load replies say so, with a ready-made exec call.
+ *
+ *  - `codex-mcp-client`: OpenAI Codex CLI (and its IDE extension and the
+ *    ChatGPT desktop app's Codex mode, which share the client). Its
+ *    on_tool_list_changed handler only logs "MCP server tool list changed"
+ *    (codex-rs/rmcp-client/src/logging_client_handler.rs in rust-v0.144.0 and
+ *    rust-v0.156.1), and the model then gets "unsupported call:
+ *    mcp__mcp<tool>" for a tool yaw-mcp had just reported loaded. Measured
+ *    2026-09-24 against both versions.
+ *  - `continue-client`: Continue's IDE extension. Its MCPConnection
+ *    (continuedev/continue core/context/mcp/MCPConnection.ts at 5ddd0d3)
+ *    constructs `new Client({ name: "continue-client" })`, registers no
+ *    notification handler ("// TODO register server notification handlers")
+ *    and calls listTools only while connecting. Read from source 2026-09-24,
+ *    not measured against a running Continue; the cost of being wrong is one
+ *    extra line in a load reply.
+ *
+ *  Exact match on the name as sent, like LITE_BY_DEFAULT_CLIENTS: a client
+ *  that DOES re-list must not be told to route around its own tool list. */
+export const NO_RELIST_CLIENTS: ReadonlySet<string> = new Set(["codex-mcp-client", "continue-client"]);
+
+/** False only for a client in NO_RELIST_CLIENTS; an unknown or absent
+ *  clientInfo is assumed to re-list, which is what the MCP spec asks of it. */
+export function clientRelistsTools(clientInfo?: { name?: string }): boolean {
+  return !(clientInfo?.name !== undefined && NO_RELIST_CLIENTS.has(clientInfo.name));
+}
+
 // How much of the catalog tools/list advertises. Gateway by default -- see
 // ToolExposure in proxy.ts for the measurement that made it the default --
 // and lite by default for the clients in LITE_BY_DEFAULT_CLIENTS, which is
@@ -652,6 +685,14 @@ export class ConnectServer {
    *  would see an unchanged file and skip the reconcile that never finished,
    *  leaving a connection running on config the user has already replaced. */
   private bundlesReconcilePending = false;
+  /** The startup pre-warm while it is still running, else null. find_tool
+   *  and exec read only LEARNED tool lists, and on a fresh install the
+   *  pre-warm is what learns them -- fire-and-forget from `oninitialized`,
+   *  so a first call can land before it: find_tool said "No configured
+   *  server has a tool matching" a configured server's tool, and exec said
+   *  "Unknown tool". Both now wait for this (bounded, STARTUP_PREWARM_WAIT_MS)
+   *  when the answer would otherwise be "nothing". */
+  private startupPrewarm: Promise<void> | null = null;
   private toolRoutes = new Map<string, ToolRoute>();
   private resourceRoutes = new Map<string, ResourceRoute>();
   private promptRoutes = new Map<string, PromptRoute>();
@@ -1080,6 +1121,71 @@ export class ConnectServer {
       });
     });
   };
+
+  /** Wait for the startup pre-warm, if it is still running, for at most
+   *  STARTUP_PREWARM_WAIT_MS, or until `signal` aborts. Resolves either way:
+   *  past the bound the caller answers from what is known, exactly as it did
+   *  before this existed, and on an abort the caller checks the signal. */
+  private async settleStartupPrewarm(signal?: AbortSignal): Promise<void> {
+    const pending = this.startupPrewarm;
+    if (!pending || signal?.aborted) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let onAbort: (() => void) | undefined;
+    const bound = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, ConnectServer.STARTUP_PREWARM_WAIT_MS);
+      timer.unref?.();
+      onAbort = () => resolve();
+      signal?.addEventListener("abort", onAbort, { once: true });
+    });
+    try {
+      await Promise.race([pending, bound]);
+    } finally {
+      clearTimeout(timer);
+      if (onAbort) signal?.removeEventListener("abort", onAbort);
+    }
+  }
+
+  /** How long find_tool / exec wait on a still-running startup pre-warm.
+   *  Measured on a loaded Windows ARM64 box, a fresh install's pre-warm of
+   *  two npx/oam servers finished 4-6 s after initialize; this leaves room
+   *  for a larger bundle without holding a call anywhere near a client's
+   *  tool timeout (Codex: 300 s). Not readonly, so a test can shrink it. */
+  private static STARTUP_PREWARM_WAIT_MS = 20_000;
+
+  /** The line a load reply needs for a client that never re-lists tools
+   *  (NO_RELIST_CLIENTS), or null for every other client.
+   *
+   *  The reply above it enumerates the tools just loaded as if they were now
+   *  callable, which is true for a client that re-lists and false for this
+   *  one: its tool list is the startup one, so the model's direct call fails
+   *  inside the client. The example names a tool that is really reachable --
+   *  a served, not shadowed, tool of the first namespace that loaded -- and,
+   *  where the server has one, a tool that needs no arguments (read-only
+   *  first), so `args: {}` runs as written. When every tool needs arguments
+   *  the line says to fill them in rather than show a call that would fail. */
+  private execHintForNonRelistingClient(loaded: readonly string[]): string | null {
+    if (clientRelistsTools(this.server.getClientVersion())) return null;
+    const needsNoArgs = (t: { inputSchema: Record<string, unknown> }): boolean => {
+      const required = t.inputSchema?.required;
+      return !Array.isArray(required) || required.length === 0;
+    };
+    for (const ns of loaded) {
+      const conn = this.connections.get(ns);
+      if (!conn) continue;
+      const served = this.splitShadowedTools(ns, conn.tools).served;
+      const example =
+        served.find((t) => needsNoArgs(t) && t.annotations?.readOnlyHint === true) ??
+        served.find(needsNoArgs) ??
+        served[0];
+      if (example === undefined) continue;
+      const call = JSON.stringify({ steps: [{ tool: example.namespacedName, args: {} }] });
+      const fill = needsNoArgs(example)
+        ? ""
+        : ` (with the tool's own arguments in "args"; mcp_connect_read_tool shows a tool's arguments)`;
+      return `This client keeps the tool list it read at startup, so the tools just loaded are not in it and a direct call to one fails. Call them through mcp_connect_exec instead, e.g. ${call}${fill}`;
+    }
+    return null;
+  }
 
   private rebuildRoutes(): void {
     this.toolRoutes = buildToolRoutes(this.connections, this.getDeferredServers());
@@ -1761,6 +1867,19 @@ export class ConnectServer {
     // the meta-tool boundary, where a connected set genuinely does exist.
     await this.hydrateComplianceGrades();
 
+    // Build the routing table once the three things it derives from are all
+    // in place: the config (adoptConfig), the persisted tool cache
+    // (hydrateToolCache, above) and the grades that gate it. Nothing else
+    // builds it at startup -- the later rebuilds all wait on an activation, a
+    // config change, auto-load, or a pre-warm that learns something new -- so
+    // without this, every cached-but-unloaded tool had no route for the first
+    // calls of a session. exec looks its steps up in toolRoutes, and "a
+    // cached-but-unloaded server is loaded on first use" answered "Unknown
+    // tool" instead. That is the ONLY way a client that never re-lists tools
+    // (Codex) reaches an upstream tool, and typed's lite find_tool -> exec
+    // flow hits the same wall.
+    this.rebuildRoutes();
+
     // Prewarm the uv bootstrap if any configured server needs it. Fire
     // and forget — ensureUv() is memoized, so the first activation
     // awaits the same in-flight promise rather than triggering a
@@ -1802,8 +1921,15 @@ export class ConnectServer {
       // bundles.json and it disappeared" user experience. Pre-warm each one
       // in the background: activate → populate the in-memory toolCache
       // → disconnect so we're not holding 9 upstream processes idle.
-      // Fire-and-forget so this doesn't gate the handshake response.
-      this.prewarmDormantServers().catch((err: Error) => log("warn", "Pre-warm failed", { error: err?.message }));
+      // Fire-and-forget so this doesn't gate the handshake response. Kept in
+      // startupPrewarm while it runs, so a find_tool or exec that lands first
+      // can wait for what it is about to learn instead of answering "none".
+      const prewarm = this.prewarmDormantServers()
+        .catch((err: Error) => log("warn", "Pre-warm failed", { error: err?.message }))
+        .finally(() => {
+          if (this.startupPrewarm === prewarm) this.startupPrewarm = null;
+        });
+      this.startupPrewarm = prewarm;
 
       // Opt-in auto-load of the top recurring pack. Requires persistence
       // (so there IS a history to learn from) AND YAW_MCP_AUTO_LOAD=1. Runs
@@ -2258,7 +2384,7 @@ export class ConnectServer {
       // raw TypeError out as a JSON-RPC internal error.
       const q = typeof args.query === "string" ? args.query : "";
       const limit = typeof args.limit === "number" && Number.isFinite(args.limit) ? args.limit : undefined;
-      return this.observed(this.attachGuideNudge(this.handleFindTool(q, limit)));
+      return this.observed(this.attachGuideNudge(await this.handleFindTool(q, limit)));
     }
     if (name === META_TOOLS.exec.name) {
       const result = await this.handleExec(args, extra?.signal);
@@ -3212,7 +3338,13 @@ export class ConnectServer {
     // holding tools it was never told about -- the one thing the banner exists
     // to prevent. Same wording and same dash as the banner below, so the two
     // cannot drift.
-    const warmPrefix = warmedNamespace ? `Auto-loaded "${warmedNamespace}" — top match for your query.\n\n` : "";
+    // A client that never re-lists tools cannot see what was just auto-loaded
+    // either; the same exec line activate and dispatch give it rides along.
+    const warmExecHint = warmedNamespace ? this.execHintForNonRelistingClient([warmedNamespace]) : null;
+    const warmBanner = warmedNamespace
+      ? `Auto-loaded "${warmedNamespace}" — top match for your query.${warmExecHint ? `\n${warmExecHint}` : ""}`
+      : "";
+    const warmPrefix = warmBanner ? `${warmBanner}\n\n` : "";
     const focusMiss = (text: string): { content: Array<{ type: string; text: string }> } => ({
       content: [{ type: "text", text: `${warmPrefix}${text}` }],
     });
@@ -3296,8 +3428,8 @@ export class ConnectServer {
           ? "Servers ranked by relevance:\n"
           : "Installed MCP servers:\n",
     );
-    if (warmedNamespace) {
-      lines.push(`Auto-loaded "${warmedNamespace}" — top match for your query.\n`);
+    if (warmBanner) {
+      lines.push(`${warmBanner}\n`);
     }
 
     // Compliance filter banner. When YAW_MCP_MIN_COMPLIANCE is active, the
@@ -5202,6 +5334,8 @@ export class ConnectServer {
     // still errors (not cap-style budgeting) because a failed activateOne
     // returns ok:false with capped unset, which sets anyError below.
     const total = namespaces.length;
+    // Namespaces this call left loaded, for the exec hint below.
+    const loadedOk: string[] = [];
     let i = 0;
     for (const namespace of namespaces) {
       i += 1;
@@ -5209,6 +5343,7 @@ export class ConnectServer {
       const r = await this.activateOne(namespace, progress);
       results.push(r.message);
       if (r.isChanged) anyChanged = true;
+      if (r.ok) loadedOk.push(namespace);
       // Gateway mode advertises a namespace only after the USER asks for
       // it -- BY NAME here, by INTENT in handleDispatch and discover's
       // auto-warm, by REPLAY of their own recurring pack in
@@ -5320,6 +5455,10 @@ export class ConnectServer {
     // is separate -- a distinct block, opening with the `[yaw-mcp]` prefix that
     // sanitizeUpstreamInstructions neutralizes inside any payload, so no fenced
     // text can pass itself off as that tip or be mistaken for part of it.
+    // Broker prose, so it goes BEFORE the third-party blocks (see below).
+    const execHint = this.execHintForNonRelistingClient(loadedOk);
+    if (execHint) results.push(execHint);
+
     results.push(...upstreamInstructions);
 
     return {
@@ -5530,6 +5669,8 @@ export class ConnectServer {
     // a list_changed-driven gateway client.
     let advertisedGrew = false;
 
+    // Winners this call left loaded, for the exec hint below.
+    const dispatchedOk: string[] = [];
     let i = 0;
     for (const winner of winners) {
       i += 1;
@@ -5548,6 +5689,7 @@ export class ConnectServer {
       if (r.ok) {
         if (!this.sessionActivated.has(winner.namespace)) advertisedGrew = true;
         this.sessionActivated.add(winner.namespace);
+        dispatchedOk.push(winner.namespace);
       }
       // Cap refusals are expected when the budget exceeds the concurrent
       // server cap -- informational alongside successes, but if NOTHING
@@ -5575,6 +5717,9 @@ export class ConnectServer {
       // tools/list surface moved. Mirrors handleActivate.
       await this.notifyAllListsChanged();
     }
+
+    const execHint = this.execHintForNonRelistingClient(dispatchedOk);
+    if (execHint) results.push(execHint);
 
     const header = `Dispatched "${trimmed}" — loaded top ${winners.length} of ${ranked.length} matching server${ranked.length === 1 ? "" : "s"}.\n`;
     return {
@@ -6212,7 +6357,10 @@ export class ConnectServer {
    *  match rather than leaving the model to infer it -- a silently absent
    *  schema reads as "this tool takes no arguments", which is a worse answer
    *  than "activate it to see". */
-  private handleFindTool(query: string, limit?: number): { content: Array<{ type: string; text: string }> } {
+  private async handleFindTool(
+    query: string,
+    limit?: number,
+  ): Promise<{ content: Array<{ type: string; text: string }> }> {
     const servers = this.getProfiledActiveServers();
     if (servers.length === 0) {
       // Two different empty states reach this one branch, and they need
@@ -6241,10 +6389,20 @@ export class ConnectServer {
       1,
       Math.min(limit ?? ConnectServer.FIND_TOOL_DEFAULT_LIMIT, ConnectServer.FIND_TOOL_MAX_LIMIT),
     );
-    const ranked = rankTools(
+    let ranked = rankTools(
       query,
       servers.map((s) => this.rankableFor(s)),
     );
+    // "No match" is only a real answer once the startup pre-warm has learned
+    // the tool lists it is about to learn. Re-read the servers after the
+    // wait: the pre-warm fills the cache rankableFor merges.
+    if (ranked.length === 0 && this.startupPrewarm) {
+      await this.settleStartupPrewarm();
+      ranked = rankTools(
+        query,
+        this.getProfiledActiveServers().map((s) => this.rankableFor(s)),
+      );
+    }
     if (ranked.length === 0) {
       return {
         content: [
@@ -6575,6 +6733,22 @@ export class ConnectServer {
     // above. The shared gate is still what gets called -- one refusal string
     // per case, the same one runActivateOne emits -- so this stays correct if
     // that filtering ever moves.
+    //
+    // First, a step naming a tool with no route may name one the startup
+    // pre-warm is still learning (a fresh install has no cache to route
+    // from). Wait for it HERE -- after the refusals above, which decide from
+    // the pipeline's shape alone and must not sit behind a 20 s wait -- and
+    // before this pass, the first thing that reads toolRoutes. The pre-warm
+    // rebuilds routes only when its whole sweep ends, so if the bound lapses
+    // first, rebuild from what it has learned so far: each server it finished
+    // is already in the tool cache the deferred routes derive from.
+    if (this.startupPrewarm && steps.some((s) => !this.toolRoutes.has(s.tool))) {
+      await this.settleStartupPrewarm(signal);
+      if (signal?.aborted) {
+        return { content: [{ type: "text", text: "exec: cancelled before step 0 ran." }], isError: true };
+      }
+      if (steps.some((s) => !this.toolRoutes.has(s.tool))) this.rebuildRoutes();
+    }
     for (let i = 0; i < steps.length; i++) {
       const step = steps[i];
       const route = this.toolRoutes.get(step.tool);
