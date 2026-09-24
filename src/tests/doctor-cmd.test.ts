@@ -3989,6 +3989,56 @@ describe("runDoctor — SECRET VAULT", () => {
     expect(text.text()).toContain("passphrase: set in this environment\n");
   });
 
+  it("reads a check that could not run (a key-derivation failure) as unverifiable, never as a wrong passphrase", async () => {
+    // checkVaultPassphrase throws rather than answering "wrong" when unlock()
+    // fails for a reason that says nothing about the passphrase -- scrypt
+    // itself failing. "does NOT unlock" plus a pointer at `secrets reset`
+    // would send a user with the right passphrase to move their vault aside.
+    // No kdf loadVault accepts fails to derive here, so the failure is
+    // injected at the one call doctor makes.
+    const file = join(synthHome, ".yaw-mcp", "secrets.json");
+    await saveVault(file, await createEmptyVault("the-real-passphrase-xyz"));
+    const vaultModule = await import("../secrets-vault.js");
+    const spy = vi
+      .spyOn(vaultModule, "checkVaultPassphrase")
+      .mockRejectedValue(new Error("Invalid scrypt params: memory limit exceeded"));
+    try {
+      const text = captureOut();
+      const r = await runDoctor({
+        cwd: synthCwd,
+        home: synthHome,
+        env: { YAW_MCP_VAULT_PASSPHRASE: "the-real-passphrase-xyz" },
+        os: "linux",
+        out: text.out,
+      });
+      expect(spy).toHaveBeenCalled();
+      const txt = text.text();
+      expect(txt).toContain("passphrase: set in this environment\n");
+      expect(txt).not.toContain("does NOT unlock");
+      expect(txt).not.toContain("secrets reset");
+      expect(r.exitCode).toBe(0);
+      expect(isUnlocked()).toBe(false);
+
+      const json = captureOut();
+      const j = await runDoctor({
+        cwd: synthCwd,
+        home: synthHome,
+        env: { YAW_MCP_VAULT_PASSPHRASE: "the-real-passphrase-xyz" },
+        os: "linux",
+        out: json.out,
+        json: true,
+        skipRegistryCheck: true,
+      });
+      expect(JSON.parse(j.lines[0]).vault).toMatchObject({
+        passphraseSet: true,
+        passphraseUnlocks: null,
+        checkMarkerCorrupt: false,
+      });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it("carries passphraseUnlocks in --json: true, false, or null with no passphrase", async () => {
     const file = join(synthHome, ".yaw-mcp", "secrets.json");
     await saveVault(file, await createEmptyVault("the-real-passphrase-xyz"));

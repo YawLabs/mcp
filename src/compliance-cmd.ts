@@ -469,9 +469,14 @@ function killTree(child: ChildProcess): void {
   if (pid !== undefined) {
     if (process.platform === "win32") {
       // taskkill /T walks the whole descendant tree; /F is required because
-      // the wrapper won't forward a graceful signal.
+      // the wrapper won't forward a graceful signal. A system binary, but
+      // still a child: yaw-mcp's own secrets stay out of its env, like every
+      // other spawn's (see internal-secret-env.ts).
       try {
-        const killer = spawn("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore" });
+        const killer = spawn("taskkill", ["/pid", String(pid), "/T", "/F"], {
+          stdio: "ignore",
+          env: stripInternalSecretsFromEnv(process.env),
+        });
         killer.on("error", () => {});
         return;
       } catch {

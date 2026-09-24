@@ -71,9 +71,11 @@ export const SECRETS_SCHEMA_VERSION = 2;
  *  rules and every entry would look corrupt. */
 const LEGACY_SCHEMA_VERSION = 1;
 
-/** AAD for the vault-level `check` marker. Cannot collide with an entry name
- *  (SECRET_NAME_RE forbids the colon), so the marker and an entry named
- *  "check" stay distinct ciphertexts. Exported alongside
+/** AAD for the vault-level `check` marker. setSecret refuses a colon in a
+ *  name (SECRET_NAME_RE), so no vault this build writes can carry an entry
+ *  under this AAD, and the marker and an entry named "check" stay distinct
+ *  ciphertexts. (loadVault does not apply SECRET_NAME_RE to stored names, so a
+ *  hand-edited file could.) Exported alongside
  *  VAULT_CHECK_PLAINTEXT so a test or a recovery tool can decrypt the marker
  *  the way this module does instead of re-deriving the constant. */
 export const VAULT_CHECK_AAD = "yaw-mcp:vault-check";
@@ -99,13 +101,14 @@ export interface VaultFile {
  *  created with -- i.e. the passphrase is correct. */
 export const VAULT_CHECK_PLAINTEXT = "yaw-mcp-vault-v1";
 
-/** Thrown by unlock() when the `check` marker fails to decrypt but a real
- *  entry succeeds under the same key: the passphrase is RIGHT and the
+/** Thrown by unlock() when the `check` marker does not verify -- it fails to
+ *  decrypt, or decrypts to something other than VAULT_CHECK_PLAINTEXT -- but
+ *  a real entry succeeds under the same key: the passphrase is RIGHT and the
  *  verification token itself is damaged. Exported so the CLI can attach a
  *  path-specific fix hint by comparing against this constant instead of
  *  sniffing the message text. */
 export const VAULT_CHECK_CORRUPT_ERROR =
-  'vault verification token ("check") is corrupt -- the passphrase is correct, but the check marker does not decrypt';
+  'vault verification token ("check") is corrupt -- the passphrase is correct, but the check marker does not verify';
 
 /** Thrown by unlock() when NOTHING in the vault decrypts under the supplied
  *  passphrase. Exported for the same reason as VAULT_CHECK_CORRUPT_ERROR: the
@@ -115,17 +118,6 @@ export const VAULT_WRONG_PASSPHRASE_ERROR = "wrong passphrase for this vault (de
 
 export function vaultPath(home: string = homedir()): string {
   return join(home, CONFIG_DIRNAME, SECRETS_FILENAME);
-}
-
-function emptyVault(): VaultFile {
-  return {
-    version: SECRETS_SCHEMA_VERSION,
-    salt: generateSalt().toString("base64"),
-    // Recorded, never assumed: see KdfParams. A vault that carries its own
-    // cost factor keeps opening after the default is raised.
-    kdf: { ...DEFAULT_KDF },
-    entries: {},
-  };
 }
 
 /** Thrown by loadVault when one entry's shape is wrong. Carries the entry
@@ -142,7 +134,30 @@ export class VaultEntryCorruptError extends Error {
   }
 }
 
-export async function loadVault(path: string): Promise<VaultFile | null> {
+/** A non-fatal condition loadVault met on a vault it still returned. Handed to
+ *  LoadVaultOptions.onWarning instead of being logged, so a caller with its
+ *  own output contract (the CLI's `--json`, where stderr is one JSON object
+ *  per line) can render it itself. `message` is the prose loadVault would
+ *  otherwise have logged. */
+export type VaultLoadWarning = { kind: "check-malformed"; path: string; message: string };
+
+export interface LoadVaultOptions {
+  /** When set, loadVault reports through this and logs nothing itself: the
+   *  malformed-check warning comes here instead of log("warn"), and the two
+   *  failures it otherwise logs before throwing (a non-ENOENT read error, a
+   *  file that is not JSON) are thrown without that line. The not-JSON
+   *  error's message carries what its line did, the path and the parse
+   *  error. The read error does not: it is rethrown as readFile raised it,
+   *  and for a read-phase errno (EISDIR, EIO) Node's message names no path,
+   *  so a caller that passes this has to name the file itself when it
+   *  renders the error -- the CLI's safeLoadVault does, with the error's
+   *  `code`. When absent, all three are logged as warn lines -- the server
+   *  surface relies on them. */
+  onWarning?: (warning: VaultLoadWarning) => void;
+}
+
+export async function loadVault(path: string, opts?: LoadVaultOptions): Promise<VaultFile | null> {
+  const onWarning = opts?.onWarning;
   let raw: string;
   try {
     raw = await readFile(path, "utf8");
@@ -153,21 +168,29 @@ export async function loadVault(path: string): Promise<VaultFile | null> {
     // read it -- bubble that out so callers don't treat it as "no vault"
     // and overwrite real data.
     if (code === "ENOENT") return null;
-    log("warn", "Failed to read vault", { path, error: err instanceof Error ? err.message : String(err), code });
+    if (!onWarning) {
+      log("warn", "Failed to read vault", { path, error: err instanceof Error ? err.message : String(err), code });
+    }
     throw err;
   }
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch (err) {
-    log("warn", "Vault file is not valid JSON", { path, error: err instanceof Error ? err.message : String(err) });
+    if (!onWarning) {
+      log("warn", "Vault file is not valid JSON", { path, error: err instanceof Error ? err.message : String(err) });
+    }
     throw new Error(`vault at ${path} is not valid JSON: ${err instanceof Error ? err.message : String(err)}`);
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new Error(`vault at ${path} is corrupt: root must be a JSON object`);
   }
   const obj = parsed as Record<string, unknown>;
-  if (typeof obj.salt !== "string" || !obj.entries || typeof obj.entries !== "object") {
+  // An ARRAY `entries` is refused like a missing one, as the lenient reader
+  // in secrets-cmd.ts already does: `[]` otherwise loaded as an empty vault,
+  // and `["x"]` failed as "vault corrupt at entry 0", naming a key that is
+  // not there.
+  if (typeof obj.salt !== "string" || !obj.entries || typeof obj.entries !== "object" || Array.isArray(obj.entries)) {
     throw new Error(`vault at ${path} is corrupt: missing or invalid salt/entries`);
   }
   // The salt is a string (checked above), but a truncated / non-base64 salt
@@ -211,14 +234,18 @@ export async function loadVault(path: string): Promise<VaultFile | null> {
     }
   }
   // A malformed `check` is deliberately NOT fatal the way a malformed entry
-  // is: the marker is a verification convenience the next mutating write
-  // re-stamps (ensureCheck), never user data, so throwing here would lock a
-  // user out of intact secrets over a damaged token. But dropping it in total
-  // silence is the other extreme -- the vault quietly falls back to the
-  // legacy any-entry-decrypts path with nothing anywhere saying why. Log it,
+  // is: the marker is a verification convenience the next setSecret re-stamps
+  // (ensureCheck; removeSecret carries the vault's marker as it found it, so
+  // a `remove` in between just leaves it absent a little longer), never user
+  // data, so throwing here would lock a user out of intact secrets over a
+  // damaged token. But dropping it in total silence is the other extreme --
+  // the vault quietly falls back to the legacy any-entry-decrypts path with
+  // nothing anywhere saying why. Report it (to onWarning, or as a warn line),
   // then discard it.
   if (obj.check !== undefined && !isEncryptedEntry(obj.check)) {
-    log("warn", "Vault verification token is malformed; ignoring it (the next write re-stamps it)", { path });
+    const message = "Vault verification token is malformed; ignoring it (the next `yaw-mcp secrets set` re-stamps it)";
+    if (onWarning) onWarning({ kind: "check-malformed", path, message });
+    else log("warn", message, { path });
   }
   const check = isEncryptedEntry(obj.check) ? obj.check : undefined;
   return {
@@ -243,7 +270,7 @@ export async function saveVault(path: string, vault: VaultFile): Promise<void> {
   // atomicWriteFile mkdirs the target dir recursively before writing the temp
   // file, so the caller does NOT need to create the directory first -- and
   // MUST NOT. dirMode only applies to directories atomicWriteFile itself
-  // creates (atomic-write.ts:195 mkdirpWithMode), so an explicit mkdir here
+  // creates (atomic-write.ts mkdirpWithMode), so an explicit mkdir here
   // would hand it a directory that already exists, make the 0o700 below a
   // no-op, and leave ~/.yaw-mcp born at the umask default (typically 0o755)
   // for the window before the chmod. Letting atomicWriteFile create it means
@@ -313,8 +340,10 @@ export function lock(): void {
 }
 
 /** Derive the key for the given vault if not cached, else return the
- *  cached one. The salt must match -- if the vault was rotated and the
- *  salt changed, the caller must lock() first to clear the stale key.
+ *  cached one. The cache is keyed on the salt, so a vault with a different
+ *  salt (a rotated one) is a cache miss: its key is derived fresh and, once
+ *  verified, replaces the cached one. No lock() is needed first; lock() only
+ *  zeroizes the cached key, which that replacement drops without filling.
  *
  *  Returns the caller's OWN copy of the key, never the cached Buffer
  *  itself. lock() zero-fills the cached one in place, and a caller that
@@ -474,10 +503,11 @@ function checkMarkerMatches(vault: VaultFile, key: Buffer): boolean {
 
 /** Return a vault guaranteed to carry a verification token under `key`.
  *  Encrypts VAULT_CHECK_PLAINTEXT when vault.check is absent; otherwise
- *  returns the vault unchanged. Called on every path that produces a vault
- *  to save, so every saved vault has a check future unlocks can verify
- *  against. Module-private: setSecret and createEmptyVault below are its
- *  only callers. */
+ *  returns the vault unchanged. Module-private: setSecret and
+ *  createEmptyVault below are its only callers. rotateVault stamps a fresh
+ *  marker of its own (a new key needs one), and removeSecret stamps nothing
+ *  -- it leaves the marker as it found it, so a check-less vault stays
+ *  check-less across a `remove` until the next `set`. */
 function ensureCheck(vault: VaultFile, key: Buffer): VaultFile {
   if (vault.check) return vault;
   return { ...vault, check: encryptEntry(VAULT_CHECK_PLAINTEXT, key, VAULT_CHECK_AAD) };
@@ -502,16 +532,20 @@ export function vaultVerifiesPassphrases(vault: VaultFile): boolean {
  *    "opens"          -- unlock() succeeds.
  *    "marker-corrupt" -- unlock() fails ONLY because the check marker is
  *                        damaged (VAULT_CHECK_CORRUPT_ERROR: an entry decrypts
- *                        under the key, the marker does not -- see verifyKey).
- *                        The passphrase is RIGHT, and nothing opens until the
- *                        marker is repaired (vaultCheckCorruptHint); `rotate`
- *                        refuses that vault too (rotateVault checks the marker
- *                        first).
- *    "wrong"          -- anything else.
+ *                        under the key, the marker does not verify -- see
+ *                        verifyKey). The passphrase is RIGHT, and nothing
+ *                        opens until the marker is repaired
+ *                        (vaultCheckCorruptHint); `rotate` refuses that vault
+ *                        too -- its unlock() throws the same error before
+ *                        rotateVault runs.
+ *    "wrong"          -- unlock() fails with VAULT_WRONG_PASSPHRASE_ERROR
+ *                        (nothing decrypts), or the passphrase is empty.
  *  Three values rather than a boolean because the callers say different
  *  things in the middle case: doctor must not print a green "unlocks" for a
  *  vault the broker refuses, and `secrets reset` must not send that user to
- *  `rotate`. */
+ *  `rotate`. There is no fourth value for a failure that says nothing about
+ *  the passphrase (a key-derivation error): checkVaultPassphrase throws that
+ *  instead -- see there. */
 export type VaultPassphraseVerdict = "opens" | "marker-corrupt" | "wrong";
 
 /** Which of the three `passphrase` is for `vault`.
@@ -520,9 +554,17 @@ export type VaultPassphraseVerdict = "opens" | "marker-corrupt" | "wrong";
  *  line and `secrets reset`'s refusal to move a vault this passphrase already
  *  opens ask the same question, and two hand copies of "unlock, but read the
  *  corrupt-marker error as a right passphrase" drift -- one would read it as
- *  wrong. upstream.ts's verifyVaultPassphrase asks it too, on its own unlock()
- *  call: its suite mocks this module export by export and pins that call, so
- *  it is deliberately not routed through here.
+ *  wrong. upstream.ts's verifyVaultPassphrase (the in-session prompt's
+ *  pre-flight) routes through here too, and folds a thrown check into false
+ *  because it promises never to throw.
+ *
+ *  THROWS -- rather than answering "wrong" -- when unlock() fails for any
+ *  reason other than its two verdict errors: in practice a scrypt failure in
+ *  deriveKey (the host cannot allocate the working set). That failure says
+ *  nothing about the passphrase, and "wrong" would have doctor print "does
+ *  NOT unlock" and `secrets reset` treat the vault as one to move aside.
+ *  Thrown, it is "could not check": doctor reports the passphrase line as
+ *  unverifiable, and `secrets reset` stops before touching the vault.
  *
  *  A successful unlock() leaves the derived key in the module cache, as any
  *  unlock does; a caller with no further use for it should lock(). Only
@@ -533,9 +575,10 @@ export async function checkVaultPassphrase(vault: VaultFile, passphrase: string)
     (await unlock(vault, passphrase)).fill(0);
     return "opens";
   } catch (err) {
-    return (err instanceof Error ? err.message : String(err)) === VAULT_CHECK_CORRUPT_ERROR
-      ? "marker-corrupt"
-      : "wrong";
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg === VAULT_CHECK_CORRUPT_ERROR) return "marker-corrupt";
+    if (msg === VAULT_WRONG_PASSPHRASE_ERROR) return "wrong";
+    throw err;
   }
 }
 
@@ -549,7 +592,8 @@ export function vaultCheckCorruptHint(path: string): string {
 
 /** A fresh, EMPTY vault that already carries its verification marker under
  *  `passphrase` -- what `secrets reset` writes in place of the vault it moves
- *  aside.
+ *  aside. Of the two vault constructors, the one whose result verifies
+ *  passphrases.
  *
  *  newVault() alone is not enough for that: an empty vault with no `check`
  *  has nothing for unlock() to verify against, so it accepts ANY passphrase
@@ -559,11 +603,11 @@ export function vaultCheckCorruptHint(path: string): string {
  *  next command verifies against it. setSecret's ensureCheck path is what
  *  stamps it on a first `set`; this is the same marker without an entry.
  *
- *  Derives under DEFAULT_KDF, which is what emptyVault() records in the file,
+ *  Derives under DEFAULT_KDF, which is what newVault() records in the file,
  *  so the recorded parameters and the marker's key agree. Touches neither
  *  disk nor the module key cache; the derived key is zeroed before return. */
 export async function createEmptyVault(passphrase: string): Promise<VaultFile> {
-  const vault = emptyVault();
+  const vault = newVault();
   const key = await deriveKey(passphrase, Buffer.from(vault.salt, "base64"), DEFAULT_KDF);
   try {
     return ensureCheck(vault, key);
@@ -585,7 +629,8 @@ export async function createEmptyVault(passphrase: string): Promise<VaultFile> {
  *   2. Decrypt EVERY entry into memory. If ANY entry fails to decrypt
  *      (corruption, key mismatch), throw immediately -- nothing is
  *      re-encrypted, so the on-disk vault the caller still holds is
- *      untouched and recoverable.
+ *      untouched and recoverable. On a vault with a marker the error names
+ *      the entry as corrupt, since step 1 proved the passphrase.
  *   3. Only after all plaintext is in hand: generate a fresh salt,
  *      derive `newKey`, and re-encrypt every entry + a fresh check
  *      marker under it.
@@ -607,6 +652,12 @@ export async function rotateVault(vault: VaultFile, oldKey: Buffer, newPassphras
 
   // Step 2: decrypt every entry into memory. Any failure aborts the whole
   // rotation -- the on-disk vault stays untouched.
+  //
+  // What the failure means depends on step 1. With a marker, step 1 has just
+  // PROVED the key, so an entry that fails here is damaged (or was written
+  // under another key), and blaming the passphrase would send a user who
+  // typed it right to `secrets reset` -- which refuses, because it opens the
+  // vault. Only a check-less (legacy) vault leaves the key unproven here.
   const plaintext = new Map<string, string>();
   for (const [name, entry] of Object.entries(vault.entries)) {
     try {
@@ -614,6 +665,11 @@ export async function rotateVault(vault: VaultFile, oldKey: Buffer, newPassphras
     } catch {
       // Best-effort scrub of whatever we already decrypted before bailing.
       plaintext.clear();
+      if (vault.check) {
+        throw new Error(
+          `rotate aborted: entry "${name}" failed to decrypt, but the passphrase is right (the vault's check marker verifies under it) -- the entry is corrupt, or was written under a different passphrase than the rest of the vault. Remove it (\`yaw-mcp secrets remove ${name}\`), set it again, and re-run rotate.`,
+        );
+      }
       throw new Error(`rotate aborted: entry "${name}" failed to decrypt under the current passphrase`);
     }
   }
@@ -724,9 +780,21 @@ export function getSecret(vault: VaultFile, key: Buffer, name: string): string |
   return decryptBound(vault, entry, key, name);
 }
 
-/** Bootstrap a fresh vault when no file exists yet. */
+/** A fresh, EMPTY vault with NO verification marker -- what a first `secrets
+ *  set` starts from when no file exists yet. Until setSecret stamps the marker
+ *  (ensureCheck), unlock() has nothing to verify against and accepts ANY
+ *  passphrase: right for that first `set`, whose passphrase becomes the
+ *  vault's, and wrong for anything that must hold a passphrase from birth.
+ *  createEmptyVault is this same vault with the marker already stamped. */
 export function newVault(): VaultFile {
-  return emptyVault();
+  return {
+    version: SECRETS_SCHEMA_VERSION,
+    salt: generateSalt().toString("base64"),
+    // Recorded, never assumed: see KdfParams. A vault that carries its own
+    // cost factor keeps opening after the default is raised.
+    kdf: { ...DEFAULT_KDF },
+    entries: {},
+  };
 }
 
 /**
@@ -769,13 +837,12 @@ export function newVault(): VaultFile {
  *     newline. So the span is never returned raw: see MalformedSecretRef
  *     for the two bounded forms it is reduced to.
  */
-/** Matches a `${secret:NAME}` reference. Consumed by resolveSecretRefs
- *  below, and exported for the callers that only need the NAMES referenced
- *  in an env map and so can scan without decrypting anything:
- *    - meta-tools.ts -- the values-free `mcp_connect_secrets` report.
- *    - upstream.ts   -- the spawn-time ref scan + the stderr redactor.
- *  Keep those importing this constant rather than re-declaring a local
- *  copy; three copies of one regex drift.
+/** Matches a `${secret:NAME}` reference. Consumed by resolveSecretRefs,
+ *  collectSecretRefNames and malformedSecretRefSpans below; exported for the
+ *  tests that pin its shape. Production code that only needs the NAMES
+ *  referenced in an env map (meta-tools.ts, upstream.ts, doctor-cmd.ts) goes
+ *  through collectSecretRefNames rather than importing this, and nothing
+ *  should re-declare a local copy: copies of one regex drift.
  *  Global flag => this object carries mutable lastIndex state that every
  *  importer shares. String.matchAll does NOT rescue that: its internal clone
  *  is SEEDED FROM this regex's lastIndex (matchAll only spares the original

@@ -1631,7 +1631,9 @@ export interface VaultStatus {
   /** Whether that passphrase OPENS the vault: true, false, or null when there
    *  was nothing to check -- no passphrase in the env, no readable vault, or a
    *  vault with no check marker and no entries (unlock accepts any passphrase
-   *  there, so "it unlocked" would claim what was never tested). Costs one
+   *  there, so "it unlocked" would claim what was never tested) -- or the
+   *  check itself failed for a reason that says nothing about the passphrase
+   *  (a key-derivation error; see checkVaultPassphrase). Costs one
    *  scrypt derivation (~100 ms) when it runs; the derived key is dropped
    *  before the status is returned. This is the line that separates "the
    *  value is wrong or stale" from "it is forgotten" -- the second is what
@@ -1689,14 +1691,22 @@ async function collectVaultStatus(opts: {
   // vaultVerifiesPassphrases). The one scrypt derivation this costs leaves a
   // key in the module cache that doctor has no use for, so it is dropped at
   // once. The value itself is never rendered anywhere: see passphraseSet.
+  // checkVaultPassphrase THROWS when the check itself fails (a key-derivation
+  // error) rather than calling the passphrase wrong; that says nothing either
+  // way, so the verdict stays null and the line reads as unverifiable.
   const passphrase = opts.env.YAW_MCP_VAULT_PASSPHRASE ?? "";
   let passphraseUnlocks: boolean | null = null;
   let checkMarkerCorrupt = false;
   if (passphrase !== "" && vault !== null && vaultVerifiesPassphrases(vault)) {
-    const verdict = await checkVaultPassphrase(vault, passphrase);
-    lock();
-    passphraseUnlocks = verdict === "opens";
-    checkMarkerCorrupt = verdict === "marker-corrupt";
+    try {
+      const verdict = await checkVaultPassphrase(vault, passphrase);
+      passphraseUnlocks = verdict === "opens";
+      checkMarkerCorrupt = verdict === "marker-corrupt";
+    } catch {
+      // Could not check: leave passphraseUnlocks null.
+    } finally {
+      lock();
+    }
   }
 
   const refs: VaultStatus["refs"] = [];
@@ -1781,11 +1791,13 @@ function renderVaultSection(opts: { status: VaultStatus; print: (s?: string) => 
       print(`  schema:     v${status.schemaVersion}`);
     }
   }
-  // Three states, not two: set-and-opens, set-but-does-not, and set-but-
-  // unverifiable (no readable vault, or nothing in it to check against). The
-  // "does NOT" line is the only surface that tells a stale or forgotten
-  // passphrase apart from an absent one -- the spawn error says "does not
-  // unlock" but nothing there pointed at the way out.
+  // Four set-states, not two: set-and-opens, set-but-marker-corrupt (checked
+  // before the generic does-NOT branch), set-but-does-not, and set-but-
+  // unverifiable (no readable vault, nothing in it to check against, or a
+  // check that could not run). The "does NOT" line is the only surface that
+  // tells a stale or forgotten passphrase apart from an absent one -- the
+  // spawn error says "does not unlock" but nothing there pointed at the way
+  // out.
   if (!status.passphraseSet) {
     print("  passphrase: not set in this environment");
   } else if (status.passphraseUnlocks === true) {

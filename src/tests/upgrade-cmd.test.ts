@@ -2062,12 +2062,44 @@ describe("killProcessTree", () => {
 
     killProcessTree({ pid: 4321, kill }, "win32", spawnImpl);
 
-    expect(spawnImpl).toHaveBeenCalledWith("taskkill", ["/pid", "4321", "/T", "/F"], { stdio: "ignore" });
+    expect(spawnImpl).toHaveBeenCalledWith("taskkill", ["/pid", "4321", "/T", "/F"], {
+      stdio: "ignore",
+      env: expect.any(Object),
+    });
     // The error sink is load-bearing: an unhandled 'error' event on a spawned
     // child takes the process down.
     expect(on).toHaveBeenCalledWith("error", expect.any(Function));
     // kill() still runs so the probe's close/error handler resolves.
     expect(kill).toHaveBeenCalledTimes(1);
+  });
+
+  it("spawns taskkill with yaw-mcp's own secrets STRIPPED from its env", () => {
+    // taskkill is a system binary, but it was one of the two spawns in the
+    // package that still inherited process.env whole -- passphrase included.
+    vi.stubEnv("YAW_MCP_VAULT_PASSPHRASE", "hunter2");
+    vi.stubEnv("YAW_MCP_VAULT_PASSPHRASE_NEW", "hunter3");
+    vi.stubEnv("YAW_MCP_TOKEN", "mcp_pat_stale");
+    try {
+      const seen: Array<{ env: NodeJS.ProcessEnv }> = [];
+      const spawnImpl = vi.fn((_cmd: string, _args: string[], opts: { stdio: "ignore"; env: NodeJS.ProcessEnv }) => {
+        seen.push(opts);
+        return { on: vi.fn() };
+      });
+
+      killProcessTree({ pid: 4321, kill: () => true }, "win32", spawnImpl);
+
+      expect(seen).toHaveLength(1);
+      const { env } = seen[0];
+      expect(env).not.toHaveProperty("YAW_MCP_VAULT_PASSPHRASE");
+      expect(env).not.toHaveProperty("YAW_MCP_VAULT_PASSPHRASE_NEW");
+      expect(env).not.toHaveProperty("YAW_MCP_TOKEN");
+      // A strip, not a blank env: taskkill is still found on PATH.
+      const pathKey = Object.keys(env).find((k) => k.toUpperCase() === "PATH");
+      expect(pathKey).toBeDefined();
+      expect(env[pathKey as string]).toBe(process.env.PATH);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it("uses a plain kill on POSIX, where there is no shell wrapper to punch through", () => {

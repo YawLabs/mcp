@@ -162,9 +162,10 @@ describe("appendAuditEvent + readAuditLog", () => {
 
   it("trims BELOW the cap so the next append does not rewrite the whole log", async () => {
     // Trimming back to exactly AUDIT_TAIL_CAP leaves the file sitting on the
-    // trigger, so every subsequent append re-reads and atomically rewrites
-    // the whole ~400-500 KB log -- once per spawned secret, forever. The
-    // hysteresis gap is what amortizes that.
+    // trigger, so every subsequent append atomically rewrites the whole
+    // ~400-500 KB log -- once per spawned secret, forever. The hysteresis gap
+    // is what amortizes that rewrite. (Not the read: a trimmed log is past the
+    // size gate, so every append still reads it -- see trimToTailCap.)
     const { mkdirSync, writeFileSync } = await import("node:fs");
     mkdirSync(join(home, ".yaw-mcp"), { recursive: true });
     const lines: string[] = [];

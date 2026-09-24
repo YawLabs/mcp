@@ -40,6 +40,43 @@ describe("isCredentialEnvName", () => {
     expect(isCredentialEnvName("Path")).toBe(false);
     // Folding must not turn a refused name into an accepted one.
     expect(isCredentialEnvName("Compass")).toBe(false);
+    expect(isCredentialEnvName("ssh_key_path")).toBe(false);
+  });
+
+  it("refuses a name whose LAST segment is a locator, however credential-shaped its front", () => {
+    // KEY / TOKEN / CREDENTIALS are whole segments in all of these, so the
+    // segment test alone accepted them: a masked prompt for a file path, and
+    // the redactor rewriting an inherited path wherever stderr printed it.
+    for (const name of [
+      "SSH_KEY_PATH",
+      "API_KEY_PATH",
+      "TLS_KEY_FILE",
+      "AWS_SHARED_CREDENTIALS_FILE",
+      "SECRETS_DIR",
+      "TOKEN_BUCKET_SIZE",
+      "REDIS_KEY_PREFIX",
+      "VAULT_TOKEN_HOST",
+      "VAULT_TOKEN_PORT",
+    ]) {
+      expect(isCredentialEnvName(name), name).toBe(false);
+    }
+  });
+
+  it("keeps the credential names the locator rule must not reach", () => {
+    for (const name of [
+      // A connection string carries its password inline, so _URL / _URI are
+      // not locators here.
+      "REDIS_PASSWORD_URL",
+      "MONGO_CREDENTIALS_URI",
+      // ID is the other half of the key pair, not where the key lives.
+      "AWS_ACCESS_KEY_ID",
+      // Only the LAST segment counts.
+      "PATH_TOKEN",
+      "HOST_KEY",
+      "GOOGLE_APPLICATION_CREDENTIALS",
+    ]) {
+      expect(isCredentialEnvName(name), name).toBe(true);
+    }
   });
 });
 
@@ -75,6 +112,23 @@ describe("detectMissingCredentials", () => {
     expect(detectMissingCredentials("Missing environment: OPENAI_API_KEY")).toEqual(["OPENAI_API_KEY"]);
   });
 
+  it("matches the plural 'variables' / 'vars' of that same line", () => {
+    // The trailing "s" defeated the var/variable group, so the name capture
+    // took the word "variables" itself and isAllCaps dropped it.
+    expect(detectMissingCredentials("Missing environment variables: OPENAI_API_KEY")).toEqual(["OPENAI_API_KEY"]);
+    expect(detectMissingCredentials("Missing env vars: GITHUB_TOKEN")).toEqual(["GITHUB_TOKEN"]);
+    expect(detectMissingCredentials("Missing required environment variables: OPENAI_API_KEY")).toEqual([
+      "OPENAI_API_KEY",
+    ]);
+    // Only the first name of a list is captured; GITHUB_ORG would not be
+    // credential-shaped anyway.
+    expect(detectMissingCredentials("Missing environment variables: GITHUB_TOKEN, GITHUB_ORG")).toEqual([
+      "GITHUB_TOKEN",
+    ]);
+    // The same line naming a non-credential still elicits nothing.
+    expect(detectMissingCredentials("Missing environment variables: LOG_LEVEL")).toEqual([]);
+  });
+
   it("does not eat a leading VAR out of the name itself", () => {
     // The var/variable group is optional, so it can match the NAME's own
     // first three letters. Without the mandatory whitespace after it, this
@@ -83,6 +137,168 @@ describe("detectMissingCredentials", () => {
     // Same trap for the env/environment group now that a colon may follow it:
     // the group must not swallow the "ENV" of a name that starts with it.
     expect(detectMissingCredentials("Missing ENV_TOKEN")).toEqual(["ENV_TOKEN"]);
+    // ...and for the plural: "vars" must not swallow the "VARS" of a name.
+    expect(detectMissingCredentials("Missing VARS_TOKEN")).toEqual(["VARS_TOKEN"]);
+  });
+
+  it("matches 'X environment variable is required' and its env-var spellings", () => {
+    // The words between the name and "is" made every pattern miss this, and
+    // it is the exact line the Brave Search reference server prints.
+    expect(detectMissingCredentials("Error: BRAVE_API_KEY environment variable is required")).toEqual([
+      "BRAVE_API_KEY",
+    ]);
+    expect(detectMissingCredentials("GITHUB_TOKEN environment variable is required")).toEqual(["GITHUB_TOKEN"]);
+    expect(detectMissingCredentials("Error: GITHUB_TOKEN environment variable is not set")).toEqual(["GITHUB_TOKEN"]);
+    expect(detectMissingCredentials("The GITHUB_TOKEN env var is not set")).toEqual(["GITHUB_TOKEN"]);
+    expect(detectMissingCredentials("GITHUB_TOKEN environment variable must be set")).toEqual(["GITHUB_TOKEN"]);
+    // The words are not a trigger on their own: the verb still has to say
+    // the value is absent, and the name still has to read as a credential.
+    expect(detectMissingCredentials("GITHUB_TOKEN environment variable is deprecated")).toEqual([]);
+    expect(detectMissingCredentials("HOME environment variable is required")).toEqual([]);
+  });
+
+  it("matches 'Please set' with 'the' and the env / variable words in front of the name", () => {
+    // Pattern 4 spelled its own env words -- "env", "env var", "env
+    // variable", no "environment", no plural, no colon, no "the" -- so in
+    // each of these the capture took the lowercase word itself ("environment",
+    // "the", "var") and isAllCaps dropped it: no prompt at all.
+    expect(detectMissingCredentials("Please set environment variable GITHUB_TOKEN")).toEqual(["GITHUB_TOKEN"]);
+    expect(detectMissingCredentials("Please set the environment variable GITHUB_TOKEN")).toEqual(["GITHUB_TOKEN"]);
+    expect(detectMissingCredentials("Please set the GITHUB_TOKEN environment variable")).toEqual(["GITHUB_TOKEN"]);
+    expect(detectMissingCredentials("Please set env var: GITHUB_TOKEN")).toEqual(["GITHUB_TOKEN"]);
+    // The plural and the colon forms pattern 1 accepts, read from the same
+    // shared words.
+    expect(detectMissingCredentials("Please set environment variables: GITHUB_TOKEN")).toEqual(["GITHUB_TOKEN"]);
+    expect(detectMissingCredentials("Please set the env vars GITHUB_TOKEN")).toEqual(["GITHUB_TOKEN"]);
+    expect(detectMissingCredentials("Please set env: GITHUB_TOKEN")).toEqual(["GITHUB_TOKEN"]);
+    expect(detectMissingCredentials("Please set the 'GITHUB_TOKEN' environment variable")).toEqual(["GITHUB_TOKEN"]);
+    // The phrasings that already matched still do.
+    expect(detectMissingCredentials("Please set GITHUB_TOKEN")).toEqual(["GITHUB_TOKEN"]);
+    expect(detectMissingCredentials("Please set env var GITHUB_TOKEN")).toEqual(["GITHUB_TOKEN"]);
+    expect(detectMissingCredentials("Please set env variable GITHUB_TOKEN")).toEqual(["GITHUB_TOKEN"]);
+  });
+
+  it("does not let a leading 'the' or env word eat the front of a 'Please set' name", () => {
+    // Every leading word is optional and case-insensitive, so each can match
+    // the first letters of the NAME. The mandatory gap after each word is what
+    // keeps these whole instead of reporting "IANT_TOKEN" or "_TOKEN".
+    expect(detectMissingCredentials("Please set VARIANT_TOKEN")).toEqual(["VARIANT_TOKEN"]);
+    expect(detectMissingCredentials("Please set THE_TOKEN")).toEqual(["THE_TOKEN"]);
+    expect(detectMissingCredentials("Please set ENV_TOKEN")).toEqual(["ENV_TOKEN"]);
+    expect(detectMissingCredentials("Please set ENVIRONMENT_TOKEN")).toEqual(["ENVIRONMENT_TOKEN"]);
+    expect(detectMissingCredentials("Please set VARS_TOKEN")).toEqual(["VARS_TOKEN"]);
+    expect(detectMissingCredentials("Please set the THE_TOKEN")).toEqual(["THE_TOKEN"]);
+    expect(detectMissingCredentials("Please set env var VARIANT_TOKEN")).toEqual(["VARIANT_TOKEN"]);
+  });
+
+  it("asks for nothing when 'Please set' names a non-credential, and crosses a line only after a colon", () => {
+    // The new words widen WHERE a name is found, not WHICH names elicit.
+    expect(detectMissingCredentials("Please set LOG_LEVEL")).toEqual([]);
+    expect(detectMissingCredentials("Please set the LOG_LEVEL environment variable")).toEqual([]);
+    expect(detectMissingCredentials("Please set environment variable LOG_LEVEL")).toEqual([]);
+    expect(detectMissingCredentials("Please set the SSH_KEY_PATH environment variable")).toEqual([]);
+    // "the" is followed by a same-line gap, never a line break...
+    expect(detectMissingCredentials("Please set the\nGITHUB_TOKEN")).toEqual([]);
+    // ...while a colon after an env word introduces a list, as in pattern 1.
+    expect(detectMissingCredentials("Please set env var:\n  GITHUB_TOKEN")).toEqual(["GITHUB_TOKEN"]);
+  });
+
+  it("stays linear on long pathological input around the 'Please set' words", () => {
+    // Each probe is a 100 KB run pattern 4's optional words and gaps must
+    // backtrack across before it settles on no credential: a lowercase word
+    // or a non-credential name the ALL_CAPS / credential filter then drops,
+    // or no match at all. A pattern that put two
+    // quantifiers able to match the same whitespace next to each other would
+    // try every split of the run, which is quadratic in its length. The
+    // trailing phrase must still be found: that proves the scan got to the
+    // end of the input instead of giving up early, so the timing is not
+    // vacuous.
+    const n = 100_000;
+    const tail = "\nPlease set the environment variable GITHUB_TOKEN";
+    const probes: [string, string][] = [
+      ["spaces after set", `Please set${" ".repeat(n)}!`],
+      ["tabs and spaces after the", `Please set the${" \t".repeat(n / 2)}!`],
+      ["line breaks after env:", `Please set env:${" \n".repeat(n / 2)}!`],
+      ["spaces before a colon after var", `Please set env var${" ".repeat(n)}:!`],
+      ["repeated leading words", `Please set ${"the env var: ".repeat(n / 13)}!`],
+      ["repeated phrase", `${"Please set the environment variables: ".repeat(n / 38)}!`],
+      ["long name-shaped run", `Please set the environment variable ${"A".repeat(n)}!`],
+    ];
+    // Warm-up, so the first timed run does not also pay for compiling the
+    // patterns.
+    detectMissingCredentials(tail);
+    for (const [label, body] of probes) {
+      const t0 = performance.now();
+      const found = detectMissingCredentials(body + tail);
+      const elapsed = performance.now() - t0;
+      // Measured standalone on a Windows ARM64 box: 0.5-3.5 ms per probe for
+      // all five patterns. This file runs in the parallel "unit" project (see
+      // vitest.config.ts), where a run can be ~4x oversubscribed, so the
+      // budget leaves ~300x headroom over the linear cost. A second optional
+      // gap placed straight after pattern 4's gap after "set" took ~18 s on
+      // the first probe alone.
+      expect(elapsed, label).toBeLessThan(1000);
+      expect(found, label).toEqual(["GITHUB_TOKEN"]);
+    }
+  });
+
+  it("matches a name wrapped in quotes or backticks, without the quote joining the name", () => {
+    expect(detectMissingCredentials("`GITHUB_TOKEN` is required")).toEqual(["GITHUB_TOKEN"]);
+    expect(detectMissingCredentials("'GITHUB_TOKEN' is not set")).toEqual(["GITHUB_TOKEN"]);
+    expect(detectMissingCredentials('"GITHUB_TOKEN" must be set')).toEqual(["GITHUB_TOKEN"]);
+    expect(detectMissingCredentials("Missing env var 'GITHUB_TOKEN'")).toEqual(["GITHUB_TOKEN"]);
+    expect(detectMissingCredentials("Please set `GITHUB_TOKEN`")).toEqual(["GITHUB_TOKEN"]);
+    // A quote is not a trigger: the rest of the phrase still has to match.
+    expect(detectMissingCredentials("'GITHUB_TOKEN' is valid")).toEqual([]);
+    expect(detectMissingCredentials("Missing env var 'VALUE'")).toEqual([]);
+    expect(detectMissingCredentials("`NODE_ENV` is not set")).toEqual([]);
+  });
+
+  it("matches 'not set' / 'unset' / 'not provided' without 'is', and 'No X provided'", () => {
+    expect(detectMissingCredentials("env var SLACK_BOT_TOKEN not set")).toEqual(["SLACK_BOT_TOKEN"]);
+    expect(detectMissingCredentials("GITHUB_TOKEN not set")).toEqual(["GITHUB_TOKEN"]);
+    expect(detectMissingCredentials("GITHUB_TOKEN unset")).toEqual(["GITHUB_TOKEN"]);
+    expect(detectMissingCredentials("GITHUB_TOKEN is not provided")).toEqual(["GITHUB_TOKEN"]);
+    expect(detectMissingCredentials("No GITHUB_TOKEN provided")).toEqual(["GITHUB_TOKEN"]);
+    expect(detectMissingCredentials("No GITHUB_TOKEN environment variable set")).toEqual(["GITHUB_TOKEN"]);
+    // These phrasings widen WHERE a name is found, not WHICH names elicit: a
+    // non-credential name in the same line still asks for nothing.
+    expect(detectMissingCredentials("env var LOG_LEVEL not set")).toEqual([]);
+    expect(detectMissingCredentials("NODE_ENV unset")).toEqual([]);
+    expect(detectMissingCredentials("DATABASE_HOST not provided")).toEqual([]);
+    expect(detectMissingCredentials("No CONFIG provided")).toEqual([]);
+    expect(detectMissingCredentials("No SSH_KEY_PATH provided")).toEqual([]);
+    // The verb has to end where the word does, and "No" needs a verb at all.
+    expect(detectMissingCredentials("GITHUB_TOKEN unsettled")).toEqual([]);
+    expect(detectMissingCredentials("GITHUB_TOKEN not settable")).toEqual([]);
+    expect(detectMissingCredentials("No GITHUB_TOKEN rotation needed")).toEqual([]);
+  });
+
+  it("still requires 'is' before required / missing, and never treats 'is not defined' as missing", () => {
+    // Without "is", these words describe something other than an absent
+    // value, and prompting would ask for a key the server already has.
+    expect(detectMissingCredentials("GITHUB_TOKEN required scopes: repo, read:org")).toEqual([]);
+    expect(detectMissingCredentials("OPENAI_API_KEY missing permissions for this model")).toEqual([]);
+    // "No" is what makes "provided" a complaint.
+    expect(detectMissingCredentials("GITHUB_TOKEN provided")).toEqual([]);
+    // The JS ReferenceError shape is a crash, not a missing credential.
+    expect(detectMissingCredentials("ReferenceError: GITHUB_TOKEN is not defined")).toEqual([]);
+  });
+
+  it("does not carry a phrase across a line break, except after a colon", () => {
+    // A line that merely ENDS in "missing" used to claim the credential-shaped
+    // name at the start of the NEXT line, whatever that line said about it.
+    expect(detectMissingCredentials("sourcemap is missing\nOPENAI_API_KEY loaded from vault")).toEqual([]);
+    expect(detectMissingCredentials("Missing\nGITHUB_TOKEN")).toEqual([]);
+    expect(detectMissingCredentials("Missing\r\nGITHUB_TOKEN")).toEqual([]);
+    // The is-less "unset" would otherwise pair a name ending one line with a
+    // shell trace starting the next.
+    expect(detectMissingCredentials("export OPENAI_API_KEY\nunset DEBUG")).toEqual([]);
+    // A colon introduces a list, and the list form keeps eliciting.
+    expect(detectMissingCredentials("Missing:\n  OPENAI_API_KEY")).toEqual(["OPENAI_API_KEY"]);
+    expect(detectMissingCredentials("Missing required environment variables:\r\n  OPENAI_API_KEY")).toEqual([
+      "OPENAI_API_KEY",
+    ]);
   });
 
   it("matches 'X is not set'", () => {
@@ -202,5 +418,17 @@ describe("detectMissingCredentials -- only credential-shaped names elicit", () =
     // segment, with or without the API_ prefix.
     expect(detectMissingCredentials("API_KEY is required")).toEqual(["API_KEY"]);
     expect(detectMissingCredentials("OPENAI_API_KEY is not set")).toEqual(["OPENAI_API_KEY"]);
+  });
+
+  it("does not elicit for a locator that merely names a credential (SSH_KEY_PATH)", () => {
+    // Same false-positive class as TOKENIZER_PATH, reached through a whole
+    // KEY / TOKEN segment instead of the substring fallback.
+    expect(detectMissingCredentials("SSH_KEY_PATH is required")).toEqual([]);
+    expect(detectMissingCredentials("TLS_KEY_FILE is not set")).toEqual([]);
+    expect(detectMissingCredentials("TOKEN_BUCKET_SIZE is required")).toEqual([]);
+    expect(detectMissingCredentials("Missing environment variable: AWS_SHARED_CREDENTIALS_FILE")).toEqual([]);
+    // ...while the credential itself, and its _ID half, still elicit.
+    expect(detectMissingCredentials("SSH_KEY is required")).toEqual(["SSH_KEY"]);
+    expect(detectMissingCredentials("AWS_ACCESS_KEY_ID is required")).toEqual(["AWS_ACCESS_KEY_ID"]);
   });
 });

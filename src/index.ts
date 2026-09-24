@@ -127,8 +127,8 @@ function run<T>(
 // the MCP server. Known subcommands branch off before the server is ever
 // constructed, so `compliance`, `install`, and `doctor` never open a stdio
 // transport. There is no auth gate to branch around: the hosted backend is
-// retired, YAW_MCP_TOKEN is a dead legacy key (see upstream.ts), and every
-// subcommand here is local-only.
+// retired, YAW_MCP_TOKEN is a dead legacy key (see internal-secret-env.ts),
+// and every subcommand here is local-only.
 const subcommand = process.argv[2];
 
 // Every client env var, read ONCE here and threaded into the verbs that need

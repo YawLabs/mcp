@@ -63,7 +63,12 @@ export interface KdfParams {
 /** What a vault created by THIS build is written with. Free to move upward as
  *  hardware gets faster: every vault created or rotated from now on records
  *  the parameters it was written under, and a vault that records NONE is read
- *  under LEGACY_KDF below -- never under this. */
+ *  under LEGACY_KDF below -- never under this.
+ *
+ *  Deliberately NOT frozen, unlike LEGACY_KDF: secrets-vault.test.ts assigns
+ *  DEFAULT_KDF.N in place to stand in for a future bump (a kdf-less vault
+ *  must still open under LEGACY_KDF). Freezing this would make that
+ *  assignment throw under ESM strict mode. */
 export const DEFAULT_KDF: KdfParams = { N: 1 << 15, r: 8, p: 1 };
 
 /** The parameters every KDF-LESS vault was derived under -- schema v1, written
@@ -102,8 +107,9 @@ function kdfMemoryBytes(N: number, r: number): number {
 }
 
 /** Validate KDF parameters read off disk. Rejects non-integers, zero/negative
- *  values, a non-power-of-two N, anything past a per-field bound, and any
- *  N/r PAIR whose combined working set exceeds MAX_KDF_MEMORY_BYTES. */
+ *  values, a non-power-of-two N, anything past a per-field bound, any N/r
+ *  PAIR whose combined working set exceeds MAX_KDF_MEMORY_BYTES, and any N/r
+ *  pair node's scrypt refuses outright (see below). */
 export function isValidKdfParams(v: unknown): v is KdfParams {
   if (!v || typeof v !== "object") return false;
   const o = v as Record<string, unknown>;
@@ -114,6 +120,14 @@ export function isValidKdfParams(v: unknown): v is KdfParams {
   if (r < 1 || r > MAX_KDF_R) return false;
   if (p < 1 || p > MAX_KDF_P) return false;
   if (kdfMemoryBytes(N, r) > MAX_KDF_MEMORY_BYTES) return false;
+  // OpenSSL's scrypt requires N < 2^(16 * r) and rejects anything else with
+  // ERR_CRYPTO_INVALID_SCRYPT_PARAMS, whatever maxmem says. Under MAX_KDF_N
+  // (2^18) that only bites r=1 with N >= 2^16, but a vault carrying such a
+  // pair used to pass this check and then fail unlock() with node's raw
+  // RangeError -- which the broker reported as a wrong passphrase -- instead
+  // of the "invalid kdf parameters" error loadVault gives every other bad
+  // pair. For r >= 4 the bound is 2^64 or more and OpenSSL skips the check.
+  if (r < 4 && N >= 2 ** (16 * r)) return false;
   return true;
 }
 

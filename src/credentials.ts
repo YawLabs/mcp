@@ -1,29 +1,89 @@
 // Heuristic detection of "missing credential" failures. When a local
 // upstream fails to start with a stderr tail like "GITHUB_TOKEN is
-// required" or "Missing env var: OPENAI_API_KEY", yaw-mcp can prompt the
-// user for the value directly via MCP elicitation rather than making
-// them hunt for where to put it. We only ever treat ALL_CAPS names as
-// credentials -- anything else is too noisy to infer.
+// required" or "Missing env var: OPENAI_API_KEY", yaw-mcp can ask the
+// user for the value -- typed into a masked field on a one-shot loopback
+// page reached through an MCP elicitation, never into the elicitation
+// itself -- rather than making them hunt for where to put it. We only ever
+// treat ALL_CAPS names as credentials -- anything else is too noisy to infer.
 
 // Case-insensitive so the surrounding English is matched in any casing,
 // but the captured name is post-filtered to require ALL_CAPS so ordinary
 // English words ("var", "missing") never sneak through.
 //
-// Pattern 1 tolerates every phrasing servers actually emit around the name:
-// an optional "required", an optional "env"/"environment", an optional
-// "var"/"variable", and an optional COLON after ANY of "missing", "env"/
-// "environment" or "var"/"variable" -- "Missing env var: OPENAI_API_KEY"
-// (this file's own header example), "Missing env: X" and "missing: X" all
-// matched none of those before (the colon was only tolerated after the
-// var/variable group). The `\s+` AFTER each optional colon is load-bearing:
-// without it "Missing VARIANT_TOKEN" has its leading "VAR" eaten by the
-// var/variable group and reports the name as "IANT_TOKEN" (and "Missing
-// ENV_TOKEN" would lose its "ENV" the same way).
+// The env-var name, spelled ONCE: every capture group below and isAllCaps
+// read it, so widening or tightening it cannot leave one copy behind (a name
+// a pattern captures but isAllCaps refuses is silently never elicited).
+const NAME = "[A-Z_][A-Z0-9_]{2,}";
+// Whitespace that does NOT cross a line, used for every gap in every pattern
+// except the one after a colon (SEP, below). The haystack is multi-line
+// (stderr tail + error message joined with "\n"), and a gap that spans a
+// break lets a line merely ENDING in "missing" ("sourcemap is missing") claim
+// whatever credential-shaped name STARTS the next one ("OPENAI_API_KEY loaded
+// from vault") -- a prompt for a key the server never asked for.
+const GAP = "[^\\S\\r\\n]+";
+// The separator after a word that may end in a colon -- pattern 1's
+// "missing", and the env / variable words of LEADING_ENV_WORDS (below): a
+// same-line gap, OR a colon followed by any whitespace. The colon is the one
+// marker that a break continues the phrase -- "Missing:\n  OPENAI_API_KEY"
+// is a list, and it still elicits.
+const SEP = "(?:[^\\S\\r\\n]*:\\s+|[^\\S\\r\\n]+)";
+// An optional quote or backtick around the name ("`GITHUB_TOKEN` is
+// required", "Missing env var 'GITHUB_TOKEN'"). Placed only where the name
+// meets a gap -- where it meets a `\b` instead, the boundary already allows a
+// quote -- and kept OUTSIDE the capture so it never joins the name.
+const QUOTE = "[\"'`]?";
+// "environment variable" / "env var" between the name and the verb
+// ("GITHUB_TOKEN environment variable is required", the phrasing the Brave
+// Search reference server prints), read by patterns 2, 3 and 5. It comes
+// AFTER the capture, so unlike LEADING_ENV_WORDS it cannot eat the front of a
+// name.
+const ENV_WORDS = `(?:(?:env|environment)${GAP})?(?:(?:variable|var)${GAP})?`;
+// The same words IN FRONT of the name, read by patterns 1 and 4 ("Missing
+// env var: X", "Please set environment variable X") -- one copy, so the two
+// patterns cannot drift apart again (pattern 4 once spelled its own narrower
+// list and matched no "environment", no plural and no colon). Unlike
+// ENV_WORDS, each word may take a colon ("Missing env vars: X"), and the
+// var/variable words a plural ("Missing environment variables: X"). The separator after each word is
+// load-bearing: both groups are optional and case-insensitive, so without it
+// "Missing VARIANT_TOKEN" has its leading "VAR" eaten by the var/variable
+// group and reports the name as "IANT_TOKEN" (and "Missing ENV_TOKEN" /
+// "Missing VARS_TOKEN" would lose a prefix the same way).
+const LEADING_ENV_WORDS = `(?:(?:env|environment)${SEP})?(?:(?:variables?|vars?)${SEP})?`;
+
+// Pattern 1 tolerates these words around the name: an optional "required",
+// then LEADING_ENV_WORDS -- an optional "env"/"environment" and an optional
+// "var"/"variable" (plural too, "Missing environment variables: X") -- and an
+// optional COLON after ANY of "missing", "env"/"environment" or
+// "var"/"variable" -- "Missing env var: OPENAI_API_KEY" (this file's own
+// header example), "Missing env: X" and "missing: X" all elicit. It captures
+// only the FIRST name of a comma-separated list.
+//
+// Pattern 2 needs "is" before required/missing/empty/undefined, because
+// without it those words describe something else ("GITHUB_TOKEN required
+// scopes", "OPENAI_API_KEY missing permissions"). Only "not set", "unset" and
+// "not provided" read the same with or without it ("env var SLACK_BOT_TOKEN
+// not set"). "is not defined" is deliberately absent: it is the JS
+// ReferenceError shape, a crash rather than a missing credential.
+//
+// Pattern 4 is the "Please set X" shape. It reads the same LEADING_ENV_WORDS
+// as pattern 1 ("Please set env var: X", "Please set environment variable X",
+// "Please set environment variables: X") after an optional "the" ("Please set
+// the environment variable X"). Nothing after the name is read, so "Please
+// set the X environment variable" matches on "the" alone. "the" takes a
+// mandatory gap for the same reason the env words do: "Please set THE_TOKEN"
+// keeps its "THE".
+//
+// Pattern 5 is the "No GITHUB_TOKEN provided" shape; "no" and the verb
+// around the name are both required, so "GITHUB_TOKEN provided" is not a hit.
 const MISSING_PATTERNS: RegExp[] = [
-  /\bmissing\s*:?\s+(?:required\s+)?(?:(?:env|environment)\s*:?\s+)?(?:(?:variable|var)\s*:?\s+)?([A-Z_][A-Z0-9_]{2,})\b/gi,
-  /\b([A-Z_][A-Z0-9_]{2,})\s+is\s+(?:required|not\s+set|missing|empty|undefined)\b/gi,
-  /\b([A-Z_][A-Z0-9_]{2,})\s+must\s+be\s+set\b/gi,
-  /\bplease\s+set\s+(?:env\s+(?:var\s+|variable\s+)?)?([A-Z_][A-Z0-9_]{2,})\b/gi,
+  new RegExp(`\\bmissing${SEP}(?:required${GAP})?${LEADING_ENV_WORDS}${QUOTE}(${NAME})\\b`, "gi"),
+  new RegExp(
+    `\\b(${NAME})${QUOTE}${GAP}${ENV_WORDS}(?:is${GAP}(?:required|missing|empty|undefined)|(?:is${GAP})?(?:not${GAP}set|unset|not${GAP}provided))\\b`,
+    "gi",
+  ),
+  new RegExp(`\\b(${NAME})${QUOTE}${GAP}${ENV_WORDS}must${GAP}be${GAP}set\\b`, "gi"),
+  new RegExp(`\\bplease${GAP}set${GAP}(?:the${GAP})?${LEADING_ENV_WORDS}${QUOTE}(${NAME})\\b`, "gi"),
+  new RegExp(`\\bno${GAP}${QUOTE}(${NAME})${QUOTE}${GAP}${ENV_WORDS}(?:provided|set)\\b`, "gi"),
 ];
 
 // A failing server's stderr chooses what the user is asked to type into a
@@ -97,6 +157,21 @@ const CREDENTIAL_NOUN_SUFFIXES = ["TOKEN", "SECRET", "PASSWORD", "PASSPHRASE", "
 // is also the head of an ordinary one.
 const CREDENTIAL_SUBSTRINGS = ["TOKEN", "SECRET", "PASSWORD", "PASSPHRASE", "APIKEY", "CREDENTIAL"];
 
+// A name whose LAST segment is one of these names WHERE a thing lives, or a
+// property of it, not the thing: SSH_KEY_PATH, TLS_KEY_FILE, REDIS_KEY_PREFIX,
+// TOKEN_BUCKET_SIZE. The credential segment in front is only a qualifier, and
+// eliciting for one pops a secret prompt for a file path. Refused before the
+// segment test, so it also keeps upstream.ts's redactor from treating an
+// inherited SSH_KEY_PATH's value as a secret and rewriting that path wherever
+// it appears in stderr.
+//
+// URL and URI are deliberately absent: a connection string carries its
+// password inline (postgres://user:pass@host), so REDIS_PASSWORD_URL stays a
+// credential. ID is absent too -- AWS_ACCESS_KEY_ID is half of the credential
+// pair. Only the LAST segment counts: PATH_TOKEN and HOST_KEY end in a
+// credential segment, so they still elicit.
+const LOCATOR_SEGMENTS = new Set(["PATH", "FILE", "DIR", "HOST", "PORT", "PREFIX", "SIZE"]);
+
 // Belt-and-braces on top of the credential-shape test above: these are names
 // that either ARE infrastructure variables or are English words a server is
 // likely to shout in a failure line. Keeping them listed means the filter
@@ -141,14 +216,18 @@ const IGNORED = new Set([
 // JS regex has no (?i:...) scoped case-insensitivity, so the capture-group
 // case check has to happen in code: keep only matches whose captured span
 // is already uppercase in the original input.
+const ALL_CAPS_NAME = new RegExp(`^${NAME}$`);
 function isAllCaps(name: string): boolean {
-  return /^[A-Z_][A-Z0-9_]{2,}$/.test(name);
+  return ALL_CAPS_NAME.test(name);
 }
 
 /** Does this ALL_CAPS name read as a credential rather than as ordinary
- *  infrastructure? See CREDENTIAL_SEGMENTS for why the test is per-segment. */
+ *  infrastructure? See CREDENTIAL_SEGMENTS for why the test is per-segment,
+ *  and LOCATOR_SEGMENTS for the trailing segment that overrides it. */
 function isCredentialShaped(name: string): boolean {
-  for (const segment of name.split("_")) {
+  const segments = name.split("_");
+  if (LOCATOR_SEGMENTS.has(segments[segments.length - 1] ?? "")) return false;
+  for (const segment of segments) {
     if (CREDENTIAL_SEGMENTS.has(segment)) return true;
     // Strictly LONGER than the noun: the whole-word case is the set's job,
     // and this rule is only for the compound (BOTTOKEN) the set cannot list
