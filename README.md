@@ -449,4 +449,4 @@ The source is published so you can read and audit it before running it -- `yaw-m
 - [@yawlabs/mcp-compliance](https://www.npmjs.com/package/@yawlabs/mcp-compliance) -- test your MCP servers for spec compliance
 - [CHANGELOG](./CHANGELOG.md) -- release notes
 - [GitHub](https://github.com/YawLabs/mcp) -- source and issues
-- [![Follow @TokenLimitNews on X](https://img.shields.io/badge/follow-%40TokenLimitNews-000000?logo=x&logoColor=white)](https://x.com/TokenLimitNews)
+- [![Follow @YawLabs on X](https://img.shields.io/badge/follow-%40YawLabs-000000?logo=x&logoColor=white)](https://x.com/YawLabs)
