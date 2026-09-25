@@ -133,14 +133,16 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
   },
   // Same client list as install/uninstall -- one INSTALL_CLIENTS constant
   // feeds all three, so a new client cannot appear in one and not the others.
-  // --remove-originals / --keep-originals are the two ways to answer the
-  // duplicate-run question without a prompt, which is the only way to script
-  // an import at all. Mirrors parseImportArgs in src/import-cmd.ts.
+  // --remove-originals / --keep-originals answer the duplicate-run question
+  // without a prompt, and --force answers the other one -- whether to change
+  // a server bundles.json already has -- which off a TTY is refused without
+  // it. A script needs both answers, so all three MUST be completable.
+  // Mirrors parseImportArgs in src/import-cmd.ts.
   {
     name: "import",
     description: "Adopt a client's existing MCP servers into bundles.json",
     positional: [[...INSTALL_CLIENTS]],
-    flags: ["--scope", "--project-dir", "--dry-run", "--remove-originals", "--keep-originals", "--help"],
+    flags: ["--scope", "--project-dir", "--dry-run", "--remove-originals", "--keep-originals", "--force", "--help"],
   },
   // --force / --yes gate the destructive removal (confirm on a TTY, refuse off
   // one), so they MUST be completable -- a user who cannot tab --force will not

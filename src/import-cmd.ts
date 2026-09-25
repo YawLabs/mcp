@@ -37,7 +37,10 @@
 // originals STAY -- silently unwiring somebody's working client config is a
 // worse outcome than running a server twice. And the removal is REFUSED
 // outright when the client has no yaw-mcp entry of its own, because then the
-// imported servers would be reachable from nowhere at all.
+// imported servers would be reachable from nowhere at all. `--dry-run` beside
+// `--remove-originals` previews that removal -- the file, and every key a real
+// run would take out of it or the reason it would take out none -- through the
+// same search and the same splice the real run uses.
 //
 // THE THIRD TRAP: THE CLIENT CONFIG IS THE OTHER COPY. Every line below that
 // removes something, or overwrites something, exists because the two files
@@ -51,7 +54,12 @@
 //     entry carries no catalog slug, so upsertUserBundle's cross-slug refusal
 //     cannot fire for it and every match MERGES, with the client entry
 //     winning. A silent launch-command swap is how an import turns into
-//     arbitrary command execution on the next activate.
+//     arbitrary command execution on the next activate. So a merge that would
+//     CHANGE the stored entry is not written without an answer, as install's
+//     own entry is not: a prompt on a TTY ([o]verwrite / [s]kip / [a]bort,
+//     default skip), `--force`, or -- off a TTY with neither -- exit 2 with
+//     nothing written at all. A match the merge would leave as it is is not a
+//     collision and is not asked about.
 //   * The plan prints the namespace the file will actually hold, which is not
 //     always the derived one: a stored entry matched by NAME keeps its own.
 //   * A `${...}` the client expands itself is expanded here, or the server is
@@ -63,6 +71,7 @@
 
 import { homedir } from "node:os";
 import { basename, resolve as resolvePath } from "node:path";
+import { createInterface } from "node:readline/promises";
 import { atomicWriteFile } from "./atomic-write.js";
 import { clientChoices, resolveClientArg } from "./client-aliases.js";
 import {
@@ -73,13 +82,14 @@ import {
   classifyClientConfig,
   containerKeysAt,
   containerNounFor,
+  type EntryTransform,
   importViewOf,
   readClientConfigFile,
   siteAt,
   terminateWithNewline,
   unloadableConfigProblem,
 } from "./client-config.js";
-import { resolveInstallSite } from "./install-cmd.js";
+import { deepEqualJson, describeEntryDiff, resolveInstallSite } from "./install-cmd.js";
 import {
   blockedContainerFix,
   type ClientEnvValues,
@@ -95,9 +105,16 @@ import {
   unparseableConfigFix,
 } from "./install-targets.js";
 import { parseJsonc } from "./jsonc.js";
-import { deriveNamespace, type LaunchShape, previewUpsertUserBundle, upsertUserBundle } from "./local-bundles.js";
+import {
+  deriveNamespace,
+  type LaunchShape,
+  localBundlesPath,
+  previewUpsertUserBundle,
+  upsertUserBundle,
+} from "./local-bundles.js";
 import { createStreamWriter } from "./logger.js";
-import { askYesNo, QUESTION_CANCELLED } from "./readline-question.js";
+import { userConfigDir } from "./paths.js";
+import { askYesNo, QUESTION_CANCELLED, questionOrEmpty } from "./readline-question.js";
 import { displayArg, displaySafe } from "./trust-cmd.js";
 import { TRIAL_ENTRY_PREFIX } from "./try-cmd.js";
 import type { UpstreamServerConfig } from "./types.js";
@@ -119,7 +136,11 @@ export const IMPORT_USAGE = `Usage: yaw-mcp import <client> [flags]
 
   A server already in bundles.json is MERGED, with the client's copy winning,
   so the plan names every entry that would be replaced and shows the launch
-  command it would replace. A VS Code server written with a \${input:...} or
+  command it would replace. When the merge would change the stored entry, a
+  terminal run asks first -- [o]verwrite, [s]kip or [a]bort, and a bare Enter
+  skips that server -- and a run off one writes nothing and exits 2 unless you
+  pass --force. A stored entry the merge would leave as it is is not asked
+  about. A VS Code server written with a \${input:...} or
   \${env:...} variable is skipped by name: VS Code expands those itself and
   yaw-mcp does not, so importing one would produce a server that cannot start.
 
@@ -136,10 +157,14 @@ Flags:
                        one config file. Defaults to the client's user scope.
   --project-dir <dir>  Project root for a project/workspace scope
                        (default: the current directory).
-  --dry-run            Show what would be imported. Writes nothing.
+  --dry-run            Show what would be imported -- and, with
+                       --remove-originals, which client entries would be
+                       removed. Writes nothing.
   --remove-originals   Remove the imported entries from the client config
                        without asking.
-  --keep-originals     Leave the client config alone without asking.`;
+  --keep-originals     Leave the client config alone without asking.
+  --force              Overwrite a bundles.json entry the import would change
+                       without asking.`;
 
 export interface ImportCommandOptions {
   clientId?: InstallClientId;
@@ -149,6 +174,9 @@ export interface ImportCommandOptions {
   dryRun?: boolean;
   removeOriginals?: boolean;
   keepOriginals?: boolean;
+  /** Overwrite every bundles.json entry the import would change, without
+   *  asking -- the only way past that question off a TTY. */
+  force?: boolean;
   home?: string;
   cwd?: string;
   appData?: string;
@@ -163,8 +191,11 @@ export interface ImportCommandOptions {
   err?: (s: string) => void;
   /** Test hook: override the TTY verdict instead of reading process.std*. */
   isTTY?: boolean;
-  /** Test hook: answer the removal prompt without a real TTY read. */
+  /** Test hook: answer the removal prompt without a real TTY read. It does
+   *  NOT answer the bundles.json overwrite question, which reads `io`. */
   promptAnswer?: string;
+  /** The streams both questions are asked on; process.stdin / process.stdout
+   *  when absent. */
   io?: { stdin: NodeJS.ReadableStream; stdout: NodeJS.WritableStream; terminal?: boolean };
 }
 
@@ -210,6 +241,11 @@ interface ImportCandidate {
   /** The launch shape of the entry already in bundles.json that this write
    *  would fold onto, when there is one. */
   replacing?: LaunchShape;
+  /** What this write would CHANGE in that stored entry, one line per
+   *  difference (storedEntryChanges). Absent when there is no stored entry,
+   *  when the merge would leave it as it is, or when the write could not be
+   *  previewed -- and only a present one is asked about. */
+  changes?: string[];
 }
 
 /** A raw `env` / `headers` block from a client config, reduced to the
@@ -455,6 +491,113 @@ function renderLaunch(shape: LaunchShape): string {
   return shape.url ? `HTTP ${displaySafe(shape.url)}` : "(no launch command)";
 }
 
+/** previewUpsertUserBundle's answer for one candidate. */
+type UpsertPreview = Awaited<ReturnType<typeof previewUpsertUserBundle>>;
+
+/**
+ * What an import's write would change in the entry bundles.json already holds,
+ * one line per difference -- or null when the merge would leave that entry as
+ * it is, which is not a collision and is not asked about. Called only for a
+ * preview that found a stored entry.
+ *
+ * `preview.entry` is the MERGED entry the write would land. The entry it folds
+ * onto is read back through the same call: an upsert carrying nothing but the
+ * stored entry's own namespace matches that entry and sets no other field, so
+ * what it would land is the stored entry. That keeps bundles.json's reader and
+ * the upsert's two-pass lookup in local-bundles.ts rather than restating either
+ * here. A read-back that lands on an entry with a different launch from the
+ * one `preview` reported replacing is treated as unreadable.
+ *
+ * The read-back is the stored entry AS A MERGE NORMALIZES IT: a blank or
+ * non-string env value and an empty optionalEnvKeys come out dropped. This
+ * write drops them too unless the client's entry names that env key, so a
+ * write whose only effect is that normalization is not asked about, and an env
+ * key the client names over a blank stored value is described as added rather
+ * than changed -- even when the client's value is blank too and the write
+ * would change nothing, which asks one question more than it needs to.
+ *
+ * "Differs" is install's own test and wording -- deepEqualJson and
+ * describeEntryDiff -- so key order is not a difference, and only command and
+ * args are shown with their values: env is named by key, anything else by
+ * field name. Each line goes through displaySafe, since bundles.json is a
+ * hand-editable file.
+ *
+ * Never throws. A read-back that throws, finds no entry, or lands on another
+ * launch answers with a line saying so, which still counts as a change: the
+ * cost is a question that did not need asking, never an overwrite made
+ * without one.
+ */
+async function storedEntryChanges(
+  preview: UpsertPreview,
+  home: string,
+  warnOnce: (w: string) => void,
+): Promise<string[] | null> {
+  const unreadable = ["the stored entry could not be read back to compare, so it is treated as changed"];
+  if (preview.namespace === undefined) return unreadable;
+  try {
+    const stored = await previewUpsertUserBundle({ namespace: preview.namespace }, { home });
+    for (const w of stored.warnings) warnOnce(w);
+    if (!stored.replaced || JSON.stringify(stored.replacing) !== JSON.stringify(preview.replacing)) return unreadable;
+    if (deepEqualJson(stored.entry, preview.entry)) return null;
+    return describeEntryDiff(stored.entry, preview.entry).map(displaySafe);
+  } catch {
+    return unreadable;
+  }
+}
+
+/** Diff lines under a common indent, built outside the template literals that
+ *  print them. */
+function indentLines(lines: readonly string[], indent: string): string {
+  return lines.map((l) => `${indent}${l}`).join("\n");
+}
+
+/** Every answer to the bundles.json overwrite question, or the answer that
+ *  stopped the asking. */
+type CollisionAnswers = Map<ImportCandidate, "overwrite" | "skip"> | "abort" | "cancelled";
+
+/**
+ * Ask about each entry this import would change, in plan order, before
+ * anything is written. install's promptCollision, once per entry: the same
+ * three answers and the same `(default: skip)`, with EOF read as that default
+ * and Ctrl+C as a cancel, both through questionOrEmpty. [a]bort or Ctrl+C stops
+ * the asking there.
+ *
+ * Each answer is the line that arrives while its question is waiting. A line
+ * that arrives while none is -- typed ahead of the second question, say -- is
+ * not kept for the next one: readline emits it with no question to take it,
+ * and that question then waits for a fresh line, or takes the default at EOF.
+ */
+async function askBundleCollisions(
+  changing: readonly ImportCandidate[],
+  bundlesFile: string,
+  io: ImportCommandOptions["io"],
+): Promise<CollisionAnswers> {
+  const rl = createInterface({
+    input: io?.stdin ?? process.stdin,
+    output: io?.stdout ?? process.stdout,
+    terminal: io?.terminal,
+  });
+  const answers = new Map<ImportCandidate, "overwrite" | "skip">();
+  try {
+    for (const c of changing) {
+      const diff = indentLines(c.changes ?? [], "    ");
+      const raw = await questionOrEmpty(
+        rl,
+        `${bundlesFile} already has an entry "${displaySafe(c.plannedNamespace)}" that differs from the one importing ${displayArg(c.key)} would write:\n` +
+          `${diff}\n` +
+          "  [o]verwrite, [s]kip, or [a]bort? (default: skip) ",
+      );
+      if (raw === QUESTION_CANCELLED) return "cancelled";
+      const answer = raw.trim().toLowerCase();
+      if (answer.startsWith("a")) return "abort";
+      answers.set(c, answer.startsWith("o") ? "overwrite" : "skip");
+    }
+    return answers;
+  } finally {
+    rl.close();
+  }
+}
+
 /** A config file plus the path inside it that holds the server entries -- as a
  *  `ConfigSite`, so its SYNTAX is the one the target row and the scope
  *  resolved and is never restated here. A client with more than one scope has
@@ -657,6 +800,12 @@ export function parseImportArgs(
       case "--keep-originals":
         opts.keepOriginals = true;
         break;
+      // install's word for the same answer: replace a differing entry without
+      // asking. Unrelated to the two flags above, which answer the question
+      // about the CLIENT config.
+      case "--force":
+        opts.force = true;
+        break;
       case "-h":
       case "--help":
         return { ok: false, error: IMPORT_USAGE, help: true };
@@ -709,6 +858,202 @@ interface ImportedEntry {
    *  never from the derived one: a name-fallback merge keeps the stored
    *  namespace, and this is the identity the removal decision hangs on. */
   landed: string;
+}
+
+/** What runImport resolved its client and scope to -- resolveInstallSite's
+ *  answer, once it has one. */
+type ImportSite = NonNullable<ReturnType<typeof resolveInstallSite>>;
+
+/** Where the search for yaw-mcp's own entry looked, and what it found. The
+ *  real run decides from it whether the originals may go, and a dry run with
+ *  --remove-originals previews that same decision from it. */
+interface BrokerSearch {
+  /** Every container searched, the imported one FIRST. */
+  searched: ContainerRef[];
+  /** The first searched container holding a yaw-mcp entry, or null when none
+   *  does -- and then the originals are never removed. */
+  wiredIn: ContainerRef | null;
+  /** The searched containers `yaw-mcp install` refuses, each with its words. */
+  refused: Map<ContainerRef, Extract<ContainerRead, { state: "refused" }>>;
+  /** The container a bare `yaw-mcp install <client>` writes -- the step the
+   *  refusal names -- or null when no user-scope path resolved. */
+  installRef: ContainerRef | null;
+}
+
+/**
+ * Find the yaw-mcp entry the imported servers would be reached through once
+ * their originals are gone. Reads files; never writes one.
+ *
+ * A client with more than one scope reads more than one container -- Claude
+ * Code's user-scope `mcpServers` and its local-scope `projects[<dir>].mcpServers`
+ * are both inside ~/.claude.json -- so searching only the container the
+ * servers came from reported "no yaw-mcp entry" at a non-user scope while one
+ * sat in the same file, and the remedy it printed (`yaw-mcp install <client>`,
+ * which writes the USER scope) fixed nothing the message was about.
+ *
+ * `sourceRef` is the imported container and `source` the view of it the caller
+ * already holds. It is searched FIRST, from that view, so the single-scope
+ * clients read no extra files at all.
+ */
+async function searchForBroker(
+  site: ImportSite,
+  sourceRef: ContainerRef,
+  source: ClientConfigView,
+  opts: ImportCommandOptions,
+  home: string,
+): Promise<BrokerSearch> {
+  const { target } = site;
+  const searched: ContainerRef[] = [sourceRef];
+  // The container a bare `yaw-mcp install <client>` writes -- the step the
+  // refusal names. Every client has a user scope and resolveInstallSite
+  // defaults to it, so it is the user-scope ref.
+  let installRef: ContainerRef | null = site.scope === "user" ? searched[0] : null;
+  for (const spec of target.scopes) {
+    if (spec.scope === site.scope) continue;
+    try {
+      // SITES, so each searched container carries the syntax its own row and
+      // scope resolved -- the read below never restates a format. A row that
+      // fans one scope out to several files contributes all of them, which is
+      // where the entry could be.
+      const others = resolveInstallSites({
+        clientId: target.clientId,
+        scope: spec.scope,
+        os: site.os,
+        home,
+        appData: resolveAppDataDir({ appData: opts.appData, home }),
+        // Same env the target scope resolved with, so an env-redirected client
+        // is searched at its REAL other-scope path rather than the default one.
+        clientEnv: opts.clientEnv,
+        // The project the user is standing in -- the same resolution
+        // resolveInstallSite would have made had that scope been the target.
+        projectDir: spec.requiresProjectDir
+          ? (site.projectDir ?? resolvePath(opts.cwd ?? process.cwd(), "."))
+          : undefined,
+        claudeConfigDir: opts.claudeConfigDir,
+      });
+      for (const other of others) {
+        const already = searched.find(
+          (r) =>
+            r.resolved.absolute === other.resolved.absolute &&
+            r.resolved.containerPath.join(".") === other.resolved.containerPath.join("."),
+        );
+        const ref = already ?? other;
+        if (!already) searched.push(ref);
+        if (spec.scope === "user" && installRef === null) installRef = ref;
+      }
+    } catch {
+      // A scope this machine cannot resolve a path for is one the client is
+      // not reading either, so it is simply not searched.
+    }
+  }
+  let wiredIn: ContainerRef | null = null;
+  const refused = new Map<ContainerRef, Extract<ContainerRead, { state: "refused" }>>();
+  for (let i = 0; i < searched.length; i++) {
+    // The imported container is FIRST and is the VIEW already in hand, so the
+    // single-scope clients read no extra files at all.
+    const read: ContainerRead =
+      i === 0 ? { state: "container", wired: isWiredIn(source) } : await readContainer(searched[i]);
+    if (read.state === "container" && read.wired) {
+      wiredIn = searched[i];
+      break;
+    }
+    if (read.state === "refused") refused.set(searched[i], read);
+  }
+  return { searched, wiredIn, refused, installRef };
+}
+
+/**
+ * Why the originals stay when no searched container holds a yaw-mcp entry,
+ * and what to run -- everything after the lead, so the real run ("Not
+ * removing the originals: ...") and the dry run ("Would not remove the
+ * originals: ...") give one reason in one wording.
+ *
+ * The one case where removing is never right: with no yaw-mcp entry in the
+ * client config, dropping the originals leaves the client unable to reach ANY
+ * of them, and the import would read as a success while taking every server
+ * offline. The containers are NAMED rather than the claim being made about the
+ * client as a whole: "it has no entry" was a statement about one container,
+ * made as though it covered every file the client reads.
+ *
+ * A container install refuses is named for what it is, not as "no entry". When
+ * it is the one `yaw-mcp install <client>` writes, "run install first" sent the
+ * user to a command that exits 1 on it, so the advice leads with install's own
+ * by-hand step instead. One clause per distinct fault: Claude Code's user and
+ * local scopes share ~/.claude.json, and an unparseable one would otherwise be
+ * reported twice.
+ */
+function removalRefusal(search: BrokerSearch, target: ImportSite["target"]): string {
+  const { searched, refused, installRef } = search;
+  const noEntry = searched.filter((r) => !refused.has(r));
+  const clauses = [`no yaw-mcp entry in ${noEntry.map(describeContainer).join(" or ")}`];
+  for (const r of refused.values()) if (!clauses.includes(r.clause)) clauses.push(r.clause);
+  const installCmd = `yaw-mcp install ${target.clientId}`;
+  const blocking = installRef ? refused.get(installRef) : undefined;
+  const next = blocking
+    ? `\`${installCmd}\` ${blocking.installSays}; ${blocking.fix(`run \`${installCmd}\` and re-run this with --remove-originals`)}.`
+    : `Run \`${installCmd}\` first, then re-run this with --remove-originals.`;
+  return `${clauses.join(", and ")}, so ${target.label} would be left with no way to reach them. ${next}`;
+}
+
+/** What peeling the imported keys out of a client config's text produced. */
+interface OriginalsSplice {
+  /** The text a write would persist. */
+  next: string;
+  /** The keys that actually came out, in the order they were asked for. */
+  removed: string[];
+  /** The keys the splicer refused, each rendered as `key (why)`. */
+  unremovable: string[];
+}
+
+/**
+ * Peel `keys` out of the client config's bytes through the core's write
+ * facade, one key at a time, exactly as `uninstall` and `try-cleanup` do. A
+ * parse-and-reserialize would take the user's comments -- and, in
+ * ~/.claude.json, the rest of their Claude Code state -- with it, and going
+ * through the facade is what VERIFIES each removal (nothing but that key
+ * moved, no neighbour changed, the file still reads back) before there are
+ * bytes to persist.
+ *
+ * ONE CALL PER KEY, each classified against the text the last one produced,
+ * rather than one call carrying every removal: a key the splicer refuses (an
+ * empty-string key is the shape that reaches it) must not abort the removal
+ * for every other imported server, which is what a single edit list would do.
+ * That was the bug -- one loop-wide catch, under a message that named no key
+ * at all.
+ *
+ * Pure: it writes nothing and returns the text for the caller to persist. That
+ * is what lets a dry run name exactly the keys the real run would take out,
+ * rather than the keys it asked for.
+ */
+function spliceOutOriginals(
+  raw: string,
+  site: ConfigSite,
+  keys: readonly string[],
+  transform: EntryTransform | undefined,
+): OriginalsSplice {
+  let next = raw;
+  const removed: string[] = [];
+  const unremovable: string[] = [];
+  for (const key of keys) {
+    try {
+      const at = classifyClientConfig(next, site, { transform });
+      const edits: ClientConfigEdit[] = [{ op: "remove", key }];
+      const after = applyClientConfigEdits(at, edits, site);
+      if (after !== next) removed.push(key);
+      next = after;
+    } catch (e) {
+      unremovable.push(`${displayArg(key)} (${e instanceof Error ? e.message : String(e)})`);
+    }
+  }
+  return { next, removed, unremovable };
+}
+
+/** The line naming the keys a removal cannot take out. `outcome` is the real
+ *  run's "could not be removed" or the dry run's "would not be removed"; the
+ *  rest is one sentence, so the two cannot drift apart. */
+function unremovableNote(outcome: string, file: string, unremovable: string[], label: string): string {
+  const one = unremovable.length === 1;
+  return `yaw-mcp import: ${outcome} from ${file}: ${unremovable.join("; ")}. Remove ${one ? "that entry" : "those entries"} by hand; ${label} would otherwise keep launching ${one ? "it" : "them"} alongside yaw-mcp.`;
 }
 
 export async function runImport(opts: ImportCommandOptions): Promise<ImportCommandResult> {
@@ -889,21 +1234,30 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
 
   // What each write would actually do, taken BEFORE anything is written so
   // every candidate is diffed against the same on-disk state the user is
-  // looking at. Two things come out of it that the candidate cannot know on
+  // looking at. Three things come out of it that the candidate cannot know on
   // its own: the namespace the file will hold (a stored entry matched by NAME
   // keeps its own, so printing the derived one named a namespace that would
-  // never exist) and the launch command this write would replace.
+  // never exist), the launch command this write would replace, and whether it
+  // would change the stored entry at all -- the question asked before writing.
+  /** Candidates whose write could not be previewed. The real run's write of
+   *  each throws the same error and skips it, so none of them is imported --
+   *  which is what a dry run's removal preview needs to know. */
+  const unpreviewed = new Set<ImportCandidate>();
   for (const c of candidates) {
     try {
       const preview = await previewUpsertUserBundle(c.entry, { home });
       for (const w of preview.warnings) warnOnce(w);
       c.plannedNamespace = preview.namespace ?? c.namespace;
       c.replacing = preview.replaced ? preview.replacing : undefined;
+      // Never throws, so a failed comparison cannot land this candidate in
+      // `unpreviewed` below.
+      if (preview.replaced) c.changes = (await storedEntryChanges(preview, home, warnOnce)) ?? undefined;
     } catch (e) {
       // A bundles.json that is present but unparseable. The write below throws
       // the same error and reports it per candidate; the plan just falls back
       // to the derived namespace rather than aborting a run that has not
       // touched anything yet.
+      unpreviewed.add(c);
       warnOnce(`could not preview the write against bundles.json: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
@@ -935,10 +1289,11 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
     }
     // An imported entry carries no catalog slug, so upsertUserBundle's
     // cross-slug refusal can never fire for it: EVERY match merges, with the
-    // client's copy winning. Naming what the write would overwrite is the only
-    // thing standing between "adopt the servers I already had" and "replace
-    // the launch command of one of them", which is arbitrary command execution
-    // on the next activate.
+    // client's copy winning. Naming what the write would overwrite -- and,
+    // below the plan, asking before a write that would change it -- is what
+    // stands between "adopt the servers I already had" and "replace the launch
+    // command of one of them", which is arbitrary command execution on the
+    // next activate.
     if (c.replacing) {
       print(`    REPLACES the "${c.plannedNamespace}" entry already in bundles.json:`);
       print(`      was: ${renderLaunch(c.replacing)}`);
@@ -959,8 +1314,153 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
     );
   }
 
+  /** The candidates whose write would CHANGE an entry bundles.json already
+   *  holds -- the ones the question below is about. */
+  const changing = candidates.filter((c) => c.changes !== undefined);
+
   if (opts.dryRun) {
+    // ----- the entries the import would change ---------------------------
+    //
+    // Previewed, never asked about: a dry run answers no question, so it shows
+    // the overwrite a real run would make if it went ahead -- install's dry
+    // run does the same -- and says what a real run needs to go ahead.
+    if (changing.length > 0) print("");
+    for (const c of changing) {
+      const how = opts.force ? "--force" : "a real run asks first, and off a terminal needs --force";
+      print(`Would overwrite the "${displaySafe(c.plannedNamespace)}" entry in bundles.json (${how}):`);
+      for (const d of c.changes ?? []) print(`  ${d}`);
+    }
+
+    // ----- what --remove-originals would take out ------------------------
+    //
+    // The removal is the one step of an import that edits a file the user did
+    // not name, so a dry run asked for it previews it: the file and every key
+    // a real run would take out of it, or the reason it would take out none.
+    // Without --remove-originals nothing is printed here: a real run then
+    // leaves the file alone or asks first, and a preview cannot answer that
+    // question for the user. --keep-originals beside it wins, as it does in
+    // the real run below (parseImportArgs refuses that pair, so only a direct
+    // caller can pass both).
+    //
+    // The search, the refusal and the splice are the real run's own, over the
+    // same bytes, so the preview cannot name a key the real run would leave or
+    // miss one it would take. Only the imported SET is predicted rather than
+    // read back: the real run takes it from its writes -- the last writer of
+    // each namespace -- and here it is the last candidate PLANNED onto each
+    // one, less any whose write could not be previewed. Like the "Would
+    // overwrite" preview above, it assumes every entry the import would change
+    // is overwritten; a real run whose question is answered [s]kip for one
+    // does not import that server, so leaves its key where it is.
+    if (opts.removeOriginals && !opts.keepOriginals) {
+      const file = displaySafe(resolved.absolute);
+      const planned = new Map<string, ImportCandidate>();
+      for (const c of candidates) if (!unpreviewed.has(c)) planned.set(c.plannedNamespace, c);
+      if (planned.size === 0) {
+        printErr(
+          `yaw-mcp import: would remove nothing from ${file} -- none of these servers would be imported, because their write to bundles.json could not be previewed (the warning above says why).`,
+        );
+      } else {
+        const broker = await searchForBroker(site, siteAt(targetSite, sourcePath), source, opts, home);
+        if (broker.wiredIn === null) {
+          printErr(`Would not remove the originals: ${removalRefusal(broker, target)}`);
+        } else {
+          const keys = [...planned.values()].map((c) => c.key);
+          const preview = spliceOutOriginals(view.raw ?? "", siteAt(targetSite, sourcePath), keys, target.entry);
+          if (preview.unremovable.length > 0) {
+            printErr(unremovableNote("would not be removed", file, preview.unremovable, target.label));
+          }
+          const count = preview.removed.length;
+          if (count === 0) {
+            printErr(
+              `yaw-mcp import: would remove nothing from ${file}; it would be left unchanged. The servers would be imported either way.`,
+            );
+          } else {
+            print("");
+            if (broker.wiredIn !== broker.searched[0]) {
+              print(`Reached through the yaw-mcp entry in ${describeContainer(broker.wiredIn)}.`);
+            }
+            print(`Would remove ${count} ${count === 1 ? "entry" : "entries"} from ${file} (--remove-originals):`);
+            for (const key of preview.removed) print(`  ${displayArg(key)}`);
+          }
+        }
+      }
+    }
     print("\n--- dry run: nothing was written ---");
+    return { exitCode: 0, written: [] };
+  }
+
+  // ----- entries bundles.json already holds that this import would change --
+  //
+  // Decided BEFORE the first write, so [a]bort, Ctrl+C and the off-TTY refusal
+  // leave both files exactly as they were, the servers that collide with
+  // nothing included: a run that wrote half its plan and then stopped would
+  // leave the user to work out which half landed.
+  const bundlesFile = displaySafe(localBundlesPath(userConfigDir(home)));
+  /** Candidates whose question was answered [s]kip. They are not written, so
+   *  they are not imported, so their originals are never removed below. */
+  const declined = new Set<ImportCandidate>();
+  if (changing.length > 0) {
+    /** Null under --force, which answers every question "overwrite". */
+    let answers: Map<ImportCandidate, "overwrite" | "skip"> | null = null;
+    if (!opts.force) {
+      if (!isInteractive(opts)) {
+        // Off a TTY, silence is not consent here either. install refuses to
+        // replace its own differing entry with exit 2 -- the code `remove` and
+        // `uninstall` also use for a confirmation that could not be asked for,
+        // each naming --force -- so a script can tell "needs a flag" from a
+        // failed write without reading the prose. The diff comes with the
+        // refusal, so a scripted run sees what --force would replace before it
+        // is re-run with it.
+        const one = changing.length === 1;
+        const blocks = changing.map(
+          (c) =>
+            `  "${displaySafe(c.plannedNamespace)}" differs from the one importing ${displayArg(c.key)} would write:\n` +
+            indentLines(c.changes ?? [], "    "),
+        );
+        printErr(
+          `yaw-mcp import: ${bundlesFile} already has ${changing.length === 1 ? "an entry" : `${changing.length} entries`} this import would change, and there is no terminal to ask on. Nothing was written.\n` +
+            `${blocks.join("\n")}\n` +
+            `  Re-run with --force to overwrite ${one ? "it" : "them"}, or --dry-run to preview.`,
+        );
+        return { exitCode: 2, written: [] };
+      }
+      const asked = await askBundleCollisions(changing, bundlesFile, opts.io);
+      if (asked === "abort") {
+        printErr("yaw-mcp import: Aborted. Nothing was written.");
+        return { exitCode: 1, written: [] };
+      }
+      if (asked === "cancelled") {
+        // Ctrl+C at the question: exit 130, the convention every other prompt
+        // in the product follows.
+        printErr("yaw-mcp import: Cancelled. Nothing was written.");
+        return { exitCode: 130, written: [] };
+      }
+      answers = asked;
+    }
+    // Printed only once every question is answered: an "Overwriting" line
+    // printed between two questions would stand in the transcript above a
+    // later [a]bort that wrote nothing.
+    print("");
+    for (const c of changing) {
+      const ns = displaySafe(c.plannedNamespace);
+      if (answers === null) {
+        // The plan showed only the launch; --force is the one path on which
+        // nothing has shown the rest of the diff yet.
+        print(`Overwriting the "${ns}" entry in bundles.json (--force):`);
+        for (const d of c.changes ?? []) print(`  ${d}`);
+      } else if (answers.get(c) === "overwrite") {
+        print(`Overwriting the "${ns}" entry in bundles.json.`);
+      } else {
+        declined.add(c);
+        print(`Left the "${ns}" entry in bundles.json as it is -- ${displayArg(c.key)} is not imported.`);
+      }
+    }
+  }
+  const toWrite = candidates.filter((c) => !declined.has(c));
+  if (toWrite.length === 0) {
+    print(
+      `\nNothing imported: every server was skipped, so bundles.json and ${displaySafe(resolved.absolute)} are unchanged.`,
+    );
     return { exitCode: 0, written: [] };
   }
 
@@ -970,7 +1470,7 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
    *  an update of something that was there beforehand. */
   const writtenNamespaces = new Set<string>();
   let updated = 0;
-  for (const c of candidates) {
+  for (const c of toWrite) {
     try {
       const res = await upsertUserBundle(c.entry, { home });
       for (const w of res.warnings) warnOnce(w);
@@ -1054,102 +1554,16 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
     return { exitCode: 0, written };
   }
 
-  // Where a yaw-mcp entry could be. A client with more than one scope reads
-  // more than one container -- Claude Code's user-scope `mcpServers` and its
-  // local-scope `projects[<dir>].mcpServers` are both inside ~/.claude.json --
-  // so searching only the container the servers came from reported "no yaw-mcp
-  // entry" at a non-user scope while one sat in the same file, and the remedy
-  // it printed (`yaw-mcp install <client>`, which writes the USER scope) fixed
-  // nothing the message was about.
-  //
-  // The imported container is FIRST and is the copy already in memory, so the
-  // single-scope clients read no extra files at all.
-  const searched: ContainerRef[] = [siteAt(targetSite, sourcePath)];
-  // The container a bare `yaw-mcp install <client>` writes -- the step the
-  // refusal below names. Every client has a user scope and resolveInstallSite
-  // defaults to it, so it is the user-scope ref.
-  let installRef: ContainerRef | null = site.scope === "user" ? searched[0] : null;
-  for (const spec of target.scopes) {
-    if (spec.scope === site.scope) continue;
-    try {
-      // SITES, so each searched container carries the syntax its own row and
-      // scope resolved -- the read below never restates a format. A row that
-      // fans one scope out to several files contributes all of them, which is
-      // where the entry could be.
-      const others = resolveInstallSites({
-        clientId: target.clientId,
-        scope: spec.scope,
-        os: site.os,
-        home,
-        appData: resolveAppDataDir({ appData: opts.appData, home }),
-        // Same env the target scope resolved with, so an env-redirected client
-        // is searched at its REAL other-scope path rather than the default one.
-        clientEnv: opts.clientEnv,
-        // The project the user is standing in -- the same resolution
-        // resolveInstallSite would have made had that scope been the target.
-        projectDir: spec.requiresProjectDir
-          ? (site.projectDir ?? resolvePath(opts.cwd ?? process.cwd(), "."))
-          : undefined,
-        claudeConfigDir: opts.claudeConfigDir,
-      });
-      for (const other of others) {
-        const already = searched.find(
-          (r) =>
-            r.resolved.absolute === other.resolved.absolute &&
-            r.resolved.containerPath.join(".") === other.resolved.containerPath.join("."),
-        );
-        const ref = already ?? other;
-        if (!already) searched.push(ref);
-        if (spec.scope === "user" && installRef === null) installRef = ref;
-      }
-    } catch {
-      // A scope this machine cannot resolve a path for is one the client is
-      // not reading either, so it is simply not searched.
-    }
-  }
-  let wiredIn: ContainerRef | null = null;
-  const refused = new Map<ContainerRef, Extract<ContainerRead, { state: "refused" }>>();
-  for (let i = 0; i < searched.length; i++) {
-    // The imported container is FIRST and is the VIEW already in hand, so the
-    // single-scope clients read no extra files at all.
-    const read: ContainerRead =
-      i === 0 ? { state: "container", wired: isWiredIn(source) } : await readContainer(searched[i]);
-    if (read.state === "container" && read.wired) {
-      wiredIn = searched[i];
-      break;
-    }
-    if (read.state === "refused") refused.set(searched[i], read);
-  }
-
+  // Where a yaw-mcp entry could be, across every scope of the client -- see
+  // searchForBroker. With none, removing the originals is never right, and
+  // the reason and the step to take are removalRefusal's.
+  const search = await searchForBroker(site, siteAt(targetSite, sourcePath), source, opts, home);
+  const wiredIn = search.wiredIn;
   if (!wiredIn) {
-    // The one case where removing is never right: with no yaw-mcp entry in the
-    // client config, dropping the originals leaves the client unable to reach
-    // ANY of them, and the import would read as a success while taking every
-    // server offline. The containers are NAMED rather than the claim being
-    // made about the client as a whole: "it has no entry" was a statement
-    // about one container, made as though it covered every file the client
-    // reads.
-    //
-    // A container install refuses is named for what it is, not as "no entry".
-    // When it is the one `yaw-mcp install <client>` writes, "run install
-    // first" sent the user to a command that exits 1 on it, so the advice
-    // leads with install's own by-hand step instead. One clause per distinct
-    // fault: Claude Code's user and local scopes share ~/.claude.json, and an
-    // unparseable one would otherwise be reported twice.
-    const noEntry = searched.filter((r) => !refused.has(r));
-    const clauses = [`no yaw-mcp entry in ${noEntry.map(describeContainer).join(" or ")}`];
-    for (const r of refused.values()) if (!clauses.includes(r.clause)) clauses.push(r.clause);
-    const installCmd = `yaw-mcp install ${target.clientId}`;
-    const blocking = installRef ? refused.get(installRef) : undefined;
-    const next = blocking
-      ? `\`${installCmd}\` ${blocking.installSays}; ${blocking.fix(`run \`${installCmd}\` and re-run this with --remove-originals`)}.`
-      : `Run \`${installCmd}\` first, then re-run this with --remove-originals.`;
-    printErr(
-      `Not removing the originals: ${clauses.join(", and ")}, so ${target.label} would be left with no way to reach them. ${next}`,
-    );
+    printErr(`Not removing the originals: ${removalRefusal(search, target)}`);
     return { exitCode: 0, written };
   }
-  if (wiredIn !== searched[0]) {
+  if (wiredIn !== search.searched[0]) {
     print(`Reached through the yaw-mcp entry in ${describeContainer(wiredIn)}.`);
   }
 
@@ -1176,40 +1590,19 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
     }
   }
 
-  // Peel the entries out of the original bytes through the core's write
-  // facade, one key at a time, exactly as `uninstall` and `try-cleanup` do. A
-  // parse-and-reserialize would take the user's comments -- and, in
-  // ~/.claude.json, the rest of their Claude Code state -- with it, and going
-  // through the facade is what VERIFIES each removal (nothing but that key
-  // moved, no neighbour changed, the file still reads back) before there are
-  // bytes to persist.
-  //
-  // ONE CALL PER KEY, each classified against the text the last one produced,
-  // rather than one call carrying every removal: a key the splicer refuses (an
-  // empty-string key is the shape that reaches it) must not abort the removal
-  // for every other imported server, which is what a single edit list would
-  // do. That was the bug -- one loop-wide catch, under a message that named no
-  // key at all.
-  const removalSite = siteAt(targetSite, sourcePath);
-  let next = view.raw ?? "";
-  let removed = 0;
-  const unremovable: string[] = [];
-  for (const r of imported) {
-    try {
-      const at = classifyClientConfig(next, removalSite, { transform: target.entry });
-      const edits: ClientConfigEdit[] = [{ op: "remove", key: r.candidate.key }];
-      const after = applyClientConfigEdits(at, edits, removalSite);
-      if (after !== next) removed++;
-      next = after;
-    } catch (e) {
-      unremovable.push(`${displayArg(r.candidate.key)} (${e instanceof Error ? e.message : String(e)})`);
-    }
+  // Peeled out of the bytes the plan was read from, one key at a time, at the
+  // container address the servers were actually READ from (`sourcePath`, a
+  // drive-case sibling included) -- see spliceOutOriginals.
+  const splice = spliceOutOriginals(
+    view.raw ?? "",
+    siteAt(targetSite, sourcePath),
+    imported.map((r) => r.candidate.key),
+    target.entry,
+  );
+  if (splice.unremovable.length > 0) {
+    printErr(unremovableNote("could not be removed", displaySafe(resolved.absolute), splice.unremovable, target.label));
   }
-  if (unremovable.length > 0) {
-    printErr(
-      `yaw-mcp import: could not be removed from ${displaySafe(resolved.absolute)}: ${unremovable.join("; ")}. Remove ${unremovable.length === 1 ? "that entry" : "those entries"} by hand; ${target.label} would otherwise keep launching ${unremovable.length === 1 ? "it" : "them"} alongside yaw-mcp.`,
-    );
-  }
+  const removed = splice.removed.length;
   if (removed === 0) {
     printErr(
       `yaw-mcp import: nothing was removed from ${displaySafe(resolved.absolute)}; it was left unchanged. The servers are imported either way.`,
@@ -1217,7 +1610,7 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
     return { exitCode: 0, written };
   }
   try {
-    await atomicWriteFile(resolved.absolute, terminateWithNewline(next));
+    await atomicWriteFile(resolved.absolute, terminateWithNewline(splice.next));
   } catch (e) {
     printErr(
       `yaw-mcp import: could not write ${displaySafe(resolved.absolute)} (${(e as Error).message}). It was left unchanged; the servers are imported either way.`,

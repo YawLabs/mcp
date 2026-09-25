@@ -20,12 +20,23 @@
 // That was the reported bug: doctor and --list parsed the file install had
 // just written as JSON and called it malformed.
 
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { quoteArgForDisplay } from "../auto-upgrade.js";
 import {
   adapterFor,
   applyClientConfigEdits,
@@ -164,6 +175,11 @@ function installThrough(
   const stored = view.normalized();
   const identical = stored !== undefined && canonicalJson(stored) === canonicalJson(entry);
   return { view, entry, identical, next: applyClientConfigEdits(view, edits, site) };
+}
+
+/** `s` as a literal inside a RegExp -- a Windows path's backslashes included. */
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 /** What install refused with, or "" when it did not refuse. */
@@ -969,6 +985,38 @@ const BUNDLES_EMPTY = (): BundlesSummary => ({
   warnings: [],
 });
 
+/** Whether this machine refuses to REPLACE a file made read-only with chmod --
+ *  which is what the read-only install test needs, since install's write is
+ *  a rename onto the file (atomic-write.ts). Windows does: chmod 0o444 sets
+ *  the read-only attribute, and a rename onto such a file fails EPERM. POSIX
+ *  does not: rename(2) asks the DIRECTORY for write access, never the file
+ *  it replaces, so there a read-only config.toml is replaced and install
+ *  succeeds, and the test has nothing to show. Asked of the disk rather than
+ *  assumed from the platform, so a filesystem that behaves otherwise skips or
+ *  runs the test by what it actually does. */
+const READ_ONLY_BLOCKS_REPLACE: boolean = (() => {
+  const dir = mkdtempSync(join(tmpdir(), "yaw-mcp-codex-ro-probe-"));
+  const target = join(dir, "target");
+  try {
+    writeFileSync(target, "a");
+    writeFileSync(join(dir, "other"), "b");
+    chmodSync(target, 0o444);
+    try {
+      renameSync(join(dir, "other"), target);
+      return false;
+    } catch {
+      return true;
+    }
+  } finally {
+    try {
+      chmodSync(target, 0o666);
+    } catch {
+      // Already gone or never made; the rmSync below copes either way.
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+})();
+
 function captureIo() {
   const out: string[] = [];
   const err: string[] = [];
@@ -1128,6 +1176,133 @@ describe("install -> --list -> doctor over the file install wrote", () => {
     expect(listRow(out, "user")[3]).toBe("installed");
     expect(headlineCount(out)).toBe(1);
   });
+});
+
+// ---------------------------------------------------------------------------
+// Our entry in a spelling the splice will not edit: install and uninstall
+// refuse, with the by-hand step doctor gives for the same file
+// ---------------------------------------------------------------------------
+
+describe("install and uninstall over an entry the splice will not edit", () => {
+  let home: string;
+  let projectDir: string;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "yaw-mcp-codex-unspliceable-home-"));
+    projectDir = mkdtempSync(join(tmpdir(), "yaw-mcp-codex-unspliceable-proj-"));
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(projectDir, { recursive: true, force: true });
+  });
+
+  const userFile = (): string => join(home, ".codex", "config.toml");
+
+  function seed(text: string): void {
+    mkdirSync(dirname(userFile()), { recursive: true });
+    writeFileSync(userFile(), text, "utf8");
+  }
+
+  const linesOf = (s: string): string[] => s.split("\n").filter((l) => l !== "");
+
+  /** The audited file: the grace key at 0, and our entry -- exactly as
+   *  install writes it -- INSIDE a root-level inline `mcp_servers = { ... }`.
+   *  Codex loads it and launches yaw-mcp from it; doctor and --list both see
+   *  the entry. */
+  const ENTRY_IN_INLINE_ROOT =
+    "mcp_optional_startup_grace_ms = 0\n" +
+    'mcp_servers = { mcp = { command = "npx", args = ["-y", "@yawlabs/mcp@latest"], startup_timeout_sec = 60.0 } }\n';
+
+  /** Every spelling the TOML adapter reads as our entry and will not edit. */
+  const SHAPES: Array<[string, string]> = [
+    ["an entry inside an inline root container", ENTRY_IN_INLINE_ROOT],
+    ["f09-inline", fixture("f09-inline")],
+    ["f16-dotted", fixture("f16-dotted")],
+    ["g14-dotted-in-container", fixture("g14-dotted-in-container")],
+    ["g10-array-entry", fixture("g10-array-entry")],
+  ];
+
+  /** The adapter's own reason and by-hand step for `raw` -- the pair doctor's
+   *  CLIENTS line prints (doctor-cmd.test.ts pins that line). */
+  function unspliceable(raw: string): { reason: string; fix: string } {
+    const read = classifyClientConfig(raw, siteFor({ os: "linux" }), { transform: CODEX.entry }).read;
+    if (read.kind !== "unspliceable" || read.fix === undefined) throw new Error(`not unspliceable: ${read.kind}`);
+    return { reason: read.reason, fix: read.fix };
+  }
+
+  it("the inline-root entry's step is the container conversion, as doctor gives it", () => {
+    // The byte-exact anchor for the loops below: the shape the audit ran.
+    expect(unspliceable(ENTRY_IN_INLINE_ROOT)).toEqual({
+      reason: "inside the inline table mcp_servers = { ... }",
+      fix: "convert the inline mcp_servers = { ... } to [mcp_servers.mcp]-style tables by hand",
+    });
+  });
+
+  for (const [label, raw] of SHAPES) {
+    it(`install refuses with the step, before any Runtime line, under every flag (${label})`, async () => {
+      // It used to end "failed to splice the "mcp" entry ... Refusing to
+      // overwrite." with no step, after a Runtime line for an entry it never
+      // wrote -- while the same file with no entry of ours got the step.
+      const { reason, fix } = unspliceable(raw);
+      for (const over of [{}, { dryRun: true }, { skip: true }, { force: true }, { repair: true }]) {
+        const tag = `${label} ${JSON.stringify(over)}`;
+        seed(raw);
+        const cap = captureIo();
+        const result = await runInstall({
+          clientId: "codex-cli",
+          scope: "user",
+          os: "linux",
+          home,
+          cwd: projectDir,
+          io: cap.io,
+          oamProbe: OAM_ABSENT,
+          bundlesSummary: BUNDLES_EMPTY,
+          ...over,
+        });
+        expect(result.exitCode, tag).toBe(1);
+        expect(result.written, tag).toEqual([]);
+        expect(result.wouldWrite, tag).toEqual([]);
+        expect(readFileSync(userFile(), "utf8"), tag).toBe(raw);
+        expect(linesOf(cap.stderr()), tag).toEqual([
+          `yaw-mcp install: the "mcp" entry in ${userFile()} is ${reason}, which install will not edit -- ` +
+            `refusing to overwrite it; ${fix}, then re-run.`,
+        ]);
+        expect(linesOf(cap.stdout()), tag).toEqual(["Target: Codex CLI (user)", `File:   ${userFile()}`]);
+      }
+    });
+
+    it(`uninstall refuses with the step instead of saying there is no entry (${label})`, async () => {
+      // It printed "Nothing to do: Codex CLI (user) has no yaw-mcp entry." at
+      // exit 0 over an entry Codex goes on launching. Refused before the
+      // confirmation, so the no-TTY run is exit 1 too, not the exit-2 flag
+      // refusal; and before the preview, so --dry-run is the same refusal.
+      const { reason, fix } = unspliceable(raw);
+      for (const over of [{ force: true }, { dryRun: true }, {}]) {
+        const tag = `${label} ${JSON.stringify(over)}`;
+        seed(raw);
+        const cap = captureIo();
+        const result = await runUninstall({
+          clientId: "codex-cli",
+          scope: "user",
+          os: "linux",
+          home,
+          cwd: projectDir,
+          io: cap.io,
+          ...over,
+        });
+        expect(result.exitCode, tag).toBe(1);
+        expect(result.written, tag).toEqual([]);
+        expect(result.wouldWrite, tag).toEqual([]);
+        expect(readFileSync(userFile(), "utf8"), tag).toBe(raw);
+        expect(linesOf(cap.stderr()), tag).toEqual([
+          `yaw-mcp uninstall: the "mcp" entry in ${userFile()} is ${reason}, which uninstall will not edit -- ` +
+            `nothing was removed; ${fix}, then re-run.`,
+        ]);
+        expect(cap.stdout(), tag).not.toContain("Nothing to do");
+      }
+    });
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -1820,6 +1995,193 @@ describe("install sets Codex's startup grace at the top of config.toml", () => {
     expect(out.join("")).toContain('Codex CLI (user): OK -- has "mcp" entry');
     expect(out.join("")).not.toContain("malformed");
     expect(diagnosis.exitCode).toBe(0);
+  });
+
+  /** `install --list`'s whole stdout, run over this describe's home. */
+  async function list(over: Partial<Parameters<typeof runInstall>[0]> = {}): Promise<string> {
+    const cap = captureIo();
+    const r = await runInstall({ listOnly: true, os: "linux", home, cwd: projectDir, io: cap.io, ...over });
+    expect(r.exitCode).toBe(0);
+    expect(cap.stderr()).toBe("");
+    return cap.stdout();
+  }
+
+  /** The four cells of the Codex CLI row for SCOPE, split on the table's
+   *  two-space gutter -- so a marker with single spaces stays in its cell,
+   *  and a marker that broke the columns would show up as a fifth cell. */
+  function codexListRow(out: string, scope: string): string[] {
+    const rows = out
+      .split("\n")
+      .map((l) => l.trim().split(/ {2,}/))
+      .filter((cells) => cells[0] === "Codex CLI" && cells[1] === scope);
+    expect(rows, `exactly one Codex CLI (${scope}) row in:\n${out}`).toHaveLength(1);
+    return rows[0];
+  }
+
+  /** --list's notes that name the key: the lines that carry the detail its
+   *  marker cannot. */
+  const graceNotes = (out: string): string[] => linesOf(out).filter((l) => l.startsWith("Note: ") && l.includes(GRACE));
+
+  it("--list marks a working entry whose file lacks the key `(setting missing)`, and names the run that adds it", async () => {
+    // The pre-#174 Codex setup: the entry install wrote, and no grace key --
+    // exactly the file whose tools Codex 0.151+ leaves out, and which --list
+    // used to call plain `installed`. The note is data from the row: the key,
+    // its value and its why. The headline still counts the row: the entry is
+    // there and loads.
+    seed(fixture("f05-identical"));
+    const before = await list();
+    expect(codexListRow(before, "user")).toEqual([
+      "Codex CLI",
+      "user",
+      "~/.codex/config.toml",
+      "installed (setting missing)",
+    ]);
+    expect(graceNotes(before)).toEqual([
+      `Note: ~/.codex/config.toml has the Codex CLI (user) entry but does not set ${GRACE_LINE}: ${WHY}. ` +
+        "`yaw-mcp install codex-cli` adds it.",
+    ]);
+    expect(before).toMatch(/^1\/\d+ client scopes have yaw-mcp configured on linux\./m);
+
+    // The run it names does add it, and the row goes back to plain.
+    const run = await install();
+    expect(run.result.exitCode, run.stderr).toBe(0);
+    const after = await list();
+    expect(codexListRow(after, "user")[3]).toBe("installed");
+    expect(graceNotes(after)).toEqual([]);
+  });
+
+  it("--list marks a value Codex will not load `(setting refused)`, in install's own words for it", async () => {
+    // A release that reads the key will not load -1 (0.144.0, which predates
+    // the key, does): install's warning, and the step for the value's shape.
+    // Past 2^63 - 1 no release loads the file at all: install's refusal.
+    const F05 = fixture("f05-identical");
+    // The control: a value Codex takes is the user's choice -- install notes
+    // it and leaves it, and --list does not flag it.
+    seed(`${GRACE} = 1000\n\n${F05}`);
+    const taken = await list();
+    expect(codexListRow(taken, "user")[3]).toBe("installed");
+    expect(graceNotes(taken)).toEqual([]);
+    for (const [head, note] of [
+      [
+        `${GRACE} = -1\n\n`,
+        `Note: ~/.codex/config.toml sets ${GRACE} to -1, a negative integer where Codex CLI needs a non-negative ` +
+          `integer -- a Codex CLI release that reads the key will not load the file with that value; 0 is recommended. ${STEP}`,
+      ],
+      [
+        `${GRACE} = [0]\n\n`,
+        `Note: ~/.codex/config.toml sets ${GRACE} to an array of 1, where Codex CLI needs a non-negative integer -- ` +
+          `a Codex CLI release that reads the key will not load the file with that value; 0 is recommended. ${SHAPE_STEP}`,
+      ],
+      [
+        `${GRACE} = 9223372036854775808\n\n`,
+        `Note: ~/.codex/config.toml sets ${GRACE} to 9223372036854775808, larger than a TOML integer holds, so Codex ` +
+          "CLI will not load the file -- change that value by hand to a non-negative integer no larger than " +
+          "9223372036854775807 (0 is recommended).",
+      ],
+    ] as const) {
+      seed(`${head}${F05}`);
+      const out = await list();
+      expect(codexListRow(out, "user"), head).toEqual([
+        "Codex CLI",
+        "user",
+        "~/.codex/config.toml",
+        "installed (setting refused)",
+      ]);
+      expect(graceNotes(out), head).toEqual([note]);
+    }
+  });
+
+  it("--list names --scope and --project-dir in the run for a project-scope row", async () => {
+    // A project file from before the key, seen from inside the project and
+    // from elsewhere with --project-dir: the run it names has to write the
+    // same file either way.
+    seed(fixture("f05-identical"), join(projectDir, ".codex", "config.toml"));
+    const inside = await list();
+    expect(codexListRow(inside, "project")[3]).toBe("installed (setting missing)");
+    expect(graceNotes(inside)).toHaveLength(1);
+    expect(graceNotes(inside)[0]).toContain("has the Codex CLI (project) entry but does not set");
+    expect(graceNotes(inside)[0]).toMatch(/`yaw-mcp install codex-cli --scope project` adds it\.$/);
+
+    const elsewhere = await list({ cwd: home, projectDir });
+    expect(codexListRow(elsewhere, "project")[3]).toBe("installed (setting missing)");
+    expect(graceNotes(elsewhere)[0]).toMatch(
+      new RegExp(
+        `\`yaw-mcp install codex-cli --scope project --project-dir ${escapeRegExp(quoteArgForDisplay(projectDir) ?? projectDir)}\` adds it\\.$`,
+      ),
+    );
+  });
+
+  it.skipIf(process.platform !== "win32" || !READ_ONLY_BLOCKS_REPLACE)(
+    "a read-only config.toml: install and uninstall name the file and how to clear the attribute, exit 1, nothing written",
+    async () => {
+      // Windows only: see READ_ONLY_BLOCKS_REPLACE -- on POSIX a read-only
+      // config.toml does not stop the rename install publishes with, so the
+      // write succeeds and there is no failure to word. The audited run: the
+      // entry correct and the key missing, so the write is the key line
+      // alone -- and the message used to be node's EPERM naming the temp
+      // sibling (`config.toml.tmp-<pid>-...`), with no step.
+      const before = fixture("f05-identical");
+      seed(before);
+      chmodSync(userFile(), 0o444);
+      try {
+        const step = `it is read-only -- clear its read-only attribute (\`attrib -R "${userFile()}"\`), then re-run.`;
+        const run = await install();
+        expect(run.result.exitCode).toBe(1);
+        expect(run.result.written).toEqual([]);
+        expect(run.stderr).toBe(`yaw-mcp install: failed to write ${userFile()}: ${step}\n`);
+        expect(run.stderr).not.toContain(".tmp-");
+        expect(run.stdout).not.toContain("Done:");
+        const un = await uninstall();
+        expect(un.result.exitCode).toBe(1);
+        expect(un.result.written).toEqual([]);
+        expect(un.stderr).toBe(`yaw-mcp uninstall: failed to write ${userFile()}: ${step}\n`);
+        expect(un.stdout).not.toContain("Done:");
+        // Nothing written, and no temp sibling left behind by either run.
+        expect(read()).toBe(before);
+        expect(readdirSync(dirname(userFile()))).toEqual(["config.toml"]);
+      } finally {
+        chmodSync(userFile(), 0o666);
+      }
+    },
+  );
+
+  it("CODEX_HOME set to a regular file: install names that file and the variable, exit 1, nothing written", async () => {
+    // Windows reads `<file>/config.toml` as missing and fails at the write's
+    // mkdir (EEXIST); POSIX fails the READ with ENOTDIR first. Either way the
+    // raw errno never said CODEX_HOME, and now the one clause does.
+    const afile = join(home, "afile");
+    writeFileSync(afile, "not a directory\n");
+    const file = join(afile, "config.toml");
+    const run = await install({ clientEnv: { codexHome: afile } });
+    expect(run.result.exitCode).toBe(1);
+    expect(run.result.written).toEqual([]);
+    const clause =
+      `${afile} is a file, not a directory, and CODEX_HOME (set to ${afile}) puts config.toml under it -- ` +
+      "point CODEX_HOME at a directory, then re-run.";
+    expect([
+      `yaw-mcp install: failed to write ${file}: ${clause}\n`,
+      `yaw-mcp install: cannot read ${file}: ${clause}\n`,
+    ]).toContain(run.stderr);
+    expect(readFileSync(afile, "utf8")).toBe("not a directory\n");
+  });
+
+  it("a regular file where ~/.codex has to be is named with no variable, when no variable put it there", async () => {
+    // Variables that are SET but move some other client's file must not be
+    // named: the resolver says the Codex path is the same without them. They
+    // point below the file in the way on purpose -- where the clause WOULD
+    // name a variable it was handed -- so it is the resolver's answer, not
+    // the paths, that keeps them out.
+    const codexDir = join(home, ".codex");
+    writeFileSync(codexDir, "x");
+    const run = await install({
+      clientEnv: { claudeConfigDir: join(codexDir, "claude"), xdgConfigHome: join(codexDir, "xdg") },
+    });
+    expect(run.result.exitCode).toBe(1);
+    const clause = `${codexDir} is a file, not a directory -- move or rename it, then re-run.`;
+    expect([
+      `yaw-mcp install: failed to write ${userFile()}: ${clause}\n`,
+      `yaw-mcp install: cannot read ${userFile()}: ${clause}\n`,
+    ]).toContain(run.stderr);
   });
 
   /** Run `body` with some of the TOML adapter's methods replaced, and put the

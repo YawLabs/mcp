@@ -119,6 +119,12 @@
 //      18446744073709551615 ("u64 value was too large", at parse). Codex
 //      0.144.0, which predates the key, loads every one of them but those two
 //      past 2^63 - 1, which it refuses at parse as well.
+//   S8 a config.toml that is not UTF-8. Measured on 0.144.0 only (`codex mcp
+//      list` with CODEX_HOME in a scratch dir, 2026-09-25): over
+//      `model = "o3<FF><FE>"` it exits 1 with "Failed to read config file
+//      <path>: invalid utf-8 sequence of 1 bytes from index 11", and the index
+//      it names is the 0-based byte offset of the first bad sequence (checked
+//      at offsets 11, 22 and 5).
 
 import { isAbsolute, join, resolve } from "node:path";
 import {

@@ -11,6 +11,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
+import { Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 function writeYawMcpConfig(root: string, filename: string, obj: unknown): void {
@@ -20,7 +21,7 @@ function writeYawMcpConfig(root: string, filename: string, obj: unknown): void {
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { classifyClientConfig, unloadableConfigProblem } from "../client-config.js";
+import { classifyClientConfig, decodeClientConfigBytes, unloadableConfigProblem } from "../client-config.js";
 import { legacyMigrationSkippedWarning } from "../config-loader.js";
 import {
   DOCTOR_ENV_VARS,
@@ -35,11 +36,13 @@ import {
   runDoctor as runDoctorUnstubbed,
   scanShellHistoryForShadows,
 } from "../doctor-cmd.js";
+import { type BundlesSummary, runInstall } from "../install-cmd.js";
 import {
   blockedContainerFix,
   claudeCodeProjectKey,
   describeJsonShape,
   ENTRY_NAME,
+  INSTALL_TARGETS,
   resolveInstallSites,
   unloadableConfigFix,
   unparseableConfigFix,
@@ -5194,6 +5197,186 @@ describe("runDoctor -- a TOML client config (Codex CLI) is classified by its ada
     expect(errs.join("")).toContain(`warning: ${warning}`);
   });
 
+  // A config.toml whose bytes are not UTF-8. Install's read refuses that file
+  // (decodeClientConfigBytes: a TOML file must be UTF-8, and Codex will not
+  // load one that is not), while both probes read it as UTF-8 text, in which
+  // each bad sequence is U+FFFD -- and that text parses, so the row said
+  // present, no entry, and named an install run that exits 1 on the file.
+  // Both probes now decode the bytes the one way install's read does. FF FE
+  // sits mid-file, inside a string on the second line.
+  describe("a config.toml whose bytes are not UTF-8 (FF FE mid-file)", () => {
+    const PREFIX = 'model = "o3"\nnote = "a';
+    const badBytes = (): Buffer =>
+      Buffer.concat([
+        Buffer.from(PREFIX, "utf8"),
+        Buffer.from([0xff, 0xfe]),
+        Buffer.from('b"\n\n[mcp_servers.other]\ncommand = "node"\n', "utf8"),
+      ]);
+    const DETAIL = "invalid UTF-8 at byte offset 22, and a TOML file must be UTF-8 -- re-save the file as UTF-8";
+    const STATUS = `exists but TOML is malformed (${DETAIL}) -- install refuses to overwrite it; fix the TOML by hand, or move the file aside, then run \`${CODEX_INSTALL}\``;
+
+    function writeBadToml(): void {
+      mkdirSync(join(synthHome, ".codex"), { recursive: true });
+      writeFileSync(codexToml(), badBytes());
+    }
+
+    it("the fixture: the bad sequence starts at byte 22, the core's detail is the one pinned here, and the text parses", () => {
+      expect(Buffer.byteLength(PREFIX, "utf8")).toBe(22);
+      const decoded = decodeClientConfigBytes(badBytes(), "toml");
+      expect(decoded.malformed?.detail).toBe(DETAIL);
+      // What both probes used to classify: the bytes as UTF-8 text, which
+      // parses, with one sibling server and no entry of ours.
+      const view = classifyClientConfig(decoded.text, codexSite());
+      expect(view.read.kind).toBe("ok");
+      expect(view.count()).toBe(1);
+      expect(view.entry()).toBeUndefined();
+    });
+
+    it("doctor (the sync probe): the malformed row with the byte offset, on the CLIENTS line, the warning and --json", async () => {
+      writeBadToml();
+      const cap = captureOut();
+      const errs: string[] = [];
+      const r = await runDoctor({
+        cwd: synthCwd,
+        home: synthHome,
+        env: {},
+        os: "linux",
+        out: cap.out,
+        err: (s) => errs.push(s),
+      });
+      expect(clientsRow(cap.text(), CODEX_LABEL).status).toBe(STATUS);
+      // The malformed row's own remedy, from the helper, so the literal above
+      // cannot drift from it.
+      expect(STATUS).toContain(unparseableConfigFix(`run \`${CODEX_INSTALL}\``, "TOML"));
+      const row = codexRow(r.snapshot.clients);
+      expect(row?.exists).toBe(true);
+      expect(row?.malformed).toBe(true);
+      expect(row?.malformedDetail).toBe(DETAIL);
+      expect(row?.hasMcpEntry).toBe(false);
+      expect(row?.containerEntries).toBe(0);
+      expect(row?.unreadable).toBeNull();
+      expect(probeUsable(row!)).toBe(false);
+      const warning = `${codexToml()}: ${CODEX_LABEL} ${STATUS}`;
+      expect(r.snapshot.config.warnings.filter((w) => w.includes("Codex CLI"))).toEqual([warning]);
+      expect(errs.join("")).toContain(`warning: ${warning}`);
+      expect(r.exitCode).toBe(2);
+
+      const json = await runDoctor({
+        cwd: synthCwd,
+        home: synthHome,
+        env: {},
+        os: "linux",
+        out: () => {},
+        err: () => {},
+        json: true,
+        skipRegistryCheck: true,
+      });
+      const parsed = JSON.parse(json.lines[0]) as {
+        clients: Array<{ clientId: string; scope: string; malformed: boolean; malformedDetail: string | null }>;
+      };
+      expect(parsed.clients.every((c) => "malformedDetail" in c)).toBe(true);
+      const jsonRow = parsed.clients.find((c) => c.clientId === "codex-cli" && c.scope === "user");
+      expect(jsonRow?.malformed).toBe(true);
+      expect(jsonRow?.malformedDetail).toBe(DETAIL);
+    });
+
+    it("probeClientsAsync: malformed with the byte offset, the same row as the sync probe", async () => {
+      writeBadToml();
+      const asyncRow = codexRow(await probeClientsAsync({ home: synthHome, os: "linux", cwd: synthCwd }));
+      expect(asyncRow?.exists).toBe(true);
+      expect(asyncRow?.malformed).toBe(true);
+      expect(asyncRow?.malformedDetail).toBe(DETAIL);
+      expect(asyncRow?.hasMcpEntry).toBe(false);
+      expect(asyncRow?.containerEntries).toBe(0);
+      const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: () => {}, err: () => {} });
+      expect(asyncRow).toEqual(codexRow(r.snapshot.clients));
+    });
+
+    it("install --list (which reads through probeClientsAsync) lists the row as malformed", async () => {
+      writeBadToml();
+      const out: string[] = [];
+      const err: string[] = [];
+      const sink = (arr: string[]): NodeJS.WritableStream =>
+        new Writable({
+          write(chunk: Buffer, _enc, cb): void {
+            arr.push(chunk.toString());
+            cb();
+          },
+        }) as unknown as NodeJS.WritableStream;
+      const r = await runInstall({
+        os: "linux",
+        home: synthHome,
+        cwd: synthCwd,
+        listOnly: true,
+        io: { stdin: process.stdin, stdout: sink(out), stderr: sink(err), isTTY: false },
+      });
+      expect(r.exitCode).toBe(0);
+      const rows = out
+        .join("")
+        .split("\n")
+        .map((l) => l.trim().split(/ {2,}/))
+        .filter((cells) => cells[0] === "Codex CLI" && cells[1] === "user");
+      expect(rows).toEqual([["Codex CLI", "user", "~/.codex/config.toml", "malformed"]]);
+    });
+  });
+
+  // The other half of the same change: a file that IS valid UTF-8 -- a BOM,
+  // multi-byte characters in a comment and in values -- decodes to exactly the
+  // text the old `readFileSync(path, "utf8")` returned, so doctor says what it
+  // always said about it. The read seam hands the probes text read that old
+  // way, so each run below is compared against the pre-change read of the
+  // same files. The project file's missing launch command carries non-ASCII
+  // into the report, where a wrong decode would show.
+  it("a valid config.toml with a BOM and multi-byte UTF-8 reads exactly as the text read did, on both probes", async () => {
+    // Code points, not escapes or literal characters, so this source stays
+    // ASCII: a BOM, U+00E9 and U+1F642 in a comment, U+2014 and U+00FC in a
+    // value, and U+00E9 and U+1F642 in the missing command's path.
+    const cp = (...points: number[]): string => String.fromCodePoint(...points);
+    writeCodexToml(
+      `${cp(0xfeff)}# caf${cp(0xe9)} ${cp(0x1f642)}\nmodel = "o3 ${cp(0x2014)} ${cp(0xfc)}"\n\n${fixture("f05-identical")}`,
+    );
+    const missing = `/nonexistent/caf${cp(0xe9)}/${cp(0x1f642)}/node`;
+    writeCodexToml(`[mcp_servers.mcp]\ncommand = "${missing}"\nargs = ["x.js"]\n`, join(synthCwd, ".codex"));
+    const textRead = (p: string): string => readFileSync(p, "utf8");
+    const run = async (readClientConfig?: (p: string) => string) => {
+      const cap = captureOut();
+      const r = await runDoctor({
+        cwd: synthCwd,
+        home: synthHome,
+        env: {},
+        os: "linux",
+        platform: "linux",
+        out: cap.out,
+        err: () => {},
+        skipRegistryCheck: true,
+        ...(readClientConfig ? { readClientConfig } : {}),
+      });
+      return { r, text: cap.text() };
+    };
+    const bytesRun = await run();
+    const textRun = await run(textRead);
+    // Everything after the header line, which carries the run's own timestamp.
+    const report = (text: string): string => text.slice(text.indexOf("\n"));
+    expect(bytesRun.text.startsWith("yaw-mcp doctor -- ")).toBe(true);
+    expect(report(bytesRun.text)).toBe(report(textRun.text));
+    expect(bytesRun.r.snapshot.clients).toEqual(textRun.r.snapshot.clients);
+    expect(bytesRun.r.exitCode).toBe(textRun.r.exitCode);
+
+    const user = codexRow(bytesRun.r.snapshot.clients);
+    expect(user?.malformed).toBe(false);
+    expect(user?.hasMcpEntry).toBe(true);
+    expect(clientsRow(bytesRun.text, CODEX_LABEL).status.startsWith(`OK -- has "${ENTRY_NAME}" entry`)).toBe(true);
+    const project = codexRow(bytesRun.r.snapshot.clients, "project");
+    expect(project?.malformed).toBe(false);
+    expect(project?.launchCommandMissing).toBe(missing);
+    expect(bytesRun.r.snapshot.clients.every((c) => c.malformedDetail === null)).toBe(true);
+
+    const probe = { home: synthHome, os: "linux" as const, cwd: synthCwd, platform: "linux" as const };
+    const asyncBytes = await probeClientsAsync(probe);
+    expect(asyncBytes).toEqual(await probeClientsAsync({ ...probe, readClientConfig: textRead }));
+    expect(asyncBytes).toEqual(bytesRun.r.snapshot.clients);
+  });
+
   it("an [[mcp_servers]] array (f11-array-container) is blocked, worded as a TOML table, not a warning", async () => {
     writeCodexToml(fixture("f11-array-container"));
     const cap = captureOut();
@@ -5448,6 +5631,379 @@ describe("runDoctor -- a TOML client config (Codex CLI) is classified by its ada
     expect(local?.syntax).toBe("JSON");
     expect(local?.hasMcpEntry).toBe(true);
     expect(local?.entryProjectKey).toBe(variant);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Codex's top-level startup grace (the row's `config.rootDefaults`). Install
+// adds `mcp_optional_startup_grace_ms = 0` at the top of config.toml, and doctor
+// said nothing about the key: a config.toml written before install added it --
+// the setup whose yaw-mcp tools Codex 0.151 and later leave out of the session
+// -- read "OK" and "All good", and so did one at -1 or 0.0, which Codex 0.156.1
+// will not load at all (exit 1). A key past what a TOML integer holds, in the
+// file install had refused to write its entry into, read "present, no entry
+// -- run install": a run that refuses the file again. Doctor now
+// reads the key through install's own plan (planRootDefaults), off the same
+// view as the entry: a missing key beside our entry is a CLIENTS note and a
+// DIAGNOSIS step with the exit left at 0 (the legacy-entry precedent), a
+// refused value beside our entry is a warning (exit 2), and a value no release
+// loads takes the whole CLIENTS line.
+// ---------------------------------------------------------------------------
+
+describe("runDoctor -- Codex's top-level startup grace (config.rootDefaults)", () => {
+  const GRACE = "mcp_optional_startup_grace_ms";
+  const INSTALL = "yaw-mcp install codex-cli";
+  /** The row's own reason, so these assertions follow the data. */
+  const WHY =
+    INSTALL_TARGETS.find((t) => t.clientId === "codex-cli")?.config.rootDefaults?.[0]?.why ??
+    "(no rootDefaults on the codex-cli row)";
+  /** Our entry exactly as install writes it (the f01-missing expected bytes),
+   *  and nothing else: a config.toml from before install added the key. */
+  const ENTRY =
+    '[mcp_servers.mcp]\ncommand = "npx"\nargs = ["-y", "@yawlabs/mcp@latest"]\nstartup_timeout_sec = 60.0\n';
+  /** Install's refusal / warning clause, which a refused value's line quotes. */
+  const WONT_LOAD = "a Codex CLI release that reads the key will not load the file with that value";
+
+  const codexToml = (): string => join(synthHome, ".codex", "config.toml");
+  function writeCodexToml(raw: string): void {
+    mkdirSync(join(synthHome, ".codex"), { recursive: true });
+    writeFileSync(codexToml(), raw);
+  }
+
+  /** The DIAGNOSIS step for this file, as doctor words it. */
+  const step = (cmd = INSTALL): string => `Run \`${cmd}\` to add ${GRACE} = 0 to ${codexToml()}: ${WHY}.`;
+
+  /** One CLIENTS row's status, after `  <label>: `. Exactly one must exist. */
+  function clientsRow(text: string, label = "Codex CLI (user)"): string {
+    const prefix = `  ${label}: `;
+    const hits = text.split("\n").filter((l) => l.startsWith(prefix));
+    expect(hits).toHaveLength(1);
+    return hits[0].slice(prefix.length);
+  }
+
+  /** Every non-empty line under DIAGNOSIS, the section the report ends on. */
+  function diagnosisLines(text: string): string[] {
+    const lines = text.split("\n");
+    const at = lines.indexOf("DIAGNOSIS");
+    expect(at).toBeGreaterThanOrEqual(0);
+    return lines.slice(at + 1).filter((l) => l.length > 0);
+  }
+
+  async function doctor(over: Partial<Parameters<typeof runDoctor>[0]> = {}) {
+    const cap = captureOut();
+    const errs: string[] = [];
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      err: (s) => errs.push(s),
+      skipRegistryCheck: true,
+      ...over,
+    });
+    const row = r.snapshot.clients.find((c) => c.clientId === "codex-cli" && c.scope === "user");
+    if (row === undefined) throw new Error("no Codex CLI (user) row");
+    const codexWarnings = r.snapshot.config.warnings.filter((w) => w.includes("Codex CLI"));
+    return { r, row, text: cap.text(), stderr: errs.join(""), codexWarnings };
+  }
+
+  /** `yaw-mcp install codex-cli` over the same synthetic home, hermetic the
+   *  way target-codex-cli.test.ts runs it: no TTY, no oam, no bundles walk. */
+  async function install() {
+    const out: string[] = [];
+    const err: string[] = [];
+    const sink = (arr: string[]): NodeJS.WritableStream =>
+      new Writable({
+        write(chunk: Buffer, _enc, cb): void {
+          arr.push(chunk.toString());
+          cb();
+        },
+      }) as unknown as NodeJS.WritableStream;
+    const bundles = (): BundlesSummary => ({
+      state: "empty",
+      count: 0,
+      path: "/synth/.yaw-mcp/bundles.json",
+      warnings: [],
+    });
+    const result = await runInstall({
+      clientId: "codex-cli",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      cwd: synthCwd,
+      io: { stdin: process.stdin, stdout: sink(out), stderr: sink(err), isTTY: false },
+      oamProbe: async () => oamNotInstalled(),
+      bundlesSummary: bundles,
+    });
+    return { exitCode: result.exitCode, stdout: out.join(""), stderr: err.join("") };
+  }
+
+  it("our entry without the key: OK with a note, a DIAGNOSIS step, no warning, exit 0", async () => {
+    writeCodexToml(ENTRY);
+    const { r, row, text, codexWarnings } = await doctor();
+    expect(clientsRow(text)).toBe(
+      `OK -- has "${ENTRY_NAME}" entry; the file does not set ${GRACE} -- run \`${INSTALL}\` to add ${GRACE} = 0`,
+    );
+    const diag = diagnosisLines(text);
+    expect(diag[0]).toBe("  All good. yaw-mcp should start cleanly.");
+    expect(diag[diag.length - 1]).toBe(`  ${step()}`);
+    expect(codexWarnings).toEqual([]);
+    expect(r.exitCode).toBe(0);
+    expect(row.rootDefaults).toEqual([
+      {
+        key: GRACE,
+        recommended: 0,
+        why: WHY,
+        state: "missing",
+        value: null,
+        kind: null,
+        needs: null,
+        everyRelease: null,
+        fix: null,
+      },
+    ]);
+    // The async probe --list and try read carries the same list.
+    const asyncRow = (await probeClientsAsync({ home: synthHome, os: "linux", cwd: synthCwd })).find(
+      (c) => c.clientId === "codex-cli" && c.scope === "user",
+    );
+    expect(asyncRow?.rootDefaults).toEqual(row.rootDefaults);
+  });
+
+  it("the step is the run install makes: install adds exactly that line, and doctor is clean after it", async () => {
+    writeCodexToml(ENTRY);
+    const before = await doctor();
+    const named = diagnosisLines(before.text).filter((l) => l.includes(GRACE));
+    expect(named).toEqual([`  ${step()}`]);
+
+    const ran = await install();
+    expect(ran.exitCode, ran.stderr).toBe(0);
+    // Install's own line, word for word the tail of doctor's step.
+    const tail = `${GRACE} = 0 to ${codexToml()}: ${WHY}.`;
+    expect(ran.stdout).toContain(`Added ${tail}`);
+    expect(step().endsWith(` to add ${tail}`)).toBe(true);
+
+    const after = await doctor();
+    expect(clientsRow(after.text)).toBe(`OK -- has "${ENTRY_NAME}" entry`);
+    expect(after.text).not.toContain(GRACE);
+    expect(after.row.rootDefaults).toEqual([]);
+    expect(after.r.exitCode).toBe(0);
+  });
+
+  it("--json: .diagnosis.summary ends with the same step, once per file, and every clients[] slot carries rootDefaults", async () => {
+    writeCodexToml(ENTRY);
+    // cwd === home: the user and project scopes read this ONE config.toml.
+    const r = await runDoctor({
+      cwd: synthHome,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: () => {},
+      err: () => {},
+      json: true,
+      skipRegistryCheck: true,
+    });
+    const parsed = JSON.parse(r.lines[0]) as {
+      warnings: string[];
+      diagnosis: { exitCode: number; summary: string };
+      clients: Array<{ clientId: string; scope: string; syntax: string; rootDefaults: Array<{ state: string }> }>;
+    };
+    expect(parsed.diagnosis.exitCode).toBe(0);
+    expect(parsed.diagnosis.summary.startsWith("All good.")).toBe(true);
+    expect(parsed.diagnosis.summary.endsWith(` ${step()}`)).toBe(true);
+    // One step names the key once; a second scope's copy would name it twice.
+    expect(parsed.diagnosis.summary.split(GRACE).length - 1).toBe(1);
+    expect(parsed.warnings.filter((w) => w.includes("Codex CLI"))).toEqual([]);
+    expect(parsed.clients.every((c) => Array.isArray(c.rootDefaults))).toBe(true);
+    const codex = parsed.clients.filter((c) => c.clientId === "codex-cli");
+    expect(codex.map((c) => c.scope)).toEqual(["user", "project"]);
+    expect(codex.every((c) => c.rootDefaults.length === 1 && c.rootDefaults[0].state === "missing")).toBe(true);
+    expect(parsed.clients.filter((c) => c.syntax === "JSON").every((c) => c.rootDefaults.length === 0)).toBe(true);
+  });
+
+  it("text: two scopes reading one config.toml give ONE step, naming the first scope's run", async () => {
+    writeCodexToml(ENTRY);
+    const { text } = await doctor({ cwd: synthHome });
+    // Both CLIENTS rows carry the note, each with its own scope's command...
+    expect(clientsRow(text, "Codex CLI (user)")).toContain(`run \`${INSTALL}\` to add`);
+    expect(clientsRow(text, "Codex CLI (project)")).toContain(`run \`${INSTALL} --scope project\` to add`);
+    // ...and DIAGNOSIS says it once, for the one file.
+    expect(diagnosisLines(text).filter((l) => l.includes(GRACE))).toEqual([`  ${step()}`]);
+  });
+
+  it("a missing key beside a launch problem: the rerun line says install adds it as it writes the working entry", async () => {
+    const gone = join(synthHome, "gone", "oam");
+    // A TOML literal string, so a win32 path's backslashes stay verbatim.
+    writeCodexToml(`[mcp_servers.mcp]\ncommand = '${gone}'\nargs = ["run", "x.js"]\n`);
+    const { r, text } = await doctor();
+    const status = clientsRow(text);
+    expect(status.startsWith(`has "${ENTRY_NAME}" entry, but its launch command does not exist: ${gone}`)).toBe(true);
+    expect(
+      status.endsWith(`; the file does not set ${GRACE} -- install adds ${GRACE} = 0 as it writes the working entry`),
+    ).toBe(true);
+    // Still named in DIAGNOSIS: the warning is the launch command, and the
+    // step is not moot beside it.
+    const diag = diagnosisLines(text);
+    expect(diag[0]).toBe("  Warnings above need attention.");
+    expect(diag).toContain(`  ${step()}`);
+    expect(r.exitCode).toBe(2);
+  });
+
+  it("a legacy entry and a missing key beside a working entry: both clauses, and the OK stays", async () => {
+    writeCodexToml(`${ENTRY}\n[mcp_servers.yaw-mcp]\ncommand = "npx"\nargs = ["-y", "@yawlabs/mcp@latest"]\n`);
+    const { r, text } = await doctor();
+    expect(clientsRow(text)).toBe(
+      `OK -- has "${ENTRY_NAME}" entry; legacy "yaw-mcp" entry also present -- remove it to avoid running yaw-mcp twice; ` +
+        `the file does not set ${GRACE} -- run \`${INSTALL}\` to add ${GRACE} = 0`,
+    );
+    expect(r.exitCode).toBe(0);
+  });
+
+  it("no entry of ours: no grace clause and no step (install adds the key with the entry), though the list has it", async () => {
+    writeCodexToml('model = "o3"\n\n[mcp_servers.other]\ncommand = "other-server"\n');
+    const { r, row, text } = await doctor();
+    expect(clientsRow(text)).toBe(`present, no "${ENTRY_NAME}" entry -- run \`${INSTALL}\``);
+    expect(diagnosisLines(text).filter((l) => l.includes(GRACE))).toEqual([]);
+    expect(row.rootDefaults.map((d) => d.state)).toEqual(["missing"]);
+    expect(r.exitCode).toBe(0);
+  });
+
+  it("an entry written for another OS gets the by-hand line and no install-run step", async () => {
+    // A drive-letter path judged with POSIX semantics: WSL reading a Windows
+    // profile. An install run from here would rewrite the entry for THIS OS.
+    writeCodexToml('[mcp_servers.mcp]\ncommand = "C:/oam/oam.exe"\nargs = ["run", "x.js"]\n');
+    const { row, text } = await doctor({ platform: "linux" });
+    expect(row.launchForeignPath).toBe("C:/oam/oam.exe");
+    expect(
+      clientsRow(text).endsWith(
+        `; the file does not set ${GRACE} -- set ${GRACE} = 0 by hand, on one line above the first table in the file`,
+      ),
+    ).toBe(true);
+    expect(diagnosisLines(text).filter((l) => l.includes(GRACE))).toEqual([]);
+  });
+
+  it("another value Codex takes (1000) is carried as 'other' and printed nowhere", async () => {
+    writeCodexToml(`${GRACE} = 1000\n\n${ENTRY}`);
+    const { r, row, text } = await doctor();
+    expect(clientsRow(text)).toBe(`OK -- has "${ENTRY_NAME}" entry`);
+    expect(text).not.toContain(GRACE);
+    expect(row.rootDefaults).toEqual([
+      {
+        key: GRACE,
+        recommended: 0,
+        why: WHY,
+        state: "other",
+        value: "1000",
+        kind: null,
+        needs: null,
+        everyRelease: null,
+        fix: null,
+      },
+    ]);
+    expect(r.exitCode).toBe(0);
+  });
+
+  it("-1 beside our entry reads byte-exact: no OK, the value, what Codex needs, and the by-hand step", async () => {
+    writeCodexToml(`${GRACE} = -1\n\n${ENTRY}`);
+    const { r, text, stderr, codexWarnings } = await doctor();
+    const status =
+      `has "${ENTRY_NAME}" entry; the file sets ${GRACE} to -1, a negative integer where Codex CLI needs a ` +
+      `non-negative integer -- ${WONT_LOAD}, and install leaves a value you set alone; edit that value by hand ` +
+      "(0 is recommended)";
+    expect(clientsRow(text)).toBe(status);
+    expect(codexWarnings).toEqual([`${codexToml()}: Codex CLI (user) ${status}`]);
+    expect(stderr).toContain(`warning: ${codexToml()}: Codex CLI (user) ${status}`);
+    expect(diagnosisLines(text)).toEqual(["  Warnings above need attention."]);
+    expect(r.exitCode).toBe(2);
+  });
+
+  it.each([
+    { toml: '"0"', value: '"0"', kind: "a string ", needs: "a non-negative integer", scalar: true },
+    { toml: "0.0", value: "0.0", kind: "a float ", needs: "an integer", scalar: true },
+    { toml: "true", value: "true", kind: "a boolean ", needs: "a non-negative integer", scalar: true },
+    { toml: "[0]", value: "an array of 1", kind: "", needs: "a non-negative integer", scalar: false },
+    { toml: "{ a = 1 }", value: "a TOML table", kind: "", needs: "a non-negative integer", scalar: false },
+  ])("a refused value beside our entry ($toml) is a warning naming it and what Codex needs, exit 2", async (c) => {
+    writeCodexToml(`${GRACE} = ${c.toml}\n\n${ENTRY}`);
+    const { r, row, text, codexWarnings } = await doctor();
+    const fix = c.scalar
+      ? "edit that value by hand (0 is recommended)"
+      : "delete it by hand and set the key on one line above the first table in the file (0 is recommended)";
+    const status =
+      `has "${ENTRY_NAME}" entry; the file sets ${GRACE} to ${c.value}, ${c.kind}where Codex CLI needs ` +
+      `${c.needs} -- ${WONT_LOAD}, and install leaves a value you set alone; ${fix}`;
+    expect(clientsRow(text)).toBe(status);
+    expect(codexWarnings).toEqual([`${codexToml()}: Codex CLI (user) ${status}`]);
+    expect(row.rootDefaults.map((d) => [d.state, d.value, d.needs, d.fix])).toEqual([
+      ["refused", c.value, c.needs, fix],
+    ]);
+    expect(r.exitCode).toBe(2);
+  });
+
+  it("a refused value with no entry of ours is not a warning: install is the step, and it warns itself", async () => {
+    writeCodexToml(`${GRACE} = -1\n\n[mcp_servers.other]\ncommand = "other-server"\n`);
+    const { r, row, text, codexWarnings } = await doctor();
+    expect(clientsRow(text)).toBe(`present, no "${ENTRY_NAME}" entry -- run \`${INSTALL}\``);
+    expect(row.rootDefaults.map((d) => d.state)).toEqual(["refused"]);
+    expect(codexWarnings).toEqual([]);
+    expect(r.exitCode).toBe(0);
+  });
+
+  /** Every kind of value Codex 0.156.1 refused to load, measured (S7 in
+   *  target-codex-cli.ts), but the integer past the ceiling -- which install
+   *  refuses outright, so it has a test of its own below. */
+  const REFUSED_TOML = ["-1", '"0"', "0.0", "true", "1979-05-27", "[0]", "{ a = 1 }"];
+
+  it.each(REFUSED_TOML)("doctor spells a refused value (%s) the way install's warning does", async (toml) => {
+    writeCodexToml(`${GRACE} = ${toml}\n\n${ENTRY}`);
+    const { row } = await doctor();
+    const d = row.rootDefaults[0];
+    if (d?.state !== "refused") throw new Error(`not refused: ${JSON.stringify(d)}`);
+    const ran = await install();
+    expect(ran.exitCode).toBe(0);
+    const kind = d.kind === null ? "" : `${d.kind} `;
+    expect(ran.stderr).toContain(`already sets ${GRACE} to ${d.value}, ${kind}where Codex CLI needs ${d.needs},`);
+    // The by-hand step is install's too, give or take its capital and the
+    // recommendation doctor carries in the same clause.
+    expect(ran.stderr.toLowerCase()).toContain(d.fix.replace(" (0 is recommended)", ""));
+  });
+
+  it("a value no release loads takes the CLIENTS line, with or without our entry; a warning only with it", async () => {
+    const big = "9223372036854775808";
+    const status =
+      `exists but sets ${GRACE} to ${big}, larger than a TOML integer holds, so Codex CLI will not load the file ` +
+      "-- install refuses to write into it; change that value by hand to a non-negative integer no larger than " +
+      `9223372036854775807 (0 is recommended), then run \`${INSTALL}\``;
+
+    // No entry: what `install codex-cli` leaves behind when it refuses this
+    // file. The line used to be "present, no entry -- run install".
+    writeCodexToml(`${GRACE} = ${big}\nmodel = "o3"\n`);
+    let run = await doctor();
+    expect(clientsRow(run.text)).toBe(status);
+    expect(run.text).not.toContain(`present, no "${ENTRY_NAME}" entry`);
+    expect(run.codexWarnings).toEqual([]);
+    expect(run.r.exitCode).toBe(0);
+
+    // With our entry: the client starts nothing from the file, ours included.
+    writeCodexToml(`${GRACE} = ${big}\n\n${ENTRY}`);
+    run = await doctor();
+    expect(clientsRow(run.text)).toBe(status);
+    expect(run.codexWarnings).toEqual([`${codexToml()}: Codex CLI (user) ${status}`]);
+    expect(diagnosisLines(run.text)).toEqual(["  Warnings above need attention."]);
+    expect(run.r.exitCode).toBe(2);
+  });
+
+  it("the value-no-release-loads step is install's refusal's own", async () => {
+    writeCodexToml(`${GRACE} = 9223372036854775808\n\n${ENTRY}`);
+    const { row } = await doctor();
+    const d = row.rootDefaults[0];
+    if (d?.state !== "refused-every-release") throw new Error(`not refused-every-release: ${JSON.stringify(d)}`);
+    const ran = await install();
+    expect(ran.exitCode).toBe(1);
+    expect(ran.stderr).toContain(
+      `sets ${GRACE} to ${d.value}, ${d.everyRelease}, so Codex CLI will not load the file -- refusing to write ` +
+        `into it; ${d.fix}, then re-run.`,
+    );
   });
 });
 

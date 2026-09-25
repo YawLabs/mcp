@@ -6,7 +6,8 @@
 // can rely on rather than how the adapter spells it (that is
 // client-config-json.test.ts).
 
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
@@ -30,6 +31,7 @@ import {
   classifyClientConfig,
   composeEntry,
   containerKeysAt,
+  decodeClientConfigBytes,
   describeValueShape,
   detectLineEnding,
   type EntryAddress,
@@ -37,6 +39,7 @@ import {
   type EntryView,
   effectiveConfigFormat,
   findLegacyKey,
+  firstInvalidUtf8Offset,
   hasConfigAdapter,
   importViewOf,
   launchOf,
@@ -607,6 +610,183 @@ describe("reading a file", () => {
   it("classifies what it read", async () => {
     const view = await readClientConfigFile(site(), { readFile: () => Promise.resolve('{"mcpServers":{"mcp":{}}}') });
     expect(view.entry()?.key).toBe("mcp");
+  });
+});
+
+describe("reading a file whose format must be UTF-8", () => {
+  // TOML must be UTF-8, and Codex will not load a config.toml that is not
+  // (0.144.0: "invalid utf-8 sequence of 1 bytes from index 11" for the first
+  // fixture below). A lenient decode turned each bad byte into U+FFFD, which
+  // install then wrote back to disk over the user's bytes and reported Done.
+  const tomlSite = (absolute = "/home/u/.codex/config.toml"): ConfigSite =>
+    site({
+      format: "toml",
+      resolved: { absolute, display: "~/.codex/config.toml", containerPath: ["mcp_servers"] },
+    });
+  /** Bytes from text parts (UTF-8) and raw byte runs, in order. */
+  const bytesOf = (...parts: (string | number[])[]): Uint8Array =>
+    Buffer.concat(parts.map((part) => (typeof part === "string" ? Buffer.from(part, "utf8") : Buffer.from(part))));
+  const REPLACEMENT = String.fromCharCode(0xfffd);
+  const BOM = String.fromCharCode(0xfeff);
+  const refusalOf = (fn: () => unknown): string => {
+    try {
+      fn();
+    } catch (err) {
+      expect(err).toBeInstanceOf(ClientConfigWriteError);
+      return (err as Error).message;
+    }
+    throw new Error("expected a refusal");
+  };
+
+  it("refuses a TOML file that is not UTF-8 as malformed, names the byte offset, and hands the facade nothing to write", async () => {
+    const view = await readClientConfigFile(tomlSite(), {
+      readFile: () => Promise.resolve(bytesOf('model = "o3', [0xff, 0xfe], '"\n')),
+    });
+    expect(view.read).toEqual({
+      kind: "malformed",
+      syntax: "TOML",
+      reason: "encoding",
+      detail: "invalid UTF-8 at byte offset 11, and a TOML file must be UTF-8 -- re-save the file as UTF-8",
+      position: { offset: 11, line: 1, column: 12 },
+    });
+    expect(view.count()).toBe(0);
+    // `raw` is the lenient decoding, as documented on ClientConfigView -- NOT
+    // the file's bytes, which is why the facade below must refuse every edit.
+    expect(view.raw).toBe(`model = "o3${REPLACEMENT}${REPLACEMENT}"\n`);
+    const edits: ClientConfigEdit[][] = [
+      [{ op: "upsert", key: "mcp", entry: ENTRY }],
+      [{ op: "remove", key: "mcp" }],
+      [{ op: "rootDefault", key: "mcp_optional_startup_grace_ms", value: 0 }],
+    ];
+    for (const edit of edits) {
+      const refused = refusalOf(() => applyClientConfigEdits(view, edit, tomlSite()));
+      expect(refused, edit[0].op).toBe(
+        "/home/u/.codex/config.toml is not valid TOML at line 1 column 12 " +
+          "(invalid UTF-8 at byte offset 11, and a TOML file must be UTF-8 -- re-save the file as UTF-8)",
+      );
+    }
+  });
+
+  it("counts a leading BOM's three bytes in the offset, and its one character in the position", async () => {
+    // Offset 8 is the bad byte in the FILE (EF BB BF, then `a = "`); the
+    // position is in the TEXT, where the BOM is one U+FEFF -- so 6, and the
+    // column counts that U+FEFF the way positionAt does for every format.
+    const view = await readClientConfigFile(tomlSite(), {
+      readFile: () => Promise.resolve(bytesOf([0xef, 0xbb, 0xbf], 'a = "', [0xff], '"\n')),
+    });
+    expect(view.read.kind === "malformed" && view.read.detail).toContain("at byte offset 8,");
+    expect(view.read.kind === "malformed" && view.read.position).toEqual({ offset: 6, line: 1, column: 7 });
+  });
+
+  it("keeps a leading BOM on a TOML file that is UTF-8, so it reads exactly as a utf8 readFile did", async () => {
+    const text = `${BOM}model = "o3"\r\n\r\n[mcp_servers.mcp]\r\ncommand = "npx"\r\n`;
+    const view = await readClientConfigFile(tomlSite(), { readFile: () => Promise.resolve(Buffer.from(text, "utf8")) });
+    expect(view.raw).toBe(text);
+    expect(view.entry()?.launch?.command).toBe("npx");
+  });
+
+  it("reads a TOML file holding a real U+FFFD -- well-formed UTF-8 the user wrote, not a decode error", async () => {
+    const view = await readClientConfigFile(tomlSite(), {
+      readFile: () => Promise.resolve(bytesOf('model = "', [0xef, 0xbf, 0xbd], '"\n')),
+    });
+    expect(view.read.kind).toBe("ok");
+    expect(view.raw).toBe(`model = "${REPLACEMENT}"\n`);
+  });
+
+  it("decodes a JSON-family file that is not UTF-8 leniently, as it always has -- the refusal is TOML's alone", async () => {
+    // Scoped on purpose (see mustBeUtf8 in client-config.ts): JSON has the
+    // same U+FFFD loss on a write, and changing it is a separate decision.
+    for (const format of ["json", "jsonc"] as const) {
+      const view = await readClientConfigFile(site({ format }), {
+        readFile: () => Promise.resolve(bytesOf('{"mcpServers":{"mcp":{"command":"x', [0xff], '"}}}')),
+      });
+      expect(view.read.kind, format).toBe("ok");
+      expect(view.entry()?.launch?.command, format).toBe(`x${REPLACEMENT}`);
+    }
+  });
+
+  it("reads the BYTES of a real file by default, so the refusal reaches every verb that reads through here", async () => {
+    // No seam: the default loader. A loader that decoded as utf8 itself would
+    // hand the check a string it can no longer inspect, and the file would
+    // read `ok`.
+    const dir = mkdtempSync(join(tmpdir(), "yaw-mcp-utf8-"));
+    try {
+      const path = join(dir, "config.toml");
+      const written = bytesOf("# notes ", [0xff, 0xfe], '\n[mcp_servers.mcp]\ncommand = "npx"\n');
+      writeFileSync(path, written);
+      const view = await readClientConfigFile(tomlSite(path));
+      expect(view.read.kind === "malformed" && view.read.reason).toBe("encoding");
+      expect(view.read.kind === "malformed" && view.read.detail).toContain("invalid UTF-8 at byte offset 8,");
+      expect(view.entry()).toBeUndefined();
+      expect(readFileSync(path).equals(written)).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("exports the decode, so a reader doing its own IO refuses the same bytes the same way", () => {
+    const decoded = decodeClientConfigBytes(bytesOf('model = "o3', [0xff, 0xfe], '"\n'), "toml");
+    expect(decoded.text).toBe(`model = "o3${REPLACEMENT}${REPLACEMENT}"\n`);
+    expect(decoded.malformed?.reason).toBe("encoding");
+    expect(decodeClientConfigBytes(bytesOf('model = "o3"\n'), "toml")).toEqual({
+      text: 'model = "o3"\n',
+      malformed: null,
+    });
+  });
+
+  it("finds the first invalid UTF-8 sequence exactly where a strict decoder stops", () => {
+    // The oracle is a fatal TextDecoder: the offset is the length of the
+    // longest prefix it accepts (Rust's `valid_up_to`, which is the index
+    // Codex names), and -1 when it accepts the whole input.
+    const strict = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+    const accepts = (b: Uint8Array): boolean => {
+      try {
+        strict.decode(b);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const expected = (b: Uint8Array): number => {
+      if (accepts(b)) return -1;
+      let k = b.length - 1;
+      while (k > 0 && !accepts(b.subarray(0, k))) k--;
+      return k;
+    };
+    const check = (b: Uint8Array): void => {
+      const want = expected(b);
+      const got = firstInvalidUtf8Offset(b);
+      if (got !== want) {
+        throw new Error(`[${Buffer.from(b).toString("hex")}]: scanner says ${got}, a strict decoder ${want}`);
+      }
+    };
+    // Every single byte and every pair: each lead, each continuation, each
+    // truncation at the end of the input.
+    for (let a = 0; a < 256; a++) {
+      check(Uint8Array.of(a));
+      for (let b = 0; b < 256; b++) check(Uint8Array.of(a, b));
+    }
+    // Three- and four-byte sequences around every boundary a lead narrows
+    // (overlongs, surrogates, past U+10FFFF), whole and cut short, bare and
+    // with ASCII around them so the offset is not always 0.
+    const leads = [0xc0, 0xc1, 0xc2, 0xdf, 0xe0, 0xe1, 0xec, 0xed, 0xee, 0xef, 0xf0, 0xf1, 0xf3, 0xf4, 0xf5, 0xff];
+    const seconds = [0x7f, 0x80, 0x8f, 0x90, 0x9f, 0xa0, 0xbf, 0xc0];
+    const rests = [0x7f, 0x80, 0xbf, 0xc0];
+    for (const lead of leads) {
+      for (const second of seconds) {
+        for (const third of rests) {
+          check(Uint8Array.of(lead, second, third));
+          check(Uint8Array.of(0x61, 0x62, lead, second, third, 0x63));
+          for (const fourth of rests) {
+            check(Uint8Array.of(lead, second, third, fourth));
+            check(Uint8Array.of(0x61, lead, second, third, fourth, 0x62));
+          }
+        }
+      }
+    }
+    // A valid multi-byte run before the bad byte: the offset counts BYTES.
+    expect(firstInvalidUtf8Offset(bytesOf("caf", [0xc3, 0xa9], " ", [0xf0, 0x9f, 0x98, 0x80], [0xff]))).toBe(10);
+    expect(firstInvalidUtf8Offset(new Uint8Array(0))).toBe(-1);
   });
 });
 

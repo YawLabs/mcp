@@ -27,6 +27,9 @@
 //
 // Failure semantics:
 //   - Existing client file with malformed JSON  → refuse, point at the file.
+//   - Our entry in a spelling the file's        -> refuse (exit 1) with the
+//     adapter will not edit (a TOML inline        adapter's by-hand step, the
+//     table)                                      one doctor gives.
 //   - Existing `mcp` entry that differs         → prompt (TTY) or refuse
 //                                                  (exit 2) off one, unless
 //                                                  --repair (keeps its env's
@@ -34,7 +37,16 @@
 //                                                  (drops all of it) or
 //                                                  --skip answers up front.
 //                                                  One that already matches
-//                                                  is a no-op.
+//                                                  is a no-op, apart from a
+//                                                  missing top-level default
+//                                                  (Codex's startup grace),
+//                                                  which the run adds.
+//   - A write that fails on disk                -> exit 1, worded by
+//                                                  describeWriteFailure
+//                                                  (write-failure.ts): the
+//                                                  real file, never its temp
+//                                                  sibling, and the step
+//                                                  that gets past it.
 //   - Client file changed between read + write  → refuse, ask for a re-run
 //                                                  (see the fingerprint check
 //                                                  ahead of atomicWriteFile).
@@ -75,6 +87,7 @@ import {
 import { clientChoices, resolveClientArg } from "./client-aliases.js";
 import {
   applyClientConfigEdits,
+  CLIENT_ENV_VARS,
   type ClientConfigEdit,
   type ClientConfigView,
   type ConfigRootDefault,
@@ -87,7 +100,9 @@ import {
   type EntryTransform,
   planRootDefaults,
   previewRootDefaults,
+  type RootDefaultPlan,
   readClientConfigFile,
+  readClientEnv,
   reloadDoneClause,
   reloadRemovalClause,
   type SyntaxName,
@@ -135,6 +150,7 @@ import {
 } from "./oam-spawn.js";
 import { tildePath, userConfigDir } from "./paths.js";
 import { QUESTION_CANCELLED, questionOrEmpty } from "./readline-question.js";
+import { describeFileInTheWay, describeWriteFailure, type WriteFailureEnvHint } from "./write-failure.js";
 
 export interface InstallCommandOptions {
   /** Target client. Omitted when --list or --all drives the run. */
@@ -158,8 +174,9 @@ export interface InstallCommandOptions {
    *  That is what separates it from `--force`: `--force` overwrites whatever is
    *  there, env included, which is why a setup script cannot use it casually.
    *  `--repair` says "make the entry match what install would write, and keep
-   *  what the user added", and on an entry that ALREADY matches it is a no-op
-   *  like every other path now is -- so a post-upgrade fixup can run it
+   *  what the user added", and on an entry that ALREADY matches it does what
+   *  every other path does there -- nothing, or add a missing top-level
+   *  default (Codex's startup grace) -- so a post-upgrade fixup can run it
    *  unconditionally. */
   repair?: boolean;
   /** Leave an existing yaw-mcp entry untouched (exit 0). */
@@ -396,6 +413,31 @@ function keptRootShapeStep(syntax: SyntaxName): string {
   return `To change it, delete it by hand and set the key on one line ${rootLinePlacement(syntax)}.`;
 }
 
+/** The step a message about a kept top-level value ends with:
+ *  KEPT_ROOT_VALUE_STEP for a scalar, keptRootShapeStep for an array or a
+ *  table. The scalar test is spellRootValue's own, so every value it names by
+ *  its shape gets the shape step. Shared by install's note and warning and by
+ *  --list's note, so the two surfaces end the same way. */
+function keptRootStep(value: unknown, syntax: SyntaxName): string {
+  const scalar =
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "bigint" ||
+    typeof value === "boolean" ||
+    value instanceof Date;
+  return scalar ? KEPT_ROOT_VALUE_STEP : keptRootShapeStep(syntax);
+}
+
+/** The by-hand step for our entry in a spelling the file's adapter will not
+ *  edit (an `unspliceable` read): the adapter's own `fix`, per shape -- the
+ *  step doctor's CLIENTS line prints for the same file, and it is per shape
+ *  because no one step is right for all of them (for an entry inside an
+ *  inline `mcp_servers = { ... }`, only converting the container works). The
+ *  fallback is doctor's own, for an adapter written before `fix` existed. */
+function unspliceableFix(read: { fix?: string }): string {
+  return read.fix ?? "rewrite it by hand as a table of its own (or delete it)";
+}
+
 /** The tail both the live path and the --dry-run preview end with. One
  *  function, two call sites: the dry-run branch returns before the live tail,
  *  and a second copy of these strings is how one of them goes stale.
@@ -484,6 +526,57 @@ export interface InstallResult {
   collisionRefused?: boolean;
 }
 
+/** Every row's top-level defaults as USAGE names them, one row per entry:
+ *  `Codex CLI: mcp_optional_startup_grace_ms = 0`. DERIVED from the rows'
+ *  `config.rootDefaults`, for the synopsis's reason: a hand-kept name here
+ *  stops being true the day a row adds or drops one. Empty when no row
+ *  declares any. */
+function rootDefaultsForUsage(): string[] {
+  return INSTALL_TARGETS.filter((t) => (t.config.rootDefaults?.length ?? 0) > 0).map(
+    (t) => `${t.label}: ${(t.config.rootDefaults ?? []).map(spellRootDefault).join(", ")}`,
+  );
+}
+
+/** What USAGE says a re-run over an entry that already matches does. A row
+ *  with a top-level default turns that re-run into a write of the default
+ *  when the file lacks it (see the rootDefaults comment in runInstall), so
+ *  "a no-op" alone was false for it; with no such row it is the one line it
+ *  always was. */
+function rerunUsage(): string {
+  const defaults = rootDefaultsForUsage();
+  if (defaults.length === 0) {
+    return "  Re-running install over an entry that already matches is a no-op (exit 0, no prompt).\n";
+  }
+  return (
+    "  Re-running install over an entry that already matches is a no-op (exit 0, no\n" +
+    "  prompt) -- unless the file lacks a top-level setting its client needs:\n" +
+    defaults.map((d) => `    ${d}\n`).join("") +
+    "  The re-run then adds that setting (--dry-run previews it). It is add-only:\n" +
+    "  a value you set is left alone, and install says so.\n"
+  );
+}
+
+/** The exit-1 case the flags in USAGE do not answer, spelled out because it
+ *  holds under --dry-run and --skip, which USAGE otherwise calls exit 0. Every
+ *  refusal of the FILE returns before the preview prints, and before --skip
+ *  can leave an entry alone -- or where there is no entry for it to leave (a
+ *  blocked container): runInstall's unreadable, malformed, unloadable,
+ *  unspliceable and `refused.everyRelease` returns, and the blocked one. The
+ *  top-level-setting clause is there only while a row declares a default. */
+function refusalUsage(): string {
+  const setting =
+    rootDefaultsForUsage().length > 0
+      ? "  one that sets a top-level setting above to a value no release of its client\n" +
+        "  loads (an integer outside the range a TOML integer holds). The message\n" +
+        "  says what to change by hand.\n"
+      : "  one that its client cannot load. The message says what to change by hand.\n";
+  return (
+    "  A file install will not write into exits 1 with nothing written, under\n" +
+    "  --dry-run and --skip too: one that does not parse, for example, or\n" +
+    setting
+  );
+}
+
 const USAGE =
   // DERIVED, never a hand-kept list: `parseInstallArgs` validates against
   // `clientChoices("install")`, so a literal synopsis is a promise the parser
@@ -502,8 +595,10 @@ const USAGE =
   // available": Claude Desktop is available on Linux and `--all` skips it.
   "       yaw-mcp install --all   (install into every client yaw-mcp supports on this OS)\n" +
   "\n" +
-  "  Re-running install over an entry that already matches is a no-op (exit 0, no prompt).\n" +
-  "  Undo it with `yaw-mcp uninstall <client>`.\n" +
+  rerunUsage() +
+  // Uninstall takes entries out and never a top-level key (see
+  // keptRootDefaultLines), so "undo" has to say what it leaves.
+  `  Undo it with \`yaw-mcp uninstall <client>\`${rootDefaultsForUsage().length > 0 ? ", which leaves such a setting in place" : ""}.\n` +
   "\n" +
   // What to do about an entry that is ALREADY there is the decision install
   // asks the user to make, and the three flags that answer it were named in
@@ -523,11 +618,16 @@ const USAGE =
   "  --force     Overwrite whatever is there, env included: the new entry keeps\n" +
   "              none of the old entry's env, and install names each key it drops.\n" +
   "  --repair    Replace an entry that has DRIFTED from what install writes,\n" +
-  "              keeping the old entry's string-valued env; a no-op when it\n" +
-  "              already matches, so a fixup script can run it unconditionally.\n" +
-  "  --skip      Leave the existing entry untouched and exit 0.\n" +
-  "  --dry-run   Print the entry (and any permissions patch) that WOULD be\n" +
-  "              written, and exit 0 without touching a file.\n" +
+  "              keeping the old entry's string-valued env; over one that\n" +
+  "              already matches it does what a re-run does (above), so a\n" +
+  "              fixup script can run it unconditionally.\n" +
+  "  --skip      Leave the existing entry, and the rest of the file, untouched\n" +
+  "              and exit 0.\n" +
+  "  --dry-run   Print what WOULD be written -- the entry, a top-level setting\n" +
+  "              it adds, any permissions patch -- and exit 0 without touching\n" +
+  "              a file.\n" +
+  "\n" +
+  refusalUsage() +
   "\n" +
   "  Deprecated (accepted, ignored, warns): --token <mcp_pat_...>, --no-yaw-mcp-config.\n" +
   "  yaw-mcp is local-only -- it stores no token and never writes ~/.yaw-mcp/config.json.\n" +
@@ -543,11 +643,24 @@ const USAGE =
  *  directory, not a file"), so install, uninstall and `try` say the same
  *  sentence rather than being three more spellings of one fault.
  *
+ *  The mirror image is the other shape named here: a FILE where a directory
+ *  on the path has to be. On POSIX, reading `<CODEX_HOME>/config.toml` with
+ *  CODEX_HOME set to a regular file fails right here, with ENOTDIR -- before
+ *  the write that fails the same way on Windows (EEXIST from mkdir) -- so the
+ *  clause is the write side's own (describeFileInTheWay), and `env` names
+ *  the variable that put the path there when the caller knows it (see
+ *  locationEnvHint). `try` passes none, and gets the clause without it.
+ *
  *  Every other errno keeps its message, which is what a real permissions
  *  problem needs. Exported so `try` uses this one instead of a fourth copy. */
-export function describeUnreadableConfig(cmd: string, path: string, err: unknown): string {
-  if ((err as NodeJS.ErrnoException).code === "EISDIR") {
+export function describeUnreadableConfig(cmd: string, path: string, err: unknown, env?: WriteFailureEnvHint): string {
+  const code = (err as NodeJS.ErrnoException).code;
+  if (code === "EISDIR") {
     return `yaw-mcp ${cmd}: ${path} is a directory, not a file -- move or remove it, then re-run.`;
+  }
+  if (code === "ENOTDIR") {
+    const inTheWay = describeFileInTheWay(path, { env });
+    if (inTheWay !== null) return `yaw-mcp ${cmd}: cannot read ${path}: ${inTheWay}.`;
   }
   return `yaw-mcp ${cmd}: cannot read ${path}: ${(err as Error).message}`;
 }
@@ -875,6 +988,13 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   log(`Target: ${target.label} (${scope})`);
   log(`File:   ${resolved.absolute}`);
 
+  // The resolve inputs every settings-side question below shares, and the ones
+  // install's own plan resolved with. Up here, ahead of the read, because the
+  // unreadable refusal asks them too: which variable put the file where it is
+  // (locationEnvHint).
+  const rowArgs = rowResolveArgs(opts, os, projectDir);
+  const home = rowArgs.home;
+
   // Read + classify the existing client config THROUGH THE CORE. One reader
   // for every syntax, the strictness the site declared, and the entry-level
   // questions (is ours there, what is stored, is there a legacy key, which
@@ -909,7 +1029,14 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   const view = await readClientConfigFile(site, { transform: target.entry });
   const read = view.read;
   if (read.kind === "unreadable") {
-    err(describeUnreadableConfig("install", resolved.absolute, { code: read.code, message: read.message }));
+    err(
+      describeUnreadableConfig(
+        "install",
+        resolved.absolute,
+        { code: read.code, message: read.message },
+        locationEnvHint(target, scope, rowArgs, resolved.absolute),
+      ),
+    );
     return { written: [], wouldWrite: [], messages, exitCode: 1 };
   }
   if (read.kind === "malformed") {
@@ -953,6 +1080,25 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   if (unloadable !== null && !(read.kind === "blocked" && !read.reparable)) {
     err(
       `yaw-mcp install: ${resolved.absolute} ${unloadableConfigProblem(unloadable)} -- refusing to write into it; ${unloadableConfigFix("re-run")}.`,
+    );
+    return { written: [], wouldWrite: [], messages, exitCode: 1 };
+  }
+  // Our entry is there, in a spelling the file's adapter will not rewrite --
+  // for TOML an inline table, dotted keys, an array of tables, or an entry
+  // inside an inline `mcp_servers = { ... }`. The write facade refuses every
+  // edit to such a read, so this run could only ever end in that refusal;
+  // it is made HERE, in the shape of the refusals above, with the adapter's
+  // by-hand step (the one doctor's CLIENTS line gives for the same file). It
+  // used to fall through to the splice and end "failed to splice the "mcp"
+  // entry ... Refusing to overwrite." with no step at all, after a Runtime
+  // line for an entry it never wrote -- while the same file with no entry
+  // of ours in it got the conversion step from the splicer. The read carries
+  // no entries (see makeView), so `--skip` never saw an entry to leave and
+  // ended in the same refusal: exit 1, before and after this, on every path.
+  if (read.kind === "unspliceable") {
+    err(
+      `yaw-mcp install: the "${read.key}" entry in ${resolved.absolute} is ${read.reason}, which install will not edit -- ` +
+        `refusing to overwrite it; ${unspliceableFix(read)}, then re-run.`,
     );
     return { written: [], wouldWrite: [], messages, exitCode: 1 };
   }
@@ -1278,18 +1424,6 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     }
   }
 
-  // The resolve inputs every settings-side question below shares, and the ones
-  // install's own plan resolved with.
-  const home = opts.home ?? homedir();
-  const rowArgs: RowResolveArgs = {
-    os,
-    home,
-    appData: resolveAppDataDir({ appData: opts.appData, home: opts.home }),
-    projectDir,
-    claudeConfigDir: opts.claudeConfigDir,
-    clientEnv: opts.clientEnv,
-  };
-
   // An npx entry written over a LOCAL launch the client also loads, from a
   // file it ranks below this one (typed over Yaw Terminal's bundled copy in
   // ~/.claude.json). Buffered with the Runtime lines, and for their reason: it
@@ -1510,15 +1644,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   for (const { rootDefault, value, float, refused } of rootPlan.kept) {
     const spelled = float ?? spellRootValue(value, view.adapter.syntax);
     const recommended = JSON.stringify(rootDefault.value);
-    // spellRootValue's own scalar test, so every value it names by its shape
-    // gets the shape step.
-    const scalar =
-      typeof value === "string" ||
-      typeof value === "number" ||
-      typeof value === "bigint" ||
-      typeof value === "boolean" ||
-      value instanceof Date;
-    const step = scalar ? KEPT_ROOT_VALUE_STEP : keptRootShapeStep(view.adapter.syntax);
+    const step = keptRootStep(value, view.adapter.syntax);
     if (refused !== undefined) {
       const kind = refused.kind === undefined ? "" : `${refused.kind} `;
       err(
@@ -1935,7 +2061,12 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     try {
       await atomicWriteFile(resolved.absolute, clientJson);
     } catch (e) {
-      err(`yaw-mcp install: failed to write ${resolved.absolute}: ${(e as Error).message}`);
+      // Worded by describeWriteFailure, not node: the raw errno named the
+      // temp sibling atomicWriteFile renames from and said nothing to do --
+      // for a read-only config.toml, and for a CODEX_HOME that is a file.
+      err(
+        `yaw-mcp install: ${describeWriteFailure(resolved.absolute, e, { env: locationEnvHint(target, scope, rowArgs, resolved.absolute) })}.`,
+      );
       return { written, wouldWrite: [], messages, exitCode: 1 };
     }
     log(`Wrote ${resolved.absolute}`);
@@ -2881,7 +3012,7 @@ async function runInstallList(
   // and `install <client> --project-dir <rel>` name the same directory.
   const cwd = resolve(opts.cwd ?? process.cwd(), opts.projectDir ?? ".");
   const os = opts.os ?? CURRENT_OS;
-  const probes = await probeClientsAsync({
+  const where: ListRootWhere = {
     home,
     os,
     cwd,
@@ -2891,13 +3022,18 @@ async function runInstallList(
     // show "not installed" beside an entry sitting at the redirected path.
     clientEnv: opts.clientEnv,
     appData: resolveAppData(opts),
-  });
+  };
+  const probes = await probeClientsAsync(where);
+  // What install would do about each row's top-level defaults -- see
+  // listRootPlan. Read one row at a time, in row order, like the probe.
+  const rootPlans: Array<RootDefaultPlan | null> = [];
+  for (const p of probes) rootPlans.push(await listRootPlan(p, where));
 
-  const rows = probes.map((p) => ({
+  const rows = probes.map((p, i) => ({
     client: INSTALL_TARGETS.find((t) => t.clientId === p.clientId)?.label ?? p.clientId,
     scope: p.scope,
     path: displayPath(p.path, home, os),
-    status: statusFor(p),
+    status: statusFor(p, rootPlans[i]),
   }));
 
   // An entry the client cannot load (strict JSON with a comment) is not
@@ -2943,12 +3079,139 @@ async function runInstallList(
     );
     log("");
   }
+  // The `(setting missing)` / `(setting refused)` markers, spelled out: the
+  // cell only has room to say THAT, and the user needs the key, the value and
+  // the step, which fit only here -- the drive-case note's reason, above.
+  for (const [i, p] of probes.entries()) {
+    const plan = rootPlans[i];
+    if (plan === null) continue;
+    for (const line of listRootNotes(p, plan, { home, os, cwd, projectDirGiven: opts.projectDir !== undefined })) {
+      log(line);
+    }
+    log("");
+  }
   log("Install into a specific client: `yaw-mcp install <client> [--scope user|project|local]`");
   log("Install into every supported client (user scope where supported): `yaw-mcp install --all`");
   return { written: [], wouldWrite: [], messages, exitCode: 0 };
 }
 
-function statusFor(p: ClientProbeResult): string {
+/** The resolve inputs `--list` probes every row with, and resolves a row's
+ *  site with again for listRootPlan: the same ones, so the plan is made for
+ *  the file the row reports. */
+interface ListRootWhere {
+  home: string;
+  os: InstallOS;
+  cwd: string;
+  claudeConfigDir: string | undefined;
+  clientEnv: ClientEnvValues | undefined;
+  appData: string | undefined;
+}
+
+/** What install would do about one `--list` row's top-level defaults
+ *  (`config.rootDefaults`: Codex CLI's `mcp_optional_startup_grace_ms = 0`),
+ *  planned by `planRootDefaults` over the row's own file exactly as install
+ *  plans it -- or null when the row has nothing to say about them.
+ *
+ *  Null for a row whose client declares none (every JSON-family row), a row
+ *  with no entry of ours (install adds a missing default with the entry, so
+ *  there is no separate step to name), a file its client cannot load (its
+ *  row already says `not loading`), a read that is not `ok` (planRootDefaults
+ *  gives it an empty plan -- the entry spelled in a shape install refuses,
+ *  for one), and a plan whose only kept values are ones the client takes (a
+ *  `1000` is the user's choice: install notes it and leaves it, and --list
+ *  does not flag it). What is left is a default MISSING beside a working
+ *  entry -- a Codex setup from before install added the key, which a re-run
+ *  now changes -- or a value the client REFUSES.
+ *
+ *  A second read of the row's file, after the probe's: the probe answers
+ *  doctor's questions and carries no plan. The site is resolved with the
+ *  probe's own arguments (enumerateProbeSlots in doctor-cmd.ts), and a plan
+ *  whose site names another file than the row is dropped rather than
+ *  printed beside it. */
+async function listRootPlan(p: ClientProbeResult, where: ListRootWhere): Promise<RootDefaultPlan | null> {
+  if (p.unavailable || !p.hasMcpEntry || p.unloadable !== null) return null;
+  const target = INSTALL_TARGETS.find((t) => t.clientId === p.clientId);
+  const defaults = target?.config.rootDefaults;
+  if (target === undefined || defaults === undefined || defaults.length === 0) return null;
+  const spec = target.scopes.find((s) => s.scope === p.scope);
+  if (spec === undefined) return null;
+  let site: ConfigSite;
+  try {
+    site = resolveInstallSites({
+      clientId: target.clientId,
+      scope: p.scope,
+      os: where.os,
+      home: where.home,
+      appData: where.appData,
+      projectDir: spec.requiresProjectDir ? where.cwd : undefined,
+      claudeConfigDir: where.claudeConfigDir,
+      clientEnv: where.clientEnv,
+    })[0];
+  } catch {
+    // Unreachable for a slot the probe resolved with these same arguments.
+    return null;
+  }
+  if (site.resolved.absolute !== p.path) return null;
+  const plan = planRootDefaults(await readClientConfigFile(site, { transform: target.entry }), defaults);
+  return plan.set.length > 0 || plan.kept.some((k) => k.refused !== undefined) ? plan : null;
+}
+
+/** The notes under the `--list` table for one row's `(setting missing)` or
+ *  `(setting refused)` marker: one per default, in install's own words for
+ *  the same value -- the refusal's for a value NO release of the client loads
+ *  the file with (install exits 1 on that file), the warning's for one a
+ *  release that reads the key will not load, and the `Added` line's reason
+ *  for a missing one, with the run that adds it. The key, the value and the
+ *  client's name come from the plan and the row, never from a client-id
+ *  branch here. */
+function listRootNotes(
+  p: ClientProbeResult,
+  plan: RootDefaultPlan,
+  at: { home: string; os: InstallOS; cwd: string; projectDirGiven: boolean },
+): string[] {
+  const target = INSTALL_TARGETS.find((t) => t.clientId === p.clientId);
+  const label = target?.label ?? p.clientId;
+  const file = displayPath(p.path, at.home, at.os);
+  const lines: string[] = [];
+  for (const { rootDefault, value, float, refused } of plan.kept) {
+    if (refused === undefined) continue;
+    const spelled = float ?? spellRootValue(value, p.syntax);
+    const recommended = JSON.stringify(rootDefault.value);
+    if (refused.everyRelease !== undefined) {
+      lines.push(
+        `Note: ${file} sets ${rootDefault.key} to ${spelled}, ${refused.everyRelease}, so ${label} will not load ` +
+          `the file -- change that value by hand to ${refused.needs} (${recommended} is recommended).`,
+      );
+      continue;
+    }
+    const kind = refused.kind === undefined ? "" : `${refused.kind} `;
+    lines.push(
+      `Note: ${file} sets ${rootDefault.key} to ${spelled}, ${kind}where ${label} needs ${refused.needs} -- a ` +
+        `${label} release that reads the key will not load the file with that value; ${recommended} is ` +
+        `recommended. ${keptRootStep(value, p.syntax)}`,
+    );
+  }
+  if (plan.set.length > 0) {
+    // The run that writes this row's file: the default scope needs no flag,
+    // and a project directory is named only when --list was given one -- the
+    // same cwd install would otherwise resolve it against.
+    const scopeSpec = target?.scopes.find((s) => s.scope === p.scope);
+    const projectFlag =
+      at.projectDirGiven && scopeSpec?.requiresProjectDir === true
+        ? ` --project-dir ${quoteArgForDisplay(at.cwd) ?? at.cwd}`
+        : "";
+    const run = `yaw-mcp install ${p.clientId}${p.scope === "user" ? "" : ` --scope ${p.scope}`}${projectFlag}`;
+    for (const rootDefault of plan.set) {
+      lines.push(
+        `Note: ${file} has the ${label} (${p.scope}) entry but does not set ${spellRootDefault(rootDefault)}: ` +
+          `${rootDefault.why}. \`${run}\` adds it.`,
+      );
+    }
+  }
+  return lines;
+}
+
+function statusFor(p: ClientProbeResult, rootPlan: RootDefaultPlan | null = null): string {
   // A client that ships on this OS but has no documented path for the config
   // file yaw-mcp writes is not "unavailable" -- the user may be running it.
   // `doctor` prints the reason.
@@ -2972,7 +3235,22 @@ function statusFor(p: ClientProbeResult): string {
   // key holds it. The key itself is named in a note under the table, which is
   // the only place a full path fits.
   const keySuffix = p.entryProjectKey ? " (other drive case)" : "";
-  if (p.hasMcpEntry) return `installed${keySuffix}`;
+  // The entry is there, but a top-level default its client needs is not what
+  // install would leave (listRootPlan): missing, which a re-run adds, or set
+  // to a value the client will not load. A bare "installed" said nothing to
+  // a user on a Codex config from before install added the key -- exactly
+  // the setup whose tools Codex 0.151+ leaves out. The cell stays short; a
+  // note under the table names the key, the value and the step. A refused
+  // value outranks a missing one: it is the one that stops the file loading.
+  const rootSuffix =
+    rootPlan === null
+      ? ""
+      : rootPlan.kept.some((k) => k.refused !== undefined)
+        ? " (setting refused)"
+        : rootPlan.set.length > 0
+          ? " (setting missing)"
+          : "";
+  if (p.hasMcpEntry) return `installed${keySuffix}${rootSuffix}`;
   // A file whose only yaw-mcp wiring is a PRE-RENAME entry is an upgrade
   // pending, not somebody else's config: `install <client>` has something
   // specific to do there (write `mcp` and remove the old key in the same
@@ -3269,6 +3547,14 @@ export const INSTALL_USAGE = USAGE;
 //   - Malformed JSON                -> refuse, point at the file. Same as
 //                                      install: never rewrite bytes we could
 //                                      not parse.
+//   - Our entry in a spelling the
+//     file's adapter will not edit
+//     (a TOML inline table)         -> refuse (exit 1, nothing written) with
+//                                      the adapter's by-hand step. NOT
+//                                      "nothing to do": the entry is there
+//                                      and its client still launches it.
+//   - A write that fails on disk    -> exit 1, worded by describeWriteFailure,
+//                                      as install's is.
 // ---------------------------------------------------------------------------
 
 /** The labels of every row that patches Claude Code's permissions file
@@ -3540,6 +3826,68 @@ interface RowResolveArgs {
   clientEnv: ClientEnvValues | undefined;
 }
 
+/** A run's RowResolveArgs: the inputs its own (client, scope) plan resolved
+ *  with -- %APPDATA% through resolveAppDataDir, as resolveInstallSite does.
+ *  One builder for install and uninstall, so the helpers below are asked
+ *  about the file the run actually resolved. */
+function rowResolveArgs(
+  opts: { home?: string; appData?: string; claudeConfigDir?: string; clientEnv?: ClientEnvValues },
+  os: InstallOS,
+  projectDir: string | undefined,
+): RowResolveArgs {
+  return {
+    os,
+    home: opts.home ?? homedir(),
+    appData: resolveAppDataDir({ appData: opts.appData, home: opts.home }),
+    projectDir,
+    claudeConfigDir: opts.claudeConfigDir,
+    clientEnv: opts.clientEnv,
+  };
+}
+
+/** The environment variable that put `file` where it is for this (client,
+ *  scope), for describeWriteFailure to name when the fix is to point it
+ *  elsewhere -- CODEX_HOME set to a regular file came back from mkdir as a
+ *  bare EEXIST that never mentioned the variable.
+ *
+ *  Asked of the RESOLVER, never of a client id, the way configDirScopedGrantNote
+ *  asks it: the first variable in CLIENT_ENV_VARS that is set here and without
+ *  which the row resolves a different file. `readClientEnv` is the one map from
+ *  a variable's name to its key in ClientEnvValues, so asking it with that one
+ *  variable set names the key, and no second copy of the map is kept here.
+ *  CLAUDE_CONFIG_DIR also arrives as `claudeConfigDir` of its own, which the
+ *  resolver prefers, so it is unset in both places. A variable that moves no
+ *  config file (YAW_MODE, TYPED_CLI_BUNDLE) resolves the same file and is never
+ *  named. Undefined when none moved it. */
+function locationEnvHint(
+  target: InstallTarget,
+  scope: InstallScope,
+  where: RowResolveArgs,
+  file: string,
+): WriteFailureEnvHint | undefined {
+  const env = where.clientEnv ?? {};
+  for (const name of CLIENT_ENV_VARS) {
+    const key = Object.keys(readClientEnv({ [name]: "set" }))[0] as keyof ClientEnvValues | undefined;
+    if (key === undefined) continue;
+    const value = key === "claudeConfigDir" ? (where.claudeConfigDir ?? env.claudeConfigDir) : env[key];
+    if (value === undefined || value.length === 0) continue;
+    let unmoved: string;
+    try {
+      unmoved = resolveInstallPath({
+        clientId: target.clientId,
+        scope,
+        ...where,
+        claudeConfigDir: key === "claudeConfigDir" ? undefined : where.claudeConfigDir,
+        clientEnv: { ...env, [key]: undefined },
+      }).absolute;
+    } catch {
+      continue;
+    }
+    if (samePathKey(unmoved) !== samePathKey(file)) return { name, value };
+  }
+  return undefined;
+}
+
 /** The first file among a row's `hooks.alsoReads` whose "mcp" entry its client
  *  loads and which does NOT launch through npx -- a LOCAL launch, Yaw
  *  Terminal's bundled copy in ~/.claude.json being the common one. install
@@ -3773,7 +4121,14 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
   const view = await readClientConfigFile(site, { transform: target.entry });
   const read = view.read;
   if (read.kind === "unreadable") {
-    err(describeUnreadableConfig("uninstall", resolved.absolute, { code: read.code, message: read.message }));
+    err(
+      describeUnreadableConfig(
+        "uninstall",
+        resolved.absolute,
+        { code: read.code, message: read.message },
+        locationEnvHint(target, scope, rowResolveArgs(opts, os, projectDir), resolved.absolute),
+      ),
+    );
     return { written: [], wouldWrite: [], messages, exitCode: 1 };
   }
   if (read.kind === "malformed") {
@@ -3781,6 +4136,25 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
       read.reason === "root"
         ? `yaw-mcp uninstall: ${resolved.absolute} is not a ${read.syntax} object -- refusing to edit. Remove the "${ENTRY_NAME}" entry by hand.`
         : `yaw-mcp uninstall: ${resolved.absolute} is not valid ${read.syntax} (${read.detail}). Refusing to edit. Fix the file and re-run.`,
+    );
+    return { written: [], wouldWrite: [], messages, exitCode: 1 };
+  }
+  // Our entry is there, in a spelling the file's adapter will not edit (for
+  // TOML: an inline table, dotted keys, an array of tables, or an entry
+  // inside an inline `mcp_servers = { ... }`). Such a read carries no
+  // entries, so the walk below found nothing and this run printed "Nothing to
+  // do: ... has no yaw-mcp entry" at exit 0 -- over an entry doctor and
+  // --list both report, and that Codex goes on launching (an array of tables
+  // is the exception: Codex will not load a file that writes the entry that
+  // way, so it launches nothing from it). The write
+  // facade refuses every edit to it, so the run cannot remove it either: it
+  // says so, with the adapter's by-hand step (the one doctor prints for the
+  // same file), exit 1 and nothing written, like the malformed refusal above
+  // -- under --dry-run too.
+  if (read.kind === "unspliceable") {
+    err(
+      `yaw-mcp uninstall: the "${read.key}" entry in ${resolved.absolute} is ${read.reason}, which uninstall will not edit -- ` +
+        `nothing was removed; ${unspliceableFix(read)}, then re-run.`,
     );
     return { written: [], wouldWrite: [], messages, exitCode: 1 };
   }
@@ -3879,14 +4253,7 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
   // Keeping line says why a file in the overlay keeps the HOME grant, since the
   // client launched from that overlay reads the overlay's settings.json, not
   // this one.
-  const rowArgs: RowResolveArgs = {
-    os,
-    home,
-    appData: resolveAppDataDir({ appData: opts.appData, home: opts.home }),
-    projectDir,
-    claudeConfigDir: opts.claudeConfigDir,
-    clientEnv: opts.clientEnv,
-  };
+  const rowArgs = rowResolveArgs(opts, os, projectDir);
   // The patch under CLAUDE_CONFIG_DIR as it stands: the only one outside a Yaw
   // Mode augment pane, and the overlay's inside one.
   const primaryPatch = grant.patches.find((p) => !p.yawHome) ?? null;
@@ -4164,7 +4531,11 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
     try {
       await atomicWriteFile(resolved.absolute, clientJson);
     } catch (e) {
-      err(`yaw-mcp uninstall: failed to write ${resolved.absolute}: ${(e as Error).message}`);
+      // install's wording for the same failure (see its write): the real
+      // file, never the temp sibling, and the step past it.
+      err(
+        `yaw-mcp uninstall: ${describeWriteFailure(resolved.absolute, e, { env: locationEnvHint(target, scope, rowArgs, resolved.absolute) })}.`,
+      );
       return { written, wouldWrite: [], messages, exitCode: 1 };
     }
     log(`Wrote ${resolved.absolute}`);

@@ -3072,8 +3072,12 @@ describe("runInstall --list (read-only)", () => {
   // adapter. Before that, every one of these rows -- including the file
   // `install codex-cli` itself writes -- listed as `malformed`, because the
   // probe parsed config.toml as JSON. The fixtures are the TOML codec's own.
+  // f05-identical is our entry WITHOUT the startup-grace key a current
+  // install adds, so its row carries the marker for the missing setting; the
+  // same entry under the key is the plain `installed` (target-codex-cli.test.ts
+  // has the notes).
   it.each([
-    ["f05-identical", "installed"],
+    ["f05-identical", "installed (setting missing)"],
     ["g12-no-container", "no-entries"],
     ["f03-siblings", "other-entries"],
     ["f10-malformed", "malformed"],
@@ -3460,12 +3464,56 @@ describe("install usage", () => {
   it("says --force drops the old entry's env and --repair keeps its string values", () => {
     // The usage used to say only "--force  Overwrite whatever is there." while
     // the code carried the old env across on --force exactly as on --repair.
+    // --repair over an entry that already matches is not called "a no-op" any
+    // more: for Codex CLI it adds the missing startup-grace key, as a plain
+    // re-run does, and the line points at the paragraph that says so.
     expect(INSTALL_USAGE).toContain(
       "  --force     Overwrite whatever is there, env included: the new entry keeps\n" +
         "              none of the old entry's env, and install names each key it drops.\n" +
         "  --repair    Replace an entry that has DRIFTED from what install writes,\n" +
-        "              keeping the old entry's string-valued env; a no-op when it\n" +
-        "              already matches, so a fixup script can run it unconditionally.\n",
+        "              keeping the old entry's string-valued env; over one that\n" +
+        "              already matches it does what a re-run does (above), so a\n" +
+        "              fixup script can run it unconditionally.\n",
+    );
+  });
+
+  it("says a re-run adds a missing top-level setting, names each row's, and that --dry-run previews it", () => {
+    // `install --help` said a re-run over a matching entry is "a no-op (exit
+    // 0, no prompt)", and that --dry-run prints "the entry (and any
+    // permissions patch)". For codex-cli a re-run over a correct entry with no
+    // startup-grace key writes that key and ends on a Done line, and the dry
+    // run previews the key line. The setting is named from the rows'
+    // `config.rootDefaults`, never a hand-kept list.
+    const settings = INSTALL_TARGETS.filter((t) => (t.config.rootDefaults?.length ?? 0) > 0).map(
+      (t) =>
+        `    ${t.label}: ${(t.config.rootDefaults ?? []).map((d) => `${d.key} = ${JSON.stringify(d.value)}`).join(", ")}\n`,
+    );
+    expect(settings).toEqual(["    Codex CLI: mcp_optional_startup_grace_ms = 0\n"]);
+    expect(INSTALL_USAGE).toContain(
+      "  Re-running install over an entry that already matches is a no-op (exit 0, no\n" +
+        "  prompt) -- unless the file lacks a top-level setting its client needs:\n" +
+        settings.join("") +
+        "  The re-run then adds that setting (--dry-run previews it). It is add-only:\n" +
+        "  a value you set is left alone, and install says so.\n" +
+        "  Undo it with `yaw-mcp uninstall <client>`, which leaves such a setting in place.\n",
+    );
+    expect(INSTALL_USAGE).not.toContain("already matches is a no-op (exit 0, no prompt).");
+    expect(INSTALL_USAGE).toContain(
+      "  --dry-run   Print what WOULD be written -- the entry, a top-level setting\n" +
+        "              it adds, any permissions patch -- and exit 0 without touching\n" +
+        "              a file.\n",
+    );
+  });
+
+  it("says a file install will not write into exits 1, under --dry-run and --skip too", () => {
+    // --skip and --dry-run are described as exit 0, and an out-of-range grace
+    // value (like a malformed file) is refused at exit 1 under both.
+    expect(INSTALL_USAGE).toContain(
+      "  A file install will not write into exits 1 with nothing written, under\n" +
+        "  --dry-run and --skip too: one that does not parse, for example, or\n" +
+        "  one that sets a top-level setting above to a value no release of its client\n" +
+        "  loads (an integer outside the range a TOML integer holds). The message\n" +
+        "  says what to change by hand.\n",
     );
   });
 });

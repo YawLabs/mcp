@@ -74,6 +74,7 @@ import {
 import { log } from "./logger.js";
 import { type OamProbe, probeOam, resolveStableNpmEntry } from "./oam-spawn.js";
 import { isFeatureDisabled } from "./opt-out-env.js";
+import { describeWriteFailure } from "./write-failure.js";
 
 /** One entry this pass re-pointed. */
 export interface HealedEntry {
@@ -101,10 +102,39 @@ export interface UnhealableConfig {
   reason: string;
 }
 
+/** A stale entry this pass set out to re-point and could not: every gate
+ *  passed, so the entry IS ours and IS broken, and then the rewrite did not
+ *  land. Its client still names a launch file that is gone.
+ *
+ *  Reported on its own, never folded into either list above. It is not
+ *  `healed` (nothing changed on disk), and it is not `unhealable` either: the
+ *  sweep read the file fine and knows exactly which entry is dead. Before this
+ *  existed the failure went to a log line and nowhere else, so `yaw-mcp heal`
+ *  over a read-only config.toml said "No stale yaw-mcp entries found." and
+ *  exited 0 -- straight after its own dry run had said "Would re-point 1
+ *  stale entry". */
+export interface FailedHeal {
+  clientId: string;
+  scope: string;
+  /** The config file that still holds the dead entry. */
+  path: string;
+  /** The dead entry-file path the entry still names. */
+  from: string;
+  /** What the rewrite would have launched -- same meaning as HealedEntry.to. */
+  to: string;
+  /** Why it did not land, as one clause with no final period, naming `path`:
+   *  describeWriteFailure's words for a write the disk refused (the file, why,
+   *  and the step past it), or the edit's own refusal for a write that was
+   *  never attempted (a file its client cannot load, a splice that would not
+   *  verify). */
+  error: string;
+}
+
 /** What one sweep concluded. */
 export interface HealResult {
   healed: HealedEntry[];
   unhealable: UnhealableConfig[];
+  failed: FailedHeal[];
 }
 
 export interface HealOptions {
@@ -136,6 +166,12 @@ export interface HealOptions {
    *  happens to have oam installed. */
   oamProbe?: () => OamProbe | Promise<OamProbe>;
   resolveOamEntry?: (pkg: string) => string | null;
+  /** Test seam for the one write the sweep makes: atomicWriteFile unless a
+   *  test says otherwise. A real read-only file only fails that write on
+   *  Windows -- POSIX rename(2) asks the DIRECTORY for write access, never the
+   *  file it replaces -- so a test that has to fail the write on every runner
+   *  throws from here instead. */
+  writeConfig?: (path: string, text: string) => Promise<void>;
 }
 
 /**
@@ -207,16 +243,24 @@ function isLaunchableFile(entryPath: string): boolean {
  * Never rejects for a per-file problem: a machine with one unreadable config
  * must still heal the others, and every caller is a fire-and-forget startup
  * path.
+ *
+ * A stale entry it set out to rewrite and could not is returned under
+ * `failed` and NOT logged here. Each caller reports it on its own surface --
+ * `yaw-mcp heal` (heal-cmd.ts) prints it on stderr and exits 1, and the serve
+ * wrapper below logs it -- so a person at a terminal sees it once, in the
+ * command's own words, rather than once more as a raw log line.
  */
 export async function healStaleBrokerEntries(opts: HealOptions = {}): Promise<HealResult> {
   const env = opts.env ?? process.env;
   // Gate 3, checked once and up front.
-  if (isReadOnlyDiagnostics(env)) return { healed: [], unhealable: [] };
+  if (isReadOnlyDiagnostics(env)) return { healed: [], unhealable: [], failed: [] };
 
   const os = opts.os ?? CURRENT_OS;
   const platform = opts.platform ?? process.platform;
   const healed: HealedEntry[] = [];
   const unhealable: UnhealableConfig[] = [];
+  const failed: FailedHeal[] = [];
+  const writeConfig = opts.writeConfig ?? atomicWriteFile;
 
   // Resolved ONCE for the whole sweep, and LAZILY: probing oam spawns a
   // process, and this pass runs on every broker start. The steady state is
@@ -338,28 +382,65 @@ export async function healStaleBrokerEntries(opts: HealOptions = {}): Promise<He
       const nextEntry = nextLaunch === null ? null : oamRunEntryPath(nextLaunch.command, nextLaunch.args);
       if (nextEntry !== null && norm(nextEntry, platform) === norm(entryPath, platform)) return;
 
-      if (opts.dryRun !== true) {
-        // Terminated the way install, try and import terminate what they
-        // write. A splice leaves the bytes outside its own span alone, so
-        // without this a file that did not end in a line break would still
-        // not end in one after a heal. terminateWithNewline adds exactly one,
-        // in the file's own line ending, and leaves a file that already ends
-        // in one as it is. Nothing compares this text by identity afterwards
-        // -- gate 2 and the check above have already decided the entry
-        // changes -- so it cannot turn a no-op into a phantom write.
-        const text = applyClientConfigEdits(view, [{ op: "upsert", key: ENTRY_NAME, entry: next }], site);
-        await atomicWriteFile(site.resolved.absolute, terminateWithNewline(text));
-      }
-
-      healed.push({
+      // From here the entry is known to be ours and broken, and this pass has
+      // decided to rewrite it. A failure past this point is not a file to skip
+      // quietly: the client still names a launch file that is gone, so it is
+      // reported under `failed`, never left to the catch below.
+      const outcome = {
         clientId: target.clientId,
         scope,
         path: site.resolved.absolute,
         from: entryPath,
         to: nextEntry ?? "npx",
-      });
+      };
+
+      // Rendered BEFORE the dry-run branch, the way install renders its
+      // editor copies: applyClientConfigEdits is where a refusal lives (a file
+      // its client cannot load, a splice that will not verify), and it only
+      // returns TEXT, so a dry run can ask it too. A preview that skipped it
+      // promised a repair the live run then refused.
+      let text: string;
+      try {
+        text = applyClientConfigEdits(view, [{ op: "upsert", key: ENTRY_NAME, entry: next }], site);
+      } catch (err) {
+        // install's wording for the same refusal, without its "Refusing to
+        // overwrite." -- the caller says what did not happen. The refusal's
+        // own message names the file and, where it has one, the by-hand fix.
+        failed.push({
+          ...outcome,
+          error: `failed to splice the "${ENTRY_NAME}" entry into ${site.resolved.absolute} (${err instanceof Error ? err.message : String(err)})`,
+        });
+        return;
+      }
+
+      if (opts.dryRun !== true) {
+        try {
+          // Terminated the way install, try and import terminate what they
+          // write. A splice leaves the bytes outside its own span alone, so
+          // without this a file that did not end in a line break would still
+          // not end in one after a heal. terminateWithNewline adds exactly
+          // one, in the file's own line ending, and leaves a file that already
+          // ends in one as it is. Nothing compares this text by identity
+          // afterwards -- gate 2 and the check above have already decided the
+          // entry changes -- so it cannot turn a no-op into a phantom write.
+          await writeConfig(site.resolved.absolute, terminateWithNewline(text));
+        } catch (err) {
+          // Worded by describeWriteFailure, as install and uninstall word the
+          // same failure: node's errno named the temp sibling atomicWriteFile
+          // renames from and said nothing to do. No env hint is passed, and
+          // none is needed: that hint names the variable behind a directory
+          // mkdir could not make, and this file was just read, so its
+          // directory is already there.
+          failed.push({ ...outcome, error: describeWriteFailure(site.resolved.absolute, err) });
+          return;
+        }
+      }
+
+      healed.push(outcome);
     } catch (err) {
-      // One bad config must not stop the sweep.
+      // Anything else that throws for this site -- none is expected: the read
+      // classifies its own IO errors, and the rewrite reports its own
+      // failures under `failed` above. One bad config must not stop the sweep.
       log("warn", "Could not heal a stale yaw-mcp entry", {
         path: site.resolved.absolute,
         error: err instanceof Error ? err.message : String(err),
@@ -412,12 +493,17 @@ export async function healStaleBrokerEntries(opts: HealOptions = {}): Promise<He
       clients: healed.map((h) => `${h.clientId} (${h.scope})`),
     });
   }
-  return { healed, unhealable };
+  return { healed, unhealable, failed };
 }
 
 /**
  * The startup wrapper: the same sweep, opt-out-able and incapable of
  * rejecting. `serve` calls this and does not await it.
+ *
+ * It is also where the serve path reports a rewrite that did not land. The
+ * sweep returns those rather than logging them (see healStaleBrokerEntries),
+ * and serve has no other surface: one warn line per entry, carrying the same
+ * clause `yaw-mcp heal` prints, and the server carries on.
  */
 export async function maybeHealStaleBrokerEntries(opts: HealOptions = {}): Promise<HealResult> {
   const env = opts.env ?? process.env;
@@ -427,13 +513,23 @@ export async function maybeHealStaleBrokerEntries(opts: HealOptions = {}): Promi
   // did nothing here, and neither did the "0 " that cmd.exe's
   // `set YAW_MCP_AUTO_HEAL=0 && ...` delivers: a Windows user who opted out
   // the documented way was still healed.
-  if (isFeatureDisabled("YAW_MCP_AUTO_HEAL", env)) return { healed: [], unhealable: [] };
+  if (isFeatureDisabled("YAW_MCP_AUTO_HEAL", env)) return { healed: [], unhealable: [], failed: [] };
+  let result: HealResult;
   try {
-    return await healStaleBrokerEntries(opts);
+    result = await healStaleBrokerEntries(opts);
   } catch (err) {
     log("warn", "Stale-entry heal pass failed", {
       error: err instanceof Error ? err.message : String(err),
     });
-    return { healed: [], unhealable: [] };
+    return { healed: [], unhealable: [], failed: [] };
   }
+  // `log` swallows its own write errors, so reporting cannot reject either.
+  for (const f of result.failed) {
+    log("warn", "Could not heal a stale yaw-mcp entry", {
+      client: `${f.clientId} (${f.scope})`,
+      path: f.path,
+      error: f.error,
+    });
+  }
+  return result;
 }

