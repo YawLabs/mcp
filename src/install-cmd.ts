@@ -77,6 +77,7 @@ import {
   applyClientConfigEdits,
   type ClientConfigEdit,
   type ClientConfigView,
+  type ConfigRootDefault,
   type ConfigSite,
   classifyClientConfig,
   composeEntry,
@@ -84,9 +85,12 @@ import {
   containerNounFor,
   describeValueShape,
   type EntryTransform,
+  planRootDefaults,
+  previewRootDefaults,
   readClientConfigFile,
   reloadDoneClause,
   reloadRemovalClause,
+  type SyntaxName,
   selectSites,
   siteAt,
   terminateWithNewline,
@@ -343,6 +347,23 @@ function describeContainer(file: string, containerPath: string[]): string {
     .map((k) => `.${k}`)
     .join("");
   return `${file} under ${containerPath[0]}[${JSON.stringify(containerPath[1])}]${tail}`;
+}
+
+/** A row's top-level default as the messages spell it: `key = value`. The
+ *  value is JSON-spelled, which for the scalars a default can hold (a number,
+ *  a boolean, a plain string) is what TOML writes too. */
+function spellRootDefault(rootDefault: ConfigRootDefault): string {
+  return `${rootDefault.key} = ${JSON.stringify(rootDefault.value)}`;
+}
+
+/** A value the USER's file holds for a top-level key, for the one note that
+ *  says install left it alone. A scalar is spelled; anything else is named by
+ *  its shape, never echoed (it is the user's, and it can be any size). */
+function spellRootValue(value: unknown, syntax: SyntaxName): string {
+  if (typeof value === "string") return JSON.stringify(value);
+  if (typeof value === "number" || typeof value === "bigint" || typeof value === "boolean") return String(value);
+  if (value instanceof Date) return value.toISOString();
+  return Array.isArray(value) ? describeValueShape(value) : containerNounFor(syntax);
 }
 
 /** The tail both the live path and the --dry-run preview end with. One
@@ -973,7 +994,10 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   // flag's contract ahead of the idempotence check: `--skip` says "leave what
   // is there", which is the answer whether the stored entry matches or not, so
   // it must not fall into the legacy trim (a write) that the identical path
-  // otherwise performs.
+  // otherwise performs -- nor into a row's missing top-level default (Codex's
+  // startup grace): `--skip` over an existing entry leaves the whole file as
+  // it is, the key included. With no entry there is nothing to skip, so this
+  // does not return, and the key is added with the entry as on any install.
   if (existingHasEntry && opts.skip) {
     log(
       opts.dryRun
@@ -1368,6 +1392,42 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     for (const line of runtimeLines) log(line);
   }
 
+  // The row's TOP-LEVEL defaults, as data (`config.rootDefaults`): Codex's
+  // `mcp_optional_startup_grace_ms = 0`, without which Codex 0.151 and later
+  // give an npx-launched yaw-mcp one second to start and leave it out of the
+  // whole session (0.147 to 0.150 wait a fixed second the key cannot change).
+  // Primary site only -- it is the one file a row with such a default has --
+  // and read off the SAME view as the entry, so `--scope project` and
+  // CODEX_HOME reach exactly the file the entry is written to. `--skip` over
+  // an existing entry returned above, before this plan: it leaves the whole
+  // file as it is, a missing key included. With no entry --skip has nothing
+  // to leave, and the key is planned as on any install.
+  //
+  // ADD-ONLY. A missing key is added in the same write as everything else,
+  // and makes an otherwise-identical re-run a write of that line alone (plus
+  // a blank line under it when the file starts with a table, and a line
+  // break on a last line that had none). A key already there at the same
+  // value needs nothing and says nothing. A key there at ANY other value is
+  // the user's: its line is left exactly as it is (the entry is still written
+  // when it needs to be) and one note says what install would have set and
+  // why -- `--force` and `--repair` are about the ENTRY and do not change
+  // that. A float where the default is an integer (`0.0`) is another value,
+  // not the same one: the note prints it as the file spells it and names it
+  // a float.
+  const rootPlan = planRootDefaults(view, target.config.rootDefaults);
+  const rootSets = rootPlan.set;
+  for (const { rootDefault, value, float } of rootPlan.kept) {
+    const found =
+      float !== undefined
+        ? `${float}, a float where ${target.label} needs an integer`
+        : spellRootValue(value, view.adapter.syntax);
+    log(
+      `Note: ${resolved.absolute} already sets ${rootDefault.key} to ${found}, ` +
+        `and install leaves a value you set alone. ${JSON.stringify(rootDefault.value)} is recommended: ` +
+        `${rootDefault.why}.`,
+    );
+  }
+
   // ONE write, through the core, whatever the file's syntax and whatever the
   // run has to do to it: repair a blocked container key, upsert the entry,
   // trim a legacy key -- as a LIST of edits applied in that order against the
@@ -1378,11 +1438,12 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   // all.
   //
   // NULL means "this run has no client-config write to make": the stored entry
-  // already matches and there is no legacy entry to trim. Everything from the
-  // fingerprint re-check to the `Wrote ...` line is then skipped, which is what
-  // makes a re-run genuinely a no-op on disk rather than a rewrite that happens
-  // to produce the same bytes (a rewrite still moves mtime, still races a live
-  // Claude Code session, and still shows up in a backup diff).
+  // already matches, there is no legacy entry to trim, and no top-level
+  // default to add. Everything from the fingerprint re-check to the `Wrote
+  // ...` line is then skipped, which is what makes a re-run genuinely a no-op
+  // on disk rather than a rewrite that happens to produce the same bytes (a
+  // rewrite still moves mtime, still races a live Claude Code session, and
+  // still shows up in a backup diff).
   let clientJson: string | null = null;
   // The blocked-container repair, REMEMBERED where it is decided and announced
   // only where the announcement is true: in the preview block under --dry-run,
@@ -1397,7 +1458,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   // note described a repair no file ever got. Buffering it into `runtimeLines`
   // would not have helped: that buffer is flushed above, also before the write.
   let repairedContainer: { keyPath: string; shape: string } | null = null;
-  if (skipEntryWrite && !trimLegacy) {
+  if (skipEntryWrite && !trimLegacy && rootSets.length === 0) {
     clientJson = null;
   } else {
     const edits: ClientConfigEdit[] = [];
@@ -1423,6 +1484,12 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     // Trimmed in the SAME write as the entry, so the file never lands on disk
     // holding one without the other.
     if (trimLegacy) edits.push({ op: "remove", key: legacyEntry as string });
+    // Top-level defaults last, in the same write: the facade verifies each
+    // was absent before and reads back as its value after, and that nothing
+    // else at the top level moved.
+    for (const rootDefault of rootSets) {
+      edits.push({ op: "rootDefault", key: rootDefault.key, value: rootDefault.value });
+    }
     try {
       // The facade leaves the user's bytes alone outside what it splices, so a
       // file that already ends in a newline keeps exactly the one it had
@@ -1434,16 +1501,23 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
       // One refusal for every way the write could not be made -- a splicer
       // that threw, a verification that failed, a file the client itself
       // cannot load. The facade's message carries the specifics; the wording
-      // around it stays the one install has always printed for the edit it
-      // was making. (The old separate "failed to replace the non-object key"
-      // wording folds in here: the repair is now part of the same atomic
-      // edit list, and it was only ever reachable by a throw from the splicer
-      // on a path this function had just validated.)
-      err(
-        skipEntryWrite
-          ? `yaw-mcp install: failed to remove the legacy "${legacyEntry}" entry from ${resolved.absolute} (${(e as Error).message}). Refusing to overwrite.`
-          : `yaw-mcp install: failed to splice the "${ENTRY_NAME}" entry into ${resolved.absolute} (${(e as Error).message}). Refusing to overwrite.`,
-      );
+      // around it names the edit this run was making. (The old separate
+      // "failed to replace the non-object key" wording folds in here: the
+      // repair is now part of the same atomic edit list, and it was only ever
+      // reachable by a throw from the splicer on a path this function had just
+      // validated.) An entry write keeps the wording it has always had; a
+      // write that was only a legacy trim and/or a top-level default says
+      // THAT, never "failed to splice the entry" for an entry it was not
+      // touching.
+      const settings = rootSets.map(spellRootDefault).join(" and ");
+      const attempted = !skipEntryWrite
+        ? `splice the "${ENTRY_NAME}" entry into ${resolved.absolute}`
+        : trimLegacy && rootSets.length > 0
+          ? `remove the legacy "${legacyEntry}" entry from ${resolved.absolute} and set ${settings} in it`
+          : trimLegacy
+            ? `remove the legacy "${legacyEntry}" entry from ${resolved.absolute}`
+            : `set ${settings} in ${resolved.absolute}`;
+      err(`yaw-mcp install: failed to ${attempted} (${(e as Error).message}). Refusing to overwrite.`);
       return { written: [], wouldWrite: [], messages, exitCode: 1 };
     }
   }
@@ -1614,25 +1688,36 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     }
     if (repairedContainer) log(containerRepairNote(repairedContainer, "would replace"));
     log("\n--- dry run: would add the following (the rest of each file is left as-is) ---");
-    if (clientJson !== null && !skipEntryWrite) {
-      const previewEntry =
-        envCarried && entryToWrite.env
-          ? {
-              ...entryToWrite,
-              env: Object.fromEntries(Object.keys(entryToWrite.env).map((k) => [k, DRY_RUN_ENV_PLACEHOLDER])),
-            }
-          : entryToWrite;
-      // Rendered by the site's own adapter, so the preview is in the file's
-      // own syntax rather than in JSON with another language's name on it.
-      // For the JSON family it is byte-for-byte what this printed before.
-      log(
-        `\n# ${resolved.absolute}\n${view.adapter.renderPreview(view.address, ENTRY_NAME, previewEntry, read.kind === "absent")}`,
-      );
+    if (clientJson !== null && (!skipEntryWrite || rootSets.length > 0)) {
+      // The top-level default lines first, then the entry: the order they sit
+      // in the file (a fresh one is exactly this block). Both rendered by the
+      // site's own adapter, so the preview is in the file's own syntax.
+      const blocks: string[] = [];
+      if (rootSets.length > 0) blocks.push(previewRootDefaults(view, rootSets));
+      if (!skipEntryWrite) {
+        const previewEntry =
+          envCarried && entryToWrite.env
+            ? {
+                ...entryToWrite,
+                env: Object.fromEntries(Object.keys(entryToWrite.env).map((k) => [k, DRY_RUN_ENV_PLACEHOLDER])),
+              }
+            : entryToWrite;
+        // Rendered by the site's own adapter, so the preview is in the file's
+        // own syntax rather than in JSON with another language's name on it.
+        // For the JSON family it is byte-for-byte what this printed before.
+        blocks.push(view.adapter.renderPreview(view.address, ENTRY_NAME, previewEntry, read.kind === "absent"));
+      }
+      log(`\n# ${resolved.absolute}\n${blocks.join("\n")}`);
     }
     for (const settingsPatch of settingsPatches) {
       if (settingsPatch.changed) {
         log(`# ${settingsPatch.path}\npermissions.allow += ${JSON.stringify(settingsPatch.added)}`);
       }
+    }
+    // Conditional tense, like every other line of the preview: nothing has
+    // been written, and the live run prints "Set ..." only after it has.
+    for (const rootDefault of rootSets) {
+      log(`Would set ${spellRootDefault(rootDefault)} in ${resolved.absolute}: ${rootDefault.why}.`);
     }
     const freshNote = yawFreshPaneNote({
       grantPatches: settingsPatches,
@@ -1736,6 +1821,11 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     written.push(resolved.absolute);
     if (trimLegacy) {
       log(`Removed the legacy "${legacyEntry}" entry -- it would have run yaw-mcp a second time.`);
+    }
+    // Past tense, after the bytes landed, like the two lines above -- and the
+    // one line that says so when this key is the only thing the write changed.
+    for (const rootDefault of rootSets) {
+      log(`Set ${spellRootDefault(rootDefault)} in ${resolved.absolute}: ${rootDefault.why}.`);
     }
   }
 
@@ -1852,8 +1942,15 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
         // line's: a client that watches its config file must not be told to
         // restart, and one that needs a window reload must not be told the
         // editor. `reload` defaults to "restart", whose clause is what every
-        // pre-existing row printed, byte for byte.
-        `\nDone: ${target.label} is configured. ${reloadDoneClause(target.reload, target.label)}`,
+        // pre-existing row printed, byte for byte. A write that left the entry
+        // as it was and added a top-level default (Codex's startup grace, with
+        // or without a legacy trim) names "the change", never a new server; a
+        // legacy-trim-only write keeps the wording it has always had.
+        `\nDone: ${target.label} is configured. ${reloadDoneClause(
+          target.reload,
+          target.label,
+          skipEntryWrite && rootSets.length > 0 ? "change" : "server",
+        )}`,
   );
   return { written, wouldWrite: [], messages, exitCode: 0 };
 }

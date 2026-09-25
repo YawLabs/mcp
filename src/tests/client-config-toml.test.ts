@@ -31,7 +31,7 @@
 //            (`codex mcp list --json` / `get mcp --json` under a scratch
 //            CODEX_HOME); g21's input returns both `mcp` and `other`.
 
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -40,9 +40,11 @@ import {
   describeTomlShape,
   detectTomlEol,
   entryAsWritten,
+  insertTomlRootKey,
   isTomlTable,
   parseTomlConfig,
   readTomlConfig,
+  readTomlRootKey,
   removeTomlEntry,
   renderTomlEntry,
   scanTomlSections,
@@ -55,6 +57,7 @@ import {
   tomlKey,
   tomlString,
   upsertTomlEntry,
+  verifyTomlRootInsert,
   verifyTomlSplice,
 } from "../client-config-toml.js";
 
@@ -409,8 +412,9 @@ describe("scanner", () => {
     // An open value-bracket is recorded the same way. It cannot change the
     // back-off's answer -- the line that closes a bracket holds the `]` that
     // closes it, so it is never blank-or-comment and a backwards walk stops
-    // there either way -- but the map is a statement about the document, and
-    // the next line-walker will want it.
+    // there either way -- but the root-key insert's FORWARD walk needs it to
+    // step past a multi-line root value (see the "places the line for a
+    // multi-line ..." cases below).
     const array = fixture("g15-mlarray-header", "input.toml");
     expect(
       [...scanTomlSections(array).continuedLines.entries()]
@@ -2293,5 +2297,298 @@ describe("codex agreement table", () => {
     expect(header.kind === "ok" && header.containerUnspliceable).toBeNull();
     const pure = readTomlConfig(lf('mcp_servers = { sib = { command = "node" } }'), CONTAINER);
     expect(pure.kind === "ok" && pure.containerUnspliceable).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Root keys: one top-level `key = value` line, added and never changed
+// ---------------------------------------------------------------------------
+
+/** The Codex setting the codex-cli row asks install to add. */
+const GRACE = "mcp_optional_startup_grace_ms";
+const GRACE_LINE = `${GRACE} = 0`;
+const crlf = (...lines: string[]): string => `${lines.join("\r\n")}\r\n`;
+
+/** True when `after` is `before` with ONE contiguous run inserted, and that
+ *  run is the key line plus one or two line breaks behind it (the line's own,
+ *  and the blank line that separates it from a table it lands above) -- once
+ *  `before`'s last line, if it had no line break, has been given the file's
+ *  own. Every other byte in the same order is what "never moves or reformats
+ *  another line" means in bytes. */
+function isBeforePlusOneLine(before: string, after: string, line: string, eol: string): boolean {
+  const terminated = /[\r\n]$/.test(before) ? before : before + eol;
+  for (let at = after.indexOf(line); at !== -1; at = after.indexOf(line, at + 1)) {
+    for (const post of [eol, eol + eol]) {
+      const end = at + line.length + post.length;
+      if (after.slice(at, end) !== line + post) continue;
+      if (after.slice(0, at) + after.slice(end) === terminated) return true;
+    }
+  }
+  return false;
+}
+
+describe("root keys -- one top-level line, added and never changed", () => {
+  it("reads a root key off the PARSED document: a quoted key counts, a table's key does not", () => {
+    expect(readTomlRootKey(null, GRACE)).toEqual({ present: false });
+    expect(readTomlRootKey("", GRACE)).toEqual({ present: false });
+    expect(readTomlRootKey(" \n", GRACE)).toEqual({ present: false });
+    expect(readTomlRootKey(lf(`${GRACE} = 1000`), GRACE)).toEqual({ present: true, value: 1000 });
+    expect(readTomlRootKey(lf(GRACE_LINE), GRACE)).toEqual({ present: true, value: 0 });
+    // Presence comes from the parse, so every spelling of the key is the key.
+    expect(readTomlRootKey(lf(`"${GRACE}" = 1000`), GRACE)).toEqual({ present: true, value: 1000 });
+    expect(readTomlRootKey(lf(`'${GRACE}' = 5`), GRACE)).toEqual({ present: true, value: 5 });
+    expect(readTomlRootKey(`${BOM}${lf(`${GRACE} = 7`)}`, GRACE)).toEqual({ present: true, value: 7 });
+    // Under a header the same text is THAT table's key, not a root one.
+    expect(readTomlRootKey(lf("[profiles.x]", `${GRACE} = 5`), GRACE)).toEqual({ present: false });
+    expect(readTomlRootKey(lf('model = "gpt-5"', "[tui]", `${GRACE} = 5`), GRACE)).toEqual({ present: false });
+    // A caller reads it off a file it already classified, so a parse failure
+    // is the codec's own error type, not a quiet "absent".
+    expect(() => readTomlRootKey(lf("x = "), GRACE)).toThrow(TomlConfigError);
+  });
+
+  it("marks a FLOAT root value with its spelling as written, and an integer not at all", () => {
+    // The parse returns `0.0` and `0` as the same JS number; Codex types the
+    // key as an integer and refuses the float, so the read has to say which.
+    expect(readTomlRootKey(lf(`${GRACE} = 0.0`), GRACE)).toStrictEqual({ present: true, value: 0, float: "0.0" });
+    expect(readTomlRootKey(lf(`${GRACE} = -0.0`), GRACE)).toStrictEqual({ present: true, value: -0, float: "-0.0" });
+    expect(readTomlRootKey(lf(`${GRACE} = 0e0   # zero`), GRACE)).toStrictEqual({
+      present: true,
+      value: 0,
+      float: "0e0",
+    });
+    expect(readTomlRootKey(crlf(`"${GRACE}" = 1_000.0`), GRACE)).toStrictEqual({
+      present: true,
+      value: 1000,
+      float: "1_000.0",
+    });
+    expect(readTomlRootKey(lf(`${GRACE} = inf`), GRACE)).toStrictEqual({
+      present: true,
+      value: Number.POSITIVE_INFINITY,
+      float: "inf",
+    });
+    // Integers, in any spelling TOML has for one, carry no mark.
+    expect(readTomlRootKey(lf(GRACE_LINE), GRACE)).toStrictEqual({ present: true, value: 0 });
+    expect(readTomlRootKey(lf(`${GRACE} = -0`), GRACE)).toStrictEqual({ present: true, value: 0 });
+    expect(readTomlRootKey(lf(`${GRACE} = 0x10`), GRACE)).toStrictEqual({ present: true, value: 16 });
+    expect(readTomlRootKey(lf(`${GRACE} = 1_000`), GRACE)).toStrictEqual({ present: true, value: 1000 });
+    // A string is a string, whatever it holds.
+    expect(readTomlRootKey(lf(`${GRACE} = "0.0"`), GRACE)).toStrictEqual({ present: true, value: "0.0" });
+  });
+
+  // [what the file is, input, expected] -- every placement rule, byte-exact.
+  const PLACEMENTS: Array<[string, string | null, string]> = [
+    ["no file", null, lf(GRACE_LINE)],
+    ["an empty file", "", lf(GRACE_LINE)],
+    ["a whitespace-only file", "  \n\n", lf(GRACE_LINE)],
+    ["only tables", lf("[tui]", 'theme = "dark"'), lf(GRACE_LINE, "", "[tui]", 'theme = "dark"')],
+    [
+      "only tables, under a leading comment block that stays where it is",
+      lf("# my codex settings", "# second line", "[tui]", 'theme = "dark"'),
+      lf(GRACE_LINE, "", "# my codex settings", "# second line", "[tui]", 'theme = "dark"'),
+    ],
+    [
+      "only tables, in a file that already opens on a blank line (no double blank)",
+      lf("", "[tui]", 'theme = "dark"'),
+      lf(GRACE_LINE, "", "[tui]", 'theme = "dark"'),
+    ],
+    [
+      "an [[array of tables]] first",
+      lf("[[profiles]]", 'name = "a"'),
+      lf(GRACE_LINE, "", "[[profiles]]", 'name = "a"'),
+    ],
+    ["nothing but a comment", lf("# nothing configured yet"), lf(GRACE_LINE, "", "# nothing configured yet")],
+    [
+      "root keys, a blank line, then a table",
+      lf('model = "gpt-5"', 'approval_policy = "never"', "", "[tui]"),
+      lf('model = "gpt-5"', 'approval_policy = "never"', GRACE_LINE, "", "[tui]"),
+    ],
+    [
+      "a root key followed directly by a header",
+      lf('model = "gpt-5"', "[tui]", 'theme = "dark"'),
+      lf('model = "gpt-5"', GRACE_LINE, "[tui]", 'theme = "dark"'),
+    ],
+    [
+      "a root key with an inline comment, then a comment above the first table",
+      lf('model = "gpt-5"   # inline comment', "# about the table", "[tui]"),
+      lf('model = "gpt-5"   # inline comment', GRACE_LINE, "# about the table", "[tui]"),
+    ],
+    ["root keys only, with no trailing line break", 'model = "gpt-5"', lf('model = "gpt-5"', GRACE_LINE)],
+    // Wherever the line lands, an unterminated last line gets a line break,
+    // so the caller's own "end with a line break" has nothing left to add.
+    [
+      "only tables, with no trailing line break",
+      '[tui]\ntheme = "dark"',
+      lf(GRACE_LINE, "", "[tui]", 'theme = "dark"'),
+    ],
+    [
+      "a root key, then a table with no trailing line break",
+      'model = "gpt-5"\n\n[tui]\ntheme = "dark"',
+      lf('model = "gpt-5"', GRACE_LINE, "", "[tui]", 'theme = "dark"'),
+    ],
+    [
+      "a multi-line array as the last root value",
+      lf("notify = [", '  "notify-send",', '  "done",', "]", "", "[tui]"),
+      lf("notify = [", '  "notify-send",', '  "done",', "]", GRACE_LINE, "", "[tui]"),
+    ],
+    [
+      "a multi-line basic string whose lines look like a header and a key",
+      lf('instructions = """', "[mcp_servers.fake]", 'model = "not a key"', '"""', "[tui]"),
+      lf('instructions = """', "[mcp_servers.fake]", 'model = "not a key"', '"""', GRACE_LINE, "[tui]"),
+    ],
+    [
+      "a multi-line literal string whose line looks like a comment",
+      lf("instructions = '''", "# not a comment", "'''"),
+      lf("instructions = '''", "# not a comment", "'''", GRACE_LINE),
+    ],
+    [
+      "a multi-line value that ends the file with no line break",
+      'notify = [\n  "a",\n]',
+      lf("notify = [", '  "a",', "]", GRACE_LINE),
+    ],
+    [
+      "a same-named key inside a table only, which is not a root key",
+      lf("[profiles.x]", `${GRACE} = 5`),
+      lf(GRACE_LINE, "", "[profiles.x]", `${GRACE} = 5`),
+    ],
+  ];
+
+  for (const [what, input, expected] of PLACEMENTS) {
+    it(`places the line for ${what}`, () => {
+      const out = insertTomlRootKey(input, GRACE, 0);
+      expect(out).toBe(expected);
+      expect(readTomlRootKey(out, GRACE)).toEqual({ present: true, value: 0 });
+    });
+  }
+
+  it("keeps the file's CRLF endings, and a leading BOM stays first", () => {
+    expect(insertTomlRootKey(crlf('model = "gpt-5"', "", "[tui]"), GRACE, 0)).toBe(
+      crlf('model = "gpt-5"', GRACE_LINE, "", "[tui]"),
+    );
+    expect(insertTomlRootKey(crlf("[tui]", 'theme = "dark"'), GRACE, 0)).toBe(
+      crlf(GRACE_LINE, "", "[tui]", 'theme = "dark"'),
+    );
+    // A CRLF last line with no break gets the FILE's break, not an LF --
+    // wherever the key line lands, so a caller that ends the text with a
+    // line break (install's terminateWithNewline) has nothing to add.
+    expect(insertTomlRootKey('[tui]\r\ntheme = "dark"', GRACE, 0)).toBe(
+      crlf(GRACE_LINE, "", "[tui]", 'theme = "dark"'),
+    );
+    expect(insertTomlRootKey('model = "gpt-5"\r\n[tui]', GRACE, 0)).toBe(crlf('model = "gpt-5"', GRACE_LINE, "[tui]"));
+    expect(insertTomlRootKey('model = "gpt-5"\r\nx = 1', GRACE, 0)).toBe(crlf('model = "gpt-5"', "x = 1", GRACE_LINE));
+    expect(insertTomlRootKey("\r\n", GRACE, 0)).toBe(`${GRACE_LINE}\r\n`);
+    // After the BOM, never in front of it: Codex accepts one BOM as the first
+    // byte and nowhere else.
+    expect(insertTomlRootKey(`${BOM}${lf("[tui]")}`, GRACE, 0)).toBe(`${BOM}${lf(GRACE_LINE, "", "[tui]")}`);
+    expect(insertTomlRootKey(`${BOM}${crlf("[tui]")}`, GRACE, 0)).toBe(`${BOM}${crlf(GRACE_LINE, "", "[tui]")}`);
+    expect(insertTomlRootKey(`${BOM}${lf('model = "gpt-5"')}`, GRACE, 0)).toBe(
+      `${BOM}${lf('model = "gpt-5"', GRACE_LINE)}`,
+    );
+  });
+
+  it("inserts into every fixture Codex loads without moving or respelling another byte", () => {
+    // The byte rule over the whole corpus, including the shapes the table
+    // above does not spell out (a BOM on a table's own line, detached
+    // sub-tables, backslash escapes, a comment that closes a string).
+    // Refused shapes that do not parse, and files that already hold the key,
+    // are skipped: neither is an insert.
+    let checked = 0;
+    for (const dir of readdirSync(FIXTURES, { withFileTypes: true })) {
+      if (!dir.isDirectory()) continue;
+      for (const file of readdirSync(join(FIXTURES, dir.name)).filter((f) => f.endsWith(".toml"))) {
+        const before = fixture(dir.name, file);
+        let parsed: unknown;
+        try {
+          parsed = parseTomlConfig(before);
+        } catch {
+          continue;
+        }
+        if (isTomlTable(parsed) && GRACE in parsed) continue;
+        const after = insertTomlRootKey(before, GRACE, 0);
+        const label = `${dir.name}/${file}`;
+        expect(readTomlRootKey(after, GRACE), label).toEqual({ present: true, value: 0 });
+        expect(canonTomlConfig(after, CONTAINER, [], [GRACE]), label).toBe(
+          canonTomlConfig(before.trim() === "" ? "" : before, CONTAINER, [], [GRACE]),
+        );
+        if (before.trim() !== "") {
+          expect(isBeforePlusOneLine(before, after, GRACE_LINE, detectTomlEol(before)), label).toBe(true);
+        }
+        checked++;
+      }
+    }
+    expect(checked).toBeGreaterThan(40);
+    // The one fixture whose root holds keys and comments, spelled out: the
+    // line lands under `model`, above the blank line and the first table.
+    const f03 = fixture("f03-siblings", "input.toml");
+    expect(insertTomlRootKey(f03, GRACE, 0)).toBe(
+      f03.replace("# inline comment\n", `# inline comment\n${GRACE_LINE}\n`),
+    );
+  });
+
+  it("refuses a key already at the root, in any spelling and at any value", () => {
+    for (const raw of [
+      lf(`${GRACE} = 1000`),
+      lf(`"${GRACE}" = 1000`),
+      lf(GRACE_LINE),
+      lf('model = "gpt-5"', `'${GRACE}' = 1`, "[tui]"),
+      // A dotted key makes it a table at the root -- still present.
+      lf(`${GRACE}.x = 1`),
+    ]) {
+      expect(() => insertTomlRootKey(raw, GRACE, 0), raw).toThrow(TomlSpliceRefusal);
+      expect(() => insertTomlRootKey(raw, GRACE, 0), raw).toThrow(
+        `the top-level "${GRACE}" key is already set in this file -- yaw-mcp only adds it and never changes a value that is there; edit it by hand to change it`,
+      );
+    }
+    expect(() => insertTomlRootKey(lf("x = "), GRACE, 0)).toThrow(TomlConfigError);
+  });
+
+  it("spells the key and the value the way the entry renderer does", () => {
+    expect(insertTomlRootKey(null, "a.b", "x y")).toBe(lf('"a.b" = "x y"'));
+    expect(insertTomlRootKey(null, "flag", true)).toBe(lf("flag = true"));
+    expect(insertTomlRootKey(null, GRACE, 250)).toBe(lf(`${GRACE} = 250`));
+  });
+
+  it("verifies its own output: a changed root key, a line under a header or a wrong value is refused", () => {
+    const before = lf('model = "gpt-5"', "", "[tui]", 'theme = "dark"');
+    const good = lf('model = "gpt-5"', GRACE_LINE, "", "[tui]", 'theme = "dark"');
+    expect(() => verifyTomlRootInsert(before, good, GRACE, 0)).not.toThrow();
+    expect(() =>
+      verifyTomlRootInsert(before, lf('model = "gpt-4"', GRACE_LINE, "", "[tui]", 'theme = "dark"'), GRACE, 0),
+    ).toThrow(`the edit changed settings other than the top-level "${GRACE}" it was asked to add`);
+    // A line after a header is a key of that TABLE, which is exactly the
+    // misplacement a root insert must never make.
+    expect(() =>
+      verifyTomlRootInsert(before, lf('model = "gpt-5"', "", "[tui]", 'theme = "dark"', GRACE_LINE), GRACE, 0),
+    ).toThrow(`the edit did not leave a top-level "${GRACE}" behind`);
+    expect(() =>
+      verifyTomlRootInsert(before, lf('model = "gpt-5"', `${GRACE} = 1`, "", "[tui]", 'theme = "dark"'), GRACE, 0),
+    ).toThrow(`the top-level "${GRACE}" did not read back as the value written`);
+    expect(() => verifyTomlRootInsert(lf(`${GRACE} = 1000`), lf(GRACE_LINE), GRACE, 0)).toThrow(
+      `the top-level "${GRACE}" was already set before the edit`,
+    );
+    expect(() => verifyTomlRootInsert(before, `${before}${GRACE} = \n`, GRACE, 0)).toThrow(/does not parse as TOML/);
+  });
+
+  it("calls that check on BOTH of its returns", () => {
+    // The lever reachable through the public API, as for upsert above: an
+    // integer outside the JS safe range renders exactly and reads back as a
+    // bigint, so the value does not read back as the one written.
+    const UNSAFE = 9007199254740994;
+    expect(() => insertTomlRootKey(null, GRACE, UNSAFE)).toThrow(TomlVerifyError);
+    expect(() => insertTomlRootKey("", GRACE, UNSAFE)).toThrow(TomlVerifyError);
+    expect(() => insertTomlRootKey(lf("[tui]"), GRACE, UNSAFE)).toThrow(TomlVerifyError);
+    expect(() => insertTomlRootKey(lf("[tui]"), GRACE, UNSAFE)).toThrow(/did not read back as the value written/);
+  });
+
+  it("canon drops a ROOT key only when asked, and only at the root", () => {
+    const withKey = lf('model = "gpt-5"', GRACE_LINE, "[profiles.x]", `${GRACE} = 5`);
+    const without = lf('model = "gpt-5"', "[profiles.x]", `${GRACE} = 5`);
+    expect(canonTomlConfig(withKey, CONTAINER)).not.toBe(canonTomlConfig(without, CONTAINER));
+    expect(canonTomlConfig(withKey, CONTAINER, [], [GRACE])).toBe(canonTomlConfig(without, CONTAINER, [], [GRACE]));
+    // The same-named key inside a table is still in the picture...
+    expect(canonTomlConfig(without, CONTAINER, [], [GRACE])).toContain(`"profiles":{"x":{"${GRACE}":5}}`);
+    // ...and so is every other root key.
+    expect(canonTomlConfig(withKey.replace("gpt-5", "gpt-4"), CONTAINER, [], [GRACE])).not.toBe(
+      canonTomlConfig(without, CONTAINER, [], [GRACE]),
+    );
   });
 });

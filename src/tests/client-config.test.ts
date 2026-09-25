@@ -15,11 +15,14 @@ import {
   addressOf,
   applyClientConfigEdits,
   CLIENT_ENV_VARS,
+  type ClientConfigEdit,
   type ClientConfigView,
+  ClientConfigWriteError,
   type ClientEnv,
   CONFIG_FORMATS,
   type ConfigAdapter,
   type ConfigRead,
+  type ConfigRootDefault,
   type ConfigSite,
   canonicalJson,
   carriedFieldsOf,
@@ -38,7 +41,10 @@ import {
   launchOf,
   MissingConfigAdapterError,
   normalizeEntry,
+  planRootDefaults,
   positionAt,
+  previewRootDefaults,
+  type RootDefaultValue,
   readClientConfigFile,
   readClientEnv,
   registerConfigAdapter,
@@ -285,6 +291,23 @@ describe("reload descriptors tell the truth per client", () => {
   it("names the next session for a CLI that reads its config once per session", () => {
     expect(reloadDoneClause("next-session", "typed")).toBe("typed picks the entry up in its next session.");
     expect(reloadRemovalClause("next-session", "typed")).toBe("typed drops the server in its next session.");
+  });
+
+  it("names the change, never a new server, for a write that added only a top-level default", () => {
+    expect(reloadDoneClause(undefined, "Codex CLI", "change")).toBe("Restart it to pick up the change.");
+    expect(reloadDoneClause("restart", "Codex CLI", "change")).toBe("Restart it to pick up the change.");
+    expect(reloadDoneClause("live", "Zed", "change")).toBe(
+      "Zed picks the change up when the file is saved -- no restart needed.",
+    );
+    expect(reloadDoneClause("reload-window", "Continue", "change")).toBe(
+      "Reload the IDE window to pick up the change.",
+    );
+    expect(reloadDoneClause("next-session", "typed", "change")).toBe("typed picks the change up in its next session.");
+    // Passing "server" is the same as passing nothing: the bytes every row
+    // has always printed.
+    for (const kind of [undefined, "restart", "live", "reload-window", "next-session"] as const) {
+      expect(reloadDoneClause(kind, "X", "server"), String(kind)).toBe(reloadDoneClause(kind, "X"));
+    }
   });
 
   it("keeps uninstall's restart clause for every kind that existed before next-session", () => {
@@ -583,6 +606,212 @@ describe("the write facade", () => {
     // An empty key is one the splicer refuses outright.
     expect(() => applyClientConfigEdits(view, [{ op: "upsert", key: "", entry: ENTRY }], site())).toThrow(
       /could not be edited/,
+    );
+  });
+});
+
+describe("top-level defaults through the write facade (ConfigShape.rootDefaults)", () => {
+  // Every test that swaps the TOML adapter for a stand-in puts the row's own
+  // adapter back, so the tests after this block keep the format.
+  afterEach(resetAdapters);
+
+  const GRACE = "mcp_optional_startup_grace_ms";
+  const GRACE_DEFAULT: ConfigRootDefault = { key: GRACE, value: 0, why: "the reason" };
+  const GRACE_EDIT: ClientConfigEdit = { op: "rootDefault", key: GRACE, value: 0 };
+  const CODEX_FILE = "/home/u/.codex/config.toml";
+  const codex = (): ConfigSite =>
+    site({
+      label: "Codex CLI",
+      format: "toml",
+      resolved: { absolute: CODEX_FILE, display: "~/.codex/config.toml", containerPath: ["mcp_servers"] },
+    });
+  const TABLE = '[mcp_servers.mcp]\ncommand = "npx"\nargs = ["-y", "@yawlabs/mcp@latest"]\n';
+  const FILE = `model = "gpt-5"\n\n${TABLE}`;
+  /** The row's TOML adapter with some methods replaced. */
+  function registerStandIn(over: Partial<ConfigAdapter>): void {
+    resetConfigAdapterRegistry();
+    registerConfigAdapter("toml", { ...ROW_TOML_ADAPTER, ...over });
+  }
+  const realInsert = (raw: string | null, key: string, value: RootDefaultValue): string => {
+    const insert = ROW_TOML_ADAPTER.insertRootKey;
+    if (insert === undefined) throw new Error("the TOML adapter lost insertRootKey");
+    return insert(raw, key, value);
+  };
+
+  it("adds a missing top-level key as its own line, verified, and changes nothing else", () => {
+    const view = classifyClientConfig(FILE, codex());
+    expect(applyClientConfigEdits(view, [GRACE_EDIT], codex())).toBe(`model = "gpt-5"\n${GRACE} = 0\n\n${TABLE}`);
+  });
+
+  it("creates a missing file with the entry AND the key in one write", () => {
+    const view = classifyClientConfig(null, codex());
+    const entry = { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] };
+    const out = applyClientConfigEdits(view, [{ op: "upsert", key: "mcp", entry }, GRACE_EDIT], codex());
+    expect(out).toBe(`${GRACE} = 0\n\n${TABLE}`);
+    // A file that does not exist still has nothing in it to remove or repair.
+    expect(() => applyClientConfigEdits(view, [GRACE_EDIT, { op: "remove", key: "mcp" }], codex())).toThrow(
+      /does not exist, so there is nothing in it to remove/,
+    );
+    expect(() =>
+      applyClientConfigEdits(
+        view,
+        [
+          { op: "upsert", key: "mcp", entry },
+          { op: "upsert", key: "other", entry },
+        ],
+        codex(),
+      ),
+    ).toThrow(/does not exist/);
+  });
+
+  it("adds the entry and the key to a file that has neither, and still compares the rest", () => {
+    // The container is created here too, so the comparison drops it AND the
+    // key -- and nothing else: the trust table must come through unchanged.
+    const trustOnly = "[projects.'/home/me/repo']\ntrust_level = \"trusted\"\n";
+    const entry = { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] };
+    const edits: ClientConfigEdit[] = [{ op: "upsert", key: "mcp", entry }, GRACE_EDIT];
+    expect(applyClientConfigEdits(classifyClientConfig(trustOnly, codex()), edits, codex())).toBe(
+      `${GRACE} = 0\n\n${trustOnly}\n${TABLE}`,
+    );
+    registerStandIn({
+      insertRootKey: (raw, key, value) => realInsert(raw, key, value).replace('"trusted"', '"untrusted"'),
+    });
+    expect(() => applyClientConfigEdits(classifyClientConfig(trustOnly, codex()), edits, codex())).toThrow(
+      `writing to ${CODEX_FILE} would have changed other settings in the file -- nothing was written`,
+    );
+  });
+
+  it("refuses a key that is already there -- at the splice, and again after it", () => {
+    const present = `${GRACE} = 1000\n${FILE}`;
+    // The row's adapter refuses before anything is spliced...
+    expect(() => applyClientConfigEdits(classifyClientConfig(present, codex()), [GRACE_EDIT], codex())).toThrow(
+      /could not be edited \(the top-level "mcp_optional_startup_grace_ms" key is already set in this file/,
+    );
+    // ...and an adapter that OVERWROTE the value instead is caught by the
+    // facade's own check, so a present key can never be changed through here.
+    registerStandIn({ insertRootKey: (raw) => (raw ?? "").replace(`${GRACE} = 1000`, `${GRACE} = 0`) });
+    expect(() => applyClientConfigEdits(classifyClientConfig(present, codex()), [GRACE_EDIT], codex())).toThrow(
+      `"${GRACE}" is already set in ${CODEX_FILE}, and a rootDefault never changes a value that is there -- nothing was written`,
+    );
+  });
+
+  it("refuses an insert that also changed another top-level key", () => {
+    registerStandIn({
+      insertRootKey: (raw, key, value) => realInsert(raw, key, value).replace('model = "gpt-5"', 'model = "gpt-4"'),
+    });
+    expect(() => applyClientConfigEdits(classifyClientConfig(FILE, codex()), [GRACE_EDIT], codex())).toThrow(
+      `writing to ${CODEX_FILE} would have changed other settings in the file -- nothing was written`,
+    );
+  });
+
+  it("refuses an insert whose key does not read back as the value asked for", () => {
+    registerStandIn({ insertRootKey: (raw, key) => realInsert(raw, key, 5) });
+    expect(() => applyClientConfigEdits(classifyClientConfig(FILE, codex()), [GRACE_EDIT], codex())).toThrow(
+      `"${GRACE}" did not read back from ${CODEX_FILE} as 0 -- nothing was written`,
+    );
+  });
+
+  it("drops the key from the comparison ONLY when a rootDefault edit is in the list", () => {
+    // An upsert whose splicer slipped the key in as well: without a
+    // rootDefault edit asking for it, the key is a change to the rest of the
+    // file like any other.
+    registerStandIn({
+      upsert: (raw, addr, key, entry) => realInsert(ROW_TOML_ADAPTER.upsert(raw, addr, key, entry), GRACE, 0),
+    });
+    const view = classifyClientConfig(FILE, codex());
+    const entry = { command: "npx", args: ["-y", "@yawlabs/mcp@latest"], startup_timeout_sec: 60 };
+    expect(() => applyClientConfigEdits(view, [{ op: "upsert", key: "mcp", entry }], codex())).toThrow(
+      `writing to ${CODEX_FILE} would have changed other settings in the file -- nothing was written`,
+    );
+  });
+
+  it("does not let a rootDefault key hide a same-named SERVER from the entry checks", () => {
+    // The key is top-level, never a server name: a splice that also rewrote a
+    // server called the same is still caught as a change to that server.
+    const named = `${FILE}\n[mcp_servers.${GRACE}]\ncommand = "node"\n`;
+    registerStandIn({
+      insertRootKey: (raw, key, value) => realInsert(raw, key, value).replace('command = "node"', 'command = "deno"'),
+    });
+    expect(() => applyClientConfigEdits(classifyClientConfig(named, codex()), [GRACE_EDIT], codex())).toThrow(
+      `writing to ${CODEX_FILE} would have changed the "${GRACE}" entry beside it -- nothing was written`,
+    );
+  });
+
+  it("names the programming error when the adapter cannot set a top-level key", () => {
+    const json = classifyClientConfig('{"mcpServers":{}}', site());
+    const refusal =
+      "needs a config adapter that can read and add a top-level key, and the JSON adapter does not implement " +
+      "both readRootKey and insertRootKey -- a target may declare rootDefaults only on a format whose adapter " +
+      "does (a programming error, not a problem with the file)";
+    expect(() => applyClientConfigEdits(json, [{ op: "rootDefault", key: "x", value: 0 }], site())).toThrow(
+      ClientConfigWriteError,
+    );
+    expect(() => applyClientConfigEdits(json, [{ op: "rootDefault", key: "x", value: 0 }], site())).toThrow(refusal);
+    expect(() => planRootDefaults(json, [{ key: "x", value: 0, why: "w" }])).toThrow(refusal);
+    expect(() => previewRootDefaults(json, [{ key: "x", value: 0, why: "w" }])).toThrow(refusal);
+    // No defaults never asks the adapter at all, so every JSON row is untouched.
+    expect(planRootDefaults(json, undefined)).toEqual({ set: [], kept: [] });
+    expect(planRootDefaults(json, [])).toEqual({ set: [], kept: [] });
+  });
+
+  it("refuses a rootDefault that names the server map's own key", () => {
+    expect(() =>
+      applyClientConfigEdits(
+        classifyClientConfig(FILE, codex()),
+        [{ op: "rootDefault", key: "mcp_servers", value: 0 }],
+        codex(),
+      ),
+    ).toThrow(`a rootDefault edit cannot set "mcp_servers": that key holds the server map in ${CODEX_FILE}`);
+  });
+
+  it("plans: absent is set, the same value is nothing at all, another value is kept and reported", () => {
+    const plan = (raw: string | null) => planRootDefaults(classifyClientConfig(raw, codex()), [GRACE_DEFAULT]);
+    expect(plan(null)).toEqual({ set: [GRACE_DEFAULT], kept: [] });
+    expect(plan("")).toEqual({ set: [GRACE_DEFAULT], kept: [] });
+    expect(plan(FILE)).toEqual({ set: [GRACE_DEFAULT], kept: [] });
+    expect(plan(`${GRACE} = 0\n${FILE}`)).toEqual({ set: [], kept: [] });
+    expect(plan(`"${GRACE}" = 1000\n${FILE}`)).toEqual({
+      set: [],
+      kept: [{ rootDefault: GRACE_DEFAULT, value: 1000 }],
+    });
+    expect(plan(`${GRACE} = "0"\n${FILE}`)).toEqual({ set: [], kept: [{ rootDefault: GRACE_DEFAULT, value: "0" }] });
+    // A FLOAT is another value too, even where it parses to the same number:
+    // Codex types the key as an integer and refuses a float. It is kept with
+    // its spelling as written, so the note can say 0.0 and not 0.
+    for (const [spelled, value] of [
+      ["0.0", 0],
+      ["-0.0", -0],
+      ["0e0", 0],
+      ["1000.0", 1000],
+    ] as const) {
+      expect(plan(`${GRACE} = ${spelled}\n${FILE}`), spelled).toEqual({
+        set: [],
+        kept: [{ rootDefault: GRACE_DEFAULT, value, float: spelled }],
+      });
+    }
+    // The type matters only against an INTEGER default: a float default is
+    // compared by value, and a float in the file is not "another type" for it.
+    const floatDefault: ConfigRootDefault = { key: GRACE, value: 0.5, why: "w" };
+    expect(planRootDefaults(classifyClientConfig(`${GRACE} = 0.5\n${FILE}`, codex()), [floatDefault])).toEqual({
+      set: [],
+      kept: [],
+    });
+    // A same-named key inside a table is that table's, not the top level's.
+    expect(plan(`${FILE}\n[profiles.x]\n${GRACE} = 5\n`)).toEqual({ set: [GRACE_DEFAULT], kept: [] });
+    // A file nothing will be written to gets no plan, and so no note.
+    expect(plan("mcp_servers = 5\n")).toEqual({ set: [], kept: [] });
+    expect(plan("x = \n")).toEqual({ set: [], kept: [] });
+  });
+
+  it("previews each line a write would add, spelled as the write spells it -- the line, not the edit", () => {
+    const view = classifyClientConfig(FILE, codex());
+    expect(previewRootDefaults(view, [GRACE_DEFAULT])).toBe(`${GRACE} = 0\n`);
+    expect(previewRootDefaults(view, [])).toBe("");
+    // A tables-only file gets a blank line under the key as well; the
+    // preview is the line alone, whatever the file.
+    expect(previewRootDefaults(classifyClientConfig(TABLE, codex()), [GRACE_DEFAULT])).toBe(`${GRACE} = 0\n`);
+    expect(applyClientConfigEdits(classifyClientConfig(TABLE, codex()), [GRACE_EDIT], codex())).toBe(
+      `${GRACE} = 0\n\n${TABLE}`,
     );
   });
 });
