@@ -29,9 +29,10 @@
 //   * It does not terminate the file with a newline. A splice leaves the bytes
 //     outside its own span alone, so a file with no final newline comes back
 //     without one; the CALLER adds it when it writes, which is where that
-//     decision lives today (install-cmd.ts and try-cmd.ts both do it) and the
-//     only place it can live without breaking the no-op identity contract
-//     above. `terminateWithNewline` in client-config.ts is that one line.
+//     decision lives today (install-cmd.ts, try-cmd.ts, import-cmd.ts and
+//     heal-entries.ts all do it) and the only place it can live without
+//     breaking the no-op identity contract above. `terminateWithNewline` in
+//     client-config.ts is that one line.
 //   * It does not re-emit a leading UTF-8 BOM on a real edit. That is
 //     jsonc.ts's documented asymmetry -- kept byte-for-byte on a no-op,
 //     stripped on an edit -- and re-adding it here would change the existing

@@ -20,7 +20,10 @@
 //   * `mcp_optional_startup_grace_ms = 0` at the TOP of config.toml (a root
 //     key, not part of our table), added by install when it is missing and
 //     never changed when it is there (S6). It is `config.rootDefaults` below
-//     -- data the install core reads -- never a client-id branch;
+//     -- data the install core reads -- never a client-id branch, and so is
+//     the type Codex reads it as (`accepts`, S7), which is how install knows
+//     a value already there is one a Codex release that reads the key (0.151
+//     on) will not load;
 //   * `env_vars` and `enabled` are Codex's own per-server fields and are
 //     carried from a stored entry on every path but --force, the way `env`
 //     already is -- otherwise a user who allow-listed HTTPS_PROXY (which this
@@ -104,6 +107,18 @@
 //      rust-v0.147.0 and absent at rust-v0.146.0. So Codex 0.147 to 0.150 wait
 //      a fixed 1 s that this key cannot change, and the fix needs Codex 0.151
 //      or newer.
+//   S7 the TYPE Codex reads that key as, which is `accepts` on the row's
+//      rootDefault: config_toml.rs declares `pub mcp_optional_startup_grace_ms:
+//      Option<u64>,` with no custom deserializer at every tag from
+//      rust-v0.151.0 through rust-v0.156.1 (`gh api` on each tag's raw file,
+//      2026-09-24). Measured on 0.156.1 only (`codex mcp list` with CODEX_HOME
+//      in a scratch dir, 2026-09-24): 0, 1000, -0, +5, 0x10, 1_000 and
+//      9223372036854775807 load; -1, "0", true, 0.0, 1979-05-27, [0] and
+//      { a = 1 } each stop Codex with "failed to load bootstrap configuration"
+//      and exit 1 ("expected u64"), and so do 9223372036854775808 and
+//      18446744073709551615 ("u64 value was too large", at parse). Codex
+//      0.144.0, which predates the key, loads every one of them but those two
+//      past 2^63 - 1, which it refuses at parse as well.
 
 import { isAbsolute, join, resolve } from "node:path";
 import {
@@ -472,9 +487,20 @@ function codexImportView(stored: Record<string, unknown>): ImportView {
 }
 
 /** The top-level Codex setting install adds (S6), as data. `why` is printed
- *  after `Set mcp_optional_startup_grace_ms = 0 in <file>: `, and after "0 is
- *  recommended: " when the file already sets another value -- so it is true
- *  whatever that value is, and it is ASCII (it prints to a Windows console). */
+ *  after `Added mcp_optional_startup_grace_ms = 0 to <file>: `, and after "0
+ *  is recommended: " when the file already sets another value Codex takes --
+ *  so it is true whatever that value is, and it is ASCII (it prints to a
+ *  Windows console).
+ *
+ *  `accepts` is the type Codex reads the key as (S7): a value in the file
+ *  outside it -- a float, a negative, a string, a boolean, a date, an array,
+ *  a table -- is one a Codex release that reads the key will not load the
+ *  file with (measured on 0.156.1; the source types the key as a u64 from
+ *  0.151.0 on, and an older Codex does not read it), and install's warning
+ *  says so in place of `why`. An integer past 2^63 - 1, or below -2^63, is
+ *  outside it too, and is one NO Codex release loads the file with -- no
+ *  TOML integer holds it, and 0.144.0 refuses 2^63 at parse as well -- so
+ *  install refuses to write into that file instead of warning. */
 const STARTUP_GRACE_DEFAULT = {
   key: "mcp_optional_startup_grace_ms",
   value: 0,
@@ -482,6 +508,7 @@ const STARTUP_GRACE_DEFAULT = {
     "Codex 0.151 and later otherwise give optional MCP servers one shared grace (1000 ms unless set) to start " +
     "and leave a slower yaw-mcp out of the whole session; at 0 each server gets its own startup_timeout_sec " +
     "(60 s on the entry install writes)",
+  accepts: "unsigned-integer",
 } as const;
 
 export const CODEX_CLI_TARGET = defineTarget({

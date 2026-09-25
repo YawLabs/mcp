@@ -352,6 +352,79 @@ describe("runImport -- the duplicate-run trap", () => {
     expect(Object.keys(after.mcpServers)).toEqual(["mcp"]);
   });
 
+  it("--remove-originals ends a CRLF config that had no final line break in one CRLF, with no bare LF anywhere", async () => {
+    // A ~/.claude.json saved with CRLF and no final line break has nothing at
+    // its end for the removal to keep, so the write ADDS one -- and it has to
+    // be the file's own line ending. A bare "\n" after a CRLF body leaves the
+    // file with mixed line endings: it still parses, but editors flag it and
+    // every diff of it is noise.
+    const path = join(synthHome, ".claude.json");
+    writeFileSync(path, JSON.stringify(WIRED, null, 2).replace(/\n/g, "\r\n"));
+    const r = await runImport({
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      removeOriginals: true,
+      isTTY: false,
+      ...capture(),
+    });
+    expect(r.exitCode).toBe(0);
+    const after = readFileSync(path, "utf8");
+    // The whole file: the broker entry alone, every line break a CRLF, and
+    // exactly one CRLF after the closing brace.
+    expect(after).toBe(
+      `${JSON.stringify({ mcpServers: { mcp: WIRED.mcpServers.mcp } }, null, 2).replace(/\n/g, "\r\n")}\r\n`,
+    );
+    expect(after).not.toMatch(/(?<!\r)\n/);
+  });
+
+  it("--remove-originals ends an LF config that had no final line break in exactly one LF", async () => {
+    // The other side of the case above: an LF file gets an LF, not a CRLF,
+    // and one of them -- not a CR anywhere, not a doubled line break.
+    const path = writeClaudeCode(WIRED);
+    const r = await runImport({
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      removeOriginals: true,
+      isTTY: false,
+      ...capture(),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(readFileSync(path, "utf8")).toBe(
+      `${JSON.stringify({ mcpServers: { mcp: WIRED.mcpServers.mcp } }, null, 2)}\n`,
+    );
+  });
+
+  it("--remove-originals ends a CRLF Codex config.toml that had no final line break in one CRLF", async () => {
+    // The same write for Codex CLI, whose config is TOML: a CRLF config.toml
+    // with no final line break, the imported table in the middle and the
+    // broker's table last. Removing the middle table leaves the text ending
+    // on the broker's last line, so the write adds the line break -- a CRLF.
+    const dir = join(synthHome, ".codex");
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, "config.toml");
+    writeFileSync(
+      path,
+      'model = "o3"\r\n\r\n[mcp_servers.github]\r\ncommand = "npx"\r\nargs = ["-y", "gh"]\r\n\r\n[mcp_servers.mcp]\r\ncommand = "npx"\r\nargs = ["-y", "@yawlabs/mcp@latest"]',
+    );
+    const r = await runImport({
+      clientId: "codex-cli",
+      home: synthHome,
+      cwd: synthCwd,
+      removeOriginals: true,
+      isTTY: false,
+      ...capture(),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.written).toContain(path);
+    const after = readFileSync(path, "utf8");
+    expect(after).toBe(
+      'model = "o3"\r\n\r\n[mcp_servers.mcp]\r\ncommand = "npx"\r\nargs = ["-y", "@yawlabs/mcp@latest"]\r\n',
+    );
+    expect(after).not.toMatch(/(?<!\r)\n/);
+  });
+
   it("REFUSES to remove the originals when the client is not wired to yaw-mcp", async () => {
     // Without a yaw-mcp entry in the client config, removing the originals
     // leaves the client with no way to reach ANY of them -- the import would
@@ -593,6 +666,39 @@ describe("runImport -- finding yaw-mcp across the client's other scopes", () => 
     // in exactly one container; naming what was searched makes it checkable.
     expect(cap.errText()).toContain("mcpServers");
     expect(cap.errText()).toContain(join(synthHome, ".claude.json"));
+  });
+
+  it("ends a CRLF project .mcp.json that had no final line break in one CRLF, with no bare LF anywhere", async () => {
+    // The CRLF file import is most likely to meet: a project .mcp.json
+    // committed without a final line break and checked out on Windows under
+    // core.autocrlf=true. yaw-mcp is wired only in ~/.claude.json, so the
+    // removal is reached through that entry -- and install never wrote this
+    // file, so the removal is the first write that has to terminate it.
+    writeClaudeCode({ mcpServers: { mcp: { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] } } });
+    const projectFile = join(synthCwd, ".mcp.json");
+    const lf = JSON.stringify({ mcpServers: { github: { command: "npx", args: ["-y", "gh"] } } }, null, 2);
+    writeFileSync(projectFile, lf.replace(/\n/g, "\r\n"));
+    const cap = capture();
+    const r = await runImport({
+      clientId: "claude-code",
+      scope: "project",
+      projectDir: synthCwd,
+      home: synthHome,
+      cwd: synthCwd,
+      removeOriginals: true,
+      isTTY: false,
+      ...cap,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.text()).toMatch(/Reached through the yaw-mcp entry in/);
+    expect(r.written).toContain(projectFile);
+    const after = readFileSync(projectFile, "utf8");
+    expect(Object.keys(JSON.parse(after).mcpServers)).toEqual([]);
+    // One CRLF after the closing brace, and no line break in the file that is
+    // not a CRLF. (The whole-file bytes are left to the splicer's own tests:
+    // the shape it leaves an emptied object in is not what this pins.)
+    expect(after.endsWith("}\r\n")).toBe(true);
+    expect(after).not.toMatch(/(?<!\r)\n/);
   });
 });
 

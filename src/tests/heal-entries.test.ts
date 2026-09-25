@@ -97,6 +97,13 @@ describe("healStaleBrokerEntries", () => {
     const after = readFileSync(p, "utf8");
     expect(after).toContain(liveEntry.split("\\").join("\\\\"));
     expect(after).not.toContain("2.1.2");
+    // A heal re-points the entry and changes nothing else: the file comes
+    // back as the same fixture naming the live path. In particular it does
+    // not gain the root-level mcp_optional_startup_grace_ms = 0 that install
+    // sets for Codex -- heal edits config.toml as it always has, and install
+    // is the one command that writes that key.
+    expect(after).not.toContain("mcp_optional_startup_grace_ms");
+    expect(after).toBe(tomlEntry(liveEntry));
   });
 
   it("carries the client's own extra fields through the rewrite", async () => {
@@ -477,5 +484,75 @@ describe("healStaleBrokerEntries -- a client whose one scope is SEVERAL files", 
     const bad = r.unhealable.filter((u) => u.clientId === "cline");
     expect(bad.map((u) => u.path)).toEqual([vscode]);
     expect(bad[0].reason).toBe("malformed");
+  });
+});
+
+describe("healStaleBrokerEntries -- the file's final line break", () => {
+  // heal used to write the splice's output exactly as it came back, and a
+  // splice leaves the bytes outside its own span alone -- so a client config
+  // that did not end in a line break still did not after a heal, while
+  // install, try and import all terminate what they write. The line break a
+  // heal adds is the file's own (a bare LF on a CRLF file is mixed line
+  // endings), and a file that already ends in one keeps exactly one.
+  //
+  // `env: {}` keeps every case on the fake home: an ambient CLAUDE_CONFIG_DIR
+  // or CODEX_HOME would send the sweep to another file.
+  const EOLS = [
+    ["LF", "\n"],
+    ["CRLF", "\r\n"],
+  ] as const;
+
+  /** ~/.claude.json holding a broker entry for `entryPath`, in `eol`. */
+  function claudeJson(entryPath: string, eol: string, terminated: boolean): string {
+    const body = JSON.stringify(
+      { mcpServers: { mcp: { command: OAM_BIN, args: ["run", "--no-check", entryPath] } } },
+      null,
+      2,
+    );
+    return body.split("\n").join(eol) + (terminated ? eol : "");
+  }
+
+  /** A Codex config.toml whose entry is NOT the last table. When it is last,
+   *  the splice rewrites the file's tail itself and ends it in a line break;
+   *  a sibling table after it is what leaves the tail to the file. */
+  function codexToml(entryPath: string, eol: string, terminated: boolean): string {
+    const lines = [
+      "[mcp_servers.mcp]",
+      `command = ${JSON.stringify(OAM_BIN)}`,
+      `args = ["run", "--no-check", ${JSON.stringify(entryPath)}]`,
+      "startup_timeout_sec = 60.0",
+      "",
+      "[projects.'/some/repo']",
+      'trust_level = "trusted"',
+    ];
+    return lines.join(eol) + (terminated ? eol : "");
+  }
+
+  describe.each([
+    { file: "~/.claude.json", clientId: "claude-code", at: () => join(home, ".claude.json"), build: claudeJson },
+    {
+      file: "a config.toml whose entry is not the last table",
+      clientId: "codex-cli",
+      at: () => join(home, ".codex", "config.toml"),
+      build: codexToml,
+    },
+  ])("$file", ({ clientId, at, build }) => {
+    it.each(EOLS)("%s with no final line break gets exactly one, in its own line ending", async (_, eol) => {
+      const p = at();
+      mkdirSync(dirname(p), { recursive: true });
+      writeFileSync(p, build(DEAD, eol, false));
+      const healed = await heal({ env: {} });
+      expect(healed.filter((h) => h.clientId === clientId).map((h) => h.path)).toEqual([p]);
+      expect(readFileSync(p, "utf8")).toBe(build(liveEntry, eol, true));
+    });
+
+    it.each(EOLS)("%s already ending in a line break keeps exactly one", async (_, eol) => {
+      const p = at();
+      mkdirSync(dirname(p), { recursive: true });
+      writeFileSync(p, build(DEAD, eol, true));
+      const healed = await heal({ env: {} });
+      expect(healed.filter((h) => h.clientId === clientId).map((h) => h.path)).toEqual([p]);
+      expect(readFileSync(p, "utf8")).toBe(build(liveEntry, eol, true));
+    });
   });
 });

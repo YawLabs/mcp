@@ -1905,9 +1905,13 @@ function rootValueSpelling(raw: string, key: string): string | null {
  *  `raw` does not parse, `TomlSpliceRefusal` when the key is already set at
  *  the root, and `TomlVerifyError` when the result would not be exactly
  *  `raw` plus that key (see `verifyTomlRootInsert`, which every return below
- *  has passed). */
+ *  has passed). That check holds an integer `value` to an integer readback,
+ *  so an integral value this writer spells as a float -- on a `FLOAT_FIELDS`
+ *  key, or of magnitude 1e21 or more (see `rootKeyLine`) -- cannot be written
+ *  as a root default: the insert refuses it, `raw` or no `raw`, and so does
+ *  the --dry-run preview that renders the line through it. */
 export function insertTomlRootKey(raw: string | null, key: string, value: TomlRootValue): string {
-  const line = `${tomlKey(key)} = ${tomlValue(value, key)}`;
+  const line = rootKeyLine(key, value);
   if (raw === null || raw.trim() === "") {
     const fresh = line + (raw === null ? "\n" : detectTomlEol(raw));
     verifyTomlRootInsert("", fresh, key, value);
@@ -1958,14 +1962,25 @@ function rootInsertEdits(text: string, scan: TomlScan, line: string): SpanEdit[]
   return terminated({ start: at, end: at, text: line + eol });
 }
 
+/** The root `key = value` line an insert writes, spelled by the entry
+ *  renderer's own `tomlKey` / `tomlValue`. So an integral value the renderer
+ *  spells as a float is a float here too: `60` on a `FLOAT_FIELDS` key is
+ *  `60.0`, and an integer of magnitude 1e21 or more is in exponent form
+ *  (`1e+21`). `verifyTomlRootInsert` refuses an integer that reads back as a
+ *  float, so such a value cannot be written as a root default. */
+function rootKeyLine(key: string, value: TomlRootValue): string {
+  return `${tomlKey(key)} = ${tomlValue(value, key)}`;
+}
+
 /** Prove that `after` is `before` plus exactly one root key, set to `value`.
  *
  *  Four claims, each of which a misplaced line breaks: the key was NOT at the
  *  root of `before`; `after` parses; the key reads back at the root as
- *  `value` (a line that landed under a header reads as that table's key and
- *  fails here); and the rest of the document -- every other root key, every
- *  table, every server -- means what it meant (canonical JSON with that one
- *  root key dropped from both sides). Throws `TomlVerifyError`.
+ *  `value`, an integer as an integer (a line that landed under a header
+ *  reads as that table's key and fails here); and the rest of the document
+ *  -- every other root key, every table, every server -- means what it meant
+ *  (canonical JSON with that one root key dropped from both sides). Throws
+ *  `TomlVerifyError`.
  *
  *  Like `verifyTomlSplice` it compares MEANING, not bytes: byte preservation
  *  is a property of the insert touching no other line, which the byte-exact
@@ -1983,6 +1998,22 @@ export function verifyTomlRootInsert(before: string, after: string, key: string,
   if (!read.present) throw new TomlVerifyError(`the edit did not leave a top-level "${key}" behind`);
   if (JSON.stringify(canonValue(read.value)) !== JSON.stringify(canonValue(value))) {
     throw new TomlVerifyError(`the top-level "${key}" did not read back as the value written`);
+  }
+  // The TYPE as well, by the rule the write facade (`verifyEdits` in
+  // client-config.ts) and `planRootDefaults` apply, spelled the same way: an
+  // integer value reads back as an integer. A float parses to the same JS
+  // number (`0.0` and `0`), so the compare above passes it, but it is not the
+  // integer written, and a client that types the key as an integer refuses
+  // it. That includes an integral value this writer itself spells as a float
+  // (see `rootKeyLine`): it is refused here, so the insert -- and the dry-run
+  // preview, which renders its line through the insert -- refuses it, rather
+  // than pass a line the facade would refuse to write and the next run's plan
+  // would report as another value. A value that is not an integer can only
+  // read back as a float, which is what it is.
+  if (typeof value === "number" && Number.isInteger(value) && read.float !== undefined) {
+    throw new TomlVerifyError(
+      `the top-level "${key}" read back as the float ${read.float}, where the value written is an integer`,
+    );
   }
   if (canonTomlConfig(before.trim() === "" ? "" : before, [], [], [key]) !== canonTomlConfig(after, [], [], [key])) {
     throw new TomlVerifyError(`the edit changed settings other than the top-level "${key}" it was asked to add`);

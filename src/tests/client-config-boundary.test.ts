@@ -278,18 +278,50 @@ const RULES: Rule[] = [
     negative: ["map.remove(k)", "set.remove(item)", "applyClientConfigEdits(view, edits, site)"],
   },
   {
-    what: "a final line break added by hand, which ends a CRLF file in a bare LF",
+    what:
+      'a final line break added by hand after `.endsWith("\\n")` -- a `?` straight after the call, or an if whose ' +
+      "first statement assigns (`+=` or `=`) a value spelling `\\n` -- which ends a CRLF file in a bare LF",
     // `terminateWithNewline` ends a write in the file's own line ending. The
     // hand-rolled `x.endsWith("\n") ? x : x + "\n"` it replaced appended a bare
     // LF to a CRLF file with no final line break, and the settings.json grant
     // carried its own copy of that line after the client configs had moved to
     // the helper -- so the shape is a rule, not a one-off fix.
-    pattern: /\.endsWith\(\s*(["'`])\\n\1\s*\)\s*\?/,
+    //
+    // Anchored on the `.endsWith("\n")` call, then on either way of acting on
+    // it: a `?` (the ternary), or a closing paren -- the if's -- followed,
+    // braced or not, by an assignment (`+=` or `=`) whose value spells `\n`
+    // before the next `;` or line break: `if (!x.endsWith("\n")) x += "\n"`.
+    // The value has to spell `\n` so an if that assigns something else -- a
+    // line reader holding back a partial line -- is not an offender. There is
+    // deliberately no bare `+= "\n"` alternative: jsonc.ts's comment stripper
+    // appends one to keep JSON.parse's line numbers in step with the user's
+    // file, and that ends no file. Other spellings of the test
+    // (`.at(-1) === "\n"`, `/\n$/.test(x)`, `x.replace(/\n?$/, "\n")`) get past
+    // it, as the header says of a textual scan.
+    pattern: /\.endsWith\(\s*(["'`])\\n\1\s*\)\s*(?:\?|\)\s*\{?\s*[\w.]+\s*(?:\+=|=)[^;\n]*\\n)/,
     allowed: {},
-    positive: ['nextJson: next.endsWith("\\n") ? next : `${next}\\n`', "return t.endsWith('\\n') ? t : t + '\\n';"],
+    positive: [
+      'nextJson: next.endsWith("\\n") ? next : `${next}\\n`',
+      "return t.endsWith('\\n') ? t : t + '\\n';",
+      // The if-statement spellings of the same terminator.
+      'if (!next.endsWith("\\n")) next += "\\n";',
+      'if (!out.endsWith("\\n")) { out += "\\n"; }',
+      // The shape Biome leaves a braced if in: its body on a line of its own,
+      // so the whitespace after the if's closing paren has to cross a line
+      // break. In this string `\\n` is the backslash-n the rule looks for and
+      // `\n` is a real line break.
+      'if (!out.endsWith("\\n")) {\n    out += "\\n";\n  }',
+      'if (!next.endsWith("\\n")) next = `${next}\\n`;',
+    ],
     negative: [
       'return text.endsWith("\\n") || text.endsWith("\\r") ? text : text + detectLineEnding(text);',
       "nextJson: terminateWithNewline(next)",
+      // terminateWithNewline's own first line: the if after the test returns.
+      'if (text.endsWith("\\n")) return text;',
+      // jsonc.ts's comment stripper: a `+= "\n"` with no `.endsWith` in front.
+      'if (src[i] === "\\n") out += "\\n";',
+      // A line reader: the if assigns, but nothing that spells `\n`.
+      'if (!chunk.endsWith("\\n")) pending = lines.pop() ?? "";',
     ],
   },
 ];

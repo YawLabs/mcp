@@ -19,7 +19,7 @@
  * path is safe to persist ONLY because the writer can recognise its own
  * previous output and refresh it. That recognition is what makes a rewrite a
  * repair rather than a clobber, and it is the whole of the safety argument
- * here. Three gates must ALL pass before a single byte is written:
+ * here. Four gates must ALL pass before a single byte is written:
  *
  *   1. SHAPE IS OURS  -- an `oam run` launch whose entry file sits inside a
  *      `node_modules/@yawlabs/mcp/` tree. A hand-written entry, a pinned
@@ -58,6 +58,7 @@ import {
   readClientConfigFile,
   readClientEnv,
   selectSites,
+  terminateWithNewline,
 } from "./client-config.js";
 import { isReadOnlyDiagnostics } from "./config-loader.js";
 import { isForeignAbsoluteLaunch, oamRunEntryPath } from "./doctor-cmd.js";
@@ -338,8 +339,16 @@ export async function healStaleBrokerEntries(opts: HealOptions = {}): Promise<He
       if (nextEntry !== null && norm(nextEntry, platform) === norm(entryPath, platform)) return;
 
       if (opts.dryRun !== true) {
+        // Terminated the way install, try and import terminate what they
+        // write. A splice leaves the bytes outside its own span alone, so
+        // without this a file that did not end in a line break would still
+        // not end in one after a heal. terminateWithNewline adds exactly one,
+        // in the file's own line ending, and leaves a file that already ends
+        // in one as it is. Nothing compares this text by identity afterwards
+        // -- gate 2 and the check above have already decided the entry
+        // changes -- so it cannot turn a no-op into a phantom write.
         const text = applyClientConfigEdits(view, [{ op: "upsert", key: ENTRY_NAME, entry: next }], site);
-        await atomicWriteFile(site.resolved.absolute, text);
+        await atomicWriteFile(site.resolved.absolute, terminateWithNewline(text));
       }
 
       healed.push({

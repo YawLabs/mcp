@@ -566,6 +566,17 @@ describe("scanner", () => {
     expect(detectTomlEol("a = 1")).toBe("\n");
     expect(scanTomlSections(fixture("f04-crlf-bom", "input.toml")).eol).toBe("\r\n");
   });
+
+  it("reads a MIXED-ending file's line ending from its first line break, not from any CRLF in it", () => {
+    // An LF file with a CRLF block pasted in further down is an LF file: that
+    // is the core's detectLineEnding rule, which install's terminateWithNewline
+    // also applies, so the two cannot disagree about which ending a write uses.
+    // An "any CRLF anywhere means CRLF" rule would call this file CRLF.
+    expect(detectTomlEol("a = 1\nb = 2\r\n")).toBe("\n");
+    expect(scanTomlSections("a = 1\nb = 2\r\n[t]\r\nx = 1\r\n").eol).toBe("\n");
+    // The first break decides in the other direction too.
+    expect(detectTomlEol("a = 1\r\nb = 2\n")).toBe("\r\n");
+  });
 });
 
 describe("renderer", () => {
@@ -845,6 +856,16 @@ describe("upsert -- byte-exact", () => {
     });
   }
 
+  it("appends the table to a MIXED-ending file in the ending of its first line break", () => {
+    // LF first, CRLF further down: the file's ending is LF, so the blank line
+    // that separates the new table and every line of that table are LF, while
+    // the CRLF lines already there keep their CRLF.
+    const input = "a = 1\nb = 2\r\n[t]\r\nx = 1\r\n";
+    expect(upsertTomlEntry(input, CONTAINER, ENTRY, BROKER)).toBe(
+      `${input}\n${lf("[mcp_servers.mcp]", 'command = "npx"', 'args = ["-y", "@yawlabs/mcp@latest"]', "startup_timeout_sec = 60.0")}`,
+    );
+  });
+
   it("f01: renders the table on its own for a missing file", () => {
     expect(upsertTomlEntry(null, CONTAINER, ENTRY, BROKER)).toBe(fixture("f01-missing", "expected.toml"));
   });
@@ -1110,6 +1131,26 @@ describe("refusals -- the spellings a span splice will not edit", () => {
       /an inline table, which cannot gain an entry/,
     );
     expect(() => parseTomlConfig(`${input}\n[mcp_servers.mcp]\ncommand = "npx"\n`)).toThrow(TomlConfigError);
+  });
+
+  it("recognises a root inline container written with no space after `=`", () => {
+    // `mcp_servers={ ... }` is the same inline table as g09's spelling. The
+    // scanner takes the value from the byte right after the `=`, so it sees
+    // the `{`: the upsert gives the actionable refusal rather than an opaque
+    // "does not parse" from its post-write check, and the read flags the
+    // container, which is what doctor's hint comes from.
+    const input = lf('mcp_servers={ sib = { command = "node" } }', "", "[tui]", 'theme = "dark"');
+    expect(() => upsertTomlEntry(input, CONTAINER, ENTRY, BROKER)).toThrow(TomlSpliceRefusal);
+    expect(() => upsertTomlEntry(input, CONTAINER, ENTRY, BROKER)).toThrow(
+      '"mcp_servers" is an inline table, which cannot gain an entry without rewriting it -- convert it to [mcp_servers.mcp]-style tables by hand, then re-run',
+    );
+    const read = readTomlConfig(input, CONTAINER, [ENTRY]);
+    expect(read.kind).toBe("ok");
+    if (read.kind !== "ok") return;
+    expect(read.containerUnspliceable).toEqual({
+      shape: "an inline table (mcp_servers = { ... }) that a later [mcp_servers.mcp] header cannot extend",
+      fix: "convert it to [mcp_servers.mcp]-style tables by hand",
+    });
   });
 
   it("refuses a container that is not a table (f11)", () => {
@@ -2366,6 +2407,43 @@ describe("root keys -- one top-level line, added and never changed", () => {
       value: Number.POSITIVE_INFINITY,
       float: "inf",
     });
+    // A leading `+` and every spelling of nan are part of the token, so the
+    // mark is the file's own spelling, never the number's: `+0.0` is not "0",
+    // `+inf` is not "Infinity", and no nan is "NaN" -- TOML is case-sensitive,
+    // so that spelling is in no file a user could search.
+    expect(readTomlRootKey(lf(`${GRACE} = +0.0`), GRACE)).toStrictEqual({ present: true, value: 0, float: "+0.0" });
+    expect(readTomlRootKey(lf(`${GRACE} = +inf`), GRACE)).toStrictEqual({
+      present: true,
+      value: Number.POSITIVE_INFINITY,
+      float: "+inf",
+    });
+    for (const spelled of ["nan", "+nan", "-nan"]) {
+      expect(readTomlRootKey(lf(`${GRACE} = ${spelled}`), GRACE), spelled).toStrictEqual({
+        present: true,
+        value: Number.NaN,
+        float: spelled,
+      });
+    }
+    // No space after the `=`: the value starts on the very next byte.
+    expect(readTomlRootKey(lf(`${GRACE}=0.0`), GRACE)).toStrictEqual({ present: true, value: 0, float: "0.0" });
+    expect(readTomlRootKey(lf(`${GRACE}=1000.0`), GRACE)).toStrictEqual({
+      present: true,
+      value: 1000,
+      float: "1000.0",
+    });
+    // A leading BOM: the spelling is read at the scan's offset into the
+    // ORIGINAL text, BOM included, so it is right on the BOM's own line and on
+    // every root line after it.
+    expect(readTomlRootKey(`${BOM}${lf(`${GRACE} = 0.0`)}`, GRACE)).toStrictEqual({
+      present: true,
+      value: 0,
+      float: "0.0",
+    });
+    expect(readTomlRootKey(`${BOM}${lf('model = "gpt-5"', `${GRACE} = 1_000.0`)}`, GRACE)).toStrictEqual({
+      present: true,
+      value: 1000,
+      float: "1_000.0",
+    });
     // Integers, in any spelling TOML has for one, carry no mark.
     expect(readTomlRootKey(lf(GRACE_LINE), GRACE)).toStrictEqual({ present: true, value: 0 });
     expect(readTomlRootKey(lf(`${GRACE} = -0`), GRACE)).toStrictEqual({ present: true, value: 0 });
@@ -2390,6 +2468,18 @@ describe("root keys -- one top-level line, added and never changed", () => {
       "only tables, in a file that already opens on a blank line (no double blank)",
       lf("", "[tui]", 'theme = "dark"'),
       lf(GRACE_LINE, "", "[tui]", 'theme = "dark"'),
+    ],
+    // A line of spaces or a tab is blank too, so it is kept as the one blank
+    // line under the key and no second one is added.
+    [
+      "only tables, in a file that opens on a spaces-only line (no double blank)",
+      lf("  ", "[tui]", 'theme = "dark"'),
+      lf(GRACE_LINE, "  ", "[tui]", 'theme = "dark"'),
+    ],
+    [
+      "only tables, in a file that opens on a tab-only line (no double blank)",
+      lf("\t", "[tui]", 'theme = "dark"'),
+      lf(GRACE_LINE, "\t", "[tui]", 'theme = "dark"'),
     ],
     [
       "an [[array of tables]] first",
@@ -2483,6 +2573,25 @@ describe("root keys -- one top-level line, added and never changed", () => {
     expect(insertTomlRootKey(`${BOM}${lf('model = "gpt-5"')}`, GRACE, 0)).toBe(
       `${BOM}${lf('model = "gpt-5"', GRACE_LINE)}`,
     );
+    // A tables-only CRLF file that opens on a blank line keeps that line as
+    // the one blank under the key: the CR is part of a blank line, as a space
+    // or a tab is, so no second blank line is added -- after a BOM as well.
+    expect(insertTomlRootKey(crlf("", "[tui]", 'theme = "dark"'), GRACE, 0)).toBe(
+      crlf(GRACE_LINE, "", "[tui]", 'theme = "dark"'),
+    );
+    expect(insertTomlRootKey(crlf("\t", "[tui]"), GRACE, 0)).toBe(crlf(GRACE_LINE, "\t", "[tui]"));
+    expect(insertTomlRootKey(`${BOM}${crlf("", "[tui]")}`, GRACE, 0)).toBe(`${BOM}${crlf(GRACE_LINE, "", "[tui]")}`);
+  });
+
+  it("writes into a MIXED-ending file in the ending of its first line break", () => {
+    // LF first, CRLF further down: the key line is LF, and the CRLF lines
+    // around it keep their CRLF.
+    expect(insertTomlRootKey("a = 1\nb = 2\r\n[t]\r\nx = 1\r\n", GRACE, 0)).toBe(
+      `a = 1\nb = 2\r\n${GRACE_LINE}\n[t]\r\nx = 1\r\n`,
+    );
+    // Tables only, no final line break: the key line, the blank line under it
+    // and the break the unterminated last line gets are all LF.
+    expect(insertTomlRootKey("[t]\nx = 1\r\ny = 2", GRACE, 0)).toBe(`${GRACE_LINE}\n\n[t]\nx = 1\r\ny = 2\n`);
   });
 
   it("inserts into every fixture Codex loads without moving or respelling another byte", () => {
@@ -2566,6 +2675,39 @@ describe("root keys -- one top-level line, added and never changed", () => {
       `the top-level "${GRACE}" was already set before the edit`,
     );
     expect(() => verifyTomlRootInsert(before, `${before}${GRACE} = \n`, GRACE, 0)).toThrow(/does not parse as TOML/);
+  });
+
+  it("verifies the TYPE it wrote as well as the value: an integer that reads back as a float is refused", () => {
+    // The parse hands back `0.0` and `0` as the same JS number, so a value
+    // compare alone passes either -- and Codex refuses the float.
+    const before = lf('model = "gpt-5"', "", "[tui]", 'theme = "dark"');
+    for (const spelled of ["0.0", "-0.0", "0e0"]) {
+      const after = lf('model = "gpt-5"', `${GRACE} = ${spelled}`, "", "[tui]", 'theme = "dark"');
+      expect(() => verifyTomlRootInsert(before, after, GRACE, 0), spelled).toThrow(
+        `the top-level "${GRACE}" read back as the float ${spelled}, where the value written is an integer`,
+      );
+    }
+    // One rule, the write facade's and planRootDefaults': an integer value
+    // reads back as an integer -- even where this writer itself spells it as
+    // a float. A FLOAT_FIELDS key renders 60 as 60.0, and an integer of
+    // magnitude 1e21 or more renders in exponent form, so the insert refuses
+    // both rather than hand the facade a line it would refuse.
+    const TIMEOUT = "startup_timeout_sec";
+    for (const raw of [null, "", lf("[tui]")]) {
+      expect(() => insertTomlRootKey(raw, TIMEOUT, 60), String(raw)).toThrow(
+        `the top-level "${TIMEOUT}" read back as the float 60.0, where the value written is an integer`,
+      );
+    }
+    expect(() => insertTomlRootKey(null, "x", 1e21)).toThrow(
+      `the top-level "x" read back as the float 1e+21, where the value written is an integer`,
+    );
+    // The integer 60 spelled as an integer is what the rule asks for, on that
+    // key as on any other.
+    expect(() => verifyTomlRootInsert("", lf(`${TIMEOUT} = 60`), TIMEOUT, 60)).not.toThrow();
+    // A value that is not an integer is written as the float it is, and reads
+    // back as one.
+    expect(() => verifyTomlRootInsert("", lf(`${GRACE} = 0.5`), GRACE, 0.5)).not.toThrow();
+    expect(insertTomlRootKey(null, GRACE, 0.5)).toBe(lf(`${GRACE} = 0.5`));
   });
 
   it("calls that check on BOTH of its returns", () => {
