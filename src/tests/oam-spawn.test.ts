@@ -2356,7 +2356,7 @@ describe("MIN_OAM_VERSION freshness floor", () => {
   /** The ratchet. ONE literal, and the title is built from it, so the two
    *  cannot say different numbers -- the title used to name 0.13.0 while the
    *  body asserted 0.13.1. */
-  const FLOOR = "0.16.4";
+  const FLOOR = "0.17.0";
 
   it(`is at least ${FLOOR} (bump this literal when you bump the floor)`, () => {
     // POLICY (see the constant's doc): the floor is the last oam release the
