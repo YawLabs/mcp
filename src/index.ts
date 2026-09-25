@@ -326,8 +326,10 @@ if (subcommand === "compliance") {
                              you already had instead of starting empty. The
                              client keeps launching them itself until you say
                              otherwise, so this offers to remove the originals
-                             (never silently). --dry-run, --scope,
-                             --remove-originals, --keep-originals.
+                             (never silently). A server bundles.json already
+                             has in another form is asked about first, and
+                             off a terminal needs --force. --dry-run, --scope,
+                             --remove-originals, --keep-originals, --force.
     remove <slug>            Remove a server (by slug, namespace or name) from
                              bundles.json. Shows the server and the command it
                              launches, then confirms; --force skips the prompt

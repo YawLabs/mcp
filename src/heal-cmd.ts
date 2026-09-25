@@ -133,8 +133,10 @@ export async function runHeal(
   let printed = false;
   if (options.quiet !== true) {
     if (healed.length === 0) {
-      // Only when the sweep found nothing at all: a stale entry it could not
-      // re-point is reported below, and this line would contradict it.
+      // Only when the sweep found no stale entry, re-pointed or not: a stale
+      // entry it could not re-point is reported below, and this line would
+      // contradict it. (A config it could not check at all is listed below
+      // too, and does not suppress this line.)
       if (failed.length === 0) {
         process.stdout.write("No stale yaw-mcp entries found.\n");
         printed = true;

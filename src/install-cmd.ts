@@ -4144,7 +4144,9 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
   // inside an inline `mcp_servers = { ... }`). Such a read carries no
   // entries, so the walk below found nothing and this run printed "Nothing to
   // do: ... has no yaw-mcp entry" at exit 0 -- over an entry doctor and
-  // --list both report, and that the client goes on launching. The write
+  // --list both report, and that Codex goes on launching (an array of tables
+  // is the exception: Codex will not load a file that writes the entry that
+  // way, so it launches nothing from it). The write
   // facade refuses every edit to it, so the run cannot remove it either: it
   // says so, with the adapter's by-hand step (the one doctor prints for the
   // same file), exit 1 and nothing written, like the malformed refusal above

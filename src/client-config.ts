@@ -356,8 +356,11 @@ export interface EntryView {
  *  document whose root is not a map (a JSON array, a scalar) and so has no
  *  place to put a container; `"encoding"` is a file whose bytes are not text
  *  in the encoding its syntax requires -- a TOML file that is not UTF-8 (see
- *  `decodeClientConfigBytes`) -- so no parser ran at all. Every consumer words
- *  `"encoding"` as it words `"syntax"`: "is not valid <syntax> (<detail>)". */
+ *  `decodeClientConfigBytes`) -- so no parser ran at all. The commands that
+ *  refuse the file (install, uninstall, import, try) word `"encoding"` as they
+ *  word `"syntax"`: "is not valid <syntax> (<detail>)". doctor prints
+ *  "exists but <syntax> is malformed", and adds the detail only for
+ *  `"encoding"`. */
 export type MalformedReason = "syntax" | "root" | "encoding";
 
 /** Everything reading one client config file can conclude, in one union.
@@ -1151,11 +1154,11 @@ export function firstInvalidUtf8Offset(bytes: Uint8Array): number {
  *  anything the splice touched, and report success over.
  *
  *  TOML: the spec requires it ("A TOML file must be a valid UTF-8 encoded
- *  Unicode document"), and Codex will not load a config.toml that is not --
- *  measured on 0.144.0, `codex mcp list` over `model = "o3<FF><FE>"` exits 1
- *  with "Failed to read config file <path>: invalid utf-8 sequence of 1 bytes
- *  from index 11". So a refusal costs the user nothing their client was
- *  reading.
+ *  Unicode document"), and Codex will not load a config.toml that is not
+ *  (S8 in target-codex-cli.ts: measured on 0.144.0, `codex mcp list` over
+ *  `model = "o3<FF><FE>"` exits 1 with "Failed to read config file <path>:
+ *  invalid utf-8 sequence of 1 bytes from index 11"). So a refusal costs the
+ *  user nothing their client was reading.
  *
  *  The JSON family is decoded as it always has been: an invalid sequence
  *  becomes U+FFFD, and a write carries that U+FFFD back to disk. That is the
