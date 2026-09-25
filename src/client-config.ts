@@ -354,8 +354,11 @@ export interface EntryView {
 
 /** Why a file did not parse. `"syntax"` is the parser's refusal; `"root"` is a
  *  document whose root is not a map (a JSON array, a scalar) and so has no
- *  place to put a container. */
-export type MalformedReason = "syntax" | "root";
+ *  place to put a container; `"encoding"` is a file whose bytes are not text
+ *  in the encoding its syntax requires -- a TOML file that is not UTF-8 (see
+ *  `decodeClientConfigBytes`) -- so no parser ran at all. Every consumer words
+ *  `"encoding"` as it words `"syntax"`: "is not valid <syntax> (<detail>)". */
+export type MalformedReason = "syntax" | "root" | "encoding";
 
 /** Everything reading one client config file can conclude, in one union.
  *
@@ -911,7 +914,11 @@ export function findLegacyKey(keys: readonly string[]): string | null {
 export interface ClientConfigView {
   /** What the file is. */
   readonly read: ConfigRead;
-  /** The bytes, or null when there is no file. */
+  /** The file's text, or null when there is no file. One exception: for a
+   *  file refused as not UTF-8 (`malformed` with reason `"encoding"`) it is
+   *  the text with every invalid sequence decoded as U+FFFD, so it is NOT the
+   *  file's bytes -- which is why nothing may be written from it, and the
+   *  write facade refuses every edit to a `malformed` read. */
   readonly raw: string | null;
   /** The address the entries were read at -- the one a write goes to. */
   readonly address: EntryAddress;
@@ -1080,10 +1087,146 @@ export function siteAt(site: ConfigSite, containerPath: readonly string[]): Conf
   return { ...site, resolved: { ...site.resolved, containerPath: [...containerPath] } };
 }
 
+/** The offset of the first byte of `bytes` that does not begin a well-formed
+ *  UTF-8 sequence, or -1 when every byte belongs to one.
+ *
+ *  "Well-formed" is the Unicode definition (Table 3-7 of the standard), which
+ *  is what a strict decoder -- `new TextDecoder("utf-8", { fatal: true })`,
+ *  Rust's `str::from_utf8` -- accepts: no overlong form (C0, C1, E0 80-9F,
+ *  F0 80-8F), no surrogate (ED A0-BF), nothing past U+10FFFF (F4 90-BF,
+ *  F5-FF), no stray continuation byte, no sequence cut short by another byte
+ *  or by the end of the input. The offset is where the bad SEQUENCE starts --
+ *  its lead byte -- which is the index Codex's own refusal names ("invalid
+ *  utf-8 sequence of 1 bytes from index 11"), so the two point at one byte.
+ *
+ *  A scan of our own rather than a fatal TextDecoder because the decoder only
+ *  says THAT the input is bad; the offset is what lets the refusal point at
+ *  the byte. The test pins the two to agree. */
+export function firstInvalidUtf8Offset(bytes: Uint8Array): number {
+  let i = 0;
+  while (i < bytes.length) {
+    const lead = bytes[i];
+    if (lead < 0x80) {
+      i++;
+      continue;
+    }
+    // How many continuation bytes follow this lead, and the range the FIRST
+    // of them must fall in. The narrowed ranges are what rule out overlong
+    // forms, surrogates and code points past U+10FFFF; every later
+    // continuation byte is plain 80-BF.
+    let follow: number;
+    let low = 0x80;
+    let high = 0xbf;
+    if (lead >= 0xc2 && lead <= 0xdf) follow = 1;
+    else if (lead === 0xe0) {
+      follow = 2;
+      low = 0xa0;
+    } else if (lead === 0xed) {
+      follow = 2;
+      high = 0x9f;
+    } else if (lead >= 0xe1 && lead <= 0xef) follow = 2;
+    else if (lead === 0xf0) {
+      follow = 3;
+      low = 0x90;
+    } else if (lead === 0xf4) {
+      follow = 3;
+      high = 0x8f;
+    } else if (lead >= 0xf1 && lead <= 0xf3) follow = 3;
+    // 80-BF with no lead before it, C0/C1 (always overlong) and F5-FF (past
+    // U+10FFFF, or no UTF-8 lead at all).
+    else return i;
+    if (i + follow >= bytes.length) return i;
+    if (bytes[i + 1] < low || bytes[i + 1] > high) return i;
+    for (let k = 2; k <= follow; k++) {
+      if (bytes[i + k] < 0x80 || bytes[i + k] > 0xbf) return i;
+    }
+    i += follow + 1;
+  }
+  return -1;
+}
+
+/** Whether a format's files must be UTF-8, so that a read REFUSES bytes that
+ *  are not, rather than decoding each bad sequence to U+FFFD -- which the next
+ *  write would carry back to disk in place of the user's own bytes, far from
+ *  anything the splice touched, and report success over.
+ *
+ *  TOML: the spec requires it ("A TOML file must be a valid UTF-8 encoded
+ *  Unicode document"), and Codex will not load a config.toml that is not --
+ *  measured on 0.144.0, `codex mcp list` over `model = "o3<FF><FE>"` exits 1
+ *  with "Failed to read config file <path>: invalid utf-8 sequence of 1 bytes
+ *  from index 11". So a refusal costs the user nothing their client was
+ *  reading.
+ *
+ *  The JSON family is decoded as it always has been: an invalid sequence
+ *  becomes U+FFFD, and a write carries that U+FFFD back to disk. That is the
+ *  same loss, but refusing those files would change what install, uninstall,
+ *  try, import and heal do for every JSON client, so it is its own decision
+ *  and is not made here. */
+function mustBeUtf8(format: ConfigFormat): boolean {
+  switch (format) {
+    case "toml":
+      return true;
+    case "json":
+    case "jsonc":
+      return false;
+    default: {
+      const _exhaustive: never = format;
+      return _exhaustive;
+    }
+  }
+}
+
+/** A client config's bytes as the text its adapter classifies.
+ *
+ *  `text` is always the file decoded as UTF-8, a leading BOM KEPT as U+FEFF
+ *  -- exactly what `readFile(path, "utf8")` returns, which is how every read
+ *  here decoded before this function existed, so a file that is valid UTF-8
+ *  reads byte-for-byte as it always did (each adapter handles its own BOM).
+ *  `malformed` is null unless the format must be UTF-8 (`mustBeUtf8`) and the
+ *  bytes are not; then it is the read to report INSTEAD of classifying
+ *  `text`, whose U+FFFD characters are the decoder's, not the user's.
+ *
+ *  Exported, and sync, so a reader that does its own IO can decode the bytes
+ *  the one way `readClientConfigFile` does. */
+export function decodeClientConfigBytes(
+  bytes: Uint8Array,
+  format: ConfigFormat,
+): { text: string; malformed: Extract<ConfigRead, { kind: "malformed" }> | null } {
+  const buffer = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const text = buffer.toString("utf8");
+  if (!mustBeUtf8(format)) return { text, malformed: null };
+  const bad = firstInvalidUtf8Offset(bytes);
+  if (bad === -1) return { text, malformed: null };
+  const syntax = syntaxNameFor(format);
+  // Everything before the bad sequence is well-formed, so it decodes to the
+  // same characters on its own as it does at the head of `text`: its length is
+  // where the bad sequence sits in `text`, and the line and column follow.
+  const valid = buffer.subarray(0, bad).toString("utf8");
+  return {
+    text,
+    malformed: {
+      kind: "malformed",
+      syntax,
+      reason: "encoding",
+      // The BYTE offset belongs in the detail and the position does not: the
+      // facade's refusal adds " at line L column C" from `position` itself,
+      // while install, uninstall, import and try print the detail alone.
+      detail: `invalid UTF-8 at byte offset ${bad}, and a ${syntax} file must be UTF-8 -- re-save the file as UTF-8`,
+      position: positionAt(text, valid.length),
+    },
+  };
+}
+
 export interface ReadSeam {
-  /** Reads the file's bytes. The seam doctor's probe already has, kept so its
-   *  EBUSY and EISDIR tests keep working. */
-  readFile?: (path: string) => Promise<string>;
+  /** Reads the file. The seam doctor's probe already has, kept so its EBUSY
+   *  and EISDIR tests keep working.
+   *
+   *  The default returns the BYTES, and `decodeClientConfigBytes` turns them
+   *  into text -- which is what lets a TOML file that is not UTF-8 be refused
+   *  instead of read as U+FFFD. A seam that returns a string hands over text
+   *  that is already decoded, so no UTF-8 check applies to it; return a
+   *  Uint8Array to exercise that check. */
+  readFile?: (path: string) => Promise<string | Uint8Array>;
 }
 
 /** Read and classify one site's file, owning the IO.
@@ -1092,15 +1235,22 @@ export interface ReadSeam {
  *  has no file, and that is the ordinary case. Every other errno is
  *  `unreadable` WITH its code, so a caller can tell a directory at the path
  *  (EISDIR) or an AV scanner holding the handle (EBUSY) from a syntax error
- *  the user would otherwise be sent to fix. */
+ *  the user would otherwise be sent to fix.
+ *
+ *  A file its format requires to be UTF-8 (TOML) that is not is `malformed`
+ *  with reason `"encoding"`, never classified. install, uninstall, try, import
+ *  and heal read through here and already stop on a `malformed` read -- the
+ *  first four refuse with exit 1, heal lists the file as one it could not
+ *  check -- so none of them writes the U+FFFD a lenient decode would have put
+ *  in place of the user's bytes. */
 export async function readClientConfigFile(
   site: ConfigSite,
   opts: ClassifyOptions & ReadSeam = {},
 ): Promise<ClientConfigView> {
-  const load = opts.readFile ?? ((path: string) => readFile(path, "utf8"));
-  let raw: string;
+  const load = opts.readFile ?? ((path: string) => readFile(path));
+  let loaded: string | Uint8Array;
   try {
-    raw = await load(site.resolved.absolute);
+    loaded = await load(site.resolved.absolute);
   } catch (err) {
     const code = (err as { code?: unknown } | null)?.code;
     if (code === "ENOENT") return classifyClientConfig(null, site, opts);
@@ -1111,7 +1261,16 @@ export async function readClientConfigFile(
     };
     return makeView(read, null, addressOf(site), 0, adapterFor(site.format), opts);
   }
-  return classifyClientConfig(raw, site, opts);
+  if (typeof loaded === "string") return classifyClientConfig(loaded, site, opts);
+  const decoded = decodeClientConfigBytes(loaded, site.format);
+  if (decoded.malformed === null) return classifyClientConfig(decoded.text, site, opts);
+  // Addressed the way `classifyClientConfig` addresses a read it cannot
+  // classify further: the first candidate container, index 0.
+  const address: EntryAddress = {
+    format: site.format,
+    containerPath: opts.containerPaths?.[0] ?? site.resolved.containerPath,
+  };
+  return makeView(decoded.malformed, decoded.text, address, 0, adapterFor(site.format), opts);
 }
 
 // ---------------------------------------------------------------------------

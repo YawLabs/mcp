@@ -1206,11 +1206,13 @@ describe("runTryCleanup", () => {
     expect(cap.text()).toMatch(/nothing to do/);
   });
 
-  it("warns rather than silently skipping the peel when the client file is valid JSON but not an object", async () => {
+  it("fails, keeping the marker, when the client file is valid JSON but not an object", async () => {
     // Mirror of the GC case: a JSON array has no container for removeJsoncEntry
     // to name the entry in, so no peel is possible. Skipping that in SILENCE
     // and then printing "cleaned up" is the false all-clear over a plaintext
-    // credential that gcExpiredTrials was fixed to refuse.
+    // credential that gcExpiredTrials was fixed to refuse -- and so was the
+    // warn-then-drop-the-marker this test used to pin: the marker is the only
+    // thing on disk that names the entry, so a failed peel keeps it.
     mkdirSync(trialsDir(synthHome), { recursive: true });
     const clientPath = join(synthHome, ".claude.json");
     writeFileSync(clientPath, "[]\n");
@@ -1235,16 +1237,18 @@ describe("runTryCleanup", () => {
       out: cap.pushOut,
       err: cap.pushErr,
     });
-    expect(r.exitCode).toBe(0);
+    expect(r.exitCode).toBe(1);
     expect(r.written).toEqual([]);
     expect(cap.errText()).toMatch(/couldn't strip yaw-mcp-try-demo/);
     expect(cap.errText()).toContain("is not a JSON object");
+    expect(cap.errText()).toContain("the trial marker was kept");
+    expect(cap.errText()).toContain("then re-run: yaw-mcp try-cleanup demo");
+    expect(cap.text()).not.toMatch(/cleaned up/);
     // Nothing to peel means nothing written -- the file is left as found.
     expect(readFileSync(clientPath, "utf8")).toBe("[]\n");
-    // Unlike doctor's GC (which keeps the marker so the next sweep retries),
-    // the user-initiated cleanup still drops it -- the warning above is what
-    // stops that from reading as a clean sweep.
-    expect(existsSync(trialMarkerPath("demo", synthHome))).toBe(false);
+    // Kept, as doctor's GC keeps it, so a re-run after the file is fixed
+    // still has something naming the entry.
+    expect(existsSync(trialMarkerPath("demo", synthHome))).toBe(true);
   });
 });
 
@@ -2038,12 +2042,14 @@ describe("runTry — auto-detected client (no --client)", () => {
     expect(existsSync(join(synthHome, ".claude.json"))).toBe(false);
   });
 
-  describe("auto-detect does not pick a non-JSON client file (trial markers cannot peel TOML yet)", () => {
-    // A trial marker records no syntax and peels as jsonc, so a trial written
-    // into ~/.codex/config.toml could never be cleaned up by try-cleanup or
-    // doctor's trial GC. Now that the probe reads that file as a valid TOML
-    // config -- and so as a usable slot -- auto-detect has to keep to
-    // JSON-family files on its own. An explicit --client is a separate matter.
+  describe("auto-detect does not pick a non-JSON client file", () => {
+    // The probe reads ~/.codex/config.toml as a valid TOML config -- and so as
+    // a usable slot -- but auto-detect keeps to JSON-family files. This
+    // yaw-mcp cleans a TOML trial up (the marker records the file's syntax;
+    // see the codex-cli trial group below), while an older one reading the
+    // same marker peels it as JSON and cannot, and lifting the filter would
+    // change which client an existing user's `try` picks. An explicit
+    // --client codex-cli is a separate matter.
     const seedCodex = (): { path: string; bytes: string } => {
       const bytes = readFileSync(join(import.meta.dirname, "fixtures", "codex", "f05-identical", "input.toml"), "utf8");
       mkdirSync(join(synthHome, ".codex"), { recursive: true });
@@ -3009,5 +3015,197 @@ describe("runTry -- optional env vars", () => {
     expect(r.exitCode).toBe(0);
     expect(cap.text()).toMatch(/env keys:\s+FOO_TOKEN \(optional\), LOG_LEVEL\b/);
     expect(cap.text()).not.toContain("given");
+  });
+});
+
+// A trial marker used to record no syntax, and every peel read the client file
+// as JSON. For a Codex trial that failed to parse config.toml -- after which
+// try-cleanup deleted the marker anyway and printed "cleaned up" with exit 0,
+// leaving the entry wired in with nothing on disk naming it, and doctor's
+// sweep failed the same way on every run. The marker now records the file's
+// syntax, and a failed peel keeps the marker.
+describe("codex-cli trials -- cleanup reads config.toml as TOML", () => {
+  const codexPath = (): string => join(synthHome, ".codex", "config.toml");
+  // The user's own content, in CRLF: a top-level key and a sibling server, so a
+  // peel that rewrote anything but the trial's table -- or turned a line
+  // ending -- shows up as a byte difference.
+  const USER_TOML = [
+    'model = "o3"',
+    "",
+    "[mcp_servers.other]",
+    'command = "other-server"',
+    'args = ["--flag"]',
+    "",
+  ].join("\r\n");
+
+  function seedCodex(): void {
+    mkdirSync(join(synthHome, ".codex"), { recursive: true });
+    writeFileSync(codexPath(), USER_TOML, "utf8");
+  }
+
+  async function wireCodexTrial(): Promise<void> {
+    seedCodex();
+    const cap = captureIO();
+    const r = await runTry({
+      slug: "demo",
+      clientId: "codex-cli",
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      // No CODEX_HOME: the trial goes to <home>/.codex/config.toml.
+      env: {},
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => SAMPLE,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(readFileSync(codexPath(), "utf8")).toContain("[mcp_servers.yaw-mcp-try-demo]");
+  }
+
+  const readMarker = (): TrialMarker =>
+    JSON.parse(readFileSync(trialMarkerPath("demo", synthHome), "utf8")) as TrialMarker;
+
+  it("records the syntax of the file the entry went into on the marker", async () => {
+    await wireCodexTrial();
+    expect(readMarker().format).toBe("toml");
+    expect(readMarker().clientPath).toBe(codexPath());
+
+    // A JSON-family client records its own syntax, not TOML's.
+    const cap = captureIO();
+    const r = await runTry({
+      slug: "other",
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      env: {},
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => ({ ...SAMPLE, slug: "other" }),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.marker?.format).toBe("jsonc");
+  });
+
+  it("try-cleanup --force removes the entry, keeps the rest byte for byte (CRLF too), and deletes the marker", async () => {
+    await wireCodexTrial();
+
+    const cap = captureIO();
+    const r = await runTryCleanup({ slug: "demo", home: synthHome, force: true, out: cap.pushOut, err: cap.pushErr });
+
+    expect(cap.errText()).toBe("");
+    expect(r.exitCode).toBe(0);
+    expect(r.written).toEqual([codexPath()]);
+    expect(cap.text()).toContain(`Removed yaw-mcp-try-demo from ${codexPath()}`);
+    expect(cap.text()).toContain('Trial for "demo" cleaned up.');
+    expect(readFileSync(codexPath(), "utf8")).toBe(USER_TOML);
+    expect(existsSync(trialMarkerPath("demo", synthHome))).toBe(false);
+  });
+
+  it("still peels config.toml for a marker written before the format field existed", async () => {
+    // Every marker an earlier release wrote lacks `format`; its syntax comes
+    // from the file name. Guessing JSON for it is the bug this group pins.
+    await wireCodexTrial();
+    const legacy: Partial<TrialMarker> = readMarker();
+    delete legacy.format;
+    writeFileSync(trialMarkerPath("demo", synthHome), JSON.stringify(legacy));
+
+    const cap = captureIO();
+    const r = await runTryCleanup({ slug: "demo", home: synthHome, force: true, out: cap.pushOut, err: cap.pushErr });
+
+    expect(cap.errText()).toBe("");
+    expect(r.exitCode).toBe(0);
+    expect(readFileSync(codexPath(), "utf8")).toBe(USER_TOML);
+    expect(existsSync(trialMarkerPath("demo", synthHome))).toBe(false);
+  });
+
+  it("a peel that fails keeps the marker, exits 1 and names the next step -- which then works", async () => {
+    await wireCodexTrial();
+    const wired = readFileSync(codexPath(), "utf8");
+    // A line no TOML parser accepts, so the file cannot be read at all.
+    const broken = `${wired}this is not toml\r\n`;
+    writeFileSync(codexPath(), broken, "utf8");
+
+    const cap = captureIO();
+    const r = await runTryCleanup({ slug: "demo", home: synthHome, force: true, out: cap.pushOut, err: cap.pushErr });
+
+    expect(r.exitCode).toBe(1);
+    expect(r.written).toEqual([]);
+    expect(cap.errText()).toContain(`yaw-mcp try-cleanup: couldn't strip yaw-mcp-try-demo from ${codexPath()} (`);
+    expect(cap.errText()).toContain("-- it may still be wired in, so the trial marker was kept.");
+    expect(cap.errText()).toContain("then re-run: yaw-mcp try-cleanup demo");
+    expect(cap.text()).not.toMatch(/cleaned up/);
+    expect(existsSync(trialMarkerPath("demo", synthHome))).toBe(true);
+    expect(readFileSync(codexPath(), "utf8")).toBe(broken);
+
+    // The step it names: fix the file, re-run.
+    writeFileSync(codexPath(), wired, "utf8");
+    const cap2 = captureIO();
+    const r2 = await runTryCleanup({
+      slug: "demo",
+      home: synthHome,
+      force: true,
+      out: cap2.pushOut,
+      err: cap2.pushErr,
+    });
+    expect(r2.exitCode).toBe(0);
+    expect(readFileSync(codexPath(), "utf8")).toBe(USER_TOML);
+    expect(existsSync(trialMarkerPath("demo", synthHome))).toBe(false);
+  });
+
+  it("doctor's expired-trial sweep removes a codex trial from config.toml", async () => {
+    await wireCodexTrial();
+    const expired = { ...readMarker(), expiresAt: Date.now() - 1000 };
+    writeFileSync(trialMarkerPath("demo", synthHome), JSON.stringify(expired));
+
+    const gc = await gcExpiredTrials({ home: synthHome });
+
+    expect(gc.failures).toEqual([]);
+    expect(gc.cleared).toBe(1);
+    expect(readFileSync(codexPath(), "utf8")).toBe(USER_TOML);
+    expect(existsSync(trialMarkerPath("demo", synthHome))).toBe(false);
+  });
+
+  it("re-running try for another client peels the previous codex trial out of config.toml", async () => {
+    // The third peel site: step 6b, which reclaims the entry the slug's
+    // previous marker names before that marker is overwritten.
+    await wireCodexTrial();
+    const common = {
+      slug: "demo",
+      clientId: "claude-code" as const,
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux" as const,
+      env: {},
+      fetchExplore: async (): Promise<ExploreServerResponse> => SAMPLE,
+    };
+
+    const preview = captureIO();
+    await runTry({ ...common, dryRun: true, out: preview.pushOut, err: preview.pushErr });
+    expect(preview.text()).toContain(`would remove: the previous demo trial (yaw-mcp-try-demo) from ${codexPath()}`);
+
+    const cap = captureIO();
+    const r = await runTry({ ...common, out: cap.pushOut, err: cap.pushErr });
+    expect(r.exitCode).toBe(0);
+    expect(cap.errText()).not.toMatch(/couldn't remove the previous/);
+    expect(cap.text()).toContain(`Removed the previous demo trial (yaw-mcp-try-demo) from ${codexPath()}`);
+    expect(readFileSync(codexPath(), "utf8")).toBe(USER_TOML);
+  });
+
+  it("refuses a marker recording a format this build cannot read, rather than guessing one", async () => {
+    await wireCodexTrial();
+    const wired = readFileSync(codexPath(), "utf8");
+    writeFileSync(trialMarkerPath("demo", synthHome), JSON.stringify({ ...readMarker(), format: "yaml" }));
+
+    const cap = captureIO();
+    const r = await runTryCleanup({ slug: "demo", home: synthHome, force: true, out: cap.pushOut, err: cap.pushErr });
+
+    expect(r.exitCode).toBe(1);
+    expect(cap.errText()).toContain('records a config format this yaw-mcp cannot read ("yaml")');
+    expect(existsSync(trialMarkerPath("demo", synthHome))).toBe(true);
+    expect(readFileSync(codexPath(), "utf8")).toBe(wired);
+    // The GC's scan refuses it the same way: surfaced for the user, not swept.
+    const scan = await scanTrials({ home: synthHome });
+    expect(scan.malformed).toEqual([trialMarkerPath("demo", synthHome)]);
   });
 });

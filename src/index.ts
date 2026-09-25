@@ -270,6 +270,11 @@ if (subcommand === "compliance") {
                              aggregator into the client; it does NOT add a
                              server (for that, see \`add\` below). <client> is
                              one of: ${wrapHelpList(clientChoices("install"))}.
+                             For codex-cli it also adds
+                             mcp_optional_startup_grace_ms = 0 to config.toml
+                             when the file lacks it, even on a re-run over an
+                             entry that is already correct, and leaves a value
+                             you set alone (\`install --help\` has the rest).
     install --list           Show every MCP client config location on this
                              machine and whether yaw-mcp is wired into each.
                              The STATUS column is about YAW-MCP, not about the
@@ -293,8 +298,14 @@ if (subcommand === "compliance") {
                              \`installed\` or \`legacy\` row can add \`(other
                              drive case)\`, for a Claude Code local-scope entry
                              an older version left under the other
-                             drive-letter spelling of this directory
-                             (read-only; no writes).
+                             drive-letter spelling of this directory. An
+                             \`installed\` row can also add \`(setting
+                             missing)\` or \`(setting refused)\`: its file
+                             lacks a top-level setting install adds (Codex
+                             CLI's mcp_optional_startup_grace_ms), or sets it
+                             to a value the client will not load, and a note
+                             under the table says what to do. Read-only; no
+                             writes.
     install --all            Install into every client yaw-mcp supports on this
                              OS. It plans from that list, not from a probe of
                              what you have installed (--list is the detecting

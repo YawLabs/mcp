@@ -1,7 +1,8 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { atomicWriteFile } from "../atomic-write.js";
 import {
   type HealedEntry,
   type HealResult,
@@ -9,6 +10,7 @@ import {
   maybeHealStaleBrokerEntries,
 } from "../heal-entries.js";
 import { MIN_OAM_VERSION, type OamProbe } from "../oam-spawn.js";
+import { describeWriteFailure } from "../write-failure.js";
 
 /** An oam that is installed and healthy, at a path we never have to create:
  *  buildLaunchEntry only requires the string be absolute. The version is
@@ -344,7 +346,7 @@ describe("maybeHealStaleBrokerEntries -- YAW_MCP_AUTO_HEAL", () => {
     const p = writeCodexConfig(tomlEntry(DEAD));
     const before = readFileSync(p, "utf8");
     const r = await maybeHeal({ YAW_MCP_AUTO_HEAL: value });
-    expect(r).toEqual({ healed: [], unhealable: [] });
+    expect(r).toEqual({ healed: [], unhealable: [], failed: [] });
     expect(readFileSync(p, "utf8")).toBe(before);
   });
 
@@ -553,6 +555,148 @@ describe("healStaleBrokerEntries -- the file's final line break", () => {
       const healed = await heal({ env: {} });
       expect(healed.filter((h) => h.clientId === clientId).map((h) => h.path)).toEqual([p]);
       expect(readFileSync(p, "utf8")).toBe(build(liveEntry, eol, true));
+    });
+  });
+});
+
+/** The errno node raises when atomicWriteFile's publish rename is refused --
+ *  what a read-only config.toml produces on Windows: the code, the call, the
+ *  temp sibling it renamed from and the file it renamed onto, and a message
+ *  naming both. Thrown through the `writeConfig` seam, because a read-only
+ *  file fails that rename only on Windows; the real read-only run is in
+ *  heal-cmd.test.ts. */
+function renameRefused(file: string): NodeJS.ErrnoException {
+  const tmp = `${file}.tmp-4242-1790344914194-1`;
+  // `dest` is on node's rename errors but not on the ErrnoException type.
+  const e = new Error(`EPERM: operation not permitted, rename '${tmp}' -> '${file}'`) as NodeJS.ErrnoException & {
+    dest?: string;
+  };
+  e.code = "EPERM";
+  e.syscall = "rename";
+  e.path = tmp;
+  e.dest = file;
+  return e;
+}
+
+describe("healStaleBrokerEntries -- a rewrite that does not land", () => {
+  // The sweep used to catch a failed write, log it, and carry on as if the
+  // file had held nothing stale: `yaw-mcp heal` over a read-only config.toml
+  // said "No stale yaw-mcp entries found." and exited 0, and --json reported
+  // healed [] and unhealable [], straight after the dry run had said "Would
+  // re-point 1 stale entry". Every case runs with `env: {}`, so an ambient
+  // CLAUDE_CONFIG_DIR or CODEX_HOME cannot send a write to a real file.
+
+  it("reports a write the disk refused under `failed`, in describeWriteFailure's words, never as healed", async () => {
+    const p = writeCodexConfig(tomlEntry(DEAD));
+    const before = readFileSync(p, "utf8");
+    const err = renameRefused(p);
+    const r = await healResult({
+      env: {},
+      writeConfig: async () => {
+        throw err;
+      },
+    });
+    expect(r.healed.filter((h) => h.clientId === "codex-cli")).toEqual([]);
+    const failed = r.failed.filter((f) => f.clientId === "codex-cli");
+    // One row, not two: the user and project scopes alias this file (cwd is
+    // home), and the dedupe covers a failed rewrite as it covers a repair.
+    expect(failed).toEqual([
+      { clientId: "codex-cli", scope: "user", path: p, from: DEAD, to: liveEntry, error: describeWriteFailure(p, err) },
+    ]);
+    // The file the user knows, never the temp sibling node's message named.
+    expect(failed[0].error.startsWith(`failed to write ${p}: `)).toBe(true);
+    expect(failed[0].error).not.toContain(".tmp-");
+    expect(readFileSync(p, "utf8")).toBe(before);
+  });
+
+  it("still re-points the configs after the one whose write fails", async () => {
+    // The failing file is the one the sweep reaches FIRST -- Claude Code's row
+    // comes before Codex's -- so a sweep that stopped at a failure would leave
+    // the Codex entry dead too.
+    const codexPath = writeCodexConfig(tomlEntry(DEAD));
+    const claudePath = join(home, ".claude.json");
+    writeFileSync(
+      claudePath,
+      JSON.stringify({ mcpServers: { mcp: { command: OAM_BIN, args: ["run", "--no-check", DEAD] } } }, null, 2),
+    );
+    const r = await healResult({
+      env: {},
+      writeConfig: async (path: string, text: string) => {
+        if (path === claudePath) throw renameRefused(claudePath);
+        await atomicWriteFile(path, text);
+      },
+    });
+    expect(r.failed.map((f) => f.path)).toEqual([claudePath]);
+    expect(r.healed.map((h) => h.path)).toEqual([codexPath]);
+    expect(readFileSync(claudePath, "utf8")).toContain("2.1.2");
+    expect(readFileSync(codexPath, "utf8")).not.toContain("2.1.2");
+  });
+
+  it("reports an edit the file refuses under `failed` -- in the dry run too, which used to promise the repair", async () => {
+    // Cline's shared file is strict JSON, so a trailing comma makes it a file
+    // Cline cannot load, and the write gate refuses to splice into it. The dry
+    // run used to skip that gate and list the entry as one it would re-point,
+    // and the live run then logged the refusal and reported nothing at all.
+    const shared = join(home, ".cline", "data", "settings", "cline_mcp_settings.json");
+    mkdirSync(dirname(shared), { recursive: true });
+    const text = `{\n  "mcpServers": {\n    "mcp": ${JSON.stringify({ command: OAM_BIN, args: ["run", "--no-check", DEAD] })},\n  }\n}\n`;
+    writeFileSync(shared, text);
+    for (const dryRun of [true, false]) {
+      const r = await healResult({ env: {}, os: "linux", dryRun });
+      expect(r.healed.filter((h) => h.clientId === "cline")).toEqual([]);
+      const failed = r.failed.filter((f) => f.clientId === "cline");
+      expect(failed.map((f) => [f.path, f.from])).toEqual([[shared, DEAD]]);
+      expect(failed[0].error).toMatch(
+        /^failed to splice the "mcp" entry into .+ \(.+has comments or trailing commas.+refusing to write into it; remove the comments and trailing commas, or move the file aside, then re-run\)$/,
+      );
+    }
+    expect(readFileSync(shared, "utf8")).toBe(text);
+  });
+});
+
+describe("maybeHealStaleBrokerEntries -- a rewrite that does not land", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+  });
+
+  it("logs the same clause once and resolves -- the serve path never rejects over it", async () => {
+    // Unset, so the default threshold (info) lets the warn through.
+    vi.stubEnv("LOG_LEVEL", undefined);
+    const lines: string[] = [];
+    vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => {
+      if (typeof chunk === "string") lines.push(chunk);
+      return true;
+    });
+    const p = writeCodexConfig(tomlEntry(DEAD));
+    const err = renameRefused(p);
+    const r = await maybeHealStaleBrokerEntries({
+      home,
+      cwd: home,
+      env: {},
+      oamProbe: probe,
+      resolveOamEntry: () => liveEntry,
+      writeConfig: async () => {
+        throw err;
+      },
+    });
+    expect(r.failed.map((f) => f.path)).toEqual([p]);
+    // The module-default log surface is the server's: one JSON record a line.
+    const records = lines
+      .map((line) => {
+        try {
+          return JSON.parse(line) as Record<string, unknown>;
+        } catch {
+          return null;
+        }
+      })
+      .filter((rec) => rec !== null && rec.msg === "Could not heal a stale yaw-mcp entry");
+    expect(records).toHaveLength(1);
+    expect(records[0]).toMatchObject({
+      level: "warn",
+      client: "codex-cli (user)",
+      path: p,
+      error: describeWriteFailure(p, err),
     });
   });
 });

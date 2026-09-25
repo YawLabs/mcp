@@ -31,7 +31,12 @@
 //   2  warnings (e.g., schema-version mismatch, a retired `token` /
 //      `apiBase` key still sitting in a config file, a client config that
 //      is malformed / unreadable or whose entry cannot launch yaw-mcp --
-//      see clientLaunchWarnings). One unreadable state stays at exit 0: a
+//      which includes an entry in a file whose client refuses to load it
+//      over a top-level setting, Codex's `mcp_optional_startup_grace_ms` at
+//      -1 or 0.0 -- see clientLaunchWarnings). A top-level setting that is
+//      merely MISSING (that same key, in a config.toml written before install
+//      added it) stays at exit 0: DIAGNOSIS names the install run that adds
+//      it -- see rootDefaultSteps. One unreadable state stays at exit 0: a
 //      TRANSIENT read failure on a client config (win32 EBUSY while an AV
 //      scanner or the search indexer holds the handle, EAGAIN). Its CLIENTS
 //      line still prints, but it is a moment's contention, not a fault --
@@ -51,12 +56,19 @@ import { join, posix, resolve, win32 } from "node:path";
 import { cliToNamespaces } from "./cli-shadows.js";
 import {
   addressOf,
+  type ClientConfigView,
   type ConfigFormat,
+  type ConfigRead,
+  type ConfigRootDefault,
   type ConfigSite,
   classifyClientConfig,
   containerNounFor,
+  decodeClientConfigBytes,
+  describeValueShape,
   type EntryTransform,
   effectiveConfigFormat,
+  planRootDefaults,
+  type RootDefaultValue,
   readClientEnv,
   type SyntaxName,
   syntaxNameFor,
@@ -460,7 +472,83 @@ export interface DoctorJsonSnapshot {
     };
   };
   upgrade: { current: string; latest: string | null; stale: boolean };
+  /** `summary` is the text path's DIAGNOSIS in one string: the verdict; on
+   *  the healthy verdict with no servers, the no-servers step in one
+   *  sentence; and on either verdict, one sentence per file that holds our
+   *  entry but lacks a row's top-level setting (Codex's
+   *  `mcp_optional_startup_grace_ms`), word for word the text path's line
+   *  (rootDefaultSteps). The structured form of the last is
+   *  `clients[].rootDefaults`. */
   diagnosis: { exitCode: number; summary: string };
+}
+
+/** One of a row's top-level defaults (`config.rootDefaults` -- Codex CLI's
+ *  `mcp_optional_startup_grace_ms = 0`) that a probed file does NOT hold at
+ *  the row's own value. See ClientProbeResult.rootDefaults.
+ *
+ *  `state` says what the file does with the key, as the plan install itself
+ *  makes (planRootDefaults) reads it:
+ *   - "missing": the file does not set the key. `yaw-mcp install` adds it.
+ *   - "other": the file sets another value the client takes (`1000`). It is
+ *     the user's, and install leaves it alone.
+ *   - "refused": the file sets a value a release of the client that reads the
+ *     key will not load the file with (`-1`, `"0"`, `0.0`: Codex 0.151 and
+ *     later exit 1 at startup, measured on 0.156.1). Whether the file loads
+ *     depends on the release; install warns and leaves the value alone.
+ *   - "refused-every-release": the file sets a value NO release of the client
+ *     loads the file with (an integer outside what a TOML integer holds), so
+ *     install refuses to write into the file at all.
+ *
+ *  Every field is on every item (a JSON consumer reads them without a
+ *  presence check), and null in the states that do not have it -- the union
+ *  below spells which. */
+export type RootDefaultProbe = RootDefaultProbeBase &
+  (
+    | { state: "missing"; value: null; kind: null; needs: null; everyRelease: null; fix: null }
+    | { state: "other"; value: string; kind: null; needs: null; everyRelease: null; fix: null }
+    | (RootValueRefusedFields & { state: "refused"; everyRelease: null })
+    | (RootValueRefusedFields & {
+        state: "refused-every-release";
+        /** Why no release loads the file ("larger than a TOML integer
+         *  holds"). */
+        everyRelease: string;
+      })
+  );
+
+/** The fields every RootDefaultProbe carries. */
+interface RootDefaultProbeBase {
+  /** The top-level key, unquoted (`mcp_optional_startup_grace_ms`). */
+  key: string;
+  /** The value install adds when the key is missing, and recommends over any
+   *  other (`0`). */
+  recommended: RootDefaultValue;
+  /** Why that value matters, as the row states it: the clause install prints
+   *  after `Added <key> = <value> to <file>: `. ASCII, no trailing period. */
+  why: string;
+}
+
+/** The fields a RootDefaultProbe carries in both refused states. `value` is
+ *  on "other" too, spelled the same way. */
+interface RootValueRefusedFields {
+  /** The file's value, spelled the way install's note, warning and refusal
+   *  spell it: a scalar as itself (`-1`, `"0"`, a float as the file writes
+   *  it, `0.0`), an array or a table by its shape (`an array of 1`, `a TOML
+   *  table`) -- never echoed, as it can be any size. */
+  value: string;
+  /** What the value is, with its article ("a negative integer", "a float"),
+   *  or null where `value` already says it: an array, a table, an integer
+   *  past the ceiling (RootValueRefusal.kind). */
+  kind: string | null;
+  /** What the client needs instead ("a non-negative integer"). */
+  needs: string;
+  /** The by-hand step, one lowercase clause ending on the recommended value.
+   *  "refused-every-release" gets install's own refusal step, "change that
+   *  value by hand to <needs> (0 is recommended)". "refused" gets "edit that
+   *  value by hand (0 is recommended)", or, for an array or a table -- which
+   *  can be a `[key]` header and the keys under it -- "delete it by hand and
+   *  set the key on one line above the first table in the file (0 is
+   *  recommended)": the steps install's warning ends with. */
+  fix: string;
 }
 
 export interface ClientProbeResult {
@@ -538,9 +626,20 @@ export interface ClientProbeResult {
    *  run where one is the remedy, and install is what removes the key. */
   legacyEntryName: string | null;
   /** The file exists but its content did not parse in its own syntax (see
-   *  `syntax`): invalid JSON or a non-object JSON root, or TOML that does not
-   *  parse. Never set for a read failure -- that is `unreadable`. */
+   *  `syntax`): invalid JSON or a non-object JSON root, TOML that does not
+   *  parse, or a TOML file whose bytes are not UTF-8 (see `malformedDetail`).
+   *  Never set for a read failure -- that is `unreadable`. */
   malformed: boolean;
+  /** Why `malformed` is set, as the read words it, or null. Set today for one
+   *  case: a file its syntax requires to be UTF-8 (TOML) whose bytes are not
+   *  -- "invalid UTF-8 at byte offset 11, and a TOML file must be UTF-8 --
+   *  re-save the file as UTF-8", the detail install prints when it refuses
+   *  the same file. The status line puts it in parentheses after "is
+   *  malformed". No parser ran on such a file, so there is no parser message
+   *  to give, and the byte offset is what points at the bad bytes. A file
+   *  that fails to parse leaves it null, and its line reads as it always has,
+   *  without the parser's message. Additive JSON field. */
+  malformedDetail: string | null;
   /** The file parses for yaw-mcp but NOT for the client that owns it: a
    *  STRICT-JSON site (claude-code's project `.mcp.json` -- see `strictJson`
    *  in install-targets.ts) carrying a comment or a trailing comma, which
@@ -641,6 +740,31 @@ export interface ClientProbeResult {
    *  read, so the status line can say which spelling is live instead of
    *  implying there is only ever one. Additive JSON field. */
   entryProjectKey: string | null;
+  /** The row's top-level defaults (`config.rootDefaults`: Codex CLI's
+   *  `mcp_optional_startup_grace_ms = 0`) that this file does NOT hold at the
+   *  row's own value, one item each, in the row's order. Read through the
+   *  plan install itself makes (planRootDefaults), off the same view as the
+   *  entry, so doctor and install cannot disagree about which key a file
+   *  lacks or which value its client refuses; data, never a client-id
+   *  branch. See RootDefaultProbe for the states.
+   *
+   *  Empty on every row that declares none (every JSON-family row: their
+   *  adapters cannot read a top-level key), on a slot with no file on disk,
+   *  and on a file the plan does not read -- malformed, unreadable, a blocked
+   *  container, an unspliceable entry: install refuses the write there
+   *  anyway, and the status line already says why. A key at the row's own
+   *  value is not listed: there is nothing to say about it. The list is
+   *  about the FILE, so a file with no "mcp" entry lists a missing key too
+   *  (install adds it with the entry).
+   *
+   *  What the report does with each state is renderClientStatus's,
+   *  clientCannotLaunch's and rootDefaultSteps' business: "missing" beside
+   *  our entry is a CLIENTS note and a DIAGNOSIS step, never a warning;
+   *  "refused" beside our entry is a warning; "refused-every-release" takes
+   *  the whole CLIENTS line, and is a warning beside our entry; "other" is
+   *  carried here and printed nowhere, as install's own note is the only
+   *  place that value is discussed. Additive JSON field. */
+  rootDefaults: readonly RootDefaultProbe[];
 }
 
 export interface DoctorResult {
@@ -814,9 +938,16 @@ async function collectStateStatus(opts: { env: NodeJS.ProcessEnv; home: string }
  *  section and the warning fold below, so the same state cannot be worded two
  *  ways. */
 function describeClient(c: ClientProbeResult): { client: string; label: string; status: string } {
-  const installCmd = `yaw-mcp install ${c.clientId}${c.scope === "user" ? "" : ` --scope ${c.scope}`}`;
+  const installCmd = installCommandFor(c);
   const client = INSTALL_TARGETS.find((t) => t.clientId === c.clientId)?.label ?? c.clientId;
-  return { client, label: `${client} (${c.scope})`, status: renderClientStatus(c, installCmd) };
+  return { client, label: `${client} (${c.scope})`, status: renderClientStatus(c, installCmd, client) };
+}
+
+/** The install run that (re)writes one probe's slot: its client, and its
+ *  scope when that is not the default. One spelling for the CLIENTS line and
+ *  the DIAGNOSIS steps. */
+function installCommandFor(c: ClientProbeResult): string {
+  return `yaw-mcp install ${c.clientId}${c.scope === "user" ? "" : ` --scope ${c.scope}`}`;
 }
 
 /** errno codes for a read failure that is a moment's contention, not a state
@@ -888,6 +1019,28 @@ function clientCannotLaunch(c: ClientProbeResult): boolean {
     // fold exists for -- the CLIENTS row says the entry is not loading while
     // DIAGNOSIS said "All good", on --json too.
     (c.unloadable !== null && c.hasMcpEntry) ||
+    // The same fold one level up the file: our entry sits in a file whose
+    // client refuses to load it over a TOP-LEVEL setting -- Codex's
+    // `mcp_optional_startup_grace_ms` at -1, "0" or 0.0, which a Codex that
+    // reads the key (0.151 on, whose source types it as a u64) stops on at
+    // startup, measured on 0.156.1: "failed to load bootstrap configuration",
+    // exit 1 -- or at an integer no release loads. The client starts nothing
+    // from that file, ours included, which is this fold's definition, and the
+    // CLIENTS line no longer reads OK. Only WITH our entry, for the reason the
+    // strict-file line above gives: a file yaw-mcp was never installed to is
+    // advice (the CLIENTS line carries it), not a fault of this setup.
+    //
+    // A MISSING top-level setting is not here, on the precedent of a legacy
+    // entry beside a working one: the file loads and yaw-mcp starts, and what
+    // the missing key costs depends on the client (Codex 0.151 and later give
+    // optional servers one shared second to start and leave a slower yaw-mcp
+    // out of that whole session; an older Codex does not read the key) -- a
+    // degraded setup with an install run that fixes it, which the CLIENTS line
+    // and DIAGNOSIS (rootDefaultSteps) name, not one that cannot launch. Folding
+    // it would take every Codex setup installed before the key existed to exit
+    // 2, and the Yaw Terminal panel that polls `doctor --json` to "Warnings
+    // need attention", over a step the report already gives.
+    (c.hasMcpEntry && c.rootDefaults.some((d) => d.state === "refused" || d.state === "refused-every-release")) ||
     c.launchCommandMissing !== null ||
     c.launchOamEntryMissing !== null ||
     c.launchOamNotAbsolute !== null
@@ -912,8 +1065,10 @@ function clientCannotLaunch(c: ClientProbeResult): boolean {
  * Only the cannot-launch states qualify. "not configured", "present, no
  * entry" and a lone legacy entry are ordinary (a client the user never
  * installed to); a PATH-resolved `npx` entry is the healthy default; a
- * launch path written for another OS is unverifiable, not broken. None of
- * them may drag a working machine to exit 2.
+ * launch path written for another OS is unverifiable, not broken; a
+ * top-level setting the row adds that the file does not have yet (Codex's
+ * startup grace) is a next step for DIAGNOSIS, not a fault. None of them
+ * may drag a working machine to exit 2.
  *
  * One warning per (file, client, status), NOT one per probe. Claude Code's
  * user and local scopes read the SAME ~/.claude.json (different containers
@@ -966,6 +1121,57 @@ function clientLaunchWarnings(clients: readonly ClientProbeResult[]): string[] {
     else grouped.set(key, { path: c.path, client, scopes: [c.scope], status });
   }
   return [...grouped.values()].map((g) => `${g.path}: ${g.client} (${g.scopes.join(", ")}) ${g.status}`);
+}
+
+/**
+ * The DIAGNOSIS next steps for a row's top-level defaults that a file holding
+ * our entry does not set -- `mcp_optional_startup_grace_ms = 0` in a Codex
+ * config.toml written before install added it: the setup in which Codex 0.151
+ * and later leave yaw-mcp's tools out of the whole session whenever it takes
+ * more than a second to start (measured on 0.156.1, where its npx start took
+ * from 3 to more than 35 s). One sentence per (file, key), in probe order,
+ * worded after install's own `Added <key> = <value> to <file>: <why>.` line,
+ * naming the run that adds it.
+ *
+ * WHY a step and not a warning: see the missing-setting note in
+ * clientCannotLaunch -- the precedent is the legacy entry beside a working
+ * one, which is a CLIENTS note and no warning. The step comes on top of that
+ * note because the key fixes a failure the user can SEE (Codex leaving
+ * yaw-mcp's tools out), and DIAGNOSIS is the part of the report everyone
+ * reads; a clause at the end of one CLIENTS row among a dozen is not.
+ * Printed on BOTH DIAGNOSIS branches (after "All good" and after "Warnings
+ * above need attention"), unlike the no-servers lines: nothing a warning
+ * says makes this step moot, and holding it back until the warnings are
+ * fixed would take a second doctor run to learn it. The --json summary ends
+ * with the same sentences, so the two surfaces cannot word it apart.
+ *
+ * Keyed on the FILE, not the scope: Codex's user and project scopes read one
+ * config.toml whenever the cwd is the home directory (Yaw Terminal's
+ * sidecar), and one key in one file is one step. The first scope's command is
+ * named, as the warning fold keeps the first grouped row's wording; either
+ * scope's run writes that file.
+ *
+ * Only rows with our entry where an install run is the remedy. An entry whose
+ * launch path is for another OS is skipped (an install run here would rewrite
+ * that entry for THIS OS -- its CLIENTS line gives the by-hand step instead).
+ * The entry-less rows are left out because their own "run install" line
+ * already adds the key.
+ */
+function rootDefaultSteps(clients: readonly ClientProbeResult[]): string[] {
+  const steps = new Map<string, string>();
+  for (const c of clients) {
+    if (!c.hasMcpEntry || c.launchForeignPath !== null) continue;
+    for (const d of c.rootDefaults) {
+      if (d.state !== "missing") continue;
+      const key = `${c.path}\0${d.key}`;
+      if (steps.has(key)) continue;
+      steps.set(
+        key,
+        `Run \`${installCommandFor(c)}\` to add ${d.key} = ${JSON.stringify(d.recommended)} to ${c.path}: ${d.why}.`,
+      );
+    }
+  }
+  return [...steps.values()];
 }
 
 export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult> {
@@ -1207,6 +1413,10 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
       print("  Add one with `yaw-mcp add <slug>`; `yaw-mcp search <text>` finds slugs.");
     }
   }
+  // A top-level setting a client row adds that a file holding our entry does
+  // not have yet (Codex's startup grace): a next step on either branch, never
+  // a warning -- see rootDefaultSteps.
+  for (const step of rootDefaultSteps(clients)) print(`  ${step}`);
 
   return { exitCode, lines, snapshot: { version: VERSION, config, clients } };
 }
@@ -1484,6 +1694,11 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
       summary += " No MCP servers are configured yet -- add one with `yaw-mcp add <slug>`.";
     }
   }
+  // The text path's DIAGNOSIS steps, word for word and on both branches as
+  // there (rootDefaultSteps), so `.diagnosis.summary` -- what the Yaw Terminal
+  // panel shows -- tells a Codex setup without the startup grace the same
+  // thing the text report does.
+  for (const step of rootDefaultSteps(clients)) summary += ` ${step}`;
 
   const snapshotJson: DoctorJsonSnapshot = {
     timestamp,
@@ -2598,8 +2813,10 @@ function schemaSuffix(f: LoadedConfigFile): string {
 
 /** One-line status string for the CLIENTS section of doctor output.
  *  Centralises the per-state wording so the renderer in `runDoctor`
- *  doesn't carry a nested ternary tree as more states get added. */
-function renderClientStatus(c: ClientProbeResult, installCmd: string): string {
+ *  doesn't carry a nested ternary tree as more states get added. `client`
+ *  is the row's label ("Codex CLI"), for the clauses that say what that
+ *  client does with the file. */
+function renderClientStatus(c: ClientProbeResult, installCmd: string, client: string): string {
   if (c.unavailable) {
     return c.unavailableReason !== undefined
       ? `not supported on this OS yet -- ${c.unavailableReason}`
@@ -2626,8 +2843,12 @@ function renderClientStatus(c: ClientProbeResult, installCmd: string): string {
   // from the one helper both surfaces call, and names this row's command.
   // The syntax word is the row's own (`c.syntax`), so a config.toml that does
   // not parse says TOML and names the TOML fix.
+  // A TOML file that is not UTF-8 carries the read's detail, with its byte
+  // offset (see malformedDetail); a file that does not parse prints no
+  // detail, as it always has.
   if (c.malformed) {
-    return `exists but ${c.syntax} is malformed -- install refuses to overwrite it; ${unparseableConfigFix(`run \`${installCmd}\``, c.syntax)}`;
+    const detail = c.malformedDetail !== null ? ` (${c.malformedDetail})` : "";
+    return `exists but ${c.syntax} is malformed${detail} -- install refuses to overwrite it; ${unparseableConfigFix(`run \`${installCmd}\``, c.syntax)}`;
   }
   // The same trap one level down: the file parses, but a key on the way to the
   // entry holds a shape install refuses rather than drop -- a non-empty array
@@ -2653,6 +2874,25 @@ function renderClientStatus(c: ClientProbeResult, installCmd: string): string {
   // repairs that key and is then refused by the unloadable gate.
   if (c.unloadable !== null) {
     return `exists but ${c.unloadable} -- install refuses to write into it; ${unloadableConfigFix(`run \`${installCmd}\``)}`;
+  }
+  // The same class of file, found through a top-level setting instead of the
+  // syntax: a row's top-level default at a value NO release of its client
+  // loads the file with (Codex's `mcp_optional_startup_grace_ms` at an integer
+  // no TOML integer holds -- RootValueRefusal.everyRelease). Install refuses
+  // to write into that file (exit 1, --dry-run and --skip included), so every
+  // line below -- "present, no entry -- run install" above all, which is what
+  // this file read as before -- would name a run that is refused, and every
+  // entry line would describe an entry the client never reads. It says what
+  // install's refusal says, in its words: the value, why no release loads it,
+  // and what to change it to. Warned about only beside our entry (see
+  // clientCannotLaunch). Ranked with the unloadable line above: install asks
+  // the unloadable question first, and this one before it looks at the
+  // container (an inline `mcp_servers = { ... }` below) or the entry.
+  const noReleaseLoads = c.rootDefaults.find(
+    (d): d is Extract<RootDefaultProbe, { state: "refused-every-release" }> => d.state === "refused-every-release",
+  );
+  if (noReleaseLoads !== undefined) {
+    return `exists but sets ${noReleaseLoads.key} to ${noReleaseLoads.value}, ${noReleaseLoads.everyRelease}, so ${client} will not load the file -- install refuses to write into it; ${noReleaseLoads.fix}, then run \`${installCmd}\``;
   }
   // Our entry is there, but in a spelling install will not rewrite (for TOML:
   // an inline table, dotted keys, an array of tables, or an entry inside an
@@ -2723,17 +2963,42 @@ function renderClientStatus(c: ClientProbeResult, installCmd: string): string {
       `drive-letter case -- only a Claude Code whose cwd is spelled that way reads it, and \`${installCmd}\` ` +
       "writes the canonical key"
     : "";
+  // The row's top-level defaults that this file does not hold at the row's
+  // value (ClientProbeResult.rootDefaults -- Codex's
+  // `mcp_optional_startup_grace_ms`), one trailer per key, appended to every
+  // branch below that reports OUR entry -- the way the legacy clause is, and
+  // for the reason it was hoisted: every problem is named on the first doctor
+  // run, not once the other one is fixed. Entry-less rows get none: their
+  // "run install" adds a missing key with the entry, and install warns about a
+  // refused value itself when it gets there.
+  //
+  // A MISSING key is a note, on the legacy entry's precedent: the file loads
+  // and yaw-mcp starts, so the OK stays, and the step is in the clause and in
+  // DIAGNOSIS (rootDefaultSteps) -- not a warning (see clientCannotLaunch).
+  // Its remedy follows the branch's own: on the three lines that already say
+  // to rerun install, that run adds the key (as the legacy clause says it
+  // removes the legacy entry); on the OK lines it is the install run to make;
+  // on the other-OS line it is a line added by hand, since an install run from
+  // here would rewrite that entry for THIS OS.
+  //
+  // A REFUSED value takes the OK away and is a warning (clientCannotLaunch):
+  // a release that reads the key starts nothing from this file. The clause
+  // says what install's warning says about the value, and that install leaves
+  // a value the user set alone -- on the rerun lines that run will not change
+  // it. See rootDefaultClause.
+  const rootClause = (remedy: RootClauseRemedy): string =>
+    c.rootDefaults.map((d) => rootDefaultClause(d, { client, installCmd, remedy, syntax: c.syntax })).join("");
   if (c.launchCommandMissing) {
-    return `has "${ENTRY_NAME}" entry, but its launch command does not exist: ${c.launchCommandMissing} -- the client cannot start yaw-mcp; rerun \`${installCmd}\`${legacy}${keyNote}`;
+    return `has "${ENTRY_NAME}" entry, but its launch command does not exist: ${c.launchCommandMissing} -- the client cannot start yaw-mcp; rerun \`${installCmd}\`${legacy}${rootClause("rerun")}${keyNote}`;
   }
   // Both oam-specific states below are "the entry looks fine and will not
   // start", so they rank with launchCommandMissing rather than with the OK
   // branches -- reporting "OK (runs on oam)" for either is the wrong answer.
   if (c.launchOamEntryMissing) {
-    return `has "${ENTRY_NAME}" entry running on oam, but its entry file does not exist: ${c.launchOamEntryMissing} -- oam cannot fetch it on demand the way npx would; rerun \`${installCmd}\`${legacy}${keyNote}`;
+    return `has "${ENTRY_NAME}" entry running on oam, but its entry file does not exist: ${c.launchOamEntryMissing} -- oam cannot fetch it on demand the way npx would; rerun \`${installCmd}\`${legacy}${rootClause("rerun")}${keyNote}`;
   }
   if (c.launchOamNotAbsolute) {
-    return `has "${ENTRY_NAME}" entry with a bare "${c.launchOamNotAbsolute}" command -- it resolves against the client's PATH, which a GUI-launched client does not inherit from your shell; rerun \`${installCmd}\` to write an absolute path (set OAM_BIN to oam's full path first if install cannot find it)${legacy}${keyNote}`;
+    return `has "${ENTRY_NAME}" entry with a bare "${c.launchOamNotAbsolute}" command -- it resolves against the client's PATH, which a GUI-launched client does not inherit from your shell; rerun \`${installCmd}\` to write an absolute path (set OAM_BIN to oam's full path first if install cannot find it)${legacy}${rootClause("rerun")}${keyNote}`;
   }
   // Below the cannot-launch branches and above the OK ones: doctor knows
   // neither. The path is absolute on the OS the entry was written for, and
@@ -2742,13 +3007,17 @@ function renderClientStatus(c: ClientProbeResult, installCmd: string): string {
   // not happen; reporting broken would flag a Windows profile as seen from
   // WSL for being a Windows profile.
   if (c.launchForeignPath) {
-    return `has "${ENTRY_NAME}" entry${c.launchRuntime === "oam" ? " (runs on oam)" : ""} whose launch path is for another OS: ${c.launchForeignPath} -- not verified from here${c.hasLegacyEntry ? `; legacy "${c.legacyEntryName}" entry also present -- remove it to avoid running yaw-mcp twice` : ""}${keyNote}`;
+    return `has "${ENTRY_NAME}" entry${c.launchRuntime === "oam" ? " (runs on oam)" : ""} whose launch path is for another OS: ${c.launchForeignPath} -- not verified from here${c.hasLegacyEntry ? `; legacy "${c.legacyEntryName}" entry also present -- remove it to avoid running yaw-mcp twice` : ""}${rootClause("by-hand")}${keyNote}`;
   }
+  // "OK" only when no top-level value in the file is one the client refuses
+  // (see rootClause above): the entry itself is fine either way, and the
+  // clause says what is not.
+  const ok = c.rootDefaults.some((d) => d.state === "refused") ? "" : "OK -- ";
   if (c.hasMcpEntry && c.hasLegacyEntry) {
-    return `OK -- has "${ENTRY_NAME}" entry${c.launchRuntime === "oam" ? " (runs on oam)" : ""}; legacy "${c.legacyEntryName}" entry also present -- remove it to avoid running yaw-mcp twice${keyNote}`;
+    return `${ok}has "${ENTRY_NAME}" entry${c.launchRuntime === "oam" ? " (runs on oam)" : ""}; legacy "${c.legacyEntryName}" entry also present -- remove it to avoid running yaw-mcp twice${rootClause("run")}${keyNote}`;
   }
   if (c.hasMcpEntry) {
-    return `OK -- has "${ENTRY_NAME}" entry${c.launchRuntime === "oam" ? " (runs on oam)" : ""}${keyNote}`;
+    return `${ok}has "${ENTRY_NAME}" entry${c.launchRuntime === "oam" ? " (runs on oam)" : ""}${rootClause("run")}${keyNote}`;
   }
   if (c.hasLegacyEntry) {
     // No "then remove it by hand": install trims the legacy entry in the same
@@ -2758,6 +3027,55 @@ function renderClientStatus(c: ClientProbeResult, installCmd: string): string {
   }
   if (c.exists) return `present, no "${ENTRY_NAME}" entry -- run \`${installCmd}\``;
   return `not configured -- run \`${installCmd}\``;
+}
+
+/** What a CLIENTS line beside our entry names as the step for a MISSING
+ *  top-level default, after its own remedy: "rerun" where the line already
+ *  says to rerun install (that run adds the key), "run" where it names no run
+ *  (the OK lines), "by-hand" where an install run from here is the wrong step
+ *  (an entry written for another OS). */
+type RootClauseRemedy = "rerun" | "run" | "by-hand";
+
+/** One CLIENTS-line trailer, `; ...`, for one of the row's top-level defaults
+ *  beside our entry -- or "" for a state the line says nothing about: "other"
+ *  (a value the client takes is the user's; install's own note is where it is
+ *  discussed) and "refused-every-release" (renderClientStatus returns its own
+ *  line for that file before any entry line). See renderClientStatus's
+ *  `rootClause` for which branch passes which remedy. The key is named in the
+ *  clause, never assumed: the clause is data-driven like the plan it
+ *  renders. */
+function rootDefaultClause(
+  d: RootDefaultProbe,
+  line: { client: string; installCmd: string; remedy: RootClauseRemedy; syntax: SyntaxName },
+): string {
+  switch (d.state) {
+    case "missing": {
+      // Spelled as install spells the line it adds (spellRootDefault in
+      // install-cmd.ts): the value JSON-spelled, which for the scalars a
+      // default can hold is what TOML writes too.
+      const setting = `${d.key} = ${JSON.stringify(d.recommended)}`;
+      const step =
+        line.remedy === "rerun"
+          ? `install adds ${setting} as it writes the working entry`
+          : line.remedy === "run"
+            ? `run \`${line.installCmd}\` to add ${setting}`
+            : `set ${setting} by hand, on one line ${rootLinePlacement(line.syntax)}`;
+      return `; the file does not set ${d.key} -- ${step}`;
+    }
+    case "refused":
+      // install's warning, clause for clause: the value, what it is, what the
+      // client needs, that a release that reads the key will not load the
+      // file with it -- then that install leaves the value alone, and the
+      // by-hand step.
+      return (
+        `; the file sets ${d.key} to ${d.value}, ${d.kind === null ? "" : `${d.kind} `}where ${line.client} ` +
+        `needs ${d.needs} -- a ${line.client} release that reads the key will not load the file with that value, ` +
+        `and install leaves a value you set alone; ${d.fix}`
+      );
+    case "other":
+    case "refused-every-release":
+      return "";
+  }
 }
 
 interface ProbeOptions {
@@ -2795,7 +3113,9 @@ interface ProbeOptions {
    *  It is the only way to produce a transient EBUSY / EAGAIN read
    *  deterministically -- a directory at the path gives EISDIR, a chmod
    *  gives EACCES, but nothing a test can arrange holds a handle at just the
-   *  right moment. Production never sets it. */
+   *  right moment. Production never sets it. It returns TEXT, where the
+   *  default read returns bytes, so no UTF-8 check applies to what it returns
+   *  (see classifyProbeRead). */
   readClientConfig?: (path: string) => string;
 }
 
@@ -2815,8 +3135,15 @@ interface ProbeSlot {
    *  "can we read it". Threading it from HERE is what keeps the probe and the
    *  write facade agreeing about one file, rather than doctor calling a config
    *  install reads fine malformed. `transform` is the row's entry transform,
-   *  which the adapter path hands the core like install does. */
-  read: { path: string; site: ConfigSite; transform: EntryTransform | undefined } | null;
+   *  which the adapter path hands the core like install does, and
+   *  `rootDefaults` the row's top-level defaults (`config.rootDefaults`),
+   *  which the adapter path plans as install does (see probeRootDefaults). */
+  read: {
+    path: string;
+    site: ConfigSite;
+    transform: EntryTransform | undefined;
+    rootDefaults: readonly ConfigRootDefault[] | undefined;
+  } | null;
 }
 
 /** The content-derived part of a ClientProbeResult -- everything a slot does
@@ -2842,6 +3169,7 @@ const EMPTY_PROBE: Readonly<ProbeClassification> = {
   hasLegacyEntry: false,
   legacyEntryName: null,
   malformed: false,
+  malformedDetail: null,
   unloadable: null,
   unreadable: null,
   unreadableCode: null,
@@ -2854,9 +3182,18 @@ const EMPTY_PROBE: Readonly<ProbeClassification> = {
   entryProjectKey: null,
   entryUnspliceable: null,
   containerUnspliceable: null,
+  rootDefaults: [],
 };
 
 const MALFORMED: Readonly<ProbeClassification> = { ...EMPTY_PROBE, malformed: true };
+
+/** A core `malformed` read as a probe: MALFORMED, plus the read's detail when
+ *  the reason is `"encoding"` (see ClientProbeResult.malformedDetail). One
+ *  mapping for both places such a read reaches the probe: the byte decode in
+ *  classifyProbeRead and the adapter's own read in classifyAdapterView. */
+function malformedProbe(read: Extract<ConfigRead, { kind: "malformed" }>): ProbeClassification {
+  return { ...MALFORMED, malformedDetail: read.reason === "encoding" ? read.detail : null };
+}
 
 /** What a slot reports when its config file's BYTES could not be read.
  *  Distinct from MALFORMED on purpose: both probes used to wrap the read AND
@@ -2945,7 +3282,9 @@ function* enumerateProbeSlots(opts: ProbeOptions): Generator<ProbeSlot> {
           syntax: syntaxNameFor(site.format),
           containerPath: addressOf(site).containerPath,
         },
-        read: exists ? { path: site.resolved.absolute, site, transform: target.entry } : null,
+        read: exists
+          ? { path: site.resolved.absolute, site, transform: target.entry, rootDefaults: target.config.rootDefaults }
+          : null,
       };
     }
   }
@@ -2953,20 +3292,21 @@ function* enumerateProbeSlots(opts: ProbeOptions): Generator<ProbeSlot> {
 
 function probeClients(opts: ProbeOptions): ClientProbeResult[] {
   const out: ClientProbeResult[] = [];
-  const readConfig = opts.readClientConfig ?? ((p: string): string => readFileSync(p, "utf8"));
+  // The default reads BYTES, which classifyProbeRead decodes (see there).
+  const readConfig: (path: string) => string | Uint8Array = opts.readClientConfig ?? ((p) => readFileSync(p));
   const platform = opts.platform ?? process.platform;
   for (const { result, read } of enumerateProbeSlots(opts)) {
     if (read) {
       // The READ is caught on its own, and the classification is not caught
       // here at all -- it catches its own parse failures. See unreadableProbe
       // for why the two must not share a catch.
-      let raw: string | null = null;
+      let loaded: string | Uint8Array | null = null;
       try {
-        raw = readConfig(read.path);
+        loaded = readConfig(read.path);
       } catch (err) {
         Object.assign(result, unreadableProbe(err));
       }
-      if (raw !== null) Object.assign(result, classifyProbe(raw, read, existsSync, platform));
+      if (loaded !== null) Object.assign(result, classifyProbeRead(loaded, read, existsSync, platform));
     }
     out.push(result);
   }
@@ -3116,8 +3456,39 @@ function oamRunEntryFromTokens(tokens: readonly string[]): string | null {
  *  parseJsonc again and be reported as malformed JSON. */
 const JSON_PROBE_FORMATS: ReadonlySet<ConfigFormat> = new Set<ConfigFormat>(["json", "jsonc"]);
 
-/** Classify one slot's bytes with the classifier its SITE's format calls for.
- *  Shared by both the sync and async probe variants. */
+/** Classify one slot's file as it was read. Shared by both the sync and async
+ *  probe variants.
+ *
+ *  BYTES -- what both probes read by default -- are decoded the one way
+ *  install's read decodes them (decodeClientConfigBytes, which
+ *  readClientConfigFile calls), so doctor and install agree about a file that
+ *  is not text in the encoding its syntax requires: a config.toml holding
+ *  bytes that are not UTF-8 is malformed here, with the read's detail (see
+ *  malformedProbe), where install refuses it. It is never classified from the
+ *  U+FFFD the decode puts in place of the bad bytes: that text can parse, and
+ *  when it did, a file without our entry was sent to an install run that
+ *  exits 1 on it. Every other file decodes to exactly the text
+ *  `readFileSync(path, "utf8")` returned, a leading BOM kept, so its
+ *  classification is unchanged.
+ *
+ *  A STRING is the read seam's (ProbeOptions.readClientConfig), text that is
+ *  already decoded, and is classified as given, as readClientConfigFile's own
+ *  seam treats one. */
+function classifyProbeRead(
+  loaded: string | Uint8Array,
+  read: NonNullable<ProbeSlot["read"]>,
+  exists: (p: string) => boolean,
+  platform: NodeJS.Platform,
+): ProbeClassification {
+  if (typeof loaded === "string") return classifyProbe(loaded, read, exists, platform);
+  const decoded = decodeClientConfigBytes(loaded, read.site.format);
+  return decoded.malformed === null
+    ? classifyProbe(decoded.text, read, exists, platform)
+    : malformedProbe(decoded.malformed);
+}
+
+/** Classify one slot's text with the classifier its SITE's format calls for.
+ *  Reached only through classifyProbeRead. */
 function classifyProbe(
   raw: string,
   read: NonNullable<ProbeSlot["read"]>,
@@ -3126,29 +3497,50 @@ function classifyProbe(
 ): ProbeClassification {
   return JSON_PROBE_FORMATS.has(read.site.format)
     ? classifyProbeContent(raw, read.site.resolved.containerPath, read.site.format === "json", exists, platform)
-    : classifyProbeViaAdapter(raw, read.site, read.transform, exists, platform);
+    : classifyProbeViaAdapter(raw, read.site, read.transform, read.rootDefaults, exists, platform);
 }
 
 /** Classify a NON-JSON client config through the same core read install uses
  *  (classifyClientConfig), so doctor and install cannot disagree about one
  *  file's syntax. Reached only through classifyProbe.
  *
+ *  The row's top-level defaults are planned here too, off the SAME view as
+ *  the entry, exactly as install plans them off the view it writes through
+ *  (probeRootDefaults) -- so `--scope project` and CODEX_HOME reach the file
+ *  the entry is read from, and a key doctor calls missing is one install
+ *  would add. Only this path plans them: a JSON-family row cannot declare
+ *  any (see ClientProbeResult.rootDefaults).
+ *
  *  No drive-case fold: that belongs to Claude Code's projects[] map, which is
  *  JSON. The adapter never throws on bad bytes -- it answers `malformed` -- and
  *  a MissingConfigAdapterError propagates ON PURPOSE: a build without the
  *  adapter is a defect, and must not be reported as a malformed user file.
- *  The only catch is around the launch checks, so an unexpected throw there
- *  degrades one row to unreadable instead of crashing doctor, the panel's
- *  `doctor --json` or `install --list` -- and is never reported as
- *  malformed. */
+ *  So does the error planRootDefaults throws for a row that declares
+ *  top-level defaults on an adapter that cannot read a top-level key, for the
+ *  same reason (install throws it over the same row). The only catch is
+ *  around the launch checks, so an unexpected throw there degrades one row to
+ *  unreadable instead of crashing doctor, the panel's `doctor --json` or
+ *  `install --list` -- and is never reported as malformed. */
 function classifyProbeViaAdapter(
   raw: string,
   site: ConfigSite,
   transform: EntryTransform | undefined,
+  rootDefaults: readonly ConfigRootDefault[] | undefined,
   exists: (p: string) => boolean,
   platform: NodeJS.Platform,
 ): ProbeClassification {
   const view = classifyClientConfig(raw, site, { transform });
+  return { ...classifyAdapterView(view, exists, platform), rootDefaults: probeRootDefaults(view, rootDefaults) };
+}
+
+/** Everything classifyProbeViaAdapter reports but the top-level defaults:
+ *  what the adapter's read says about the file, its container and our
+ *  entry, and the launch checks on that entry. */
+function classifyAdapterView(
+  view: ClientConfigView,
+  exists: (p: string) => boolean,
+  platform: NodeJS.Platform,
+): ProbeClassification {
   const read = view.read;
   const violation = view.unloadable();
   const unloadable = violation ? unloadableConfigProblem(violation) : null;
@@ -3159,7 +3551,7 @@ function classifyProbeViaAdapter(
       // Unreachable with the bytes already in hand; mapped defensively.
       return { ...EMPTY_PROBE, unreadable: read.message, unreadableCode: read.code };
     case "malformed":
-      return { ...MALFORMED };
+      return malformedProbe(read);
     case "blocked":
       // The adapter decides reparability; a TOML container is never reparable.
       return read.reparable
@@ -3208,6 +3600,109 @@ function classifyProbeViaAdapter(
       return _exhaustive;
     }
   }
+}
+
+/** A row's top-level defaults as install finds them in one file: its plan
+ *  (planRootDefaults), turned into the probe's items (RootDefaultProbe), in
+ *  the row's order. A default the plan neither sets nor keeps is at the row's
+ *  own value and gets no item.
+ *
+ *  That complement holds only where the plan reads the file: an absent (or
+ *  whitespace-only) file sets every default, an `ok` read sets or keeps the
+ *  ones it has to, and every other read gets an EMPTY plan -- so on a
+ *  malformed, unreadable, blocked or unspliceable file this returns nothing,
+ *  which is what ClientProbeResult.rootDefaults promises for those, not a
+ *  claim that the keys are fine. An empty or missing `defaults` never touches
+ *  the adapter (planRootDefaults' own rule), so a row that declares none runs
+ *  as before.
+ *
+ *  The value is spelled here, once, as install spells it (spellRootValue),
+ *  and the by-hand step is decided here from the value's own shape -- the
+ *  same scalar test install's loop makes -- because the item carries the
+ *  value only as that spelling. */
+function probeRootDefaults(
+  view: ClientConfigView,
+  defaults: readonly ConfigRootDefault[] | undefined,
+): RootDefaultProbe[] {
+  if (defaults === undefined || defaults.length === 0) return [];
+  const plan = planRootDefaults(view, defaults);
+  const syntax = view.adapter.syntax;
+  const out: RootDefaultProbe[] = [];
+  for (const rootDefault of defaults) {
+    const base = { key: rootDefault.key, recommended: rootDefault.value, why: rootDefault.why };
+    if (plan.set.includes(rootDefault)) {
+      out.push({ ...base, state: "missing", value: null, kind: null, needs: null, everyRelease: null, fix: null });
+      continue;
+    }
+    const kept = plan.kept.find((k) => k.rootDefault === rootDefault);
+    if (kept === undefined) continue;
+    const { value, float, refused } = kept;
+    // A float is spelled as the FILE writes it (`0.0`), never as the number
+    // it parses to (`0`), which would name the very value the row recommends.
+    const spelled = float ?? spellRootValue(value, syntax);
+    if (refused === undefined) {
+      out.push({ ...base, state: "other", value: spelled, kind: null, needs: null, everyRelease: null, fix: null });
+      continue;
+    }
+    const recommended = `(${JSON.stringify(rootDefault.value)} is recommended)`;
+    const kind = refused.kind ?? null;
+    if (refused.everyRelease !== undefined) {
+      out.push({
+        ...base,
+        state: "refused-every-release",
+        value: spelled,
+        kind,
+        needs: refused.needs,
+        everyRelease: refused.everyRelease,
+        fix: `change that value by hand to ${refused.needs} ${recommended}`,
+      });
+      continue;
+    }
+    // spellRootValue's own scalar test, so every value it names by its shape
+    // gets the shape step (install's loop makes the same split).
+    const scalar =
+      typeof value === "string" ||
+      typeof value === "number" ||
+      typeof value === "bigint" ||
+      typeof value === "boolean" ||
+      value instanceof Date;
+    out.push({
+      ...base,
+      state: "refused",
+      value: spelled,
+      kind,
+      needs: refused.needs,
+      everyRelease: null,
+      fix: scalar
+        ? `edit that value by hand ${recommended}`
+        : `delete it by hand and set the key on one line ${rootLinePlacement(syntax)} ${recommended}`,
+    });
+  }
+  return out;
+}
+
+/** A value the USER's file holds for a top-level key, as the probe's item
+ *  (and so every doctor line) spells it: a scalar as itself, anything else by
+ *  its shape, never echoed (it is the user's, and it can be any size).
+ *
+ *  A deliberate twin of install-cmd.ts's spellRootValue, which spells the
+ *  same value in install's note, warning and refusal: doctor cannot import
+ *  install-cmd.ts, which imports this module. The doctor tests hold the two
+ *  to one spelling by running install over the same file. */
+function spellRootValue(value: unknown, syntax: SyntaxName): string {
+  if (typeof value === "string") return JSON.stringify(value);
+  if (typeof value === "number" || typeof value === "bigint" || typeof value === "boolean") return String(value);
+  if (value instanceof Date) return value.toISOString();
+  return Array.isArray(value) ? describeValueShape(value) : containerNounFor(syntax);
+}
+
+/** Where a top-level line goes when the user adds it by hand. In TOML a
+ *  `key = value` line after a `[table]` header is a key OF that table, so "at
+ *  the top level" is not enough of an instruction there -- the end of the
+ *  file is usually inside the last table. A twin of install-cmd.ts's
+ *  rootLinePlacement, for the reason spellRootValue gives. */
+function rootLinePlacement(syntax: SyntaxName): string {
+  return syntax === "TOML" ? "above the first table in the file" : "at the top level of the file";
 }
 
 /** The launch checks for one stored entry value: what runtime it launches on
@@ -3393,6 +3888,7 @@ function classifyProbeContent(
       hasLegacyEntry: legacyEntryName !== null,
       legacyEntryName,
       malformed: false,
+      malformedDetail: null,
       unloadable,
       unreadable: null,
       unreadableCode: null,
@@ -3409,6 +3905,10 @@ function classifyProbeContent(
       // A JSON object key is always spliceable, and so is a JSON container.
       entryUnspliceable: null,
       containerUnspliceable: null,
+      // No JSON-family row declares a top-level default: their adapters
+      // implement neither readRootKey nor insertRootKey, and a row may declare
+      // one only on a format whose adapter does (ConfigShape.rootDefaults).
+      rootDefaults: [],
     };
   } catch {
     // Parse failures only: the READ happens in the caller, under its own
@@ -3429,14 +3929,15 @@ export async function probeClientsAsync(opts: ProbeOptions): Promise<ClientProbe
     if (read) {
       // Same read-vs-classify split as probeClients; see unreadableProbe.
       // The (sync) read seam is honoured here too -- it exists to inject a
-      // read failure, and only the default is the non-blocking read.
-      let raw: string | null = null;
+      // read failure, and only the default is the non-blocking read. That
+      // default reads BYTES, decoded as probeClients' are (classifyProbeRead).
+      let loaded: string | Uint8Array | null = null;
       try {
-        raw = opts.readClientConfig ? opts.readClientConfig(read.path) : await readFile(read.path, "utf8");
+        loaded = opts.readClientConfig ? opts.readClientConfig(read.path) : await readFile(read.path);
       } catch (err) {
         Object.assign(result, unreadableProbe(err));
       }
-      if (raw !== null) Object.assign(result, classifyProbe(raw, read, existsSync, platform));
+      if (loaded !== null) Object.assign(result, classifyProbeRead(loaded, read, existsSync, platform));
     }
     out.push(result);
   }

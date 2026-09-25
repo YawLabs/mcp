@@ -27,7 +27,7 @@
 //     Every value it acts on (clientPath, containerPath, entryName) comes
 //     straight out of the marker file, so without that guard a corrupt or
 //     hand-edited marker makes the sweep delete an arbitrary key from an
-//     arbitrary JSON file.
+//     arbitrary JSON or TOML file.
 //   - NOTHING IS SENT ANYWHERE AND NOTHING IS FINGERPRINTED. `try` used to
 //     POST a {slug, action, anonId} triple to /api/try/event; that endpoint
 //     died with the hosted backend and the poster is now a no-op, so no trial
@@ -71,11 +71,16 @@ import { clientChoices, resolveClientArg } from "./client-aliases.js";
 import {
   applyClientConfigEdits,
   type ClientConfigView,
+  CONFIG_FORMATS,
+  type ConfigFormat,
   type ConfigSite,
   classifyClientConfig,
   composeEntry,
+  containerNounFor,
+  hasConfigAdapter,
   readClientConfigFile,
   readClientEnv,
+  syntaxNameFor,
   terminateWithNewline,
 } from "./client-config.js";
 import { probeClientsAsync, probeUsable } from "./doctor-cmd.js";
@@ -181,7 +186,7 @@ export const TRIALS_DIRNAME = "trials";
  *  verbatim out of the marker file, so they check this prefix before acting:
  *  a marker naming anything else is corrupt, hand-edited, or from a writer we
  *  don't know, and honoring it would remove an arbitrary key from an
- *  arbitrary JSON file on disk. */
+ *  arbitrary JSON or TOML file on disk. */
 export const TRIAL_ENTRY_PREFIX = "yaw-mcp-try-";
 
 export interface ExploreServerResponse {
@@ -219,6 +224,22 @@ export interface TrialMarker {
    *  trial entry was written. Doctor needs this to GC the entry from
    *  the right scope (especially Claude Code local-scope under projects). */
   containerPath: string[];
+  /** The SYNTAX of the file at clientPath: the effective format of the site
+   *  the entry was written to -- "jsonc" for every JSON-family client `try`
+   *  writes, "toml" for Codex CLI's config.toml. The cleanup and GC paths read
+   *  the file with this adapter. Before the field existed every marker was
+   *  peeled as JSON, so a Codex trial could never be removed: the peel failed
+   *  to parse config.toml, and try-cleanup then dropped the marker anyway and
+   *  said "cleaned up".
+   *
+   *  OPTIONAL, and TRIAL_SCHEMA_VERSION does not move for it, on the same
+   *  terms as entryFingerprint below: an older yaw-mcp ignores the field (and
+   *  so still cannot peel a TOML trial), while a version bump would make it
+   *  refuse every marker this one writes. A marker without it -- every marker
+   *  written before it existed -- has its format derived from its file name
+   *  (see markerFormat). A value this build cannot read is refused by
+   *  rejectUntrustedMarker. */
+  format?: ConfigFormat;
   /** Entry name in the container — almost always `yaw-mcp-try-<slug>` but
    *  persisted so a future rename doesn't orphan old markers. */
   entryName: string;
@@ -446,11 +467,11 @@ export function trialMarkerPath(slug: string, home: string = homedir()): string 
  *
  *  Both consumers (runTryCleanup, scanTrials -> gcExpiredTrials) delete
  *  `entryName` at `containerPath` from `clientPath` using values read verbatim
- *  from the marker file, so the blast radius of a bad marker is any JSON key
- *  on disk. `try` only ever writes `yaw-mcp-try-<slug>` at schemaVersion
- *  TRIAL_SCHEMA_VERSION; anything else is corrupt, hand-edited, or from a
- *  writer we don't know. */
-function rejectUntrustedMarker(marker: { entryName: string; schemaVersion?: number }): string | null {
+ *  from the marker file, so the blast radius of a bad marker is any key in
+ *  any JSON or TOML file on disk. `try` only ever writes `yaw-mcp-try-<slug>`
+ *  at schemaVersion TRIAL_SCHEMA_VERSION, with a `format` this build reads;
+ *  anything else is corrupt, hand-edited, or from a writer we don't know. */
+function rejectUntrustedMarker(marker: { entryName: string; schemaVersion?: number; format?: unknown }): string | null {
   if (!marker.entryName.startsWith(TRIAL_ENTRY_PREFIX)) {
     return `names a non-trial entry ("${marker.entryName}", expected "${TRIAL_ENTRY_PREFIX}*")`;
   }
@@ -462,7 +483,24 @@ function rejectUntrustedMarker(marker: { entryName: string; schemaVersion?: numb
   if (typeof marker.schemaVersion === "number" && marker.schemaVersion > TRIAL_SCHEMA_VERSION) {
     return `was written by a newer yaw-mcp (schemaVersion ${marker.schemaVersion} > ${TRIAL_SCHEMA_VERSION})`;
   }
+  // A format this build has no adapter for -- a newer yaw-mcp that learned
+  // another syntax, or a hand edit -- is refused by name, like a newer
+  // schemaVersion, rather than guessed at. An ABSENT format is not a refusal:
+  // markers written before the field existed omit it (see markerFormat).
+  if (marker.format !== undefined && !isReadableFormat(marker.format)) {
+    return `records a config format this yaw-mcp cannot read (${JSON.stringify(marker.format)})`;
+  }
   return null;
+}
+
+/** True when `value` is a declared ConfigFormat this build has an adapter for.
+ *  Takes `unknown` because the value comes verbatim out of a marker file. */
+function isReadableFormat(value: unknown): value is ConfigFormat {
+  return (
+    typeof value === "string" &&
+    (CONFIG_FORMATS as readonly string[]).includes(value) &&
+    hasConfigAdapter(value as ConfigFormat)
+  );
 }
 
 /** Fingerprint of the LAUNCH an entry performs: its command and args, in the
@@ -539,6 +577,10 @@ async function readTrialMarker(markerPath: string): Promise<{ marker: TrialMarke
   }
 }
 
+/** The marker fields a peel reads: where the entry lives, what it is called,
+ *  what it launched, and the syntax of the file it is in. */
+type PeelTarget = Pick<TrialMarker, "clientPath" | "containerPath" | "entryName" | "entryFingerprint" | "format">;
+
 /** The read -> parse -> remove -> write core the three peel sites share
  *  (peelTrialEntry, runTryCleanup, gcExpiredTrials). It reports WHAT happened
  *  and lets each caller decide what that MEANS -- the part that legitimately
@@ -548,34 +590,38 @@ async function readTrialMarker(markerPath: string): Promise<{ marker: TrialMarke
  *   - "absent":     nothing to do (no file, empty file, entry already gone, or
  *                   a container on the way down that cannot hold it).
  *   - "not-object": the whole FILE is valid JSON that is NOT an object, so it
- *                   is not a client config at all and no peel is possible. The
- *                   GC refuses to unlink the marker on this; try-cleanup warns
- *                   and carries on.
+ *                   is not a client config at all and no peel is possible.
+ *                   try-cleanup and the GC both keep the marker on this (see
+ *                   notAContainer for the reason they print).
  *   - "replaced":   an entry IS at that name, but it is not the one the trial
  *                   wrote (see trialLaunchFingerprint). Nothing is touched --
  *                   it is the user's now.
  *  Read/parse/write errors propagate to the caller's own catch.
  *
- *  `expectFingerprint` is undefined for a marker written before fingerprints
+ *  Takes the MARKER, not its fields one by one, so no caller can peel with a
+ *  syntax other than the one the marker names (markerSite reads it): the
+ *  three call sites used to pass path, container and name, and a format
+ *  argument added beside them is one a fourth caller could leave out.
+ *
+ *  `entryFingerprint` is undefined for a marker written before fingerprints
  *  existed, and then the provenance check is skipped entirely: every marker
  *  had unprovable provenance until now, and refusing those would strand the
  *  trials they name. */
 async function peelEntryFromConfig(
-  clientPath: string,
-  containerPath: string[],
-  entryName: string,
+  marker: PeelTarget,
   dryRun = false,
-  expectFingerprint?: string,
 ): Promise<"removed" | "absent" | "not-object" | "replaced"> {
-  const site = markerSite(clientPath, containerPath);
+  const { clientPath, entryName, entryFingerprint: expectFingerprint } = marker;
+  const site = markerSite(marker);
   const view = await readClientConfigFile(site);
   const read = view.read;
   // No file, or a file that is empty or whitespace-only.
   if (read.kind === "absent") return "absent";
   // The bytes could not be read at all (EISDIR, EACCES, EBUSY). Thrown rather
-  // than returned, because every caller's catch already turns that into the
-  // "couldn't strip ..." warning that names the errno, and a new outcome kind
-  // would need handling at three call sites to say the same thing.
+  // than returned, because every caller's catch already turns that into its
+  // own "couldn't strip ..." / "could not be removed" report naming the errno,
+  // and a new outcome kind would need handling at three call sites to say the
+  // same thing.
   if (read.kind === "unreadable") throw new Error(read.message);
   if (read.kind === "malformed") {
     // The whole FILE is not a map: not a client config at all, so no peel is
@@ -593,8 +639,8 @@ async function peelEntryFromConfig(
   // a map is "not-object" above.
   if (read.kind === "blocked") return "absent";
   // A shape the splicer will not edit (no JSON-family file produces one; a
-  // TOML inline table would). Reported like a syntax failure: the caller's
-  // warning names it and the marker is kept.
+  // TOML inline table would). Thrown like a syntax failure, so every caller
+  // reports it the way it reports one.
   if (read.kind === "unspliceable") throw new Error(`the "${read.key}" entry is ${read.reason}`);
   // The user pulled the trial entry and the now-empty mcpServers block (or, at
   // claude-code local scope, the whole projects[<dir>] block) out by hand, so
@@ -627,38 +673,59 @@ async function peelEntryFromConfig(
   return "removed";
 }
 
-/** The site a MARKER names, as the core reads sites.
+/** The syntax a marker's client config is read with: the `format` the marker
+ *  recorded, or -- for a marker written before that field existed -- the one
+ *  its FILE NAME says. A `.toml` file is Codex CLI's config.toml, the only
+ *  non-JSON file `try` writes (resolveCodexPath always names config.toml);
+ *  every other file `try` writes is JSON-family and reads as "jsonc".
  *
- *  `format` is `"jsonc"` for every marker, because a marker records
- *  `clientPath`, `containerPath` and `entryName` and has never recorded the
- *  file's SYNTAX or the scope it was resolved at -- so there is nothing on
- *  disk to derive a strictness from. `clientName` is deliberately not
- *  consulted for one either: it is unvalidated marker data, and a wrong id
- *  there would pick a syntax for a file it does not describe.
+ *  Every caller peels only a marker rejectUntrustedMarker has passed (for the
+ *  GC, scanTrials applies it), so a recorded `format` is one this build has an
+ *  adapter for. One that slipped past would make adapterFor throw
+ *  MissingConfigAdapterError, which fails the peel -- and a failed peel keeps
+ *  the marker.
  *
- *  MEASURED, not assumed: for the one operation a marker drives -- a REMOVAL
- *  -- `"json"` here would behave identically, and the claim that it would
- *  strand a trial in a commented file is false. The strict adapter falls back
- *  to a lenient parse and reports the file `ok` with `unloadable` set, and the
- *  write facade allows a remove into an unloadable file on purpose (taking our
- *  entry out of a file the client skips is correct). A file that fails BOTH
- *  parsers is `malformed` either way. So this is the honest "the marker never
- *  said, and for a removal it does not matter" value, not a behaviour the peel
- *  depends on -- a mutation to `"json"` leaves every test green, which is what
- *  says so.
+ *  The file name rather than `clientName`: the path names the very file the
+ *  peel parses, while clientName is a label beside it, and a wrong id there
+ *  would pick a syntax for a file it does not describe. A wrong guess either
+ *  way cannot remove anything -- the other adapter does not parse the file, and
+ *  a failed peel keeps the marker (runTryCleanup, gcExpiredTrials).
+ *
+ *  "jsonc" rather than "json" for the JSON family, because an old marker never
+ *  said which scope its file was resolved at, so there is nothing to derive a
+ *  strictness from -- and for the one operation a marker drives, a REMOVAL,
+ *  the two behave identically. The strict adapter falls back to a lenient
+ *  parse and reports the file `ok` with `unloadable` set, and the write facade
+ *  allows a remove into an unloadable file on purpose (taking our entry out of
+ *  a file the client skips is correct). A file that fails BOTH parsers is
+ *  `malformed` either way. */
+function markerFormat(marker: Pick<TrialMarker, "clientPath" | "format">): ConfigFormat {
+  if (marker.format !== undefined) return marker.format;
+  return /\.toml$/i.test(marker.clientPath) ? "toml" : "jsonc";
+}
+
+/** The site a MARKER names, as the core reads sites, in the syntax
+ *  markerFormat gives it.
  *
  *  `containerPath` is EXACT, never folded through claudeCodeContainerPaths:
  *  it is the value the marker recorded when the trial entry was written, and
  *  a peel must delete that entry and nothing else. Folding a drive-letter-case
  *  sibling in here would let a cleanup remove a key the trial never wrote. */
-function markerSite(clientPath: string, containerPath: readonly string[]): ConfigSite {
+function markerSite(marker: PeelTarget): ConfigSite {
   return {
     id: "trial",
     label: "trial entry",
-    resolved: { absolute: clientPath, display: clientPath, containerPath: [...containerPath] },
-    format: "jsonc",
+    resolved: { absolute: marker.clientPath, display: marker.clientPath, containerPath: [...marker.containerPath] },
+    format: markerFormat(marker),
     detectDir: null,
   };
+}
+
+/** The reason a "not-object" peel prints: the file is valid in its syntax but
+ *  is not the map a client config is ("... is not a JSON object"). One
+ *  sentence for try-cleanup and the GC, in the marker's own syntax. */
+function notAContainer(marker: Pick<TrialMarker, "clientPath" | "format">): string {
+  return `${marker.clientPath} is not ${containerNounFor(syntaxNameFor(markerFormat(marker)))}`;
 }
 
 /** True when `raw` already holds an entry at `entryName` in `site`'s
@@ -691,13 +758,7 @@ async function peelTrialEntry(
 ): Promise<"removed" | "absent" | "failed" | "replaced"> {
   if (rejectUntrustedMarker(marker) !== null) return "failed";
   try {
-    const outcome = await peelEntryFromConfig(
-      marker.clientPath,
-      marker.containerPath,
-      marker.entryName,
-      dryRun,
-      marker.entryFingerprint,
-    );
+    const outcome = await peelEntryFromConfig(marker, dryRun);
     return outcome === "not-object" ? "failed" : outcome;
   } catch {
     return "failed";
@@ -786,11 +847,15 @@ async function autoDetectClient(opts: {
   // doctor could read (the user is actively using it, and `try` will be able
   // to splice into it).
   //
-  // JSON-family files only. A trial marker records no syntax and peels with
-  // format "jsonc" (markerSite), so a trial auto-written into a non-JSON file
-  // (Codex CLI's config.toml) could never be cleaned up by try-cleanup or
-  // doctor's trial GC. Auto-detect keeps to JSON-family files until the marker
-  // records one; an explicit --client is unaffected.
+  // JSON-family files only. This filter went in while a trial marker recorded
+  // no syntax and every peel read the file as JSON, which left a trial in
+  // Codex CLI's config.toml beyond the reach of try-cleanup and doctor's GC.
+  // The marker now records the syntax (TrialMarker.format), so this yaw-mcp
+  // cleans up a TOML trial -- but an older one reading the same marker still
+  // peels it as JSON and cannot. The filter stays, so a user who never names
+  // Codex is never handed a trial an older yaw-mcp cannot remove, and so the
+  // client an existing user's `try` picks does not change. An explicit
+  // --client codex-cli is the user's choice and is unaffected.
   for (const p of probes) {
     if (probeUsable(p) && p.syntax === "JSON") return { clientId: p.clientId, scope: p.scope };
   }
@@ -1141,6 +1206,10 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
     // buildLaunchEntry adds is inside the fingerprint, exactly as it will be
     // read back out of the config.
     entryFingerprint: trialLaunchFingerprint(entryToWrite),
+    // The syntax of the file the entry goes into -- the SAME site the read and
+    // the splice below use -- so try-cleanup and doctor's GC read it back with
+    // that adapter (see TrialMarker.format). "toml" for Codex CLI.
+    format: site.format,
   };
 
   // Step 6: read existing client config (if any).
@@ -1525,7 +1594,7 @@ export async function runTryCleanup(opts: TryCleanupOptions): Promise<TryCommand
   // Everything below deletes marker.entryName at marker.containerPath from
   // marker.clientPath -- three values read straight out of a file on disk. A
   // marker we did not write (hand-edited, corrupted, or produced by a newer
-  // yaw-mcp) could therefore name ANY key in ANY JSON file. Refuse instead of
+  // yaw-mcp) could therefore name ANY key in ANY config file. Refuse instead of
   // acting; the user deletes the marker by hand.
   const rejection = rejectUntrustedMarker(marker);
   if (rejection) {
@@ -1572,22 +1641,19 @@ export async function runTryCleanup(opts: TryCleanupOptions): Promise<TryCommand
     }
   }
 
-  // Peel the entry out of the client config (no-op if already gone). Routed
-  // through the client-config core's write facade so user comments in the
-  // client config survive -- a JSON.parse + JSON.stringify pass would silently
-  // strip them -- and so the removal is VERIFIED before anything is persisted.
+  // Peel the entry out of the client config (no-op if already gone), read in
+  // the syntax the marker names (markerSite). Routed through the client-config
+  // core's write facade so user comments in the client config survive -- a
+  // JSON.parse + JSON.stringify pass would silently strip them -- and so the
+  // removal is VERIFIED before anything is persisted.
   const written: string[] = [];
   /** Set when the entry at the marker's name turned out to be someone else's
    *  work, so the closing line does not claim a cleanup that did not happen. */
   let leftReplacedEntry = false;
+  /** Why the peel failed, or null when it did not. */
+  let peelFailure: string | null = null;
   try {
-    const outcome = await peelEntryFromConfig(
-      marker.clientPath,
-      marker.containerPath,
-      marker.entryName,
-      false,
-      marker.entryFingerprint,
-    );
+    const outcome = await peelEntryFromConfig(marker);
     if (outcome === "replaced") {
       leftReplacedEntry = true;
       // The key is the user's now -- they kept the trial's name and pointed it
@@ -1604,19 +1670,29 @@ export async function runTryCleanup(opts: TryCleanupOptions): Promise<TryCommand
     } else if (outcome === "not-object") {
       // Valid JSON that is not an object (an array, a string, a number): there
       // is no container the entry could be named in, so no peel is possible.
-      // SAY so. Skipping it silently and then printing "cleaned
-      // up" is the same false all-clear over a plaintext credential that the
-      // GC was fixed to refuse -- the user reads "cleaned up", and the entry
-      // is still wired.
-      printErr(
-        `yaw-mcp try-cleanup: warning -- couldn't strip ${marker.entryName} from ${marker.clientPath} (${marker.clientPath} is not a JSON object).`,
-      );
+      // A failure like any other, below -- the same call the GC makes.
+      peelFailure = notAContainer(marker);
     }
   } catch (e) {
+    peelFailure = (e as Error).message;
+  }
+
+  // A FAILED peel ends the run here, before the marker is touched. This used
+  // to warn and carry on: it deleted the marker and printed "cleaned up" with
+  // exit 0, so a user reading that believed the entry -- inline secret and all
+  // -- was gone, while it stayed wired in with nothing left on disk naming it.
+  // doctor then reported "All good", because its sweep only walks markers.
+  // Every Codex trial took that path, since each peel read config.toml as
+  // JSON. The marker is kept so this command, and doctor's sweep, can retry
+  // once the file is fixed, and the exit is non-zero so a script sees it.
+  if (peelFailure !== null) {
     printErr(
-      `yaw-mcp try-cleanup: warning -- couldn't strip ${marker.entryName} from ${marker.clientPath} (${(e as Error).message}).`,
+      `yaw-mcp try-cleanup: couldn't strip ${marker.entryName} from ${marker.clientPath} (${peelFailure}) -- it may still be wired in, so the trial marker was kept.`,
     );
-    // Continue -- still drop the marker so doctor stops surfacing it.
+    printErr(
+      `  Fix that file (or remove the ${marker.entryName} entry from it by hand), then re-run: yaw-mcp try-cleanup ${slug}`,
+    );
+    return { exitCode: 1, written: [] };
   }
 
   // Drop the marker.
@@ -1754,14 +1830,10 @@ export async function gcExpiredTrials(opts: {
     try {
       // Routed through the client-config core (inside the shared peel) so user
       // comments in the client config survive doctor's GC pass -- the previous
-      // JSON.parse + JSON.stringify shape silently stripped them.
-      const outcome = await peelEntryFromConfig(
-        marker.clientPath,
-        marker.containerPath,
-        marker.entryName,
-        false,
-        marker.entryFingerprint,
-      );
+      // JSON.parse + JSON.stringify shape silently stripped them -- and read in
+      // the syntax the marker names, so an expired Codex trial is swept out of
+      // config.toml instead of failing to parse there on every doctor run.
+      const outcome = await peelEntryFromConfig(marker);
       if (outcome === "replaced") {
         // The entry at that name is not the one this trial wrote: the user
         // kept the key and pointed it at their own server. The sweep used to
@@ -1806,7 +1878,7 @@ export async function gcExpiredTrials(opts: {
         // the unlink -- dropping the marker here would leave the trial
         // entry wired with nothing on disk that could ever name it again.
         // Throwing keeps stage "peel", which is what the user needs told.
-        throw new Error(`${marker.clientPath} is not a JSON object`);
+        throw new Error(notAContainer(marker));
       }
       // Unlink the file that was actually scanned -- deriving the path from
       // marker.slug would orphan a marker whose filename mismatches its slug.
