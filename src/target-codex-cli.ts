@@ -17,6 +17,10 @@
 //   * `startup_timeout_sec = 60`, written because Codex's own default is 10
 //     seconds and a warm `npx` fetch of @yawlabs/mcp does not reliably finish
 //     inside that;
+//   * `mcp_optional_startup_grace_ms = 0` at the TOP of config.toml (a root
+//     key, not part of our table), added by install when it is missing and
+//     never changed when it is there (S6). It is `config.rootDefaults` below
+//     -- data the install core reads -- never a client-id branch;
 //   * `env_vars` and `enabled` are Codex's own per-server fields and are
 //     carried from a stored entry on every path but --force, the way `env`
 //     already is -- otherwise a user who allow-listed HTTPS_PROXY (which this
@@ -72,6 +76,34 @@
 //      `enabled: Option<bool>`; and `TryFrom` resolves the timeout as
 //      `(Some(sec), _) => sec`, `(None, Some(ms)) => from_millis(ms)`, which
 //      is the rule `normalizeCodexEntry` mirrors.
+//   S6 codex-rs config_toml.rs at tag rust-v0.156.1 (lines ~309-313), the
+//      ROOT key `mcp_optional_startup_grace_ms`: "Milliseconds to wait for
+//      optional MCP servers while building the initial tool catalog. Defaults
+//      to 1000. Set to 0 to disable the shared grace and wait for each
+//      server's configured startup_timeout_sec instead." That quote, and the
+//      behaviour below, come from a separate session's measurements with real
+//      Codex binaries on 2026-09-24, not from a fetch made while writing this
+//      row: on 0.156.1 yaw-mcp launched through this row's npx entry took 3-35+
+//      s to start and its tools were ABSENT on all 8 turns of a 37 s session
+//      (a server that misses the grace is left out for the whole session, not
+//      added on a later turn); with `mcp_optional_startup_grace_ms = 0` at the
+//      root, Codex waited the entry's `startup_timeout_sec` and the tools were
+//      PRESENT from turn 1. Codex 0.144.0 accepts the key (no config error,
+//      `codex mcp list` works). `required = true` on the entry was measured
+//      FATAL when a start outlasts `startup_timeout_sec` ("required MCP
+//      servers failed to initialize ... timed out handshaking"), so it is NOT
+//      used: it would turn a slow or broken yaw-mcp into a Codex that refuses
+//      to start.
+//      Which releases this applies to, checked against source on 2026-09-24
+//      (only 0.156.1 was measured): the key is absent from config_toml.rs at
+//      rust-v0.150.0 and present from rust-v0.151.0, added by openai/codex
+//      commit 124e560b93 "Make the optional MCP startup grace configurable
+//      (#41199)". Before that the grace was FIXED: `OPTIONAL_MCP_STARTUP_GRACE:
+//      Duration = Duration::from_secs(1)` in
+//      codex-rs/codex-mcp/src/connection_manager/tool_catalog.rs is present at
+//      rust-v0.147.0 and absent at rust-v0.146.0. So Codex 0.147 to 0.150 wait
+//      a fixed 1 s that this key cannot change, and the fix needs Codex 0.151
+//      or newer.
 
 import { isAbsolute, join, resolve } from "node:path";
 import {
@@ -84,11 +116,15 @@ import {
   type ImportView,
   launchOf,
   normalizeEntry,
+  type RootDefaultValue,
+  type RootKeyRead,
   registerConfigAdapter,
 } from "./client-config.js";
 import {
   canonTomlConfig,
+  insertTomlRootKey,
   readTomlConfig,
+  readTomlRootKey,
   removeTomlEntry,
   renderTomlEntry,
   TOML_SYNTAX,
@@ -234,14 +270,25 @@ function describeTomlLocation(absolute: string, _addr: EntryAddress): string {
 function canonToml(
   raw: string,
   addr: EntryAddress,
-  opts: { drop?: readonly string[]; dropContainer?: boolean } = {},
+  opts: { drop?: readonly string[]; dropContainer?: boolean; dropRoot?: readonly string[] } = {},
 ): string {
   // Dropping the CONTAINER is spelled as dropping every name in it:
   // `canonTomlConfig` deletes a container it has emptied, so the two are the
   // same document. Doing it this way keeps one canonicaliser rather than two.
   const drop =
     opts.dropContainer === true ? tomlEntryNames(readTomlConfig(raw, addr.containerPath)) : (opts.drop ?? []);
-  return canonTomlConfig(raw, addr.containerPath, drop);
+  return canonTomlConfig(raw, addr.containerPath, drop, opts.dropRoot ?? []);
+}
+
+/** A top-level key of config.toml, read off the parsed document. */
+function readTomlRoot(raw: string, key: string): RootKeyRead {
+  return readTomlRootKey(raw, key);
+}
+
+/** Add a top-level `key = value` line before the first table. Refuses a key
+ *  already there (TomlSpliceRefusal), and verifies its own output. */
+function insertTomlRoot(raw: string | null, key: string, value: RootDefaultValue): string {
+  return insertTomlRootKey(raw, key, value);
 }
 
 /** Codex CLI's config.toml, spliced table by table.
@@ -257,6 +304,10 @@ export const TOML_ADAPTER: ConfigAdapter = {
   renderPreview: previewToml,
   describeLocation: describeTomlLocation,
   canon: canonToml,
+  // The two root-key methods: what lets a TOML row declare a top-level
+  // default (`ConfigShape.rootDefaults`). The JSON family implements neither.
+  readRootKey: readTomlRoot,
+  insertRootKey: insertTomlRoot,
 };
 
 registerConfigAdapter("toml", TOML_ADAPTER);
@@ -420,10 +471,23 @@ function codexImportView(stored: Record<string, unknown>): ImportView {
   return view;
 }
 
+/** The top-level Codex setting install adds (S6), as data. `why` is printed
+ *  after `Set mcp_optional_startup_grace_ms = 0 in <file>: `, and after "0 is
+ *  recommended: " when the file already sets another value -- so it is true
+ *  whatever that value is, and it is ASCII (it prints to a Windows console). */
+const STARTUP_GRACE_DEFAULT = {
+  key: "mcp_optional_startup_grace_ms",
+  value: 0,
+  why:
+    "Codex 0.151 and later otherwise give optional MCP servers one shared grace (1000 ms unless set) to start " +
+    "and leave a slower yaw-mcp out of the whole session; at 0 each server gets its own startup_timeout_sec " +
+    "(60 s on the entry install writes)",
+} as const;
+
 export const CODEX_CLI_TARGET = defineTarget({
   clientId: "codex-cli",
   label: "Codex CLI",
-  config: { format: "toml", root: CONTAINER_KEY },
+  config: { format: "toml", root: CONTAINER_KEY, rootDefaults: [STARTUP_GRACE_DEFAULT] },
   availableOn: ["macos", "linux", "windows"],
   entry: {
     normalize: normalizeCodexEntry,
@@ -437,6 +501,13 @@ export const CODEX_CLI_TARGET = defineTarget({
     // magnitude for that launch and 60 is not. A genuinely COLD fetch (a fresh
     // machine, or the first spawn after a new release) can still exceed it --
     // the remedy there is to re-run the spawn, not a timeout we could pick.
+    //
+    // On Codex 0.151 and later this timeout is only half of it: the shared
+    // `mcp_optional_startup_grace_ms` (1000 ms by default) decides whether a
+    // server's tools make the session at all, and it is the root key in
+    // `config.rootDefaults` above, set to 0, that makes Codex wait these 60
+    // seconds instead (S6). Codex 0.147 to 0.150 already wait a fixed 1 s
+    // that the key cannot change.
     extraFields: () => ({ startup_timeout_sec: 60 }),
     // Bare `npx` on Windows: Codex resolves the `.cmd` shim itself (S2), which
     // is also what `codex mcp add` writes, so a `cmd /c` entry of ours would
@@ -450,7 +521,9 @@ export const CODEX_CLI_TARGET = defineTarget({
     forImport: codexImportView,
   },
   notes:
-    "Codex CLI reads MCP servers from config.toml ([mcp_servers.<name>] tables) under CODEX_HOME, which defaults to ~/.codex. A project's .codex/config.toml is read only once Codex trusts the project. Codex starts a server with a cleared environment and forwards an allowlist, so put yaw-mcp settings in the entry's [mcp_servers.mcp.env] table or name them in env_vars. On Windows the entry is bare npx, not cmd /c npx, and needs Codex 0.59.0 or newer, which resolves npx's .cmd shim itself. Restart Codex after editing; `codex mcp list` shows the entry.",
+    "Codex CLI reads MCP servers from config.toml ([mcp_servers.<name>] tables) under CODEX_HOME, which defaults to ~/.codex. A project's .codex/config.toml is read only once Codex trusts the project. Codex starts a server with a cleared environment and forwards an allowlist, so put yaw-mcp settings in the entry's [mcp_servers.mcp.env] table or name them in env_vars. On Windows the entry is bare npx, not cmd /c npx, and needs Codex 0.59.0 or newer, which resolves npx's .cmd shim itself. " +
+    "Install also sets mcp_optional_startup_grace_ms = 0 at the top of config.toml: Codex 0.151 and later otherwise give MCP servers a shared 1 s grace to start and leave a slower yaw-mcp out of the whole session. With 0, Codex waits up to each server's startup_timeout_sec, which the entry sets to 60. Codex 0.147 to 0.150 already wait a fixed 1 s that this key cannot change, so the fix needs Codex 0.151 or newer. A value already in the file is left alone, and uninstall leaves the key in place (it only changes how long Codex waits for servers to start). " +
+    "Restart Codex after editing; `codex mcp list` shows the entry.",
   resolvePath: resolveCodexPath,
   scopes: [
     // User FIRST, like every other multi-scope row: the probe walks this array

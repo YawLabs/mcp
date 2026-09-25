@@ -244,7 +244,16 @@ const RULES: Rule[] = [
     // (raw, addr, key[, entry]). Without the second argument the rule matched
     // every `map.remove(k)` in the codebase, and a rule that noisy gets
     // switched off rather than obeyed.
-    pattern: /\.(?:upsert|remove|repairContainer)\([^),]+,/,
+    //
+    // `insertRootKey` is the fourth writer (a row's top-level default). It
+    // reaches a file only through the facade's `rootDefault` edit, and a
+    // consumer that wants its line for a preview asks `previewRootDefaults`.
+    // It is OPTIONAL on the adapter, so strict TypeScript makes a direct call
+    // spell it `?.(` or `!(` unless the caller narrowed it first -- the
+    // pattern takes all three spellings, for every writer name. (An alias,
+    // `const f = adapter.insertRootKey; f(...)`, still gets past a textual
+    // scan, as the header says.)
+    pattern: /\.(?:upsert|remove|repairContainer|insertRootKey)(?:\?\.|!)?\([^),]+,/,
     // THE tight one. `applyClientConfigEdits` is the only exported route to
     // edited text, and it verifies before it returns (no reordered entries, no
     // changed neighbour, no strict file made unloadable). A consumer calling
@@ -254,7 +263,14 @@ const RULES: Rule[] = [
     allowed: {
       "src/client-config.ts": "the write facade -- it calls the adapter and then verifies the result",
     },
-    positive: ["adapter.upsert(raw, addr, key, entry)", "JSON_ADAPTER.remove(raw, addr, k)"],
+    positive: [
+      "adapter.upsert(raw, addr, key, entry)",
+      "JSON_ADAPTER.remove(raw, addr, k)",
+      // The three ways a consumer can call the optional method and compile.
+      "const next = view.adapter.insertRootKey?.(view.raw, rootDefault.key, rootDefault.value);",
+      "const next = view.adapter.insertRootKey!(view.raw, rootDefault.key, rootDefault.value);",
+      "if (adapter.insertRootKey) text = adapter.insertRootKey(text, edit.key, edit.value);",
+    ],
     // A one-argument `.remove(` is not an adapter call: the adapter's takes
     // (raw, addr, key). Requiring at least two arguments is what keeps this
     // from matching every Map and Set in the codebase -- an over-broad rule

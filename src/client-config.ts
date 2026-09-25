@@ -118,7 +118,46 @@ export interface ConfigShape {
    *  is carried so the Done and uninstall wording can say whether the file
    *  stays behind. */
   ownership?: "shared" | "dedicated";
+  /** Settings OUTSIDE the server map that install adds at the top level of
+   *  the file when they are missing, because the client's own default for
+   *  them keeps yaw-mcp from working (Codex's
+   *  `mcp_optional_startup_grace_ms = 0`). Absent on every row that needs
+   *  none.
+   *
+   *  ADD-ONLY, by contract: a key already in the file -- at any value -- is
+   *  the user's and is never changed. At another value install says what it
+   *  would have set; at the same value it says nothing. Only install adds
+   *  one; uninstall leaves it (it is not a server, and it may be the user's
+   *  own). A row may declare these only when its format's adapter
+   *  implements `readRootKey` and `insertRootKey`; anything else is a
+   *  programming error that `planRootDefaults` and the write facade name. */
+  rootDefaults?: readonly ConfigRootDefault[];
 }
+
+/** A value a top-level default is written with. */
+export type RootDefaultValue = number | string | boolean;
+
+/** One top-level setting a row wants present, as DATA: consumers key on this,
+ *  never on the client id. */
+export interface ConfigRootDefault {
+  /** The top-level key, unquoted (`mcp_optional_startup_grace_ms`). */
+  key: string;
+  value: RootDefaultValue;
+  /** Why the value matters, as one clause install prints after
+   *  `Set <key> = <value> in <file>: ` -- and after the recommendation when the
+   *  file already sets another value. ASCII, no trailing period. */
+  why: string;
+}
+
+/** Whether a top-level key is set in a file, and to what (read from the
+ *  PARSED document, never from the text).
+ *
+ *  `float` is there only when the syntax wrote the value as a FLOAT (for
+ *  example `0.0`, `1000.0`, `0.5` or `inf`), and holds the spelling as
+ *  written. A float can parse to the same JS number an integer does (TOML
+ *  `0.0` and `0`), so comparing values alone would call those equal; a client
+ *  that types the key as an integer does not. */
+export type RootKeyRead = { present: false } | { present: true; value: unknown; float?: string };
 
 /** The part of a scope spec that can override the target's format.
  *
@@ -548,17 +587,31 @@ export type ReloadKind = "live" | "restart" | "reload-window" | "next-session";
  *
  *  `undefined` means `"restart"`, and that branch returns the string install
  *  prints today byte-for-byte, so routing the existing targets through here
- *  changes no output. */
-export function reloadDoneClause(reload: ReloadKind | undefined, label: string): string {
+ *  changes no output.
+ *
+ *  `what` is what the write changed. `"server"`, the default, is the wording
+ *  every row has always printed, so a caller that does not pass it gets the
+ *  bytes it always got. `"change"` is for a write that added a top-level
+ *  default (`ConfigShape.rootDefaults`) and left the entry as it was: "the new
+ *  MCP server" would name a server the run did not add, so each kind names
+ *  the change instead. */
+export function reloadDoneClause(
+  reload: ReloadKind | undefined,
+  label: string,
+  what: "server" | "change" = "server",
+): string {
+  const server = what === "server";
   switch (reload) {
     case "live":
-      return `${label} starts the server when the file is saved -- no restart needed.`;
+      return server
+        ? `${label} starts the server when the file is saved -- no restart needed.`
+        : `${label} picks the change up when the file is saved -- no restart needed.`;
     case "reload-window":
-      return "Reload the IDE window to pick up the new MCP server.";
+      return `Reload the IDE window to pick up the ${server ? "new MCP server" : "change"}.`;
     case "next-session":
-      return `${label} picks the entry up in its next session.`;
+      return `${label} picks the ${server ? "entry" : "change"} up in its next session.`;
     default:
-      return "Restart it to pick up the new MCP server.";
+      return `Restart it to pick up the ${server ? "new MCP server" : "change"}.`;
   }
 }
 
@@ -618,8 +671,29 @@ export interface ConfigAdapter {
    *
    *  `drop` names the entries to remove from the container. `dropContainer`
    *  removes the container itself instead, for the two edits that legitimately
-   *  change it: a repair, and an upsert that creates it. */
-  canon(raw: string, addr: EntryAddress, opts?: { drop?: readonly string[]; dropContainer?: boolean }): string;
+   *  change it: a repair, and an upsert that creates it. `dropRoot` names
+   *  TOP-LEVEL keys to remove, for the one edit that legitimately adds one (a
+   *  `rootDefault`); only an adapter that implements `insertRootKey` is ever
+   *  handed it. */
+  canon(
+    raw: string,
+    addr: EntryAddress,
+    opts?: { drop?: readonly string[]; dropContainer?: boolean; dropRoot?: readonly string[] },
+  ): string;
+  /** OPTIONAL, with `insertRootKey`: read one top-level key of `raw` from the
+   *  parsed document. Present only on an adapter whose syntax has top-level
+   *  settings a row declares `rootDefaults` for (TOML); the JSON family does
+   *  not implement it. Valid on text `classify` returned `ok` for. */
+  readRootKey?(raw: string, key: string): RootKeyRead;
+  /** OPTIONAL, with `readRootKey`: add one top-level `key = value` to `raw`
+   *  (`null` means no file: render the line alone) and return the new text.
+   *  MUST refuse (throw) when the key is already present, and must change no
+   *  existing line (whitespace it adds around the new line -- a separating
+   *  blank line, a line break on a last line that had none -- aside). It
+   *  reaches a file only through `applyClientConfigEdits`, which verifies the
+   *  result like every other edit; `previewRootDefaults` also calls it, with
+   *  `null`, to render the line alone for --dry-run, and writes nothing. */
+  insertRootKey?(raw: string | null, key: string, value: RootDefaultValue): string;
 }
 
 /** The DESIGN.md spelling of `ConfigAdapter`, kept as an alias so a sibling
@@ -979,10 +1053,17 @@ export async function readClientConfigFile(
 // Writing
 // ---------------------------------------------------------------------------
 
+/** One edit to a client config file.
+ *
+ *  `rootDefault` ADDS one top-level `key = value` (a row's `rootDefaults`),
+ *  and only when the key is ABSENT: the adapter refuses a present key, and
+ *  the post-write check refuses it again. `key` is a top-level key, never a
+ *  server name, so it is not one of the entries the entry checks drop. */
 export type ClientConfigEdit =
   | { op: "upsert"; key: string; entry: Record<string, unknown> }
   | { op: "remove"; key: string }
-  | { op: "repair"; path: readonly string[] };
+  | { op: "repair"; path: readonly string[] }
+  | { op: "rootDefault"; key: string; value: RootDefaultValue };
 
 /** A write that was refused. Nothing has been written when this is thrown:
  *  `applyClientConfigEdits` returns TEXT, so a refusal simply means the caller
@@ -1016,8 +1097,9 @@ export class ClientConfigWriteError extends Error {
  *    1. the result classifies `ok`, and is no less loadable than the input;
  *    2. every entry no edit named keeps its value AND its relative order;
  *    3. every upserted key reads back equal, and every removed key is gone;
- *    4. the rest of the document -- everything but the entries the edits named
- *       -- is unchanged.
+ *    4. every `rootDefault` key was absent before and reads back as its value;
+ *    5. the rest of the document -- everything but the entries the edits named,
+ *       and the top-level keys a `rootDefault` edit added -- is unchanged.
  *
  *  The cost is one extra parse per write. What it buys is that a bug in a
  *  splicer refuses the write instead of corrupting the user's config. */
@@ -1030,22 +1112,44 @@ export function applyClientConfigEdits(
   const where = site === undefined ? "the config file" : site.resolved.absolute;
   const { adapter, address, read } = view;
   const writes = edits.some((edit) => edit.op !== "remove");
-
-  if (read.kind === "absent") {
-    const only = edits[0];
-    if (edits.length !== 1 || only.op !== "upsert") {
+  // A `rootDefault` on an adapter that cannot read or add a top-level key is
+  // a row declared against the wrong format -- a programming error, named
+  // before anything is attempted rather than surfacing as a missing method.
+  // Same for a key that IS the container: adding it would be a second,
+  // conflicting definition of the server map.
+  for (const edit of edits) {
+    if (edit.op !== "rootDefault") continue;
+    rootKeySupport(adapter, `a "${edit.key}" rootDefault edit`, ClientConfigWriteError);
+    if (edit.key === address.containerPath[0]) {
       throw new ClientConfigWriteError(
-        `${where} does not exist, so there is nothing in it to ${only.op === "remove" ? "remove" : "repair"}`,
+        `a rootDefault edit cannot set "${edit.key}": that key holds the server map in ${where}`,
       );
     }
-    let fresh: string;
+  }
+
+  if (read.kind === "absent") {
+    // A file that does not exist is CREATED: the entry rendered fresh, plus
+    // any top-level defaults, applied in list order starting from no text.
+    // There is nothing in it to remove or repair, and one write creates it
+    // with at most one entry -- the shape it has always had, plus the keys.
+    const refused = edits.find((edit) => edit.op === "remove" || edit.op === "repair");
+    if (refused !== undefined || edits.filter((edit) => edit.op === "upsert").length > 1) {
+      throw new ClientConfigWriteError(
+        `${where} does not exist, so there is nothing in it to ${refused?.op === "remove" ? "remove" : "repair"}`,
+      );
+    }
+    let fresh: string | null = null;
     try {
-      fresh = adapter.upsert(null, address, only.key, only.entry);
+      for (const edit of edits) {
+        if (edit.op === "upsert") fresh = adapter.upsert(fresh, address, edit.key, edit.entry);
+        else if (edit.op === "rootDefault") fresh = insertRootKeyWith(adapter, fresh, edit.key, edit.value);
+      }
     } catch (err) {
       throw new ClientConfigWriteError(
         `${where} could not be created (${err instanceof Error ? err.message : String(err)})`,
       );
     }
+    if (fresh === null) throw new ClientConfigWriteError(`${where} could not be created (no edit produced text)`);
     verifyEdits(adapter, address, null, fresh, edits, where, view);
     return fresh;
   }
@@ -1085,6 +1189,7 @@ export function applyClientConfigEdits(
     for (const edit of edits) {
       if (edit.op === "upsert") text = adapter.upsert(text, address, edit.key, edit.entry);
       else if (edit.op === "remove") text = adapter.remove(text, address, edit.key);
+      else if (edit.op === "rootDefault") text = insertRootKeyWith(adapter, text, edit.key, edit.value);
       else text = adapter.repairContainer(text, address, edit.path);
     }
   } catch (err) {
@@ -1134,9 +1239,15 @@ function verifyEdits(
   where: string,
   view: ClientConfigView,
 ): void {
+  // ENTRY keys only. A `rootDefault` key is a top-level setting, not a server:
+  // adding it to this set would drop a same-named SERVER from every entry
+  // check below, and the one key it may change is dropped from the document
+  // comparison at the end instead -- and only from the top level.
   const touched = new Set<string>();
+  const rootKeys: string[] = [];
   for (const edit of edits) {
-    if (edit.op !== "repair") touched.add(edit.key);
+    if (edit.op === "upsert" || edit.op === "remove") touched.add(edit.key);
+    else if (edit.op === "rootDefault") rootKeys.push(edit.key);
   }
   let reread = adapter.classify(after, address, undefined);
   // A removal can legitimately empty the DOCUMENT, and `absent` is this
@@ -1194,20 +1305,144 @@ function verifyEdits(
     }
   }
 
+  // A top-level default is ADD-ONLY: absent before, and exactly its value
+  // after. Checked here as well as in the adapter's own insert, so an adapter
+  // that overwrote a present key instead of refusing is still caught.
+  for (const edit of edits) {
+    if (edit.op !== "rootDefault") continue;
+    const readRoot = rootKeySupport(adapter, `a "${edit.key}" rootDefault edit`, ClientConfigWriteError).read;
+    if (before !== null && readRoot(before, edit.key).present) {
+      throw new ClientConfigWriteError(
+        `"${edit.key}" is already set in ${where}, and a rootDefault never changes a value that is there -- nothing was written`,
+      );
+    }
+    const back = readRoot(after, edit.key);
+    if (!back.present || canonicalJson(back.value) !== canonicalJson(edit.value)) {
+      throw new ClientConfigWriteError(
+        `"${edit.key}" did not read back from ${where} as ${canonicalJson(edit.value)} -- nothing was written`,
+      );
+    }
+  }
+
   if (before !== null) {
     // A repair replaces the container, and an upsert into a file that had none
     // creates it, so on those two paths the container itself is what the edit
     // was about -- comparing it would fail a change the caller asked for. Every
     // other path compares the container minus the entries the edits named.
+    //
+    // `dropRoot` takes the top-level keys a `rootDefault` edit added out of
+    // both sides -- ONLY when such an edit is in the list, and only those keys,
+    // so a change to any other top-level key (or to that one, on any other
+    // write) still fails this comparison.
     const containerChanged =
       edits.some((edit) => edit.op === "repair") || (view.read.kind === "ok" && !view.read.containerPresent);
-    const opts = containerChanged ? { dropContainer: true } : { drop: [...touched] };
+    const dropRoot = rootKeys.length > 0 ? { dropRoot: rootKeys } : {};
+    const opts = containerChanged ? { dropContainer: true, ...dropRoot } : { drop: [...touched], ...dropRoot };
     if (adapter.canon(before, address, opts) !== adapter.canon(after, address, opts)) {
       throw new ClientConfigWriteError(
         `writing to ${where} would have changed other settings in the file -- nothing was written`,
       );
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Top-level defaults (ConfigShape.rootDefaults)
+// ---------------------------------------------------------------------------
+
+/** The adapter's two root-key methods, or a throw naming the programming
+ *  error: a row declared `rootDefaults` on a format whose adapter cannot read
+ *  or add a top-level key. `ErrorType` lets the write facade keep its one
+ *  error type while a read-side caller gets a plain Error. */
+function rootKeySupport(
+  adapter: ConfigAdapter,
+  what: string,
+  ErrorType: new (message: string) => Error = Error,
+): {
+  read: (raw: string, key: string) => RootKeyRead;
+  insert: (raw: string | null, key: string, value: RootDefaultValue) => string;
+} {
+  const read = adapter.readRootKey;
+  const insert = adapter.insertRootKey;
+  if (read === undefined || insert === undefined) {
+    throw new ErrorType(
+      `${what} needs a config adapter that can read and add a top-level key, and the ${adapter.syntax} adapter ` +
+        "does not implement both readRootKey and insertRootKey -- a target may declare rootDefaults only on a " +
+        "format whose adapter does (a programming error, not a problem with the file)",
+    );
+  }
+  return { read: read.bind(adapter), insert: insert.bind(adapter) };
+}
+
+function insertRootKeyWith(adapter: ConfigAdapter, raw: string | null, key: string, value: RootDefaultValue): string {
+  return rootKeySupport(adapter, `a "${key}" rootDefault edit`, ClientConfigWriteError).insert(raw, key, value);
+}
+
+/** What install does about a row's `rootDefaults` in one file. */
+export interface RootDefaultPlan {
+  /** Absent from the file: the write adds each, as a `rootDefault` edit. */
+  set: readonly ConfigRootDefault[];
+  /** Present with ANOTHER value: left exactly as it is, and reported. `float`
+   *  is the file's spelling when the default is an integer and the file
+   *  writes the value as a float (see `planRootDefaults`). */
+  kept: readonly { rootDefault: ConfigRootDefault; value: unknown; float?: string }[];
+}
+
+/** Sort a row's `rootDefaults` for the file a view read.
+ *
+ *  A key the file already holds at the SAME value is in neither list: there
+ *  is nothing to do and nothing to say. "Same" is canonical-JSON equality of
+ *  the parsed value, so `0` and a hand-written `0` agree and a string `"0"`
+ *  does not -- and, for an integer default, the TYPE as well: a float
+ *  (`0.0`, `-0.0`, `0e0`) parses to the same JS number, but a client that
+ *  types the key as an integer refuses it (Codex reads
+ *  `mcp_optional_startup_grace_ms` as `Option<u64>`), so it is kept and
+ *  reported with its spelling, never read as the recommended value.
+ *
+ *  Only a file that is absent or reads `ok` gets a plan. Every other read is
+ *  one the write facade refuses anyway (malformed, unreadable, unspliceable,
+ *  a blocked container), and a note about a key in a file nothing will be
+ *  written to is noise beside that refusal -- so those get an empty plan.
+ *
+ *  An empty or missing `defaults` never touches the adapter, so a row that
+ *  declares none (every JSON-family row) runs exactly as before. */
+export function planRootDefaults(
+  view: ClientConfigView,
+  defaults: readonly ConfigRootDefault[] | undefined,
+): RootDefaultPlan {
+  if (defaults === undefined || defaults.length === 0) return { set: [], kept: [] };
+  const { read } = rootKeySupport(view.adapter, `a target's rootDefaults (${defaults.map((d) => d.key).join(", ")})`);
+  if (view.read.kind === "absent") return { set: [...defaults], kept: [] };
+  if (view.read.kind !== "ok" || view.raw === null) return { set: [], kept: [] };
+  const set: ConfigRootDefault[] = [];
+  const kept: { rootDefault: ConfigRootDefault; value: unknown; float?: string }[] = [];
+  for (const rootDefault of defaults) {
+    const current = read(view.raw, rootDefault.key);
+    if (!current.present) {
+      set.push(rootDefault);
+      continue;
+    }
+    const integerDefault = typeof rootDefault.value === "number" && Number.isInteger(rootDefault.value);
+    const float = integerDefault ? current.float : undefined;
+    if (float !== undefined) kept.push({ rootDefault, value: current.value, float });
+    else if (canonicalJson(current.value) !== canonicalJson(rootDefault.value)) {
+      kept.push({ rootDefault, value: current.value });
+    }
+  }
+  return { set, kept };
+}
+
+/** What `--dry-run` prints for the top-level defaults a write would add: each
+ *  `key = value` line in the file's own syntax, spelled as the write spells
+ *  it, and nothing else. It is the LINE, not the edit: it does not show
+ *  where in the file the line lands, nor the blank line the write puts under
+ *  it when the file starts with a table (as a file an earlier install
+ *  created does), nor a line break the write gives a last line that had
+ *  none. */
+export function previewRootDefaults(view: ClientConfigView, defaults: readonly ConfigRootDefault[]): string {
+  if (defaults.length === 0) return "";
+  const { insert } = rootKeySupport(view.adapter, "a rootDefault preview");
+  return defaults.map((d) => insert(null, d.key, d.value)).join("");
 }
 
 // ---------------------------------------------------------------------------

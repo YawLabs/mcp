@@ -4,7 +4,11 @@
 // that also holds the user's model, theme and per-project trust settings. So
 // the same rule the JSONC helpers in jsonc.ts follow applies here, harder: a
 // write must change our own table and nothing else -- not a comment, not a
-// number's spelling, not a sibling's key order.
+// number's spelling, not a sibling's key order. The one exception is a row's
+// top-level default (`ConfigShape.rootDefaults`): `insertTomlRootKey` may ADD
+// one root `key = value` line, only when that key is absent, and never
+// changes a line that is there (beyond the whitespace around it that "Root
+// keys" below lists).
 //
 // SPLIT, on purpose:
 //
@@ -36,7 +40,9 @@
 // been verified (`verifyTomlSplice`), and there is no exported way to get
 // spliced text that skipped that check -- so a scanner bug that would move,
 // eat or re-nest anything is a refusal (nothing written), not a corrupted
-// config.
+// config. The one other writer, `insertTomlRootKey` (one `key = value` line
+// at the document root, which a table splice cannot reach), carries its own
+// check of the same kind (`verifyTomlRootInsert`).
 //
 // What the check proves, exactly: the result PARSES; the document with the
 // touched entries dropped MEANS what it meant; the other entries keep their
@@ -245,6 +251,8 @@ export interface TomlAssignment {
   inlineTable: boolean;
   /** Offset of the assignment line's start. */
   start: number;
+  /** Offset of the value's first character (past the `=` and its spaces). */
+  valueStart: number;
 }
 
 /** Why a line did not begin in normal state at bracket depth 0: it is inside a
@@ -262,15 +270,21 @@ export interface TomlScan {
    *  comment, and a line holding only spaces inside `"""` is not a blank line.
    *  So anything that walks lines backwards or forwards over the text has to
    *  consult this map instead of trusting the characters -- which is what the
-   *  `contentEnd` back-off below does.
+   *  `contentEnd` back-off below does walking backwards, and what the root-key
+   *  insert (`rootInsertEdits`) does walking forwards.
    *
-   *  Honest about which carry earns its keep: the back-off is fixed by the two
-   *  STRING carries. `bracket` cannot change its answer, because the line that
-   *  closes a bracket holds the `]` or `}` that closes it and is therefore
-   *  never blank-or-comment -- a backwards walk stops on that line whether or
-   *  not this map is consulted. It is recorded because the map states a fact
-   *  about the document rather than a private of one caller, and the next
-   *  line-walker will want it; it is not a guard with a consequence to pin. */
+   *  Which carry earns its keep depends on the direction. The backwards
+   *  `contentEnd` back-off needs only the two STRING carries: the line that
+   *  closes a bracket holds the `]` or `}` that closes it, so it is never
+   *  blank-or-comment, and a backwards walk stops on it whether or not this
+   *  map is consulted. The forward walk needs `bracket` as well: to put a root
+   *  line after a multi-line array or inline table that is the last root
+   *  value, it has to step over every line of that value, and only this map
+   *  says those lines are the value. Without `bracket` the line would be
+   *  spliced inside the array and `verifyTomlRootInsert` would refuse the
+   *  write. The root-key tests "places the line for a multi-line array as the
+   *  last root value" and "places the line for a multi-line value that ends
+   *  the file with no line break" pin that. */
   continuedLines: Map<number, TomlLineCarry>;
   /** The file's own line ending, from its first line break. LF when it has none. */
   eol: string;
@@ -485,7 +499,8 @@ function readHeader(text: string, pos: number): { keyPath: string[]; arrayTable:
  *
  *  The same carry is recorded per line in `continuedLines`, because a line
  *  inside a multi-line string or an open bracket also has to be invisible to
- *  the `contentEnd` back-off below, which walks lines by their text.
+ *  the `contentEnd` back-off below, which walks lines by their text, and has
+ *  to be stepped over by the root-key insert's forward walk.
  *
  *  Pure and total: it never throws and it never needs the document to be
  *  valid. It is nonetheless only ever run on text the parser has already
@@ -544,6 +559,7 @@ export function scanTomlSections(text: string): TomlScan {
               keyPath: read.path,
               inlineTable: text[v] === "{",
               start: lineStart,
+              valueStart: v,
             });
             pos = eq + 1;
           }
@@ -1674,11 +1690,24 @@ function canonValue(value: unknown): unknown {
  *  allowed to change" the post-write check compares.
  *
  *  An emptied container is treated as absent, so removing the only server is
- *  not itself reported as a change to the rest of the file. */
-export function canonTomlConfig(raw: string, containerPath: readonly string[], drop: readonly string[] = []): string {
+ *  not itself reported as a change to the rest of the file.
+ *
+ *  `dropRoot` names keys to take out of the document ROOT as well -- only the
+ *  root: a same-named key inside a table (`[profiles.x]`) stays in the
+ *  picture. It is for the one edit that legitimately adds a root key
+ *  (`insertTomlRootKey`), and a caller passes it only when that edit is in the
+ *  write, so every other root key -- and that key too, on every other write --
+ *  is still compared. */
+export function canonTomlConfig(
+  raw: string,
+  containerPath: readonly string[],
+  drop: readonly string[] = [],
+  dropRoot: readonly string[] = [],
+): string {
   const parsed = parseTomlConfig(raw);
   const value = canonValue(parsed);
   if (!isTomlTable(value)) return JSON.stringify(value);
+  for (const key of dropRoot) delete value[key];
   let cursor: Record<string, unknown> = value;
   for (let i = 0; i < containerPath.length; i++) {
     const key = containerPath[i];
@@ -1771,5 +1800,186 @@ export function verifyTomlSplice(
     if (JSON.stringify(canonValue(stored)) !== JSON.stringify(canonValue(entryAsWritten(expectation.upsert.entry)))) {
       throw new TomlVerifyError(`the "${expectation.upsert.name}" entry did not read back as the value written`);
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Root keys
+// ---------------------------------------------------------------------------
+//
+// One `key = value` line at the document ROOT: a Codex setting that is not
+// part of any server table (`mcp_optional_startup_grace_ms`). In TOML a root
+// key/value line has to come before the first `[table]` header -- after one,
+// the same line is a key of that table -- so the table splice above cannot
+// place it, and this is a second, smaller splice: INSERT one whole line, never
+// replace or reformat a line that is already there. The only other bytes it
+// adds are whitespace: a blank line under the key when it lands at the top of
+// a tables-only file, and a line break, in the file's own ending, on a last
+// line that had none. Whitespace-only text is not carried (see
+// insertTomlRootKey).
+//
+// It only ever ADDS. A key that is already present, in any spelling the
+// parser accepts (`"mcp_optional_startup_grace_ms" = 1000` counts), is a
+// refusal: the value is the user's, and changing it is not something this
+// writer does.
+
+/** A value a root key line is written with. */
+export type TomlRootValue = number | string | boolean;
+
+/** Whether a key is set at the document root, and to what.
+ *
+ *  `float` is there only when the value is a TOML FLOAT, and holds its
+ *  spelling as the file writes it (`0.0`, `-0.0`, `0e0`, `1000.0`). The parse
+ *  hands back `0.0` and `0` as the same JS number, and a client that types
+ *  the key as an integer (Codex: `Option<u64>`) refuses the float, so a caller
+ *  that compares values needs the type as well. */
+export type TomlRootKeyRead = { present: false } | { present: true; value: unknown; float?: string };
+
+/** Read one ROOT key of `raw`, from the PARSED document -- so a quoted key is
+ *  the key, a dotted `key.sub = 1` makes it present (as a table), and a
+ *  same-named key inside a table (`[profiles.x]`) is not at the root at all.
+ *
+ *  Null, empty and whitespace-only text read as "not present", the way Codex
+ *  reads a missing file. Throws `TomlConfigError` when the text does not
+ *  parse: a caller reads this off a file it has already classified. */
+export function readTomlRootKey(raw: string | null, key: string): TomlRootKeyRead {
+  if (raw === null || raw.trim() === "") return { present: false };
+  const parsed = parseTomlConfig(raw);
+  if (!isTomlTable(parsed) || !Object.hasOwn(parsed, key)) return { present: false };
+  const value = parsed[key];
+  if (typeof value !== "number") return { present: true, value };
+  // A JS number is a TOML integer OR a TOML float: `PARSE_OPTIONS` returns an
+  // integer as a bigint only when it has to. A second parse with EVERY
+  // integer as a bigint tells the two apart. It classifies this one value and
+  // nothing else, and it cannot refuse text the first parse accepted.
+  const typed = parseTomlText(stripBom(raw), { integersAsBigInt: true }) as Record<string, unknown>;
+  if (typeof typed[key] === "bigint") return { present: true, value };
+  return { present: true, value, float: rootValueSpelling(raw, key) ?? String(value) };
+}
+
+/** A root float's spelling as the file writes it, read at the value's offset
+ *  in the scan. A float is one token (`[+-]`, digits and `_`, an optional
+ *  fraction and exponent, or `inf` / `nan`), so the token is the spelling.
+ *  Null when the scan has no single-key root assignment for `key`; the reader
+ *  then falls back to the number's own spelling (still marked a float). */
+function rootValueSpelling(raw: string, key: string): string | null {
+  const assignment = scanTomlSections(raw).assignments.find(
+    (a) => a.section.length === 0 && a.keyPath.length === 1 && a.keyPath[0] === key,
+  );
+  if (assignment === undefined) return null;
+  const token = /^[+-]?(?:inf|nan|[0-9][0-9_]*(?:\.[0-9][0-9_]*)?(?:[eE][+-]?[0-9][0-9_]*)?)/.exec(
+    raw.slice(assignment.valueStart),
+  );
+  return token === null ? null : token[0];
+}
+
+/** Insert one root `key = value` line into `raw` and return the new text.
+ *
+ *  Where it goes, so that it is a ROOT key and nothing else moves:
+ *
+ *   - no file, or nothing but whitespace: the line on its own (whitespace and
+ *     a lone BOM are not carried, as in `upsertTomlEntry`);
+ *   - root key/value lines present: on the line after the LAST of them --
+ *     after every continuation line of a multi-line value, which is what
+ *     `TomlScan.continuedLines` is consulted for -- so it lands before the
+ *     first header and whatever blank lines and comments follow keep their
+ *     place;
+ *   - no root key/value lines (only tables, maybe under leading comments):
+ *     at the very top, after a BOM, followed by one blank line unless the
+ *     file already opens on one. A leading comment block is not moved: it
+ *     stays directly above the content it was above.
+ *
+ *  Wherever the line lands, a file whose LAST line has no line break gets
+ *  one, in the file's own ending -- the only change besides the key line and
+ *  the blank line the top-of-file placement puts under it. Without it a
+ *  caller that ends what it writes with a line break (install's
+ *  `terminateWithNewline`, which knows no line endings) would append a bare
+ *  LF to a CRLF file.
+ *
+ *  The line uses the file's own line ending. Throws `TomlConfigError` when
+ *  `raw` does not parse, `TomlSpliceRefusal` when the key is already set at
+ *  the root, and `TomlVerifyError` when the result would not be exactly
+ *  `raw` plus that key (see `verifyTomlRootInsert`, which every return below
+ *  has passed). */
+export function insertTomlRootKey(raw: string | null, key: string, value: TomlRootValue): string {
+  const line = `${tomlKey(key)} = ${tomlValue(value, key)}`;
+  if (raw === null || raw.trim() === "") {
+    const fresh = line + (raw === null ? "\n" : detectTomlEol(raw));
+    verifyTomlRootInsert("", fresh, key, value);
+    return fresh;
+  }
+  const parsed = parseTomlConfig(raw);
+  if (!isTomlTable(parsed)) {
+    throw new TomlSpliceRefusal("the document root", "not a TOML table", "fix the file by hand, then re-run");
+  }
+  if (Object.hasOwn(parsed, key)) {
+    throw new TomlSpliceRefusal(
+      `the top-level "${key}" key`,
+      "already set in this file",
+      "yaw-mcp only adds it and never changes a value that is there; edit it by hand to change it",
+    );
+  }
+  const scan = scanTomlSections(raw);
+  const next = applyEdits(raw, rootInsertEdits(raw, scan, line));
+  verifyTomlRootInsert(raw, next, key, value);
+  return next;
+}
+
+/** Where a new root line goes, and the line break an unterminated last line
+ *  gets; see `insertTomlRootKey`. */
+function rootInsertEdits(text: string, scan: TomlScan, line: string): SpanEdit[] {
+  const eol = scan.eol;
+  const unterminated = !/[\r\n]/.test(text[text.length - 1] ?? "");
+  const terminated = (edit: SpanEdit): SpanEdit[] =>
+    unterminated ? [edit, { start: text.length, end: text.length, text: eol }] : [edit];
+  // `section` is `[]` exactly for an assignment above the first header: a
+  // header's key path is never empty, so every line after one is in a table.
+  const roots = scan.assignments.filter((a) => a.section.length === 0);
+  const last = roots[roots.length - 1];
+  if (last === undefined) {
+    const at = bomOffset(text);
+    const opensOnBlank = isBlankLine(text, at, lineEnd(text, at));
+    return terminated({ start: at, end: at, text: line + eol + (opensOnBlank ? "" : eol) });
+  }
+  // Past the assignment's own line, then past every line that began inside
+  // its value (a multi-line array, a `"""` or `'''` string): those lines are
+  // the value, whatever they look like, and a line inserted among them would
+  // be written into it.
+  let at = lineEnd(text, last.start);
+  while (at < text.length && scan.continuedLines.has(at)) at = lineEnd(text, at);
+  // At end of file the unterminated last line is the one the key follows, so
+  // its line break goes in FRONT of the key line instead of after the file.
+  if (at >= text.length) return [{ start: at, end: at, text: (unterminated ? eol : "") + line + eol }];
+  return terminated({ start: at, end: at, text: line + eol });
+}
+
+/** Prove that `after` is `before` plus exactly one root key, set to `value`.
+ *
+ *  Four claims, each of which a misplaced line breaks: the key was NOT at the
+ *  root of `before`; `after` parses; the key reads back at the root as
+ *  `value` (a line that landed under a header reads as that table's key and
+ *  fails here); and the rest of the document -- every other root key, every
+ *  table, every server -- means what it meant (canonical JSON with that one
+ *  root key dropped from both sides). Throws `TomlVerifyError`.
+ *
+ *  Like `verifyTomlSplice` it compares MEANING, not bytes: byte preservation
+ *  is a property of the insert touching no other line, which the byte-exact
+ *  fixtures pin. */
+export function verifyTomlRootInsert(before: string, after: string, key: string, value: TomlRootValue): void {
+  if (readTomlRootKey(before, key).present) {
+    throw new TomlVerifyError(`the top-level "${key}" was already set before the edit`);
+  }
+  let read: TomlRootKeyRead;
+  try {
+    read = readTomlRootKey(after, key);
+  } catch (e) {
+    throw new TomlVerifyError(`the edited text does not parse as TOML (${(e as Error).message})`);
+  }
+  if (!read.present) throw new TomlVerifyError(`the edit did not leave a top-level "${key}" behind`);
+  if (JSON.stringify(canonValue(read.value)) !== JSON.stringify(canonValue(value))) {
+    throw new TomlVerifyError(`the top-level "${key}" did not read back as the value written`);
+  }
+  if (canonTomlConfig(before.trim() === "" ? "" : before, [], [], [key]) !== canonTomlConfig(after, [], [], [key])) {
+    throw new TomlVerifyError(`the edit changed settings other than the top-level "${key}" it was asked to add`);
   }
 }
