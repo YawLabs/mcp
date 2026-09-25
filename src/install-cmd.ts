@@ -1652,19 +1652,21 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     // beside the primary's), and running it twice -- once to decide, once to
     // print -- would double every line and re-read every copy.
     const extraPreview: Array<[(s: string) => void, string]> = [];
-    const extraWouldWrite = await applyToExtraSites({
-      cmd: "install",
-      sites: extraSites,
-      transform: target.entry,
-      // The BASE entry, not `entryToWrite`: each copy composes its own from
-      // its own carry. See applyToExtraSites.
-      compose: { base: newEntry, os, force: opts.force === true },
-      keepLegacy: opts.keepLegacy === true,
-      authorised: overwriteAuthorised,
-      dryRun: true,
-      log: (s) => extraPreview.push([log, s]),
-      err: (s) => extraPreview.push([err, s]),
-    });
+    const extraWouldWrite = (
+      await applyToExtraSites({
+        cmd: "install",
+        sites: extraSites,
+        transform: target.entry,
+        // The BASE entry, not `entryToWrite`: each copy composes its own from
+        // its own carry. See applyToExtraSites.
+        compose: { base: newEntry, os, force: opts.force === true },
+        keepLegacy: opts.keepLegacy === true,
+        authorised: overwriteAuthorised,
+        dryRun: true,
+        log: (s) => extraPreview.push([log, s]),
+        err: (s) => extraPreview.push([err, s]),
+      })
+    ).touched;
     const flushExtraPreview = (): void => {
       for (const [sink, line] of extraPreview) sink(line);
     };
@@ -1833,21 +1835,26 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   // the command, so a copy that cannot be written is a warning rather than a
   // failure. Runs even when the primary needed no write -- an identical shared
   // file beside a stale editor copy is exactly the state a re-run is for.
-  written.push(
-    ...(await applyToExtraSites({
-      cmd: "install",
-      sites: extraSites,
-      transform: target.entry,
-      // The BASE entry, not `entryToWrite`: each copy composes its own from
-      // its own carry. See applyToExtraSites.
-      compose: { base: newEntry, os, force: opts.force === true },
-      keepLegacy: opts.keepLegacy === true,
-      authorised: overwriteAuthorised,
-      dryRun: false,
-      log,
-      err,
-    })),
-  );
+  const extras = await applyToExtraSites({
+    cmd: "install",
+    sites: extraSites,
+    transform: target.entry,
+    // The BASE entry, not `entryToWrite`: each copy composes its own from
+    // its own carry. See applyToExtraSites.
+    compose: { base: newEntry, os, force: opts.force === true },
+    keepLegacy: opts.keepLegacy === true,
+    authorised: overwriteAuthorised,
+    dryRun: false,
+    log,
+    err,
+  });
+  written.push(...extras.touched);
+  /** Did any file this run wrote get a new or changed "mcp" entry -- the
+   *  primary (whose write has landed if `clientJson` is set: every failure
+   *  above returned) or an editor copy? False for a run whose writes were only
+   *  a legacy trim, a top-level default and/or a permissions.allow grant, and
+   *  the Done line then names the change rather than a server. */
+  const entryWritten = (clientJson !== null && !skipEntryWrite) || extras.entryWrites.length > 0;
 
   // Claude Code: merge permissions.allow into settings.json so tool
   // calls don't prompt. Best-effort: any failure here is logged but does
@@ -1934,6 +1941,11 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   // disabledMcpjsonServers under projects[<dir>] in ~/.claude.json), so
   // "restart it" alone strands the user: the freshly-written entry stays
   // inert until the prompt is answered, and nothing else names that gate.
+  // Printed whether or not this run wrote the entry: install cannot see Claude
+  // Code's approval state, and an entry written earlier or committed by a
+  // teammate is just as inert until approved. The sentence names no new
+  // server, so it holds for a run whose only write was a legacy trim or the
+  // project settings grant too.
   log(
     target.clientId === "claude-code" && scope === "project"
       ? `\nDone: ${target.label} is configured. Restart it in this project and approve the .mcp.json server when ` +
@@ -1942,14 +1954,15 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
         // line's: a client that watches its config file must not be told to
         // restart, and one that needs a window reload must not be told the
         // editor. `reload` defaults to "restart", whose clause is what every
-        // pre-existing row printed, byte for byte. A write that left the entry
-        // as it was and added a top-level default (Codex's startup grace, with
-        // or without a legacy trim) names "the change", never a new server; a
-        // legacy-trim-only write keeps the wording it has always had.
+        // pre-existing row printed, byte for byte. A run in which no file got
+        // a new or changed entry -- its writes were a legacy trim, a top-level
+        // default (Codex's startup grace) and/or a permissions.allow grant, on
+        // the primary or on an editor copy -- names "the change", never a new
+        // server. Any entry written anywhere keeps the server wording.
         `\nDone: ${target.label} is configured. ${reloadDoneClause(
           target.reload,
           target.label,
-          skipEntryWrite && rootSets.length > 0 ? "change" : "server",
+          entryWritten ? "server" : "change",
         )}`,
   );
   return { written, wouldWrite: [], messages, exitCode: 0 };
@@ -2366,7 +2379,15 @@ export function describeEntryDiff(stored: unknown, nextEntry: object): string[] 
  *  removal (`uninstall`), which takes our entry and -- unless `keepLegacy` --
  *  any legacy key out of each copy; without it an uninstall would leave a live
  *  broker wired in every editor copy it had written, which is the
- *  duplicate-broker state the legacy trim exists to prevent. */
+ *  duplicate-broker state the legacy trim exists to prevent.
+ *
+ *  RETURNS every copy it wrote (on a dry run, would write) as `touched`, and
+ *  among those, as `entryWrites`, the copies whose "mcp" entry was added or
+ *  changed. A copy whose entry was already correct, written only because a
+ *  legacy key had to come out (its entry is re-spliced with the same value),
+ *  is in `touched` and not in `entryWrites`: install's
+ *  Done line reads the second list, and names a new MCP server only when some
+ *  file got one. Always empty for the removal. */
 async function applyToExtraSites(args: {
   cmd: "install" | "uninstall";
   sites: readonly ConfigSite[];
@@ -2382,9 +2403,10 @@ async function applyToExtraSites(args: {
   dryRun: boolean;
   log: (s: string) => void;
   err: (s: string) => void;
-}): Promise<string[]> {
+}): Promise<{ touched: string[]; entryWrites: string[] }> {
   const { cmd, compose, log, err } = args;
   const touched: string[] = [];
+  const entryWrites: string[] = [];
   for (const site of args.sites) {
     const where = site.resolved.absolute;
     const named = `${where} (${site.label})`;
@@ -2450,12 +2472,17 @@ async function applyToExtraSites(args: {
       carried: compose.force ? {} : view.carried(),
     });
     const stored = view.normalized();
+    /** True when this copy's entry is added or changed by the write below,
+     *  false when its value is already correct -- the write then exists only
+     *  to take a legacy key out, and re-splices the entry with the same
+     *  value. */
+    const entryChanges = !hasEntry || !deepEqualJson(stored, entry);
 
-    if (hasEntry && deepEqualJson(stored, entry) && !trimLegacy) {
+    if (!entryChanges && !trimLegacy) {
       log(`The "${ENTRY_NAME}" entry in ${named} is already correct.`);
       continue;
     }
-    if (hasEntry && !deepEqualJson(stored, entry) && !args.authorised) {
+    if (hasEntry && entryChanges && !args.authorised) {
       err(
         `yaw-mcp ${cmd}: warning -- ${named} already has a differing "${ENTRY_NAME}" entry; left untouched. ` +
           "Re-run with --repair to bring every copy up to date, or --force to overwrite them.",
@@ -2491,19 +2518,21 @@ async function applyToExtraSites(args: {
       // legitimately differ.
       log(`Would also write the "${ENTRY_NAME}" entry to ${named}.`);
       touched.push(where);
+      if (entryChanges) entryWrites.push(where);
       continue;
     }
     try {
       await atomicWriteFile(where, next);
       log(`Wrote ${named}`);
       touched.push(where);
+      if (entryChanges) entryWrites.push(where);
     } catch (e) {
       err(
         `yaw-mcp ${cmd}: warning -- failed to write ${named} (${(e as Error).message}); left unchanged. That copy of the client will not see yaw-mcp.`,
       );
     }
   }
-  return touched;
+  return { touched, entryWrites };
 }
 
 /** True when a value-flag's argument reads as the NEXT flag rather than as the
@@ -3825,17 +3854,19 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
   // alike -- and running the pass twice, once to decide and once to print,
   // would re-read every copy and print every line of this twice.
   const extraPreview: Array<{ stream: "log" | "err"; line: string }> = [];
-  const extraWouldRemove = await applyToExtraSites({
-    cmd: "uninstall",
-    sites: extraSites,
-    transform: target.entry,
-    compose: undefined,
-    keepLegacy: opts.keepLegacy === true,
-    authorised: true,
-    dryRun: true,
-    log: (line) => extraPreview.push({ stream: "log", line }),
-    err: (line) => extraPreview.push({ stream: "err", line }),
-  });
+  const extraWouldRemove = (
+    await applyToExtraSites({
+      cmd: "uninstall",
+      sites: extraSites,
+      transform: target.entry,
+      compose: undefined,
+      keepLegacy: opts.keepLegacy === true,
+      authorised: true,
+      dryRun: true,
+      log: (line) => extraPreview.push({ stream: "log", line }),
+      err: (line) => extraPreview.push({ stream: "err", line }),
+    })
+  ).touched;
   /** Print what the preview pass had to say. `warnings: false` on the
    *  confirmation path alone: the live pass re-reads each copy after the
    *  answer and raises its own warning there, so flushing those here too would
@@ -4022,17 +4053,19 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
   // now -- `extraWouldRemove` is what carries it past the gate, which used to
   // return first, because `removals` is built from the shared file alone.
   written.push(
-    ...(await applyToExtraSites({
-      cmd: "uninstall",
-      sites: extraSites,
-      transform: target.entry,
-      compose: undefined,
-      keepLegacy: opts.keepLegacy === true,
-      authorised: true,
-      dryRun: false,
-      log,
-      err,
-    })),
+    ...(
+      await applyToExtraSites({
+        cmd: "uninstall",
+        sites: extraSites,
+        transform: target.entry,
+        compose: undefined,
+        keepLegacy: opts.keepLegacy === true,
+        authorised: true,
+        dryRun: false,
+        log,
+        err,
+      })
+    ).touched,
   );
 
   // Best-effort, exactly like install's patch: the entry is already gone, and a

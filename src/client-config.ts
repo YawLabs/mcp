@@ -591,10 +591,12 @@ export type ReloadKind = "live" | "restart" | "reload-window" | "next-session";
  *
  *  `what` is what the write changed. `"server"`, the default, is the wording
  *  every row has always printed, so a caller that does not pass it gets the
- *  bytes it always got. `"change"` is for a write that added a top-level
- *  default (`ConfigShape.rootDefaults`) and left the entry as it was: "the new
- *  MCP server" would name a server the run did not add, so each kind names
- *  the change instead. */
+ *  bytes it always got. `"change"` is for a run that wrote files but gave none
+ *  of them a new or changed entry -- it added a top-level default
+ *  (`ConfigShape.rootDefaults`), trimmed a legacy key and/or added a
+ *  permissions.allow grant, and left every entry as it was: "the new MCP
+ *  server" would name a server the run did not add, so each kind names the
+ *  change instead. */
 export function reloadDoneClause(
   reload: ReloadKind | undefined,
   label: string,
@@ -816,18 +818,45 @@ export function describeValueShape(value: unknown): string {
   return `a ${typeof value}`;
 }
 
-/** `text` with exactly one final newline, never doubled.
+/** A text's own line ending, read from its first line break: CRLF, LF or a
+ *  lone CR, and LF when it has none.
+ *
+ *  Syntax-agnostic -- it reads line breaks, not JSON or TOML -- so it is the
+ *  one answer for every writer that adds a line break of its own to a file
+ *  the user owns. The TOML adapter's `detectTomlEol` is this function.
+ *  jsonc.ts keeps a private copy of the same regex: the JSON adapter this
+ *  module imports is built on it, so an import back from there would be a
+ *  cycle. */
+export function detectLineEnding(text: string): "\r\n" | "\n" | "\r" {
+  const match = /\r\n|\n|\r/.exec(text);
+  return match === null ? "\n" : (match[0] as "\r\n" | "\n" | "\r");
+}
+
+/** `text` with exactly one final line break, never doubled, in the text's own
+ *  line ending.
  *
  *  A splice leaves the bytes outside its own span alone, so a file that did
- *  not end in a newline comes back without one. Every caller that WRITES
- *  terminates it -- POSIX tools and diffs both want the newline, and the file
- *  is being rewritten anyway.
+ *  not end in a line break comes back without one. Every caller that WRITES
+ *  terminates it -- POSIX tools and diffs both want the line break, and the
+ *  file is being rewritten anyway.
+ *
+ *  The line break added is the text's own (`detectLineEnding`): LF only when
+ *  the text uses LF or has no line break at all. A bare LF appended to a CRLF
+ *  file left it with mixed line endings -- a CRLF config.toml whose last line
+ *  had none, after a table in the middle was replaced, is how that was found.
+ *  A text that already ends in a line break is returned as it is: one ending
+ *  in LF (so CRLF too), and, in a CR-only file, one ending in a lone CR. A
+ *  lone CR at the end of a CRLF file is half of that file's line break, so it
+ *  is completed with the LF rather than left dangling.
  *
  *  Apply this to text you are about to write, never to a value you are
  *  comparing by identity: a no-op removal returns its input string itself, and
  *  terminating that would turn "nothing changed" into a phantom write. */
 export function terminateWithNewline(text: string): string {
-  return text.endsWith("\n") ? text : `${text}\n`;
+  if (text.endsWith("\n")) return text;
+  const eol = detectLineEnding(text);
+  if (text.endsWith("\r")) return eol === "\r\n" ? `${text}\n` : text;
+  return text + eol;
 }
 
 /** The legacy entry key present among `keys`, or null.

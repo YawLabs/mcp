@@ -25,7 +25,7 @@
 
 import { readFile, stat } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
-import { describeValueShape } from "./client-config.js";
+import { describeValueShape, terminateWithNewline } from "./client-config.js";
 import type { InstallScope } from "./install-target-model.js";
 import { addJsoncArrayElement, parseJsonc, removeJsoncArrayElements } from "./jsonc.js";
 
@@ -347,7 +347,9 @@ export async function prepareClaudeCodeSettingsPatch(opts: {
     // than re-serialized.
     try {
       const next = patchPermissionsAllowText(rawSettings, [CLAUDE_CODE_ALLOW_PATTERN], op);
-      return { path, nextJson: next.endsWith("\n") ? next : `${next}\n`, changed: true, added, removed, fingerprint };
+      // The client configs' own terminator, so a CRLF settings.json with no
+      // final line break gets a CRLF, not a bare LF.
+      return { path, nextJson: terminateWithNewline(next), changed: true, added, removed, fingerprint };
     } catch (e) {
       // Backstop for whatever the shape check above cannot foresee -- an
       // `allow` key holding a non-array is the reachable one, since

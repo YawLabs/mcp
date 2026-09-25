@@ -277,6 +277,21 @@ const RULES: Rule[] = [
     // would be switched off rather than obeyed.
     negative: ["map.remove(k)", "set.remove(item)", "applyClientConfigEdits(view, edits, site)"],
   },
+  {
+    what: "a final line break added by hand, which ends a CRLF file in a bare LF",
+    // `terminateWithNewline` ends a write in the file's own line ending. The
+    // hand-rolled `x.endsWith("\n") ? x : x + "\n"` it replaced appended a bare
+    // LF to a CRLF file with no final line break, and the settings.json grant
+    // carried its own copy of that line after the client configs had moved to
+    // the helper -- so the shape is a rule, not a one-off fix.
+    pattern: /\.endsWith\(\s*(["'`])\\n\1\s*\)\s*\?/,
+    allowed: {},
+    positive: ['nextJson: next.endsWith("\\n") ? next : `${next}\\n`', "return t.endsWith('\\n') ? t : t + '\\n';"],
+    negative: [
+      'return text.endsWith("\\n") || text.endsWith("\\r") ? text : text + detectLineEnding(text);',
+      "nextJson: terminateWithNewline(next)",
+    ],
+  },
 ];
 
 describe("the client-config boundary", () => {
