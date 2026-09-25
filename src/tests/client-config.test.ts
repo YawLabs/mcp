@@ -31,6 +31,7 @@ import {
   composeEntry,
   containerKeysAt,
   describeValueShape,
+  detectLineEnding,
   type EntryAddress,
   type EntryTransform,
   type EntryView,
@@ -449,6 +450,39 @@ describe("value helpers", () => {
   it("terminates text for a write without ever doubling the newline", () => {
     expect(terminateWithNewline("{}")).toBe("{}\n");
     expect(terminateWithNewline("{}\n")).toBe("{}\n");
+  });
+
+  it("terminates text in its own line ending: CRLF for CRLF, a lone CR for CR, LF otherwise", () => {
+    // A bare LF appended to a CRLF file left it with mixed line endings.
+    expect(terminateWithNewline("{\r\n}")).toBe("{\r\n}\r\n");
+    expect(terminateWithNewline('a = 1\r\n\r\n[t]\r\nb = "x"')).toBe('a = 1\r\n\r\n[t]\r\nb = "x"\r\n');
+    expect(terminateWithNewline("{\r}")).toBe("{\r}\r");
+    expect(terminateWithNewline("{\n}")).toBe("{\n}\n");
+    // No line break at all to copy: LF, as before.
+    expect(terminateWithNewline("")).toBe("\n");
+    // The FIRST line break is the file's, as detectTomlEol and jsonc.ts read it.
+    expect(terminateWithNewline("{\r\n\n}")).toBe("{\r\n\n}\r\n");
+    expect(terminateWithNewline("{\n\r\n}")).toBe("{\n\r\n}\n");
+    // A dangling CR at the end of a CRLF file is completed, not left lone; in
+    // a CR-only file the same CR is the whole line break.
+    expect(terminateWithNewline("{\r\n}\r")).toBe("{\r\n}\r\n");
+    expect(terminateWithNewline("{\r}\r")).toBe("{\r}\r");
+  });
+
+  it("returns text that already ends in a line break as it is, lone CR included", () => {
+    for (const text of ["{}\n", "{\r\n}\r\n", "{\r}\r", "{\r\n}\n", "\n", "\r\n", "\r"]) {
+      expect(terminateWithNewline(text), JSON.stringify(text)).toBe(text);
+    }
+  });
+
+  it("reads a text's line ending from its first line break, LF when it has none", () => {
+    expect(detectLineEnding("a\r\nb\r\n")).toBe("\r\n");
+    expect(detectLineEnding("a\nb\n")).toBe("\n");
+    expect(detectLineEnding("a\rb\r")).toBe("\r");
+    expect(detectLineEnding("a")).toBe("\n");
+    expect(detectLineEnding("")).toBe("\n");
+    expect(detectLineEnding("a\nb\r\n")).toBe("\n");
+    expect(detectLineEnding("a\r\nb\n")).toBe("\r\n");
   });
 });
 

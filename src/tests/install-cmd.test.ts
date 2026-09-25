@@ -4647,6 +4647,203 @@ describe("runInstall — idempotence (re-run over an entry that already matches)
   });
 });
 
+// ---------------------------------------------------------------------------
+// The Done line names a server only when some file this run wrote got a new
+// or changed entry. A run whose writes were a legacy trim and/or a
+// permissions.allow grant names "the change".
+// ---------------------------------------------------------------------------
+
+describe("runInstall -- the Done line names a new server only when one was written", () => {
+  const SERVER_DONE = "\nDone: Claude Code is configured. Restart it to pick up the new MCP server.";
+  const CHANGE_DONE = "\nDone: Claude Code is configured. Restart it to pick up the change.";
+
+  async function install(extra: Partial<Parameters<typeof runInstall>[0]> = {}) {
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: { ...cap.io, isTTY: false },
+      oamProbe: OAM_ABSENT,
+      suppressBundlesNote: true,
+      ...extra,
+    });
+    return { r, stdout: cap.stdout(), stderr: cap.stderr() };
+  }
+
+  /** Add a key beside our entry in a JSON file install wrote. */
+  function addToContainer(path: string, container: string[], key: string, value: unknown): void {
+    const doc = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+    let at = doc;
+    for (const seg of container) at = at[seg] as Record<string, unknown>;
+    at[key] = value;
+    writeFileSync(path, `${JSON.stringify(doc, null, 2)}\n`);
+  }
+
+  it("a fresh install still names the new MCP server", async () => {
+    const { r, stdout } = await install();
+    expect(r.exitCode).toBe(0);
+    expect(r.written).toContain(join(synthHome, ".claude.json"));
+    expect(stdout).toContain(SERVER_DONE);
+  });
+
+  it("a legacy-trim-only write names the change", async () => {
+    await install();
+    const claudeJson = join(synthHome, ".claude.json");
+    addToContainer(claudeJson, ["mcpServers"], "yaw-mcp", { command: "npx", args: ["-y", "@yawlabs/mcp"] });
+    const { r, stdout } = await install();
+    expect(r.exitCode).toBe(0);
+    expect(r.written).toEqual([claudeJson]);
+    expect(stdout).toMatch(/Removed the legacy "yaw-mcp" entry/);
+    expect(stdout).toContain(CHANGE_DONE);
+    expect(stdout).not.toContain("new MCP server");
+  });
+
+  it("a permissions.allow-only write names the change", async () => {
+    await install();
+    const settingsPath = join(synthHome, ".claude", "settings.json");
+    writeFileSync(settingsPath, JSON.stringify({ permissions: { allow: ["Bash(git *)"] } }), "utf8");
+    const { r, stdout } = await install();
+    expect(r.exitCode).toBe(0);
+    expect(r.written).toEqual([settingsPath]);
+    expect(stdout).toContain(CHANGE_DONE);
+    expect(stdout).not.toContain("new MCP server");
+  });
+
+  it("a legacy trim beside an entry this run replaces keeps the server wording", async () => {
+    await install();
+    const claudeJson = join(synthHome, ".claude.json");
+    addToContainer(claudeJson, ["mcpServers", ENTRY_NAME], "type", "stdio");
+    addToContainer(claudeJson, ["mcpServers"], "yaw-mcp", { command: "npx", args: ["-y", "@yawlabs/mcp"] });
+    const { r, stdout } = await install({ repair: true });
+    expect(r.exitCode).toBe(0);
+    expect(stdout).toMatch(/Removed the legacy "yaw-mcp" entry/);
+    expect(stdout).toContain(SERVER_DONE);
+    expect(stdout).not.toContain("pick up the change");
+  });
+
+  it("at project scope, a legacy-trim-only write still asks for the approval and names no new server", async () => {
+    const projectOpts = { scope: "project" as const, projectDir: synthCwd, cwd: synthCwd };
+    const first = await install(projectOpts);
+    expect(first.stdout).toContain("approve the .mcp.json server when prompted");
+    const mcpJson = join(synthCwd, ".mcp.json");
+    addToContainer(mcpJson, ["mcpServers"], "yaw-mcp", { command: "npx", args: ["-y", "@yawlabs/mcp"] });
+    const { r, stdout } = await install(projectOpts);
+    expect(r.exitCode).toBe(0);
+    expect(r.written).toEqual([mcpJson]);
+    // install cannot see Claude Code's approval state, so the gate is named on
+    // every run -- and that sentence never claimed a new server.
+    expect(stdout).toContain("approve the .mcp.json server when prompted");
+    expect(stdout).not.toContain("new MCP server");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A CRLF file with no final line break is ended in CRLF, not a bare LF. The
+// splice copies the file's own line ending into what it adds; the final line
+// break every write is ended with has to as well.
+// ---------------------------------------------------------------------------
+
+describe("runInstall / runUninstall -- a CRLF file with no final line break stays CRLF", () => {
+  /** Every LF in `text` that is not the second half of a CRLF. */
+  const bareLfs = (text: string): number => (text.match(/(?<!\r)\n/g) ?? []).length;
+  const CRLF_CLIENT = ["{", '  "mcpServers": {', '    "other": { "command": "node" }', "  }", "}"].join("\r\n");
+
+  const opts = {
+    clientId: "claude-code" as const,
+    scope: "user" as const,
+    os: "linux" as const,
+    oamProbe: OAM_ABSENT,
+    suppressBundlesNote: true,
+  };
+
+  it("~/.claude.json (JSONC): the entry is added in CRLF and the file ends in CRLF", async () => {
+    const path = join(synthHome, ".claude.json");
+    writeFileSync(path, CRLF_CLIENT, "utf8");
+    const r = await runInstall({ ...opts, home: synthHome, io: captureIo().io });
+    expect(r.exitCode).toBe(0);
+    const after = readFileSync(path, "utf8");
+    expect(JSON.parse(after).mcpServers[ENTRY_NAME]).toBeDefined();
+    expect(bareLfs(after)).toBe(0);
+    expect(after.endsWith("}\r\n")).toBe(true);
+  });
+
+  it(".mcp.json (strict JSON, project scope): the file ends in CRLF", async () => {
+    const path = join(synthCwd, ".mcp.json");
+    writeFileSync(path, CRLF_CLIENT, "utf8");
+    const r = await runInstall({
+      ...opts,
+      scope: "project",
+      home: synthHome,
+      projectDir: synthCwd,
+      cwd: synthCwd,
+      io: captureIo().io,
+    });
+    expect(r.exitCode).toBe(0);
+    const after = readFileSync(path, "utf8");
+    expect(JSON.parse(after).mcpServers[ENTRY_NAME]).toBeDefined();
+    expect(bareLfs(after)).toBe(0);
+    expect(after.endsWith("}\r\n")).toBe(true);
+  });
+
+  it("settings.json: the permissions.allow grant ends the file in CRLF", async () => {
+    // The grant's own writer used to end its text by hand, with the same
+    // bare LF.
+    const settingsPath = join(synthHome, ".claude", "settings.json");
+    mkdirSync(dirname(settingsPath), { recursive: true });
+    writeFileSync(settingsPath, ["{", '  "permissions": {', '    "allow": ["Bash(git *)"]', "  }", "}"].join("\r\n"));
+    const r = await runInstall({ ...opts, home: synthHome, io: captureIo().io });
+    expect(r.exitCode).toBe(0);
+    expect(r.written).toContain(settingsPath);
+    const after = readFileSync(settingsPath, "utf8");
+    expect(after).toContain(CLAUDE_CODE_ALLOW_PATTERN);
+    expect(bareLfs(after)).toBe(0);
+    expect(after.endsWith("}\r\n")).toBe(true);
+  });
+
+  it("uninstall: taking the entry out ends the file in CRLF", async () => {
+    const path = join(synthHome, ".claude.json");
+    const withOurs = [
+      "{",
+      '  "mcpServers": {',
+      '    "other": { "command": "node" },',
+      `    "${ENTRY_NAME}": { "command": "npx", "args": ["-y", "@yawlabs/mcp"] }`,
+      "  }",
+      "}",
+    ].join("\r\n");
+    writeFileSync(path, withOurs, "utf8");
+    const r = await runUninstall({ ...opts, home: synthHome, force: true, io: captureIo().io });
+    expect(r.exitCode).toBe(0);
+    expect(r.written).toContain(path);
+    const after = readFileSync(path, "utf8");
+    expect(JSON.parse(after).mcpServers[ENTRY_NAME]).toBeUndefined();
+    expect(bareLfs(after)).toBe(0);
+    expect(after.endsWith("}\r\n")).toBe(true);
+  });
+
+  it("an LF file with no final line break still ends in LF, with no CR added", async () => {
+    const path = join(synthHome, ".claude.json");
+    writeFileSync(path, CRLF_CLIENT.replaceAll("\r\n", "\n"), "utf8");
+    const r = await runInstall({ ...opts, home: synthHome, io: captureIo().io });
+    expect(r.exitCode).toBe(0);
+    const after = readFileSync(path, "utf8");
+    expect(after).not.toContain("\r");
+    expect(after.endsWith("}\n")).toBe(true);
+  });
+
+  it("a CRLF file that already ends in CRLF keeps exactly that one line break", async () => {
+    const path = join(synthHome, ".claude.json");
+    writeFileSync(path, `${CRLF_CLIENT}\r\n`, "utf8");
+    const r = await runInstall({ ...opts, home: synthHome, io: captureIo().io });
+    expect(r.exitCode).toBe(0);
+    const after = readFileSync(path, "utf8");
+    expect(bareLfs(after)).toBe(0);
+    expect(after.endsWith("}\r\n")).toBe(true);
+    expect(after.endsWith("\r\n\r\n")).toBe(false);
+  });
+});
+
 describe("runInstall --all -- a DRIFTED entry off a TTY", () => {
   // The drift here is the one a real user produces: a first `install --all`
   // writes every client, then one client's entry grows an extra arg. The
@@ -6609,6 +6806,86 @@ describe.each(CLINE_PLATFORMS)("runInstall / runUninstall -- a target whose one 
       expect(after.mcpServers[LEGACY]).toBeUndefined();
       expect(after.mcpServers[ENTRY_NAME]).toBeDefined();
       expect(cap.stdout()).not.toContain(`The "${ENTRY_NAME}" entry in ${copy}`);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // The Done line names a server only when some file got one -- the shared
+  // file or a copy. Cline's `reload` is "live", so the two wordings are "starts
+  // the server" and "picks the change up".
+  // -------------------------------------------------------------------------
+
+  const CLINE_SERVER_DONE =
+    "\nDone: Cline is configured. Cline starts the server when the file is saved -- no restart needed.";
+  const CLINE_CHANGE_DONE =
+    "\nDone: Cline is configured. Cline picks the change up when the file is saved -- no restart needed.";
+
+  it("names the change, not a server, when the only write is a legacy trim in a copy", async () => {
+    const home = mkdtempSync(join(tmpdir(), "yaw-cline-"));
+    try {
+      const copy = seedEditorStorage(home);
+      await runInstall({ ...clineOpts(home), io: captureIo().io });
+      // The shared file is already correct and so is the copy's entry; the one
+      // thing to do is the pre-rename key beside it, which is not a server this
+      // run adds.
+      const doc = JSON.parse(readFileSync(copy, "utf8")) as { mcpServers: Record<string, unknown> };
+      doc.mcpServers[LEGACY] = { command: "old" };
+      writeFileSync(copy, `${JSON.stringify(doc, null, 2)}\n`);
+
+      const cap = captureIo();
+      const r = await runInstall({ ...clineOpts(home), io: cap.io });
+      expect(r.exitCode).toBe(0);
+      expect(r.written).toEqual([copy]);
+      expect(cap.stdout()).toContain(CLINE_CHANGE_DONE);
+      expect(cap.stdout()).not.toContain("starts the server");
+      expect(cap.stdout()).not.toContain("new MCP server");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the server wording when a copy gets the entry and the shared file needs nothing", async () => {
+    const home = mkdtempSync(join(tmpdir(), "yaw-cline-"));
+    try {
+      // Installed before the editor appeared, so the copy has no entry yet --
+      // this run writes one there, and that is a server the copy's Cline starts.
+      await runInstall({ ...clineOpts(home), io: captureIo().io });
+      const copy = seedEditorStorage(home);
+
+      const cap = captureIo();
+      const r = await runInstall({ ...clineOpts(home), io: cap.io });
+      expect(r.exitCode).toBe(0);
+      expect(r.written).toEqual([copy]);
+      expect(cap.stdout()).toContain(CLINE_SERVER_DONE);
+      expect(cap.stdout()).not.toContain("picks the change up");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("ends a CRLF copy with no final line break in CRLF, on install and on uninstall", async () => {
+    const home = mkdtempSync(join(tmpdir(), "yaw-cline-"));
+    try {
+      const copy = seedEditorStorage(home);
+      const bareLfs = (text: string): number => (text.match(/(?<!\r)\n/g) ?? []).length;
+      writeFileSync(copy, ["{", '  "mcpServers": {', '    "other": { "command": "node" }', "  }", "}"].join("\r\n"));
+      const installed = await runInstall({ ...clineOpts(home), io: captureIo().io });
+      expect(installed.written).toContain(copy);
+      const afterInstall = readFileSync(copy, "utf8");
+      expect(entryIn(copy)).toBeDefined();
+      expect(bareLfs(afterInstall)).toBe(0);
+      expect(afterInstall.endsWith("}\r\n")).toBe(true);
+
+      // The copy's own removal path, over the same shape: no final line break.
+      writeFileSync(copy, afterInstall.slice(0, -2));
+      const removed = await runUninstall({ ...clineOpts(home), force: true, io: captureIo().io });
+      expect(removed.written).toContain(copy);
+      const afterUninstall = readFileSync(copy, "utf8");
+      expect(entryIn(copy)).toBeUndefined();
+      expect(bareLfs(afterUninstall)).toBe(0);
+      expect(afterUninstall.endsWith("}\r\n")).toBe(true);
     } finally {
       rmSync(home, { recursive: true, force: true });
     }

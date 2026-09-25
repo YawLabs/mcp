@@ -59,6 +59,9 @@
 // handed -- so apply edits one at a time, each against the result of the last.
 
 import { parse as parseTomlText, TomlDate, TomlError } from "smol-toml";
+// The one syntax-agnostic line-ending reader. Not a cycle: client-config.ts
+// never imports this module (the codex-cli row registers it).
+import { detectLineEnding } from "./client-config.js";
 
 /** The syntax word for user-facing messages ("is not valid TOML"). */
 export const TOML_SYNTAX = "TOML" as const;
@@ -295,10 +298,12 @@ type ScanState = "normal" | "basic" | "literal" | "mlBasic" | "mlLiteral";
 const isHorizontalSpace = (c: string | undefined): boolean => c === " " || c === "\t";
 const isBareKeyChar = (c: string | undefined): boolean => c !== undefined && /^[A-Za-z0-9_-]$/.test(c);
 
-/** The file's own line ending, read from its first line break. */
+/** The file's own line ending, read from its first line break (LF when it has
+ *  none). The core's `detectLineEnding`, so this module and the
+ *  `terminateWithNewline` its callers end a write with cannot disagree about
+ *  what a file's line ending is. */
 export function detectTomlEol(text: string): string {
-  const match = /\r\n|\n|\r/.exec(text);
-  return match ? match[0] : "\n";
+  return detectLineEnding(text);
 }
 
 /** Offset just past the line break that ends the line holding `from`, or the
@@ -1891,10 +1896,10 @@ function rootValueSpelling(raw: string, key: string): string | null {
  *
  *  Wherever the line lands, a file whose LAST line has no line break gets
  *  one, in the file's own ending -- the only change besides the key line and
- *  the blank line the top-of-file placement puts under it. Without it a
- *  caller that ends what it writes with a line break (install's
- *  `terminateWithNewline`, which knows no line endings) would append a bare
- *  LF to a CRLF file.
+ *  the blank line the top-of-file placement puts under it. It is added here
+ *  rather than left to the caller because at the end of the file it has to go
+ *  in FRONT of the key line; install's `terminateWithNewline`, which also ends
+ *  a file in its own line ending, then has nothing to add.
  *
  *  The line uses the file's own line ending. Throws `TomlConfigError` when
  *  `raw` does not parse, `TomlSpliceRefusal` when the key is already set at

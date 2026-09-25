@@ -1421,3 +1421,92 @@ describe("install sets Codex's startup grace at the top of config.toml", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// A CRLF config.toml whose last line has no line break stays CRLF
+// ---------------------------------------------------------------------------
+
+describe("install ends a CRLF config.toml in CRLF", () => {
+  let home: string;
+  let projectDir: string;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "yaw-mcp-codex-crlf-home-"));
+    projectDir = mkdtempSync(join(tmpdir(), "yaw-mcp-codex-crlf-proj-"));
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(projectDir, { recursive: true, force: true });
+  });
+
+  const userFile = (): string => join(home, ".codex", "config.toml");
+
+  /** Every LF in `text` that is not the second half of a CRLF. */
+  const bareLfs = (text: string): number => (text.match(/(?<!\r)\n/g) ?? []).length;
+
+  async function install(over: Partial<Parameters<typeof runInstall>[0]> = {}) {
+    const cap = captureIo();
+    const result = await runInstall({
+      clientId: "codex-cli",
+      scope: "user",
+      os: "linux",
+      home,
+      cwd: projectDir,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+      bundlesSummary: BUNDLES_EMPTY,
+      ...over,
+    });
+    return { result, stdout: cap.stdout(), stderr: cap.stderr() };
+  }
+
+  // Our table in the MIDDLE, differing from what install writes, and the last
+  // line -- another server's -- with no line break. The grace key is already
+  // there, so the table replace is the whole write: nothing else in it gives
+  // that last line its line break, and the terminator install ends every write
+  // with used to add a bare LF, leaving the file with mixed line endings.
+  const BEFORE = [
+    "mcp_optional_startup_grace_ms = 0",
+    "",
+    "[mcp_servers.mcp]",
+    'command = "theirs"',
+    "",
+    "[mcp_servers.other]",
+    'command = "node"',
+  ].join("\r\n");
+
+  for (const flag of ["repair", "force"] as const) {
+    it(`--${flag} over a differing entry that is not the last table ends the file in CRLF, with no bare LF`, async () => {
+      mkdirSync(dirname(userFile()), { recursive: true });
+      writeFileSync(userFile(), BEFORE, "utf8");
+      const run = await install({ [flag]: true });
+      expect(run.result.exitCode, run.stderr).toBe(0);
+      const after = readFileSync(userFile(), "utf8");
+      expect(after).not.toContain('"theirs"');
+      expect(bareLfs(after)).toBe(0);
+      expect(after.endsWith('[mcp_servers.other]\r\ncommand = "node"\r\n')).toBe(true);
+    });
+  }
+
+  it("an LF file with no final line break still gets an LF, and no CR", async () => {
+    mkdirSync(dirname(userFile()), { recursive: true });
+    writeFileSync(userFile(), BEFORE.replaceAll("\r\n", "\n"), "utf8");
+    const run = await install({ repair: true });
+    expect(run.result.exitCode, run.stderr).toBe(0);
+    const after = readFileSync(userFile(), "utf8");
+    expect(after).not.toContain("\r");
+    expect(after.endsWith('[mcp_servers.other]\ncommand = "node"\n')).toBe(true);
+  });
+
+  it("a CRLF file that already ends in CRLF keeps exactly that one line break", async () => {
+    mkdirSync(dirname(userFile()), { recursive: true });
+    writeFileSync(userFile(), `${BEFORE}\r\n`, "utf8");
+    const run = await install({ repair: true });
+    expect(run.result.exitCode, run.stderr).toBe(0);
+    const after = readFileSync(userFile(), "utf8");
+    expect(bareLfs(after)).toBe(0);
+    expect(after.endsWith('command = "node"\r\n')).toBe(true);
+    expect(after.endsWith("\r\n\r\n")).toBe(false);
+  });
+});

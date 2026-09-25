@@ -406,6 +406,21 @@ describe("install writes typed's strict-JSON file", () => {
     ]);
   });
 
+  it("names the change, not the entry, when the only write is the permissions.allow grant", async () => {
+    await install("typed");
+    // The entry in mcp.json is already correct; the grant is gone from
+    // settings.json, so the re-run's one write is that grant. typed picks up
+    // no new entry from it.
+    seed(userSettings(), `${JSON.stringify({ permissions: { allow: [] } }, null, 2)}\n`);
+    const { result, stdout } = await install("typed");
+    expect(result.exitCode).toBe(0);
+    expect(result.written).toEqual([userSettings()]);
+    expect(stdout.split(LF).filter((l) => l.startsWith("Done:"))).toEqual([
+      "Done: typed is configured. typed picks the change up in its next session.",
+    ]);
+    expect(stdout).not.toContain("picks the entry up");
+  });
+
   it("refuses a commented file, which typed would load no server from, and leaves its bytes", async () => {
     const commented = ["{", "  // mine", '  "mcpServers": {', '    "fs": { "command": "node" }', "  }", "}", ""].join(
       LF,
