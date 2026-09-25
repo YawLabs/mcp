@@ -33,6 +33,7 @@ import {
   type ClientConfigView,
   ClientConfigWriteError,
   type ConfigAdapter,
+  type ConfigRootDefault,
   type ConfigSite,
   canonicalJson,
   classifyClientConfig,
@@ -41,6 +42,7 @@ import {
   hasConfigAdapter,
   importViewOf,
   normalizeEntry,
+  planRootDefaults,
   registerConfigAdapter,
   reloadDoneClause,
   resetConfigAdapterRegistry,
@@ -208,7 +210,9 @@ describe("the codex-cli row", () => {
     expect(CODEX.config).toEqual({
       format: "toml",
       root: "mcp_servers",
-      rootDefaults: [{ key: "mcp_optional_startup_grace_ms", value: 0, why: expect.any(String) }],
+      rootDefaults: [
+        { key: "mcp_optional_startup_grace_ms", value: 0, why: expect.any(String), accepts: "unsigned-integer" },
+      ],
     });
     expect([...CODEX.availableOn]).toEqual(["macos", "linux", "windows"]);
     expect(CODEX.notConfigurableOn).toBeUndefined();
@@ -249,8 +253,12 @@ describe("the codex-cli row", () => {
     expect(rest).toEqual([]);
     expect(grace.key).toBe("mcp_optional_startup_grace_ms");
     expect(grace.value).toBe(0);
-    // Printed after "Set ... in <file>: " and after "0 is recommended: ", so
-    // ASCII, one clause, and no period of its own.
+    // Codex reads the key as a u64 (S7), so a value outside that is one the
+    // install warning says a Codex release that reads the key will not load
+    // -- or, for an integer no TOML integer holds, one install refuses over.
+    expect(grace.accepts).toBe("unsigned-integer");
+    // Printed after "Added ... to <file>: " and after "0 is recommended: ",
+    // so ASCII, one clause, and no period of its own.
     expect(/^[ -~]+$/.test(grace.why)).toBe(true);
     expect(grace.why.endsWith(".")).toBe(false);
     // 0.151 is the first release that reads the key (S6: absent from
@@ -280,6 +288,35 @@ describe("the codex-cli row", () => {
       expect(typeof adapter.readRootKey, t.clientId).toBe("function");
       expect(typeof adapter.insertRootKey, t.clientId).toBe("function");
     }
+  });
+
+  it("declares each rootDefault at a value its own `accepts` takes, as every rootDefaults row must", () => {
+    // ConfigRootDefault.accepts: the default's own value must be one the
+    // client takes. Planned over a file that holds exactly that value, a row
+    // that broke the rule would get its own value kept as refused -- install
+    // would add it, then warn on the next run that a release of the client
+    // that reads the key will not load the file with it and recommend it all
+    // the same, and uninstall would never say it kept it.
+    let checked = 0;
+    for (const t of INSTALL_TARGETS) {
+      for (const d of t.config.rootDefaults ?? []) {
+        const label = `${t.clientId} ${d.key}`;
+        const text = adapterFor(t.config.format).insertRootKey?.(null, d.key, d.value);
+        if (text === undefined) throw new Error(`${label}: the format's adapter has no insertRootKey`);
+        const site: ConfigSite = {
+          id: "default",
+          label: t.label,
+          format: t.config.format,
+          resolved: { absolute: "/synth/config", display: "/synth/config", containerPath: [t.config.root] },
+          detectDir: null,
+        };
+        const view = classifyClientConfig(text, site);
+        expect(view.read.kind, label).toBe("ok");
+        expect(planRootDefaults(view, [d]), label).toEqual({ set: [], kept: [] });
+        checked += 1;
+      }
+    }
+    expect(checked).toBeGreaterThan(0);
   });
 });
 
@@ -1144,21 +1181,81 @@ describe("install sets Codex's startup grace at the top of config.toml", () => {
     return { result, stdout: cap.stdout(), stderr: cap.stderr() };
   }
 
-  const setLine = (file: string): string => `Set ${GRACE_LINE} in ${file}: ${WHY}.`;
+  const addedLine = (file: string): string => `Added ${GRACE_LINE} to ${file}: ${WHY}.`;
+  /** How every note or warning about a kept scalar ends. It names neither the
+   *  key nor the file, so the key is still in the output exactly once, and it
+   *  says the value rather than a line: a multi-line string is a scalar too. */
+  const STEP = "Edit that value by hand to change it.";
+  /** How one about a kept array or table ends: such a value need not be one
+   *  line, and a line written in place of a header that follows a table is a
+   *  key of that table. It does not name the key either. */
+  const SHAPE_STEP = "To change it, delete it by hand and set the key on one line above the first table in the file.";
   const keptNote = (file: string, value: string): string =>
-    `Note: ${file} already sets ${GRACE} to ${value}, and install leaves a value you set alone. 0 is recommended: ${WHY}.`;
+    `Note: ${file} already sets ${GRACE} to ${value}, and install leaves a value you set alone. 0 is recommended: ${WHY}. ${STEP}`;
+  /** The stderr warning for a value outside the row's `accepts`: what the
+   *  value is and what Codex needs, and no WHY -- that describes what a value
+   *  Codex takes does. Scoped to a release that reads the key: 0.144.0,
+   *  which predates it, loads -1 (S7). */
+  const refusedWarning = (file: string, found: string, step = STEP): string =>
+    `yaw-mcp install: warning -- ${file} already sets ${GRACE} to ${found}, and install leaves a value you set alone. ` +
+    `A Codex CLI release that reads the key will not load the file with that value; 0 is recommended. ${step}`;
+  /** The refusal for a value NO Codex release loads the file with, in the
+   *  form of install's refusal over a file its client loads nothing from:
+   *  what the value is, why Codex will not load the file, and what to change
+   *  the value to -- with the key named once. */
+  const unloadableRefusal = (file: string, found: string, why: string, needs: string): string =>
+    `yaw-mcp install: ${file} sets ${GRACE} to ${found}, ${why}, so Codex CLI will not load the file -- ` +
+    `refusing to write into it; change that value by hand to ${needs} (0 is recommended), then re-run.`;
+  /** The whole stderr of an install over an inline `mcp_servers = { ... }`
+   *  with no entry of ours in it: the splice is refused in the adapter's own
+   *  words, with the fix by hand, and nothing follows "Refusing to
+   *  overwrite." -- the entry was never written, so no step about the key
+   *  alone is true. */
+  const inlineRootRefusal = (file: string): string =>
+    `yaw-mcp install: failed to splice the "mcp" entry into ${file} (${file} could not be edited ` +
+    `("mcp_servers" is an inline table, which cannot gain an entry without rewriting it -- ` +
+    "convert it to [mcp_servers.mcp]-style tables by hand, then re-run)). Refusing to overwrite.\n";
   const count = (haystack: string, needle: string): number => haystack.split(needle).length - 1;
+  /** Every non-empty line of a captured stream. */
+  const linesOf = (s: string): string[] => s.split("\n").filter((l) => l !== "");
 
-  it("a fresh install writes the key and the entry, and says it set the key", async () => {
+  it("a fresh install writes the key and the entry, and says it added the key", async () => {
     const run = await install();
     expect(run.result.exitCode, run.stderr).toBe(0);
     expect(read()).toBe(`${GRACE_LINE}\n\n${TABLE}`);
     expect(run.result.written).toEqual([userFile()]);
-    expect(count(run.stdout, setLine(userFile()))).toBe(1);
+    expect(count(run.stdout, addedLine(userFile()))).toBe(1);
     // After the write, never before it.
-    expect(run.stdout.indexOf(`Wrote ${userFile()}`)).toBeLessThan(run.stdout.indexOf(setLine(userFile())));
+    expect(run.stdout.indexOf(`Wrote ${userFile()}`)).toBeLessThan(run.stdout.indexOf(addedLine(userFile())));
     // The entry WAS written here, so the Done line keeps its server wording.
     expect(run.stdout).toContain("\nDone: Codex CLI is configured. Restart it to pick up the new MCP server.");
+  });
+
+  it("the timeout the printed why and notes give is the startup_timeout_sec on the entry install writes", async () => {
+    // The why and the notes each spell the entry's timeout into their own
+    // text, apart from the extraFields that writes it -- so a changed timeout
+    // would go on printing the old number on every install while the
+    // assertions built from WHY still passed. The number here is read back
+    // off the entry this install wrote (and checked against the row's own
+    // extraFields), never written out as a literal.
+    const run = await install();
+    expect(run.result.exitCode, run.stderr).toBe(0);
+    const stored = classifyClientConfig(read(), siteFor(), { transform: CODEX.entry }).entry()?.value as
+      | Record<string, unknown>
+      | undefined;
+    const timeout = stored?.startup_timeout_sec;
+    expect(typeof timeout).toBe("number");
+    expect(timeout).toBe(CODEX.entry?.extraFields?.({ os: "linux", purpose: "broker" })?.startup_timeout_sec);
+    const added = linesOf(run.stdout).filter((l) => l.startsWith(`Added ${GRACE_LINE} to ${userFile()}: `));
+    expect(added).toHaveLength(1);
+    expect(added[0]).toContain(
+      `each server gets its own startup_timeout_sec (${timeout} s on the entry install writes)`,
+    );
+    const notes = linesOf(run.stdout).filter((l) => l.startsWith("Note: Codex CLI reads MCP servers"));
+    expect(notes).toHaveLength(1);
+    expect(notes[0]).toContain(
+      `Codex waits up to each server's startup_timeout_sec, which the entry sets to ${timeout}.`,
+    );
   });
 
   it("a re-run over a correct entry with the key missing writes ONLY the key line, and says so", async () => {
@@ -1172,7 +1269,7 @@ describe("install sets Codex's startup grace at the top of config.toml", () => {
     expect(read()).toBe(before.replace("# mine\n", `# mine\n${GRACE_LINE}\n`));
     expect(run.stdout).toContain(`The "mcp" entry in ${userFile()} is already correct.`);
     expect(run.stdout).toContain(`Wrote ${userFile()}`);
-    expect(count(run.stdout, setLine(userFile()))).toBe(1);
+    expect(count(run.stdout, addedLine(userFile()))).toBe(1);
     expect(run.stdout).not.toContain("Nothing to do");
     expect(run.result.written).toEqual([userFile()]);
     // No server was added, so the Done line names the change.
@@ -1197,7 +1294,7 @@ describe("install sets Codex's startup grace at the top of config.toml", () => {
     const run = await install();
     expect(run.result.exitCode, run.stderr).toBe(0);
     expect(read()).toBe(`${GRACE_LINE}\n\n${before}`);
-    expect(count(run.stdout, setLine(userFile()))).toBe(1);
+    expect(count(run.stdout, addedLine(userFile()))).toBe(1);
     expect(run.stdout).toContain("\nDone: Codex CLI is configured. Restart it to pick up the change.");
   });
 
@@ -1208,7 +1305,7 @@ describe("install sets Codex's startup grace at the top of config.toml", () => {
     expect(run.result.exitCode, run.stderr).toBe(0);
     expect(read()).toBe(`${GRACE_LINE}\n\n${fixture("f05-identical")}`);
     expect(run.stdout).toContain('Removed the legacy "yaw-mcp" entry');
-    expect(count(run.stdout, setLine(userFile()))).toBe(1);
+    expect(count(run.stdout, addedLine(userFile()))).toBe(1);
     expect(run.stdout).toContain("\nDone: Codex CLI is configured. Restart it to pick up the change.");
     expect(run.stdout).not.toContain("new MCP server");
   });
@@ -1224,7 +1321,7 @@ describe("install sets Codex's startup grace at the top of config.toml", () => {
     expect(run.result.written).toEqual([userFile()]);
     expect(read()).toBe(`${GRACE_LINE}\r\n\r\n${table}`);
     expect(/(^|[^\r])\n/.test(read())).toBe(false);
-    expect(count(run.stdout, setLine(userFile()))).toBe(1);
+    expect(count(run.stdout, addedLine(userFile()))).toBe(1);
   });
 
   it("a key already at 0 is nothing to do and nothing to say", async () => {
@@ -1254,12 +1351,18 @@ describe("install sets Codex's startup grace at the top of config.toml", () => {
     expect(run.result.written).toEqual([]);
     expect(count(run.stdout, keptNote(userFile(), "1000"))).toBe(1);
     expect(count(`${run.stdout}${run.stderr}`, GRACE)).toBe(1);
+    // 1000 is a value Codex takes, so the note gives the reason 0 helps, and
+    // nothing -- on stdout or in a stderr warning -- claims that Codex will
+    // not load the file.
+    expect(`${run.stdout}${run.stderr}`).not.toContain("will not load");
     expect(run.stdout).toContain("Nothing to do: Codex CLI is already configured.");
   });
 
-  it("a FLOAT the user wrote is another value: left alone, and the note names it as written", async () => {
+  it("a FLOAT the user wrote is another value: left alone, and the warning names it as written", async () => {
     // `0.0` parses to the same number as `0`, and Codex (which types the key
-    // as an integer) refuses it -- so it is never read as the recommended 0.
+    // as an integer) refuses it -- so it is never read as the recommended 0,
+    // and it gets the warning for a value a Codex release that reads the key
+    // will not load.
     for (const spelled of ["0.0", "-0.0", "0e0", "1000.0"]) {
       const before = `${GRACE} = ${spelled}\n\n${fixture("f05-identical")}`;
       seed(before);
@@ -1267,9 +1370,145 @@ describe("install sets Codex's startup grace at the top of config.toml", () => {
       expect(run.result.exitCode, run.stderr).toBe(0);
       expect(read(), spelled).toBe(before);
       expect(run.result.written, spelled).toEqual([]);
-      expect(count(run.stdout, keptNote(userFile(), `${spelled}, a float where Codex CLI needs an integer`))).toBe(1);
+      expect(
+        count(run.stderr, refusedWarning(userFile(), `${spelled}, a float where Codex CLI needs an integer`)),
+      ).toBe(1);
       expect(count(`${run.stdout}${run.stderr}`, GRACE), spelled).toBe(1);
     }
+  });
+
+  it("a tab after the = reads as a space does: a float is named as written, and an inline mcp_servers gets its own refusal", async () => {
+    // TOML allows a tab after `=`, and where the value starts decides both of
+    // these: the spelling a kept float is named by (`0.0`, never the `0` it
+    // parses to, which the warning would then recommend in the same breath),
+    // and whether mcp_servers is seen as an inline table -- refused in its
+    // own words with the fix by hand, rather than as an edit that did not
+    // parse.
+    const floatBefore = `${GRACE} =\t0.0\n\n${fixture("f05-identical")}`;
+    seed(floatBefore);
+    const kept = await install();
+    expect(kept.result.exitCode, kept.stderr).toBe(0);
+    expect(kept.result.written).toEqual([]);
+    expect(read()).toBe(floatBefore);
+    expect(kept.stderr).toBe(`${refusedWarning(userFile(), "0.0, a float where Codex CLI needs an integer")}\n`);
+
+    // The space spelling is the control: the same refusal, byte for byte.
+    for (const sep of [" = ", " =\t"]) {
+      const before = `mcp_servers${sep}{ other = { command = "x" } }\n`;
+      seed(before);
+      const run = await install();
+      expect(run.result.exitCode, JSON.stringify(sep)).toBe(1);
+      expect(run.result.written, JSON.stringify(sep)).toEqual([]);
+      expect(read(), JSON.stringify(sep)).toBe(before);
+      expect(run.stderr, JSON.stringify(sep)).toBe(inlineRootRefusal(userFile()));
+    }
+  });
+
+  it("a value a Codex release that reads the key will not load is left alone, with a stderr warning in place of why 0 helps", async () => {
+    // Codex reads the key as a u64 (S7): measured on 0.156.1, each value set
+    // on one root line here stops it with "failed to load bootstrap
+    // configuration". The two after the entry are a table and an array in
+    // TOML just as `{ a = 1 }` and `[0]` are, and the multi-line string is a
+    // string just as `"0"` is (its first line break is not part of it); all
+    // three are here for the step they end with. The warning says what the
+    // value is and what Codex needs, and drops WHY -- that describes what a
+    // value Codex takes does ("otherwise give ... one shared grace"). It goes
+    // to stderr, like the typed programProbe warning, and like that one it
+    // leaves the exit at 0 and the closing line as it is: Codex 0.144.0,
+    // which predates the key, loads every one-line value here (S7). An
+    // integer no TOML integer holds is the exception, and has its own test
+    // below.
+    const F05 = fixture("f05-identical");
+    const atRoot = (written: string): string => `${GRACE} = ${written}\n\n${F05}`;
+    for (const [before, found, step] of [
+      [atRoot("-1"), "-1, a negative integer where Codex CLI needs a non-negative integer", STEP],
+      [atRoot('"0"'), '"0", a string where Codex CLI needs a non-negative integer', STEP],
+      // Spread over two lines, and still a scalar: the step says to edit the
+      // value, never "that line", which would leave the closing `"""` behind.
+      [atRoot('"""\n0"""'), '"0", a string where Codex CLI needs a non-negative integer', STEP],
+      [atRoot("true"), "true, a boolean where Codex CLI needs a non-negative integer", STEP],
+      [atRoot("1979-05-27"), "1979-05-27, a date or time where Codex CLI needs a non-negative integer", STEP],
+      [atRoot("[0]"), "an array of 1, where Codex CLI needs a non-negative integer", SHAPE_STEP],
+      [atRoot("{ a = 1 }"), "a TOML table, where Codex CLI needs a non-negative integer", SHAPE_STEP],
+      // After the entry: no one line sets the key, and a header rewritten in
+      // place into `key = 0` would be a key of [mcp_servers.mcp].
+      [`${F05}\n[${GRACE}]\na = 1\n`, "a TOML table, where Codex CLI needs a non-negative integer", SHAPE_STEP],
+      [`${F05}\n[[${GRACE}]]\na = 1\n`, "an array of 1, where Codex CLI needs a non-negative integer", SHAPE_STEP],
+    ] as const) {
+      seed(before);
+      const run = await install();
+      expect(run.result.exitCode, run.stderr).toBe(0);
+      expect(read(), before).toBe(before);
+      expect(run.result.written, before).toEqual([]);
+      expect(count(run.stderr, refusedWarning(userFile(), found, step)), before).toBe(1);
+      expect(`${run.stdout}${run.stderr}`, before).not.toContain(WHY);
+      expect(count(`${run.stdout}${run.stderr}`, GRACE), before).toBe(1);
+      expect(run.stdout, before).toContain("Nothing to do: Codex CLI is already configured.");
+    }
+    // The ceiling itself is a value Codex takes (measured on 0.156.1), so it
+    // gets the note any other value it takes does.
+    seed(`${GRACE} = 9223372036854775807\n\n${fixture("f05-identical")}`);
+    const top = await install();
+    expect(count(top.stdout, keptNote(userFile(), "9223372036854775807"))).toBe(1);
+  });
+
+  it("an integer no TOML integer holds is a file no Codex release loads: install refuses it, exit 1, nothing written", async () => {
+    // Past 2^63 - 1 the reader here still parses the value (as a bigint), but
+    // Codex 0.156.1 and 0.144.0 -- which predates the key -- both refuse the
+    // file at parse (S7), so every release loads nothing from it. So it gets
+    // the form and the exit of install's refusal over a file its client loads
+    // nothing from: no Runtime line, no `already correct`, no Done or Nothing
+    // to do line, nothing written, the key named once -- the same under
+    // --dry-run and --skip, and under --force and --repair, the flags a user
+    // reaches for right after a refusal (past it, either would rewrite a file
+    // no Codex loads and end on the Done line); and whether the entry is not
+    // there yet, correct, or differing. Below -2^63 is outside the same range.
+    const F05 = fixture("f05-identical");
+    const tooLarge = [
+      "larger than a TOML integer holds",
+      "a non-negative integer no larger than 9223372036854775807",
+    ] as const;
+    for (const [before, found, why, needs] of [
+      [`${GRACE} = 9223372036854775808\n\n${F05}`, "9223372036854775808", ...tooLarge],
+      [`${GRACE} = 18446744073709551615\n\n${F05}`, "18446744073709551615", ...tooLarge],
+      // No entry yet: the run would have written one, and writes nothing.
+      [`${GRACE} = 9223372036854775808\n`, "9223372036854775808", ...tooLarge],
+      // A differing entry: the one --force and --repair would rewrite.
+      [`${GRACE} = 9223372036854775808\n\n${fixture("f06-codex-add-shape")}`, "9223372036854775808", ...tooLarge],
+      [
+        `${GRACE} = -9223372036854775809\n\n${F05}`,
+        "-9223372036854775809",
+        "smaller than a TOML integer holds",
+        "a non-negative integer",
+      ],
+    ] as const) {
+      for (const over of [{}, { dryRun: true }, { skip: true }, { force: true }, { repair: true }]) {
+        const label = `${before} ${JSON.stringify(over)}`;
+        seed(before);
+        const run = await install(over);
+        expect(run.result.exitCode, label).toBe(1);
+        expect(run.result.written, label).toEqual([]);
+        expect(run.result.wouldWrite, label).toEqual([]);
+        expect(read(), label).toBe(before);
+        expect(linesOf(run.stderr), label).toEqual([unloadableRefusal(userFile(), found, why, needs)]);
+        expect(linesOf(run.stdout), label).toEqual(["Target: Codex CLI (user)", `File:   ${userFile()}`]);
+        expect(count(`${run.stdout}${run.stderr}`, GRACE), label).toBe(1);
+      }
+    }
+    // The floor itself is a TOML integer, and a negative one: the warning,
+    // not the refusal -- a release from before the key does not read it.
+    seed(`${GRACE} = -9223372036854775808\n\n${F05}`);
+    const floor = await install();
+    expect(floor.result.exitCode, floor.stderr).toBe(0);
+    expect(
+      count(
+        floor.stderr,
+        refusedWarning(
+          userFile(),
+          "-9223372036854775808, a negative integer where Codex CLI needs a non-negative integer",
+        ),
+      ),
+    ).toBe(1);
   });
 
   it("--repair and --force rewrite a stale entry and still leave the user's value alone", async () => {
@@ -1282,7 +1521,7 @@ describe("install sets Codex's startup grace at the top of config.toml", () => {
         `${GRACE} = 5000\n\n${fixture("f06-codex-add-shape", "expected-repair")}`,
       );
       expect(count(run.stdout, keptNote(userFile(), "5000")), JSON.stringify(flag)).toBe(1);
-      expect(run.stdout).not.toContain(`Set ${GRACE}`);
+      expect(run.stdout).not.toContain(`Added ${GRACE}`);
     }
   });
 
@@ -1306,7 +1545,37 @@ describe("install sets Codex's startup grace at the top of config.toml", () => {
     expect(read()).toBe(before);
   });
 
-  it("--dry-run writes nothing, shows the line in the preview, and says it WOULD set it", async () => {
+  it("--skip with no entry has nothing to skip: the entry and the key are written as on any install", async () => {
+    // The other half of the --skip contract: it skips an EXISTING entry, so on
+    // an empty home it is an ordinary install -- the key line, a blank line,
+    // the table -- and says so exactly as a run without the flag does.
+    const dry = await install({ skip: true, dryRun: true });
+    expect(dry.result.exitCode, dry.stderr).toBe(0);
+    expect(existsSync(userFile())).toBe(false);
+    expect(dry.result.wouldWrite).toEqual([userFile()]);
+    expect(count(dry.stdout, `Would add ${GRACE_LINE} to ${userFile()}: ${WHY}.`)).toBe(1);
+    expect(dry.stdout).not.toContain("--skip");
+
+    const run = await install({ skip: true });
+    expect(run.result.exitCode, run.stderr).toBe(0);
+    expect(read()).toBe(`${GRACE_LINE}\n\n${TABLE}`);
+    expect(run.result.written).toEqual([userFile()]);
+    expect(count(run.stdout, addedLine(userFile()))).toBe(1);
+    expect(run.stdout).not.toContain("Nothing to do");
+    expect(run.stdout).not.toContain("left untouched");
+    // The entry WAS written, so the run ends on the server Done line.
+    expect(run.stdout.trimEnd().split("\n").at(-1)).toBe(
+      "Done: Codex CLI is configured. Restart it to pick up the new MCP server.",
+    );
+
+    // Word for word what the same install without the flag prints.
+    rmSync(dirname(userFile()), { recursive: true, force: true });
+    const plain = await install();
+    expect(read()).toBe(`${GRACE_LINE}\n\n${TABLE}`);
+    expect(run.stdout).toBe(plain.stdout);
+  });
+
+  it("--dry-run writes nothing, shows the line in the preview, and says it WOULD add it", async () => {
     const fresh = await install({ dryRun: true });
     expect(fresh.result.exitCode, fresh.stderr).toBe(0);
     expect(existsSync(userFile())).toBe(false);
@@ -1314,8 +1583,8 @@ describe("install sets Codex's startup grace at the top of config.toml", () => {
     expect(fresh.result.wouldWrite).toEqual([userFile()]);
     // The block is the fresh file itself: the key, a blank line, the table.
     expect(fresh.stdout).toContain(`# ${userFile()}\n${GRACE_LINE}\n\n${TABLE}`);
-    expect(count(fresh.stdout, `Would set ${GRACE_LINE} in ${userFile()}: ${WHY}.`)).toBe(1);
-    expect(fresh.stdout).not.toContain(setLine(userFile()));
+    expect(count(fresh.stdout, `Would add ${GRACE_LINE} to ${userFile()}: ${WHY}.`)).toBe(1);
+    expect(fresh.stdout).not.toContain(addedLine(userFile()));
 
     // Over a correct entry the preview is the key line alone.
     const before = fixture("f05-identical");
@@ -1326,7 +1595,70 @@ describe("install sets Codex's startup grace at the top of config.toml", () => {
     expect(keyOnly.stdout).toContain(`# ${userFile()}\n${GRACE_LINE}\n`);
     expect(keyOnly.stdout).not.toContain("[mcp_servers.mcp]");
     expect(keyOnly.stdout).not.toContain("Nothing to do");
-    expect(count(keyOnly.stdout, `Would set ${GRACE_LINE} in ${userFile()}: ${WHY}.`)).toBe(1);
+    expect(count(keyOnly.stdout, `Would add ${GRACE_LINE} to ${userFile()}: ${WHY}.`)).toBe(1);
+  });
+
+  it("--dry-run says what the live run says about a kept value: the warning for one Codex will not load, the Note for one it takes", async () => {
+    // Over a correct entry the preview ends on "Nothing to do", and the one
+    // thing it still has to say is what the live run says about the user's
+    // value -- the stderr warning above all, the only word that a Codex that
+    // reads the key will not load this file. Nothing is written either way.
+    const refusedBefore = `${GRACE} = -1\n\n${fixture("f05-identical")}`;
+    seed(refusedBefore);
+    const dry = await install({ dryRun: true });
+    expect(dry.result.exitCode, dry.stderr).toBe(0);
+    expect(dry.result.wouldWrite).toEqual([]);
+    expect(read()).toBe(refusedBefore);
+    expect(dry.stderr).toBe(
+      `${refusedWarning(userFile(), "-1, a negative integer where Codex CLI needs a non-negative integer")}\n`,
+    );
+    expect(dry.stdout).toContain("\nNothing to do: Codex CLI (user) is already configured.");
+    const live = await install();
+    expect(live.result.exitCode, live.stderr).toBe(0);
+    expect(dry.stderr).toBe(live.stderr);
+
+    const takenBefore = `${GRACE} = 1000\n\n${fixture("f05-identical")}`;
+    seed(takenBefore);
+    const dryTaken = await install({ dryRun: true });
+    expect(dryTaken.result.exitCode, dryTaken.stderr).toBe(0);
+    expect(dryTaken.result.wouldWrite).toEqual([]);
+    expect(read()).toBe(takenBefore);
+    expect(linesOf(dryTaken.stdout).filter((l) => l.startsWith("Note: "))).toEqual([keptNote(userFile(), "1000")]);
+    expect(dryTaken.stderr).toBe("");
+    expect(dryTaken.stdout).toContain("\nNothing to do: Codex CLI (user) is already configured.");
+    const liveTaken = await install();
+    expect(linesOf(liveTaken.stdout).filter((l) => l.startsWith("Note: "))).toEqual([keptNote(userFile(), "1000")]);
+  });
+
+  it("--dry-run over a key the file already sets never says it would add it", async () => {
+    // The live run only ever adds a key the file does not set, and the
+    // preview promises what the live run does. Each file here has an entry
+    // to write (a differing one, or none), so the run gets past "Nothing to
+    // do" to the preview: over a value the user set, the Note is the one line
+    // that names the key, and the preview block is the entry alone; over a 0,
+    // no line names it at all.
+    for (const before of [`${GRACE} = 1000\n\n${fixture("f06-codex-add-shape")}`, `${GRACE} = 1000\n`]) {
+      seed(before);
+      const dry = await install({ dryRun: true });
+      expect(dry.result.exitCode, dry.stderr).toBe(0);
+      expect(dry.result.wouldWrite, before).toEqual([userFile()]);
+      expect(read(), before).toBe(before);
+      expect(
+        linesOf(dry.stdout).filter((l) => l.startsWith("Note: ")),
+        before,
+      ).toEqual([keptNote(userFile(), "1000")]);
+      expect(dry.stdout, before).not.toContain(`Would add ${GRACE}`);
+      expect(count(`${dry.stdout}${dry.stderr}`, GRACE), before).toBe(1);
+      expect(dry.stdout, before).toContain(`\n# ${userFile()}\n[mcp_servers.mcp]\n`);
+    }
+
+    const zero = `${GRACE_LINE}\n`;
+    seed(zero);
+    const dry = await install({ dryRun: true });
+    expect(dry.result.exitCode, dry.stderr).toBe(0);
+    expect(dry.result.wouldWrite).toEqual([userFile()]);
+    expect(read()).toBe(zero);
+    expect(`${dry.stdout}${dry.stderr}`).not.toContain(GRACE);
   });
 
   it("--scope project writes the key into the project's .codex/config.toml, and only there", async () => {
@@ -1335,7 +1667,7 @@ describe("install sets Codex's startup grace at the top of config.toml", () => {
     expect(run.result.exitCode, run.stderr).toBe(0);
     expect(read(projectFile)).toBe(`${GRACE_LINE}\n\n${TABLE}`);
     expect(existsSync(userFile())).toBe(false);
-    expect(count(run.stdout, setLine(projectFile))).toBe(1);
+    expect(count(run.stdout, addedLine(projectFile))).toBe(1);
   });
 
   it("follows CODEX_HOME exactly as the entry does", async () => {
@@ -1346,11 +1678,10 @@ describe("install sets Codex's startup grace at the top of config.toml", () => {
     expect(run.result.exitCode, run.stderr).toBe(0);
     expect(read(file)).toBe(`${GRACE_LINE}\n\n${TABLE}`);
     expect(existsSync(userFile())).toBe(false);
-    expect(count(run.stdout, setLine(file))).toBe(1);
+    expect(count(run.stdout, addedLine(file))).toBe(1);
   });
 
-  it("uninstall takes the entry and leaves the key", async () => {
-    await install();
+  async function uninstall(over: Partial<Parameters<typeof runUninstall>[0]> = {}) {
     const cap = captureIo();
     const result = await runUninstall({
       clientId: "codex-cli",
@@ -1360,13 +1691,108 @@ describe("install sets Codex's startup grace at the top of config.toml", () => {
       cwd: projectDir,
       force: true,
       io: cap.io,
+      ...over,
     });
-    expect(result.exitCode, cap.stderr()).toBe(0);
+    return { result, stdout: cap.stdout(), stderr: cap.stderr() };
+  }
+
+  /** What uninstall says about the key it leaves at 0. It names no one as the
+   *  key's author: install says nothing about a key already at 0, so by the
+   *  time uninstall runs the user's own line and one install added are the
+   *  same bytes. It names the key and the value, not a line: the file may
+   *  spell them another way. `verb` is "Would keep" on --dry-run. */
+  const keepingLine = (file: string, verb = "Keeping"): string =>
+    `${verb} ${GRACE} at 0 in ${file}: uninstall leaves top-level settings alone -- this one is not a server, ` +
+    "and it may be your own. Delete the line that sets it by hand if you no longer want it.";
+
+  it("uninstall takes the entry and leaves the key, and says it kept it", async () => {
+    await install();
+    const run = await uninstall();
+    expect(run.result.exitCode, run.stderr).toBe(0);
     expect(read()).toBe(`${GRACE_LINE}\n`);
+    expect(run.result.written).toEqual([userFile()]);
+    // One line, the key named once, after the entry's own line and before the
+    // Done line -- which stays the one every row prints.
+    expect(count(run.stdout, keepingLine(userFile()))).toBe(1);
+    expect(count(`${run.stdout}${run.stderr}`, GRACE)).toBe(1);
+    const removedAt = run.stdout.indexOf('Removed the "mcp" entry.');
+    const keptAt = run.stdout.indexOf(keepingLine(userFile()));
+    expect(removedAt).toBeGreaterThanOrEqual(0);
+    expect(removedAt).toBeLessThan(keptAt);
+    expect(keptAt).toBeLessThan(run.stdout.indexOf("\nDone: Codex CLI no longer launches yaw-mcp."));
+
+    // Uninstall again: nothing to remove is nothing to say, about the key too.
+    const again = await uninstall();
+    expect(again.result.exitCode, again.stderr).toBe(0);
+    expect(again.stdout).toContain("Nothing to do: Codex CLI (user) has no yaw-mcp entry.");
+    expect(`${again.stdout}${again.stderr}`).not.toContain(GRACE);
+    expect(read()).toBe(`${GRACE_LINE}\n`);
+
     // And a later install puts the entry back without touching the key.
     const reinstall = await install();
     expect(read()).toBe(`${GRACE_LINE}\n\n${TABLE}`);
-    expect(reinstall.stdout).not.toContain(`Set ${GRACE}`);
+    expect(reinstall.stdout).not.toContain(`Added ${GRACE}`);
+  });
+
+  it("uninstall says the same about a 0 the user wrote before install, and never that install added it", async () => {
+    // install leaves this key alone and says nothing about it, so the line
+    // uninstall prints has to be true of a key install never touched.
+    seed(`${GRACE_LINE}   # mine\n`);
+    const installed = await install();
+    expect(installed.stdout).not.toContain(`Added ${GRACE}`);
+    const run = await uninstall();
+    expect(run.result.exitCode, run.stderr).toBe(0);
+    expect(read()).toBe(`${GRACE_LINE}   # mine\n`);
+    expect(count(run.stdout, keepingLine(userFile()))).toBe(1);
+  });
+
+  it("uninstall names the key and its value, not a line, whatever spelling of 0 the file uses", async () => {
+    // Each of these is the row's own 0 to install (it says nothing about
+    // them), so uninstall keeps each -- and none of them is the line
+    // `mcp_optional_startup_grace_ms = 0`, which the message never quotes.
+    for (const line of [`${GRACE}=0`, `${GRACE} = +0`, `"${GRACE}" = 0`]) {
+      seed(`${line}\n\n${fixture("f05-identical")}`);
+      const run = await uninstall();
+      expect(run.result.exitCode, run.stderr).toBe(0);
+      expect(read(), line).toBe(`${line}\n`);
+      expect(count(run.stdout, keepingLine(userFile())), line).toBe(1);
+      expect(run.stdout, line).not.toContain(GRACE_LINE);
+      expect(count(`${run.stdout}${run.stderr}`, GRACE), line).toBe(1);
+    }
+  });
+
+  it("uninstall --dry-run says it WOULD keep the key, and writes nothing", async () => {
+    await install();
+    const before = read();
+    const dry = await uninstall({ force: false, dryRun: true });
+    expect(dry.result.exitCode, dry.stderr).toBe(0);
+    expect(read()).toBe(before);
+    expect(dry.result.wouldWrite).toEqual([userFile()]);
+    expect(count(dry.stdout, keepingLine(userFile(), "Would keep"))).toBe(1);
+    expect(dry.stdout).not.toContain(keepingLine(userFile()));
+    expect(count(`${dry.stdout}${dry.stderr}`, GRACE)).toBe(1);
+  });
+
+  it("uninstall says nothing about a key at another value, or about a key that is not there", async () => {
+    // Another value is the user's (install's note or warning said so when it
+    // left it), a float 0.0 included; a missing key has nothing to keep.
+    // Either way the entry still goes, and neither the live run nor the
+    // preview names the key.
+    for (const head of [`${GRACE} = 1000\n\n`, `${GRACE} = 0.0\n\n`, ""]) {
+      const before = `${head}${fixture("f05-identical")}`;
+      seed(before);
+      const dry = await uninstall({ force: false, dryRun: true });
+      expect(dry.result.wouldWrite, head).toEqual([userFile()]);
+      expect(`${dry.stdout}${dry.stderr}`, head).not.toContain(GRACE);
+      const run = await uninstall();
+      expect(run.result.exitCode, run.stderr).toBe(0);
+      expect(run.result.written, head).toEqual([userFile()]);
+      expect(run.stdout, head).toContain('Removed the "mcp" entry.');
+      expect(`${run.stdout}${run.stderr}`, head).not.toContain(GRACE);
+      expect(read(), head).not.toContain("[mcp_servers.mcp]");
+      // The user's line is left exactly as it was.
+      if (head !== "") expect(read(), head).toBe(head.replace(/\n\n$/, "\n"));
+    }
   });
 
   it("--list and doctor read a file carrying the key as installed and healthy", async () => {
@@ -1396,29 +1822,140 @@ describe("install sets Codex's startup grace at the top of config.toml", () => {
     expect(diagnosis.exitCode).toBe(0);
   });
 
-  it("a failed key-only write says it was setting the key, not splicing the entry", async () => {
+  /** Run `body` with some of the TOML adapter's methods replaced, and put the
+   *  row's own adapter back afterwards, whatever happens. */
+  async function withStandIn(over: Partial<ConfigAdapter>, body: () => Promise<void>): Promise<void> {
     const real = adapterFor("toml");
     try {
       resetConfigAdapterRegistry();
-      registerConfigAdapter("toml", {
-        ...real,
-        insertRootKey: () => {
-          throw new Error("stand-in refusal");
-        },
-      });
-      const before = fixture("f05-identical");
-      seed(before);
-      const run = await install();
-      expect(run.result.exitCode).toBe(1);
-      expect(run.stderr).toContain(
-        `yaw-mcp install: failed to set ${GRACE_LINE} in ${userFile()} (${userFile()} could not be edited (stand-in refusal)). Refusing to overwrite.`,
-      );
-      expect(run.stderr).not.toContain("failed to splice");
-      expect(read()).toBe(before);
+      registerConfigAdapter("toml", { ...real, ...over });
+      await body();
     } finally {
       resetConfigAdapterRegistry();
       registerConfigAdapter("toml", real);
     }
+  }
+  const refuse = (): never => {
+    throw new Error("stand-in refusal");
+  };
+  /** A pre-rename entry install trims, placed after the entry it keeps. */
+  const LEGACY_TABLE = '\n[mcp_servers.yaw-mcp]\ncommand = "npx"\nargs = ["-y", "@yawlabs/mcph"]\n';
+
+  it("a failed key-only write says it was setting the key, not splicing the entry, and how to finish", async () => {
+    await withStandIn({ insertRootKey: refuse }, async () => {
+      const before = fixture("f05-identical");
+      seed(before);
+      const run = await install();
+      expect(run.result.exitCode).toBe(1);
+      // "Refusing to overwrite." is in every refused write; here the step to
+      // finish by hand follows it: the one line, and where it has to go --
+      // the entry needs nothing.
+      expect(run.stderr).toBe(
+        `yaw-mcp install: failed to set ${GRACE_LINE} in ${userFile()} (${userFile()} could not be edited (stand-in refusal)). Refusing to overwrite. ` +
+          `The "mcp" entry is already correct; to finish by hand, add ${GRACE_LINE} above the first table in the file.\n`,
+      );
+      expect(run.stderr).not.toContain("failed to splice");
+      expect(read()).toBe(before);
+    });
+  });
+
+  it("a failed legacy trim plus key write names both, and says the legacy entry is still there", async () => {
+    // The step says to delete the legacy entry as well: adding the line alone
+    // would leave yaw-mcp configured twice.
+    await withStandIn({ insertRootKey: refuse }, async () => {
+      const before = `${fixture("f05-identical")}${LEGACY_TABLE}`;
+      seed(before);
+      const run = await install();
+      expect(run.result.exitCode).toBe(1);
+      expect(run.stderr).toBe(
+        `yaw-mcp install: failed to remove the legacy "yaw-mcp" entry from ${userFile()} and set ${GRACE_LINE} in it ` +
+          `(${userFile()} could not be edited (stand-in refusal)). Refusing to overwrite. ` +
+          `The "mcp" entry is already correct, and the legacy "yaw-mcp" entry is still in the file; ` +
+          `to finish by hand, delete that entry and add ${GRACE_LINE} above the first table in the file.\n`,
+      );
+      expect(read()).toBe(before);
+    });
+  });
+
+  it("a failed legacy-only trim names the trim alone, with no step about a key it was not adding", async () => {
+    // The key is already at 0, so the write is the trim alone: `remove` is
+    // the method that throws, since `insertRootKey` is never called here.
+    await withStandIn({ remove: refuse }, async () => {
+      const before = `${GRACE_LINE}\n\n${fixture("f05-identical")}${LEGACY_TABLE}`;
+      seed(before);
+      const run = await install();
+      expect(run.result.exitCode).toBe(1);
+      expect(run.stderr).toBe(
+        `yaw-mcp install: failed to remove the legacy "yaw-mcp" entry from ${userFile()} ` +
+          `(${userFile()} could not be edited (stand-in refusal)). Refusing to overwrite.\n`,
+      );
+      expect(read()).toBe(before);
+    });
+  });
+
+  it("a failed entry splice with the key also to add says the splice failed, and gives no by-hand step for the key alone", async () => {
+    // The step the key-only failures above end with is true only when the
+    // entry needed no write. Here our entry is not in the file at all -- an
+    // inline mcp_servers cannot gain one -- and the key is missing too, so
+    // "the entry is already correct; add the key by hand" would send the user
+    // to a fix that leaves Codex with no yaw-mcp. The row's own adapter, no
+    // stand-in, and the preview refused in the same words as the run.
+    const before = fixture("g09-inline-root");
+    for (const over of [{}, { dryRun: true }]) {
+      const label = JSON.stringify(over);
+      seed(before);
+      const run = await install(over);
+      expect(run.result.exitCode, label).toBe(1);
+      expect(run.result.written, label).toEqual([]);
+      expect(run.result.wouldWrite, label).toEqual([]);
+      expect(read(), label).toBe(before);
+      expect(run.stderr, label).toBe(inlineRootRefusal(userFile()));
+    }
+  });
+
+  /** Run `body` with the codex-cli row's `rootDefaults` replaced, and put the
+   *  row's own back afterwards, whatever happens. install looks the row up by
+   *  its client id, so this is how a run reaches a default no shipped row
+   *  declares. It swaps the property IN PLACE on the row object
+   *  INSTALL_TARGETS holds, so for the body's duration every reader of that
+   *  row sees the stand-in; the array and the source table are unchanged. */
+  async function withStandInDefaults(defaults: readonly ConfigRootDefault[], body: () => Promise<void>): Promise<void> {
+    const real = CODEX.config.rootDefaults;
+    try {
+      CODEX.config.rootDefaults = defaults;
+      await body();
+    } finally {
+      CODEX.config.rootDefaults = real;
+    }
+  }
+
+  it("a table under a key the row makes no type claim about gets the Note, ending with the shape step", async () => {
+    // The Note branch -- a kept value with no refusal -- over an array or a
+    // table. No shipped row gets there: Codex's default declares `accepts`,
+    // which refuses both shapes. A default with no `accepts` claims nothing
+    // about what the client takes, so the table is kept unrefused: the Note,
+    // with the stand-in's own why, ending as the warning for a table does,
+    // since a `[key]` header after the entry rewritten in place would be a
+    // key of [mcp_servers.mcp].
+    const standIn: ConfigRootDefault = { key: GRACE, value: 0, why: "stand-in why" };
+    await withStandInDefaults([standIn], async () => {
+      const before = `${fixture("f05-identical")}\n[${GRACE}]\na = 1\n`;
+      seed(before);
+      const run = await install();
+      expect(run.result.exitCode, run.stderr).toBe(0);
+      expect(read()).toBe(before);
+      expect(run.result.written).toEqual([]);
+      const note =
+        `Note: ${userFile()} already sets ${GRACE} to a TOML table, and install leaves a value you set alone. ` +
+        `0 is recommended: stand-in why. ${SHAPE_STEP}`;
+      expect(linesOf(run.stdout).filter((l) => l.startsWith("Note: "))).toEqual([note]);
+      expect(run.stdout).not.toContain(STEP);
+      expect(run.stderr).toBe("");
+      expect(count(run.stdout, GRACE)).toBe(1);
+      expect(run.stdout).toContain("Nothing to do: Codex CLI is already configured.");
+    });
+    // And the row's own default is back.
+    expect(CODEX.config.rootDefaults?.[0]?.accepts).toBe("unsigned-integer");
   });
 });
 
@@ -1508,5 +2045,22 @@ describe("install ends a CRLF config.toml in CRLF", () => {
     expect(bareLfs(after)).toBe(0);
     expect(after.endsWith('command = "node"\r\n')).toBe(true);
     expect(after.endsWith("\r\n\r\n")).toBe(false);
+  });
+
+  it("a whitespace-only CRLF file is created in CRLF, and a lone-CR one still installs, in LF", async () => {
+    // Whitespace-only reads as no file, so install creates it -- but the file
+    // is there, and its line ending is the user's. A lone CR is not a TOML
+    // newline, so that one is created as a missing file is.
+    const created = `mcp_optional_startup_grace_ms = 0\n\n${fixture("f01-missing", "expected")}`;
+    mkdirSync(dirname(userFile()), { recursive: true });
+    writeFileSync(userFile(), "  \r\n\r\n", "utf8");
+    const crlfRun = await install();
+    expect(crlfRun.result.exitCode, crlfRun.stderr).toBe(0);
+    expect(readFileSync(userFile(), "utf8")).toBe(created.replace(/\n/g, "\r\n"));
+
+    writeFileSync(userFile(), "\r", "utf8");
+    const crRun = await install();
+    expect(crRun.result.exitCode, crRun.stderr).toBe(0);
+    expect(readFileSync(userFile(), "utf8")).toBe(created);
   });
 });

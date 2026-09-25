@@ -467,9 +467,13 @@ describe("value helpers", () => {
     // a CR-only file the same CR is the whole line break.
     expect(terminateWithNewline("{\r\n}\r")).toBe("{\r\n}\r\n");
     expect(terminateWithNewline("{\r}\r")).toBe("{\r}\r");
+    // In an LF file a trailing CR is no line break the file uses, so the file
+    // still gets its LF -- after the CR, which stays where it was.
+    expect(terminateWithNewline("{\n}\r")).toBe("{\n}\r\n");
+    expect(terminateWithNewline("a = 1\nb = 2\r")).toBe("a = 1\nb = 2\r\n");
   });
 
-  it("returns text that already ends in a line break as it is, lone CR included", () => {
+  it("returns text that already ends in LF, or in a CR-only file's lone CR, as it is", () => {
     for (const text of ["{}\n", "{\r\n}\r\n", "{\r}\r", "{\r\n}\n", "\n", "\r\n", "\r"]) {
       expect(terminateWithNewline(text), JSON.stringify(text)).toBe(text);
     }
@@ -613,6 +617,29 @@ describe("the write facade", () => {
     expect(classifyClientConfig(out, site()).entry()?.launch?.command).toBe("npx");
   });
 
+  it("creates a JSON file holding only CRLF whitespace with exactly the bytes a missing file gets, in LF", () => {
+    // The JSON counterpart of the TOML test in the rootDefaults block below. A
+    // whitespace-only CRLF file classifies absent, and the facade hands its
+    // whitespace to the adapter as the text to start from, so that TOML keeps
+    // the user's line ending. The JSON adapter renders that whitespace exactly
+    // as it renders no text -- the fresh document, LF, one trailing newline --
+    // rather than splicing into it, which would write CRLF and, for
+    // "\r\n\r\n", leave a blank line after the closing brace.
+    const upsert: ClientConfigEdit[] = [{ op: "upsert", key: "mcp", entry: ENTRY }];
+    const rendered =
+      '{\n  "mcpServers": {\n    "mcp": {\n      "command": "npx",\n      "args": [\n        "-y",\n        "@yawlabs/mcp@latest"\n      ]\n    }\n  }\n}\n';
+    for (const format of ["jsonc", "json"] as const) {
+      const at = site({ format });
+      expect(applyClientConfigEdits(classifyClientConfig(null, at), upsert, at), format).toBe(rendered);
+      for (const ws of ["\r\n", "  \r\n", "\r\n\r\n", "\r\n  "]) {
+        const label = `${format} ${JSON.stringify(ws)}`;
+        const view = classifyClientConfig(ws, at);
+        expect(view.read.kind, label).toBe("absent");
+        expect(applyClientConfigEdits(view, upsert, at), label).toBe(rendered);
+      }
+    }
+  });
+
   it("refuses an empty edit list", () => {
     expect(() => applyClientConfigEdits(classifyClientConfig("{}", site()), [])).toThrow(/no edits/);
   });
@@ -625,6 +652,39 @@ describe("the write facade", () => {
     expect(() => applyClientConfigEdits(view, [{ op: "repair", path: ["mcpServers"] }], site())).toThrow(
       /nothing in it to repair/,
     );
+  });
+
+  it("refuses two upserts into a file that does not exist with the reason, not a repair nobody asked for", () => {
+    const upserts: ClientConfigEdit[] = [
+      { op: "upsert", key: "mcp", entry: ENTRY },
+      { op: "upsert", key: "other", entry: ENTRY },
+    ];
+    expect(() => applyClientConfigEdits(classifyClientConfig(null, site()), upserts, site())).toThrow(
+      "/home/u/cfg.json does not exist, and a write that creates it adds at most one entry -- 2 upserts were asked for",
+    );
+    // A file that is there but holds only whitespace takes the same path, and
+    // the message says what it is rather than that it is missing.
+    expect(() => applyClientConfigEdits(classifyClientConfig(" \n", site()), upserts, site())).toThrow(
+      "/home/u/cfg.json holds only whitespace, and a write that creates it adds at most one entry -- 2 upserts were asked for",
+    );
+    // A remove or a repair in the list is still the refusal named.
+    expect(() =>
+      applyClientConfigEdits(classifyClientConfig(null, site()), [...upserts, { op: "remove", key: "x" }], site()),
+    ).toThrow("/home/u/cfg.json does not exist, so there is nothing in it to remove");
+  });
+
+  it("ends an LF file whose last byte is a lone CR with an LF once terminated for the write", () => {
+    // JSON reads a CR as whitespace, so the file classifies ok, and the splice
+    // leaves the CR outside its span: the edited text still ends in "}\r". In
+    // an LF file that CR is no line break, so the caller's terminator adds one.
+    const raw = '{\n  "mcpServers": {}\n}\r';
+    const out = applyClientConfigEdits(
+      classifyClientConfig(raw, site()),
+      [{ op: "upsert", key: "mcp", entry: ENTRY }],
+      site(),
+    );
+    expect(out.endsWith("}\r")).toBe(true);
+    expect(terminateWithNewline(out)).toBe(`${out}\n`);
   });
 
   it("returns the input string itself when a removal finds nothing", () => {
@@ -695,7 +755,91 @@ describe("top-level defaults through the write facade (ConfigShape.rootDefaults)
         ],
         codex(),
       ),
-    ).toThrow(/does not exist/);
+    ).toThrow(
+      `${CODEX_FILE} does not exist, and a write that creates it adds at most one entry -- 2 upserts were asked for`,
+    );
+  });
+
+  it("creates a whitespace-only CRLF file in CRLF, and a lone-CR one in LF as before", () => {
+    // A whitespace-only file classifies absent, so it is created -- but it is
+    // THERE, and its line ending is the user's. The TOML adapter copies it
+    // when it is handed the whitespace, whichever edit runs first.
+    const entry = { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] };
+    const created = `${GRACE} = 0\n\n${TABLE}`;
+    const crlf = (text: string): string => text.replace(/\n/g, "\r\n");
+    for (const ws of ["\r\n", "  \r\n\r\n", "\r\n  "]) {
+      const view = classifyClientConfig(ws, codex());
+      expect(view.read.kind, JSON.stringify(ws)).toBe("absent");
+      expect(applyClientConfigEdits(view, [{ op: "upsert", key: "mcp", entry }, GRACE_EDIT], codex())).toBe(
+        crlf(created),
+      );
+      expect(applyClientConfigEdits(view, [GRACE_EDIT, { op: "upsert", key: "mcp", entry }], codex())).toBe(
+        crlf(created),
+      );
+    }
+    // A lone CR is not a TOML newline: a file created in it would not parse,
+    // so a lone-CR (or LF) whitespace file is created from no text, in LF.
+    for (const ws of ["\r", " \r\r", "\n\n", ""]) {
+      const view = classifyClientConfig(ws, codex());
+      expect(applyClientConfigEdits(view, [{ op: "upsert", key: "mcp", entry }, GRACE_EDIT], codex()), ws).toBe(
+        created,
+      );
+    }
+  });
+
+  it("refuses an insert whose integer key reads back as a float of the same number", () => {
+    // `0.0` parses to the same JS number `0` does, so the value check alone
+    // passes it -- but Codex types the key as an integer and refuses a float,
+    // which is also why planRootDefaults reports such a key as another value.
+    for (const spelled of ["0.0", "-0.0", "0e0"]) {
+      registerStandIn({
+        insertRootKey: (raw, key, value) => realInsert(raw, key, value).replace(`${key} = 0`, `${key} = ${spelled}`),
+      });
+      expect(() => applyClientConfigEdits(classifyClientConfig(FILE, codex()), [GRACE_EDIT], codex()), spelled).toThrow(
+        `"${GRACE}" read back from ${CODEX_FILE} as the float ${spelled}, not the integer 0 -- nothing was written`,
+      );
+    }
+    // The create path runs the same check.
+    const entry = { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] };
+    expect(() =>
+      applyClientConfigEdits(
+        classifyClientConfig(null, codex()),
+        [{ op: "upsert", key: "mcp", entry }, GRACE_EDIT],
+        codex(),
+      ),
+    ).toThrow(`"${GRACE}" read back from ${CODEX_FILE} as the float 0e0, not the integer 0 -- nothing was written`);
+  });
+
+  it("holds only an INTEGER default to an integer readback: 0.5 is written, and reads back as the float it is", () => {
+    // The row's own adapter, unreplaced: the float readback is the value, not
+    // another type, so neither the adapter's check nor the facade's refuses it.
+    const FRACTION = "some_fraction";
+    expect(
+      applyClientConfigEdits(
+        classifyClientConfig(FILE, codex()),
+        [{ op: "rootDefault", key: FRACTION, value: 0.5 }],
+        codex(),
+      ),
+    ).toBe(`model = "gpt-5"\n${FRACTION} = 0.5\n\n${TABLE}`);
+  });
+
+  it("refuses, in the write and the preview alike, an integer default the TOML writer can only spell as a float", () => {
+    // startup_timeout_sec is a key the renderer always writes as a float, so
+    // the integer 60 would land as 60.0. The adapter's own insert refuses it,
+    // so a --dry-run never previews a line the write then refuses.
+    const TIMEOUT = "startup_timeout_sec";
+    const refusal = `the top-level "${TIMEOUT}" read back as the float 60.0, where the value written is an integer`;
+    const edit: ClientConfigEdit = { op: "rootDefault", key: TIMEOUT, value: 60 };
+    expect(() => applyClientConfigEdits(classifyClientConfig(FILE, codex()), [edit], codex())).toThrow(
+      `${CODEX_FILE} could not be edited (${refusal})`,
+    );
+    const entry = { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] };
+    expect(() =>
+      applyClientConfigEdits(classifyClientConfig(null, codex()), [{ op: "upsert", key: "mcp", entry }, edit], codex()),
+    ).toThrow(`${CODEX_FILE} could not be created (${refusal})`);
+    expect(() =>
+      previewRootDefaults(classifyClientConfig(FILE, codex()), [{ key: TIMEOUT, value: 60, why: "w" }]),
+    ).toThrow(refusal);
   });
 
   it("adds the entry and the key to a file that has neither, and still compares the rest", () => {
@@ -811,7 +955,9 @@ describe("top-level defaults through the write facade (ConfigShape.rootDefaults)
     expect(plan(`${GRACE} = "0"\n${FILE}`)).toEqual({ set: [], kept: [{ rootDefault: GRACE_DEFAULT, value: "0" }] });
     // A FLOAT is another value too, even where it parses to the same number:
     // Codex types the key as an integer and refuses a float. It is kept with
-    // its spelling as written, so the note can say 0.0 and not 0.
+    // its spelling as written, so what install prints can say 0.0 and not 0:
+    // the Note for this default, which declares no `accepts`, and the stderr
+    // warning for Codex's own, whose `accepts` refuses a float.
     for (const [spelled, value] of [
       ["0.0", 0],
       ["-0.0", -0],
@@ -837,10 +983,190 @@ describe("top-level defaults through the write facade (ConfigShape.rootDefaults)
     expect(plan("x = \n")).toEqual({ set: [], kept: [] });
   });
 
+  it("plans a kept value outside the default's `accepts` as refused, with the reason, and one inside it as kept", () => {
+    const typed: ConfigRootDefault = { ...GRACE_DEFAULT, accepts: "unsigned-integer" };
+    const plan = (value: string) =>
+      planRootDefaults(classifyClientConfig(`${GRACE} = ${value}\n${FILE}`, codex()), [typed]);
+    const needs = "a non-negative integer";
+    // Inside the type: the same value is nothing, another is kept, unrefused.
+    expect(plan("0")).toEqual({ set: [], kept: [] });
+    expect(plan("-0")).toEqual({ set: [], kept: [] });
+    expect(plan("1000")).toEqual({ set: [], kept: [{ rootDefault: typed, value: 1000 }] });
+    // The ceiling is the largest integer TOML has; the reader hands it back
+    // as a bigint, and it is still a value the type takes.
+    expect(plan("9223372036854775807")).toEqual({
+      set: [],
+      kept: [{ rootDefault: typed, value: 9223372036854775807n }],
+    });
+    // Outside it: each with what it is and what the type needs.
+    expect(plan("-1")).toEqual({
+      set: [],
+      kept: [{ rootDefault: typed, value: -1, refused: { kind: "a negative integer", needs } }],
+    });
+    expect(plan("-9223372036854775808")).toEqual({
+      set: [],
+      kept: [{ rootDefault: typed, value: -9223372036854775808n, refused: { kind: "a negative integer", needs } }],
+    });
+    expect(plan('"0"')).toEqual({
+      set: [],
+      kept: [{ rootDefault: typed, value: "0", refused: { kind: "a string", needs } }],
+    });
+    expect(plan("true")).toEqual({
+      set: [],
+      kept: [{ rootDefault: typed, value: true, refused: { kind: "a boolean", needs } }],
+    });
+    // A float breaks the INTEGER rule, whatever its sign, so that is what it
+    // is told it needs.
+    for (const [spelled, value] of [
+      ["0.0", 0],
+      ["-0.0", -0],
+      ["1000.0", 1000],
+      ["0.5", 0.5],
+    ] as const) {
+      expect(plan(spelled), spelled).toEqual({
+        set: [],
+        kept: [{ rootDefault: typed, value, float: spelled, refused: { kind: "a float", needs: "an integer" } }],
+      });
+    }
+    // An integer past the ceiling is spelled as itself, so it needs no kind.
+    // It is past the largest integer TOML holds, too, so no release of the
+    // client parses the file at all: `everyRelease` says so, and why.
+    expect(plan("9223372036854775808")).toEqual({
+      set: [],
+      kept: [
+        {
+          rootDefault: typed,
+          value: 9223372036854775808n,
+          refused: {
+            needs: "a non-negative integer no larger than 9223372036854775807",
+            everyRelease: "larger than a TOML integer holds",
+          },
+        },
+      ],
+    });
+    // Below the smallest is the other end of the same range; the floor itself
+    // is a TOML integer, refused only as a negative one (above).
+    expect(plan("-9223372036854775809")).toEqual({
+      set: [],
+      kept: [
+        {
+          rootDefault: typed,
+          value: -9223372036854775809n,
+          refused: { kind: "a negative integer", needs, everyRelease: "smaller than a TOML integer holds" },
+        },
+      ],
+    });
+    // A date, and the two shapes install spells as their shape.
+    expect(plan("1979-05-27").kept[0]?.refused).toEqual({ kind: "a date or time", needs });
+    expect(plan("[0]")).toEqual({ set: [], kept: [{ rootDefault: typed, value: [0], refused: { needs } }] });
+    expect(plan("{ a = 1 }").kept[0]?.refused).toEqual({ needs });
+    // With no `accepts`, the plan claims nothing about what the client takes:
+    // the same values are kept, and none is marked refused.
+    const untyped = (value: string) =>
+      planRootDefaults(classifyClientConfig(`${GRACE} = ${value}\n${FILE}`, codex()), [GRACE_DEFAULT]);
+    for (const value of ["-1", '"0"', "true", "[0]", "0.0", "9223372036854775808"]) {
+      const kept = untyped(value).kept;
+      expect(kept.length, value).toBe(1);
+      expect(kept[0]?.refused, value).toBeUndefined();
+    }
+  });
+
+  // TWO defaults. The shipped row declares one, so these are the only tests
+  // that give the facade, the plan and the preview more than one -- and each
+  // is shaped so that handling only the first one fails it: the two writes by
+  // the second line they add, the verify test by refusals that are all on
+  // the second default, the plan and the preview by the second entry.
+  const A_DEFAULT: ConfigRootDefault = { key: "a_key", value: 1, why: "a" };
+  const B_DEFAULT: ConfigRootDefault = { key: "b_key", value: true, why: "b" };
+  const TWO_EDITS: ClientConfigEdit[] = [
+    { op: "rootDefault", key: "a_key", value: 1 },
+    { op: "rootDefault", key: "b_key", value: true },
+  ];
+
+  it("adds two top-level defaults to an existing file, in list order, verified", () => {
+    const view = classifyClientConfig(FILE, codex());
+    expect(applyClientConfigEdits(view, TWO_EDITS, codex())).toBe(
+      `model = "gpt-5"\na_key = 1\nb_key = true\n\n${TABLE}`,
+    );
+  });
+
+  it("creates a missing file with the entry and two top-level defaults in one write", () => {
+    const entry = { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] };
+    const edits: ClientConfigEdit[] = [{ op: "upsert", key: "mcp", entry }, ...TWO_EDITS];
+    expect(applyClientConfigEdits(classifyClientConfig(null, codex()), edits, codex())).toBe(
+      `a_key = 1\nb_key = true\n\n${TABLE}`,
+    );
+  });
+
+  it("verifies EVERY default it adds, not just the first", () => {
+    // Each stand-in gets the FIRST insert right and only the second wrong, so
+    // a check that stopped after the first rootDefault edit would pass every
+    // write below. The comparison of the rest of the file drops both keys (and
+    // a created file gets no comparison), so it cannot catch these either:
+    // only the per-key check can.
+    const entry = { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] };
+    const existing = () => classifyClientConfig(FILE, codex());
+    const absent = () => classifyClientConfig(null, codex());
+    const creating = (edits: ClientConfigEdit[]): ClientConfigEdit[] => [{ op: "upsert", key: "mcp", entry }, ...edits];
+
+    // A wrong value.
+    registerStandIn({ insertRootKey: (raw, key, value) => realInsert(raw, key, key === "b_key" ? false : value) });
+    const wrong = `"b_key" did not read back from ${CODEX_FILE} as true -- nothing was written`;
+    expect(() => applyClientConfigEdits(existing(), TWO_EDITS, codex())).toThrow(wrong);
+    expect(() => applyClientConfigEdits(absent(), creating(TWO_EDITS), codex())).toThrow(wrong);
+
+    // A float for an integer.
+    registerStandIn({
+      insertRootKey: (raw, key, value) => {
+        const out = realInsert(raw, key, value);
+        return key === "b_key" ? out.replace("b_key = 0", "b_key = 0.0") : out;
+      },
+    });
+    const twoIntegers: ClientConfigEdit[] = [
+      { op: "rootDefault", key: "a_key", value: 1 },
+      { op: "rootDefault", key: "b_key", value: 0 },
+    ];
+    const float = `"b_key" read back from ${CODEX_FILE} as the float 0.0, not the integer 0 -- nothing was written`;
+    expect(() => applyClientConfigEdits(existing(), twoIntegers, codex())).toThrow(float);
+    expect(() => applyClientConfigEdits(absent(), creating(twoIntegers), codex())).toThrow(float);
+
+    // A second key that was already set, which the stand-in overwrote instead
+    // of refusing. A file that is created has no key in it to be set already,
+    // so this one has no create half.
+    registerStandIn({
+      insertRootKey: (raw, key, value) =>
+        key === "b_key" ? (raw ?? "").replace("b_key = false", "b_key = true") : realInsert(raw, key, value),
+    });
+    expect(() =>
+      applyClientConfigEdits(classifyClientConfig(`b_key = false\n${FILE}`, codex()), TWO_EDITS, codex()),
+    ).toThrow(
+      `"b_key" is already set in ${CODEX_FILE}, and a rootDefault never changes a value that is there -- nothing was written`,
+    );
+  });
+
+  it("plans every default, whichever of them is absent first", () => {
+    const plan = (raw: string) => planRootDefaults(classifyClientConfig(raw, codex()), [A_DEFAULT, B_DEFAULT]);
+    // The ABSENT default first: a plan that stopped at the first absent one
+    // would never see that the second is there at another value.
+    expect(plan(`b_key = false\n${FILE}`)).toEqual({
+      set: [A_DEFAULT],
+      kept: [{ rootDefault: B_DEFAULT, value: false }],
+    });
+    // And the other way round.
+    expect(plan(`a_key = 5\n${FILE}`)).toEqual({
+      set: [B_DEFAULT],
+      kept: [{ rootDefault: A_DEFAULT, value: 5 }],
+    });
+    // Both absent: both set, in list order.
+    expect(plan(FILE)).toEqual({ set: [A_DEFAULT, B_DEFAULT], kept: [] });
+  });
+
   it("previews each line a write would add, spelled as the write spells it -- the line, not the edit", () => {
     const view = classifyClientConfig(FILE, codex());
     expect(previewRootDefaults(view, [GRACE_DEFAULT])).toBe(`${GRACE} = 0\n`);
     expect(previewRootDefaults(view, [])).toBe("");
+    // Two defaults: both lines, in list order.
+    expect(previewRootDefaults(view, [A_DEFAULT, B_DEFAULT])).toBe("a_key = 1\nb_key = true\n");
     // A tables-only file gets a blank line under the key as well; the
     // preview is the line alone, whatever the file.
     expect(previewRootDefaults(classifyClientConfig(TABLE, codex()), [GRACE_DEFAULT])).toBe(`${GRACE} = 0\n`);

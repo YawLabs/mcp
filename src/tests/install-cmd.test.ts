@@ -3133,6 +3133,19 @@ describe("runInstall --all", () => {
     // And the two new clients ride the same table-driven planner.
     expect(existsSync(join(synthHome, ".codeium", "windsurf", "mcp_config.json"))).toBe(true);
     expect(existsSync(join(synthHome, ".gemini", "settings.json"))).toBe(true);
+    // Codex CLI's sub-install is a whole install, top-level default included:
+    // --all recurses into runInstall, and nothing about the --all-only flags it
+    // passes may drop `mcp_optional_startup_grace_ms = 0` or the line that says
+    // it was added. The key goes above the table, a blank line between them.
+    const codexToml = join(synthHome, ".codex", "config.toml");
+    expect(readFileSync(codexToml, "utf8").startsWith("mcp_optional_startup_grace_ms = 0\n\n[mcp_servers.mcp]\n")).toBe(
+      true,
+    );
+    const added = out.split("\n").filter((l) => l.startsWith("Added mcp_optional_startup_grace_ms = 0 to "));
+    expect(added).toHaveLength(1);
+    expect(added[0].startsWith(`Added mcp_optional_startup_grace_ms = 0 to ${codexToml}: `)).toBe(true);
+    // The entry was written, so Codex's own Done line keeps its server wording.
+    expect(out).toContain("\nDone: Codex CLI is configured. Restart it to pick up the new MCP server.\n");
     expect(out).toMatch(/Done: \d+\/\d+ clients installed successfully\./);
     // ~/.yaw-mcp/config.json is not part of an install any more.
     expect(existsSync(join(synthHome, ".yaw-mcp", "config.json"))).toBe(false);
@@ -3209,6 +3222,57 @@ describe("runInstall --all", () => {
     });
     expect(r.exitCode).toBe(1);
     expect(cap.stderr()).toMatch(/client install.*failed/);
+  });
+
+  it("counts a Codex config.toml no Codex release loads as a FAILURE, exit 1 -- not a refusal a flag answers", async () => {
+    // mcp_optional_startup_grace_ms past 2^63 - 1 is a file no Codex release
+    // parses, so the codex-cli sub-install refuses it with exit 1 and no
+    // `collisionRefused`, and --all has to count that as failed. Counted as
+    // refused, the run would exit 2 and print the "stdin is not a TTY" hint
+    // telling a script to re-run with --repair/--force/--skip, and none of
+    // those gets past a value install will not touch. The differing "mcp"
+    // entry beside the key is the one thing that WOULD raise the collision
+    // refusal off a TTY, so it is seeded to pin that the root-value refusal
+    // fires first.
+    const codexToml = join(synthHome, ".codex", "config.toml");
+    const before =
+      'mcp_optional_startup_grace_ms = 9223372036854775808\n\n[mcp_servers.mcp]\ncommand = "node"\nargs = ["old.js"]\n';
+    mkdirSync(dirname(codexToml), { recursive: true });
+    writeFileSync(codexToml, before, "utf8");
+    // How many clients --all plans on linux, derived the way PLANNED is in the
+    // "a DRIFTED entry off a TTY" describe, so a landing client does not have
+    // to re-count a literal here.
+    const planned = INSTALL_TARGETS.filter(
+      (t) => t.availableOn.includes("linux") && t.scopes.some((sc) => !sc.requiresProjectDir),
+    ).length;
+
+    const cap = captureIo();
+    const r = await runInstall({
+      os: "linux",
+      home: synthHome,
+      cwd: synthCwd,
+      all: true,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(1);
+    const stderr = cap.stderr();
+    // codex-cli's own refusal, once and byte for byte, under its header...
+    const refusal =
+      `yaw-mcp install: ${codexToml} sets mcp_optional_startup_grace_ms to 9223372036854775808, ` +
+      "larger than a TOML integer holds, so Codex CLI will not load the file -- refusing to write into it; " +
+      "change that value by hand to a non-negative integer no larger than 9223372036854775807 (0 is recommended), then re-run.";
+    expect(stderr.split(`${refusal}\n`).length - 1).toBe(1);
+    // ...and not the collision refusal the differing entry would otherwise get.
+    expect(stderr).not.toContain(`${codexToml} already has a "${ENTRY_NAME}" entry`);
+    // Counted with the failures: the closing line, byte-exact, and no
+    // consolidated "needs a flag" hint naming codex-cli.
+    expect(r.messages[r.messages.length - 1]).toBe(`1/${planned} client install failed. ${planned - 1} succeeded.`);
+    expect(stderr).not.toContain("stdin is not a TTY");
+    expect(stderr).not.toContain("was refused");
+    // Nothing written into the file its client cannot load.
+    expect(r.written).not.toContain(codexToml);
+    expect(readFileSync(codexToml, "utf8")).toBe(before);
   });
 
   it("consolidates collision-without-flag refusals into ONE hint", async () => {
@@ -4733,7 +4797,8 @@ describe("runInstall -- the Done line names a new server only when one was writt
     expect(r.exitCode).toBe(0);
     expect(r.written).toEqual([mcpJson]);
     // install cannot see Claude Code's approval state, so the gate is named on
-    // every run -- and that sentence never claimed a new server.
+    // every run that writes (a run with nothing to write ends "Nothing to do"
+    // and prints no Done line) -- and that sentence never claimed a new server.
     expect(stdout).toContain("approve the .mcp.json server when prompted");
     expect(stdout).not.toContain("new MCP server");
   });
@@ -6962,6 +7027,50 @@ describe.each(CLINE_PLATFORMS)("runInstall / runUninstall -- a target whose one 
       const r = await runInstall({ ...clineOpts(home), io: live.io });
       expect(r.written).toEqual([copy]);
       expect(preview.wouldWrite).toEqual(r.written);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("--dry-run names a copy that needs only a legacy trim, with the shared file already correct", async () => {
+    const home = mkdtempSync(join(tmpdir(), "yaw-cline-"));
+    try {
+      const copy = seedEditorStorage(home);
+      await runInstall({ ...clineOpts(home), io: captureIo().io });
+      // The copy's "mcp" entry is already correct; the one thing to do in it is
+      // the pre-rename key beside it. That write re-splices the entry with the
+      // same value, so the copy is in the pass's `touched` and not its
+      // `entryWrites` -- and the preview has to read `touched`, the list of
+      // files the live run writes. Read from `entryWrites`, this preview said
+      // "Nothing to do" with `wouldWrite: []` while the live run a second
+      // later rewrote the copy.
+      const doc = JSON.parse(readFileSync(copy, "utf8")) as { mcpServers: Record<string, unknown> };
+      doc.mcpServers[LEGACY] = { command: "old" };
+      writeFileSync(copy, `${JSON.stringify(doc, null, 2)}\n`);
+      const before = readFileSync(copy, "utf8");
+
+      const dry = captureIo();
+      const preview = await runInstall({ ...clineOpts(home, { dryRun: true }), io: dry.io });
+      expect(preview.exitCode).toBe(0);
+      expect(preview.wouldWrite).toEqual([copy]);
+      const named = `Would also write the "${ENTRY_NAME}" entry to ${copy} (VS Code).`;
+      expect(
+        dry
+          .stdout()
+          .split("\n")
+          .filter((l) => l === named),
+      ).toHaveLength(1);
+      expect(dry.stdout()).not.toContain("Nothing to do");
+      expect(readFileSync(copy, "utf8")).toBe(before);
+
+      // The promise kept: the live run writes that copy and only that copy,
+      // and the legacy key is what came out of it.
+      const live = captureIo();
+      const r = await runInstall({ ...clineOpts(home), io: live.io });
+      expect(r.written).toEqual(preview.wouldWrite);
+      const after = JSON.parse(readFileSync(copy, "utf8")) as { mcpServers: Record<string, unknown> };
+      expect(after.mcpServers[LEGACY]).toBeUndefined();
+      expect(after.mcpServers[ENTRY_NAME]).toEqual(doc.mcpServers[ENTRY_NAME]);
     } finally {
       rmSync(home, { recursive: true, force: true });
     }

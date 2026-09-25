@@ -356,14 +356,44 @@ function spellRootDefault(rootDefault: ConfigRootDefault): string {
   return `${rootDefault.key} = ${JSON.stringify(rootDefault.value)}`;
 }
 
-/** A value the USER's file holds for a top-level key, for the one note that
- *  says install left it alone. A scalar is spelled; anything else is named by
- *  its shape, never echoed (it is the user's, and it can be any size). */
+/** A value the USER's file holds for a top-level key, for the one note,
+ *  warning or refusal that names it. A scalar is spelled; anything else is
+ *  named by its shape, never echoed (it is the user's, and it can be any
+ *  size). */
 function spellRootValue(value: unknown, syntax: SyntaxName): string {
   if (typeof value === "string") return JSON.stringify(value);
   if (typeof value === "number" || typeof value === "bigint" || typeof value === "boolean") return String(value);
   if (value instanceof Date) return value.toISOString();
   return Array.isArray(value) ? describeValueShape(value) : containerNounFor(syntax);
+}
+
+/** The step that ends the note (or warning) about a top-level key install
+ *  left alone, when the key holds a scalar. It names neither the key nor the
+ *  file: the message has just said both, and it says the key exactly once.
+ *  It says the VALUE, never a line: a TOML multi-line string is a scalar over
+ *  several lines, and editing only the line the key is on would leave the
+ *  rest of the string behind as invalid TOML. */
+const KEPT_ROOT_VALUE_STEP = "Edit that value by hand to change it.";
+
+/** Where a top-level line goes when the user adds it by hand. In TOML a
+ *  `key = value` line after a `[table]` header is a key OF that table, so
+ *  "at the top level" is not enough of an instruction there -- the end of the
+ *  file is usually inside the last table. */
+function rootLinePlacement(syntax: SyntaxName): string {
+  return syntax === "TOML" ? "above the first table in the file" : "at the top level of the file";
+}
+
+/** The step in place of KEPT_ROOT_VALUE_STEP when the key holds an array or
+ *  a table -- the values spellRootValue names by their shape. Such a value
+ *  need not be one line: a `[key]` header and the keys under it, an
+ *  `[[key]]` array of tables, a `[key.sub]` header, dotted keys, a list over
+ *  several lines. And in TOML a line written in place of a header that
+ *  follows another table is a key OF that table, so editing the header into
+ *  `key = 0` where it stands can leave the key off the top level. So the step
+ *  says to take the value out and where the one line goes. Like
+ *  KEPT_ROOT_VALUE_STEP, it names neither the key nor the file. */
+function keptRootShapeStep(syntax: SyntaxName): string {
+  return `To change it, delete it by hand and set the key on one line ${rootLinePlacement(syntax)}.`;
 }
 
 /** The tail both the live path and the --dry-run preview end with. One
@@ -926,6 +956,34 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     );
     return { written: [], wouldWrite: [], messages, exitCode: 1 };
   }
+  // The row's top-level defaults (`config.rootDefaults`), planned HERE, where
+  // the file is read, for the one kind of kept value that is a refusal of
+  // its own: a value NO release of the client loads the file with
+  // (`refused.everyRelease` -- for Codex, the key's value being an integer
+  // outside the range a TOML integer holds, which its parser refuses before
+  // it reads a single key: S7 in target-codex-cli.ts; one nested in the value
+  // or at another key is not seen, see RootValueRefusal.everyRelease). Such
+  // a file is one the client loads nothing
+  // from, so it is refused as the file just above is, in the same form and
+  // for the same reason: exit 1, nothing written, and no `Nothing to do` or
+  // `Done` line -- under --dry-run and --skip too, as that one is. Ahead of
+  // the rest of the run so that nothing about an entry it will not write (a
+  // Runtime line, `already correct`, `Overwriting ...`) prints first, and a
+  // differing entry off a TTY does not answer with the collision refusal
+  // instead. ONE refusal: the first such key stops the run. It names the key
+  // once, and says what to change the value to rather than which line to
+  // edit. Every other kept value is reported further down, where the plan is
+  // acted on.
+  const rootPlan = planRootDefaults(view, target.config.rootDefaults);
+  for (const { rootDefault, value, float, refused } of rootPlan.kept) {
+    if (refused?.everyRelease === undefined) continue;
+    err(
+      `yaw-mcp install: ${resolved.absolute} sets ${rootDefault.key} to ${float ?? spellRootValue(value, view.adapter.syntax)}, ` +
+        `${refused.everyRelease}, so ${target.label} will not load the file -- refusing to write into it; ` +
+        `change that value by hand to ${refused.needs} (${JSON.stringify(rootDefault.value)} is recommended), then re-run.`,
+    );
+    return { written: [], wouldWrite: [], messages, exitCode: 1 };
+  }
   // EVERY projects[] read in this file resolves its path here -- see
   // claudeCodeContainerPaths. The canonical key comes back first and is the
   // one this run reads and writes; the rest are drive-letter-case siblings of
@@ -1397,35 +1455,85 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   // give an npx-launched yaw-mcp one second to start and leave it out of the
   // whole session (0.147 to 0.150 wait a fixed second the key cannot change).
   // Primary site only -- it is the one file a row with such a default has --
-  // and read off the SAME view as the entry, so `--scope project` and
-  // CODEX_HOME reach exactly the file the entry is written to. `--skip` over
-  // an existing entry returned above, before this plan: it leaves the whole
-  // file as it is, a missing key included. With no entry --skip has nothing
-  // to leave, and the key is planned as on any install.
+  // and planned (`rootPlan`, where the file is read) off the SAME view as the
+  // entry, so `--scope project` and CODEX_HOME reach exactly the file the
+  // entry is written to. `--skip` over an existing entry returned above --
+  // after the refusal where the plan is made, which --skip does not get past,
+  // and before the rest of the plan is acted on: it leaves the whole file as
+  // it is, a missing key included. With no entry --skip has nothing to leave,
+  // and the key is added as on any install.
   //
   // ADD-ONLY. A missing key is added in the same write as everything else,
   // and makes an otherwise-identical re-run a write of that line alone (plus
   // a blank line under it when the file starts with a table, and a line
   // break on a last line that had none). A key already there at the same
   // value needs nothing and says nothing. A key there at ANY other value is
-  // the user's: its line is left exactly as it is (the entry is still written
-  // when it needs to be) and one note says what install would have set and
-  // why -- `--force` and `--repair` are about the ENTRY and do not change
-  // that. A float where the default is an integer (`0.0`) is another value,
-  // not the same one: the note prints it as the file spells it and names it
-  // a float.
-  const rootPlan = planRootDefaults(view, target.config.rootDefaults);
+  // the user's: it is left exactly as it is (the entry is still written when
+  // it needs to be) and one message -- a `Note:` line, or the warning below
+  // for a value the client does not take -- says which value install
+  // recommends, and that the value is the user's to change. `--force` and
+  // `--repair` are about the ENTRY and do not change that. A float where the
+  // default is an integer (`0.0`) is another value, not the same one: the
+  // message prints it as the file spells it. The step it ends with follows
+  // the value's shape: a scalar gets KEPT_ROOT_VALUE_STEP, which says to edit
+  // the value and says nothing about lines (a multi-line string is a scalar
+  // too), and an array or a table gets keptRootShapeStep, since editing such
+  // a value where it stands can leave the key off the top level.
+  //
+  // A value outside the type the default's `accepts` declares (Codex: a
+  // float, a string, a negative integer, a boolean, a date, an array, a
+  // table) is one a release of the client that reads the key will not load
+  // the file with (a release from before the key existed does not read it).
+  // It gets a WARNING on stderr in place of the note, in the form of the
+  // typed programProbe warning below -- the other message about a file some
+  // releases of the client will not load -- saying what the value is, what
+  // the client needs, and that such a release will not load the file with
+  // it. It says that IN PLACE of `why`: `why` describes what a value the
+  // client takes does ("otherwise give ... one shared grace"), and a refused
+  // value gets no grace at all. Like the typed warning it does not fail the
+  // run: the exit stays 0 and the run ends on its usual line, since whether
+  // the file loads depends on the client's release (Codex 0.144.0, which
+  // predates the key, loaded each such value measured: S7 in
+  // target-codex-cli.ts), and the value is the user's, not one install
+  // wrote. The one exception is a value NO release loads the file with
+  // (`refused.everyRelease`: for Codex the key's value being an integer past
+  // 2^63 - 1, which 0.144.0 refuses at parse too, or below -2^63 -- no TOML
+  // integer holds either). That is not a value some releases load but a file
+  // the client loads nothing from: the run was refused where the plan was
+  // made, and such a value never reaches this loop. (An out-of-range integer
+  // nested in an array or a table value does reach it, as that array or
+  // table, with the warning: the plan does not look inside the value.) What
+  // the message says about the value comes from the plan, and
+  // the client's name from the row, so this loop names no client and no
+  // type.
   const rootSets = rootPlan.set;
-  for (const { rootDefault, value, float } of rootPlan.kept) {
-    const found =
-      float !== undefined
-        ? `${float}, a float where ${target.label} needs an integer`
-        : spellRootValue(value, view.adapter.syntax);
-    log(
-      `Note: ${resolved.absolute} already sets ${rootDefault.key} to ${found}, ` +
-        `and install leaves a value you set alone. ${JSON.stringify(rootDefault.value)} is recommended: ` +
-        `${rootDefault.why}.`,
-    );
+  for (const { rootDefault, value, float, refused } of rootPlan.kept) {
+    const spelled = float ?? spellRootValue(value, view.adapter.syntax);
+    const recommended = JSON.stringify(rootDefault.value);
+    // spellRootValue's own scalar test, so every value it names by its shape
+    // gets the shape step.
+    const scalar =
+      typeof value === "string" ||
+      typeof value === "number" ||
+      typeof value === "bigint" ||
+      typeof value === "boolean" ||
+      value instanceof Date;
+    const step = scalar ? KEPT_ROOT_VALUE_STEP : keptRootShapeStep(view.adapter.syntax);
+    if (refused !== undefined) {
+      const kind = refused.kind === undefined ? "" : `${refused.kind} `;
+      err(
+        `yaw-mcp install: warning -- ${resolved.absolute} already sets ${rootDefault.key} to ${spelled}, ` +
+          `${kind}where ${target.label} needs ${refused.needs}, and install leaves a value you set alone. ` +
+          `A ${target.label} release that reads the key will not load the file with that value; ` +
+          `${recommended} is recommended. ${step}`,
+      );
+    } else {
+      log(
+        `Note: ${resolved.absolute} already sets ${rootDefault.key} to ${spelled}, ` +
+          `and install leaves a value you set alone. ${recommended} is recommended: ` +
+          `${rootDefault.why}. ${step}`,
+      );
+    }
   }
 
   // ONE write, through the core, whatever the file's syntax and whatever the
@@ -1509,6 +1617,13 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
       // write that was only a legacy trim and/or a top-level default says
       // THAT, never "failed to splice the entry" for an entry it was not
       // touching.
+      //
+      // A write that was adding a top-level default to an entry that is
+      // already correct ends with how to finish BY HAND: the line, and where
+      // it has to go (in TOML, above the first table -- after one it is that
+      // table's key). With a legacy trim in the same write, the legacy entry
+      // is still in the file too, and the step says to delete it: adding the
+      // line alone would leave yaw-mcp configured twice.
       const settings = rootSets.map(spellRootDefault).join(" and ");
       const attempted = !skipEntryWrite
         ? `splice the "${ENTRY_NAME}" entry into ${resolved.absolute}`
@@ -1517,7 +1632,14 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
           : trimLegacy
             ? `remove the legacy "${legacyEntry}" entry from ${resolved.absolute}`
             : `set ${settings} in ${resolved.absolute}`;
-      err(`yaw-mcp install: failed to ${attempted} (${(e as Error).message}). Refusing to overwrite.`);
+      const byHand = `add ${settings} ${rootLinePlacement(view.adapter.syntax)}`;
+      const remedy =
+        !skipEntryWrite || rootSets.length === 0
+          ? ""
+          : trimLegacy
+            ? ` The "${ENTRY_NAME}" entry is already correct, and the legacy "${legacyEntry}" entry is still in the file; to finish by hand, delete that entry and ${byHand}.`
+            : ` The "${ENTRY_NAME}" entry is already correct; to finish by hand, ${byHand}.`;
+      err(`yaw-mcp install: failed to ${attempted} (${(e as Error).message}). Refusing to overwrite.${remedy}`);
       return { written: [], wouldWrite: [], messages, exitCode: 1 };
     }
   }
@@ -1717,9 +1839,12 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
       }
     }
     // Conditional tense, like every other line of the preview: nothing has
-    // been written, and the live run prints "Set ..." only after it has.
+    // been written, and the live run prints "Added ..." only after it has.
+    // "Add", never "set": the key is only ever added (a key already in the
+    // file is kept, and gets the note or warning above instead), and
+    // "Set <key> ..." is how this CLI words an instruction elsewhere.
     for (const rootDefault of rootSets) {
-      log(`Would set ${spellRootDefault(rootDefault)} in ${resolved.absolute}: ${rootDefault.why}.`);
+      log(`Would add ${spellRootDefault(rootDefault)} to ${resolved.absolute}: ${rootDefault.why}.`);
     }
     const freshNote = yawFreshPaneNote({
       grantPatches: settingsPatches,
@@ -1826,8 +1951,9 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     }
     // Past tense, after the bytes landed, like the two lines above -- and the
     // one line that says so when this key is the only thing the write changed.
+    // "Added", which cannot be read as an instruction the way "Set" can.
     for (const rootDefault of rootSets) {
-      log(`Set ${spellRootDefault(rootDefault)} in ${resolved.absolute}: ${rootDefault.why}.`);
+      log(`Added ${spellRootDefault(rootDefault)} to ${resolved.absolute}: ${rootDefault.why}.`);
     }
   }
 
@@ -3930,6 +4056,14 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
   if (opts.dryRun) {
     log(`\n--- dry run: would remove the following (the rest of each file is left as-is) ---`);
     for (const line of preview) log(`    ${line}`);
+    // The live run's line about a top-level default it leaves in the file, in
+    // the conditional tense -- and on the same condition: only a run that
+    // edits this file says it. The file as it stands is what the live run
+    // would leave there: a removal changes no top-level key (the write
+    // verifies that everything but the removed entries is unchanged).
+    if (removals.length > 0) {
+      for (const line of keptRootDefaultLines(target, view, resolved.absolute, "dry-run")) log(line);
+    }
     // The copies' own lines, printed HERE rather than where the pass ran --
     // and it is that one pass this preview reports, so every copy is named
     // once and `wouldWrite` below cannot disagree with what was just printed.
@@ -4039,6 +4173,10 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
       if (s.hasEntry) log(`Removed the "${ENTRY_NAME}" entry${where(s)}.`);
       if (trimsLegacy(s)) log(`Removed the legacy "${s.legacyEntry}" entry${where(s)}.`);
     }
+    // What the same file still holds that install may have added: read off
+    // the bytes just written, so the line speaks for the file as it now is.
+    const after = classifyClientConfig(clientJson, site, { transform: target.entry });
+    for (const line of keptRootDefaultLines(target, after, resolved.absolute, "live")) log(line);
   }
 
   // The editor copies, for real this time -- the pass above the "Nothing to
@@ -4148,4 +4286,52 @@ function uninstallDoneLine(target: InstallTarget, display: string): string {
     `${target.clientId}` +
     "` wires it back."
   );
+}
+
+/** What uninstall says about the row's top-level defaults
+ *  (`config.rootDefaults`) that the file it edited still holds at the row's
+ *  OWN value: one line each, in the shape of the grant's "Keeping <what> in
+ *  <file>: <why>." line.
+ *
+ *  Uninstall takes entries out and never a top-level key, so after
+ *  `uninstall codex-cli` the file still sets `mcp_optional_startup_grace_ms`
+ *  to 0 -- a setting that changes how long Codex waits for every optional MCP
+ *  server to start, not only yaw-mcp. The line says it is still there and how
+ *  to drop it. It names the key and the value, never a `key = value` line:
+ *  planRootDefaults reads every spelling of them as the row's own value
+ *  (`key=0`, `+0`, `0x0`, a quoted key), so a line spelled from the row need
+ *  not be the one in the file. It says nothing about WHO wrote it: install
+ *  leaves a key already at the value alone and says nothing about it, so by
+ *  now a user's own `= 0` and one install added are the same bytes, and
+ *  "install added it" would be false for the first.
+ *
+ *  The row's own value only. A key at another value is one install left
+ *  alone too (its note, warning or refusal named it at the time), and a
+ *  missing key has nothing to keep. "The row's own value" is exactly the one
+ *  install treats as already there -- neither added nor kept by
+ *  planRootDefaults -- so a float `0.0` is another value here just as it is
+ *  there. That complement holds only on a read that is `ok`:
+ *  planRootDefaults gives any other read an empty plan, which it would take
+ *  for every default being at its value.
+ *
+ *  Data, never a client branch: a row with no `rootDefaults` gets no lines,
+ *  and its adapter is never asked for a top-level key. `mode` picks the
+ *  tense: "dry-run" is the preview's conditional. */
+function keptRootDefaultLines(
+  target: InstallTarget,
+  view: ClientConfigView,
+  file: string,
+  mode: "live" | "dry-run",
+): string[] {
+  const defaults = target.config.rootDefaults;
+  if (defaults === undefined || defaults.length === 0 || view.read.kind !== "ok") return [];
+  const plan = planRootDefaults(view, defaults);
+  const verb = mode === "dry-run" ? "Would keep" : "Keeping";
+  return defaults
+    .filter((d) => !plan.set.includes(d) && !plan.kept.some((k) => k.rootDefault === d))
+    .map(
+      (d) =>
+        `${verb} ${d.key} at ${JSON.stringify(d.value)} in ${file}: uninstall leaves top-level settings alone -- ` +
+        "this one is not a server, and it may be your own. Delete the line that sets it by hand if you no longer want it.",
+    );
 }

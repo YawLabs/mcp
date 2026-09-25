@@ -125,28 +125,61 @@ export interface ConfigShape {
    *  none.
    *
    *  ADD-ONLY, by contract: a key already in the file -- at any value -- is
-   *  the user's and is never changed. At another value install says what it
-   *  would have set; at the same value it says nothing. Only install adds
-   *  one; uninstall leaves it (it is not a server, and it may be the user's
-   *  own). A row may declare these only when its format's adapter
-   *  implements `readRootKey` and `insertRootKey`; anything else is a
-   *  programming error that `planRootDefaults` and the write facade name. */
+   *  the user's and is never changed. At another value install says which
+   *  value it recommends and that the value is the user's to change (and,
+   *  for a value outside the default's `accepts`, that a release of the
+   *  client that reads the key will not load the file with it; for one NO
+   *  release loads the file with, it refuses to write into the file at all:
+   *  see `RootValueRefusal.everyRelease`); at the same value it says
+   *  nothing. Only install adds one; uninstall leaves it (it is not a
+   *  server, and it may be the user's own). A row may declare these only when
+   *  its format's adapter implements `readRootKey` and `insertRootKey`;
+   *  anything else is a programming error that `planRootDefaults` and the
+   *  write facade name. */
   rootDefaults?: readonly ConfigRootDefault[];
 }
 
 /** A value a top-level default is written with. */
 export type RootDefaultValue = number | string | boolean;
 
+/** A type a client reads a top-level key as, when it will not load a file
+ *  that sets the key to anything else (`ConfigRootDefault.accepts`).
+ *
+ *  `"unsigned-integer"`: an integer -- written as one, never as a float --
+ *  from 0 to 2^63 - 1. The ceiling is the largest integer TOML has (its
+ *  integers are 64-bit signed). The TOML reader here parses a larger one as a
+ *  bigint, but Codex 0.156.1 refuses 2^63 at parse ("u64 value was too
+ *  large") and loads 2^63 - 1. */
+export type RootValueType = "unsigned-integer";
+
 /** One top-level setting a row wants present, as DATA: consumers key on this,
  *  never on the client id. */
 export interface ConfigRootDefault {
   /** The top-level key, unquoted (`mcp_optional_startup_grace_ms`). */
   key: string;
+  /** An integer here must be written, and read back, as an integer, so an
+   *  integral value the adapter can only spell as a float -- in TOML, one
+   *  for a key the renderer always writes as a float (`startup_timeout_sec`,
+   *  `tool_timeout_sec`), or one of magnitude 1e21 or more -- cannot be a
+   *  default: the write and the --dry-run preview both refuse it. */
   value: RootDefaultValue;
   /** Why the value matters, as one clause install prints after
-   *  `Set <key> = <value> in <file>: ` -- and after the recommendation when the
-   *  file already sets another value. ASCII, no trailing period. */
+   *  `Added <key> = <value> to <file>: ` -- and after the recommendation when
+   *  the file already sets another value the client takes. ASCII, no
+   *  trailing period. */
   why: string;
+  /** The type the CLIENT reads the key as, when it will not load a file that
+   *  sets the key to anything else (Codex reads
+   *  `mcp_optional_startup_grace_ms` as a u64). `planRootDefaults` marks a
+   *  value already in the file outside it as `refused`, and install then
+   *  says a release of the client that reads the key will not load the file
+   *  with that value, in place of `why` -- which describes what a value the
+   *  client takes does, and so is false for one it refuses. Where the
+   *  refusal holds for every release (`RootValueRefusal.everyRelease`),
+   *  install refuses to write into the file instead. Absent: install makes
+   *  no claim about which values the client takes. The default's own `value`
+   *  must be one of them. */
+  accepts?: RootValueType;
 }
 
 /** Whether a top-level key is set in a file, and to what (read from the
@@ -845,9 +878,12 @@ export function detectLineEnding(text: string): "\r\n" | "\n" | "\r" {
  *  file left it with mixed line endings -- a CRLF config.toml whose last line
  *  had none, after a table in the middle was replaced, is how that was found.
  *  A text that already ends in a line break is returned as it is: one ending
- *  in LF (so CRLF too), and, in a CR-only file, one ending in a lone CR. A
- *  lone CR at the end of a CRLF file is half of that file's line break, so it
- *  is completed with the LF rather than left dangling.
+ *  in LF (so CRLF too), and, in a CR-only file, one ending in a lone CR --
+ *  there the CR is the file's whole line break. A lone CR at the end of any
+ *  other text gets an LF after it. In a CRLF file that CR is half of the
+ *  file's line break, so it is completed rather than left dangling. In an LF
+ *  file it is no line break the file uses, so the file still needs its LF;
+ *  the CR stays where the user put it, in front of that LF.
  *
  *  Apply this to text you are about to write, never to a value you are
  *  comparing by identity: a no-op removal returns its input string itself, and
@@ -855,7 +891,7 @@ export function detectLineEnding(text: string): "\r\n" | "\n" | "\r" {
 export function terminateWithNewline(text: string): string {
   if (text.endsWith("\n")) return text;
   const eol = detectLineEnding(text);
-  if (text.endsWith("\r")) return eol === "\r\n" ? `${text}\n` : text;
+  if (text.endsWith("\r")) return eol === "\r" ? text : `${text}\n`;
   return text + eol;
 }
 
@@ -1126,7 +1162,8 @@ export class ClientConfigWriteError extends Error {
  *    1. the result classifies `ok`, and is no less loadable than the input;
  *    2. every entry no edit named keeps its value AND its relative order;
  *    3. every upserted key reads back equal, and every removed key is gone;
- *    4. every `rootDefault` key was absent before and reads back as its value;
+ *    4. every `rootDefault` key was absent before and reads back as its value
+ *       (an integer as an integer: a float of the same number is refused);
  *    5. the rest of the document -- everything but the entries the edits named,
  *       and the top-level keys a `rootDefault` edit added -- is unchanged.
  *
@@ -1157,17 +1194,33 @@ export function applyClientConfigEdits(
   }
 
   if (read.kind === "absent") {
-    // A file that does not exist is CREATED: the entry rendered fresh, plus
-    // any top-level defaults, applied in list order starting from no text.
-    // There is nothing in it to remove or repair, and one write creates it
-    // with at most one entry -- the shape it has always had, plus the keys.
+    // A file that does not exist, or one that holds only whitespace, is
+    // CREATED: the entry rendered fresh, plus any top-level defaults, applied
+    // in list order. There is nothing in it to remove or repair, and one write
+    // creates it with at most one entry -- the shape it has always had, plus
+    // the keys.
+    const state = view.raw === null ? "does not exist" : "holds only whitespace";
     const refused = edits.find((edit) => edit.op === "remove" || edit.op === "repair");
-    if (refused !== undefined || edits.filter((edit) => edit.op === "upsert").length > 1) {
+    if (refused !== undefined) {
       throw new ClientConfigWriteError(
-        `${where} does not exist, so there is nothing in it to ${refused?.op === "remove" ? "remove" : "repair"}`,
+        `${where} ${state}, so there is nothing in it to ${refused.op === "remove" ? "remove" : "repair"}`,
       );
     }
-    let fresh: string | null = null;
+    const upserts = edits.filter((edit) => edit.op === "upsert").length;
+    if (upserts > 1) {
+      throw new ClientConfigWriteError(
+        `${where} ${state}, and a write that creates it adds at most one entry -- ${upserts} upserts were asked for`,
+      );
+    }
+    // The first edit starts from no text, or -- when the file is there and its
+    // whitespace is CRLF -- from that whitespace, so that the TOML adapter,
+    // which copies a whitespace-only file's line ending, writes the new file
+    // in CRLF too. The JSON adapter renders whitespace-only text exactly as it
+    // renders no text, so this changes nothing there. CRLF ONLY: a lone CR is
+    // not a TOML newline, so a line the adapter ended with one would not parse,
+    // and its own check would refuse a file that, started from no text, is
+    // created in LF.
+    let fresh: string | null = view.raw !== null && detectLineEnding(view.raw) === "\r\n" ? view.raw : null;
     try {
       for (const edit of edits) {
         if (edit.op === "upsert") fresh = adapter.upsert(fresh, address, edit.key, edit.entry);
@@ -1337,6 +1390,16 @@ function verifyEdits(
   // A top-level default is ADD-ONLY: absent before, and exactly its value
   // after. Checked here as well as in the adapter's own insert, so an adapter
   // that overwrote a present key instead of refusing is still caught.
+  //
+  // "Exactly its value" includes the TYPE for an integer default, by the rule
+  // `planRootDefaults` and the TOML adapter's `verifyTomlRootInsert` apply
+  // (the same condition, spelled the same way): a float parses to the same JS
+  // number (`0.0` and `0`), but it is not the integer the default is, and a
+  // client that types the key as an integer refuses it. Without this check a
+  // write from an adapter that spelled the integer as a float would pass, and
+  // the next run's plan would report the key as another value. A default that
+  // is not an integer is compared by value alone: it reads back as the float
+  // it is.
   for (const edit of edits) {
     if (edit.op !== "rootDefault") continue;
     const readRoot = rootKeySupport(adapter, `a "${edit.key}" rootDefault edit`, ClientConfigWriteError).read;
@@ -1349,6 +1412,12 @@ function verifyEdits(
     if (!back.present || canonicalJson(back.value) !== canonicalJson(edit.value)) {
       throw new ClientConfigWriteError(
         `"${edit.key}" did not read back from ${where} as ${canonicalJson(edit.value)} -- nothing was written`,
+      );
+    }
+    const integerDefault = typeof edit.value === "number" && Number.isInteger(edit.value);
+    if (integerDefault && back.float !== undefined) {
+      throw new ClientConfigWriteError(
+        `"${edit.key}" read back from ${where} as the float ${back.float}, not the integer ${canonicalJson(edit.value)} -- nothing was written`,
       );
     }
   }
@@ -1407,14 +1476,107 @@ function insertRootKeyWith(adapter: ConfigAdapter, raw: string | null, key: stri
   return rootKeySupport(adapter, `a "${key}" rootDefault edit`, ClientConfigWriteError).insert(raw, key, value);
 }
 
+/** Why a value in the file is one a release of the client that reads the key
+ *  will not load, as install's stderr warning spells it: "<value>, <kind>
+ *  where <client> needs <needs>" -- or, when `everyRelease` is set, as the
+ *  refusal install prints in place of that warning spells it.
+ *
+ *  `kind` is what the value is, with its article ("a string", "a negative
+ *  integer", "a float"). It is absent where the value's own spelling already
+ *  says what it is: install spells an array or a table as its shape, and an
+ *  integer past the ceiling as the integer itself. `needs` names the rule the
+ *  value breaks: "an integer" for a float, the ceiling for an integer past
+ *  it, and the type's own noun for everything else.
+ *
+ *  `everyRelease` is set when NO release of the client loads a file that
+ *  holds the value -- not only a release that reads the key -- and is the
+ *  clause install prints saying why ("larger than a TOML integer holds").
+ *  The only such values are integers outside the range a TOML integer
+ *  holds: TOML integers are 64-bit signed, and the TOML spec has a parser
+ *  throw on an integer it cannot hold, so the client's parser refuses the
+ *  whole file before it reads a single key. S7 in target-codex-cli.ts has
+ *  Codex 0.144.0, which predates the key, and 0.156.1 both refusing
+ *  9223372036854775808 at parse; an integer below the range is the same
+ *  rule, and was not run. (The reader here parses such an integer as a
+ *  bigint, which is how a plan sees it at all.) A file whose key holds one
+ *  as its whole value is a file its client loads nothing from, so install
+ *  refuses to write into it. Only that shape is seen: a plan reads the one
+ *  key's value, so an out-of-range integer NESTED in it (an array or a
+ *  table) gets the array-or-table refusal and its warning, and one at any
+ *  other key is never read -- the file is just as unloadable in both cases,
+ *  and nothing here says so. Every other refusal depends on the release --
+ *  0.144.0 loaded each such value measured -- and gets the warning, with the
+ *  exit left at 0. */
+export interface RootValueRefusal {
+  kind?: string;
+  needs: string;
+  everyRelease?: string;
+}
+
+/** A key the file already sets to another value: see `RootDefaultPlan.kept`. */
+export interface KeptRootDefault {
+  rootDefault: ConfigRootDefault;
+  value: unknown;
+  float?: string;
+  refused?: RootValueRefusal;
+}
+
 /** What install does about a row's `rootDefaults` in one file. */
 export interface RootDefaultPlan {
   /** Absent from the file: the write adds each, as a `rootDefault` edit. */
   set: readonly ConfigRootDefault[];
   /** Present with ANOTHER value: left exactly as it is, and reported. `float`
    *  is the file's spelling when the default is an integer and the file
-   *  writes the value as a float (see `planRootDefaults`). */
-  kept: readonly { rootDefault: ConfigRootDefault; value: unknown; float?: string }[];
+   *  writes the value as a float (see `planRootDefaults`). `refused` is there
+   *  when the default declares `accepts` and the value is outside it. */
+  kept: readonly KeptRootDefault[];
+}
+
+/** The largest integer a TOML file holds (TOML integers are 64-bit signed),
+ *  and so the ceiling of `"unsigned-integer"` -- see RootValueType. */
+const ROOT_INTEGER_CEILING = 9223372036854775807n;
+
+/** The smallest integer a TOML file holds: the other end of the range. */
+const ROOT_INTEGER_FLOOR = -9223372036854775808n;
+
+/** Why a release of the client that reads the key as `type` will not load
+ *  `value`, or undefined when it takes it -- with `everyRelease` set when no
+ *  release loads the file at all. `float` is the reader's own mark: a JS
+ *  number cannot tell `0.0` from `0`, so the value alone would pass a
+ *  float. */
+function refusalOf(type: RootValueType, value: unknown, float: string | undefined): RootValueRefusal | undefined {
+  switch (type) {
+    case "unsigned-integer": {
+      const needs = "a non-negative integer";
+      if (float !== undefined || (typeof value === "number" && !Number.isInteger(value))) {
+        return { kind: "a float", needs: "an integer" };
+      }
+      if (typeof value === "number" || typeof value === "bigint") {
+        // Outside TOML's integer range the file does not parse, whatever the
+        // release: see RootValueRefusal.everyRelease.
+        if (BigInt(value) < ROOT_INTEGER_FLOOR) {
+          return { kind: "a negative integer", needs, everyRelease: "smaller than a TOML integer holds" };
+        }
+        if (value < 0) return { kind: "a negative integer", needs };
+        if (BigInt(value) > ROOT_INTEGER_CEILING) {
+          return {
+            // The whole range the type takes, not only the bound this value
+            // broke: a negative integer meets "no larger than" and is refused
+            // too.
+            needs: `a non-negative integer no larger than ${ROOT_INTEGER_CEILING}`,
+            everyRelease: "larger than a TOML integer holds",
+          };
+        }
+        return undefined;
+      }
+      if (typeof value === "string") return { kind: "a string", needs };
+      if (typeof value === "boolean") return { kind: "a boolean", needs };
+      if (value instanceof Date) return { kind: "a date or time", needs };
+      // Anything else is an array or a table (TOML, the one format with a
+      // root-key reader, has no null), and install spells it as its shape.
+      return { needs };
+    }
+  }
 }
 
 /** Sort a row's `rootDefaults` for the file a view read.
@@ -1423,10 +1585,16 @@ export interface RootDefaultPlan {
  *  is nothing to do and nothing to say. "Same" is canonical-JSON equality of
  *  the parsed value, so `0` and a hand-written `0` agree and a string `"0"`
  *  does not -- and, for an integer default, the TYPE as well: a float
- *  (`0.0`, `-0.0`, `0e0`) parses to the same JS number, but a client that
- *  types the key as an integer refuses it (Codex reads
- *  `mcp_optional_startup_grace_ms` as `Option<u64>`), so it is kept and
- *  reported with its spelling, never read as the recommended value.
+ *  (`0.0`, `-0.0`, `0e0`) parses to the same JS number, but it is not the
+ *  integer the default is (and Codex, which reads
+ *  `mcp_optional_startup_grace_ms` as `Option<u64>`, refuses it), so it is
+ *  kept and reported with its spelling, never read as the recommended value.
+ *
+ *  A default that declares `accepts` also gets every kept value outside that
+ *  type marked `refused`, with the reason (a float, a string, a boolean, a
+ *  date, an array, a table, a negative integer, an integer past the
+ *  ceiling), and `everyRelease` as well for an integer outside TOML's
+ *  range. A kept value inside it -- `1000` for Codex's key -- is not.
  *
  *  Only a file that is absent or reads `ok` gets a plan. Every other read is
  *  one the write facade refuses anyway (malformed, unreadable, unspliceable,
@@ -1444,7 +1612,7 @@ export function planRootDefaults(
   if (view.read.kind === "absent") return { set: [...defaults], kept: [] };
   if (view.read.kind !== "ok" || view.raw === null) return { set: [], kept: [] };
   const set: ConfigRootDefault[] = [];
-  const kept: { rootDefault: ConfigRootDefault; value: unknown; float?: string }[] = [];
+  const kept: KeptRootDefault[] = [];
   for (const rootDefault of defaults) {
     const current = read(view.raw, rootDefault.key);
     if (!current.present) {
@@ -1453,10 +1621,20 @@ export function planRootDefaults(
     }
     const integerDefault = typeof rootDefault.value === "number" && Number.isInteger(rootDefault.value);
     const float = integerDefault ? current.float : undefined;
-    if (float !== undefined) kept.push({ rootDefault, value: current.value, float });
-    else if (canonicalJson(current.value) !== canonicalJson(rootDefault.value)) {
-      kept.push({ rootDefault, value: current.value });
+    const refused =
+      rootDefault.accepts === undefined ? undefined : refusalOf(rootDefault.accepts, current.value, current.float);
+    if (float === undefined && refused === undefined) {
+      if (canonicalJson(current.value) !== canonicalJson(rootDefault.value)) {
+        kept.push({ rootDefault, value: current.value });
+      }
+      continue;
     }
+    kept.push({
+      rootDefault,
+      value: current.value,
+      ...(float === undefined ? {} : { float }),
+      ...(refused === undefined ? {} : { refused }),
+    });
   }
   return { set, kept };
 }
@@ -1467,7 +1645,12 @@ export function planRootDefaults(
  *  where in the file the line lands, nor the blank line the write puts under
  *  it when the file starts with a table (as a file an earlier install
  *  created does), nor a line break the write gives a last line that had
- *  none. */
+ *  none.
+ *
+ *  Each line comes from the adapter's own insert, so a default that insert
+ *  refuses -- the TOML adapter's refuses an integral value it can only spell
+ *  as a float -- throws here as the write refuses it, rather than preview a
+ *  line no write would add. */
 export function previewRootDefaults(view: ClientConfigView, defaults: readonly ConfigRootDefault[]): string {
   if (defaults.length === 0) return "";
   const { insert } = rootKeySupport(view.adapter, "a rootDefault preview");
