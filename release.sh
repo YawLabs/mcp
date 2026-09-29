@@ -493,6 +493,17 @@ mcp_registry_gh_token() {
 # verification, so the read that decides whether to publish and the read that
 # reports what was published cannot drift.
 #
+# The EXACT lookup, GET /v0/servers/<name>/versions/<version> (the name's
+# slash as %2F), not the search listing (/v0/servers?search=...&version=...).
+# On 2026-09-29, while the 1.0.17 release ran, search requests took 25 s or
+# never answered, and the lookup answered in 0.5-6 s; search also returns
+# superseded version records alongside the one asked for (registry issue
+# #1676). The lookup answers 404 "Server not found" for a version it does not
+# hold, and -- like the listing -- for one marked deleted, unless asked with
+# include_deleted=true (v1.8.1 internal/api/handlers/v0/servers.go), so "held
+# but not listed" below keeps its meaning. A hit needs the body to name this
+# server and this version, and a status other than deleted.
+#
 # CACHE-BUSTED, and that is load-bearing rather than defensive. The registry
 # answers with an X-Registry-Cache header (measured: MISS, then STALE on the
 # same URL seconds later), so an un-busted read can serve a body from BEFORE
@@ -505,7 +516,7 @@ mcp_registry_gh_token() {
 # nobody can actually see yet. A unique `_` parameter is what moves the cache
 # key; the no-cache headers ride along because not every edge honours them on
 # their own, and the API ignores an unknown query parameter (verified: 200
-# with the correct body). $RANDOM rather than a nanosecond clock because BSD
+# with the correct body, on the lookup as on the listing). $RANDOM rather than a nanosecond clock because BSD
 # `date` has no %N and would emit a literal "N" on a macOS release host.
 #
 # Probe-only by design: any failure -- offline, API change, unparseable body,
@@ -515,7 +526,7 @@ registry_has_version() {
   local want="$1"
   local body
   body=$(curl -fsSL --max-time 20 -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
-    "https://registry.modelcontextprotocol.io/v0/servers?search=io.github.YawLabs/mcp&version=${want}&_=$(date +%s)${RANDOM}" 2>/dev/null || echo "")
+    "https://registry.modelcontextprotocol.io/v0/servers/io.github.YawLabs%2Fmcp/versions/${want}?_=$(date +%s)${RANDOM}" 2>/dev/null || echo "")
   [ -n "$body" ] || return 1
   printf %s "$body" | node -e '
     let s = "";
@@ -523,7 +534,9 @@ registry_has_version() {
     process.stdin.on("end", () => {
       try {
         const j = JSON.parse(s);
-        const hit = (j.servers || []).some((e) => e && e.server && e.server.version === process.argv[1]);
+        const official = ((j && j._meta) || {})["io.modelcontextprotocol.registry/official"] || {};
+        const hit =
+          j && j.server && j.server.name === "io.github.YawLabs/mcp" && j.server.version === process.argv[1] && official.status !== "deleted";
         process.exit(hit ? 0 : 1);
       } catch { process.exit(1); }
     });
@@ -1621,11 +1634,11 @@ elif [ "$MCP_ALREADY_LISTED" = true ] && [ "$MCP_GATEWAY_RETRIED" = true ]; then
   # The duplicate proves the version landed; a listing that does not show it
   # on a run where the registry was already timing out is a slow read, not a
   # deleted version (registry_has_version reads any failure as a miss).
-  warn "The MCP registry refused a retry of io.github.YawLabs/mcp@${VERSION} as a duplicate, so the attempt that timed out landed, but its listing does not show it after 3 reads -- it was answering slowly on this run. Check it later: https://registry.modelcontextprotocol.io/v0/servers?search=io.github.YawLabs/mcp&version=${VERSION} -- re-running this script would only meet the same duplicate."
+  warn "The MCP registry refused a retry of io.github.YawLabs/mcp@${VERSION} as a duplicate, so the attempt that timed out landed, but its lookup does not show it after 3 reads -- it was answering slowly on this run. Check it later: https://registry.modelcontextprotocol.io/v0/servers/io.github.YawLabs%2Fmcp/versions/${VERSION} -- re-running this script would only meet the same duplicate."
 elif [ "$MCP_ALREADY_LISTED" = true ]; then
   # Refused as a duplicate, yet not listed: the registry holds the version but
   # hides it -- the shape of one marked deleted (its duplicate check counts
-  # every status; /v0/servers leaves deleted ones out). A re-run would meet
+  # every status; its version lookup and listing leave deleted ones out). A re-run would meet
   # the same refusal, so do not send the operator round that loop.
   warn "The MCP registry refused io.github.YawLabs/mcp@${VERSION} as a duplicate, so it holds that version, but its listing does not show it after 3 reads -- a version marked deleted is held and unlisted. Check it with \`mcp-publisher status\`; re-running this script will not change it."
 else
