@@ -105,9 +105,17 @@ function newTmp(prefix: string): string {
  * fixtures' `git init` / `add` / `commit` -- and release.sh's own git calls --
  * into the operator's repository and index, with every case green. Read at
  * call time, not once at load, so a case can prove it by setting them.
+ *
+ * NPM_PROPAGATION_TIMEOUT goes too. release.sh runs this suite in step 1, and
+ * its step-5 timeout tells the operator to re-run with that variable set; the
+ * "defaults to 180 s" case would then read the operator's value and fail the
+ * gate of the very re-run it prescribed. Cases that set it pass it explicitly
+ * through runBash's env, which still overrides.
  */
 function baseEnv(): NodeJS.ProcessEnv {
-  return Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.toUpperCase().startsWith("GIT_")));
+  return Object.fromEntries(
+    Object.entries(process.env).filter(([k]) => !k.toUpperCase().startsWith("GIT_") && k !== "NPM_PROPAGATION_TIMEOUT"),
+  );
 }
 
 /**
@@ -1039,11 +1047,12 @@ describe("release.sh npm wait budget pre-flight", () => {
     }
   });
 
-  it("rejects a value bash's [ -ge ] could not compare, which would make the wait loop never time out", () => {
-    // Past 2^63 `[ "$elapsed" -ge "$budget" ]` prints "integer expression
-    // expected" and returns 2, which the loop's `||` reads as false: the
-    // budget branch never fires. Six digits (11.5 days) is more than anyone
-    // waits for npm.
+  it("rejects a value past what the base-10 normalisation and [ -ge ] can hold", () => {
+    // Past 2^63 the $((10#...)) normalisation wraps silently -- 2^63 itself to
+    // a negative budget (an instant timeout), twenty nines to 7.7e18 (a wait
+    // that never expires) -- and unnormalised, `[ -ge ]` would refuse the
+    // digits and the loop would never time out either. Six digits (11.5 days)
+    // is more than anyone waits for npm.
     const r = run({ NPM_PROPAGATION_TIMEOUT: "99999999999999999999" });
     expect(r.out).toContain(
       "FAIL NPM_PROPAGATION_TIMEOUT must be at most 6 digits of seconds, got '99999999999999999999'",
@@ -1078,6 +1087,9 @@ describe("release.sh step-5 npm wait", () => {
   function run(hitOnRead: number | null, budget = "180"): RunResult {
     const body = [
       STUB_HELPERS,
+      // The fail path exposes the counters too: without this, "reads once at a
+      // budget of 0" could not tell one read from none.
+      'fail() { echo "FAIL $1"; echo "FAILED reads=$READS now=$FAKE_NOW"; exit 1; }',
       'VERSION="1.0.17"',
       `NPM_WAIT_BUDGET=${budget}`,
       "FAKE_NOW=1000",
@@ -1120,6 +1132,8 @@ describe("release.sh step-5 npm wait", () => {
     expect(r.out).toContain(
       "FAIL npm does not serve @yawlabs/mcp@1.0.17 after 180s of reading https://registry.npmjs.org/@yawlabs%2Fmcp/1.0.17 every 5s",
     );
+    // 37 reads: one at 0 s and one every 5 s through 180 s.
+    expect(r.out).toContain("FAILED reads=37 now=1180");
     expect(r.out).toContain("would answer 400");
     // The re-run advice is conditional on the read answering, and does not
     // call steps 1-2 no-ops: they repeat their gates and build.
@@ -1133,9 +1147,12 @@ describe("release.sh step-5 npm wait", () => {
   it("waits the budget the pre-flight set, and reads once at a budget of 0", () => {
     const short = run(null, "40");
     expect(short.out).toContain("after 40s of reading");
+    expect(short.out).toContain("FAILED reads=9 now=1040");
     expect(short.out).not.toContain("CONTINUED");
     const zero = run(null, "0");
     expect(zero.out).toContain("after 0s of reading");
+    // One read, not none: the verdict comes after the first miss.
+    expect(zero.out).toContain("FAILED reads=1 now=1000");
     expect(zero.out).not.toContain("CONTINUED");
   });
 });

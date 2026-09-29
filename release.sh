@@ -348,7 +348,7 @@ command -v git  >/dev/null || fail "git not installed"
 # "not on npm" rather than fail. This check is what keeps that from
 # happening. sha256 accepts either binary -- macOS ships shasum, not
 # sha256sum.
-command -v curl >/dev/null || fail "curl not installed (needed for every npm-registry read, from the pre-flight already-published probe on, and for step 5's mcp-publisher download)"
+command -v curl >/dev/null || fail "curl not installed (needed for every 'is this version on npm?' read, from the pre-flight already-published probe on, and for step 5's mcp-publisher download)"
 command -v tar  >/dev/null || fail "tar not installed (needed for step 5, the MCP registry publish)"
 { command -v sha256sum >/dev/null || command -v shasum >/dev/null; } \
   || fail "sha256sum/shasum not installed (needed for step 5, the MCP registry publish)"
@@ -357,9 +357,12 @@ command -v tar  >/dev/null || fail "tar not installed (needed for step 5, the MC
 # Step 5's wait budget, checked here for the same reason as the tools above:
 # its first use is after the irreversible publish, and a duration spelt "3m"
 # or "180s" would otherwise strand the release at the registry step -- the
-# outcome the budget exists to prevent. Digits only, at most six of them
-# (bash's [ -ge ] rejects an integer past 2^63, and the wait loop would then
-# never time out), normalised through base 10 so "0180" reads as 180.
+# outcome the budget exists to prevent. Digits only, normalised through base
+# 10 so "0180" reads as 180, and at most six of them: past 2^63 that
+# normalisation wraps silently (2^63 itself to a negative budget and an
+# instant timeout, twenty nines to 7.7e18 and a wait that never expires), and
+# unnormalised, bash's [ -ge ] would refuse the digits and the loop would
+# never time out either.
 NPM_WAIT_BUDGET="${NPM_PROPAGATION_TIMEOUT:-180}"
 case "$NPM_WAIT_BUDGET" in
   *[!0-9]*) fail "NPM_PROPAGATION_TIMEOUT must be a whole number of seconds, got '${NPM_WAIT_BUDGET}'" ;;
@@ -1243,7 +1246,7 @@ else
     sleep 30
   done
   if [ "$NPM_ALREADY_THERE" = true ]; then
-    warn "npm already holds @yawlabs/mcp@${VERSION} (its E403 said so) though the pre-publish read did not show it yet -- treating step 4 as skipped; npm's read path is lagging, and step 5 waits for it"
+    warn "npm already holds @yawlabs/mcp@${VERSION} (its E403 said so) though the pre-publish read did not show it yet -- treating step 4 as skipped; npm's read path is lagging, or this host cannot read it, and step 5 waits for it unless the MCP registry already lists the version"
   else
     NPM_PUBLISHED_THIS_RUN=true
     info "Published @yawlabs/mcp@${VERSION} to npm"
@@ -1422,11 +1425,13 @@ else
   # here on the same clock. The validator spells EVERY non-200 from npm that
   # way -- "not found (status: 503)" for an npm 5xx or 429 on the registry's
   # side -- and a non-200 for a document this host has just read as 200 is
-  # transient by construction, so any status inside that phrase is retried;
-  # none of the 400s that must not be retried carries it (the duplicate
-  # version and the mcpName mismatch have their own words). Anything else
-  # fails at once with mcp-publisher's
-  # own text -- an expired login, the 422 schema report, a duplicate version,
+  # transient by construction, so any status inside that phrase is retried,
+  # and so is the same validator's "failed to fetch package metadata from
+  # NPM", its word for a request to npm that got no status at all; none of
+  # the 400s that must not be retried carries either (the duplicate version
+  # and the mcpName mismatch have their own words). Anything else fails at
+  # once with mcp-publisher's own text -- an expired login, the 422 schema
+  # report, a duplicate version,
   # a mcpName that does not match -- because none of those gets better by
   # waiting. `|| RC=$?` for the same reason as step 4: the exit code is
   # needed, and under pipefail the pipeline carries the publisher's, not tee's.
