@@ -558,8 +558,8 @@ registry_has_version() {
 # PathEscape(identifier) + "/" + PathEscape(version), then the body's
 # `mcpName` -- the same line in v1.7.9, the mcp-publisher this script pins,
 # and in v1.8.1, the version registry.modelcontextprotocol.io/v0/version
-# reported on 2026-09-29). Cloudflare answers it CF-Cache-Status: DYNAMIC (measured the
-# same day) -- never from the edge cache -- so this read sees a publish as
+# reported on 2026-09-29). Cloudflare answers it CF-Cache-Status: DYNAMIC
+# (measured 2026-09-28) -- never from the edge cache -- so this read sees a publish as
 # soon as npm's own read path does. And because it is the SAME URL the
 # registry fetches before accepting server.json, a hit here is the strongest
 # local evidence that `mcp-publisher publish` will not 400.
@@ -1264,6 +1264,9 @@ step 5 "Publish server.json to MCP registry"
 # registry_has_version carries the cache-buster and the fail-open contract;
 # see its header for why an un-busted read breaks exactly this guarantee.
 REGISTRY_HAS_VERSION=false
+# Set by the publish block below when the registry refuses a duplicate; read
+# again by the final verification, so it needs a value on every path.
+MCP_ALREADY_LISTED=false
 if registry_has_version "$VERSION"; then
   REGISTRY_HAS_VERSION=true
 fi
@@ -1367,7 +1370,11 @@ else
   TOKEN_FILE="${HOME}/.config/mcp-publisher/token.json"
   # Return 0 (true in shell `if`) iff the persisted token is missing, unparseable,
   # or expired. Reads the JWT's `exp` claim via node so we don't reinvent the
-  # JWT parser in bash.
+  # JWT parser in bash. "Expired" includes a token with under 240 s left: the
+  # registry issues them for 5 minutes (v1.8.1 internal/auth/jwt.go), and the
+  # publish retry below can run 180 s, so a token reused with less than that
+  # to spare can lapse between attempts and turn the lag the retry absorbs
+  # into a 401 that fails the release.
   TOKEN_STATUS=$(mktemp)
   node -e '
     const fs = require("fs");
@@ -1379,7 +1386,7 @@ else
     if (!p) { process.stdout.write("unparseable"); process.exit(0); }
     let claims;
     try { claims = JSON.parse(Buffer.from(p, "base64url").toString()); } catch { process.stdout.write("unparseable"); process.exit(0); }
-    if (typeof claims.exp === "number" && claims.exp * 1000 > Date.now()) {
+    if (typeof claims.exp === "number" && claims.exp * 1000 > Date.now() + 240000) {
       process.stdout.write("valid");
     } else {
       process.stdout.write("expired");
@@ -1420,28 +1427,37 @@ else
 
   # >>> mcp-publisher publish
   # The registry checks the npm side of server.json by fetching, from ITS
-  # network, the per-version document step 5 has just seen from here. That
-  # read can lag ours: ctxlint measured it (its v0.27.0 release, 2026-09-13,
-  # published on the 3rd of 3 retries, about 150 s after npm had accepted the
-  # tarball, while its own read of the same URL was already green), which is
-  # why this is the family's retry -- four attempts, 30 s, 60 s, then 90 s
-  # apart -- and not a few seconds.
+  # network, the per-version document step 5 has just seen from here, and
+  # that can still come back 404. How long npm takes end to end, measured in
+  # this family: ctxlint's v0.27.0 (2026-09-13) ran out its own 60 s wait on
+  # the same per-version document and was accepted by the registry only on
+  # attempt 3 of 3, about 150 s after npm had accepted the tarball. Hence the
+  # family's retry -- four attempts, 30 s, 60 s, then 90 s apart -- rather
+  # than a few seconds.
   #
   # Retried ONLY on the shape waiting cures, in the wording of the LIVE
   # registry (v1.8.1 on 2026-09-29; the validator was reworded by registry
   # PR #1411, in v1.8.0 -- the v1.7.9 client this script pins only relays
   # the server's text):
-  #   - npm's per-version 404, carrying this version: "exists, but version
-  #     '<v>' was not found (status: 404)", or "version '<v>' not found
+  #   - npm's per-version 404, naming this version: "exists, but version
+  #     '<v>' was not found (status: 404)", or, when the validator could not
+  #     classify its package-level check, "version '<v>' not found
   #     (status: 404)";
-  #   - "Likely transient, retry later": npm's 429 or 5xx, or a 404 the
-  #     validator could not classify, as seen from the registry;
+  #   - "Likely transient, retry later": npm's 429 or 5xx, or a 404 whose
+  #     package-level check hit a network error, 429 or 5xx, as seen from
+  #     the registry;
   #   - "failed to fetch package metadata from NPM": no status at all.
-  # A 404 WITHOUT the version -- "NPM package '<p>' not found" -- says the
-  # package itself is missing, which waiting does not cure. A duplicate
-  # version means the registry already lists this one -- an earlier run
-  # registered it, or the probe above read a stale listing -- which is the
-  # state this step exists to reach, so it counts as done. Anything else
+  # The version is matched as the validator's own "version '<v>'", not as a
+  # bare string: mcp-publisher after v1.8.1 (registry main) prints
+  # "Publishing <name>@<v> to ..." before any error, so after a pin bump a
+  # bare match would let a missing-package 404 buy all the waits. That 404
+  # -- "NPM package '<p>' not found", no version -- says the package itself
+  # is missing, which waiting does not cure. A duplicate version means the
+  # registry already HOLDS this one -- an earlier run registered it, or the
+  # probe above read a stale listing -- which is the state this step exists
+  # to reach, so it counts as done. (Held is not listed: a version marked
+  # deleted is still a duplicate, and the final verification says so.)
+  # Anything else
   # fails at once with mcp-publisher's own text -- an expired login, the 422
   # schema report, a mcpName that does not match -- because none of those
   # gets better by waiting. `|| RC=$?` for the same reason as step 4: the
@@ -1464,7 +1480,7 @@ else
       break
     fi
     if grep -q 'status 400' "$MCP_PUBLISH_LOG" \
-      && { { grep -qE 'not found \(status: *[0-9]+\)' "$MCP_PUBLISH_LOG" && grep -qF "$VERSION" "$MCP_PUBLISH_LOG"; } \
+      && { { grep -qE 'not found \(status: *[0-9]+\)' "$MCP_PUBLISH_LOG" && grep -qF "version '${VERSION}'" "$MCP_PUBLISH_LOG"; } \
         || grep -qE 'Likely transient, retry later|failed to fetch package metadata from NPM' "$MCP_PUBLISH_LOG"; }; then
       rm -f "$MCP_PUBLISH_LOG"
       if [ "$MCP_PUBLISH_TRY" -ge "$MCP_PUBLISH_MAX" ]; then
@@ -1480,7 +1496,7 @@ else
     fail "mcp-publisher publish failed (exit ${MCP_PUBLISH_RC}) -- its output is above. Fix the cause and re-run ./release.sh ${VERSION}: steps 1-2 repeat their gates and build, steps 3-4 skip what is done."
   done
   if [ "$MCP_ALREADY_LISTED" = true ]; then
-    info "The MCP registry already lists io.github.YawLabs/mcp@${VERSION} (it refused a duplicate) -- nothing to publish"
+    info "The MCP registry already holds io.github.YawLabs/mcp@${VERSION} (it refused a duplicate) -- nothing to publish"
   else
     info "Published server.json to MCP registry"
   fi
@@ -1564,6 +1580,12 @@ for REGISTRY_TRY in 1 2 3; do
 done
 if [ "$REGISTRY_FINAL" = true ]; then
   info "MCP registry: io.github.YawLabs/mcp@${VERSION}"
+elif [ "$MCP_ALREADY_LISTED" = true ]; then
+  # Refused as a duplicate, yet not listed: the registry holds the version but
+  # hides it -- the shape of one marked deleted (its duplicate check counts
+  # every status; /v0/servers leaves deleted ones out). A re-run would meet
+  # the same refusal, so do not send the operator round that loop.
+  warn "The MCP registry refused io.github.YawLabs/mcp@${VERSION} as a duplicate, so it holds that version, but its listing does not show it after 3 reads -- a version marked deleted is held and unlisted. Check it with \`mcp-publisher status\`; re-running this script will not change it."
 else
   warn "The MCP registry does not list io.github.YawLabs/mcp@${VERSION} after 3 reads. Re-run ./release.sh ${VERSION} -- steps 1-2 repeat their gates and build, steps 3-4 skip what is published, and step 5 will re-publish if the version really is absent."
 fi

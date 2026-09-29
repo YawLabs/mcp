@@ -69,19 +69,19 @@ import { afterAll, describe, expect, it, vi } from "vitest";
 // sequential group would put all of it on the critical path. Here the deadline
 // is incidental, so the fix is to stop measuring patience in units set for
 // in-process unit tests. testTimeout applies to each case, not to the file, so
-// the figure it is set against is the slowest single case. That is a stubbed
-// full release run below: the SKIP_OAM_FLOOR_VERIFY case runs release.sh
-// twice (the first stopping at step 1's failing oam floor gate, the second
-// running all five steps to the publish). Before the floor move left the
-// script, the slowest case ran it four times and measured 66 s with other
-// work holding the CPU near 80% (2026-09-13), and a two-run case measured
-// 58-63 s the same day. 5 minutes is more than 4x that, so no case can
-// plausibly reach it without being genuinely wedged, which is the failure
-// this still catches.
+// the figure it is set against is the slowest single case. That is the
+// stubbed full run's "finishes on the re-run a failed step 5 prescribes":
+// two complete release.sh runs, each through step 5's download, sha256 check,
+// extraction, login and publish. Measured 2026-09-29 with the CPU held at
+// 95-100%: 285 s for that case, 170-177 s for the single full runs, 162 s for
+// the SKIP_OAM_FLOOR_VERIFY pair. The 5 minutes this used to be left that
+// case 5% headroom, so it is 10 minutes: twice the worst measured case, which
+// only a run that is genuinely wedged -- the failure this still catches --
+// can reach.
 //
 // release.sh runs this suite as a release gate, so a flake here blocks a
 // release for a reason that has nothing to do with the release.
-vi.setConfig({ testTimeout: 300_000, hookTimeout: 300_000 });
+vi.setConfig({ testTimeout: 600_000, hookTimeout: 600_000 });
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const releaseShPath = join(repoRoot, "release.sh");
@@ -883,10 +883,11 @@ describe("release.sh MCP-registry read-back", () => {
   const block = extractBlock("REGISTRY_FINAL=false", "fi");
   const dir = newTmp("release-rb-");
 
-  function run(hitOnTry: number | null): RunResult {
+  function run(hitOnTry: number | null, alreadyListed = false): RunResult {
     const body = [
       STUB_HELPERS,
       'VERSION="0.81.0"',
+      `MCP_ALREADY_LISTED=${alreadyListed}`,
       "TRIES=0",
       "sleep() { :; }",
       `registry_has_version() { TRIES=$((TRIES + 1)); if [ -n "${hitOnTry ?? ""}" ] && [ "$TRIES" -ge "${hitOnTry ?? 0}" ]; then return 0; fi; return 1; }`,
@@ -917,6 +918,17 @@ describe("release.sh MCP-registry read-back", () => {
     expect(r.out).toContain("Re-run ./release.sh 0.81.0");
     // A missing listing is not a release failure -- npm already has the
     // version and cannot take it back.
+    expect(r.status).toBe(0);
+  });
+
+  it("does not prescribe a re-run when the registry refused a duplicate it does not list", () => {
+    // Held but unlisted is a version marked deleted: its duplicate check
+    // counts every status, its listing hides deleted ones. A re-run would meet
+    // the same refusal and print this again.
+    const r = run(null, true);
+    expect(r.out).toContain("WARN The MCP registry refused io.github.YawLabs/mcp@0.81.0 as a duplicate");
+    expect(r.out).toContain("mcp-publisher status");
+    expect(r.out).not.toContain("Re-run ./release.sh");
     expect(r.status).toBe(0);
   });
 });
@@ -1237,9 +1249,10 @@ describe("release.sh step-4 npm publish", () => {
 
 describe("release.sh mcp-publisher publish retry", () => {
   // The registry validates server.json's npm side by fetching npm's
-  // per-version document from ITS network, which can lag ours by minutes
-  // (ctxlint's v0.27.0 needed about 150 s). The failures waiting cures are
-  // retried, four attempts 30/60/90 s apart; a duplicate version is done;
+  // per-version document from ITS network, which can still 404 minutes after
+  // the publish (ctxlint's v0.27.0 was accepted about 150 s after it). The
+  // failures waiting cures are retried, four attempts 30/60/90 s apart; a
+  // duplicate version is done;
   // every other failure is the tool's own verdict and fails at once, with
   // its text. The texts below are the LIVE registry's (v1.8.1, worded by
   // registry PR #1411), each inside mcp-publisher's "status 400" wrapper.
@@ -1347,18 +1360,26 @@ describe("release.sh mcp-publisher publish retry", () => {
     expect(r.out).not.toContain("CONTINUED");
   });
 
-  it("counts a duplicate version as done: the registry already lists it", () => {
-    // The live registry's words for it. Reachable when an earlier run
-    // registered the version, or the listing probe above read a stale page.
-    const dup = wrap("invalid version: cannot publish duplicate version: io.github.YawLabs/mcp@1.0.17 already exists");
-    const r = run(99, dup);
-    expect(r.tries).toBe(1);
-    expect(r.out).toContain(
-      "INFO The MCP registry already lists io.github.YawLabs/mcp@1.0.17 (it refused a duplicate) -- nothing to publish",
-    );
-    expect(r.out).not.toContain("Published server.json");
-    expect(r.out).not.toContain("FAIL");
-    expect(r.out).toContain("CONTINUED");
+  it("counts a duplicate version as done: the registry already holds it", () => {
+    // The live registry's (v1.8.1) own bodies, not wrapped: its duplicate
+    // check returns database.ErrInvalidVersion as-is, and an insert race
+    // returns ErrAlreadyExists. Reachable when an earlier run registered the
+    // version, or the listing probe above read a stale page. Each alternative
+    // of the pattern is exercised on its own.
+    const bodies = [
+      'publish failed: server returned status 400: {"title":"Bad Request","status":400,"detail":"Failed to publish server","errors":[{"message":"invalid version: cannot publish duplicate version"}]}',
+      'publish failed: server returned status 400: {"title":"Bad Request","status":400,"detail":"Failed to publish server","errors":[{"message":"record already exists"}]}',
+    ];
+    for (const dup of bodies) {
+      const r = run(99, dup);
+      expect(r.tries, dup).toBe(1);
+      expect(r.out, dup).toContain(
+        "INFO The MCP registry already holds io.github.YawLabs/mcp@1.0.17 (it refused a duplicate) -- nothing to publish",
+      );
+      expect(r.out, dup).not.toContain("Published server.json");
+      expect(r.out, dup).not.toContain("FAIL");
+      expect(r.out, dup).toContain("CONTINUED");
+    }
   });
 
   it("fails at once, with the tool's own text, on anything else", () => {
@@ -1371,6 +1392,10 @@ describe("release.sh mcp-publisher publish retry", () => {
       "Validation failed. Checking detailed validation errors...\nvalidation failed",
       wrap("NPM package ownership validation failed. Expected mcpName 'io.github.YawLabs/mcp', got 'other'"),
       wrap("NPM package '@yawlabs/mcp' not found (status: 404)"),
+      // The same missing-package 404 behind the preamble mcp-publisher prints
+      // after v1.8.1, which names the version: a bare version match would
+      // retry it, the validator's own "version '<v>'" does not.
+      `Publishing io.github.YawLabs/mcp@1.0.17 to https://registry.modelcontextprotocol.io...\n${wrap("NPM package '@yawlabs/mcp' not found (status: 404)")}`,
     ];
     for (const text of others) {
       const r = run(99, text);
@@ -1381,6 +1406,88 @@ describe("release.sh mcp-publisher publish retry", () => {
       expect(r.out, text).not.toContain("SLEPT");
       expect(r.out, text).not.toContain("CONTINUED");
     }
+  });
+});
+
+describe("release.sh mcp-publisher download and sha256 check", () => {
+  // The check that refuses to run an unverified binary. The full run only
+  // ever serves a matching digest, and its "ready (sha256 verified)" line
+  // prints whenever nothing above it failed, so the refusal is pinned here.
+  const block = extractBlock(
+    '  TARBALL="mcp-publisher_${GOOS}_${GOARCH}.tar.gz"',
+    '  info "mcp-publisher ${MCP_PUBLISHER_VERSION} ready (sha256 verified)"',
+  );
+  const goos = process.platform === "win32" ? "windows" : process.platform === "darwin" ? "darwin" : "linux";
+  const goarch = process.arch === "arm64" ? "arm64" : "amd64";
+  const tarball = `mcp-publisher_${goos}_${goarch}.tar.gz`;
+  const STUB = ["#!/bin/bash", 'echo "ran $*" >> "$FAKE_STATE/publisher.log"', ""].join("\n");
+  // curl serves the two assets to its -o path, and nothing else.
+  const CURL = [
+    "curl() {",
+    '  local out="" prev="" a',
+    '  for a in "$@"; do if [ "$prev" = "-o" ]; then out="$a"; fi; prev="$a"; done',
+    '  case "$*" in',
+    '    *registry_*_checksums.txt*) cp "$FAKE_FIXTURES/checksums.txt" "$out" ;;',
+    '    *mcp-publisher_*.tar.gz*) cp "$FAKE_FIXTURES/mcp-publisher.tar.gz" "$out" ;;',
+    "    *) return 22 ;;",
+    "  esac",
+    "}",
+  ].join("\n");
+
+  function run(opts: { digest?: string; names?: string[] } = {}): RunResult & { ran: string[] } {
+    const root = newTmp("release-dl-");
+    const fixtures = join(root, "fixtures");
+    const state = join(root, "state");
+    mkdirSync(fixtures);
+    mkdirSync(state);
+    makePublisherFixture(fixtures, STUB, opts);
+    const body = [
+      "set -o pipefail",
+      STUB_HELPERS,
+      // A POSIX temp dir, as release.sh's own `mktemp -d` gives it: GNU tar
+      // would read a "C:/..." WORKDIR as a remote host.
+      "WORKDIR=$(mktemp -d)",
+      `trap 'rm -rf "$WORKDIR"' EXIT`,
+      `GOOS=${goos}`,
+      `GOARCH=${goarch}`,
+      'MCP_PUBLISHER_VERSION="v9.9.9"',
+      CURL,
+      block,
+      'echo "CONTINUED"',
+    ].join("\n");
+    const r = runBash(body, root, { FAKE_FIXTURES: shPath(fixtures), FAKE_STATE: shPath(state) });
+    let ran: string[] = [];
+    try {
+      ran = readFileSync(join(state, "publisher.log"), "utf8").split("\n").filter(Boolean);
+    } catch {
+      // Never ran, which the refusal cases assert on.
+    }
+    return { ...r, ran };
+  }
+
+  it("extracts and runs the binary when its digest matches", () => {
+    const r = run();
+    expect(r.out).toContain("INFO mcp-publisher v9.9.9 ready (sha256 verified)");
+    expect(r.ran).toEqual(["ran --help"]);
+    expect(r.out).toContain("CONTINUED");
+  });
+
+  it("refuses to run a tarball whose digest does not match", () => {
+    const r = run({ digest: "0".repeat(64) });
+    expect(r.out).toContain(`FAIL sha256 verification failed for ${tarball}`);
+    expect(r.out).toContain("refusing to run an unverified binary");
+    expect(r.ran).toEqual([]);
+    expect(r.out).not.toContain("ready (sha256 verified)");
+    expect(r.out).not.toContain("CONTINUED");
+  });
+
+  it("refuses when the checksums file does not list this host's tarball", () => {
+    // --ignore-missing skips listed files that are absent; a checksums file
+    // that verifies nothing at all must still fail.
+    const r = run({ names: ["mcp-publisher_plan9_mips.tar.gz"] });
+    expect(r.out).toContain(`FAIL sha256 verification failed for ${tarball}`);
+    expect(r.ran).toEqual([]);
+    expect(r.out).not.toContain("CONTINUED");
   });
 });
 
@@ -1534,6 +1641,40 @@ function runOutside(dir: string, body: string, env: Record<string, string> = {})
 /** Forward slashes, so a Windows temp path can sit inside a bash string. */
 function shPath(p: string): string {
   return p.replace(/\\/g, "/");
+}
+
+/**
+ * mcp-publisher's release assets, as step 5 downloads them, written into
+ * `dir`: mcp-publisher.tar.gz holding `stub` under the member name release.sh
+ * extracts on this platform, and checksums.txt listing a digest -- the
+ * tarball's real sha256 unless `digest` says otherwise -- for each of
+ * `names` (default: every platform's tarball name). MSYS treats `x` and
+ * `x.exe` as one file, so one tarball cannot usefully carry both. tar runs
+ * under bash with relative paths, as release.sh's does: GNU tar reads
+ * "C:/..." as a remote host.
+ */
+function makePublisherFixture(dir: string, stub: string, opts: { digest?: string; names?: string[] } = {}): void {
+  const stage = join(dir, "stage");
+  mkdirSync(stage, { recursive: true });
+  const member = process.platform === "win32" ? "mcp-publisher.exe" : "mcp-publisher";
+  writeFileSync(join(stage, member), stub);
+  chmodSync(join(stage, member), 0o755);
+  const tar = spawnSync("bash", ["-c", `tar -czf mcp-publisher.tar.gz -C stage ${member}`], {
+    cwd: dir,
+    encoding: "utf8",
+  });
+  if (tar.status !== 0) {
+    throw new Error(`building the mcp-publisher fixture failed: ${tar.stderr}`);
+  }
+  const real = createHash("sha256")
+    .update(readFileSync(join(dir, "mcp-publisher.tar.gz")))
+    .digest("hex");
+  const names =
+    opts.names ??
+    ["linux", "darwin", "windows"].flatMap((os) =>
+      ["amd64", "arm64"].map((arch) => `mcp-publisher_${os}_${arch}.tar.gz`),
+    );
+  writeFileSync(join(dir, "checksums.txt"), names.map((n) => `${opts.digest ?? real}  ${n}\n`).join(""));
 }
 
 // ---------------------------------------------------------------------------
@@ -1831,31 +1972,9 @@ describe("release.sh oam floor gate (stubbed full run)", () => {
     const home = join(root, "home");
     mkdirSync(home);
 
-    // mcp-publisher's release assets. The member name is the one release.sh
-    // extracts on this platform (MSYS treats `x` and `x.exe` as one file, so
-    // a tarball cannot usefully carry both). tar runs under bash, with
-    // relative paths, as release.sh's does: GNU tar reads "C:/..." as a
-    // remote host.
+    // mcp-publisher's release assets, served by the curl stub.
     const fixtures = join(root, "fixtures");
-    const stage = join(fixtures, "stage");
-    mkdirSync(stage, { recursive: true });
-    const member = process.platform === "win32" ? "mcp-publisher.exe" : "mcp-publisher";
-    writeFileSync(join(stage, member), PUBLISHER_STUB);
-    chmodSync(join(stage, member), 0o755);
-    const tar = spawnSync("bash", ["-c", `tar -czf mcp-publisher.tar.gz -C stage ${member}`], {
-      cwd: fixtures,
-      encoding: "utf8",
-    });
-    if (tar.status !== 0) {
-      throw new Error(`building the mcp-publisher fixture failed: ${tar.stderr}`);
-    }
-    const digest = createHash("sha256")
-      .update(readFileSync(join(fixtures, "mcp-publisher.tar.gz")))
-      .digest("hex");
-    const names = ["linux", "darwin", "windows"].flatMap((os) =>
-      ["amd64", "arm64"].map((arch) => `mcp-publisher_${os}_${arch}.tar.gz`),
-    );
-    writeFileSync(join(fixtures, "checksums.txt"), names.map((n) => `${digest}  ${n}\n`).join(""));
+    makePublisherFixture(fixtures, PUBLISHER_STUB);
 
     const bare = join(root, "origin.git");
     git(root, ["init", "-q", "--bare", "-b", "main", bare]);
@@ -1949,7 +2068,7 @@ describe("release.sh oam floor gate (stubbed full run)", () => {
     }
   };
 
-  it("runs the verifier in step 1 and releases on its OK line, touching GitHub for nothing", () => {
+  it("runs the verifier in step 1 and releases on its OK line, touching the GitHub API for nothing", () => {
     const f = setup();
     const r = release(f);
     expect(r.out).toContain("[verify:oam-floor] OK");
@@ -1988,11 +2107,20 @@ describe("release.sh oam floor gate (stubbed full run)", () => {
       "mcp-publisher login github token=fixture-token",
       "mcp-publisher publish token=",
     ]);
+    // github.com saw exactly the two pinned release assets -- the tarball and
+    // its checksums -- and nothing else: not the API, where the removed oam
+    // release-feed read lived, and not a `latest` read made fail-open.
     const curlLog = readFileSync(join(f.state, "curl.log"), "utf8");
-    expect(curlLog).toContain(`github.com/modelcontextprotocol/registry/releases/download/${PUBLISHER_VERSION}/`);
-    // Nothing on the GitHub API -- where the removed oam release-feed read
-    // lived -- and no commit but the bump.
+    const githubReads = curlLog.split("\n").filter((l) => l.includes("github.com"));
+    expect(githubReads).toHaveLength(2);
+    const pinned = new RegExp(
+      `https://github\\.com/modelcontextprotocol/registry/releases/download/${PUBLISHER_VERSION.replace(/\./g, "\\.")}/(mcp-publisher_[a-z]+_[a-z0-9]+\\.tar\\.gz|registry_[0-9.]+_checksums\\.txt)$`,
+    );
+    for (const line of githubReads) {
+      expect(line).toMatch(pinned);
+    }
     expect(curlLog).not.toContain("api.github.com");
+    // No commit but the bump.
     expect(subjects(f.bare, "main")).toEqual(["v1.0.2", "fixture"]);
     expect(git(f.bare, ["tag", "-l"]).trim()).toBe("v1.0.2");
   });
