@@ -554,9 +554,11 @@ registry_has_version() {
 # "60s" the old message claimed, spent on the wrong document.
 #
 # The PER-VERSION document is what the MCP registry's own validator reads
-# (registry v1.7.9, internal/validators/registries/npm.go: RegistryBaseURL +
-# "/" + PathEscape(identifier) + "/" + PathEscape(version), then the body's
-# `mcpName`). Cloudflare answers it CF-Cache-Status: DYNAMIC (measured the
+# (internal/validators/registries/npm.go: RegistryBaseURL + "/" +
+# PathEscape(identifier) + "/" + PathEscape(version), then the body's
+# `mcpName` -- the same line in v1.7.9, the mcp-publisher this script pins,
+# and in v1.8.1, the version registry.modelcontextprotocol.io/v0/version
+# reported on 2026-09-29). Cloudflare answers it CF-Cache-Status: DYNAMIC (measured the
 # same day) -- never from the edge cache -- so this read sees a publish as
 # soon as npm's own read path does. And because it is the SAME URL the
 # registry fetches before accepting server.json, a hit here is the strongest
@@ -1418,25 +1420,36 @@ else
 
   # >>> mcp-publisher publish
   # The registry checks the npm side of server.json by fetching, from ITS
-  # network, the per-version document step 5 has just seen from here. npm's
-  # read path is not one machine, so the two can disagree for a few seconds
-  # longer, and the registry then answers 400 with its validator's "not found
-  # (status: 404)" in the body: the same lag, seen from the far side, retried
-  # here on the same clock. The validator spells EVERY non-200 from npm that
-  # way -- "not found (status: 503)" for an npm 5xx or 429 on the registry's
-  # side -- and a non-200 for a document this host has just read as 200 is
-  # transient by construction, so any status inside that phrase is retried,
-  # and so is the same validator's "failed to fetch package metadata from
-  # NPM", its word for a request to npm that got no status at all; none of
-  # the 400s that must not be retried carries either (the duplicate version
-  # and the mcpName mismatch have their own words). Anything else fails at
-  # once with mcp-publisher's own text -- an expired login, the 422 schema
-  # report, a duplicate version,
-  # a mcpName that does not match -- because none of those gets better by
-  # waiting. `|| RC=$?` for the same reason as step 4: the exit code is
-  # needed, and under pipefail the pipeline carries the publisher's, not tee's.
+  # network, the per-version document step 5 has just seen from here. That
+  # read can lag ours: ctxlint measured it (its v0.27.0 release, 2026-09-13,
+  # published on the 3rd of 3 retries, about 150 s after npm had accepted the
+  # tarball, while its own read of the same URL was already green), which is
+  # why this is the family's retry -- four attempts, 30 s, 60 s, then 90 s
+  # apart -- and not a few seconds.
+  #
+  # Retried ONLY on the shape waiting cures, in the wording of the LIVE
+  # registry (v1.8.1 on 2026-09-29; the validator was reworded by registry
+  # PR #1411, in v1.8.0 -- the v1.7.9 client this script pins only relays
+  # the server's text):
+  #   - npm's per-version 404, carrying this version: "exists, but version
+  #     '<v>' was not found (status: 404)", or "version '<v>' not found
+  #     (status: 404)";
+  #   - "Likely transient, retry later": npm's 429 or 5xx, or a 404 the
+  #     validator could not classify, as seen from the registry;
+  #   - "failed to fetch package metadata from NPM": no status at all.
+  # A 404 WITHOUT the version -- "NPM package '<p>' not found" -- says the
+  # package itself is missing, which waiting does not cure. A duplicate
+  # version means the registry already lists this one -- an earlier run
+  # registered it, or the probe above read a stale listing -- which is the
+  # state this step exists to reach, so it counts as done. Anything else
+  # fails at once with mcp-publisher's own text -- an expired login, the 422
+  # schema report, a mcpName that does not match -- because none of those
+  # gets better by waiting. `|| RC=$?` for the same reason as step 4: the
+  # exit code is needed, and under pipefail the pipeline carries the
+  # publisher's, not tee's.
   MCP_PUBLISH_TRY=1
-  MCP_PUBLISH_MAX=6
+  MCP_PUBLISH_MAX=4
+  MCP_ALREADY_LISTED=false
   while true; do
     MCP_PUBLISH_LOG=$(mktemp)
     MCP_PUBLISH_RC=0
@@ -1445,20 +1458,32 @@ else
       rm -f "$MCP_PUBLISH_LOG"
       break
     fi
-    if grep -q 'status 400' "$MCP_PUBLISH_LOG" && grep -qE 'not found \(status: [0-9]+\)|failed to fetch package metadata from NPM' "$MCP_PUBLISH_LOG"; then
+    if grep -qiE 'duplicate version|already exists' "$MCP_PUBLISH_LOG"; then
+      rm -f "$MCP_PUBLISH_LOG"
+      MCP_ALREADY_LISTED=true
+      break
+    fi
+    if grep -q 'status 400' "$MCP_PUBLISH_LOG" \
+      && { { grep -qE 'not found \(status: *[0-9]+\)' "$MCP_PUBLISH_LOG" && grep -qF "$VERSION" "$MCP_PUBLISH_LOG"; } \
+        || grep -qE 'Likely transient, retry later|failed to fetch package metadata from NPM' "$MCP_PUBLISH_LOG"; }; then
       rm -f "$MCP_PUBLISH_LOG"
       if [ "$MCP_PUBLISH_TRY" -ge "$MCP_PUBLISH_MAX" ]; then
-        fail "The MCP registry still cannot fetch @yawlabs/mcp@${VERSION} from npm after ${MCP_PUBLISH_MAX} attempts, although npm serves it from here. Re-run ./release.sh ${VERSION} in a minute: steps 1-2 repeat their gates and build, steps 3-4 skip what is done, and step 5 tries again."
+        fail "The MCP registry still cannot fetch @yawlabs/mcp@${VERSION} from npm after ${MCP_PUBLISH_MAX} attempts over 180s, although npm serves it from here. Re-run ./release.sh ${VERSION} in a few minutes: steps 1-2 repeat their gates and build, steps 3-4 skip what is done, and step 5 tries again."
       fi
-      warn "The MCP registry cannot fetch @yawlabs/mcp@${VERSION} from npm yet (attempt ${MCP_PUBLISH_TRY}/${MCP_PUBLISH_MAX}) -- retrying in 10s"
+      MCP_PUBLISH_WAIT=$((MCP_PUBLISH_TRY * 30))
+      warn "The MCP registry cannot fetch @yawlabs/mcp@${VERSION} from npm yet (attempt ${MCP_PUBLISH_TRY}/${MCP_PUBLISH_MAX}) -- retrying in ${MCP_PUBLISH_WAIT}s"
       MCP_PUBLISH_TRY=$((MCP_PUBLISH_TRY + 1))
-      sleep 10
+      sleep "$MCP_PUBLISH_WAIT"
       continue
     fi
     rm -f "$MCP_PUBLISH_LOG"
     fail "mcp-publisher publish failed (exit ${MCP_PUBLISH_RC}) -- its output is above. Fix the cause and re-run ./release.sh ${VERSION}: steps 1-2 repeat their gates and build, steps 3-4 skip what is done."
   done
-  info "Published server.json to MCP registry"
+  if [ "$MCP_ALREADY_LISTED" = true ]; then
+    info "The MCP registry already lists io.github.YawLabs/mcp@${VERSION} (it refused a duplicate) -- nothing to publish"
+  else
+    info "Published server.json to MCP registry"
+  fi
   # <<< mcp-publisher publish
 fi
 
