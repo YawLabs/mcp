@@ -124,6 +124,14 @@ function extractBlock(start: string, end: string): string {
   if (from === -1) {
     throw new Error(`release.sh anchor not found: ${JSON.stringify(start)}`);
   }
+  // A start anchor that occurs twice would silently pick the first, and a
+  // reshaped script could then hand a test the WRONG block with every
+  // assertion still green. The tag-at-HEAD guard's `if git tag -l ...` line
+  // did exactly that (it recurs in the final verification), which is why that
+  // guard now carries marker comments like the step-4 and step-5 blocks.
+  if (lines.indexOf(start, from + 1) !== -1) {
+    throw new Error(`release.sh anchor is not unique: ${JSON.stringify(start)}`);
+  }
   const to = lines.indexOf(end, from + 1);
   if (to === -1) {
     throw new Error(`release.sh end anchor ${JSON.stringify(end)} not found after ${JSON.stringify(start)}`);
@@ -627,7 +635,7 @@ describe("release.sh version comparator", () => {
 });
 
 describe("release.sh tag-at-HEAD guard", () => {
-  const block = extractBlock('if git tag -l "v${VERSION}" | grep -q "v${VERSION}"; then', "fi");
+  const block = extractBlock("# >>> tag-at-HEAD guard", "# <<< tag-at-HEAD guard");
   const dir = newTmp("release-tag-");
 
   function run(opts: { tagSha: string | null; headSha: string; published: string }): RunResult {
@@ -643,7 +651,7 @@ describe("release.sh tag-at-HEAD guard", () => {
     *) return 0 ;;
   esac
 }`,
-      `npm() { echo "${opts.published}"; }`,
+      `npm_has_version() { [ -n "${opts.published}" ]; }`,
       block,
       'echo "CONTINUED"',
     ].join("\n");
@@ -790,23 +798,25 @@ describe("release.sh registry_has_version", () => {
 });
 
 describe("release.sh published-tarball content check", () => {
-  const block = extractBlock(
-    'PUBLISHED_INTEGRITY=$(npm view "@yawlabs/mcp@${VERSION}" dist.integrity 2>/dev/null | tr -d \'[:space:]\' || echo "")',
-    "fi",
-  );
+  const block = extractBlock('PUBLISHED_INTEGRITY=$(npm_manifest_field "$NPM_FINAL_MANIFEST" dist.integrity)', "fi");
+  const field = extractBlock("npm_manifest_field() {", "}");
   const dir = newTmp("release-tar-");
 
   function run(opts: { published: string; pack: string; publishedThisRun: boolean }): RunResult {
+    // The published side is the manifest the final verification already read
+    // -- or nothing, when npm answered nothing usable -- so npm here is only
+    // ever the `pack --dry-run --json` call.
+    const manifest = opts.published ? JSON.stringify({ version: "0.81.0", dist: { integrity: opts.published } }) : "";
     const body = [
       STUB_HELPERS,
+      field,
       'VERSION="0.81.0"',
       `NPM_PUBLISHED_THIS_RUN=${opts.publishedThisRun}`,
-      // `view` answers with the registry's integrity, anything else is the
-      // `pack --dry-run --json` call.
-      `npm() { if [ "$1" = "view" ]; then printf '%s\\n' "$FAKE_VIEW"; else printf '%s' "$FAKE_PACK"; fi; }`,
+      'NPM_FINAL_MANIFEST="$FAKE_MANIFEST"',
+      `npm() { printf '%s' "$FAKE_PACK"; }`,
       block,
     ].join("\n");
-    return runBash(body, dir, { FAKE_VIEW: opts.published, FAKE_PACK: opts.pack });
+    return runBash(body, dir, { FAKE_MANIFEST: manifest, FAKE_PACK: opts.pack });
   }
 
   const packJson = (integrity: string) => JSON.stringify([{ name: "@yawlabs/mcp", integrity }]);
@@ -894,6 +904,415 @@ describe("release.sh MCP-registry read-back", () => {
     // A missing listing is not a release failure -- npm already has the
     // version and cannot take it back.
     expect(r.status).toBe(0);
+  });
+});
+
+describe("release.sh npm_version_manifest", () => {
+  // The read that replaced `npm view "@yawlabs/mcp@<v>"` at every site: npm's
+  // per-version document, which the MCP registry's validator fetches and
+  // Cloudflare serves uncached, instead of the packument it caches for 300 s.
+  const fn = [extractBlock("npm_version_manifest() {", "}"), extractBlock("npm_has_version() {", "}")].join("\n");
+  const dir = newTmp("release-npmv-");
+
+  /** Run both helpers `calls` times with curl stubbed to return `body`, or to
+   *  fail like `curl -f` on npm's 404 when body is null. The stub APPENDS the
+   *  argv it saw to a log in `dir`. */
+  function run(body: string | null, want = "1.0.17", calls = 1): { out: string; args: string[] } {
+    const log = `curl-args-${Math.abs(hash(`${body}${want}${calls}`))}.log`;
+    const curlStub =
+      body === null
+        ? `curl() { printf '%s\\n' "$*" >> "${log}"; return 22; }`
+        : `curl() { printf '%s\\n' "$*" >> "${log}"; printf '%s' "$FAKE_BODY"; }`;
+    const script = [
+      curlStub,
+      fn,
+      `for _ in $(seq 1 ${calls}); do if m=$(npm_version_manifest "${want}"); then echo "HIT:$m"; else echo "MISS:$m"; fi; if npm_has_version "${want}"; then echo "YES"; else echo "NO"; fi; done`,
+    ].join("\n");
+    const r = runBash(script, dir, { FAKE_BODY: body ?? "" });
+    let args: string[] = [];
+    try {
+      args = readFileSync(join(dir, log), "utf8").split("\n").filter(Boolean);
+    } catch {
+      // No log means curl was never called, which the caller asserts on.
+    }
+    return { out: r.out, args };
+  }
+
+  const manifest = (version: string) =>
+    JSON.stringify({ version, mcpName: "io.github.YawLabs/mcp", dist: { integrity: "sha512-x" } });
+
+  it("prints the manifest and answers yes when npm serves that exact version", () => {
+    const r = run(manifest("1.0.17"));
+    expect(r.out).toContain(`HIT:${manifest("1.0.17")}`);
+    expect(r.out).toContain("YES");
+  });
+
+  it("misses on npm's 404, on a body for another version, and on a body that is not JSON", () => {
+    // `curl -f` exits 22 on the registry's 404 ("version not found: X"), so a
+    // missing version never reaches the parser. A body for the wrong version
+    // would be an API change, and a hit on it would be a guess.
+    for (const body of [null, manifest("1.0.16"), "<html>502 Bad Gateway</html>", ""]) {
+      const r = run(body);
+      expect(r.out).toContain("MISS:");
+      expect(r.out).toContain("NO");
+      expect(r.out).not.toContain("HIT");
+    }
+  });
+
+  it("reads the per-version document the MCP registry's validator reads, not the packument", () => {
+    // registry v1.7.9, internal/validators/registries/npm.go: base + "/" +
+    // PathEscape(identifier) + "/" + PathEscape(version), Accept: application/json.
+    // `-f` is what turns the 404 body into a miss.
+    const { args } = run(manifest("1.2.3"), "1.2.3");
+    expect(args[0]).toMatch(/https:\/\/registry\.npmjs\.org\/@yawlabs%2Fmcp\/1\.2\.3\?/);
+    expect(args[0]).toContain("Accept: application/json");
+    expect(args[0]).toMatch(/(^| )-fsSL( |$)/);
+  });
+
+  it("busts the edge cache on every read, with a total timeout", () => {
+    // Cloudflare answers this document DYNAMIC today; the buster is there for
+    // the day it does not, and the API ignores the unknown parameter.
+    const { args } = run(manifest("1.0.17"), "1.0.17", 2);
+    expect(args).toHaveLength(4);
+    for (const a of args) {
+      expect(a).toContain("Cache-Control: no-cache");
+      expect(a).toMatch(/[?&]_=\d+/);
+      expect(a).toMatch(/--max-time \d+/);
+    }
+    const busters = args.map((a) => /[?&]_=(\d+)/.exec(a)?.[1]);
+    expect(new Set(busters).size).toBeGreaterThan(1);
+  });
+
+  it("pulls a dotted field out of the manifest, and nothing out of anything else", () => {
+    const field = extractBlock("npm_manifest_field() {", "}");
+    const script = [
+      field,
+      'echo "A:$(npm_manifest_field "$M" dist.integrity)"',
+      'echo "B:$(npm_manifest_field "$M" version)"',
+      'echo "C:$(npm_manifest_field "$M" dist.nope)"',
+      'echo "D:$(npm_manifest_field "$M" dist)"',
+      'echo "E:$(npm_manifest_field "not json" dist.integrity)"',
+      'echo "F:$(npm_manifest_field "" dist.integrity)"',
+    ].join("\n");
+    const r = runBash(script, dir, { M: manifest("1.0.17") });
+    expect(r.out).toContain("A:sha512-x\n");
+    expect(r.out).toContain("B:1.0.17\n");
+    expect(r.out).toContain("C:\n");
+    expect(r.out).toContain("D:\n");
+    expect(r.out).toContain("E:\n");
+    expect(r.out).toContain("F:\n");
+  });
+});
+
+describe("release.sh npm wait budget pre-flight", () => {
+  // NPM_PROPAGATION_TIMEOUT is read and checked in the pre-flight, with the
+  // step-5 tools, because its first USE is after the irreversible publish: a
+  // duration spelt "3m" that failed there would strand the release at the
+  // registry step, the very outcome the budget exists to prevent.
+  const block = extractBlock("# >>> npm wait budget", "# <<< npm wait budget");
+  const dir = newTmp("release-budget-");
+
+  function run(env: Record<string, string>): RunResult {
+    const body = [STUB_HELPERS, block, 'echo "BUDGET=$NPM_WAIT_BUDGET"'].join("\n");
+    return runBash(body, dir, env);
+  }
+
+  it("defaults to 180 s when the variable is unset or empty", () => {
+    expect(run({}).out).toContain("BUDGET=180\n");
+    expect(run({ NPM_PROPAGATION_TIMEOUT: "" }).out).toContain("BUDGET=180\n");
+  });
+
+  it("takes whole seconds, reading leading zeros in base 10", () => {
+    expect(run({ NPM_PROPAGATION_TIMEOUT: "40" }).out).toContain("BUDGET=40\n");
+    expect(run({ NPM_PROPAGATION_TIMEOUT: "0" }).out).toContain("BUDGET=0\n");
+    // Not octal: bash's $((0180)) would be an error and $((010)) would be 8.
+    expect(run({ NPM_PROPAGATION_TIMEOUT: "0180" }).out).toContain("BUDGET=180\n");
+    expect(run({ NPM_PROPAGATION_TIMEOUT: "007" }).out).toContain("BUDGET=7\n");
+    expect(run({ NPM_PROPAGATION_TIMEOUT: "999999" }).out).toContain("BUDGET=999999\n");
+  });
+
+  it("rejects anything that is not a whole number of seconds", () => {
+    for (const bad of ["3m", "180s", "-1", "1.5", " 40", "1e3"]) {
+      const r = run({ NPM_PROPAGATION_TIMEOUT: bad });
+      expect(r.out).toContain(`FAIL NPM_PROPAGATION_TIMEOUT must be a whole number of seconds, got '${bad}'`);
+      expect(r.out).not.toContain("BUDGET=");
+    }
+  });
+
+  it("rejects a value bash's [ -ge ] could not compare, which would make the wait loop never time out", () => {
+    // Past 2^63 `[ "$elapsed" -ge "$budget" ]` prints "integer expression
+    // expected" and returns 2, which the loop's `||` reads as false: the
+    // budget branch never fires. Six digits (11.5 days) is more than anyone
+    // waits for npm.
+    const r = run({ NPM_PROPAGATION_TIMEOUT: "99999999999999999999" });
+    expect(r.out).toContain(
+      "FAIL NPM_PROPAGATION_TIMEOUT must be at most 6 digits of seconds, got '99999999999999999999'",
+    );
+    expect(run({ NPM_PROPAGATION_TIMEOUT: "1000000" }).out).toContain("at most 6 digits");
+  });
+
+  it("fails the real script in the pre-flight, before the confirm prompt and any step", () => {
+    // Fixture run: no .git, so the script dies at the branch probe soon after
+    // the pre-flight guards -- and this guard sits with the tool checks,
+    // ahead of the dependency and registry-field guards the fixture shape
+    // already covers.
+    const dirFx = makeFixture();
+    const bad = runRelease(dirFx, "9.9.9", { NPM_PROPAGATION_TIMEOUT: "3m" });
+    expect(bad.out).toContain("NPM_PROPAGATION_TIMEOUT must be a whole number of seconds, got '3m'");
+    expect(bad.status).toBe(1);
+    expect(bad.out).not.toContain("Pre-flight checks");
+    const good = runRelease(dirFx, "9.9.9", { NPM_PROPAGATION_TIMEOUT: "40" });
+    expect(good.out).not.toContain("NPM_PROPAGATION_TIMEOUT must");
+  });
+});
+
+describe("release.sh step-5 npm wait", () => {
+  // The wait that replaced ten `npm view` reads against a five-minute edge
+  // cache: a clock (NPM_WAIT_BUDGET, the pre-flight's reading of
+  // NPM_PROPAGATION_TIMEOUT, default 180 s) over the uncached per-version
+  // read. Driven on a fake clock -- sleep advances it, date reads it -- with
+  // npm_has_version answering from a read counter.
+  const block = extractBlock("  # >>> step-5 npm wait", "  # <<< step-5 npm wait");
+  const dir = newTmp("release-wait-");
+
+  function run(hitOnRead: number | null, budget = "180"): RunResult {
+    const body = [
+      STUB_HELPERS,
+      'VERSION="1.0.17"',
+      `NPM_WAIT_BUDGET=${budget}`,
+      "FAKE_NOW=1000",
+      "READS=0",
+      "sleep() { FAKE_NOW=$((FAKE_NOW + $1)); }",
+      'date() { echo "$FAKE_NOW"; }',
+      `npm_has_version() { READS=$((READS + 1)); [ -n "${hitOnRead ?? ""}" ] && [ "$READS" -ge "${hitOnRead ?? 0}" ]; }`,
+      block,
+      'echo "CONTINUED reads=$READS now=$FAKE_NOW"',
+    ].join("\n");
+    return runBash(body, dir);
+  }
+
+  it("continues at once when npm already serves the version", () => {
+    const r = run(1);
+    expect(r.out).toContain("INFO npm serves @yawlabs/mcp@1.0.17\n");
+    expect(r.out).not.toContain("after");
+    expect(r.out).toContain("CONTINUED reads=1 now=1000");
+  });
+
+  it("polls through npm's write-to-read lag and says how long it took", () => {
+    // Three misses, three 5 s sleeps, a hit on the fourth read.
+    const r = run(4);
+    expect(r.out).toContain("INFO npm serves @yawlabs/mcp@1.0.17 (after 15s and 4 reads)");
+    expect(r.out).toContain("CONTINUED reads=4 now=1015");
+  });
+
+  it("prints a progress line every 30 s so a slow npm reads as waiting, not as hung", () => {
+    // A hit on the 15th read is 14 sleeps, 70 s: the 30 s and 60 s ticks
+    // print and the 90 s one does not.
+    const r = run(15);
+    expect(r.out).toContain("... npm does not serve @yawlabs/mcp@1.0.17 yet (30s of 180s)");
+    expect(r.out).toContain("yet (60s of 180s)");
+    expect(r.out).not.toContain("yet (90s");
+    expect(r.out).toContain("(after 70s and 15 reads)");
+  });
+
+  it("fails, naming the document and the re-run, when the budget expires", () => {
+    const r = run(null);
+    expect(r.out).toContain(
+      "FAIL npm does not serve @yawlabs/mcp@1.0.17 after 180s of reading https://registry.npmjs.org/@yawlabs%2Fmcp/1.0.17 every 5s",
+    );
+    expect(r.out).toContain("would answer 400");
+    // The re-run advice is conditional on the read answering, and does not
+    // call steps 1-2 no-ops: they repeat their gates and build.
+    expect(r.out).toContain("Once that URL answers from here (curl it), re-run ./release.sh 1.0.17");
+    expect(r.out).toContain("steps 1-2 repeat their gates and build, steps 3-4 skip what is done");
+    expect(r.out).not.toContain("no-op");
+    expect(r.out).toContain("NPM_PROPAGATION_TIMEOUT=600");
+    expect(r.out).not.toContain("CONTINUED");
+  });
+
+  it("waits the budget the pre-flight set, and reads once at a budget of 0", () => {
+    const short = run(null, "40");
+    expect(short.out).toContain("after 40s of reading");
+    expect(short.out).not.toContain("CONTINUED");
+    const zero = run(null, "0");
+    expect(zero.out).toContain("after 0s of reading");
+    expect(zero.out).not.toContain("CONTINUED");
+  });
+});
+
+describe("release.sh step-4 npm publish", () => {
+  // The publish loop gained one branch: npm's E403 "You cannot publish over
+  // the previously published versions" means the version IS on npm although
+  // the skip probe just missed it -- npm's read path lagging its write path,
+  // which is the state a re-run after step 5's timeout starts from. It is
+  // treated as the skip it should have been; every other outcome is as
+  // before. npm is a function, so the pipeline into tee needs pipefail here
+  // as it has in the script.
+  const block = extractBlock("  # >>> step-4 npm publish", "  # <<< step-4 npm publish");
+  const dir = newTmp("release-pub4-");
+
+  function run(opts: { out: string; rc: number }): RunResult & { calls: number } {
+    const work = newTmp("release-pub4-calls-");
+    const body = [
+      "set -o pipefail",
+      STUB_HELPERS,
+      'VERSION="1.0.17"',
+      "IS_MINGW_ARM64=false",
+      "NPM_PUBLISHED_THIS_RUN=false",
+      "sleep() { :; }",
+      "npm_has_version() { return 1; }",
+      `npm() { echo "call" >> "${shPath(work)}/calls"; printf '%s\\n' "$FAKE_NPM_OUT"; return ${opts.rc}; }`,
+      block,
+      'echo "CONTINUED published=$NPM_PUBLISHED_THIS_RUN"',
+    ].join("\n");
+    const r = runBash(body, dir, { FAKE_NPM_OUT: opts.out });
+    let calls = 0;
+    try {
+      calls = readFileSync(join(work, "calls"), "utf8").split("\n").filter(Boolean).length;
+    } catch {
+      // never called
+    }
+    return { ...r, calls };
+  }
+
+  it("publishes and marks the run as the publisher", () => {
+    const r = run({ out: "+ @yawlabs/mcp@1.0.17", rc: 0 });
+    expect(r.calls).toBe(1);
+    expect(r.out).toContain("INFO Published @yawlabs/mcp@1.0.17 to npm");
+    expect(r.out).toContain("CONTINUED published=true");
+  });
+
+  it("reads npm's E403 'cannot publish over' as the skip the probe should have taken", () => {
+    const r = run({
+      out: "npm error code E403\nnpm error 403 403 Forbidden - PUT https://registry.npmjs.org/@yawlabs%2fmcp - You cannot publish over the previously published versions: 1.0.17.",
+      rc: 1,
+    });
+    expect(r.calls).toBe(1);
+    expect(r.out).toContain("WARN npm already holds @yawlabs/mcp@1.0.17 (its E403 said so)");
+    expect(r.out).not.toContain("FAIL");
+    // Not this run's publish: the final tarball check must read a differing
+    // tarball as post-tag drift, not as a corrupted publish.
+    expect(r.out).toContain("CONTINUED published=false");
+  });
+
+  it("still fails fast on any other non-OTP error, with the npmrc hint", () => {
+    const r = run({ out: "npm error code E401\nnpm error Incorrect or missing password", rc: 1 });
+    expect(r.calls).toBe(1);
+    expect(r.out).toContain("FAIL npm publish failed (non-OTP error");
+    expect(r.out).not.toContain("CONTINUED");
+  });
+
+  it("still retries an OTP-class failure three times, then fails", () => {
+    const r = run({ out: "npm error code EOTP\nnpm error This operation requires a one-time password", rc: 1 });
+    expect(r.calls).toBe(3);
+    expect(r.out).toContain("WARN npm publish attempt 1 EOTPed");
+    expect(r.out).toContain("WARN npm publish attempt 2 EOTPed");
+    expect(r.out).toContain("FAIL npm publish failed after 3 OTP-class attempts");
+    expect(r.out).not.toContain("CONTINUED");
+  });
+});
+
+describe("release.sh mcp-publisher publish retry", () => {
+  // The registry validates server.json's npm side by fetching npm's
+  // per-version document from ITS network, at worst a few seconds behind
+  // ours. That one 400 is retried; every other failure is the tool's own
+  // verdict and fails at once, with its text.
+  const block = extractBlock("  # >>> mcp-publisher publish", "  # <<< mcp-publisher publish");
+  const dir = newTmp("release-pub-");
+
+  const NPM_404 =
+    'publish failed: server returned status 400: {"title":"Bad Request","status":400,"detail":"Failed to publish server","errors":[{"message":"registry validation failed for package 0 (@yawlabs/mcp): NPM package \'@yawlabs/mcp\' not found (status: 404)"}]}';
+
+  function run(failures: number, failureText: string): RunResult & { tries: number } {
+    const work = newTmp("release-pub-bin-");
+    // The publisher stub fails `failures` times with `failureText`, then
+    // publishes. Its attempt count lives in a file: each call is a process.
+    const stub = [
+      "#!/bin/bash",
+      'n=$(cat "$FAKE_STATE/tries" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$FAKE_STATE/tries"',
+      `if [ "$n" -le ${failures} ]; then echo "$FAKE_FAILURE" >&2; exit 1; fi`,
+      'echo "Successfully published io.github.YawLabs/mcp@1.0.17"',
+      "",
+    ].join("\n");
+    writeFileSync(join(work, "mcp-publisher"), stub);
+    chmodSync(join(work, "mcp-publisher"), 0o755);
+    const body = [
+      // The block relies on the script's `set -o pipefail`: without it the
+      // pipeline into tee would report tee's exit code, never the publisher's.
+      "set -o pipefail",
+      STUB_HELPERS,
+      'VERSION="1.0.17"',
+      `WORKDIR="${shPath(work)}"`,
+      'BIN_NAME="mcp-publisher"',
+      "sleep() { :; }",
+      block,
+      'echo "CONTINUED"',
+    ].join("\n");
+    const r = runBash(body, dir, { FAKE_STATE: shPath(work), FAKE_FAILURE: failureText });
+    const tries = Number(readFileSync(join(work, "tries"), "utf8").trim());
+    return { ...r, tries };
+  }
+
+  it("publishes on the first attempt when the registry sees npm's document", () => {
+    const r = run(0, "");
+    expect(r.tries).toBe(1);
+    expect(r.out).toContain("Successfully published");
+    expect(r.out).toContain("INFO Published server.json to MCP registry");
+    expect(r.out).toContain("CONTINUED");
+  });
+
+  it("retries the registry's npm-404 400 and publishes once the far side catches up", () => {
+    const r = run(2, NPM_404);
+    expect(r.tries).toBe(3);
+    expect(r.out).toContain(
+      "WARN The MCP registry cannot fetch @yawlabs/mcp@1.0.17 from npm yet (attempt 1/6) -- retrying in 10s",
+    );
+    expect(r.out).toContain("(attempt 2/6)");
+    expect(r.out).toContain("INFO Published server.json to MCP registry");
+    expect(r.out).toContain("CONTINUED");
+  });
+
+  it("retries the same phrase with any non-200 status: the validator spells an npm 5xx or 429 that way too", () => {
+    // registry v1.7.9 npm.go returns "not found (status: %d)" for EVERY
+    // non-200 from npm as seen from the registry's network. A non-200 for a
+    // document this host has just read as 200 is transient by construction.
+    for (const status of ["503", "429", "502"]) {
+      const r = run(1, NPM_404.replace("(status: 404)", `(status: ${status})`));
+      expect(r.tries).toBe(2);
+      expect(r.out).toContain("(attempt 1/6) -- retrying in 10s");
+      expect(r.out).toContain("INFO Published server.json to MCP registry");
+    }
+  });
+
+  it("gives up after six npm-404 attempts with the re-run, not a seventh", () => {
+    const r = run(99, NPM_404);
+    expect(r.tries).toBe(6);
+    expect(r.out).toContain("FAIL The MCP registry still cannot fetch @yawlabs/mcp@1.0.17 from npm after 6 attempts");
+    expect(r.out).toContain("Re-run ./release.sh 1.0.17");
+    expect(r.out).toContain("steps 1-2 repeat their gates and build, steps 3-4 skip what is done");
+    expect(r.out).not.toContain("no-op");
+    expect(r.out).not.toContain("CONTINUED");
+  });
+
+  it("fails at once, with the tool's own text, on anything else", () => {
+    // None of these gets better by waiting: an expired login, the 422 schema
+    // report, a duplicate version, a mcpName mismatch -- including the two
+    // that are ALSO 400s, which is why the retry needs the validator's 404
+    // text and not just the status.
+    const others = [
+      'publish failed: server returned status 401: {"title":"Unauthorized","detail":"token expired"}',
+      "Validation failed. Checking detailed validation errors...\nvalidation failed",
+      'publish failed: server returned status 400: {"detail":"Failed to publish server","errors":[{"message":"version 1.0.17 already exists"}]}',
+      'publish failed: server returned status 400: {"errors":[{"message":"NPM package ownership validation failed. Expected mcpName \'io.github.YawLabs/mcp\', got \'other\'"}]}',
+    ];
+    for (const text of others) {
+      const r = run(99, text);
+      expect(r.tries).toBe(1);
+      expect(r.out).toContain("FAIL mcp-publisher publish failed (exit 1)");
+      expect(r.out).toContain(text.split("\n")[0]);
+      expect(r.out).not.toContain("retrying");
+      expect(r.out).not.toContain("CONTINUED");
+    }
   });
 });
 
@@ -1205,6 +1624,14 @@ describe("release.sh oam floor gate (stubbed full run)", () => {
   // skips it -- each drive one run to its end. It is the only shape here that
   // reaches the gates, the push and the publish, and all three land on stubs
   // and the bare repo.
+  //
+  // What it does NOT reach: step 5's publish path. The curl stub reports the
+  // version on the MCP registry as soon as the npm stub's `publish` has
+  // touched its marker, so every full run takes step 5's "already on the MCP
+  // registry -- skipping publish" branch, and the npm wait, the mcp-publisher
+  // download, its login and the publish retry are never entered here. Those
+  // have their own extracted-block describes above; wiring them into this run
+  // would mean serving a tarball, a checksums file and a login from the stubs.
   const NPM_STUB = [
     "#!/bin/bash",
     'echo "npm $*" >> "$FAKE_STATE/npm.log"',
@@ -1212,11 +1639,11 @@ describe("release.sh oam floor gate (stubbed full run)", () => {
     "  view)",
     '    case "$2" in',
     '      "@yawlabs/mcp") echo "1.0.1" ;;',
-    '      "@yawlabs/mcp@"*)',
-    '        v="${2#@yawlabs/mcp@}"',
-    '        if [ -f "$FAKE_STATE/published-$v" ]; then',
-    '          if [ "${3:-}" = "dist.integrity" ]; then echo "sha512-fixture"; else echo "$v"; fi',
-    "        fi ;;",
+    // A pinned-version `npm view` is the cached packument read step 5 died on
+    // (npm_version_manifest in release.sh has the measurements). Nothing in
+    // the script may make it any more, so rather than answer it the stub makes
+    // one impossible to miss.
+    '      "@yawlabs/mcp@"*) echo "npm view @yawlabs/mcp@<version> is the cached packument read release.sh must not make" >&2; exit 1 ;;',
     "    esac ;;",
     "  whoami) echo fixture ;;",
     "  run)",
@@ -1244,9 +1671,10 @@ describe("release.sh oam floor gate (stubbed full run)", () => {
     "",
   ].join("\n");
 
-  // curl serves the MCP registry's read-back and nothing else: a request for
-  // anything on GitHub fails loudly, which is how a regression that brought
-  // the release-feed read back would show up here.
+  // curl serves the MCP registry's read-back and npm's per-version document,
+  // and nothing else: a request for anything on GitHub fails loudly, which is
+  // how a regression that brought the release-feed read back would show up
+  // here.
   const CURL_SCRIPT = [
     "#!/bin/bash",
     'echo "curl $*" >> "$FAKE_STATE/curl.log"',
@@ -1254,6 +1682,12 @@ describe("release.sh oam floor gate (stubbed full run)", () => {
     "  *registry.modelcontextprotocol.io*)",
     '    u="$*"; v="${u#*version=}"; v="${v%%&*}"',
     `    if [ -f "$FAKE_STATE/published-$v" ]; then printf '{"servers":[{"server":{"version":"%s"}}]}' "$v"; else printf '{"servers":[]}'; fi ;;`,
+    // npm's per-version document, the read behind every "is it on npm?"
+    // question (npm_version_manifest). An unpublished version is a 404, which
+    // `curl -f` reports as exit 22, as the real one does.
+    "  *registry.npmjs.org/@yawlabs%2Fmcp/*)",
+    '    u="$*"; v="${u##*@yawlabs%2Fmcp/}"; v="${v%%\\?*}"',
+    `    if [ -f "$FAKE_STATE/published-$v" ]; then printf '{"version":"%s","mcpName":"io.github.YawLabs/mcp","dist":{"integrity":"sha512-fixture"}}' "$v"; else echo "curl: (22) The requested URL returned error: 404" >&2; exit 22; fi ;;`,
     '  *) echo "curl: (22) the stub does not serve $*" >&2; exit 22 ;;',
     "esac",
     "",
@@ -1363,6 +1797,15 @@ describe("release.sh oam floor gate (stubbed full run)", () => {
     expect(r.out).toContain("Lint + typecheck + tests + oam floor passed");
     expect(r.out).toContain("v1.0.2 released to npm + MCP registry.");
     expect(r.status).toBe(0);
+    // npm's per-version document, and only it, answered every "is it on npm?"
+    // question, from the pre-flight probe to the final tarball check; the
+    // cached packument read step 5 used to die on is gone from the whole run.
+    expect(npmLog(f)).not.toMatch(/^npm view @yawlabs\/mcp@/m);
+    expect(readFileSync(join(f.state, "curl.log"), "utf8")).toMatch(
+      /registry\.npmjs\.org\/@yawlabs%2Fmcp\/1\.0\.2\?_=\d+/,
+    );
+    expect(r.out).toContain("npm: @yawlabs/mcp@1.0.2");
+    expect(r.out).toContain("npm tarball: content matches this build");
     // The verifier ran once, between the type check and the tests.
     const runs = npmLog(f)
       .split("\n")
