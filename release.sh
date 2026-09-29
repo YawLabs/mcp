@@ -68,10 +68,11 @@
 #   NPM_PROPAGATION_TIMEOUT=<secs>   How long step 5 waits for npm to serve
 #                                    the version step 4 published before it
 #                                    refuses to publish server.json (default
-#                                    180). The read is npm's uncached
+#                                    300). The read is npm's uncached
 #                                    per-version document -- see
 #                                    npm_version_manifest -- so this is npm's
-#                                    own write-to-read lag, normally seconds.
+#                                    own write-to-read lag: 142 s on the 1.0.17
+#                                    release.
 #   SKIP_OAM_FLOOR_VERIFY=1          DISABLES THE OAM FLOOR GATE -- step 1's
 #                                    `npm run verify:oam-floor`, which hosts a
 #                                    stdio @modelcontextprotocol/sdk server on
@@ -363,7 +364,7 @@ command -v tar  >/dev/null || fail "tar not installed (needed for step 5, the MC
 # instant timeout, twenty nines to 7.7e18 and a wait that never expires), and
 # unnormalised, bash's [ -ge ] would refuse the digits and the loop would
 # never time out either.
-NPM_WAIT_BUDGET="${NPM_PROPAGATION_TIMEOUT:-180}"
+NPM_WAIT_BUDGET="${NPM_PROPAGATION_TIMEOUT:-300}"
 case "$NPM_WAIT_BUDGET" in
   *[!0-9]*) fail "NPM_PROPAGATION_TIMEOUT must be a whole number of seconds, got '${NPM_WAIT_BUDGET}'" ;;
 esac
@@ -1279,9 +1280,11 @@ else
   # ITS fetch of npm's per-version document succeeds (npm_version_manifest has
   # the URL and the validator's source line), so wait until that document
   # answers from here. Cloudflare never serves it from the edge cache, so what
-  # this waits on is npm's own write-to-read lag -- normally seconds -- and the
-  # budget is NPM_WAIT_BUDGET seconds -- NPM_PROPAGATION_TIMEOUT, default 180,
-  # validated in the pre-flight so a typo cannot fail the release here, after
+  # this waits on is npm's own write-to-read lag. That is not seconds: the
+  # 1.0.17 release (2026-09-29) waited 142 s over 24 reads for it. The budget
+  # is NPM_WAIT_BUDGET seconds -- NPM_PROPAGATION_TIMEOUT, default 300, which
+  # is what the sibling MCP repos' own gates default to and about twice that
+  # measurement -- validated in the pre-flight so a typo cannot fail the release here, after
   # the publish -- a clock, not the ten reads that used to expire against the
   # packument's five-minute edge TTL. Wall-clock elapsed rather than a count
   # of sleeps, so the figures in the messages stay true when a read itself is
@@ -1457,6 +1460,14 @@ else
   # probe above read a stale listing -- which is the state this step exists
   # to reach, so it counts as done. (Held is not listed: a version marked
   # deleted is still a duplicate, and the final verification says so.)
+  #
+  # The registry's OWN transient answers are retried on the same clock: HTTP
+  # 429, 502, 503 or 504 on the publish call itself. The 1.0.17 release met a
+  # 504 from its nginx gateway ("504 Gateway Time-out") while plain listing
+  # reads were timing out too -- the registry was slow, not saying no. A
+  # retry is safe even when the timed-out attempt did land: the registry then
+  # refuses the duplicate, which counts as done above.
+  #
   # Anything else
   # fails at once with mcp-publisher's own text -- an expired login, the 422
   # schema report, a mcpName that does not match -- because none of those
@@ -1479,15 +1490,24 @@ else
       MCP_ALREADY_LISTED=true
       break
     fi
+    MCP_RETRY_WHY=""
     if grep -q 'status 400' "$MCP_PUBLISH_LOG" \
       && { { grep -qE 'not found \(status: *[0-9]+\)' "$MCP_PUBLISH_LOG" && grep -qF "version '${VERSION}'" "$MCP_PUBLISH_LOG"; } \
         || grep -qE 'Likely transient, retry later|failed to fetch package metadata from NPM' "$MCP_PUBLISH_LOG"; }; then
+      MCP_RETRY_WHY="cannot fetch @yawlabs/mcp@${VERSION} from npm yet"
+      MCP_GIVE_UP="The MCP registry still cannot fetch @yawlabs/mcp@${VERSION} from npm after ${MCP_PUBLISH_MAX} attempts over 180s, although npm serves it from here."
+    elif grep -qE 'server returned status (429|502|503|504)([^0-9]|$)' "$MCP_PUBLISH_LOG"; then
+      MCP_GATEWAY_STATUS=$(grep -oE 'server returned status (429|502|503|504)' "$MCP_PUBLISH_LOG" | head -n 1 | grep -oE '[0-9]+$' || true)
+      MCP_RETRY_WHY="answered HTTP ${MCP_GATEWAY_STATUS} itself -- busy or timing out, not a verdict"
+      MCP_GIVE_UP="The MCP registry still answers HTTP ${MCP_GATEWAY_STATUS} after ${MCP_PUBLISH_MAX} attempts over 180s -- it is having trouble of its own."
+    fi
+    if [ -n "$MCP_RETRY_WHY" ]; then
       rm -f "$MCP_PUBLISH_LOG"
       if [ "$MCP_PUBLISH_TRY" -ge "$MCP_PUBLISH_MAX" ]; then
-        fail "The MCP registry still cannot fetch @yawlabs/mcp@${VERSION} from npm after ${MCP_PUBLISH_MAX} attempts over 180s, although npm serves it from here. Re-run ./release.sh ${VERSION} in a few minutes: steps 1-2 repeat their gates and build, steps 3-4 skip what is done, and step 5 tries again."
+        fail "${MCP_GIVE_UP} Re-run ./release.sh ${VERSION} in a few minutes: steps 1-2 repeat their gates and build, steps 3-4 skip what is done, and step 5 tries again."
       fi
       MCP_PUBLISH_WAIT=$((MCP_PUBLISH_TRY * 30))
-      warn "The MCP registry cannot fetch @yawlabs/mcp@${VERSION} from npm yet (attempt ${MCP_PUBLISH_TRY}/${MCP_PUBLISH_MAX}) -- retrying in ${MCP_PUBLISH_WAIT}s"
+      warn "The MCP registry ${MCP_RETRY_WHY} (attempt ${MCP_PUBLISH_TRY}/${MCP_PUBLISH_MAX}) -- retrying in ${MCP_PUBLISH_WAIT}s"
       MCP_PUBLISH_TRY=$((MCP_PUBLISH_TRY + 1))
       sleep "$MCP_PUBLISH_WAIT"
       continue

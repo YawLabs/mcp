@@ -1043,9 +1043,10 @@ describe("release.sh npm wait budget pre-flight", () => {
     return runBash(body, dir, env);
   }
 
-  it("defaults to 180 s when the variable is unset or empty", () => {
-    expect(run({}).out).toContain("BUDGET=180\n");
-    expect(run({ NPM_PROPAGATION_TIMEOUT: "" }).out).toContain("BUDGET=180\n");
+  it("defaults to 300 s when the variable is unset or empty", () => {
+    // 300, not the 180 this shipped with: npm took 142 s to serve 1.0.17.
+    expect(run({}).out).toContain("BUDGET=300\n");
+    expect(run({ NPM_PROPAGATION_TIMEOUT: "" }).out).toContain("BUDGET=300\n");
   });
 
   it("takes whole seconds, reading leading zeros in base 10", () => {
@@ -1360,6 +1361,40 @@ describe("release.sh mcp-publisher publish retry", () => {
     expect(r.out).not.toContain("CONTINUED");
   });
 
+  it("retries the registry's own 429, 502, 503 and 504 on the publish call", () => {
+    // The 1.0.17 release met the 504 below, word for word, from the
+    // registry's nginx gateway while its listing reads were timing out too.
+    const gateway = (status: string, title: string) =>
+      `Publishing to https://registry.modelcontextprotocol.io...\nError: publish failed: server returned status ${status}: <html>\n<head><title>${status} ${title}</title></head>\n<body>\n<center><h1>${status} ${title}</h1></center>\n<hr><center>nginx</center>\n</body>\n</html>`;
+    const cases: [string, string][] = [
+      ["504", "Gateway Time-out"],
+      ["502", "Bad Gateway"],
+      ["503", "Service Temporarily Unavailable"],
+      ["429", "Too Many Requests"],
+    ];
+    for (const [status, title] of cases) {
+      const r = run(1, gateway(status, title));
+      expect(r.tries, status).toBe(2);
+      expect(r.out, status).toContain(
+        `WARN The MCP registry answered HTTP ${status} itself -- busy or timing out, not a verdict (attempt 1/4) -- retrying in 30s`,
+      );
+      expect(r.out, status).toContain("SLEPT 30\n");
+      expect(r.out, status).toContain("INFO Published server.json to MCP registry");
+      expect(r.out, status).toContain("CONTINUED");
+    }
+  });
+
+  it("gives up on a registry that keeps timing out after four attempts, naming the status", () => {
+    const r = run(
+      99,
+      "Error: publish failed: server returned status 504: <html><title>504 Gateway Time-out</title></html>",
+    );
+    expect(r.tries).toBe(4);
+    expect(r.out).toContain("FAIL The MCP registry still answers HTTP 504 after 4 attempts over 180s");
+    expect(r.out).toContain("Re-run ./release.sh 1.0.17");
+    expect(r.out).not.toContain("CONTINUED");
+  });
+
   it("counts a duplicate version as done: the registry already holds it", () => {
     // The live registry's (v1.8.1) own bodies, not wrapped: its duplicate
     // check returns database.ErrInvalidVersion as-is, and an insert race
@@ -1392,6 +1427,10 @@ describe("release.sh mcp-publisher publish retry", () => {
       "Validation failed. Checking detailed validation errors...\nvalidation failed",
       wrap("NPM package ownership validation failed. Expected mcpName 'io.github.YawLabs/mcp', got 'other'"),
       wrap("NPM package '@yawlabs/mcp' not found (status: 404)"),
+      // A 500 is a server error, not an overload signal, and a status that
+      // merely starts with a retryable one is not that one.
+      'Error: publish failed: server returned status 500: {"title":"Internal Server Error"}',
+      'Error: publish failed: server returned status 5040: {"title":"not a real status"}',
       // The same missing-package 404 behind the preamble mcp-publisher prints
       // after v1.8.1, which names the version: a bare version match would
       // retry it, the validator's own "version '<v>'" does not.
