@@ -764,8 +764,12 @@ describe("release.sh registry_has_version", () => {
     return { out: r.out, args };
   }
 
-  const listing = (version: string) =>
-    JSON.stringify({ servers: [{ server: { name: "io.github.YawLabs/mcp", version } }] });
+  // The exact lookup's body, as the live registry (v1.8.1) returns it.
+  const listing = (version: string, name = "io.github.YawLabs/mcp", status = "active") =>
+    JSON.stringify({
+      server: { name, version },
+      _meta: { "io.modelcontextprotocol.registry/official": { status, isLatest: true } },
+    });
 
   it("hits when the registry lists that exact version", () => {
     expect(run(listing("0.81.0")).out).toContain("HIT");
@@ -773,6 +777,14 @@ describe("release.sh registry_has_version", () => {
 
   it("misses when the registry lists a different version", () => {
     expect(run(listing("0.80.0")).out).toContain("MISS");
+  });
+
+  it("misses on another server's body, or a version marked deleted", () => {
+    // The lookup hides deleted versions unless asked with include_deleted,
+    // but a body saying deleted must not read as listed either way.
+    expect(run(listing("0.81.0", "io.github.YawLabs/other")).out).toContain("MISS");
+    expect(run(listing("0.81.0", "io.github.YawLabs/mcp", "deleted")).out).toContain("MISS");
+    expect(run(listing("0.81.0", "io.github.YawLabs/mcp", "deprecated")).out).toContain("HIT");
   });
 
   it("fails OPEN on an unreachable registry or an unparseable body", () => {
@@ -804,10 +816,17 @@ describe("release.sh registry_has_version", () => {
     expect(new Set(busters).size).toBeGreaterThan(1);
   });
 
-  it("asks for the version it was given, not a hardcoded one", () => {
+  it("asks the exact lookup for the version it was given, not the search listing", () => {
+    // On 2026-09-29 search requests took 25 s or never answered while this
+    // lookup answered in under 6 s.
     const { args } = run(listing("1.2.3"), "1.2.3");
-    expect(args[0]).toContain("version=1.2.3");
-    expect(args[0]).toContain("search=io.github.YawLabs/mcp");
+    expect(args[0]).toMatch(
+      /https:\/\/registry\.modelcontextprotocol\.io\/v0\/servers\/io\.github\.YawLabs%2Fmcp\/versions\/1\.2\.3\?_=\d+/,
+    );
+    expect(args[0]).not.toContain("search=");
+    // -f: the lookup's 404 for an unknown version must reach the parser as
+    // no body at all, not as a JSON error document.
+    expect(args[0]).toMatch(/(^| )-fsSL( |$)/);
   });
 });
 
@@ -1964,10 +1983,12 @@ describe("release.sh oam floor gate (stubbed full run)", () => {
     'out=""; prev=""',
     'for a in "$@"; do if [ "$prev" = "-o" ]; then out="$a"; fi; prev="$a"; done',
     'case "$*" in',
-    // The listing reports a version once the STUB PUBLISHER has published it.
-    "  *registry.modelcontextprotocol.io*)",
-    '    u="$*"; v="${u#*version=}"; v="${v%%&*}"',
-    `    if [ -f "$FAKE_STATE/mcp-published-$v" ]; then printf '{"servers":[{"server":{"version":"%s"}}]}' "$v"; else printf '{"servers":[]}'; fi ;;`,
+    // The registry's exact version lookup reports a version once the STUB
+    // PUBLISHER has published it; before that it is a 404, which `curl -f`
+    // reports as exit 22, as the real one does.
+    "  *registry.modelcontextprotocol.io/v0/servers/io.github.YawLabs%2Fmcp/versions/*)",
+    '    u="$*"; v="${u##*/versions/}"; v="${v%%\\?*}"',
+    `    if [ -f "$FAKE_STATE/mcp-published-$v" ]; then printf '{"server":{"name":"io.github.YawLabs/mcp","version":"%s"},"_meta":{"io.modelcontextprotocol.registry/official":{"status":"active"}}}' "$v"; else echo "curl: (22) The requested URL returned error: 404" >&2; exit 22; fi ;;`,
     // npm's per-version document, the read behind every "is it on npm?"
     // question (npm_version_manifest). An unpublished version is a 404, which
     // `curl -f` reports as exit 22, as the real one does; so is a published
