@@ -65,6 +65,13 @@
 #                                    ordering guard for that run. Implied on a
 #                                    resume, where the version was already
 #                                    chosen by the earlier run.
+#   NPM_PROPAGATION_TIMEOUT=<secs>   How long step 5 waits for npm to serve
+#                                    the version step 4 published before it
+#                                    refuses to publish server.json (default
+#                                    180). The read is npm's uncached
+#                                    per-version document -- see
+#                                    npm_version_manifest -- so this is npm's
+#                                    own write-to-read lag, normally seconds.
 #   SKIP_OAM_FLOOR_VERIFY=1          DISABLES THE OAM FLOOR GATE -- step 1's
 #                                    `npm run verify:oam-floor`, which hosts a
 #                                    stdio @modelcontextprotocol/sdk server on
@@ -334,12 +341,35 @@ command -v npm  >/dev/null || fail "npm not installed"
 command -v git  >/dev/null || fail "git not installed"
 # Step-5 tools (MCP registry publish), preflighted HERE: their first use is
 # AFTER the tag push and the irreversible npm publish, so discovering one
-# missing there strands the release at the registry step. sha256 accepts
-# either binary -- macOS ships shasum, not sha256sum.
-command -v curl >/dev/null || fail "curl not installed (needed for step 5, the MCP registry publish)"
+# missing there strands the release at the registry step. curl carries more
+# than step 5 now -- since npm_version_manifest it is every "is this version
+# on npm?" read, from the pre-flight probe below on -- and those reads are
+# probe-only, so with curl absent every one of them would quietly answer
+# "not on npm" rather than fail. This check is what keeps that from
+# happening. sha256 accepts either binary -- macOS ships shasum, not
+# sha256sum.
+command -v curl >/dev/null || fail "curl not installed (needed for every 'is this version on npm?' read, from the pre-flight already-published probe on, and for step 5's mcp-publisher download)"
 command -v tar  >/dev/null || fail "tar not installed (needed for step 5, the MCP registry publish)"
 { command -v sha256sum >/dev/null || command -v shasum >/dev/null; } \
   || fail "sha256sum/shasum not installed (needed for step 5, the MCP registry publish)"
+
+# >>> npm wait budget
+# Step 5's wait budget, checked here for the same reason as the tools above:
+# its first use is after the irreversible publish, and a duration spelt "3m"
+# or "180s" would otherwise strand the release at the registry step -- the
+# outcome the budget exists to prevent. Digits only, normalised through base
+# 10 so "0180" reads as 180, and at most six of them: past 2^63 that
+# normalisation wraps silently (2^63 itself to a negative budget and an
+# instant timeout, twenty nines to 7.7e18 and a wait that never expires), and
+# unnormalised, bash's [ -ge ] would refuse the digits and the loop would
+# never time out either.
+NPM_WAIT_BUDGET="${NPM_PROPAGATION_TIMEOUT:-180}"
+case "$NPM_WAIT_BUDGET" in
+  *[!0-9]*) fail "NPM_PROPAGATION_TIMEOUT must be a whole number of seconds, got '${NPM_WAIT_BUDGET}'" ;;
+esac
+[ "${#NPM_WAIT_BUDGET}" -le 6 ] || fail "NPM_PROPAGATION_TIMEOUT must be at most 6 digits of seconds, got '${NPM_WAIT_BUDGET}'"
+NPM_WAIT_BUDGET=$((10#$NPM_WAIT_BUDGET))
+# <<< npm wait budget
 
 # --- Guard: the repo-local toolchain must actually be installed. The
 # `command -v` checks above cover the PATH tools; these four live in
@@ -351,7 +381,7 @@ command -v tar  >/dev/null || fail "tar not installed (needed for step 5, the MC
 # passes every other pre-flight check, survives the confirm prompt, and then
 # dies in step 1 with npm's opaque "'biome' is not recognized as an internal
 # or external command" plus a bare "Lint failed (exit 1)" -- after a git fetch
-# and two npm view round-trips have already been paid for. Observed on the
+# and two npm-registry round-trips have already been paid for. Observed on the
 # v0.80.0 release. These are O(1) stat calls, so they run ahead of all of it.
 #
 # The EXTENSIONLESS shim is the portable thing to test: npm's cmd-shim writes
@@ -497,6 +527,93 @@ registry_has_version() {
       } catch { process.exit(1); }
     });
   ' "$want"
+}
+
+# Does npm serve @yawlabs/mcp@$1? Prints that version's manifest -- the JSON
+# body of GET https://registry.npmjs.org/@yawlabs%2Fmcp/<version> -- and
+# returns 0 when it does; prints nothing and returns 1 otherwise. ONE spelling
+# for every "is this version on npm?" read in the script: the pre-flight
+# ALREADY_PUBLISHED probe, the tag-drift guard, step 4's skip and its ARM64
+# tolerance, step 5's wait and the final verification all ask the same
+# question, so they all ask it here and cannot drift.
+#
+# Why not `npm view "@yawlabs/mcp@${VERSION}" version`, which every one of
+# those sites used through 1.0.16. `npm view` fetches the package's WHOLE
+# packument (GET /@yawlabs%2Fmcp), and registry.npmjs.org serves that document
+# from Cloudflare's edge under `Cache-Control: public, max-age=300` --
+# measured 2026-09-28: CF-Cache-Status: HIT with Age: 105, and still HIT with
+# `Cache-Control: no-cache` + `Pragma: no-cache` on the request, so request
+# headers cannot opt out (a fresh `?_=` query can -- measured MISS -- but
+# `npm view` sends none, and the packument would still be the wrong document,
+# see below). For up to five minutes after `npm publish` returns, `npm view`
+# can keep answering from a packument that predates the publish. Step 5
+# polled it ten times and gave up, so recent releases, 1.0.16 included, died
+# at their last step and needed a second run, which passed -- presumably
+# because the edge TTL had expired by then. A single `npm view` also measured
+# about 20 s on this workstation, so ten of them was several minutes, not the
+# "60s" the old message claimed, spent on the wrong document.
+#
+# The PER-VERSION document is what the MCP registry's own validator reads
+# (registry v1.7.9, internal/validators/registries/npm.go: RegistryBaseURL +
+# "/" + PathEscape(identifier) + "/" + PathEscape(version), then the body's
+# `mcpName`). Cloudflare answers it CF-Cache-Status: DYNAMIC (measured the
+# same day) -- never from the edge cache -- so this read sees a publish as
+# soon as npm's own read path does. And because it is the SAME URL the
+# registry fetches before accepting server.json, a hit here is the strongest
+# local evidence that `mcp-publisher publish` will not 400.
+#
+# Cache-busted anyway, the belt-and-braces registry_has_version wears: DYNAMIC
+# is Cloudflare's answer today, not npm's contract, and npm ignores the unknown
+# `_` parameter (verified: 200 with the correct body). `-f` turns npm's 404
+# body ("version not found: X") into a non-zero exit, so a missing version
+# never reaches the parser as a body. $RANDOM rather than %N for the same
+# BSD-date reason as registry_has_version.
+#
+# Probe-only, like registry_has_version: offline, a 5xx, an unparseable body
+# all read as "not on npm", which is how every caller treated an empty `npm
+# view`. A body whose `version` is not $1 reads as a miss too -- that would be
+# an API change, and a hit on it would be a guess.
+npm_version_manifest() {
+  local want="$1"
+  local body
+  body=$(curl -fsSL --max-time 20 -H 'Accept: application/json' -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
+    "https://registry.npmjs.org/@yawlabs%2Fmcp/${want}?_=$(date +%s)${RANDOM}" 2>/dev/null || echo "")
+  [ -n "$body" ] || return 1
+  printf %s "$body" | node -e '
+    let s = "";
+    process.stdin.on("data", (d) => { s += d; });
+    process.stdin.on("end", () => {
+      try {
+        const j = JSON.parse(s);
+        if (j && j.version === process.argv[1]) { process.stdout.write(s); process.exit(0); }
+      } catch { /* not JSON: a miss, below */ }
+      process.exit(1);
+    });
+  ' "$want"
+}
+
+# The yes/no form, for the sites that only need the answer.
+npm_has_version() {
+  npm_version_manifest "$1" >/dev/null
+}
+
+# One dotted field out of a manifest npm_version_manifest printed, e.g.
+# `npm_manifest_field "$body" dist.integrity`. Prints the string value, or
+# nothing for a missing path, a non-string or an unparseable body -- the final
+# verification's tarball check reads an empty integrity as "could not
+# compare", never as a match.
+npm_manifest_field() {
+  printf %s "$1" | node -e '
+    let s = "";
+    process.stdin.on("data", (d) => { s += d; });
+    process.stdin.on("end", () => {
+      let v;
+      try {
+        v = process.argv[1].split(".").reduce((o, k) => (o == null ? undefined : o[k]), JSON.parse(s));
+      } catch { v = undefined; }
+      process.stdout.write(typeof v === "string" ? v : "");
+    });
+  ' "$2"
 }
 
 # Rewrite server.json's version + packages[0].version to $1. Used by both the
@@ -681,7 +798,8 @@ if [ -z "$LATEST_NPM" ]; then
     fail "npm view returned nothing for @yawlabs/mcp -- cannot verify version ordering. The package IS published, so this is a registry read failure, not a first publish; continuing would silently disable the backward-version guard. Retry, or set ALLOW_UNVERIFIED_VERSION=1 to proceed deliberately."
   fi
 fi
-ALREADY_PUBLISHED=$(npm view "@yawlabs/mcp@${VERSION}" version 2>/dev/null || echo "")
+ALREADY_PUBLISHED=""
+if npm_has_version "$VERSION"; then ALREADY_PUBLISHED="$VERSION"; fi
 if [ -n "$LATEST_NPM" ] && [ "$ALREADY_PUBLISHED" != "$VERSION" ]; then
   if node -e 'const a=process.argv[1].split(".").map(Number),b=process.argv[2].split(".").map(Number);for(let i=0;i<3;i++){if((a[i]||0)>(b[i]||0))process.exit(0);if((a[i]||0)<(b[i]||0))process.exit(1);}process.exit(1);' "$VERSION" "$LATEST_NPM"; then
     info "Version ${VERSION} > published latest ${LATEST_NPM}"
@@ -692,7 +810,7 @@ fi
 
 # --- Guard: the ~/.npmrc credential is not exercised until step 4's publish,
 # which runs AFTER step 3 has committed, tagged and pushed v${VERSION} to
-# protected main. The `npm view` calls above are public reads and prove nothing
+# protected main. The npm reads above are public and prove nothing
 # about auth. Probe it here -- but fail OPEN unless the output actually carries
 # a definitive auth error. An unreachable registry and npm's ARM64 exit-cleanup
 # segfault both match none of the auth patterns, so both land in the warn: the
@@ -971,6 +1089,7 @@ else
   info "Nothing to commit (already at v${VERSION})"
 fi
 
+# >>> tag-at-HEAD guard
 if git tag -l "v${VERSION}" | grep -q "v${VERSION}"; then
   # A pre-existing tag is the normal resume shape, but "the tag exists" is not
   # the same as "the tag describes what step 4 is about to publish". If the
@@ -991,7 +1110,8 @@ if git tag -l "v${VERSION}" | grep -q "v${VERSION}"; then
   EXISTING_TAG_SHA=$(git rev-list -n1 "v${VERSION}")
   HEAD_SHA=$(current_head_sha)
   if [ "$EXISTING_TAG_SHA" != "$HEAD_SHA" ]; then
-    TAG_DRIFT_PUBLISHED=$(npm view "@yawlabs/mcp@${VERSION}" version 2>/dev/null || echo "")
+    TAG_DRIFT_PUBLISHED=""
+    if npm_has_version "$VERSION"; then TAG_DRIFT_PUBLISHED="$VERSION"; fi
     if [ "$TAG_DRIFT_PUBLISHED" = "$VERSION" ]; then
       warn "Tag v${VERSION} points at ${EXISTING_TAG_SHA:0:9}, not HEAD (${HEAD_SHA:0:9}), but ${VERSION} is already on npm so step 4 will pack nothing -- continuing. The tag describes what was published; commits made since it are NOT in that tarball."
     else
@@ -1006,6 +1126,7 @@ else
   git tag -a "v${VERSION}" -m "v${VERSION}"
   info "Tag v${VERSION} created"
 fi
+# <<< tag-at-HEAD guard
 
 # Re-verify package.json matches the tag BEFORE pushing -- catching a stale
 # local index that was bumped-after-tag here prevents the "tag pushed without
@@ -1053,7 +1174,8 @@ step 4 "Publish to npm"
 # (NOT a WebAuthn web session -- the npm publishing rule in CLAUDE.md is
 # explicit on this: `npm login --auth-type=web` overwrites the automation
 # token and the next publish EOTPs on WebAuthn).
-PUBLISHED_VERSION=$(npm view "@yawlabs/mcp@${VERSION}" version 2>/dev/null || echo "")
+PUBLISHED_VERSION=""
+if npm_has_version "$VERSION"; then PUBLISHED_VERSION="$VERSION"; fi
 # Which branch ran decides how the final tarball-content check READS a
 # mismatch: bytes on npm that differ from what THIS run packed are an anomaly,
 # while bytes that differ from a tree whose version was already live are the
@@ -1062,9 +1184,11 @@ NPM_PUBLISHED_THIS_RUN=false
 if [ "$PUBLISHED_VERSION" = "$VERSION" ]; then
   info "@yawlabs/mcp@${VERSION} already on npm -- skipping"
 else
+  # >>> step-4 npm publish
   # Retry up to 3 times on EOTP/EAUTH/OTP (WebAuthn-fresh sessions sometimes
   # need ~30s for the auth backend to propagate); fail fast on everything else
   # so a packaging error or duplicate-version doesn't waste 60s spinning.
+  NPM_ALREADY_THERE=false
   ATTEMPT=1
   MAX_ATTEMPTS=3
   while true; do
@@ -1087,8 +1211,7 @@ else
     if [ "$IS_MINGW_ARM64" = true ] && { [ "$PUBLISH_RC" -eq 139 ] || [ "$PUBLISH_RC" -eq 134 ]; }; then
       PUBLISH_PROBE=""
       for PROBE_TRY in 1 2 3; do
-        PUBLISH_PROBE=$(npm view "@yawlabs/mcp@${VERSION}" version 2>/dev/null || echo "")
-        [ "$PUBLISH_PROBE" = "$VERSION" ] && break
+        if npm_has_version "$VERSION"; then PUBLISH_PROBE="$VERSION"; break; fi
         sleep 6
       done
       if [ "$PUBLISH_PROBE" = "$VERSION" ]; then
@@ -1096,6 +1219,19 @@ else
         rm -f "$PUBLISH_LOG"
         break
       fi
+    fi
+    # npm's own word that the version is already there: the E403 "You cannot
+    # publish over the previously published versions". Reachable when the
+    # skip probe above missed a version npm holds -- its read path lagging its
+    # write path, or this host unable to reach it -- which is exactly the
+    # state a re-run after step 5's timeout starts from. Treated as the skip
+    # it should have been, so that re-run's advice holds: NPM_PUBLISHED_THIS_RUN
+    # stays false, and the tarball check at the end reads any difference as
+    # post-tag drift, not as a corrupted publish.
+    if grep -q 'cannot publish over the previously published versions' "$PUBLISH_LOG"; then
+      rm -f "$PUBLISH_LOG"
+      NPM_ALREADY_THERE=true
+      break
     fi
     if ! grep -qE 'EOTP|EAUTH|one-time password|OTP' "$PUBLISH_LOG"; then
       rm -f "$PUBLISH_LOG"
@@ -1109,8 +1245,13 @@ else
     ATTEMPT=$((ATTEMPT + 1))
     sleep 30
   done
-  NPM_PUBLISHED_THIS_RUN=true
-  info "Published @yawlabs/mcp@${VERSION} to npm"
+  if [ "$NPM_ALREADY_THERE" = true ]; then
+    warn "npm already holds @yawlabs/mcp@${VERSION} (its E403 said so) though the pre-publish read did not show it yet -- treating step 4 as skipped; npm's read path is lagging, or this host cannot read it, and step 5 waits for it unless the MCP registry already lists the version"
+  else
+    NPM_PUBLISHED_THIS_RUN=true
+    info "Published @yawlabs/mcp@${VERSION} to npm"
+  fi
+  # <<< step-4 npm publish
 fi
 
 step 5 "Publish server.json to MCP registry"
@@ -1128,18 +1269,48 @@ fi
 if [ "$REGISTRY_HAS_VERSION" = true ]; then
   info "io.github.YawLabs/mcp@${VERSION} already on the MCP registry -- skipping publish"
 else
-  # Check the published-npm first; mcp-publisher's `publish` validates that the
-  # referenced npm package exists, and the registry mirror can lag the write
-  # path by seconds.
-  NPM_NOW=""
-  for POLL_TRY in 1 2 3 4 5 6 7 8 9 10; do
-    NPM_NOW=$(npm view "@yawlabs/mcp@${VERSION}" version 2>/dev/null || echo "")
-    [ "$NPM_NOW" = "$VERSION" ] && break
-    sleep 6
+  # >>> step-5 npm wait
+  # Before `mcp-publisher publish`: the registry accepts server.json only after
+  # ITS fetch of npm's per-version document succeeds (npm_version_manifest has
+  # the URL and the validator's source line), so wait until that document
+  # answers from here. Cloudflare never serves it from the edge cache, so what
+  # this waits on is npm's own write-to-read lag -- normally seconds -- and the
+  # budget is NPM_WAIT_BUDGET seconds -- NPM_PROPAGATION_TIMEOUT, default 180,
+  # validated in the pre-flight so a typo cannot fail the release here, after
+  # the publish -- a clock, not the ten reads that used to expire against the
+  # packument's five-minute edge TTL. Wall-clock elapsed rather than a count
+  # of sleeps, so the figures in the messages stay true when a read itself is
+  # slow; a progress line every 30 s so a slow npm reads as waiting, not as
+  # hung.
+  NPM_WAIT_START=$(date +%s)
+  NPM_WAIT_TICK=30
+  NPM_WAITED=0
+  NPM_READS=0
+  NPM_SERVES_VERSION=false
+  while true; do
+    NPM_READS=$((NPM_READS + 1))
+    if npm_has_version "$VERSION"; then
+      NPM_SERVES_VERSION=true
+    fi
+    NPM_WAITED=$(( $(date +%s) - NPM_WAIT_START ))
+    if [ "$NPM_SERVES_VERSION" = true ] || [ "$NPM_WAITED" -ge "$NPM_WAIT_BUDGET" ]; then
+      break
+    fi
+    if [ "$NPM_WAITED" -ge "$NPM_WAIT_TICK" ]; then
+      echo "  ... npm does not serve @yawlabs/mcp@${VERSION} yet (${NPM_WAITED}s of ${NPM_WAIT_BUDGET}s)"
+      NPM_WAIT_TICK=$((NPM_WAIT_TICK + 30))
+    fi
+    sleep 5
   done
-  if [ "$NPM_NOW" != "$VERSION" ]; then
-    fail "npm does not show @yawlabs/mcp@${VERSION} after 60s -- refusing to publish to MCP registry (it would 400)"
+  if [ "$NPM_SERVES_VERSION" != true ]; then
+    fail "npm does not serve @yawlabs/mcp@${VERSION} after ${NPM_WAITED}s of reading https://registry.npmjs.org/@yawlabs%2Fmcp/${VERSION} every 5s -- refusing to publish to the MCP registry, whose validator reads that same document and would answer 400. npm accepted the publish in step 4, so its read path is lagging its write path, or this host cannot reach it. Once that URL answers from here (curl it), re-run ./release.sh ${VERSION}: steps 1-2 repeat their gates and build, steps 3-4 skip what is done, and step 5 waits again; NPM_PROPAGATION_TIMEOUT=600 gives it longer."
   fi
+  if [ "$NPM_READS" -gt 1 ]; then
+    info "npm serves @yawlabs/mcp@${VERSION} (after ${NPM_WAITED}s and ${NPM_READS} reads)"
+  else
+    info "npm serves @yawlabs/mcp@${VERSION}"
+  fi
+  # <<< step-5 npm wait
 
   # Download + sha256-verify mcp-publisher to a temp dir. Pinned + digest-verified
   # the same way the old CI workflow did.
@@ -1245,8 +1416,50 @@ else
     info "Reusing persisted mcp-publisher token at ${TOKEN_FILE}"
   fi
 
-  "${WORKDIR}/${BIN_NAME}" publish
+  # >>> mcp-publisher publish
+  # The registry checks the npm side of server.json by fetching, from ITS
+  # network, the per-version document step 5 has just seen from here. npm's
+  # read path is not one machine, so the two can disagree for a few seconds
+  # longer, and the registry then answers 400 with its validator's "not found
+  # (status: 404)" in the body: the same lag, seen from the far side, retried
+  # here on the same clock. The validator spells EVERY non-200 from npm that
+  # way -- "not found (status: 503)" for an npm 5xx or 429 on the registry's
+  # side -- and a non-200 for a document this host has just read as 200 is
+  # transient by construction, so any status inside that phrase is retried,
+  # and so is the same validator's "failed to fetch package metadata from
+  # NPM", its word for a request to npm that got no status at all; none of
+  # the 400s that must not be retried carries either (the duplicate version
+  # and the mcpName mismatch have their own words). Anything else fails at
+  # once with mcp-publisher's own text -- an expired login, the 422 schema
+  # report, a duplicate version,
+  # a mcpName that does not match -- because none of those gets better by
+  # waiting. `|| RC=$?` for the same reason as step 4: the exit code is
+  # needed, and under pipefail the pipeline carries the publisher's, not tee's.
+  MCP_PUBLISH_TRY=1
+  MCP_PUBLISH_MAX=6
+  while true; do
+    MCP_PUBLISH_LOG=$(mktemp)
+    MCP_PUBLISH_RC=0
+    "${WORKDIR}/${BIN_NAME}" publish 2>&1 | tee "$MCP_PUBLISH_LOG" || MCP_PUBLISH_RC=$?
+    if [ "$MCP_PUBLISH_RC" -eq 0 ]; then
+      rm -f "$MCP_PUBLISH_LOG"
+      break
+    fi
+    if grep -q 'status 400' "$MCP_PUBLISH_LOG" && grep -qE 'not found \(status: [0-9]+\)|failed to fetch package metadata from NPM' "$MCP_PUBLISH_LOG"; then
+      rm -f "$MCP_PUBLISH_LOG"
+      if [ "$MCP_PUBLISH_TRY" -ge "$MCP_PUBLISH_MAX" ]; then
+        fail "The MCP registry still cannot fetch @yawlabs/mcp@${VERSION} from npm after ${MCP_PUBLISH_MAX} attempts, although npm serves it from here. Re-run ./release.sh ${VERSION} in a minute: steps 1-2 repeat their gates and build, steps 3-4 skip what is done, and step 5 tries again."
+      fi
+      warn "The MCP registry cannot fetch @yawlabs/mcp@${VERSION} from npm yet (attempt ${MCP_PUBLISH_TRY}/${MCP_PUBLISH_MAX}) -- retrying in 10s"
+      MCP_PUBLISH_TRY=$((MCP_PUBLISH_TRY + 1))
+      sleep 10
+      continue
+    fi
+    rm -f "$MCP_PUBLISH_LOG"
+    fail "mcp-publisher publish failed (exit ${MCP_PUBLISH_RC}) -- its output is above. Fix the cause and re-run ./release.sh ${VERSION}: steps 1-2 repeat their gates and build, steps 3-4 skip what is done."
+  done
   info "Published server.json to MCP registry"
+  # <<< mcp-publisher publish
 fi
 
 # Final verification across the channels this script owns: npm (its version
@@ -1262,11 +1475,14 @@ fi
 # read already existed in step 5.
 echo ""
 echo -e "${CYAN}Verifying...${NC}"
-NPM_FINAL=$(npm view "@yawlabs/mcp@${VERSION}" version 2>/dev/null || echo "")
-if [ "$NPM_FINAL" = "$VERSION" ]; then
-  info "npm: @yawlabs/mcp@${NPM_FINAL}"
+# One read of npm's per-version document (npm_version_manifest: the uncached
+# one, never `npm view`) serves both npm checks below -- the version, and the
+# integrity of the tarball it carries.
+NPM_FINAL_MANIFEST=$(npm_version_manifest "$VERSION" || echo "")
+if [ -n "$NPM_FINAL_MANIFEST" ]; then
+  info "npm: @yawlabs/mcp@${VERSION}"
 else
-  warn "npm shows ${NPM_FINAL:-nothing} (expected $VERSION)"
+  warn "npm does not serve @yawlabs/mcp@${VERSION} (https://registry.npmjs.org/@yawlabs%2Fmcp/${VERSION} answered nothing usable)"
 fi
 
 # CONTENT, not the version string. An npm tarball is content-addressed: `npm
@@ -1281,11 +1497,13 @@ fi
 # --dry-run writes no tarball and runs no prepublishOnly rebuild, so it is
 # cheap and side-effect free. The JSON on stdout is authoritative rather than
 # npm's exit code -- the ARM64 exit-cleanup segfault lands AFTER the report,
-# the same rule every other npm call in this script follows. Fail-OPEN
-# throughout: an unreadable integrity on either side warns that the comparison
-# could not run. Nothing here can fail the release, which has already gone out
-# and cannot be taken back.
-PUBLISHED_INTEGRITY=$(npm view "@yawlabs/mcp@${VERSION}" dist.integrity 2>/dev/null | tr -d '[:space:]' || echo "")
+# the same rule every other npm call in this script follows. The published
+# side is the `dist.integrity` of the manifest read above: no second
+# round-trip, and never through `npm view`. Fail-OPEN throughout: an
+# unreadable integrity on either side warns that the comparison could not
+# run. Nothing here can fail the release, which has already gone out and
+# cannot be taken back.
+PUBLISHED_INTEGRITY=$(npm_manifest_field "$NPM_FINAL_MANIFEST" dist.integrity)
 LOCAL_INTEGRITY=$(npm pack --dry-run --json 2>/dev/null | node -e '
   let s = "";
   process.stdin.on("data", (d) => { s += d; });
@@ -1322,7 +1540,7 @@ done
 if [ "$REGISTRY_FINAL" = true ]; then
   info "MCP registry: io.github.YawLabs/mcp@${VERSION}"
 else
-  warn "The MCP registry does not list io.github.YawLabs/mcp@${VERSION} after 3 reads. Re-run ./release.sh ${VERSION} -- steps 1-4 no-op once published, and step 5 will re-publish if the version really is absent."
+  warn "The MCP registry does not list io.github.YawLabs/mcp@${VERSION} after 3 reads. Re-run ./release.sh ${VERSION} -- steps 1-2 repeat their gates and build, steps 3-4 skip what is published, and step 5 will re-publish if the version really is absent."
 fi
 
 PKG_FINAL=$(current_pkg_version)
