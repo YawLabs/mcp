@@ -114,7 +114,7 @@ function newTmp(prefix: string): string {
  *
  * NPM_PROPAGATION_TIMEOUT goes too. release.sh runs this suite in step 1, and
  * its step-5 timeout tells the operator to re-run with that variable set; the
- * "defaults to 180 s" case would then read the operator's value and fail the
+ * "defaults to 300 s" case would then read the operator's value and fail the
  * gate of the very re-run it prescribed. Cases that set it pass it explicitly
  * through runBash's env, which still overrides.
  */
@@ -883,11 +883,12 @@ describe("release.sh MCP-registry read-back", () => {
   const block = extractBlock("REGISTRY_FINAL=false", "fi");
   const dir = newTmp("release-rb-");
 
-  function run(hitOnTry: number | null, alreadyListed = false): RunResult {
+  function run(hitOnTry: number | null, alreadyListed = false, gatewayRetried = false): RunResult {
     const body = [
       STUB_HELPERS,
       'VERSION="0.81.0"',
       `MCP_ALREADY_LISTED=${alreadyListed}`,
+      `MCP_GATEWAY_RETRIED=${gatewayRetried}`,
       "TRIES=0",
       "sleep() { :; }",
       `registry_has_version() { TRIES=$((TRIES + 1)); if [ -n "${hitOnTry ?? ""}" ] && [ "$TRIES" -ge "${hitOnTry ?? 0}" ]; then return 0; fi; return 1; }`,
@@ -928,6 +929,17 @@ describe("release.sh MCP-registry read-back", () => {
     const r = run(null, true);
     expect(r.out).toContain("WARN The MCP registry refused io.github.YawLabs/mcp@0.81.0 as a duplicate");
     expect(r.out).toContain("mcp-publisher status");
+    expect(r.out).not.toContain("Re-run ./release.sh");
+    expect(r.status).toBe(0);
+  });
+
+  it("reads an unlisted duplicate after the registry's own timeout as a slow listing, not a deleted version", () => {
+    // The duplicate proves the version landed on this run; the listing reads
+    // failing afterwards is the same slowness that timed the publish out.
+    const r = run(null, true, true);
+    expect(r.out).toContain("WARN The MCP registry refused a retry of io.github.YawLabs/mcp@0.81.0 as a duplicate");
+    expect(r.out).toContain("answering slowly on this run");
+    expect(r.out).not.toContain("marked deleted");
     expect(r.out).not.toContain("Re-run ./release.sh");
     expect(r.status).toBe(0);
   });
@@ -1043,9 +1055,10 @@ describe("release.sh npm wait budget pre-flight", () => {
     return runBash(body, dir, env);
   }
 
-  it("defaults to 180 s when the variable is unset or empty", () => {
-    expect(run({}).out).toContain("BUDGET=180\n");
-    expect(run({ NPM_PROPAGATION_TIMEOUT: "" }).out).toContain("BUDGET=180\n");
+  it("defaults to 300 s when the variable is unset or empty", () => {
+    // 300, not the 180 this shipped with: npm took 142 s to serve 1.0.17.
+    expect(run({}).out).toContain("BUDGET=300\n");
+    expect(run({ NPM_PROPAGATION_TIMEOUT: "" }).out).toContain("BUDGET=300\n");
   });
 
   it("takes whole seconds, reading leading zeros in base 10", () => {
@@ -1096,7 +1109,7 @@ describe("release.sh npm wait budget pre-flight", () => {
 describe("release.sh step-5 npm wait", () => {
   // The wait that replaced ten `npm view` reads against a five-minute edge
   // cache: a clock (NPM_WAIT_BUDGET, the pre-flight's reading of
-  // NPM_PROPAGATION_TIMEOUT, default 180 s) over the uncached per-version
+  // NPM_PROPAGATION_TIMEOUT, default 300 s) over the uncached per-version
   // read. Driven on a fake clock -- sleep advances it, date reads it -- with
   // npm_has_version answering from a read counter.
   const block = extractBlock("  # >>> step-5 npm wait", "  # <<< step-5 npm wait");
@@ -1278,14 +1291,16 @@ describe("release.sh mcp-publisher publish retry", () => {
     wrap("failed to fetch package metadata from NPM: context deadline exceeded"),
   ];
 
-  function run(failures: number, failureText: string): RunResult & { tries: number } {
+  function run(failures: number, failureText: string, thenText = ""): RunResult & { tries: number } {
     const work = newTmp("release-pub-bin-");
     // The publisher stub fails `failures` times with `failureText`, then
-    // publishes. Its attempt count lives in a file: each call is a process.
+    // publishes -- or, when `thenText` is set, fails with that instead. Its
+    // attempt count lives in a file: each call is a process.
     const stub = [
       "#!/bin/bash",
       'n=$(cat "$FAKE_STATE/tries" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$FAKE_STATE/tries"',
       `if [ "$n" -le ${failures} ]; then echo "$FAKE_FAILURE" >&2; exit 1; fi`,
+      'if [ -n "$FAKE_THEN" ]; then echo "$FAKE_THEN" >&2; exit 1; fi',
       'echo "Successfully published io.github.YawLabs/mcp@1.0.17"',
       "",
     ].join("\n");
@@ -1301,10 +1316,12 @@ describe("release.sh mcp-publisher publish retry", () => {
       'BIN_NAME="mcp-publisher"',
       // Records each wait instead of taking it.
       'sleep() { echo "SLEPT $1"; }',
+      // The token check the retry repeats; records its arguments.
+      'mcp_registry_ensure_token() { echo "ENSURE $*"; }',
       block,
       'echo "CONTINUED"',
     ].join("\n");
-    const r = runBash(body, dir, { FAKE_STATE: shPath(work), FAKE_FAILURE: failureText });
+    const r = runBash(body, dir, { FAKE_STATE: shPath(work), FAKE_FAILURE: failureText, FAKE_THEN: thenText });
     const tries = Number(readFileSync(join(work, "tries"), "utf8").trim());
     return { ...r, tries };
   }
@@ -1360,6 +1377,58 @@ describe("release.sh mcp-publisher publish retry", () => {
     expect(r.out).not.toContain("CONTINUED");
   });
 
+  it("retries the registry's own 429, 502, 503 and 504 on the publish call", () => {
+    // The 1.0.17 release met the 504 below, word for word, from the
+    // registry's nginx gateway while its listing reads were timing out too.
+    const gateway = (status: string, title: string) =>
+      `Publishing to https://registry.modelcontextprotocol.io...\nError: publish failed: server returned status ${status}: <html>\n<head><title>${status} ${title}</title></head>\n<body>\n<center><h1>${status} ${title}</h1></center>\n<hr><center>nginx</center>\n</body>\n</html>`;
+    const cases: [string, string][] = [
+      ["504", "Gateway Time-out"],
+      ["502", "Bad Gateway"],
+      ["503", "Service Temporarily Unavailable"],
+      ["429", "Too Many Requests"],
+    ];
+    for (const [status, title] of cases) {
+      const r = run(1, gateway(status, title));
+      expect(r.tries, status).toBe(2);
+      expect(r.out, status).toContain(
+        `WARN The MCP registry answered HTTP ${status} itself -- busy or timing out, not a verdict (attempt 1/4) -- retrying in 30s`,
+      );
+      expect(r.out, status).toContain("SLEPT 30\n");
+      // The token is re-checked before the retry, after the wait.
+      expect(r.out, status).toMatch(/SLEPT 30\nENSURE 120 quiet\n/);
+      expect(r.out, status).toContain("INFO Published server.json to MCP registry");
+      expect(r.out, status).toContain("CONTINUED");
+    }
+  });
+
+  it("reads a duplicate right after the registry's own timeout as this run's attempt having landed", () => {
+    // The timed-out attempt was saved; the retry meets it as a duplicate.
+    const r = run(
+      1,
+      "Error: publish failed: server returned status 504: <html><title>504 Gateway Time-out</title></html>",
+      'Error: publish failed: server returned status 400: {"title":"Bad Request","status":400,"detail":"Failed to publish server","errors":[{"message":"invalid version: cannot publish duplicate version"}]}',
+    );
+    expect(r.tries).toBe(2);
+    expect(r.out).toContain(
+      "INFO Published server.json to MCP registry: the attempt that timed out landed, and the registry refused the retry of io.github.YawLabs/mcp@1.0.17 as a duplicate",
+    );
+    expect(r.out).not.toContain("already holds");
+    expect(r.out).not.toContain("FAIL");
+    expect(r.out).toContain("CONTINUED");
+  });
+
+  it("gives up on a registry that keeps timing out after four attempts, naming the status", () => {
+    const r = run(
+      99,
+      "Error: publish failed: server returned status 504: <html><title>504 Gateway Time-out</title></html>",
+    );
+    expect(r.tries).toBe(4);
+    expect(r.out).toContain("FAIL The MCP registry still answers HTTP 504 after 4 attempts over 180s");
+    expect(r.out).toContain("Re-run ./release.sh 1.0.17");
+    expect(r.out).not.toContain("CONTINUED");
+  });
+
   it("counts a duplicate version as done: the registry already holds it", () => {
     // The live registry's (v1.8.1) own bodies, not wrapped: its duplicate
     // check returns database.ErrInvalidVersion as-is, and an insert race
@@ -1392,6 +1461,10 @@ describe("release.sh mcp-publisher publish retry", () => {
       "Validation failed. Checking detailed validation errors...\nvalidation failed",
       wrap("NPM package ownership validation failed. Expected mcpName 'io.github.YawLabs/mcp', got 'other'"),
       wrap("NPM package '@yawlabs/mcp' not found (status: 404)"),
+      // A 500 is a server error, not an overload signal, and a status that
+      // merely starts with a retryable one is not that one.
+      'Error: publish failed: server returned status 500: {"title":"Internal Server Error"}',
+      'Error: publish failed: server returned status 5040: {"title":"not a real status"}',
       // The same missing-package 404 behind the preamble mcp-publisher prints
       // after v1.8.1, which names the version: a bare version match would
       // retry it, the validator's own "version '<v>'" does not.

@@ -68,10 +68,11 @@
 #   NPM_PROPAGATION_TIMEOUT=<secs>   How long step 5 waits for npm to serve
 #                                    the version step 4 published before it
 #                                    refuses to publish server.json (default
-#                                    180). The read is npm's uncached
+#                                    300). The read is npm's uncached
 #                                    per-version document -- see
 #                                    npm_version_manifest -- so this is npm's
-#                                    own write-to-read lag, normally seconds.
+#                                    own write-to-read lag: 142 s on the 1.0.17
+#                                    release.
 #   SKIP_OAM_FLOOR_VERIFY=1          DISABLES THE OAM FLOOR GATE -- step 1's
 #                                    `npm run verify:oam-floor`, which hosts a
 #                                    stdio @modelcontextprotocol/sdk server on
@@ -363,7 +364,7 @@ command -v tar  >/dev/null || fail "tar not installed (needed for step 5, the MC
 # instant timeout, twenty nines to 7.7e18 and a wait that never expires), and
 # unnormalised, bash's [ -ge ] would refuse the digits and the loop would
 # never time out either.
-NPM_WAIT_BUDGET="${NPM_PROPAGATION_TIMEOUT:-180}"
+NPM_WAIT_BUDGET="${NPM_PROPAGATION_TIMEOUT:-300}"
 case "$NPM_WAIT_BUDGET" in
   *[!0-9]*) fail "NPM_PROPAGATION_TIMEOUT must be a whole number of seconds, got '${NPM_WAIT_BUDGET}'" ;;
 esac
@@ -1264,9 +1265,11 @@ step 5 "Publish server.json to MCP registry"
 # registry_has_version carries the cache-buster and the fail-open contract;
 # see its header for why an un-busted read breaks exactly this guarantee.
 REGISTRY_HAS_VERSION=false
-# Set by the publish block below when the registry refuses a duplicate; read
-# again by the final verification, so it needs a value on every path.
+# Set by the publish block below when the registry refuses a duplicate, and
+# when it retried the registry's own gateway error; both are read again by
+# the final verification, so they need a value on every path.
 MCP_ALREADY_LISTED=false
+MCP_GATEWAY_RETRIED=false
 if registry_has_version "$VERSION"; then
   REGISTRY_HAS_VERSION=true
 fi
@@ -1279,9 +1282,11 @@ else
   # ITS fetch of npm's per-version document succeeds (npm_version_manifest has
   # the URL and the validator's source line), so wait until that document
   # answers from here. Cloudflare never serves it from the edge cache, so what
-  # this waits on is npm's own write-to-read lag -- normally seconds -- and the
-  # budget is NPM_WAIT_BUDGET seconds -- NPM_PROPAGATION_TIMEOUT, default 180,
-  # validated in the pre-flight so a typo cannot fail the release here, after
+  # this waits on is npm's own write-to-read lag. That is not seconds: the
+  # 1.0.17 release (2026-09-29) waited 142 s over 24 reads for it. The budget
+  # is NPM_WAIT_BUDGET seconds -- NPM_PROPAGATION_TIMEOUT, default 300, which
+  # is what the sibling MCP repos' own gates default to and about twice that
+  # measurement -- validated in the pre-flight so a typo cannot fail the release here, after
   # the publish -- a clock, not the ten reads that used to expire against the
   # packument's five-minute edge TTL. Wall-clock elapsed rather than a count
   # of sleeps, so the figures in the messages stay true when a read itself is
@@ -1368,62 +1373,69 @@ else
   # exchanges the GitHub token for a fresh Registry JWT and writes it to
   # ~/.config/mcp-publisher/token.json.
   TOKEN_FILE="${HOME}/.config/mcp-publisher/token.json"
-  # Return 0 (true in shell `if`) iff the persisted token is missing, unparseable,
-  # or expired. Reads the JWT's `exp` claim via node so we don't reinvent the
-  # JWT parser in bash. "Expired" includes a token with under 240 s left: the
-  # registry issues them for 5 minutes (v1.8.1 internal/auth/jwt.go), and the
-  # publish retry below can run 180 s, so a token reused with less than that
-  # to spare can lapse between attempts and turn the lag the retry absorbs
-  # into a 401 that fails the release.
-  TOKEN_STATUS=$(mktemp)
-  node -e '
-    const fs = require("fs");
-    const path = process.argv[1];
-    if (!fs.existsSync(path)) { process.stdout.write("missing"); process.exit(0); }
-    let t;
-    try { t = JSON.parse(fs.readFileSync(path, "utf-8")); } catch { process.stdout.write("unparseable"); process.exit(0); }
-    const p = (t.token || "").split(".")[1];
-    if (!p) { process.stdout.write("unparseable"); process.exit(0); }
-    let claims;
-    try { claims = JSON.parse(Buffer.from(p, "base64url").toString()); } catch { process.stdout.write("unparseable"); process.exit(0); }
-    if (typeof claims.exp === "number" && claims.exp * 1000 > Date.now() + 240000) {
-      process.stdout.write("valid");
-    } else {
-      process.stdout.write("expired");
-    }
-  ' "$TOKEN_FILE" > "$TOKEN_STATUS" 2>/dev/null || echo "unparseable" > "$TOKEN_STATUS"
-  TOKEN_STATE=$(cat "$TOKEN_STATUS")
-  rm -f "$TOKEN_STATUS"
-  if [ "$TOKEN_STATE" != "valid" ]; then
-    # Token refresh needs a GitHub token with publish rights on
-    # `io.github.YawLabs/*` (per the prior release memory for the parallel
-    # ssh-mcp repo, the MCP Registry `mcp-publisher` auth needs `read:org`).
-    # Resolution order:
-    #   1. $GITHUB_TOKEN (explicit env, takes priority -- the operator's
-    #      workstation with a fine-grained PAT)
-    #   2. $MCP_REGISTRY_TOKEN (an explicit override name some setups use)
-    #   3. `gh auth token` (works on any host that has the `gh` CLI
-    #      authenticated -- the established fallback for the parallel
-    #      ssh-mcp / npmjs-mcp release scripts per their memory)
-    # The mcp-publisher binary only needs a GitHub token at login time; it
-    # persists its own registry JWT to ${TOKEN_FILE} afterward, so the
-    # GitHub token does NOT need to be in env for subsequent releases.
-    # Same resolution the pre-flight probe ran, through the shared helper so
-    # the two cannot drift. The info() stays HERE rather than inside the
-    # helper: the helper's stdout is captured, so anything printed in it would
-    # be concatenated into the token itself.
-    REGISTRY_GH_TOKEN=$(mcp_registry_gh_token)
-    if [ -n "$REGISTRY_GH_TOKEN" ] && [ -z "${GITHUB_TOKEN:-}" ] && [ -z "${MCP_REGISTRY_TOKEN:-}" ]; then
-      info "MCP-registry auth: using \`gh auth token\` (fallback)"
+  # mcp_registry_ensure_token <margin-seconds> [quiet]: make sure the persisted
+  # registry token has at least <margin> seconds left, refreshing it through
+  # `mcp-publisher login github` when it is missing, unparseable, or closer to
+  # expiry than that. Reads the JWT's `exp` claim via node so we don't
+  # reinvent the JWT parser in bash. The registry issues tokens for 5 minutes
+  # (v1.8.1 internal/auth/jwt.go). Called with 240 s before the first
+  # publish, and again, quietly, with 120 s before every retry below: an
+  # attempt that meets a timing-out gateway spends the gateway's own timeout
+  # before its 504 arrives, so four attempts and their 30/60/90 s waits can
+  # outlast the token the first login issued, and an expired token turns the
+  # lag the retry absorbs into a 401 that fails the release.
+  mcp_registry_ensure_token() {
+    TOKEN_STATUS=$(mktemp)
+    node -e '
+      const fs = require("fs");
+      const path = process.argv[1];
+      if (!fs.existsSync(path)) { process.stdout.write("missing"); process.exit(0); }
+      let t;
+      try { t = JSON.parse(fs.readFileSync(path, "utf-8")); } catch { process.stdout.write("unparseable"); process.exit(0); }
+      const p = (t.token || "").split(".")[1];
+      if (!p) { process.stdout.write("unparseable"); process.exit(0); }
+      let claims;
+      try { claims = JSON.parse(Buffer.from(p, "base64url").toString()); } catch { process.stdout.write("unparseable"); process.exit(0); }
+      if (typeof claims.exp === "number" && claims.exp * 1000 > Date.now() + Number(process.argv[2]) * 1000) {
+        process.stdout.write("valid");
+      } else {
+        process.stdout.write("expired");
+      }
+    ' "$TOKEN_FILE" "$1" > "$TOKEN_STATUS" 2>/dev/null || echo "unparseable" > "$TOKEN_STATUS"
+    TOKEN_STATE=$(cat "$TOKEN_STATUS")
+    rm -f "$TOKEN_STATUS"
+    if [ "$TOKEN_STATE" != "valid" ]; then
+      # Token refresh needs a GitHub token with publish rights on
+      # `io.github.YawLabs/*` (per the prior release memory for the parallel
+      # ssh-mcp repo, the MCP Registry `mcp-publisher` auth needs `read:org`).
+      # Resolution order:
+      #   1. $GITHUB_TOKEN (explicit env, takes priority -- the operator's
+      #      workstation with a fine-grained PAT)
+      #   2. $MCP_REGISTRY_TOKEN (an explicit override name some setups use)
+      #   3. `gh auth token` (works on any host that has the `gh` CLI
+      #      authenticated -- the established fallback for the parallel
+      #      ssh-mcp / npmjs-mcp release scripts per their memory)
+      # The mcp-publisher binary only needs a GitHub token at login time; it
+      # persists its own registry JWT to ${TOKEN_FILE} afterward, so the
+      # GitHub token does NOT need to be in env for subsequent releases.
+      # Same resolution the pre-flight probe ran, through the shared helper so
+      # the two cannot drift. The info() stays HERE rather than inside the
+      # helper: the helper's stdout is captured, so anything printed in it would
+      # be concatenated into the token itself.
+      REGISTRY_GH_TOKEN=$(mcp_registry_gh_token)
+      if [ -n "$REGISTRY_GH_TOKEN" ] && [ -z "${GITHUB_TOKEN:-}" ] && [ -z "${MCP_REGISTRY_TOKEN:-}" ]; then
+        info "MCP-registry auth: using \`gh auth token\` (fallback)"
+      fi
+      if [ -z "$REGISTRY_GH_TOKEN" ]; then
+        fail "mcp-publisher token ${TOKEN_STATE} and no GitHub token available. Set GITHUB_TOKEN (a PAT with publish rights on io.github.YawLabs/*), or run \`gh auth login\` so the \`gh auth token\` fallback works, or run once interactively: ${WORKDIR}/${BIN_NAME} login github"
+      fi
+      info "MCP-registry token ${TOKEN_STATE} -- refreshing via \`mcp-publisher login github\`"
+      MCP_GITHUB_TOKEN="$REGISTRY_GH_TOKEN" "${WORKDIR}/${BIN_NAME}" login github
+    else
+      [ "${2:-}" = quiet ] || info "Reusing persisted mcp-publisher token at ${TOKEN_FILE}"
     fi
-    if [ -z "$REGISTRY_GH_TOKEN" ]; then
-      fail "mcp-publisher token ${TOKEN_STATE} and no GitHub token available. Set GITHUB_TOKEN (a PAT with publish rights on io.github.YawLabs/*), or run \`gh auth login\` so the \`gh auth token\` fallback works, or run once interactively: ${WORKDIR}/${BIN_NAME} login github"
-    fi
-    info "MCP-registry token ${TOKEN_STATE} -- refreshing via \`mcp-publisher login github\`"
-    MCP_GITHUB_TOKEN="$REGISTRY_GH_TOKEN" "${WORKDIR}/${BIN_NAME}" login github
-  else
-    info "Reusing persisted mcp-publisher token at ${TOKEN_FILE}"
-  fi
+  }
+  mcp_registry_ensure_token 240
 
   # >>> mcp-publisher publish
   # The registry checks the npm side of server.json by fetching, from ITS
@@ -1457,6 +1469,14 @@ else
   # probe above read a stale listing -- which is the state this step exists
   # to reach, so it counts as done. (Held is not listed: a version marked
   # deleted is still a duplicate, and the final verification says so.)
+  #
+  # The registry's OWN transient answers are retried on the same clock: HTTP
+  # 429, 502, 503 or 504 on the publish call itself. The 1.0.17 release met a
+  # 504 from its nginx gateway ("504 Gateway Time-out") while plain listing
+  # reads were timing out too -- the registry was slow, not saying no. A
+  # retry is safe even when the timed-out attempt did land: the registry then
+  # refuses the duplicate, which counts as done above.
+  #
   # Anything else
   # fails at once with mcp-publisher's own text -- an expired login, the 422
   # schema report, a mcpName that does not match -- because none of those
@@ -1466,6 +1486,7 @@ else
   MCP_PUBLISH_TRY=1
   MCP_PUBLISH_MAX=4
   MCP_ALREADY_LISTED=false
+  MCP_GATEWAY_RETRIED=false
   while true; do
     MCP_PUBLISH_LOG=$(mktemp)
     MCP_PUBLISH_RC=0
@@ -1479,23 +1500,39 @@ else
       MCP_ALREADY_LISTED=true
       break
     fi
+    MCP_RETRY_WHY=""
     if grep -q 'status 400' "$MCP_PUBLISH_LOG" \
       && { { grep -qE 'not found \(status: *[0-9]+\)' "$MCP_PUBLISH_LOG" && grep -qF "version '${VERSION}'" "$MCP_PUBLISH_LOG"; } \
         || grep -qE 'Likely transient, retry later|failed to fetch package metadata from NPM' "$MCP_PUBLISH_LOG"; }; then
+      MCP_RETRY_WHY="cannot fetch @yawlabs/mcp@${VERSION} from npm yet"
+      MCP_GIVE_UP="The MCP registry still cannot fetch @yawlabs/mcp@${VERSION} from npm after ${MCP_PUBLISH_MAX} attempts over 180s, although npm serves it from here."
+    elif grep -qE 'server returned status (429|502|503|504)([^0-9]|$)' "$MCP_PUBLISH_LOG"; then
+      MCP_GATEWAY_STATUS=$(grep -oE 'server returned status (429|502|503|504)' "$MCP_PUBLISH_LOG" | head -n 1 | grep -oE '[0-9]+$' || true)
+      MCP_RETRY_WHY="answered HTTP ${MCP_GATEWAY_STATUS} itself -- busy or timing out, not a verdict"
+      MCP_GATEWAY_RETRIED=true
+      MCP_GIVE_UP="The MCP registry still answers HTTP ${MCP_GATEWAY_STATUS} after ${MCP_PUBLISH_MAX} attempts over 180s -- it is having trouble of its own."
+    fi
+    if [ -n "$MCP_RETRY_WHY" ]; then
       rm -f "$MCP_PUBLISH_LOG"
       if [ "$MCP_PUBLISH_TRY" -ge "$MCP_PUBLISH_MAX" ]; then
-        fail "The MCP registry still cannot fetch @yawlabs/mcp@${VERSION} from npm after ${MCP_PUBLISH_MAX} attempts over 180s, although npm serves it from here. Re-run ./release.sh ${VERSION} in a few minutes: steps 1-2 repeat their gates and build, steps 3-4 skip what is done, and step 5 tries again."
+        fail "${MCP_GIVE_UP} Re-run ./release.sh ${VERSION} in a few minutes: steps 1-2 repeat their gates and build, steps 3-4 skip what is done, and step 5 tries again."
       fi
       MCP_PUBLISH_WAIT=$((MCP_PUBLISH_TRY * 30))
-      warn "The MCP registry cannot fetch @yawlabs/mcp@${VERSION} from npm yet (attempt ${MCP_PUBLISH_TRY}/${MCP_PUBLISH_MAX}) -- retrying in ${MCP_PUBLISH_WAIT}s"
+      warn "The MCP registry ${MCP_RETRY_WHY} (attempt ${MCP_PUBLISH_TRY}/${MCP_PUBLISH_MAX}) -- retrying in ${MCP_PUBLISH_WAIT}s"
       MCP_PUBLISH_TRY=$((MCP_PUBLISH_TRY + 1))
       sleep "$MCP_PUBLISH_WAIT"
+      # Re-checked before every retry, quietly: see mcp_registry_ensure_token.
+      mcp_registry_ensure_token 120 quiet
       continue
     fi
     rm -f "$MCP_PUBLISH_LOG"
     fail "mcp-publisher publish failed (exit ${MCP_PUBLISH_RC}) -- its output is above. Fix the cause and re-run ./release.sh ${VERSION}: steps 1-2 repeat their gates and build, steps 3-4 skip what is done."
   done
-  if [ "$MCP_ALREADY_LISTED" = true ]; then
+  if [ "$MCP_ALREADY_LISTED" = true ] && [ "$MCP_GATEWAY_RETRIED" = true ]; then
+    # A duplicate right after the registry's own timeout is this run's
+    # timed-out attempt having landed, not an earlier run's.
+    info "Published server.json to MCP registry: the attempt that timed out landed, and the registry refused the retry of io.github.YawLabs/mcp@${VERSION} as a duplicate"
+  elif [ "$MCP_ALREADY_LISTED" = true ]; then
     info "The MCP registry already holds io.github.YawLabs/mcp@${VERSION} (it refused a duplicate) -- nothing to publish"
   else
     info "Published server.json to MCP registry"
@@ -1580,6 +1617,11 @@ for REGISTRY_TRY in 1 2 3; do
 done
 if [ "$REGISTRY_FINAL" = true ]; then
   info "MCP registry: io.github.YawLabs/mcp@${VERSION}"
+elif [ "$MCP_ALREADY_LISTED" = true ] && [ "$MCP_GATEWAY_RETRIED" = true ]; then
+  # The duplicate proves the version landed; a listing that does not show it
+  # on a run where the registry was already timing out is a slow read, not a
+  # deleted version (registry_has_version reads any failure as a miss).
+  warn "The MCP registry refused a retry of io.github.YawLabs/mcp@${VERSION} as a duplicate, so the attempt that timed out landed, but its listing does not show it after 3 reads -- it was answering slowly on this run. Check it later: https://registry.modelcontextprotocol.io/v0/servers?search=io.github.YawLabs/mcp&version=${VERSION} -- re-running this script would only meet the same duplicate."
 elif [ "$MCP_ALREADY_LISTED" = true ]; then
   # Refused as a duplicate, yet not listed: the registry holds the version but
   # hides it -- the shape of one marked deleted (its duplicate check counts
