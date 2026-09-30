@@ -1533,9 +1533,12 @@ else
     TOKEN_STATE=$(cat "$TOKEN_STATUS")
     rm -f "$TOKEN_STATUS"
     if [ "$TOKEN_STATE" != "valid" ]; then
-      # Token refresh needs a GitHub token with publish rights on
-      # `io.github.YawLabs/*` (per the prior release memory for the parallel
-      # ssh-mcp repo, the MCP Registry `mcp-publisher` auth needs `read:org`).
+      # Token refresh needs a GitHub token the registry accepts: a valid one,
+      # or the login fails with a 401. Here the registry also reads the org
+      # roles the token can see, and grants `io.github.YawLabs/*` only to a
+      # YawLabs org Owner (a classic PAT with repo, user, read:org, write:org or
+      # admin:org lets it read them, as does a fine-grained PAT that can read
+      # the organization's Members). It enforces that grant only at publish.
       # Resolution order:
       #   1. $GITHUB_TOKEN (explicit env, takes priority -- the operator's
       #      workstation with a fine-grained PAT)
@@ -1564,7 +1567,7 @@ else
         if [ -n "${MCP_BOUNDED_STOPPED:-}" ]; then
           fail "The MCP registry did not answer mcp-publisher login within ${MCP_PUBLISH_TIMEOUT_S}s. Re-run ./release.sh ${VERSION} once it answers: steps 1-2 repeat their gates and build, steps 3-4 skip what is done."
         fi
-        fail "mcp-publisher login github failed -- its output is above. A 401 there is the registry refusing the token exchange -- most often the GitHub token (GITHUB_TOKEN, MCP_REGISTRY_TOKEN or \`gh auth token\`) is invalid or expired, though the registry answers 401 when GitHub's own API fails too; a 5xx or a connection error is the registry or the network. Re-run ./release.sh ${VERSION} once that is fixed: steps 1-2 repeat their gates and build, steps 3-4 skip what is done."
+        fail "mcp-publisher login github failed -- its output is above. A 401 there is the registry refusing the token exchange -- most often the GitHub token (GITHUB_TOKEN, MCP_REGISTRY_TOKEN or \`gh auth token\`) is invalid or expired, though the registry answers 401 when GitHub's own API fails too; a 429, a 5xx or a connection error is the registry or the network. Re-run ./release.sh ${VERSION} once that is fixed: steps 1-2 repeat their gates and build, steps 3-4 skip what is done."
       fi
     else
       [ "${2:-}" = quiet ] || info "Reusing persisted mcp-publisher token at ${TOKEN_FILE}"
@@ -1669,13 +1672,14 @@ else
       MCP_GATEWAY_RETRIED=true
       MCP_GIVE_UP="The MCP registry still does not answer within ${MCP_PUBLISH_TIMEOUT_S}s after ${MCP_PUBLISH_MAX} attempts."
     # A proxy that refuses the tunnel leaves only the rest of its status line
-    # after the URL: a reason phrase that starts with a capital and has no colon
+    # right after the quoted URL: a reason phrase that starts with a capital
     # (Go's own errors there start lower case, or are EOF), nothing at all, or
-    # "unknown status code" when the line stops at the code. A refusal of any
-    # other shape reads as a drop, which changes only how a later duplicate is
-    # reported.
+    # "unknown status code" when the line stops at the code. Matching it right
+    # after the URL keeps bytes a server echoes back inside Go's own quoted
+    # error text from passing for one. A refusal of any other shape reads as a
+    # drop, which changes only how a later duplicate is reported.
     elif grep -q 'error sending request' "$MCP_PUBLISH_LOG" \
-      && grep -qE 'dial tcp|proxyconnect|tls:|x509:|TLS handshake timeout|": ( *|unknown status code|[A-Z]([a-z]|[A-Z]+[ a-z(-])[^:]*)$' "$MCP_PUBLISH_LOG"; then
+      && grep -qE 'dial tcp|proxyconnect|tls:|x509:|TLS handshake timeout|error sending request: [A-Z][a-z]+ "[^"]*": ( *|unknown status code|[A-Z]([a-z]|[A-Z]+[ a-z(-]).*)$' "$MCP_PUBLISH_LOG"; then
       MCP_RETRY_WHY="could not be reached"
       MCP_GIVE_UP="The MCP registry still cannot be reached after ${MCP_PUBLISH_MAX} attempts."
     elif grep -qE 'error sending request|error reading response' "$MCP_PUBLISH_LOG"; then
@@ -1695,6 +1699,13 @@ else
       # Re-checked before every retry, quietly: see mcp_registry_ensure_token.
       mcp_registry_ensure_token 120 quiet
       continue
+    fi
+    # The registry decides the namespace grant at login, from the org roles the
+    # token can read, but enforces it only at publish: a token that cannot read
+    # YawLabs org roles, or whose owner is not a YawLabs org Owner, logs in fine
+    # and is refused here with a 403.
+    if grep -q 'server returned status 403' "$MCP_PUBLISH_LOG"; then
+      warn "A 403 on publish is the registry refusing the io.github.YawLabs namespace. It grants that namespace only to a YawLabs org Owner whose token can read org roles: a classic PAT with the repo, user, read:org, write:org or admin:org scope, or a fine-grained PAT with read access to the organization's Members. The membership does not have to be public, whatever the registry's own message says."
     fi
     rm -f "$MCP_PUBLISH_LOG"
     fail "mcp-publisher publish failed (exit ${MCP_PUBLISH_RC}) -- its output is above. Fix the cause and re-run ./release.sh ${VERSION}: steps 1-2 repeat their gates and build, steps 3-4 skip what is done."

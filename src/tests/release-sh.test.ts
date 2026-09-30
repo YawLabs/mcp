@@ -1627,12 +1627,17 @@ describe("release.sh mcp-publisher publish retry", () => {
     expect(r.out).toContain("CONTINUED");
   });
 
-  it("retries an attempt whose connection dropped, in both of the client's wordings", () => {
+  it("retries an attempt whose connection dropped, in each of the client's wordings", () => {
     // mcp-publisher v1.7.9's own text, captured against a local registry that
     // closed the socket before answering, and one that cut the answer short.
+    // The last two are Go quoting a malformed header line the server sent,
+    // with and without a colon after the phrase: neither must pass for a
+    // proxy's refusal.
     for (const text of [
       'Error: publish failed: error sending request: Post "http://127.0.0.1:58812/v0/publish": EOF',
       "Error: publish failed: error reading response: unexpected EOF",
+      'Error: publish failed: error sending request: Post "https://registry.example.com/v0/publish": net/http: HTTP/1.x transport connection broken: malformed MIME header line: X": Bad thing',
+      'Error: publish failed: error sending request: Post "https://registry.example.com/v0/publish": net/http: HTTP/1.x transport connection broken: malformed MIME header line: X": Bad: thing',
     ]) {
       const r = run(1, text);
       expect(r.tries, `${text}: ${r.out}`).toBe(2);
@@ -1662,6 +1667,7 @@ describe("release.sh mcp-publisher publish retry", () => {
       'Error: publish failed: error sending request: Post "https://registry.example.com/v0/publish": unknown status code',
       'Error: publish failed: error sending request: Post "https://registry.example.com/v0/publish": ',
       'Error: publish failed: error sending request: Post "https://registry.example.com/v0/publish": HTTP Version Not Supported',
+      'Error: publish failed: error sending request: Post "https://registry.example.com/v0/publish": Blocked by policy: category gambling',
     ]) {
       const r = run(
         1,
@@ -1838,7 +1844,20 @@ describe("release.sh mcp-publisher publish retry", () => {
       expect(r.out, text).not.toContain("retrying");
       expect(r.out, text).not.toContain("SLEPT");
       expect(r.out, text).not.toContain("CONTINUED");
+      expect(r.out, text).not.toContain("A 403 on publish");
     }
+  });
+
+  it("says what the namespace takes when the registry refuses the publish with a 403", () => {
+    // The v1.8.1 registry's refusal, its advice trimmed.
+    const r = run(
+      99,
+      'Error: publish failed: server returned status 403: {"title":"Forbidden","status":403,"detail":"You do not have permission to publish this server. You have permission to publish: io.github.jeffyaw/*. Attempting to publish: io.github.YawLabs/mcp."}',
+    );
+    expect(r.tries, r.out).toBe(1);
+    expect(r.out).toContain("WARN A 403 on publish is the registry refusing the io.github.YawLabs namespace.");
+    expect(r.out).toContain("a YawLabs org Owner whose token can read org roles");
+    expect(r.out).toContain("FAIL mcp-publisher publish failed (exit 1)");
   });
 });
 
@@ -2555,7 +2574,7 @@ describe("release.sh oam floor gate (stubbed full run)", () => {
     expect(r.status, r.out).not.toBe(0);
     expect(r.out).toContain("token exchange failed with status 401");
     expect(r.out).toContain(
-      "mcp-publisher login github failed -- its output is above. A 401 there is the registry refusing the token exchange -- most often the GitHub token (GITHUB_TOKEN, MCP_REGISTRY_TOKEN or `gh auth token`) is invalid or expired, though the registry answers 401 when GitHub's own API fails too; a 5xx or a connection error is the registry or the network. Re-run ./release.sh 1.0.2 once that is fixed",
+      "mcp-publisher login github failed -- its output is above. A 401 there is the registry refusing the token exchange -- most often the GitHub token (GITHUB_TOKEN, MCP_REGISTRY_TOKEN or `gh auth token`) is invalid or expired, though the registry answers 401 when GitHub's own API fails too; a 429, a 5xx or a connection error is the registry or the network. Re-run ./release.sh 1.0.2 once that is fixed",
     );
     expect(r.out).not.toContain("did not answer");
     expect(stateLines(f, "publisher.log")).toEqual([
