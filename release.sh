@@ -68,11 +68,15 @@
 #   NPM_PROPAGATION_TIMEOUT=<secs>   How long step 5 waits for npm to serve
 #                                    the version step 4 published before it
 #                                    refuses to publish server.json (default
-#                                    300). The read is npm's uncached
+#                                    600), and how long step 4 asks npm
+#                                    whether a publish that segfaulted on
+#                                    ARM64 landed. The read is npm's uncached
 #                                    per-version document -- see
 #                                    npm_version_manifest -- so this is npm's
 #                                    own write-to-read lag: 142 s on the 1.0.17
-#                                    release.
+#                                    release. The @yawlabs/fetch-mcp 0.8.2
+#                                    release the same day spent 295 s of its
+#                                    own 300 s gate on it, counted in sleeps.
 #   SKIP_OAM_FLOOR_VERIFY=1          DISABLES THE OAM FLOOR GATE -- step 1's
 #                                    `npm run verify:oam-floor`, which hosts a
 #                                    stdio @modelcontextprotocol/sdk server on
@@ -355,8 +359,9 @@ command -v tar  >/dev/null || fail "tar not installed (needed for step 5, the MC
   || fail "sha256sum/shasum not installed (needed for step 5, the MCP registry publish)"
 
 # >>> npm wait budget
-# Step 5's wait budget, checked here for the same reason as the tools above:
-# its first use is after the irreversible publish, and a duration spelt "3m"
+# The npm wait budget -- step 5's wait, and step 4's probe after an ARM64
+# npm segfault -- checked here for the same reason as the tools above: its
+# first use is after the irreversible publish, and a duration spelt "3m"
 # or "180s" would otherwise strand the release at the registry step -- the
 # outcome the budget exists to prevent. Digits only, normalised through base
 # 10 so "0180" reads as 180, and at most six of them: past 2^63 that
@@ -364,7 +369,7 @@ command -v tar  >/dev/null || fail "tar not installed (needed for step 5, the MC
 # instant timeout, twenty nines to 7.7e18 and a wait that never expires), and
 # unnormalised, bash's [ -ge ] would refuse the digits and the loop would
 # never time out either.
-NPM_WAIT_BUDGET="${NPM_PROPAGATION_TIMEOUT:-300}"
+NPM_WAIT_BUDGET="${NPM_PROPAGATION_TIMEOUT:-600}"
 case "$NPM_WAIT_BUDGET" in
   *[!0-9]*) fail "NPM_PROPAGATION_TIMEOUT must be a whole number of seconds, got '${NPM_WAIT_BUDGET}'" ;;
 esac
@@ -1218,24 +1223,6 @@ else
       rm -f "$PUBLISH_LOG"
       break
     fi
-    # Same ARM64 tolerance the build and the step-1 gates get, applied to the
-    # one command where a false failure is most expensive: npm can segfault
-    # (139/134) in its exit cleanup AFTER the tarball has been accepted, and
-    # npm forbids re-publishing a version, so a re-run of a "failed" publish
-    # dies on EPUBLISHCONFLICT with the release half-done. The registry is the
-    # authority -- ask it, with a short poll for the read path's lag.
-    if [ "$IS_MINGW_ARM64" = true ] && { [ "$PUBLISH_RC" -eq 139 ] || [ "$PUBLISH_RC" -eq 134 ]; }; then
-      PUBLISH_PROBE=""
-      for PROBE_TRY in 1 2 3; do
-        if npm_has_version "$VERSION"; then PUBLISH_PROBE="$VERSION"; break; fi
-        sleep 6
-      done
-      if [ "$PUBLISH_PROBE" = "$VERSION" ]; then
-        warn "npm publish exited $PUBLISH_RC (ARM64 npm exit-cleanup segfault) but @yawlabs/mcp@${VERSION} is live on npm -- tolerating"
-        rm -f "$PUBLISH_LOG"
-        break
-      fi
-    fi
     # npm's own word that the version is already there: the E403 "You cannot
     # publish over the previously published versions". Reachable when the
     # skip probe above missed a version npm holds -- its read path lagging its
@@ -1243,11 +1230,53 @@ else
     # state a re-run after step 5's timeout starts from. Treated as the skip
     # it should have been, so that re-run's advice holds: NPM_PUBLISHED_THIS_RUN
     # stays false, and the tarball check at the end reads any difference as
-    # post-tag drift, not as a corrupted publish.
+    # post-tag drift, not as a corrupted publish. Checked before the ARM64
+    # probe below, which would otherwise read the same version as this run's.
     if grep -q 'cannot publish over the previously published versions' "$PUBLISH_LOG"; then
       rm -f "$PUBLISH_LOG"
       NPM_ALREADY_THERE=true
       break
+    fi
+    # Same ARM64 tolerance the build and the step-1 gates get, applied to the
+    # one command where a false failure is most expensive: npm can segfault
+    # (139/134) in its exit cleanup AFTER the tarball has been accepted, and
+    # npm forbids re-publishing a version, so a re-run of a "failed" publish
+    # dies on EPUBLISHCONFLICT with the release half-done. The registry is the
+    # authority -- ask it, on step 5's clock: NPM_WAIT_BUDGET seconds (default
+    # 600) of reads 5 s apart, since npm's read path can lag its write path by
+    # minutes (the @yawlabs/fetch-mcp 0.8.2 release on 2026-09-29 spent 295 s
+    # of a 300 s gate on it), and giving up early sends a publish that landed
+    # into the failure below. Wall-clock elapsed, with a progress line every
+    # 30 s, as in step 5. Not when npm's log already carries the registry's
+    # refusal -- an OTP challenge, an auth error, any 4xx -- matched on npm's
+    # own "code" line so a stray E4 in the tarball's integrity string cannot
+    # match: that is npm's answer, and waiting out the budget would only delay
+    # it, three times over on the OTP retries. A transport error or a 5xx
+    # still probes: a PUT the registry accepted may have landed before the
+    # connection dropped.
+    if [ "$IS_MINGW_ARM64" = true ] && { [ "$PUBLISH_RC" -eq 139 ] || [ "$PUBLISH_RC" -eq 134 ]; } \
+      && ! grep -qE 'npm (error|ERR!) code (EOTP|EAUTH|ENEEDAUTH|E4[0-9][0-9])|one-time password' "$PUBLISH_LOG"; then
+      PUBLISH_PROBE=""
+      PROBE_START=$(date +%s)
+      PROBE_TICK=30
+      while true; do
+        if npm_has_version "$VERSION"; then PUBLISH_PROBE="$VERSION"; break; fi
+        PROBE_WAITED=$(( $(date +%s) - PROBE_START ))
+        if [ "$PROBE_WAITED" -ge "$NPM_WAIT_BUDGET" ]; then
+          warn "npm publish exited $PUBLISH_RC and npm still does not serve @yawlabs/mcp@${VERSION} after ${PROBE_WAITED}s -- reading it as a failed publish"
+          break
+        fi
+        if [ "$PROBE_WAITED" -ge "$PROBE_TICK" ]; then
+          echo "  ... npm does not serve @yawlabs/mcp@${VERSION} yet (${PROBE_WAITED}s of ${NPM_WAIT_BUDGET}s)"
+          PROBE_TICK=$((PROBE_TICK + 30))
+        fi
+        sleep 5
+      done
+      if [ "$PUBLISH_PROBE" = "$VERSION" ]; then
+        warn "npm publish exited $PUBLISH_RC (ARM64 npm exit-cleanup segfault) but @yawlabs/mcp@${VERSION} is live on npm -- tolerating"
+        rm -f "$PUBLISH_LOG"
+        break
+      fi
     fi
     if ! grep -qE 'EOTP|EAUTH|one-time password|OTP' "$PUBLISH_LOG"; then
       rm -f "$PUBLISH_LOG"
@@ -1297,14 +1326,15 @@ else
   # answers from here. Cloudflare never serves it from the edge cache, so what
   # this waits on is npm's own write-to-read lag. That is not seconds: the
   # 1.0.17 release (2026-09-29) waited 142 s over 24 reads for it. The budget
-  # is NPM_WAIT_BUDGET seconds -- NPM_PROPAGATION_TIMEOUT, default 300, which
-  # is what the sibling MCP repos' own gates default to and about twice that
-  # measurement -- validated in the pre-flight so a typo cannot fail the release here, after
-  # the publish -- a clock, not the ten reads that used to expire against the
-  # packument's five-minute edge TTL. Wall-clock elapsed rather than a count
-  # of sleeps, so the figures in the messages stay true when a read itself is
-  # slow; a progress line every 30 s so a slow npm reads as waiting, not as
-  # hung.
+  # is NPM_WAIT_BUDGET seconds -- NPM_PROPAGATION_TIMEOUT, default 600, which
+  # matches the sibling MCP repos' gates now: the @yawlabs/fetch-mcp 0.8.2
+  # release the same day spent 295 s of its 300 s gate on the same wait, and
+  # this default was 300 too -- validated in the pre-flight so a typo cannot
+  # fail the release here, after the publish -- a clock, not the ten reads
+  # that used to expire against the packument's five-minute edge TTL.
+  # Wall-clock elapsed rather than a count of sleeps, so the figures in the
+  # messages stay true when a read itself is slow; a progress line every 30 s
+  # so a slow npm reads as waiting, not as hung.
   NPM_WAIT_START=$(date +%s)
   NPM_WAIT_TICK=30
   NPM_WAITED=0
@@ -1326,7 +1356,7 @@ else
     sleep 5
   done
   if [ "$NPM_SERVES_VERSION" != true ]; then
-    fail "npm does not serve @yawlabs/mcp@${VERSION} after ${NPM_WAITED}s of reading https://registry.npmjs.org/@yawlabs%2Fmcp/${VERSION} every 5s -- refusing to publish to the MCP registry, whose validator reads that same document and would answer 400. npm accepted the publish in step 4, so its read path is lagging its write path, or this host cannot reach it. Once that URL answers from here (curl it), re-run ./release.sh ${VERSION}: steps 1-2 repeat their gates and build, steps 3-4 skip what is done, and step 5 waits again; NPM_PROPAGATION_TIMEOUT=600 gives it longer."
+    fail "npm does not serve @yawlabs/mcp@${VERSION} after ${NPM_WAITED}s of reading https://registry.npmjs.org/@yawlabs%2Fmcp/${VERSION} every 5s -- refusing to publish to the MCP registry, whose validator reads that same document and would answer 400. npm accepted the publish in step 4, so its read path is lagging its write path, or this host cannot reach it. Once that URL answers from here (curl it), re-run ./release.sh ${VERSION}: steps 1-2 repeat their gates and build, steps 3-4 skip what is done, and step 5 waits again; NPM_PROPAGATION_TIMEOUT=1200 gives it longer."
   fi
   if [ "$NPM_READS" -gt 1 ]; then
     info "npm serves @yawlabs/mcp@${VERSION} (after ${NPM_WAITED}s and ${NPM_READS} reads)"

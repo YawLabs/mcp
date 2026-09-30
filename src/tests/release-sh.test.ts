@@ -40,9 +40,11 @@
 //   shape here that reaches the gates, the push and both publishes, and all
 //   of them land on stubs and the bare repo.
 //
-// Deliberately not covered: the IS_MINGW_ARM64 139/134 tolerance paths. They
-// are reachable only when uname reports ARM64, so a test would be the one
-// host-conditional file in the suite and would pass vacuously everywhere else.
+// Step 4's publish-segfault probe is covered by forcing IS_MINGW_ARM64=true in
+// its extracted block. Still not covered: the other IS_MINGW_ARM64 139/134
+// tolerance paths -- run_npm_check, the build and the bump. The fixture and
+// full-run shapes reach them only when uname reports ARM64, though an
+// extracted-block case could force the variable the same way.
 
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -114,7 +116,7 @@ function newTmp(prefix: string): string {
  *
  * NPM_PROPAGATION_TIMEOUT goes too. release.sh runs this suite in step 1, and
  * its step-5 timeout tells the operator to re-run with that variable set; the
- * "defaults to 300 s" case would then read the operator's value and fail the
+ * "defaults to 600 s" case would then read the operator's value and fail the
  * gate of the very re-run it prescribed. Cases that set it pass it explicitly
  * through runBash's env, which still overrides.
  */
@@ -1074,10 +1076,12 @@ describe("release.sh npm wait budget pre-flight", () => {
     return runBash(body, dir, env);
   }
 
-  it("defaults to 300 s when the variable is unset or empty", () => {
-    // 300, not the 180 this shipped with: npm took 142 s to serve 1.0.17.
-    expect(run({}).out).toContain("BUDGET=300\n");
-    expect(run({ NPM_PROPAGATION_TIMEOUT: "" }).out).toContain("BUDGET=300\n");
+  it("defaults to 600 s when the variable is unset or empty", () => {
+    // 600: npm took 142 s to serve 1.0.17, which moved this from 180 to 300,
+    // and the @yawlabs/fetch-mcp 0.8.2 release the same day spent 295 s of its
+    // own 300 s gate waiting for npm.
+    expect(run({}).out).toContain("BUDGET=600\n");
+    expect(run({ NPM_PROPAGATION_TIMEOUT: "" }).out).toContain("BUDGET=600\n");
   });
 
   it("takes whole seconds, reading leading zeros in base 10", () => {
@@ -1128,7 +1132,7 @@ describe("release.sh npm wait budget pre-flight", () => {
 describe("release.sh step-5 npm wait", () => {
   // The wait that replaced ten `npm view` reads against a five-minute edge
   // cache: a clock (NPM_WAIT_BUDGET, the pre-flight's reading of
-  // NPM_PROPAGATION_TIMEOUT, default 300 s) over the uncached per-version
+  // NPM_PROPAGATION_TIMEOUT, default 600 s) over the uncached per-version
   // read. Driven on a fake clock -- sleep advances it, date reads it -- with
   // npm_has_version answering from a read counter.
   const block = extractBlock("  # >>> step-5 npm wait", "  # <<< step-5 npm wait");
@@ -1190,7 +1194,7 @@ describe("release.sh step-5 npm wait", () => {
     expect(r.out).toContain("Once that URL answers from here (curl it), re-run ./release.sh 1.0.17");
     expect(r.out).toContain("steps 1-2 repeat their gates and build, steps 3-4 skip what is done");
     expect(r.out).not.toContain("no-op");
-    expect(r.out).toContain("NPM_PROPAGATION_TIMEOUT=600");
+    expect(r.out).toContain("NPM_PROPAGATION_TIMEOUT=1200");
     expect(r.out).not.toContain("CONTINUED");
   });
 
@@ -1218,19 +1222,36 @@ describe("release.sh step-4 npm publish", () => {
   const block = extractBlock("  # >>> step-4 npm publish", "  # <<< step-4 npm publish");
   const dir = newTmp("release-pub4-");
 
-  function run(opts: { out: string; rc: number }): RunResult & { calls: number } {
+  // arm64 turns on the probe after a segfaulting publish; npm_has_version
+  // answers from a read counter (a hit from read `hitOnRead` on, never when
+  // null) on a fake clock -- sleep advances it, date reads it -- with the
+  // budget the pre-flight would have set.
+  function run(opts: {
+    out: string;
+    rc: number;
+    arm64?: boolean;
+    hitOnRead?: number | null;
+    budget?: string;
+  }): RunResult & { calls: number } {
     const work = newTmp("release-pub4-calls-");
+    const hit = opts.hitOnRead ?? null;
     const body = [
       "set -o pipefail",
       STUB_HELPERS,
+      // The fail path exposes the probe's counters too.
+      'fail() { echo "FAIL $1"; echo "FAILED reads=$READS now=$FAKE_NOW"; exit 1; }',
       'VERSION="1.0.17"',
-      "IS_MINGW_ARM64=false",
+      `IS_MINGW_ARM64=${opts.arm64 ? "true" : "false"}`,
+      `NPM_WAIT_BUDGET=${opts.budget ?? "600"}`,
       "NPM_PUBLISHED_THIS_RUN=false",
-      "sleep() { :; }",
-      "npm_has_version() { return 1; }",
+      "FAKE_NOW=1000",
+      "READS=0",
+      "sleep() { FAKE_NOW=$((FAKE_NOW + $1)); }",
+      'date() { echo "$FAKE_NOW"; }',
+      `npm_has_version() { READS=$((READS + 1)); [ -n "${hit ?? ""}" ] && [ "$READS" -ge "${hit ?? 0}" ]; }`,
       `npm() { echo "call" >> "${shPath(work)}/calls"; printf '%s\\n' "$FAKE_NPM_OUT"; return ${opts.rc}; }`,
       block,
-      'echo "CONTINUED published=$NPM_PUBLISHED_THIS_RUN"',
+      'echo "CONTINUED published=$NPM_PUBLISHED_THIS_RUN reads=$READS now=$FAKE_NOW"',
     ].join("\n");
     const r = runBash(body, dir, { FAKE_NPM_OUT: opts.out });
     let calls = 0;
@@ -1276,6 +1297,125 @@ describe("release.sh step-4 npm publish", () => {
     expect(r.out).toContain("WARN npm publish attempt 2 EOTPed");
     expect(r.out).toContain("FAIL npm publish failed after 3 OTP-class attempts");
     expect(r.out).not.toContain("CONTINUED");
+  });
+
+  const SEGV = "npm notice Publishing to https://registry.npmjs.org/\nSegmentation fault";
+
+  it("on ARM64, reads a segfaulted publish npm then serves as this run's publish", () => {
+    // Three misses, three 5 s sleeps, a hit on the fourth read.
+    const r = run({ out: SEGV, rc: 139, arm64: true, hitOnRead: 4 });
+    expect(r.calls).toBe(1);
+    expect(r.out).toContain(
+      "WARN npm publish exited 139 (ARM64 npm exit-cleanup segfault) but @yawlabs/mcp@1.0.17 is live on npm",
+    );
+    expect(r.out).toContain("CONTINUED published=true reads=4 now=1015");
+  });
+
+  it("on ARM64, waits out a 295 s read lag instead of giving up after three reads", () => {
+    // npm's measured lag for @yawlabs/fetch-mcp 0.8.2: a hit on read 60 is 59
+    // sleeps, 295 s. The three reads 6 s apart this replaced ended at 12 s.
+    const r = run({ out: SEGV, rc: 134, arm64: true, hitOnRead: 60 });
+    expect(r.calls).toBe(1);
+    expect(r.out).toContain("... npm does not serve @yawlabs/mcp@1.0.17 yet (30s of 600s)");
+    expect(r.out).toContain("yet (270s of 600s)");
+    expect(r.out).not.toContain("yet (300s");
+    expect(r.out).toContain("is live on npm -- tolerating");
+    expect(r.out).toContain("CONTINUED published=true reads=60 now=1295");
+  });
+
+  it("on ARM64, gives up at the budget and reads it as a failed publish", () => {
+    // 121 reads: one at 0 s and one every 5 s through 600 s.
+    const r = run({ out: SEGV, rc: 139, arm64: true });
+    expect(r.calls).toBe(1);
+    expect(r.out).toContain(
+      "WARN npm publish exited 139 and npm still does not serve @yawlabs/mcp@1.0.17 after 600s -- reading it as a failed publish",
+    );
+    expect(r.out).toContain("FAIL npm publish failed (non-OTP error");
+    expect(r.out).toContain("FAILED reads=121 now=1600");
+    expect(r.out).not.toContain("CONTINUED");
+    // The pre-flight's budget, not a constant.
+    const short = run({ out: SEGV, rc: 139, arm64: true, budget: "40" });
+    expect(short.out).toContain("after 40s -- reading it as a failed publish");
+    expect(short.out).toContain("FAILED reads=9 now=1040");
+  });
+
+  it("on ARM64, reads npm's E403 after a segfault as the skip, without probing", () => {
+    // The version npm refused to overwrite is served, so a probe would read it
+    // as this run's publish; the E403 comes first.
+    const r = run({
+      out: "npm error code E403\nnpm error 403 403 Forbidden - PUT https://registry.npmjs.org/@yawlabs%2fmcp - You cannot publish over the previously published versions: 1.0.17.\nSegmentation fault",
+      rc: 139,
+      arm64: true,
+      hitOnRead: 1,
+    });
+    expect(r.calls).toBe(1);
+    expect(r.out).toContain("WARN npm already holds @yawlabs/mcp@1.0.17 (its E403 said so)");
+    expect(r.out).toContain("CONTINUED published=false reads=0 now=1000");
+  });
+
+  it("on ARM64, does not wait out the budget when npm's log already refused the publish", () => {
+    // An OTP challenge: straight to the three OTP-class attempts, 30 s apart.
+    const otp = run({
+      out: "npm error code EOTP\nnpm error This operation requires a one-time password\nSegmentation fault",
+      rc: 139,
+      arm64: true,
+    });
+    expect(otp.calls).toBe(3);
+    expect(otp.out).toContain("FAIL npm publish failed after 3 OTP-class attempts");
+    expect(otp.out).toContain("FAILED reads=0 now=1060");
+    // A stale token: straight to the non-OTP failure and its hint.
+    const auth = run({
+      out: "npm error code E401\nnpm error Incorrect or missing password\nSegmentation fault",
+      rc: 134,
+      arm64: true,
+    });
+    expect(auth.calls).toBe(1);
+    expect(auth.out).toContain("FAIL npm publish failed (non-OTP error");
+    expect(auth.out).toContain("FAILED reads=0 now=1000");
+    // Not logged in at all, and any other 4xx: npm's refusal, not a lag.
+    for (const out of [
+      "npm error code ENEEDAUTH\nnpm error need auth This command requires you to be logged in to https://registry.npmjs.org/\nSegmentation fault",
+      "npm ERR! code E422\nnpm ERR! 422 Unprocessable Entity - PUT https://registry.npmjs.org/@yawlabs%2fmcp\nSegmentation fault",
+    ]) {
+      const r = run({ out, rc: 139, arm64: true, hitOnRead: 1 });
+      expect(r.calls).toBe(1);
+      expect(r.out).toContain("FAILED reads=0 now=1000");
+    }
+  });
+
+  it("on ARM64, probes a segfault whose log only mentions E4 inside npm's integrity string", () => {
+    // npm prints the tarball's base64 integrity on every publish; an "E4" and
+    // two digits inside it is not a refusal.
+    const r = run({
+      out: "npm notice integrity: sha512-Qx9E401kLm2E422zz==\n+ @yawlabs/mcp@1.0.17\nSegmentation fault",
+      rc: 139,
+      arm64: true,
+      hitOnRead: 1,
+    });
+    expect(r.out).toContain("is live on npm -- tolerating");
+    expect(r.out).toContain("CONTINUED published=true reads=1 now=1000");
+  });
+
+  it("on ARM64, still probes after a transport error, since the PUT may have landed", () => {
+    const r = run({
+      out: "npm error code ECONNRESET\nnpm error network aborted\nSegmentation fault",
+      rc: 139,
+      arm64: true,
+      hitOnRead: 2,
+    });
+    expect(r.calls).toBe(1);
+    expect(r.out).toContain("is live on npm -- tolerating");
+    expect(r.out).toContain("CONTINUED published=true reads=2 now=1005");
+  });
+
+  it("probes only on ARM64 and only after a segfault's exit code", () => {
+    for (const r of [
+      run({ out: SEGV, rc: 139, arm64: false, hitOnRead: 1 }),
+      run({ out: "npm error code E500", rc: 1, arm64: true, hitOnRead: 1 }),
+    ]) {
+      expect(r.out).toContain("FAIL npm publish failed (non-OTP error");
+      expect(r.out).toContain("FAILED reads=0 now=1000");
+    }
   });
 });
 
