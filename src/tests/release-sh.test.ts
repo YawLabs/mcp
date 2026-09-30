@@ -64,10 +64,11 @@ import { fileURLToPath } from "node:url";
 import { afterAll, describe, expect, it, vi } from "vitest";
 
 // Every case here spawnSyncs a real bash running a real script, so the file
-// takes minutes of wall clock and a single case takes seconds. None of them
-// ASSERTS a duration -- they assert on the script's stdout -- so the only clock
-// that matters is the harness's patience, and the global 30 s testTimeout was
-// it.
+// takes minutes of wall clock and a single case takes seconds. Only one
+// ASSERTS a duration -- the TERM-deaf publisher, and only to tell a KILL (done
+// in seconds) from none (its stub's 60 s sleep); the rest assert on the
+// script's stdout -- so the only clock that matters is the harness's patience,
+// and the global 30 s testTimeout was it.
 //
 // That was enough until the suite grew: the default run packs the parallel
 // files onto every core at once, and under that contention a single case was
@@ -97,6 +98,18 @@ vi.setConfig({ testTimeout: 600_000, hookTimeout: 600_000 });
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const releaseShPath = join(repoRoot, "release.sh");
 const releaseSh = readFileSync(releaseShPath, "utf8");
+
+// The cases that let a real timeout(1) stop a publisher need the coreutils one,
+// found the way release.sh finds it. release.sh itself runs unbounded without
+// one, so a host without it (stock macOS, Alpine) skips those cases rather
+// than failing the release's own test gate.
+const hasCoreutilsTimeout = /coreutils/.test(
+  spawnSync(
+    "bash",
+    ["-c", "for t in timeout gtimeout; do command -v $t >/dev/null 2>&1 && $t --version 2>/dev/null; done; true"],
+    { encoding: "utf8" },
+  ).stdout ?? "",
+);
 
 const tmpRoots: string[] = [];
 afterAll(() => {
@@ -131,7 +144,13 @@ function newTmp(prefix: string): string {
  */
 function baseEnv(): NodeJS.ProcessEnv {
   return Object.fromEntries(
-    Object.entries(process.env).filter(([k]) => !k.toUpperCase().startsWith("GIT_") && k !== "NPM_PROPAGATION_TIMEOUT"),
+    Object.entries(process.env).filter(
+      ([k]) =>
+        !k.toUpperCase().startsWith("GIT_") &&
+        k !== "NPM_PROPAGATION_TIMEOUT" &&
+        k !== "MCP_PUBLISH_TIMEOUT_S" &&
+        k !== "MCP_PUBLISH_KILL_AFTER_S",
+    ),
   );
 }
 
@@ -968,7 +987,7 @@ describe("release.sh MCP-registry read-back", () => {
     // failing afterwards is the same slowness that timed the publish out.
     const r = run(null, true, true);
     expect(r.out).toContain("WARN The MCP registry refused a retry of io.github.YawLabs/mcp@0.81.0 as a duplicate");
-    expect(r.out).toContain("answering slowly on this run");
+    expect(r.out).toContain("it was not answering reliably on this run");
     expect(r.out).not.toContain("marked deleted");
     expect(r.out).not.toContain("Re-run ./release.sh");
     expect(r.status).toBe(0);
@@ -1438,6 +1457,7 @@ describe("release.sh mcp-publisher publish retry", () => {
   // its text. The texts below are the LIVE registry's (v1.8.1, worded by
   // registry PR #1411), each inside mcp-publisher's "status 400" wrapper.
   const block = extractBlock("  # >>> mcp-publisher publish", "  # <<< mcp-publisher publish");
+  const timeLimit = extractBlock("  # >>> mcp-publisher time limit", "  # <<< mcp-publisher time limit");
   const dir = newTmp("release-pub-");
 
   const wrap = (message: string) =>
@@ -1459,7 +1479,12 @@ describe("release.sh mcp-publisher publish retry", () => {
     wrap("failed to fetch package metadata from NPM: context deadline exceeded"),
   ];
 
-  function run(failures: number, failureText: string, thenText = ""): RunResult & { tries: number } {
+  function run(
+    failures: number,
+    failureText: string,
+    thenText = "",
+    extra: { env?: Record<string, string>; preamble?: string } = {},
+  ): RunResult & { tries: number } {
     const work = newTmp("release-pub-bin-");
     // The publisher stub fails `failures` times with `failureText`, then
     // publishes -- or, when `thenText` is set, fails with that instead. Each
@@ -1471,6 +1496,11 @@ describe("release.sh mcp-publisher publish retry", () => {
     const stub = [
       "#!/bin/bash",
       'n=$(( $(ls "$FAKE_STATE" | grep -c "^call-") + 1 )); : > "$FAKE_STATE/call-$n"',
+      // FAKE_HANG: the first call never answers, like a registry that holds the
+      // connection open; exec, so no bash parent sits between timeout and the
+      // hang. FAKE_HANG=deaf also ignores TERM, which only the KILL ends.
+      'if [ "$n" -eq 1 ] && [ "${FAKE_HANG:-}" = deaf ]; then trap "" TERM; exec sleep 60; fi',
+      'if [ "$n" -eq 1 ] && [ -n "${FAKE_HANG:-}" ]; then exec sleep 60; fi',
       `if [ "$n" -le ${failures} ]; then echo "$FAKE_FAILURE" >&2; exit 1; fi`,
       'if [ -n "$FAKE_THEN" ]; then echo "$FAKE_THEN" >&2; exit 1; fi',
       'echo "Successfully published io.github.YawLabs/mcp@1.0.17"',
@@ -1490,10 +1520,17 @@ describe("release.sh mcp-publisher publish retry", () => {
       'sleep() { echo "SLEPT $1"; }',
       // The token check the retry repeats; records its arguments.
       'mcp_registry_ensure_token() { echo "ENSURE $*"; }',
+      extra.preamble ?? "",
+      timeLimit,
       block,
       'echo "CONTINUED"',
     ].join("\n");
-    const r = runBash(body, dir, { FAKE_STATE: shPath(work), FAKE_FAILURE: failureText, FAKE_THEN: thenText });
+    const r = runBash(body, dir, {
+      FAKE_STATE: shPath(work),
+      FAKE_FAILURE: failureText,
+      FAKE_THEN: thenText,
+      ...extra.env,
+    });
     const tries = readdirSync(work).filter((f) => f.startsWith("call-")).length;
     return { ...r, tries };
   }
@@ -1583,11 +1620,162 @@ describe("release.sh mcp-publisher publish retry", () => {
     );
     expect(r.tries, r.out).toBe(2);
     expect(r.out).toContain(
-      "INFO Published server.json to MCP registry: the attempt that timed out landed, and the registry refused the retry of io.github.YawLabs/mcp@1.0.17 as a duplicate",
+      "INFO Published server.json to MCP registry: an attempt of this run that got no clear answer landed, and the registry refused the retry of io.github.YawLabs/mcp@1.0.17 as a duplicate",
     );
     expect(r.out).not.toContain("already holds");
     expect(r.out).not.toContain("FAIL");
     expect(r.out).toContain("CONTINUED");
+  });
+
+  it("retries an attempt whose connection dropped, in both of the client's wordings", () => {
+    // mcp-publisher v1.7.9's own text, captured against a local registry that
+    // closed the socket before answering, and one that cut the answer short.
+    for (const text of [
+      'Error: publish failed: error sending request: Post "http://127.0.0.1:58812/v0/publish": EOF',
+      "Error: publish failed: error reading response: unexpected EOF",
+    ]) {
+      const r = run(1, text);
+      expect(r.tries, `${text}: ${r.out}`).toBe(2);
+      expect(r.out, text).toContain(
+        "WARN The MCP registry dropped the connection without an answer (attempt 1/4) -- retrying in 30s",
+      );
+      expect(r.out, text).toMatch(/SLEPT 30\nENSURE 120 quiet\n/);
+      expect(r.out, text).toContain("INFO Published server.json to MCP registry");
+    }
+  });
+
+  it("retries a registry it could not reach, and does not read a later duplicate as this run's", () => {
+    // A connection mcp-publisher v1.7.9 reports as never opened cannot have
+    // landed: a failed DNS lookup, a TLS handshake Go's default transport gave
+    // up on after 10 s, and a proxy that refused the CONNECT tunnel (Go reports
+    // only the proxy's reason phrase, or "unknown status code" when it gives
+    // none, and nothing when it ends its status line at the code's space).
+    // The TLS and proxy texts are the real binary's, captured against a local
+    // listener that never answers the handshake and a local proxy that refused
+    // CONNECT with "502 Bad Gateway", "502 Proxy Error", a bare "502", "502 "
+    // and "505 HTTP Version Not Supported".
+    for (const text of [
+      'Error: publish failed: error sending request: Post "https://registry.modelcontextprotocol.io/v0/publish": dial tcp: lookup registry.modelcontextprotocol.io: no such host',
+      'Error: publish failed: error sending request: Post "https://127.0.0.1:57912/v0/publish": net/http: TLS handshake timeout',
+      'Error: publish failed: error sending request: Post "https://registry.example.com/v0/publish": Bad Gateway',
+      'Error: publish failed: error sending request: Post "https://registry.example.com/v0/publish": Proxy Error',
+      'Error: publish failed: error sending request: Post "https://registry.example.com/v0/publish": unknown status code',
+      'Error: publish failed: error sending request: Post "https://registry.example.com/v0/publish": ',
+      'Error: publish failed: error sending request: Post "https://registry.example.com/v0/publish": HTTP Version Not Supported',
+    ]) {
+      const r = run(
+        1,
+        text,
+        'Error: publish failed: server returned status 400: {"title":"Bad Request","status":400,"detail":"invalid version: cannot publish duplicate version"}',
+      );
+      expect(r.tries, `${text}: ${r.out}`).toBe(2);
+      expect(r.out, text).toContain("WARN The MCP registry could not be reached (attempt 1/4) -- retrying in 30s");
+      expect(r.out, text).toContain("INFO The MCP registry already holds io.github.YawLabs/mcp@1.0.17");
+      expect(r.out, text).not.toContain("got no clear answer landed");
+    }
+  });
+
+  it("does not read a duplicate after a 429 as this run's attempt having landed", () => {
+    const r = run(
+      1,
+      'Error: publish failed: server returned status 429: {"title":"Too Many Requests","status":429}',
+      'Error: publish failed: server returned status 400: {"title":"Bad Request","status":400,"detail":"invalid version: cannot publish duplicate version"}',
+    );
+    expect(r.tries, r.out).toBe(2);
+    expect(r.out).toContain("INFO The MCP registry already holds io.github.YawLabs/mcp@1.0.17");
+    expect(r.out).not.toContain("got no clear answer landed");
+  });
+
+  it.skipIf(!hasCoreutilsTimeout)("stops an attempt that never answers, and retries it", () => {
+    // 5 s, not 1: the attempt after the stopped one has to finish inside it
+    // too, and a loaded machine can take longer than 1 s just to start it.
+    const r = run(0, "", "", { env: { FAKE_HANG: "1", MCP_PUBLISH_TIMEOUT_S: "5" } });
+    expect(r.tries, r.out).toBe(2);
+    expect(r.out).toContain("mcp-publisher did not answer within 5s -- stopped it");
+    expect(r.out).toContain("WARN The MCP registry did not answer within 5s (attempt 1/4) -- retrying in 30s");
+    expect(r.out).toContain("INFO Published server.json to MCP registry");
+    expect(r.out).not.toContain("coreutils one");
+  });
+
+  it.skipIf(!hasCoreutilsTimeout)("kills an attempt that ignores the stop signal, and retries it", () => {
+    // Only the KILL after MCP_PUBLISH_KILL_AFTER_S ends this one: timeout(1)'s -k.
+    // Without it, timeout(1) still returns 124 -- but only once the deaf
+    // publisher's 60 s sleep ends -- so the time is what shows the KILL landed.
+    const t0 = Date.now();
+    const r = run(0, "", "", {
+      env: { FAKE_HANG: "deaf", MCP_PUBLISH_TIMEOUT_S: "5", MCP_PUBLISH_KILL_AFTER_S: "1" },
+    });
+    expect(Date.now() - t0, r.out).toBeLessThan(40_000);
+    expect(r.tries, r.out).toBe(2);
+    expect(r.out).toContain("WARN The MCP registry did not answer within 5s (attempt 1/4) -- retrying in 30s");
+    expect(r.out).toContain("INFO Published server.json to MCP registry");
+  });
+
+  it("retries an attempt that only the KILL ended (137, as newer coreutils report it)", () => {
+    // Git Bash's GNU timeout 8.32 exits 124 even after the KILL, so the deaf
+    // publisher above never reaches this path there. This stand-in reports
+    // coreutils 9.4 and returns 137 for the first attempt, as 9.4 does when
+    // the KILL was needed, and runs the publisher after that.
+    const r = run(0, "", "", {
+      preamble: [
+        "timeout() {",
+        '  if [ "$1" = --version ]; then echo "timeout (GNU coreutils) 9.4"; return 0; fi',
+        '  while case "$1" in -*) true ;; *) false ;; esac; do [ "$1" = -k ] && shift; shift; done',
+        "  shift",
+        '  if [ ! -e "$FAKE_STATE/killed-once" ]; then : > "$FAKE_STATE/killed-once"; return 137; fi',
+        '  "$@"',
+        "}",
+      ].join("\n"),
+    });
+    expect(r.tries, r.out).toBe(1);
+    expect(r.out).toContain("mcp-publisher did not answer within 90s -- stopped it");
+    expect(r.out).toContain("WARN The MCP registry did not answer within 90s (attempt 1/4) -- retrying in 30s");
+    expect(r.out).toContain("INFO Published server.json to MCP registry");
+  });
+
+  it("falls back to a 10 s KILL grace when MCP_PUBLISH_KILL_AFTER_S is not whole seconds above 0", () => {
+    // 0 too: timeout(1) reads a KILL grace of 0 as never sending the KILL.
+    for (const value of ["abc", "0"]) {
+      const r = run(0, "", "", { env: { MCP_PUBLISH_KILL_AFTER_S: value } });
+      expect(r.out, value).toContain(
+        `WARN MCP_PUBLISH_KILL_AFTER_S='${value}' is not whole seconds above 0 -- using 10`,
+      );
+      expect(r.out, value).toContain("INFO Published server.json to MCP registry");
+    }
+  });
+
+  it.skipIf(!hasCoreutilsTimeout)(
+    "reads a duplicate after an attempt that never answered as that attempt having landed",
+    () => {
+      const r = run(
+        0,
+        "",
+        'Error: publish failed: server returned status 400: {"title":"Bad Request","status":400,"detail":"invalid version: cannot publish duplicate version"}',
+        { env: { FAKE_HANG: "1", MCP_PUBLISH_TIMEOUT_S: "5" } },
+      );
+      expect(r.tries, r.out).toBe(2);
+      expect(r.out).toContain("an attempt of this run that got no clear answer landed");
+      expect(r.out).not.toContain("FAIL");
+    },
+  );
+
+  it("runs unbounded, and says so, when no coreutils timeout is on PATH", () => {
+    // Windows' own timeout.exe, asked for --version, prints this and exits 1.
+    const r = run(0, "", "", {
+      preamble: [
+        'timeout() { echo "ERROR: Invalid value for timeout (/T) specified. Valid range is -1 to 99999."; return 1; }',
+        "gtimeout() { return 127; }",
+      ].join("\n"),
+    });
+    expect(r.tries, r.out).toBe(1);
+    expect(r.out).toContain("WARN Neither timeout nor gtimeout on PATH is the coreutils one");
+    expect(r.out).toContain("INFO Published server.json to MCP registry");
+  });
+
+  it("falls back to 90 s when MCP_PUBLISH_TIMEOUT_S is not whole seconds", () => {
+    const r = run(0, "", "", { env: { MCP_PUBLISH_TIMEOUT_S: "90s" } });
+    expect(r.out).toContain("WARN MCP_PUBLISH_TIMEOUT_S='90s' is not whole seconds -- using 90");
+    expect(r.out).toContain("INFO Published server.json to MCP registry");
   });
 
   it("gives up on a registry that keeps timing out after four attempts, naming the status", () => {
@@ -1650,6 +1838,27 @@ describe("release.sh mcp-publisher publish retry", () => {
       expect(r.out, text).not.toContain("retrying");
       expect(r.out, text).not.toContain("SLEPT");
       expect(r.out, text).not.toContain("CONTINUED");
+    }
+  });
+});
+
+describe("release.sh mcp-publisher calls", () => {
+  // mcp-publisher waits for the registry's answer with no limit of its own, so
+  // step 5 runs each call to it -- the login and every publish attempt --
+  // through mcp_bounded. A call added or edited without it would hang the
+  // release on a registry that never answers; the publish-retry harness stubs
+  // the login out, so only this reads the call sites themselves.
+  it("runs every mcp-publisher login and publish through mcp_bounded", () => {
+    const calls = releaseSh
+      .split("\n")
+      .filter(
+        (line) => !line.trimStart().startsWith("#") && /"\$\{WORKDIR\}\/\$\{BIN_NAME\}" (login|publish)\b/.test(line),
+      );
+    expect(calls.map((line) => /(login|publish)\b/.exec(line)?.[1])).toEqual(["login", "publish"]);
+    for (const line of calls) {
+      expect(line, "release.sh runs mcp-publisher without its time limit").toContain(
+        'mcp_bounded "${WORKDIR}/${BIN_NAME}"',
+      );
     }
   });
 });
@@ -2170,7 +2379,12 @@ describe("release.sh oam floor gate (stubbed full run)", () => {
     'echo "mcp-publisher $* token=${MCP_GITHUB_TOKEN:-}" >> "$FAKE_STATE/publisher.log"',
     'case "$1" in',
     '  --help) echo "MCP Registry Publisher Tool" ;;',
-    '  login) [ -n "${MCP_GITHUB_TOKEN:-}" ] || { echo "Error: no GitHub token" >&2; exit 1; }; echo "Successfully logged in" ;;',
+    "  login)",
+    // login-hangs: a registry that never answers the login.
+    '    if [ -e "$FAKE_STATE/login-hangs" ]; then exec "$FAKE_REAL_SLEEP" 60; fi',
+    // login-refused: the registry's answer to a token it will not take.
+    '    if [ -e "$FAKE_STATE/login-refused" ]; then echo "Error: failed to get token: failed to exchange token: token exchange failed with status 401: {\\"title\\":\\"Unauthorized\\",\\"status\\":401}" >&2; exit 1; fi',
+    '    [ -n "${MCP_GITHUB_TOKEN:-}" ] || { echo "Error: no GitHub token" >&2; exit 1; }; echo "Successfully logged in" ;;',
     "  publish)",
     `    v=$(node -p 'require("./server.json").version')`,
     '    echo "Publishing to https://registry.modelcontextprotocol.io..."',
@@ -2256,6 +2470,9 @@ describe("release.sh oam floor gate (stubbed full run)", () => {
   function release(f: FullRun, env: Record<string, string> = {}): RunResult {
     const harness = [
       `STUBS="$(cd "${shPath(join(f.root, "bin"))}" && pwd)" || exit 97`,
+      // The one real sleep, for a publisher login that never answers: the
+      // stub below shadows it on PATH.
+      'export FAKE_REAL_SLEEP="$(command -v sleep)"',
       'export PATH="$STUBS:$PATH"',
       "for t in npm curl gh sleep; do",
       '  if [ "$(command -v "$t")" != "$STUBS/$t" ]; then',
@@ -2314,6 +2531,38 @@ describe("release.sh oam floor gate (stubbed full run)", () => {
       return [];
     }
   };
+
+  it.skipIf(!hasCoreutilsTimeout)("stops a login the MCP registry never answers, and fails the step saying so", () => {
+    const f = setup();
+    writeFileSync(join(f.state, "login-hangs"), "");
+    const r = release(f, { MCP_PUBLISH_TIMEOUT_S: "1", MCP_PUBLISH_KILL_AFTER_S: "1" });
+    expect(r.status, r.out).not.toBe(0);
+    expect(r.out).toContain("mcp-publisher did not answer within 1s -- stopped it");
+    expect(r.out).toContain(
+      "The MCP registry did not answer mcp-publisher login within 1s. Re-run ./release.sh 1.0.2 once it answers",
+    );
+    expect(r.out).not.toContain("A 401 there is");
+    expect(stateLines(f, "publisher.log")).toEqual([
+      "mcp-publisher --help token=",
+      "mcp-publisher login github token=fixture-token",
+    ]);
+  });
+
+  it("fails a login the MCP registry refuses by saying how to read its output, not that it did not answer", () => {
+    const f = setup();
+    writeFileSync(join(f.state, "login-refused"), "");
+    const r = release(f);
+    expect(r.status, r.out).not.toBe(0);
+    expect(r.out).toContain("token exchange failed with status 401");
+    expect(r.out).toContain(
+      "mcp-publisher login github failed -- its output is above. A 401 there is the registry refusing the token exchange -- most often the GitHub token (GITHUB_TOKEN, MCP_REGISTRY_TOKEN or `gh auth token`) is invalid or expired, though the registry answers 401 when GitHub's own API fails too; a 5xx or a connection error is the registry or the network. Re-run ./release.sh 1.0.2 once that is fixed",
+    );
+    expect(r.out).not.toContain("did not answer");
+    expect(stateLines(f, "publisher.log")).toEqual([
+      "mcp-publisher --help token=",
+      "mcp-publisher login github token=fixture-token",
+    ]);
+  });
 
   it("runs the verifier in step 1 and releases on its OK line, touching the GitHub API for nothing", () => {
     const f = setup();
