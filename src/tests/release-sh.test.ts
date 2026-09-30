@@ -48,7 +48,16 @@
 
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  copyFileSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -1453,11 +1462,15 @@ describe("release.sh mcp-publisher publish retry", () => {
   function run(failures: number, failureText: string, thenText = ""): RunResult & { tries: number } {
     const work = newTmp("release-pub-bin-");
     // The publisher stub fails `failures` times with `failureText`, then
-    // publishes -- or, when `thenText` is set, fails with that instead. Its
-    // attempt count lives in a file: each call is a process.
+    // publishes -- or, when `thenText` is set, fails with that instead. Each
+    // call is a process, so each one records itself as a NEW file, call-<n>,
+    // rather than rewriting one counter file: under heavy load on Windows the
+    // 429/502/503/504 case once read 1 try where 2 were expected, and passed on
+    // every re-run. A counter rewritten by each process is the one step here
+    // that another process can still be holding; a fresh file is not.
     const stub = [
       "#!/bin/bash",
-      'n=$(cat "$FAKE_STATE/tries" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$FAKE_STATE/tries"',
+      'n=$(( $(ls "$FAKE_STATE" | grep -c "^call-") + 1 )); : > "$FAKE_STATE/call-$n"',
       `if [ "$n" -le ${failures} ]; then echo "$FAKE_FAILURE" >&2; exit 1; fi`,
       'if [ -n "$FAKE_THEN" ]; then echo "$FAKE_THEN" >&2; exit 1; fi',
       'echo "Successfully published io.github.YawLabs/mcp@1.0.17"',
@@ -1481,13 +1494,13 @@ describe("release.sh mcp-publisher publish retry", () => {
       'echo "CONTINUED"',
     ].join("\n");
     const r = runBash(body, dir, { FAKE_STATE: shPath(work), FAKE_FAILURE: failureText, FAKE_THEN: thenText });
-    const tries = Number(readFileSync(join(work, "tries"), "utf8").trim());
+    const tries = readdirSync(work).filter((f) => f.startsWith("call-")).length;
     return { ...r, tries };
   }
 
   it("publishes on the first attempt when the registry sees npm's document", () => {
     const r = run(0, "");
-    expect(r.tries).toBe(1);
+    expect(r.tries, r.out).toBe(1);
     expect(r.out).toContain("Successfully published");
     expect(r.out).toContain("INFO Published server.json to MCP registry");
     expect(r.out).toContain("CONTINUED");
@@ -1495,7 +1508,7 @@ describe("release.sh mcp-publisher publish retry", () => {
 
   it("retries the registry's npm-404 400 30 s, then 60 s later, and publishes once the far side catches up", () => {
     const r = run(2, NPM_404);
-    expect(r.tries).toBe(3);
+    expect(r.tries, r.out).toBe(3);
     expect(r.out).toContain(
       "WARN The MCP registry cannot fetch @yawlabs/mcp@1.0.17 from npm yet (attempt 1/4) -- retrying in 30s",
     );
@@ -1514,7 +1527,7 @@ describe("release.sh mcp-publisher publish retry", () => {
     // failed the release at once.
     for (const text of TRANSIENT) {
       const r = run(1, text);
-      expect(r.tries, text).toBe(2);
+      expect(r.tries, `${text}: ${r.out}`).toBe(2);
       expect(r.out, text).toContain("(attempt 1/4) -- retrying in 30s");
       expect(r.out, text).toContain("INFO Published server.json to MCP registry");
     }
@@ -1522,7 +1535,7 @@ describe("release.sh mcp-publisher publish retry", () => {
 
   it("gives up after four attempts, 180 s of waiting, with the re-run -- not a fifth", () => {
     const r = run(99, NPM_404);
-    expect(r.tries).toBe(4);
+    expect(r.tries, r.out).toBe(4);
     expect(r.out).toContain("SLEPT 30\n");
     expect(r.out).toContain("SLEPT 60\n");
     expect(r.out).toContain("SLEPT 90\n");
@@ -1549,7 +1562,7 @@ describe("release.sh mcp-publisher publish retry", () => {
     ];
     for (const [status, title] of cases) {
       const r = run(1, gateway(status, title));
-      expect(r.tries, status).toBe(2);
+      expect(r.tries, `${status}: ${r.out}`).toBe(2);
       expect(r.out, status).toContain(
         `WARN The MCP registry answered HTTP ${status} itself -- busy or timing out, not a verdict (attempt 1/4) -- retrying in 30s`,
       );
@@ -1568,7 +1581,7 @@ describe("release.sh mcp-publisher publish retry", () => {
       "Error: publish failed: server returned status 504: <html><title>504 Gateway Time-out</title></html>",
       'Error: publish failed: server returned status 400: {"title":"Bad Request","status":400,"detail":"Failed to publish server","errors":[{"message":"invalid version: cannot publish duplicate version"}]}',
     );
-    expect(r.tries).toBe(2);
+    expect(r.tries, r.out).toBe(2);
     expect(r.out).toContain(
       "INFO Published server.json to MCP registry: the attempt that timed out landed, and the registry refused the retry of io.github.YawLabs/mcp@1.0.17 as a duplicate",
     );
@@ -1582,7 +1595,7 @@ describe("release.sh mcp-publisher publish retry", () => {
       99,
       "Error: publish failed: server returned status 504: <html><title>504 Gateway Time-out</title></html>",
     );
-    expect(r.tries).toBe(4);
+    expect(r.tries, r.out).toBe(4);
     expect(r.out).toContain("FAIL The MCP registry still answers HTTP 504 after 4 attempts over 180s");
     expect(r.out).toContain("Re-run ./release.sh 1.0.17");
     expect(r.out).not.toContain("CONTINUED");
@@ -1600,7 +1613,7 @@ describe("release.sh mcp-publisher publish retry", () => {
     ];
     for (const dup of bodies) {
       const r = run(99, dup);
-      expect(r.tries, dup).toBe(1);
+      expect(r.tries, `${dup}: ${r.out}`).toBe(1);
       expect(r.out, dup).toContain(
         "INFO The MCP registry already holds io.github.YawLabs/mcp@1.0.17 (it refused a duplicate) -- nothing to publish",
       );
@@ -1631,7 +1644,7 @@ describe("release.sh mcp-publisher publish retry", () => {
     ];
     for (const text of others) {
       const r = run(99, text);
-      expect(r.tries, text).toBe(1);
+      expect(r.tries, `${text}: ${r.out}`).toBe(1);
       expect(r.out, text).toContain("FAIL mcp-publisher publish failed (exit 1)");
       expect(r.out, text).toContain(text.split("\n")[0]);
       expect(r.out, text).not.toContain("retrying");
