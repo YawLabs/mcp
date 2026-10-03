@@ -131,8 +131,21 @@ describe("KNOWN_SUBCOMMANDS table", () => {
     //
     // Source-text technique, same as the handler-order check below: index.ts
     // dispatches at import time and cannot be imported to be inspected.
+    //
+    // Anchored to the dispatch chain's own lines -- `if (` / `} else if (` at
+    // column 0 -- rather than scraped from the whole file. A bare
+    // `subcommand === "..."` regex over raw source also matched comments
+    // (a note that QUOTES a retired branch would have kept it "dispatched")
+    // and non-dispatch code (`parseToggleArgs(..., subcommand === "enable")`),
+    // so the equality this test claims was against a set wider than the
+    // chain. A compound line (`"enable" || "disable"`, the help aliases)
+    // contributes every literal on it.
     const src = await readFile(INDEX_SRC, "utf8");
-    const dispatched = [...src.matchAll(/subcommand === "([^"]+)"/g)].map((m) => m[1]);
+    const dispatchLines = src.split("\n").filter((line) => /^(?:if|\} else if) \(/.test(line));
+    expect(dispatchLines.length).toBeGreaterThan(0);
+    const dispatched = dispatchLines.flatMap((line) =>
+      [...line.matchAll(/subcommand === "([^"]+)"/g)].map((m) => m[1]),
+    );
     expect(dispatched.length).toBeGreaterThan(0);
     expect(new Set<string>(dispatched)).toEqual(new Set<string>(KNOWN_SUBCOMMANDS));
   });
@@ -454,7 +467,9 @@ describe("index.ts entry, run as a real process", () => {
  *  a user would set to change yaw-mcp's behavior, which is what the help block
  *  documents. Anything read by src/ and not listed here must appear in the
  *  block -- add the doc line, not an entry here, unless the name genuinely
- *  belongs to this category. */
+ *  belongs to this category. VITEST is NOT here on purpose: it changes what
+ *  a spawned yaw-mcp does (every background feature off), so it is a
+ *  documented switch even though no user sets it by hand. */
 const UNDOCUMENTED_INTERNAL_ENV = new Set([
   "APPDATA",
   "ELECTRON_RUN_AS_NODE",
@@ -463,7 +478,6 @@ const UNDOCUMENTED_INTERNAL_ENV = new Set([
   "MSYSTEM",
   "PATH",
   "USERPROFILE",
-  "VITEST",
   "XDG_CACHE_HOME",
 ]);
 

@@ -61,10 +61,22 @@ export function installNudgeStatePath(home: string): string {
 /** The gate. The shadow scan runs ONLY when this returns true; off by
  *  default. Enabled by either the env override (YAW_MCP_INSTALL_NUDGE=1) or
  *  the resolved config flag (installNudge: true). Env and config are
- *  independent — either one flips it on. Only a literal "1" enables via env
- *  so a stray empty/other value can't accidentally turn it on. */
+ *  independent — either one flips it on.
+ *
+ *  The env spelling mirrors the product's opt-OUT rule (opt-out-env.ts:
+ *  `0` or `false`, any case, surrounding whitespace stripped): `1` or
+ *  `true`, any case, trimmed, turns this opt-IN on, and EVERYTHING else --
+ *  unset, empty, `yes`, `on`, `0`, a near-miss like `11` -- leaves it off.
+ *  The trim is the half that bites, and on Yaw's primary platform: cmd.exe's
+ *  `set VAR=1 && yaw-mcp discover` delivers "1 " with a trailing space, which
+ *  an exact `=== "1"` read as "not enabled". A typo still fails CLOSED, the
+ *  right direction for a feature that reads shell history. */
 export function installNudgeEnabled(env: NodeJS.ProcessEnv, config: { installNudge?: boolean } | null): boolean {
-  if (env.YAW_MCP_INSTALL_NUDGE === "1") return true;
+  const raw = env.YAW_MCP_INSTALL_NUDGE;
+  if (raw !== undefined) {
+    const trimmed = raw.trim();
+    if (trimmed === "1" || trimmed.toLowerCase() === "true") return true;
+  }
   if (config?.installNudge === true) return true;
   return false;
 }

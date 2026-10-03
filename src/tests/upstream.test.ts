@@ -1215,6 +1215,98 @@ describe("redactSecretsInOutput", () => {
     expect(err!.stderrTail).not.toContain("***HOME_DIR***");
   });
 
+  it("leaves a long LITERAL under a non-credential name readable: only vault values and credential-named entries are mapped", async () => {
+    // The map used to be the ENTIRE resolved env, so any literal of >=8 chars
+    // -- a base URL, a data dir, a project path -- became `***KEY***` wherever
+    // the child mentioned it: the one string the error was about, hidden, with
+    // no credential protected. A literal is mapped only when its NAME reads as
+    // a credential (isCredentialEnvName); a vault-sourced value is mapped
+    // whatever its name (next test).
+    const baseUrl = "https://gateway.internal.example/api/v2/projects";
+    const token = "literal-token-value-9f8e7d6c";
+    const config = makeLocalConfig({ env: { BASE_URL: baseUrl, MY_TOKEN: token } });
+
+    _sdkBehavior.clientConnect = () => {
+      _sdkBehavior.stderrEmitter?.emit("data", Buffer.from(`GET ${baseUrl} -> 401 for ${token}`));
+      return Promise.reject(new Error("handshake failed"));
+    };
+
+    let err: ActivationError | undefined;
+    try {
+      await connectToUpstream(config);
+    } catch (e) {
+      err = e as ActivationError;
+    }
+
+    expect(err).toBeInstanceOf(ActivationError);
+    expect(err!.stderrTail).toContain(baseUrl);
+    expect(err!.stderrTail).not.toContain("***BASE_URL***");
+    expect(err!.stderrTail).not.toContain(token);
+    expect(err!.stderrTail).toContain("***MY_TOKEN***");
+  });
+
+  it("maps a resolved ${secret:} value whatever its env NAME", async () => {
+    // The other half of the rule: a vault-sourced value under a bland name
+    // (ENDPOINT holding a connection string with the password inline) is a
+    // secret because of where it came from, not what it is called.
+    vi.mocked(hasSecretRefs).mockReturnValue(true);
+    process.env.YAW_MCP_VAULT_PASSPHRASE = "test-passphrase";
+    vi.mocked(loadVault).mockResolvedValue({ version: 1, salt: "abc", entries: { gw: {} } } as any);
+    vi.mocked(unlock).mockResolvedValue(Buffer.from("fakekey"));
+    const value = "https://svc:supersecretpw@gateway.internal/";
+    vi.mocked(resolveSecretRefs).mockReturnValue({
+      resolved: { ENDPOINT: value },
+      missing: [],
+      malformed: [],
+      values: { gw: value },
+    });
+    try {
+      _sdkBehavior.clientConnect = () => {
+        _sdkBehavior.stderrEmitter?.emit("data", Buffer.from(`dial ${value} failed`));
+        return Promise.reject(new Error("handshake failed"));
+      };
+
+      let err: ActivationError | undefined;
+      try {
+        await connectToUpstream(makeLocalConfig({ env: { ENDPOINT: "${secret:gw}" } }));
+      } catch (e) {
+        err = e as ActivationError;
+      }
+
+      expect(err).toBeInstanceOf(ActivationError);
+      expect(err!.stderrTail).not.toContain(value);
+      expect(err!.stderrTail).toContain("***ENDPOINT***");
+    } finally {
+      delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    }
+  });
+
+  it("decodes a multi-byte character split across two stderr chunks without U+FFFD", async () => {
+    // stderr is a byte stream and the ring used to toString() each chunk on
+    // its own, so a UTF-8 sequence cut by a chunk boundary came out as two
+    // replacement characters: a non-ASCII path in the tail turned to
+    // mojibake, and a credential straddling the cut could never match the
+    // exact-substring redactor. The ring now runs through a StringDecoder.
+    const bytes = Buffer.from("fatal: cannot open /tmp/caf\u00e9/config.json\n", "utf8");
+    const cut = bytes.indexOf(Buffer.from("\u00e9", "utf8")) + 1; // INSIDE the 2-byte sequence
+    _sdkBehavior.clientConnect = () => {
+      _sdkBehavior.stderrEmitter?.emit("data", bytes.subarray(0, cut));
+      _sdkBehavior.stderrEmitter?.emit("data", bytes.subarray(cut));
+      return Promise.reject(new Error("handshake failed"));
+    };
+
+    let err: ActivationError | undefined;
+    try {
+      await connectToUpstream(makeLocalConfig());
+    } catch (e) {
+      err = e as ActivationError;
+    }
+
+    expect(err).toBeInstanceOf(ActivationError);
+    expect(err!.stderrTail).toContain("/tmp/caf\u00e9/config.json");
+    expect(err!.stderrTail).not.toContain("\uFFFD");
+  });
+
   it("keeps longest-first ordering across variants of DIFFERENT secrets", async () => {
     // The invariant the sort exists for, now that one secret's VARIANT can be
     // longer than another secret's raw value. INNER's raw is a substring of
@@ -1897,6 +1989,31 @@ describe("resolveServerEnv", () => {
     await expect(connectToUpstream(config)).rejects.toThrow(/vault locked.*YAW_MCP_VAULT_PASSPHRASE/);
   });
 
+  it("refuses on a locked vault BEFORE resolving the launch command: no uv bootstrap, no oam probe", async () => {
+    // The vault check is the one refusal on the local path that costs nothing
+    // to decide. It used to run AFTER resolveUvSpawn (a ~20MB download on a
+    // cold cache) and the oam probe, both of which a locked vault then threw
+    // away. Nothing should be resolved, probed or spawned for a server that
+    // cannot be given its env.
+    vi.mocked(hasSecretRefs).mockReturnValue(true);
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    vi.mocked(resolveUvSpawn).mockClear();
+    vi.mocked(resolveOamSpawn).mockClear();
+    _sdkBehavior.stdioConstructions = [];
+
+    const config = makeLocalConfig({
+      runtime: "oam",
+      command: "uvx",
+      args: ["some-python-server"],
+      env: { TOKEN: "${secret:MY_TOKEN}" },
+    });
+
+    await expect(connectToUpstream(config)).rejects.toBeInstanceOf(VaultPassphraseRequiredError);
+    expect(vi.mocked(resolveUvSpawn)).not.toHaveBeenCalled();
+    expect(vi.mocked(resolveOamSpawn)).not.toHaveBeenCalled();
+    expect(_sdkBehavior.stdioConstructions).toHaveLength(0);
+  });
+
   it("throws a TYPED VaultPassphraseRequiredError carrying the namespace and ref keys", async () => {
     // The type is what lets the activation path tell "yaw-mcp needs its vault
     // passphrase" apart from "the child says a credential is missing". Matching
@@ -2204,8 +2321,9 @@ describe("connectToUpstream oam boot-probe fallback", () => {
 
   it("does NOT downgrade on non-activation failures (vault refusals rethrow untouched)", async () => {
     // Secret refs present but no passphrase -> resolveServerEnv throws the
-    // typed VaultPassphraseRequiredError AFTER the rewrite gate, which is not
-    // an ActivationError. Downgrading would just fail identically on node, so
+    // typed VaultPassphraseRequiredError (now BEFORE the uv/oam resolvers,
+    // which is why no rewrite is ever attempted here), which is not an
+    // ActivationError. Downgrading would just fail identically on node, so
     // the wrapper must rethrow without a respawn.
     vi.mocked(hasSecretRefs).mockReturnValue(true);
     delete process.env.YAW_MCP_VAULT_PASSPHRASE;
@@ -2305,6 +2423,146 @@ describe("connectToUpstream oam boot-probe fallback", () => {
     await expect(connectToUpstream(config)).rejects.toBeInstanceOf(ActivationError);
     expect(_sdkBehavior.stdioConstructions.map((c) => c.command)).toEqual(["npx"]);
     expect(vi.mocked(resolveOamSpawn)).not.toHaveBeenCalled();
+  });
+
+  it("keys the pin on the launch identity, so an entry fixed mid-session tries oam again", async () => {
+    // bundles.json is a live re-read. A namespace-only memo kept a server on
+    // node until restart even after the user changed the entry, although the
+    // evidence that earned the pin was about the OLD launch.
+    vi.mocked(resolveOamSpawn).mockResolvedValue({ command: "/usr/bin/oam", args: ["run", "/e.js"] });
+    let connects = 0;
+    _sdkBehavior.clientConnect = () => {
+      connects++;
+      return connects === 1 ? Promise.reject(new Error("oam crashed on boot")) : Promise.resolve();
+    };
+    const config = makeLocalConfig({ runtime: "oam", command: "npx", args: ["-y", "x@1"] });
+    expect((await connectToUpstream(config)).status).toBe("connected");
+    expect(_sdkBehavior.stdioConstructions.map((c) => c.command)).toEqual(["/usr/bin/oam", "npx"]);
+
+    // Same identity (a fresh object with the same launch fields): pinned, and
+    // the rewrite is not consulted.
+    _sdkBehavior.stdioConstructions = [];
+    vi.mocked(resolveOamSpawn).mockClear();
+    expect((await connectToUpstream({ ...config })).status).toBe("connected");
+    expect(vi.mocked(resolveOamSpawn)).not.toHaveBeenCalled();
+    expect(_sdkBehavior.stdioConstructions.map((c) => c.command)).toEqual(["npx"]);
+
+    // Changed args under the same namespace: the pin no longer matches and oam
+    // gets another chance.
+    _sdkBehavior.stdioConstructions = [];
+    _sdkBehavior.clientConnect = () => Promise.resolve();
+    const fixed = makeLocalConfig({ runtime: "oam", command: "npx", args: ["-y", "x@2"] });
+    expect((await connectToUpstream(fixed)).status).toBe("connected");
+    expect(vi.mocked(resolveOamSpawn)).toHaveBeenCalledTimes(1);
+    expect(_sdkBehavior.stdioConstructions.map((c) => c.command)).toEqual(["/usr/bin/oam"]);
+  });
+
+  it("stops reporting oamPinned once the entry says runtime: 'node' outright", async () => {
+    // The "Connected to upstream" line used to say downgradedFromOam/oamPinned
+    // for a server whose config now opted out of oam explicitly -- the memo
+    // matched on namespace alone. An explicit `runtime` is part of the launch
+    // identity, so the pin stops applying and the line reads as a plain node
+    // spawn, which is what it is.
+    vi.mocked(resolveOamSpawn).mockResolvedValue({ command: "/usr/bin/oam", args: ["run", "/e.js"] });
+    let connects = 0;
+    _sdkBehavior.clientConnect = () => {
+      connects++;
+      return connects === 1 ? Promise.reject(new Error("oam crashed on boot")) : Promise.resolve();
+    };
+    const config = makeLocalConfig({ command: "npx", args: ["-y", "x"] });
+    vi.mocked(defaultRuntime).mockResolvedValue("oam");
+    expect((await connectToUpstream(config)).status).toBe("connected");
+
+    vi.mocked(log).mockClear();
+    expect(
+      (await connectToUpstream(makeLocalConfig({ runtime: "node", command: "npx", args: ["-y", "x"] }))).status,
+    ).toBe("connected");
+    expect(vi.mocked(log)).toHaveBeenCalledWith("info", "Connected to upstream", {
+      name: "Test Server",
+      namespace: "test",
+      type: "local",
+    });
+  });
+
+  it("reuses the first attempt's resolved env on the node respawn: one vault resolve, one audit event per secret", async () => {
+    // The respawn used to re-run resolveServerEnv, so `yaw-mcp secrets audit`
+    // showed two "injected" events for one activation. The env is resolved
+    // once and parked on the attempt; both children get the same values.
+    vi.mocked(hasSecretRefs).mockReturnValue(true);
+    process.env.YAW_MCP_VAULT_PASSPHRASE = "test-passphrase";
+    vi.mocked(loadVault).mockResolvedValue({ version: 1, salt: "abc", entries: { gh: {} } } as any);
+    vi.mocked(unlock).mockResolvedValue(Buffer.from("fakekey"));
+    const token = "resolved-token-value-0001";
+    vi.mocked(resolveSecretRefs).mockReturnValue({
+      resolved: { TOKEN: token },
+      missing: [],
+      malformed: [],
+      values: { gh: token },
+    });
+    vi.mocked(resolveOamSpawn).mockResolvedValue({ command: "/usr/bin/oam", args: ["run", "/e.js"] });
+    let connects = 0;
+    _sdkBehavior.clientConnect = () => {
+      connects++;
+      return connects === 1 ? Promise.reject(new Error("oam crashed on boot")) : Promise.resolve();
+    };
+    try {
+      const config = makeLocalConfig({
+        runtime: "oam",
+        command: "npx",
+        args: ["-y", "x"],
+        env: { TOKEN: "${secret:gh}" },
+      });
+      expect((await connectToUpstream(config)).status).toBe("connected");
+      expect(_sdkBehavior.stdioConstructions.map((c) => c.command)).toEqual(["/usr/bin/oam", "npx"]);
+      for (const c of _sdkBehavior.stdioConstructions) expect(c.env?.TOKEN).toBe(token);
+      expect(vi.mocked(hasSecretRefs)).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(resolveSecretRefs)).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(appendAuditEvent)).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(appendAuditEvent)).toHaveBeenCalledWith({ server: "test", secret: "gh", event: "injected" });
+    } finally {
+      delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The timeout knobs resolve on first use, not at import -- the "ignored" warn
+// for a rejected value has to reach a serving broker and stay out of every
+// CLI subcommand that merely loads this module.
+// ---------------------------------------------------------------------------
+
+describe("timeout knobs resolve lazily", () => {
+  it("does not warn about a rejected MCP_LIST_TIMEOUT at import; warns once, at the first inventory call", async () => {
+    // The logger stub forwards warns to process.stderr, which is captured
+    // here; a fresh module so the memo starts empty.
+    const writes: string[] = [];
+    const original = process.stderr.write.bind(process.stderr);
+    vi.stubEnv("MCP_LIST_TIMEOUT", "3e9");
+    vi.resetModules();
+    (process.stderr as { write: unknown }).write = (chunk: string | Uint8Array) => {
+      writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+      return true;
+    };
+    try {
+      const fresh = await import("../upstream.js");
+      expect(writes.filter((w) => w.includes("MCP_LIST_TIMEOUT"))).toEqual([]);
+      const client = makeClient({
+        listResources: vi.fn().mockResolvedValue({ resources: [] }),
+        listPrompts: vi.fn().mockResolvedValue({ prompts: [] }),
+        listTools: vi.fn().mockResolvedValue({ tools: [] }),
+      });
+      await fresh.fetchToolsFromUpstream(client, "ns");
+      await fresh.fetchResourcesFromUpstream(client, "ns");
+      await fresh.fetchPromptsFromUpstream(client, "ns");
+      // Once: memoized after the first resolve, and the value in effect is the
+      // documented default.
+      expect(writes.filter((w) => w.includes("MCP_LIST_TIMEOUT"))).toHaveLength(1);
+      expect(client.listTools.mock.calls[0][1]).toEqual({ timeout: 15_000 });
+    } finally {
+      process.stderr.write = original;
+      vi.unstubAllEnvs();
+      vi.resetModules();
+    }
   });
 });
 
@@ -2950,7 +3208,6 @@ describe("disconnectFromUpstream", () => {
     await expect(disconnectFromUpstream(connection)).resolves.toBeUndefined();
 
     expect(connection.status).toBe("disconnected");
-    expect(connection.error).toBeUndefined();
     expect(onDisconnect).not.toHaveBeenCalled();
     expect(stderr.writes.some((w) => w.includes("Upstream disconnected unexpectedly"))).toBe(false);
   });
@@ -3003,7 +3260,6 @@ describe("connectToUpstream onclose after ready", () => {
     connection.client.onclose?.();
 
     expect(connection.status).toBe("error");
-    expect(connection.error).toBe("Upstream disconnected unexpectedly");
     expect(onDisconnect).toHaveBeenCalledWith("test");
     expect(stderr.writes.some((w) => w.includes("Upstream disconnected unexpectedly"))).toBe(true);
   });
@@ -3012,7 +3268,6 @@ describe("connectToUpstream onclose after ready", () => {
     const connection = await connectToUpstream(makeLocalConfig());
     expect(() => connection.client.onclose?.()).not.toThrow();
     expect(connection.status).toBe("error");
-    expect(connection.error).toBe("Upstream disconnected unexpectedly");
   });
 });
 

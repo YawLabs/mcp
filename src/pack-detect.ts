@@ -69,6 +69,12 @@ export class PackDetector {
 
   recordCall(namespace: string, toolName: string, at: number): void {
     if (!namespace || !toolName) return;
+    // Same finite check loadSnapshot applies to a timestamp off disk, for the
+    // same reason: segmentBursts compares `at` with `>` and `<`, both false
+    // against NaN, so one bad timestamp welds the history into a single burst.
+    // A live call's `at` is a Date.now() today, but the parameter is a number
+    // and nothing else here guarantees it stays one.
+    if (typeof at !== "number" || !Number.isFinite(at)) return;
     this.history.push({ namespace, toolName, at });
     if (this.history.length > this.maxHistory) {
       // Drop the oldest entries once we exceed the cap. Slice once
@@ -137,7 +143,12 @@ export class PackDetector {
   //      whole burst and the recurring trio inside it was never counted.
   //      Cutting at the overflow keeps each burst representable as a
   //      pack; a wider rotation surfaces as its recurring 3-subsets, the
-  //      best answer the MAX_NAMESPACES pack-size cap can express.
+  //      best answer the MAX_NAMESPACES pack-size cap can express. SLOWLY,
+  //      though: the cuts walk the rotation, so each 3-subset recurs only
+  //      once per full pass over it. A strict a,b,c,d loop segments as
+  //      [a,b,c] [d,a,b] [c,d,a] [b,c,d] [a,b,c] ..., and {a,b,c} reaches
+  //      MIN_RECURRENCES at the 15th call -- all of which must land inside
+  //      one span window and one maxGapMs cadence.
   // Within a burst, each namespace is recorded only once
   // (order-of-first-appearance); the "last seen" timestamp tracks the
   // most recent call in the burst so recency ranking is truthful even

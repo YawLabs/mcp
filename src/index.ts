@@ -131,13 +131,20 @@ function run<T>(
 // and every subcommand here is local-only.
 const subcommand = process.argv[2];
 
-// Every client env var, read ONCE here and threaded into the verbs that need
-// it -- never inside a runner, so a test that calls the runner directly stays
-// hermetic and cannot inherit a wrapper's env. `readClientEnv` is the single
-// reader of these names (empty counts as UNSET, one rule in one place); three
-// hand-rolled copies of that rule is how two commands came to disagree about
-// whether an empty CLAUDE_CONFIG_DIR relocates anything.
-const clientEnv = readClientEnv(process.env);
+// Every client env var, read by ONE reader and threaded into the verbs that
+// need it -- never inside a runner, so a test that calls the runner directly
+// stays hermetic and cannot inherit a wrapper's env. `readClientEnv` is the
+// single reader of these names (empty counts as UNSET, one rule in one place);
+// three hand-rolled copies of that rule is how two commands came to disagree
+// about whether an empty CLAUDE_CONFIG_DIR relocates anything.
+//
+// Called from inside the three branches that consume it (install, uninstall,
+// import), not at the top of the dispatcher: a bare `serve` -- the one
+// invocation every MCP client makes -- has no business parsing
+// CLAUDE_CONFIG_DIR and its siblings, and the server never reads them (the
+// help text for CLAUDE_CONFIG_DIR says so). Only one branch runs per
+// process, so this is still one read per invocation.
+const clientEnvForVerb = (): ReturnType<typeof readClientEnv> => readClientEnv(process.env);
 
 // Any subcommand at all means a person at a terminal, not a client speaking
 // JSON-RPC -- the server launch is the one invocation with NO first argument
@@ -170,6 +177,7 @@ if (subcommand === "compliance") {
     process.stdout.write(`${INSTALL_USAGE}\n`);
     process.exitCode = 0;
   } else {
+    const clientEnv = clientEnvForVerb();
     run("install", parsed, (options) =>
       runInstall({ ...options, claudeConfigDir: clientEnv.claudeConfigDir, clientEnv }),
     );
@@ -183,6 +191,7 @@ if (subcommand === "compliance") {
   // matters as much on the subtract side -- under a Yaw Mode overlay the entry
   // lives in the wrapper's dir, and an uninstall that ignored the redirect
   // would report "nothing to do" while the real entry stayed wired.
+  const clientEnv = clientEnvForVerb();
   run("uninstall", parseUninstallArgs(process.argv.slice(3)), (options) =>
     runUninstall({ ...options, claudeConfigDir: clientEnv.claudeConfigDir, clientEnv }),
   );
@@ -229,6 +238,7 @@ if (subcommand === "compliance") {
   // Same one reader. It matters as much on the READ side -- under a Yaw Mode
   // overlay the servers to import live in the wrapper's dir, and an import
   // that ignored the redirect would report the user has none.
+  const clientEnv = clientEnvForVerb();
   run("import", parseImportArgs(process.argv.slice(3)), (options) =>
     runImport({ ...options, claudeConfigDir: clientEnv.claudeConfigDir, clientEnv }),
   );
@@ -431,6 +441,11 @@ if (subcommand === "compliance") {
   for per-subcommand flag details.
 
   Environment variables:
+    Every "Set to \`0\`" opt-out below reads \`0\` or \`false\`, in any case,
+    with surrounding whitespace ignored (cmd.exe's \`set VAR=0 && yaw-mcp\`
+    keeps the space before \`&&\`, and still disables). Any other value --
+    unset, empty, \`1\`, \`no\`, \`off\` -- leaves that feature on.
+
     YAW_MCP_STDIO                 Set to \`1\` to run the stdio MCP server even
                                when stdin is a terminal. A bare \`yaw-mcp\` on a
                                TTY prints what the command is and stops,
@@ -684,6 +699,26 @@ if (subcommand === "compliance") {
                                stderr: \`debug\` | \`info\` | \`warn\` | \`error\`
                                (default info). \`debug\` is what to set when
                                asking why a server did not load.
+    npm_config_prefix             npm's own global prefix, as npm exports it
+                               into every \`npm run\` / \`npx\` child. When set,
+                               a copy of yaw-mcp running under
+                               <prefix>/lib/node_modules or
+                               <prefix>/node_modules is treated as a global
+                               npm install by the background self-upgrade,
+                               which otherwise recognises only the default
+                               prefixes, the version managers' layouts and
+                               ~/.npm-global. \`yaw-mcp upgrade\` does not
+                               need it: it asks \`npm prefix -g\` directly.
+    VITEST                        Test-harness guard, set by vitest in every
+                               worker and inherited by any yaw-mcp a test
+                               suite spawns. Non-empty, it disables the
+                               background self-upgrade and the sidecar
+                               refresh entirely (no registry probe, no lock,
+                               no memo, no \`npm install\`), and the probes
+                               \`upgrade\` and \`doctor\` would otherwise run
+                               against this machine (\`npm prefix -g\`,
+                               \`oam --version\`, the registry). Not a user
+                               knob: unset it only to test the real thing.
 
   Config resolution (highest precedence first) -- for the \`servers\` allow-list
   and \`blocked\` deny-list:

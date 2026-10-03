@@ -204,7 +204,7 @@ export async function describeDefaultRuntime(
  * connects every active server at the same moment) joins the read already in
  * flight rather than each starting its own -- see `inflight`.
  *
- * `cwd`/`home` default to the real process values (production passes
+ * `cwd`/`home`/`env` default to the real process values (production passes
  * nothing); they exist so the bundles path is testable without depending on
  * the machine the suite runs on. They seed the ONE-TIME read only: the cache
  * below is a single unkeyed slot, so a later call passing different values
@@ -213,9 +213,9 @@ export async function describeDefaultRuntime(
  * per-call override -- key the cache before treating it as one.
  */
 export async function defaultRuntime(
-  opts: { cwd?: string; home?: string; now?: () => number } = {},
+  opts: { cwd?: string; home?: string; now?: () => number; env?: NodeJS.ProcessEnv } = {},
 ): Promise<RuntimeChoice | null> {
-  const fromEnv = readEnvChoice(process.env);
+  const fromEnv = readEnvChoice(opts.env ?? process.env);
   if (fromEnv !== null) return fromEnv;
   if (bundlesDefaultCache === undefined) {
     // Join the read already in flight rather than starting a second one. The
@@ -240,6 +240,7 @@ async function resolveBundlesDefault(opts: {
   cwd?: string;
   home?: string;
   now?: () => number;
+  env?: NodeJS.ProcessEnv;
 }): Promise<RuntimeChoice | null> {
   // A degraded read is not cached as an ANSWER (see below), which used to
   // mean the whole load -- read, project-trust hash, parse -- ran again on
@@ -253,7 +254,13 @@ async function resolveBundlesDefault(opts: {
   ) {
     return null;
   }
-  const bundles = await loadLocalBundles({ cwd: opts.cwd ?? process.cwd(), home: opts.home }).catch(() => null);
+  // `env` is threaded through for the same reason describeDefaultRuntime
+  // passes it: loadLocalBundles's project-trust probe reads the env it is
+  // handed, so a caller that injected one expects the trust decision -- and
+  // with it whether a project-local defaultRuntime counts -- to follow it.
+  const bundles = await loadLocalBundles({ cwd: opts.cwd ?? process.cwd(), home: opts.home, env: opts.env }).catch(
+    () => null,
+  );
   // A bundles.json that EXISTS but yielded no config (unreadable, or JSON
   // that will not parse) is a degraded read, not an answer -- and it is
   // indistinguishable from "nothing configured" once it reaches the cache.

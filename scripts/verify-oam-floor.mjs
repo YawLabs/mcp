@@ -417,7 +417,7 @@ function today() {
  *   platform?: NodeJS.Platform,
  *   cwd?: string,
  *   out?: (line: string) => void,
- *   oamVersion?: (bin: string) => Promise<string>,
+ *   oamVersion?: (bin: string, o: { timeoutMs: number }) => Promise<string>,
  *   probeHosting?: (o: { command: string, args: string[], cwd: string, timeoutMs: number }) => Promise<{ tools: string[], reply: string, ms: number }>,
  *   readFile?: (p: string) => string,
  *   writeFile?: (p: string, text: string) => void,
@@ -432,7 +432,6 @@ export async function verifyOamFloor(opts = {}, deps = {}) {
   const out = deps.out ?? ((l) => process.stdout.write(`${l}\n`));
   const readFile = deps.readFile ?? ((p) => readFileSync(join(cwd, p), "utf8"));
   const writeFile = deps.writeFile ?? ((p, t) => writeFileSync(join(cwd, p), t));
-  const versionOf = deps.oamVersion ?? ((bin) => oamVersion(bin));
   const probe = deps.probeHosting ?? probeHosting;
   const fail = (why) => {
     out(`${TAG} FAIL -- ${why}`);
@@ -443,6 +442,10 @@ export async function verifyOamFloor(opts = {}, deps = {}) {
     timeoutRaw !== undefined && /^\d+$/.test(timeoutRaw) && Number(timeoutRaw) > 0
       ? Number(timeoutRaw)
       : DEFAULT_TIMEOUT_MS;
+  // Bound below timeoutMs so the version read shares the budget the header
+  // promises for the whole probe: bound to the default instead, a hung
+  // `oam --version` outlived a VERIFY_OAM_FLOOR_TIMEOUT_MS set lower.
+  const versionOf = deps.oamVersion ?? oamVersion;
 
   // The floor first: a source that cannot be read is a repo problem, and it
   // should stop the run before a process is spawned for nothing.
@@ -456,7 +459,7 @@ export async function verifyOamFloor(opts = {}, deps = {}) {
   const { bin, explicit } = resolveOamBin(env, platform);
   let installed;
   try {
-    installed = await versionOf(bin);
+    installed = await versionOf(bin, { timeoutMs });
   } catch (err) {
     const code = err && typeof err === "object" && "code" in err ? err.code : undefined;
     if (code === "ENOENT") {

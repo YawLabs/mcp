@@ -49,6 +49,7 @@ import {
   vaultPath,
   vaultVerifiesPassphrases,
 } from "./secrets-vault.js";
+import { CANCELLED, type Cancelled, NO_ECHO, type NoEcho, readLineFromTTY } from "./tty-reader.js";
 
 export const SECRETS_USAGE = `Usage: yaw-mcp secrets <action> [args]
 
@@ -611,15 +612,6 @@ function unlockErrorMessage(err: unknown, path: string): string {
   return msg;
 }
 
-/** Returned by the passphrase readers when the user hits ^C at a prompt.
- *  Distinct from "" (empty submission -> re-prompt) and from null (no
- *  passphrase obtainable). The reader NEVER calls process.exit(): the io
- *  streams are injectable, so a test or an embedder must not be able to
- *  kill the host process by feeding it a 0x03 byte. runSecrets turns this
- *  into exitCode 130 (128 + SIGINT) and the CLI entry point owns the exit. */
-const CANCELLED: unique symbol = Symbol("yaw-mcp:passphrase-cancelled");
-type Cancelled = typeof CANCELLED;
-
 /** Standard result for a ^C at any prompt (passphrase, value, or
  *  confirmation). */
 function cancelledResult(io: SecretsIo, json: boolean | undefined, action: string): SecretsCommandResult {
@@ -913,6 +905,7 @@ async function resolvePassphrase(
   io: SecretsIo,
   confirm = false,
   labels: PassphrasePromptLabels = CREATE_VAULT_LABELS,
+  note?: string,
 ): Promise<string | null | Cancelled | NoEcho> {
   if (opts.passphrase !== undefined) return opts.passphrase.length > 0 ? opts.passphrase : null;
   const fromEnv = process.env.YAW_MCP_VAULT_PASSPHRASE;
@@ -931,7 +924,14 @@ async function resolvePassphrase(
   // passphrase -- a first-set typo would silently BECOME the vault's
   // (unrecoverable) passphrase. Confirm it twice, like rotate's
   // resolveNewPassphrase, so the two entries must agree before we commit.
-  if (confirm) return promptPassphraseTwice(opts, io, labels);
+  if (confirm) {
+    // `note` is written only here, on the prompt stream and right before the
+    // first entry: it exists to say WHY a confirm-twice prompt is appearing
+    // (see the emptied-vault case in runSecrets), and the env/opts paths above
+    // never show a prompt that could surprise anyone.
+    if (note !== undefined) stdout.write(note);
+    return promptPassphraseTwice(opts, io, labels);
+  }
   // Reject an empty passphrase (bare Enter / EOF with nothing typed):
   // deriving a key from "" would otherwise unlock any vault. Re-prompt up
   // to a few times, then give up so we never spin forever on a closed pipe.
@@ -993,221 +993,10 @@ const MAX_PASSPHRASE_PROMPTS = 3;
  *  passphrase. See warnIfShortPassphrase. */
 const MIN_PASSPHRASE_WARN_LEN = 12;
 
-/** Control bytes the raw-mode reader reacts to. Spelled as escapes: the
- *  literal bytes are invisible in an editor and get mangled by tooling. */
-const CTRL_C = "\x03"; // ETX -- cancel the whole command
-const CTRL_D = "\x04"; // EOT -- cancel this entry (resolves as an empty one)
-const TAB = "\x09"; // HT -- kept only at the secret-value prompt (keepTab)
-const DEL = "\x7f"; // what most terminals send for Backspace
-const ESC = "\x1b"; // opens a key sequence (arrow, Alt chord) -- never input
-
-/** Returned by the no-echo reads when the terminal could not be switched to
- *  raw mode. Raw mode is what turns echo OFF: without it the read would be
- *  line-buffered by the terminal, which ECHOES every character -- the secret
- *  on screen, in plain text, for anyone walking by. So the no-echo prompts
- *  refuse instead (see noEchoRefusal). Distinct from CANCELLED (the user
- *  did nothing) and from null (no prompt was possible at all). */
-const NO_ECHO: unique symbol = Symbol("yaw-mcp:no-echo-unavailable");
-type NoEcho = typeof NO_ECHO;
-
 /** The refusal for NO_ECHO, worded like promptUnavailableMessage: what was
  *  required, why the prompt would not run, and the non-interactive way in. */
 function noEchoRefusal(required: string, remedy: string): string {
   return `${required} Refusing to prompt: this terminal would not turn echo off, so what you type would be shown on screen. ${remedy}`;
-}
-
-/** Raw-mode line reader for the controlling TTY. Shared by the passphrase
- *  prompts (echo OFF -- the default), the destructive-action confirmation
- *  (echo ON, so the user can see the y/n they typed), and -- via
- *  readAnswerFromTTY below -- `yaw-mcp trust`'s approval prompt. One reader
- *  means ^C / ^D / Backspace / a stray ESC behave identically at every
- *  prompt in the product.
- *
- *  A no-echo read that cannot enter raw mode resolves NO_ECHO without
- *  writing the prompt or reading a byte. An echo read carries on
- *  line-buffered: its answer was going to be shown anyway.
- *
- *  `keepTab` (no-echo reads only) buffers a Tab instead of dropping it with
- *  the other control bytes; only the secret-value prompt sets it -- see the
- *  drop below. */
-function readLineFromTTY(
-  stdin: NodeJS.ReadStream,
-  stdout: NodeJS.WritableStream,
-  prompt: string,
-  echo: true,
-): Promise<string | Cancelled>;
-function readLineFromTTY(
-  stdin: NodeJS.ReadStream,
-  stdout: NodeJS.WritableStream,
-  prompt?: string,
-  echo?: false,
-  keepTab?: boolean,
-): Promise<string | Cancelled | NoEcho>;
-function readLineFromTTY(
-  stdin: NodeJS.ReadStream,
-  stdout: NodeJS.WritableStream,
-  prompt = "Vault passphrase: ",
-  echo = false,
-  keepTab = false,
-): Promise<string | Cancelled | NoEcho> {
-  return new Promise<string | Cancelled | NoEcho>((resolve) => {
-    const chunks: string[] = [];
-    const wasRaw = stdin.isRaw === true;
-    // Raw mode BEFORE the prompt is written, so a refused no-echo read leaves
-    // no dangling "Vault passphrase: " on the line. A stream with no
-    // setRawMode at all is treated as a failure on the no-echo path too:
-    // every no-echo caller reads only when stdin.isTTY is true, and a TTY
-    // that cannot be put in raw mode echoes.
-    let raw = false;
-    try {
-      if (typeof stdin.setRawMode === "function") {
-        stdin.setRawMode(true);
-        raw = true;
-      }
-    } catch {
-      // Raw mode refused; handled just below.
-    }
-    if (!raw && !echo) {
-      resolve(NO_ECHO);
-      return;
-    }
-    stdout.write(prompt);
-    stdin.resume();
-    stdin.setEncoding("utf8");
-    // Single teardown path: detach the listener, restore the previous raw
-    // mode, pause stdin, then settle. Every exit from onData goes through it.
-    const finish = (value: string | Cancelled): void => {
-      stdout.write("\n");
-      stdin.removeListener("data", onData);
-      try {
-        stdin.setRawMode?.(wasRaw);
-      } catch {
-        // ignore
-      }
-      stdin.pause();
-      resolve(value);
-    };
-    // Escape-sequence parser state, carried ACROSS chunks: a terminal can
-    // split an arrow key's bytes over two reads, and the tail of one must
-    // not be taken for typed text.
-    let esc: "none" | "esc" | "seq" = "none";
-    // Hoisted declaration so `finish` above can name it.
-    function onData(chunk: string): void {
-      let consumed = 0;
-      // Settle, then RE-BUFFER whatever follows the byte that ended this
-      // read. A terminal paste arrives as one chunk, so without this,
-      // pasting "passphrase\nvalue\n" consumed the passphrase and silently
-      // dropped the value line -- the next prompt then hung waiting for
-      // input the user believes they already gave. unshift() puts the
-      // residual at the head of the stream (finish() has already paused
-      // it), so the NEXT reader's resume() picks it up. Optional call: the
-      // injectable io contract only promises a ReadableStream shape.
-      const finishAndRebuffer = (value: string | Cancelled): void => {
-        finish(value);
-        const rest = chunk.slice(consumed);
-        if (rest.length > 0) (stdin as { unshift?: (c: string) => void }).unshift?.(rest);
-      };
-      for (const ch of chunk) {
-        consumed += ch.length;
-        // ESC "[" (CSI) and ESC "O" (SS3) open a key sequence the terminal
-        // sent on the user's behalf -- an arrow, Home/End, a function key --
-        // and NONE of its bytes is input: it runs through a final byte in
-        // 0x40-0x7e. Dropping only the 0x1b byte and buffering the rest
-        // inserted "[D" / "[A" into the NO-ECHO value and passphrase prompts,
-        // where the user could not see the corruption: a Left arrow to fix a
-        // typo in a pasted token stored `ghp_abc[D`, and the server later
-        // failed auth with nothing pointing at the vault. Any OTHER byte
-        // after an ESC is handled as typed: the ESC was a lone Escape key,
-        // or the meta prefix of an Alt chord, and neither is a reason to
-        // lose the keystroke that follows -- so Escape-then-Enter still
-        // submits, and Escape-then-y at a [y/N] prompt is still a y. A
-        // control byte never continues a sequence either.
-        if (esc === "esc") {
-          esc = "none";
-          if (ch === "[" || ch === "O") {
-            esc = "seq";
-            continue;
-          }
-        } else if (esc === "seq") {
-          if (ch >= " ") {
-            if (ch >= "@" && ch <= "~") esc = "none";
-            continue;
-          }
-          esc = "none";
-        }
-        if (ch === ESC) {
-          esc = "esc";
-          continue;
-        }
-        if (ch === "\n" || ch === "\r") {
-          // A pasted CRLF is ONE Enter: swallow the \n so it cannot be
-          // re-buffered and submit the next prompt as empty.
-          if (ch === "\r" && chunk[consumed] === "\n") consumed += 1;
-          finishAndRebuffer(chunks.join(""));
-          return;
-        }
-        if (ch === CTRL_D) {
-          // Cancel this entry. Resolve to "", an empty submission -- the
-          // no-echo prompts (passphrase and value) re-prompt on it, and a
-          // y/N or RESET confirmation reads it as no. Never a line
-          // terminator that would submit a partial entry.
-          finishAndRebuffer("");
-          return;
-        }
-        if (ch === CTRL_C) {
-          // Cancel the command. We deliberately do NOT process.exit() here:
-          // the io streams are injectable, so a fed 0x03 must not be able to
-          // kill the host process. The caller maps CANCELLED to exit 130.
-          finishAndRebuffer(CANCELLED);
-          return;
-        }
-        if (ch === "\b" || ch === DEL) {
-          if (chunks.length > 0) {
-            chunks.pop();
-            if (echo) stdout.write("\b \b");
-          }
-          continue;
-        }
-        // Drop every remaining control byte instead of buffering + echoing
-        // it. On the echo path (the y/n confirmation) a raw control byte
-        // written back is EXECUTED by the terminal rather than displayed.
-        // Everything else meaningful (\n \r ^C ^D \b ESC) is handled above.
-        // The one byte kept is a Tab at the secret-VALUE prompt (keepTab): a
-        // pasted token can carry one, and dropping it stored a different
-        // secret behind a green "Stored secret", with nothing on the no-echo
-        // line to show it (a piped value always kept it). The passphrase
-        // prompts still drop it, deliberately: a vault created by typing a
-        // Tab there is keyed under the Tab-less string, and keeping the byte
-        // now would stop the same keystrokes opening that vault.
-        if (ch < " " && !(keepTab && ch === TAB)) continue;
-        chunks.push(ch);
-        if (echo) stdout.write(ch);
-      }
-    }
-    stdin.on("data", onData);
-  });
-}
-
-/**
- * Ask a one-line question on the terminal and hand back what was typed
- * (trimmed, lowercased by the caller). Returns null when the user hit ^C.
- *
- * Exists so `yaw-mcp trust` and `yaw-mcp secrets` share ONE prompt reader
- * instead of two. trust-cmd used node:readline, this file uses the raw-mode
- * reader above, and the fix for an ESC/arrow key at a [y/N] prompt (a raw ESC
- * echoed back is EXECUTED by the terminal, and "\x1by" is not "y", so the
- * answer silently flipped) landed in only one of them. Two implementations of
- * "read one confirmation" drift; this is the one.
- *
- * Echo is ON: a y/n answer is not a secret, and the user has to see it.
- */
-export async function readAnswerFromTTY(
-  stdin: NodeJS.ReadableStream,
-  stdout: NodeJS.WritableStream,
-  question: string,
-): Promise<string | null> {
-  const answer = await readLineFromTTY(stdin as NodeJS.ReadStream, stdout, question, true);
-  return answer === CANCELLED ? null : answer;
 }
 
 /** Returned by readStdinValue when stdin is a TTY (so there is nothing piped
@@ -1447,8 +1236,19 @@ export async function runSecrets(
   // fresh vault -- get/remove short-circuit above -- and the env-var path
   // stays single-shot inside resolvePassphrase.
   const creatingVault = opts.action === "set" && !vault.check && Object.keys(vault.entries).length === 0;
+  // A legacy (check-less) vault that `remove` emptied is indistinguishable
+  // from a brand-new one to unlock(): nothing in it verifies a passphrase, so
+  // the next `set` re-establishes one. That is the same confirm-twice prompt
+  // a fresh vault gets -- but the user still has a vault FILE and may well
+  // type its old passphrase from memory, so say what the prompt is doing
+  // instead of letting whatever they type silently become the new one.
+  // (A fresh vault needs no note: "Created vault" is the expected outcome.)
+  const emptiedVaultNote =
+    creatingVault && !isFresh
+      ? `The vault at ${path} is empty, so it has no passphrase: the one you enter now becomes its passphrase.\n`
+      : undefined;
 
-  const passphrase = await resolvePassphrase(opts, io, creatingVault);
+  const passphrase = await resolvePassphrase(opts, io, creatingVault, CREATE_VAULT_LABELS, emptiedVaultNote);
   if (passphrase === CANCELLED) return cancelledResult(io, opts.json, opts.action);
   if (passphrase === NO_ECHO) {
     return failResult(
@@ -1473,121 +1273,130 @@ export async function runSecrets(
   } catch (err) {
     return failResult(io, opts.json, opts.action, unlockErrorMessage(err, path));
   }
-
-  // ----- set ------------------------------------------------------------
-  if (opts.action === "set") {
-    const name = opts.name as string;
-    let value: string;
-    if (opts.value !== undefined) value = opts.value;
-    else {
-      const entered = await readStdinValue(opts.io, opts.fromStdin);
-      if (entered === CANCELLED) return cancelledResult(io, opts.json, "set");
-      if (entered === NO_ECHO) {
-        return failResult(
-          io,
-          opts.json,
-          "set",
-          noEchoRefusal("Secret value required.", "Pipe the value in with --stdin instead."),
-        );
-      }
-      if (entered === PROMPT_IMPOSSIBLE) {
-        return failResult(
-          io,
-          opts.json,
-          "set",
-          "cannot prompt for the value: stdin is a TTY but stdout is not, so the prompt would be written into the redirect instead of shown. Pass --value <v>, or pipe the value in with --stdin.",
-        );
-      }
-      value = entered;
-    }
-    if (!value) return failResult(io, opts.json, "set", "Secret value cannot be empty.");
-    try {
-      // setSecret rejects a name no ${secret:NAME} reference could ever
-      // address (spaces, colons, braces) -- surface that as a normal CLI
-      // error instead of an unhandled rejection. For the CLI path
-      // parseSecretsArgs already rejected it before any prompt; this is
-      // the backstop for programmatic callers of runSecrets.
-      vault = setSecret(vault, key, name, value);
-    } catch (err) {
-      return failResult(io, opts.json, "set", err instanceof Error ? err.message : String(err));
-    }
-    if (await vaultChangedSinceLoad(path, baseline)) return vaultChangedResult(io, opts.json, "set");
-    // atomicWriteFile mkdirs the target dir, so no ensureVaultDir needed.
-    const failed = await saveVaultOrReport(path, vault, io, opts.json, "set");
-    if (failed) return failed;
-    // "Replaced" vs "Stored" is the only signal a scripted run gets that it
-    // just destroyed a previous value (the non-TTY path proceeds without a
-    // confirmation), so the two cases must never print the same line.
-    if (opts.json) io.out(`${JSON.stringify({ ok: true, name, fresh_vault: isFresh, replaced: replacing })}\n`);
-    else if (replacing) io.out(`Replaced secret "${name}".\n`);
-    else io.out(`${isFresh ? "Created vault and " : ""}Stored secret "${name}".\n`);
-    // Creating the vault is the one moment the CLI can tell the user that
-    // the passphrase has to reach the yaw-mcp their CLIENT spawns, not just
-    // the shell they typed this in. See freshVaultNudge.
-    if (isFresh) freshVaultNudge(io, path, opts.json);
-    return { exitCode: 0 };
-  }
-
-  // ----- get ------------------------------------------------------------
-  if (opts.action === "get") {
-    const name = opts.name as string;
-    try {
-      // Non-null by construction: the short-circuit above returned exit 1
-      // for a missing name (and for a missing vault) before the passphrase
-      // prompt, so `vault` is `loaded.vault` with `name` present and
-      // getSecret's own hasOwn check cannot fail. The not-found message
-      // lives there, once.
-      const value = getSecret(vault, key, name) as string;
-      // Warn (on `err`, never `out` -- keeps the value pipeable) when the
-      // caller is interactive: `get` prints cleartext, so an interactive run
-      // scrolls a secret into terminal scrollback. Skipped for piped/redirected
-      // stdout, which is the intended consumption path. Under --json it is a
-      // JSON line like every other warning (this was the last prose one, and
-      // a pty-driven wrapper parsing stderr per SECRETS_USAGE choked on it).
-      const outStream = opts.io?.stdout ?? process.stdout;
-      if ((outStream as { isTTY?: boolean }).isTTY === true) {
-        if (opts.json) io.err(`${JSON.stringify({ warning: "cleartext-on-tty", name })}\n`);
-        else {
-          io.err(
-            `yaw-mcp secrets: warning -- printing "${name}" in cleartext to your terminal; it will remain in scrollback.\n`,
+  try {
+    // ----- set ------------------------------------------------------------
+    if (opts.action === "set") {
+      const name = opts.name as string;
+      let value: string;
+      if (opts.value !== undefined) value = opts.value;
+      else {
+        const entered = await readStdinValue(opts.io, opts.fromStdin);
+        if (entered === CANCELLED) return cancelledResult(io, opts.json, "set");
+        if (entered === NO_ECHO) {
+          return failResult(
+            io,
+            opts.json,
+            "set",
+            noEchoRefusal("Secret value required.", "Pipe the value in with --stdin instead."),
           );
         }
+        if (entered === PROMPT_IMPOSSIBLE) {
+          return failResult(
+            io,
+            opts.json,
+            "set",
+            "cannot prompt for the value: stdin is a TTY but stdout is not, so the prompt would be written into the redirect instead of shown. Pass --value <v>, or pipe the value in with --stdin.",
+          );
+        }
+        value = entered;
       }
-      if (opts.json) io.out(`${JSON.stringify({ ok: true, name, value })}\n`);
-      else io.out(`${value}\n`);
+      if (!value) return failResult(io, opts.json, "set", "Secret value cannot be empty.");
+      try {
+        // setSecret rejects a name no ${secret:NAME} reference could ever
+        // address (spaces, colons, braces) -- surface that as a normal CLI
+        // error instead of an unhandled rejection. For the CLI path
+        // parseSecretsArgs already rejected it before any prompt; this is
+        // the backstop for programmatic callers of runSecrets.
+        vault = setSecret(vault, key, name, value);
+      } catch (err) {
+        return failResult(io, opts.json, "set", err instanceof Error ? err.message : String(err));
+      }
+      if (await vaultChangedSinceLoad(path, baseline)) return vaultChangedResult(io, opts.json, "set");
+      // atomicWriteFile mkdirs the target dir, so no ensureVaultDir needed.
+      const failed = await saveVaultOrReport(path, vault, io, opts.json, "set");
+      if (failed) return failed;
+      // "Replaced" vs "Stored" is the only signal a scripted run gets that it
+      // just destroyed a previous value (the non-TTY path proceeds without a
+      // confirmation), so the two cases must never print the same line.
+      if (opts.json) io.out(`${JSON.stringify({ ok: true, name, fresh_vault: isFresh, replaced: replacing })}\n`);
+      else if (replacing) io.out(`Replaced secret "${name}".\n`);
+      else io.out(`${isFresh ? "Created vault and " : ""}Stored secret "${name}".\n`);
+      // Creating the vault is the one moment the CLI can tell the user that
+      // the passphrase has to reach the yaw-mcp their CLIENT spawns, not just
+      // the shell they typed this in. See freshVaultNudge.
+      if (isFresh) freshVaultNudge(io, path, opts.json);
       return { exitCode: 0 };
-    } catch (err) {
-      // The passphrase itself was already verified by unlock() above (via
-      // the vault check stamp, or the first-entry canary on a legacy
-      // vault), so "wrong passphrase" is NOT reachable here. What is: this
-      // one entry is damaged, or it was written under a different key than
-      // the rest of the vault by an older build.
-      return failResult(io, opts.json, "get", err instanceof Error ? err.message : String(err), {
-        detail: `Entry "${name}" failed to decrypt: it is corrupt, or it was written under a different passphrase than the rest of the vault. Remove it and set it again.`,
-        detailAsHint: true,
-      });
     }
-  }
 
-  // ----- remove ---------------------------------------------------------
-  if (opts.action === "remove") {
-    const name = opts.name as string;
-    // Existence was proven by the short-circuit above (the single owner of
-    // the not-found message), so removeSecret always has something to drop.
-    if (await vaultChangedSinceLoad(path, baseline)) return vaultChangedResult(io, opts.json, "remove");
-    vault = removeSecret(vault, name);
-    const failed = await saveVaultOrReport(path, vault, io, opts.json, "remove");
-    if (failed) return failed;
-    if (opts.json) io.out(`${JSON.stringify({ ok: true, removed: name })}\n`);
-    else io.out(`Removed "${name}".\n`);
-    return { exitCode: 0 };
-  }
+    // ----- get ------------------------------------------------------------
+    if (opts.action === "get") {
+      const name = opts.name as string;
+      try {
+        // Non-null by construction: the short-circuit above returned exit 1
+        // for a missing name (and for a missing vault) before the passphrase
+        // prompt, so `vault` is `loaded.vault` with `name` present and
+        // getSecret's own hasOwn check cannot fail. The not-found message
+        // lives there, once.
+        const value = getSecret(vault, key, name) as string;
+        // Warn (on `err`, never `out` -- keeps the value pipeable) when the
+        // caller is interactive: `get` prints cleartext, so an interactive run
+        // scrolls a secret into terminal scrollback. Skipped for piped/redirected
+        // stdout, which is the intended consumption path. Under --json it is a
+        // JSON line like every other warning (this was the last prose one, and
+        // a pty-driven wrapper parsing stderr per SECRETS_USAGE choked on it).
+        const outStream = opts.io?.stdout ?? process.stdout;
+        if ((outStream as { isTTY?: boolean }).isTTY === true) {
+          if (opts.json) io.err(`${JSON.stringify({ warning: "cleartext-on-tty", name })}\n`);
+          else {
+            io.err(
+              `yaw-mcp secrets: warning -- printing "${name}" in cleartext to your terminal; it will remain in scrollback.\n`,
+            );
+          }
+        }
+        if (opts.json) io.out(`${JSON.stringify({ ok: true, name, value })}\n`);
+        else io.out(`${value}\n`);
+        return { exitCode: 0 };
+      } catch (err) {
+        // The passphrase itself was already verified by unlock() above (via
+        // the vault check stamp, or the first-entry canary on a legacy
+        // vault), so "wrong passphrase" is NOT reachable here. What is: this
+        // one entry is damaged, or it was written under a different key than
+        // the rest of the vault by an older build.
+        return failResult(io, opts.json, "get", err instanceof Error ? err.message : String(err), {
+          detail: `Entry "${name}" failed to decrypt: it is corrupt, or it was written under a different passphrase than the rest of the vault. Remove it and set it again.`,
+          detailAsHint: true,
+        });
+      }
+    }
 
-  // Unreachable: the guard at the top admits only the eight actions, and
-  // each has returned above. Typed `never` so a ninth action added to
-  // SECRETS_ACTIONS without a branch here fails tsc instead of reaching this.
-  const unhandled: never = opts.action;
-  return failResult(io, opts.json, "", `unknown action ${String(unhandled)}`, { exitCode: 2 });
+    // ----- remove ---------------------------------------------------------
+    if (opts.action === "remove") {
+      const name = opts.name as string;
+      // Existence was proven by the short-circuit above (the single owner of
+      // the not-found message), so removeSecret always has something to drop.
+      if (await vaultChangedSinceLoad(path, baseline)) return vaultChangedResult(io, opts.json, "remove");
+      vault = removeSecret(vault, name);
+      const failed = await saveVaultOrReport(path, vault, io, opts.json, "remove");
+      if (failed) return failed;
+      if (opts.json) io.out(`${JSON.stringify({ ok: true, removed: name })}\n`);
+      else io.out(`Removed "${name}".\n`);
+      return { exitCode: 0 };
+    }
+
+    // Unreachable: the guard at the top admits only the eight actions, and
+    // each has returned above. Typed `never` so a ninth action added to
+    // SECRETS_ACTIONS without a branch here fails tsc instead of reaching this.
+    const unhandled: never = opts.action;
+    return failResult(io, opts.json, "", `unknown action ${String(unhandled)}`, { exitCode: 2 });
+  } finally {
+    // Zero this command's copy of the derived key on every exit path below
+    // (set/get/remove, their refusals, and a throw). unlock() hands back a
+    // COPY of its cache, so the cache is untouched and a later unlock() in
+    // this process still short-circuits; only the copy stops outliving the
+    // command in a heap dump. Best-effort, like the key.fill(0) inside
+    // unlock() itself.
+    key.fill(0);
+  }
 }
 
 /**
@@ -1658,76 +1467,84 @@ async function runSecretsRotate(opts: SecretsCommandOptions, io: SecretsIo): Pro
   } catch (err) {
     return failResult(io, opts.json, "rotate", unlockErrorMessage(err, path));
   }
-
-  const newPassphrase = await resolveNewPassphrase(opts, io);
-  if (newPassphrase === CANCELLED) return cancelledResult(io, opts.json, "rotate");
-  if (newPassphrase === NO_ECHO) {
-    return failResult(
-      io,
-      opts.json,
-      "rotate",
-      noEchoRefusal("New passphrase required.", "Set YAW_MCP_VAULT_PASSPHRASE_NEW instead."),
-    );
-  }
-  if (newPassphrase === null) {
-    return failResult(
-      io,
-      opts.json,
-      "rotate",
-      promptUnavailableMessage(
-        opts,
-        "New passphrase required (and must be confirmed).",
-        "YAW_MCP_VAULT_PASSPHRASE_NEW",
-      ),
-    );
-  }
-
-  let rotated: VaultFile;
   try {
-    // rotateVault decrypts EVERY entry first; if any fails it throws
-    // before re-encrypting, so the on-disk vault stays untouched.
-    rotated = await rotateVault(vault, oldKey, newPassphrase);
-  } catch (err) {
-    // On-disk vault is untouched by definition (we never reached save).
-    lock();
-    return failResult(io, opts.json, "rotate", err instanceof Error ? err.message : String(err));
-  }
+    const newPassphrase = await resolveNewPassphrase(opts, io);
+    if (newPassphrase === CANCELLED) return cancelledResult(io, opts.json, "rotate");
+    if (newPassphrase === NO_ECHO) {
+      return failResult(
+        io,
+        opts.json,
+        "rotate",
+        noEchoRefusal("New passphrase required.", "Set YAW_MCP_VAULT_PASSPHRASE_NEW instead."),
+      );
+    }
+    if (newPassphrase === null) {
+      return failResult(
+        io,
+        opts.json,
+        "rotate",
+        promptUnavailableMessage(
+          opts,
+          "New passphrase required (and must be confirmed).",
+          "YAW_MCP_VAULT_PASSPHRASE_NEW",
+        ),
+      );
+    }
 
-  if (await vaultChangedSinceLoad(path, baseline)) {
-    // Belt-and-braces, NOT load-bearing: unlock() keys its cache on the
-    // vault's salt (cachedSalt in secrets-vault.ts), so a key derived against
-    // the snapshot we just refused to overwrite can never be handed to
-    // whatever replaced it -- which is why `set` and `remove` take these same
-    // two exits without a lock() and still cannot leak a stale key. rotate
-    // drops it anyway: holding a derived key for a vault this command was
-    // just told it does not have is state with no use left.
-    lock();
-    return vaultChangedResult(io, opts.json, "rotate");
-  }
-  const failed = await saveVaultOrReport(path, rotated, io, opts.json, "rotate");
-  if (failed) {
-    // Same belt-and-braces drop as the refusal above: the on-disk vault is
-    // still the pre-rotation one (so the cached key remains valid for it),
-    // but the caller was just told nothing was saved. Only the lock() on the
-    // success path below is load-bearing -- there the salt really changed.
-    lock();
-    return failed;
-  }
-  // Drop the stale key derived from the OLD passphrase. The salt changed,
-  // so the next secrets command must re-derive against the new passphrase.
-  lock();
+    let rotated: VaultFile;
+    try {
+      // rotateVault decrypts EVERY entry first; if any fails it throws
+      // before re-encrypting, so the on-disk vault stays untouched.
+      rotated = await rotateVault(vault, oldKey, newPassphrase);
+    } catch (err) {
+      // On-disk vault is untouched by definition (we never reached save).
+      lock();
+      return failResult(io, opts.json, "rotate", err instanceof Error ? err.message : String(err));
+    }
 
-  const count = Object.keys(rotated.entries).length;
+    if (await vaultChangedSinceLoad(path, baseline)) {
+      // Belt-and-braces, NOT load-bearing: unlock() keys its cache on the
+      // vault's salt (cachedSalt in secrets-vault.ts), so a key derived against
+      // the snapshot we just refused to overwrite can never be handed to
+      // whatever replaced it -- which is why `set` and `remove` take these same
+      // two exits without a lock() and still cannot leak a stale key. rotate
+      // drops it anyway: holding a derived key for a vault this command was
+      // just told it does not have is state with no use left.
+      lock();
+      return vaultChangedResult(io, opts.json, "rotate");
+    }
+    const failed = await saveVaultOrReport(path, rotated, io, opts.json, "rotate");
+    if (failed) {
+      // Same belt-and-braces drop as the refusal above: the on-disk vault is
+      // still the pre-rotation one (so the cached key remains valid for it),
+      // but the caller was just told nothing was saved. Only the lock() on the
+      // success path below is load-bearing -- there the salt really changed.
+      lock();
+      return failed;
+    }
+    // Drop the stale key derived from the OLD passphrase. The salt changed,
+    // so the next secrets command must re-derive against the new passphrase.
+    lock();
 
-  if (opts.json) {
-    io.out(`${JSON.stringify({ ok: true, rotated: true, secret_count: count })}\n`);
-  } else {
-    io.out(
-      `Rotated ${count} secret${count === 1 ? "" : "s"} under a new passphrase (encryption re-wrapped, token values unchanged).\n`,
-    );
-    io.out("Vault locked -- the next secrets command will prompt for the new passphrase.\n");
+    const count = Object.keys(rotated.entries).length;
+
+    if (opts.json) {
+      io.out(`${JSON.stringify({ ok: true, rotated: true, secret_count: count })}\n`);
+    } else {
+      io.out(
+        `Rotated ${count} secret${count === 1 ? "" : "s"} under a new passphrase (encryption re-wrapped, token values unchanged).\n`,
+      );
+      io.out("Vault locked -- the next secrets command will prompt for the new passphrase.\n");
+    }
+    return { exitCode: 0 };
+  } finally {
+    // Zero this command's copy of the OLD key on every exit, including the
+    // new-passphrase refusals above and the rotateVault throw. unlock() hands
+    // back a COPY of its cache, so this touches nothing lock() does not
+    // already own; it just stops the copy outliving the command in a heap
+    // dump. Best-effort, like the key.fill(0) inside unlock() itself.
+    oldKey.fill(0);
   }
-  return { exitCode: 0 };
 }
 
 /** Where `reset` parks the vault it replaces: `<vault path>.reset-<stamp>`,

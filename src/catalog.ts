@@ -13,6 +13,8 @@
 // Both `yaw-mcp add <slug>` and `yaw-mcp try <slug>` resolve through here, so
 // a catalog shape change is fixed in one place.
 
+import { suggestCatalogSlugs } from "./catalog-search.js";
+
 const DEFAULT_CATALOG_URL = "https://yaw.sh/data/mcp-catalog.json";
 /** Exported so the timeout test advances its fake clock by THIS value rather
  *  than a literal that silently desyncs the day the constant moves. */
@@ -23,10 +25,13 @@ export const FETCH_TIMEOUT_MS = 10_000;
  *  most. One exported definition, because each verb used to carry a private
  *  copy and the two could only stay identical by accident; the catalog is
  *  the thing a slug names, so its resolver owns the shape. */
-import { suggestCatalogSlugs } from "./catalog-search.js";
-
 export const CATALOG_SLUG_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
-const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/** A well-formed shell identifier -- the only thing that can be an env map
+ *  key. Exported for the same reason as CATALOG_SLUG_RE: `add --env`, `set
+ *  env.KEY=` and the catalog's requiredEnv filter below all write env keys,
+ *  and `set` used to accept any non-empty name while `add` enforced this. */
+export const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 /** A single required-env descriptor as the catalog stores it. */
 export interface CatalogRequiredEnv {
@@ -328,6 +333,14 @@ export async function defaultFetchCatalog(
   );
 }
 
+/** defaultFetchCatalog with its staleness note routed to `warn`, as a plain
+ *  FetchCatalog. The one-argument call every command used to make dropped
+ *  the deps, so the note always hit real process.stderr -- past the `err`
+ *  writer the command had been handed. */
+export function withWarnSink(warn: ((line: string) => void) | undefined): FetchCatalog {
+  return (url) => defaultFetchCatalog(url, warn ? { warn } : {});
+}
+
 /**
  * Resolve a catalog slug to a concrete launch shape. Refuses remote/HTTP
  * servers (they have no stdio spawn command) the same way the app's
@@ -335,13 +348,22 @@ export async function defaultFetchCatalog(
  */
 export async function resolveCatalogSlug(
   slug: string,
-  opts: { catalogUrl?: string; fetchCatalog?: FetchCatalog } = {},
+  opts: {
+    catalogUrl?: string;
+    fetchCatalog?: FetchCatalog;
+    /** Sink for the default fetcher's staleness note (CatalogFetchDeps.warn).
+     *  A command passes its own stderr writer so the note lands where the
+     *  command's other diagnostics do, instead of on the real process.stderr
+     *  behind an injected `err`. Ignored when `fetchCatalog` is injected: a
+     *  custom fetcher owns its own diagnostics. */
+    warn?: (line: string) => void;
+  } = {},
 ): Promise<ResolvedCatalogServer> {
   // normalizeCatalogUrl, not `??`: an override that is set-but-empty (the
   // YAW_MCP_CATALOG_URL="" shape the CLI reads into this option) must fall
   // back to the default instead of being fetched.
   const url = normalizeCatalogUrl(opts.catalogUrl);
-  const fetchCatalog = opts.fetchCatalog ?? defaultFetchCatalog;
+  const fetchCatalog = opts.fetchCatalog ?? withWarnSink(opts.warn);
   const servers = await fetchCatalog(url);
   const entry = servers.find((s) => s.slug === slug);
   if (!entry) {

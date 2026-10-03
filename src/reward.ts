@@ -1,4 +1,4 @@
-import { classifyError, type ErrorCategory } from "./error-category.js";
+import { classifyError, ERROR_CATEGORIES, type ErrorCategory } from "./error-category.js";
 
 export interface ToolCallResultShape {
   content?: Array<{ type: string; text?: string }>;
@@ -35,15 +35,19 @@ export interface ToolCallResultShape {
 //   positive error signal. classifyError(undefined/null/"") also
 //   returns "upstream_error", which is likewise excluded -- empty
 //   bodies are handled by rule 3, not rule 2.
-const ERROR_SHAPED_CATEGORIES: ReadonlySet<ErrorCategory> = new Set<ErrorCategory>([
-  "validation_error",
-  "timeout",
-  "unauthorized",
-  "unknown_tool",
-  "connection_lost",
-  "rate_limited",
-  "not_found",
-]);
+//
+//   DERIVED from ERROR_CATEGORIES, not hand-copied: the set is "every
+//   category but the catch-all", and a literal copy of the other seven
+//   silently put any category ADDED to error-category.ts into the
+//   not-error-shaped bucket, so a 200 reply carrying the new category graded
+//   as a clean full-credit success. Deriving flips that default to the safe
+//   direction -- a new recognized error pattern is error-shaped unless
+//   someone decides otherwise here -- and leaves exactly one name to keep in
+//   step (the catch-all's). error-category.test.ts pins the full list so a
+//   widening is still a deliberate change.
+const ERROR_SHAPED_CATEGORIES: ReadonlySet<ErrorCategory> = new Set<ErrorCategory>(
+  ERROR_CATEGORIES.filter((c) => c !== "upstream_error"),
+);
 
 // The two UNCERTAIN bands, exported rather than left as bare literals.
 // reward-grader.ts decides which outcomes are worth a second LLM opinion by

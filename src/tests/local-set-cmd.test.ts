@@ -530,11 +530,12 @@ describe("runSet -- an env this command cannot edit", () => {
     ["a string, on a set", '"oops"', "env.A=1"],
     // The clear branch was not safe either: its guard only checked the LIVE
     // map's value, and the spread that builds that map turns a string env into
-    // index keys, so this threw the same parser internal. No --force here on
-    // purpose: a string env makes `env.0=` look like it drops a stored value,
-    // so an exit of 1 (this guard) rather than 2 (the clear confirmation)
-    // proves the guard runs first.
-    ["a string, on a clear", '"oops"', "env.0="],
+    // index keys, so this threw the same parser internal. (`env.0=`, the key
+    // that case used to use, is now refused at parse time by the ENV_KEY_RE
+    // name rule -- a digit cannot start a shell identifier -- so the clear
+    // goes through a valid name; the shape guard still has to fire before the
+    // spread does.) Exit 1 (this guard) rather than 2 proves it runs first.
+    ["a string, on a clear", '"oops"', "env.A="],
   ] as const) {
     it(`names the file and the field when env is ${label}`, async () => {
       const body = withEnv(envLiteral);
@@ -1024,5 +1025,27 @@ describe("runEnableDisable -- error prefix", () => {
     const cap = capture();
     await runSet({ target: "nosuch", assignments: ["isActive=true"], home: synthHome, ...cap });
     expect(cap.errText()).toContain("yaw-mcp set:");
+  });
+});
+
+describe("runSet -- env.KEY takes the same name rule as `add --env` [full-pass 2026-10-03]", () => {
+  for (const bad of ["9X", "A-B", "A.B", "A B"]) {
+    it(`refuses env.${bad}= (exit 2, nothing written)`, async () => {
+      writeBundles(SAMPLE);
+      const cap = capture();
+      const r = await runSet({ target: "gh", assignments: [`env.${bad}=1`], home: synthHome, force: true, ...cap });
+      expect(r.exitCode, bad).toBe(2);
+      expect(r.written, bad).toEqual([]);
+      expect(cap.errText(), bad).toContain("is not a valid environment variable name");
+      expect(readFileSync(bundlesPath(), "utf8"), bad).toBe(SAMPLE);
+    });
+  }
+
+  it("still accepts a shell identifier, underscores and digits included", async () => {
+    writeBundles(SAMPLE);
+    const cap = capture();
+    const r = await runSet({ target: "gh", assignments: ["env._X9=v"], home: synthHome, force: true, ...cap });
+    expect(r.exitCode).toBe(0);
+    expect(read().servers[0].env).toMatchObject({ _X9: "v" });
   });
 });

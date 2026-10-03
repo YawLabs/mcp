@@ -1,4 +1,5 @@
 import type { EventEmitter } from "node:events";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { quoteArgForDisplay, quoteShellArgIfNeeded } from "../auto-upgrade.js";
 import { compareVersions, MIN_OAM_VERSION, type OamProbe } from "../oam-spawn.js";
@@ -166,6 +167,23 @@ describe("detectInstallMethod", () => {
     expect(
       detectInstallMethod("C:\\Users\\jeff\\AppData\\Roaming\\npm\\node_modules\\@yawlabs\\mcp\\dist\\index.js"),
     ).toBe("global-npm");
+  });
+
+  it("detects the ~/.npm-global prefix npm's docs recommend, in both global layouts", () => {
+    // `npm config set prefix ~/.npm-global` is the documented escape from a
+    // sudo-owned default prefix, so it is the one custom prefix with a
+    // conventional name. It used to read as local-node-modules, and the
+    // background self-upgrade (which has no `npm prefix -g` probe) never
+    // moved that copy while telling the user `upgrade --run` would.
+    expect(detectInstallMethod("/home/u/.npm-global/lib/node_modules/@yawlabs/mcp/dist/index.js")).toBe("global-npm");
+    expect(detectInstallMethod("C:\\Users\\jeff\\.npm-global\\node_modules\\@yawlabs\\mcp\\dist\\index.js")).toBe(
+      "global-npm",
+    );
+    // Anchored on the directory NAME: a project under some other dot-dir is
+    // still a project.
+    expect(detectInstallMethod("/home/u/.npm-globalish/node_modules/@yawlabs/mcp/dist/index.js")).toBe(
+      "local-node-modules",
+    );
   });
 
   it("detects scoop/volta-style <prefix>/bin/node_modules as global", () => {
@@ -1088,6 +1106,118 @@ describe("runUpgrade", () => {
       expect(r.exitCode).toBe(0);
       expect(installed).toHaveBeenCalledWith("/usr/lib/node_modules/@yawlabs/mcp");
       expect(io.err.join("\n")).toContain("/usr/lib/node_modules/@yawlabs/mcp");
+    });
+  });
+
+  // The prefix lock for a global-npm --run. The background self-upgrade and
+  // the sidecar refresh both serialize on acquireUpgradeLock in the running
+  // prefix; this command was the one `npm install -g` into that tree that
+  // never took it, so a `serve` starting mid-run could reify the same package
+  // dir beside it.
+  describe("the prefix lock a global-npm --run takes", () => {
+    const GLOBAL_ARGV = "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js";
+    const PREFIX = "/custom/node-root";
+
+    async function runLocked(
+      acquireLock: (dir: string) => (() => void) | null,
+      spawnImpl: (cmd: string, args: string[], cwd?: string) => Promise<number> = async () => 0,
+      extra: Partial<Parameters<typeof runUpgrade>[0]> = {},
+    ) {
+      const io = captureIO();
+      const r = await runUpgrade({
+        run: true,
+        currentVersion: "0.40.0",
+        argvPath: GLOBAL_ARGV,
+        fetchLatest: async () => "0.45.0",
+        runningPrefix: async () => PREFIX,
+        acquireLock,
+        spawnImpl,
+        out: io.push,
+        err: io.pushErr,
+        ...extra,
+      });
+      return { io, r };
+    }
+
+    it("takes the lock in the running prefix and releases it once the child has exited 0", async () => {
+      const release = vi.fn();
+      const acquireLock = vi.fn((_dir: string) => release);
+      const order: string[] = [];
+      const { r } = await runLocked(
+        (dir) => {
+          order.push(`lock:${dir}`);
+          return acquireLock(dir);
+        },
+        async () => {
+          order.push("spawn");
+          expect(release).not.toHaveBeenCalled();
+          return 0;
+        },
+      );
+      expect(r.exitCode).toBe(0);
+      expect(order).toEqual([`lock:${PREFIX}`, "spawn"]);
+      expect(release).toHaveBeenCalledTimes(1);
+    });
+
+    it("refuses to spawn beside a live holder: names the lock on stderr and exits 3", async () => {
+      const spawnImpl = vi.fn(async () => 0);
+      const { io, r } = await runLocked(() => null, spawnImpl);
+      expect(r.exitCode).toBe(3);
+      expect(spawnImpl).not.toHaveBeenCalled();
+      const err = io.err.join("\n");
+      expect(err).toContain("another yaw-mcp process is upgrading this install");
+      // The path is joined with the host separator; the name and the prefix
+      // are what the operator needs to find the file.
+      expect(err).toContain(join(PREFIX, ".yaw-mcp-upgrade.lock"));
+      // Nothing on stdout claimed a run that did not happen.
+      expect(io.out.join("\n")).not.toContain("Running");
+    });
+
+    it("releases the lock when the child fails, and when the runner throws", async () => {
+      const release = vi.fn();
+      const { r } = await runLocked(
+        () => release,
+        async () => 42,
+      );
+      expect(r.exitCode).toBe(3);
+      expect(release).toHaveBeenCalledTimes(1);
+
+      const release2 = vi.fn();
+      await expect(
+        runLocked(
+          () => release2,
+          async () => {
+            throw new Error("EACCES npm");
+          },
+        ),
+      ).rejects.toThrow("EACCES npm");
+      expect(release2).toHaveBeenCalledTimes(1);
+    });
+
+    it("takes no lock when the running prefix is unknown -- npm picks its own tree then", async () => {
+      // Without a prefix the spawn carries no `--prefix`, so npm writes into
+      // whatever it resolves; a lock in a directory we did not detect would
+      // name a tree npm may not touch.
+      const acquireLock = vi.fn(() => () => {});
+      const { r } = await runLocked(acquireLock, async () => 0, { runningPrefix: async () => null });
+      expect(r.exitCode).toBe(0);
+      expect(acquireLock).not.toHaveBeenCalled();
+    });
+
+    it("takes no lock for a local-node-modules install", async () => {
+      const acquireLock = vi.fn(() => () => {});
+      const { r } = await runLocked(acquireLock, async () => 0, {
+        argvPath: "/proj/app/node_modules/@yawlabs/mcp/dist/index.js",
+      });
+      expect(r.exitCode).toBe(0);
+      expect(acquireLock).not.toHaveBeenCalled();
+    });
+
+    it("is not consulted without --run", async () => {
+      const acquireLock = vi.fn(() => null);
+      const { r } = await runLocked(acquireLock, async () => 0, { run: false });
+      expect(r.exitCode).toBe(1);
+      expect(acquireLock).not.toHaveBeenCalled();
     });
   });
 

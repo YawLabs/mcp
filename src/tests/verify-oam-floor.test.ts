@@ -407,13 +407,18 @@ function drive(opts: {
   if (opts.src !== undefined) byPath[FLOOR_SRC] = opts.src;
   const lines: string[] = [];
   const probes: { command: string; args: string[]; cwd: string; timeoutMs: number }[] = [];
+  // The options each `oam --version` read was handed: the script must pass
+  // the same timeout it gives the hosting probe, or the header's promise that
+  // VERIFY_OAM_FLOOR_TIMEOUT_MS bounds the whole probe stops at the version.
+  const versionReads: { timeoutMs?: number }[] = [];
   const writes: string[] = [];
   const deps: VerifyDeps = {
     env: opts.env ?? {},
     platform: opts.platform ?? "linux",
     cwd: "/repo",
     out: (l) => lines.push(l),
-    oamVersion: async () => {
+    oamVersion: async (_bin: string, o?: { timeoutMs?: number }) => {
+      versionReads.push(o ?? {});
       const v = opts.installed ?? "0.16.3";
       if (typeof v === "string") return v;
       throw v;
@@ -434,7 +439,7 @@ function drive(opts: {
     day: "2026-09-21",
   };
   const run = () => verifyOamFloor({ raise: opts.raise }, deps);
-  return { run, lines, probes, writes, files: byPath };
+  return { run, lines, probes, versionReads, writes, files: byPath };
 }
 
 describe("verify-oam-floor verifyOamFloor", () => {
@@ -442,6 +447,7 @@ describe("verify-oam-floor verifyOamFloor", () => {
     const d = drive({});
     expect(await d.run()).toBe(0);
     expect(d.probes).toEqual([{ command: "oam", args: ["run", PROBE_SERVER], cwd: "/repo", timeoutMs: 30_000 }]);
+    expect(d.versionReads).toEqual([{ timeoutMs: 30_000 }]);
     expect(d.lines.at(-1)).toBe(
       `${TAG} OK -- oam 0.16.3 hosts a stdio @modelcontextprotocol/sdk server (initialize + tools/list + tools/call); the floor 0.16.3 stands`,
     );
@@ -560,14 +566,18 @@ describe("verify-oam-floor verifyOamFloor", () => {
     expect(d.files[FLOOR_SRC]).toContain('"0.16.3"');
   });
 
-  it("honours VERIFY_OAM_FLOOR_TIMEOUT_MS, and falls back to 30 s on anything that is not a positive integer", async () => {
+  it("honours VERIFY_OAM_FLOOR_TIMEOUT_MS on both spawns, and falls back to 30 s on anything that is not a positive integer", async () => {
+    // Both spawns: the `oam --version` read used to be bound to the default
+    // regardless, so a hung oam outlived a timeout set lower than 30 s.
     const set = drive({ env: { VERIFY_OAM_FLOOR_TIMEOUT_MS: "5000" } });
     await set.run();
     expect(set.probes[0].timeoutMs).toBe(5000);
+    expect(set.versionReads).toEqual([{ timeoutMs: 5000 }]);
     for (const bad of ["0", "-1", "abc", "1.5", ""]) {
       const d = drive({ env: { VERIFY_OAM_FLOOR_TIMEOUT_MS: bad } });
       await d.run();
       expect(d.probes[0].timeoutMs, JSON.stringify(bad)).toBe(30_000);
+      expect(d.versionReads[0]?.timeoutMs, JSON.stringify(bad)).toBe(30_000);
     }
   });
 });

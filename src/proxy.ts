@@ -494,6 +494,18 @@ export async function routeResourceRead(
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       log("error", "Builtin resource read failed", { uri, error: message });
+      // KNOWN PROTOCOL DEVIATION, left as is. This arm -- and every other
+      // failure arm in routeResourceRead and routePromptGet below (unknown
+      // resource/prompt, namespace not connected, upstream threw) -- answers
+      // with a SUCCESSFUL resources/read or prompts/get result whose text
+      // starts "Error:", not with a JSON-RPC error. A client therefore cannot
+      // tell a failed read from a resource whose content is the string
+      // "Error: ...", and its retry/backoff logic never sees a failure. The
+      // tools/call path is different on purpose (isError + the routing-fault
+      // brand); these two have no such convention. Switching them to McpError
+      // is client-visible -- a client that today renders the text would
+      // instead surface an error dialog -- so it is the owner's call, not a
+      // drive-by fix, and is recorded here rather than silently changed.
       return { contents: [{ uri, text: `Error: ${message}` }] };
     }
   }
@@ -636,7 +648,20 @@ export function isRoutingFaultResult(result: unknown): boolean {
 // immediately (and a timeout is not branded a routing fault, so server.ts
 // books each one against the upstream's health and error rate) or pend for
 // ~24.8 days holding the namespace's inflightCalls marker.
-const CALL_TIMEOUT = resolveTimeoutEnv("MCP_CALL_TIMEOUT", 60_000);
+//
+// Resolved LAZILY on the first proxied call and memoized, matching
+// upstream.ts's connect/list knobs: a module-level read fired the "ignored"
+// warn at IMPORT, so every CLI subcommand that happened to load this module
+// warned about a knob only a serving broker consumes.
+//
+// NAMING: MCP_CALL_TIMEOUT predates the YAW_MCP_ prefix every other knob
+// carries; see defaultConnectTimeout() in upstream.ts for why it is not
+// renamed here.
+let callTimeoutMs: number | undefined;
+function callTimeout(): number {
+  callTimeoutMs ??= resolveTimeoutEnv("MCP_CALL_TIMEOUT", 60_000);
+  return callTimeoutMs;
+}
 
 // `text` is OPTIONAL on the items this returns, and that is not pedantry: on
 // the success path the body is whatever the upstream sent, and MCP content
@@ -735,7 +760,7 @@ export async function routeToolCall(
       // which is a change to how long a call may run -- a separate decision
       // from restoring the two signals the client already sent, and one that
       // wants its own bound (maxTotalTimeout) rather than riding in here.
-      { timeout: CALL_TIMEOUT, signal: options?.signal, onprogress: options?.onprogress },
+      { timeout: callTimeout(), signal: options?.signal, onprogress: options?.onprogress },
     );
 
     return result as { content: Array<{ type: string; text?: string }>; isError?: boolean };

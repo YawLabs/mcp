@@ -186,7 +186,7 @@ describe("gateway advertise growth -- notify without a connection change", () =>
   it("handleDispatch notifies when an already-connected winner is newly advertised", async () => {
     priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
     priv.connections.set("gh", makeConnection("gh", ["create_issue"]));
-    priv.twoStageRank = async () => [{ namespace: "gh", score: 5 }];
+    priv.rankIntentCandidates = async () => [{ namespace: "gh", score: 5 }];
     const notify = vi.spyOn(priv, "notifyAllListsChanged").mockResolvedValue(undefined);
     const refresh = vi.spyOn(priv, "refreshRoutesAndNotify").mockResolvedValue(undefined);
 
@@ -207,7 +207,7 @@ describe("gateway advertise growth -- notify without a connection change", () =>
   it("discover auto-warm advertises and names an already-connected winner, notifying only on growth", async () => {
     priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
     priv.connections.set("gh", makeConnection("gh", ["create_issue"]));
-    priv.twoStageRank = async () => [{ namespace: "gh", score: 5 }];
+    priv.rankIntentCandidates = async () => [{ namespace: "gh", score: 5 }];
     const notify = vi.spyOn(priv, "notifyAllListsChanged").mockResolvedValue(undefined);
 
     const first = await priv.handleDiscoverWithAutoWarm("github issue");

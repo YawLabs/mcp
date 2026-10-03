@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { isPruneEnabled, pruneContent } from "../prune.js";
+import { isPruneEnabled, MAX_PRUNE_CHARS, pruneContent } from "../prune.js";
 
 // ═══════════════════════════════════════════════════════════════════════
 // Response pruner — the F1 token-saver. Pins the conservative rules
@@ -35,6 +35,16 @@ describe("isPruneEnabled", () => {
   it("enables on '1'", () => {
     process.env.YAW_MCP_PRUNE_RESPONSES = "1";
     expect(isPruneEnabled()).toBe(true);
+  });
+
+  it("disables on '0 ' with trailing whitespace (cmd.exe `set VAR=0 && ...` keeps the space)", () => {
+    // The untrimmed compare read "0 " as "not an opt-out" and pruned anyway,
+    // while every sibling YAW_MCP_* opt-out had already moved to the shared
+    // trimming parser in opt-out-env.ts.
+    process.env.YAW_MCP_PRUNE_RESPONSES = "0 ";
+    expect(isPruneEnabled()).toBe(false);
+    process.env.YAW_MCP_PRUNE_RESPONSES = " false\t";
+    expect(isPruneEnabled()).toBe(false);
   });
 });
 
@@ -192,6 +202,27 @@ describe("pruneContent", () => {
     expect(r.content[0].text).toContain('"empty0":null');
     expect(r.content[0].text).toContain('"empty5999":null');
     expect(r.bytesPruned).toBe(r.bytesRaw);
+  });
+
+  it("applies the same size ceiling to the TEXT path (no whitespace pass over a huge non-JSON block)", () => {
+    // The ceiling used to guard only the JSON.parse branch; a multi-megabyte
+    // log tail still went through the per-line split/classify/join on the
+    // synchronous proxy path. Build a block with plenty of prunable
+    // whitespace (trailing spaces + blank runs) so the savings gate would
+    // accept it -- it survives untouched only because the ceiling applies.
+    const line = "log line with trailing spaces      \n\n\n\n";
+    const huge = line.repeat(Math.ceil(MAX_PRUNE_CHARS / line.length) + 1);
+    expect(huge.length).toBeGreaterThanOrEqual(MAX_PRUNE_CHARS);
+    const r = pruneContent([{ type: "text", text: huge }]);
+    expect(r.content[0].text).toBe(huge);
+    expect(r.bytesPruned).toBe(r.bytesRaw);
+
+    // Just under the ceiling the same shape IS pruned, so the test pins the
+    // ceiling and not a broken whitespace rule.
+    const under = line.repeat(Math.floor((MAX_PRUNE_CHARS - 1) / line.length));
+    expect(under.length).toBeLessThan(MAX_PRUNE_CHARS);
+    const u = pruneContent([{ type: "text", text: under }]);
+    expect(u.content[0].text.length).toBeLessThan(under.length);
   });
 
   // Fix 4: array elements that prune to "empty" must NOT be dropped --

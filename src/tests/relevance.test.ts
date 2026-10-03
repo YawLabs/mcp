@@ -691,10 +691,47 @@ describe("rankTools (tools across servers)", () => {
   });
 
   it("splits an identifier so a bare term hits the joined name", () => {
-    // `create_issue` tokenizes to create/issue AND the joined form, so a
-    // caller who knows only one half still lands on it.
+    // `create_issue` tokenizes to create/issue (no joined form is kept by any
+    // tokenizer in relevance.ts), so a caller who knows only one half still
+    // lands on it.
     const hits = rankTools("issue", [gh, pg]);
     expect(hits.map((h) => h.name)).toContain("create_issue");
+  });
+
+  it("tokenizes tool NAMES at the identifier floor, so a 2-char segment like s3 is findable", () => {
+    // The name side used the prose tokenizer (3-char floor), so `s3_upload`
+    // indexed as ["upload"] alone and find_tool("s3") returned nothing --
+    // while rankServers, tokenizing the same field with tokenizeIdent,
+    // credited it. The two rankers have to agree about what a name contains.
+    const aws = {
+      namespace: "aws",
+      name: "AWS",
+      tools: [
+        { name: "s3_upload", description: "Upload an object to a bucket" },
+        { name: "ec2_list", description: "List instances" },
+      ],
+    };
+    const hits = rankTools("s3", [aws, gh]);
+    expect(hits.map((h) => h.name)).toEqual(["s3_upload"]);
+  });
+
+  it("awards the namespace bonus to a multi-segment namespace the query spelled out", () => {
+    // The bonus tested `queryTerms.has(namespace)` whole-string, and the query
+    // is tokenized on the same separators a namespace is built from, so
+    // `aws_s3` could never earn it: "aws s3 upload" and "aws_s3 upload" both
+    // tokenize to aws/s3/upload. Every identifier token present now counts.
+    const awsS3 = { namespace: "aws_s3", name: "S3", tools: [{ name: "upload", description: "Put an object" }] };
+    const other = { namespace: "box", name: "Box", tools: [{ name: "upload", description: "Put a file" }] };
+    const spaced = rankTools("aws s3 upload", [other, awsS3]);
+    expect(spaced[0]).toMatchObject({ namespace: "aws_s3", name: "upload" });
+    expect(spaced[0].score).toBeGreaterThan(spaced[1].score);
+    const joined = rankTools("aws_s3 upload", [other, awsS3]);
+    expect(joined[0].namespace).toBe("aws_s3");
+    // Half the namespace is not the namespace: no bonus, so the two tie and
+    // fall back to the namespace-ordered tie-break.
+    const half = rankTools("s3 upload", [other, awsS3]);
+    expect(half.map((h) => h.namespace)).toEqual(["aws_s3", "box"]);
+    expect(half[0].score).toBe(half[1].score);
   });
 
   it("matches on description alone when the name carries nothing", () => {

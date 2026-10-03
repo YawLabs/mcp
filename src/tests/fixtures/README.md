@@ -66,6 +66,21 @@ This gate exists only to add the thing that file cannot have: real traffic.
    are what ships to the repo forever. Anything you would not put in a commit
    message should not be there -- drop those entries or re-harvest.
 
+   **What the file contains, and whose it is.** A corpus has two parts
+   (`FoundryCorpus` in `src/foundry-corpus.ts`): `entries`, the redacted
+   token bags with the namespace each was routed to, and `servers`, a
+   snapshot of the exporting machine's **entire local server catalog** --
+   every namespace, name and description in that `bundles.json`, plus each
+   server's cached tool names and descriptions out of `~/.yaw-mcp/state.json`
+   (`defaultLoadServers` in `src/foundry-cmd.ts`). The snapshot is what the
+   gate re-ranks against, so it cannot be trimmed to the servers the entries
+   name. That makes the committed fixture the **maintainer's installed-server
+   inventory**, not user data: it describes which MCP servers the maintainer
+   had configured on the day of the export, and nothing about any other user.
+   Review the `servers` block with the same eye as the token bags -- a server
+   whose name or description you would not publish should be removed from
+   the local catalog before exporting, not edited out of the file afterwards.
+
 5. **Commit it.** The gate activates on the next `npm test` with no code
    change: the test file loads this path at module scope and branches on it.
 

@@ -16,9 +16,9 @@
 // run repopulates it. We never fail a list/read on a malformed cache -- a
 // garbage grades.json is treated as "no cached grades" and ignored.
 
-import { type FileHandle, mkdir, open, readFile, rename, rm, stat } from "node:fs/promises";
+import { type FileHandle, mkdir, open, readdir, readFile, rename, rm, stat, utimes } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { atomicWriteFile, isWin32TransientFsError } from "./atomic-write.js";
 import { setJsonKey } from "./json-key.js";
@@ -283,8 +283,12 @@ async function takeLock(lockPath: string, token: string): Promise<boolean> {
  *  atomicWriteFile retries its publish rename around. That is not an error
  *  to throw: the caller waits it out exactly like a live lock, paced and
  *  bounded by its deadline, and either the hold clears and the next steal
- *  lands or the deadline names the lock in its diagnostic. */
-async function stealStaleLock(lockPath: string, isLive: (ageMs: number) => boolean): Promise<boolean> {
+ *  lands or the deadline names the lock in its diagnostic.
+ *
+ *  Exported for the test that pins the live-restore path: the window it
+ *  covers (a fresh lock landing between our stat and our rename) cannot be
+ *  hit deterministically through writeGrade. */
+export async function stealStaleLock(lockPath: string, isLive: (ageMs: number) => boolean): Promise<boolean> {
   const stolenPath = `${lockPath}.stale-${process.pid}-${++lockSeq}`;
   try {
     await rename(lockPath, stolenPath);
@@ -293,9 +297,12 @@ async function stealStaleLock(lockPath: string, isLive: (ageMs: number) => boole
     // way the path may be free now; the caller's next take settles it.
     return (err as NodeJS.ErrnoException).code === "ENOENT";
   }
-  let holder: string | null = null;
+  let holder: { token: string; atime: Date; mtime: Date } | null = null;
   try {
-    if (isLive(Date.now() - (await stat(stolenPath)).mtimeMs)) holder = await readFile(stolenPath, "utf8");
+    const st = await stat(stolenPath);
+    if (isLive(Date.now() - st.mtimeMs)) {
+      holder = { token: await readFile(stolenPath, "utf8"), atime: st.atime, mtime: st.mtime };
+    }
   } catch {
     // Vanished under us: nothing to restore.
   }
@@ -303,10 +310,48 @@ async function stealStaleLock(lockPath: string, isLive: (ageMs: number) => boole
     // EEXIST here means a THIRD process took the path meanwhile. The live
     // holder's lock is then simply gone, and the cost is bounded to one
     // possible lost grade in that three-way race -- the pre-lock behavior.
-    await takeLock(lockPath, holder).catch(() => false);
+    if (await takeLock(lockPath, holder.token).catch(() => false)) {
+      // The restored file is a NEW file, so without this it carries a fresh
+      // mtime and the holder's lease is silently extended by up to the whole
+      // stale age -- a crashed holder's lock would then survive one extra
+      // round of waiting for every stealer that caught it live. Best-effort:
+      // if the utimes fails the lock still holds, merely younger.
+      await utimes(lockPath, holder.atime, holder.mtime).catch(() => undefined);
+    }
   }
+  // A failed rm here (an AV or indexer handle on Windows, the same transient
+  // hold the rename above can meet) leaves `<lock>.stale-<pid>-<n>` behind.
+  // Nothing ever looks for that file again, so it is swept, best-effort, by
+  // the next lock take in this directory -- see sweepStaleLitter.
   await rm(stolenPath, { force: true }).catch(() => undefined);
   return true;
+}
+
+/** Remove `<lock>.stale-*` siblings older than the stale age: the litter a
+ *  stealer leaves when its final rm fails (above). Best-effort and bounded
+ *  by age on purpose -- a YOUNG stale-file is another stealer mid-flight,
+ *  about to be read for a possible restore, and must not be pulled out from
+ *  under it. Every failure is swallowed: this is housekeeping beside the
+ *  take, never a reason for the take to fail. */
+async function sweepStaleLitter(lockPath: string, staleMs: number): Promise<void> {
+  const dir = dirname(lockPath);
+  const prefix = `${basename(lockPath)}.stale-`;
+  let names: string[];
+  try {
+    names = await readdir(dir);
+  } catch {
+    return;
+  }
+  const now = Date.now();
+  for (const name of names) {
+    if (!name.startsWith(prefix)) continue;
+    const litter = join(dir, name);
+    try {
+      if (now - (await stat(litter)).mtimeMs > staleMs) await rm(litter, { force: true });
+    } catch {
+      // Gone already, or held open: it stays for the next sweep.
+    }
+  }
 }
 
 /** Unlink the lock -- only while it still carries OUR token. A lock that went
@@ -325,7 +370,7 @@ async function releaseLock(lockPath: string, token: string): Promise<void> {
 // Names the LOCK file only: audit-cmd's exit-3 wrapper already prefixes the
 // grades.json path, and the lock sits beside it, so repeating the cache path
 // here printed the same long absolute path three times in one stderr line.
-function lockTimeout(_path: string, lockPath: string, ageMs: number | null): Error {
+function lockTimeout(lockPath: string, ageMs: number | null): Error {
   const held = ageMs === null ? "" : ` for ${Math.round(ageMs / 1000)}s`;
   return new Error(`locked by another yaw-mcp audit (${lockPath}, held${held}) -- re-run this audit once it finishes`);
 }
@@ -342,6 +387,7 @@ async function withGradesLock<T>(path: string, opts: WriteGradeOptions, fn: () =
   // The lock lives beside grades.json, so on the first-ever audit its
   // directory does not exist yet.
   await mkdir(dirname(path), { recursive: true });
+  await sweepStaleLitter(lockPath, staleMs);
   const deadline = Date.now() + waitMs;
   // When the current unbroken run of transient take failures began; null
   // whenever the last take answered normally. See GRADES_LOCK_TRANSIENT_MS.
@@ -381,7 +427,7 @@ async function withGradesLock<T>(path: string, opts: WriteGradeOptions, fn: () =
     // a live one, so neither a scanner's handle nor a flickering path can
     // spin here without bound.
     if (ageMs !== null && !isLive(ageMs) && (await stealStaleLock(lockPath, isLive))) continue;
-    if (Date.now() >= deadline) throw lockTimeout(path, lockPath, ageMs);
+    if (Date.now() >= deadline) throw lockTimeout(lockPath, ageMs);
     await delay(GRADES_LOCK_POLL_MS);
   }
   try {

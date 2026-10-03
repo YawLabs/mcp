@@ -1952,6 +1952,38 @@ describe("ConnectServer", () => {
       expect(disconnectFromUpstream).toHaveBeenCalledWith(conn);
     });
 
+    it("keeps a connection that replaced the one it was unloading during the close", async () => {
+      // The prewarm teardown's race, at this site: disconnectFromUpstream
+      // flips the old connection "disconnected" synchronously and then
+      // awaits the SDK close. An activate landing in that window is a
+      // fresh activation (runActivateOne early-returns only on "connected",
+      // and the cap grants a "disconnected" entry no slot), so it spawns a
+      // child and re-registers under the same key. Deleting unconditionally
+      // after the await orphaned that child -- live, unreferenced, and
+      // invisible to shutdown() -- and dropped its advertised/filter state.
+      const priv = getPrivate(server);
+      const stale = makeConnection("gh", ["create_issue"]);
+      const replacement = makeConnection("gh", ["create_issue"]);
+      priv.connections.set("gh", stale);
+      vi.mocked(disconnectFromUpstream).mockImplementationOnce(async (c: UpstreamConnection) => {
+        c.status = "disconnected";
+        priv.connections.set("gh", replacement);
+        priv.idleCallCounts.set("gh", 0);
+        priv.sessionActivated.add("gh");
+        priv.toolFilters.set("gh", new Set(["create_issue"]));
+      });
+
+      const result = await priv.handleDeactivate(["gh"]);
+      expect(result.isError).toBeUndefined();
+      expect(priv.connections.get("gh")).toBe(replacement);
+      expect(priv.idleCallCounts.get("gh")).toBe(0);
+      expect(priv.sessionActivated.has("gh")).toBe(true);
+      expect(priv.toolFilters.has("gh")).toBe(true);
+      // And the reply does not claim the tools left the context.
+      expect(result.content[0].text).not.toContain('Unloaded "gh"');
+      expect(result.content[0].text).toContain("still loaded");
+    });
+
     it("deactivates multiple servers", async () => {
       const priv = getPrivate(server);
       priv.connections.set("gh", makeConnection("gh"));
@@ -2093,6 +2125,33 @@ describe("ConnectServer", () => {
       expect(priv.connections.has("slack")).toBe(false);
       expect(priv.idleCallCounts.has("slack")).toBe(false);
       expect(disconnectFromUpstream).toHaveBeenCalled();
+    });
+
+    it("does not delete a connection that replaced the one it reaped during the close", async () => {
+      // Same race as the prewarm teardown and handleDeactivate (see their
+      // sibling tests): the reaper awaits a multi-second close after the
+      // status flip, an activate lands in the window and re-registers a
+      // fresh child under the same key, and an unconditional delete then
+      // orphaned it.
+      const priv = getPrivate(server);
+      priv.connections.set("gh", makeConnection("gh"));
+      const stale = makeConnection("slack");
+      const replacement = makeConnection("slack");
+      priv.connections.set("slack", stale);
+      priv.idleCallCounts.set("gh", 0);
+      priv.idleCallCounts.set("slack", resolveIdleThreshold() - 1);
+      vi.mocked(disconnectFromUpstream).mockImplementationOnce(async (c: UpstreamConnection) => {
+        c.status = "disconnected";
+        priv.connections.set("slack", replacement);
+        priv.idleCallCounts.set("slack", 0);
+        priv.sessionActivated.add("slack");
+      });
+
+      await priv.trackUsageAndAutoDeactivate("gh");
+      expect(disconnectFromUpstream).toHaveBeenCalledWith(stale);
+      expect(priv.connections.get("slack")).toBe(replacement);
+      expect(priv.idleCallCounts.get("slack")).toBe(0);
+      expect(priv.sessionActivated.has("slack")).toBe(true);
     });
 
     it("does not deactivate servers below threshold", async () => {
@@ -3515,7 +3574,7 @@ describe("ConnectServer", () => {
       priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
       // Rank decisively so the auto-warm gate fires without depending on
       // BM25 scoring internals.
-      vi.spyOn(priv, "twoStageRank").mockResolvedValue([{ namespace: "gh", score: 5 }]);
+      vi.spyOn(priv, "rankIntentCandidates").mockResolvedValue([{ namespace: "gh", score: 5 }]);
       vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["create_issue"]));
 
       await priv.handleDiscoverWithAutoWarm("github issue");
@@ -3523,6 +3582,43 @@ describe("ConnectServer", () => {
       // start calling tools -- which requires the warmed namespace to be
       // advertised under the default gateway exposure.
       expect(priv.sessionActivated.has("gh")).toBe(true);
+    });
+
+    it("discover auto-warm credits the warmed namespace in its own observation tick", async () => {
+      // The tick runs AFTER the handler and ages every connected namespace
+      // it is not told about. runActivateOne's reset to zero happened
+      // inside the handler, so without the credit the server discover just
+      // decided was the relevant one came out of its own discover one tick
+      // idle -- while the comment at the call site claimed otherwise.
+      const priv = getPrivate(server);
+      priv.config = makeConfig([
+        makeServerConfig({ namespace: "gh", name: "GitHub" }),
+        makeServerConfig({ namespace: "slack", name: "Slack" }),
+      ]);
+      priv.connections.set("slack", makeConnection("slack", ["post"]));
+      priv.idleCallCounts.set("slack", 0);
+      vi.spyOn(priv, "rankIntentCandidates").mockResolvedValue([{ namespace: "gh", score: 5 }]);
+      vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["create_issue"]));
+
+      await priv.handleToolCall("mcp_connect_discover", { context: "github issue" });
+      expect(priv.connections.has("gh")).toBe(true);
+      expect(priv.idleCallCounts.get("gh")).toBe(0);
+      // A bystander still ages: the credit is for the pick, not a skipped tick.
+      expect(priv.idleCallCounts.get("slack")).toBe(1);
+    });
+
+    it("discover auto-warm credits an ALREADY-connected winner the same way", async () => {
+      // The shortcut branch spawns nothing and so resets nothing; it used to
+      // age the very server it was about to call "Auto-loaded".
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+      priv.connections.set("gh", makeConnection("gh", ["create_issue"]));
+      priv.idleCallCounts.set("gh", 3);
+      vi.spyOn(priv, "rankIntentCandidates").mockResolvedValue([{ namespace: "gh", score: 5 }]);
+
+      await priv.handleToolCall("mcp_connect_discover", { context: "github issue" });
+      expect(vi.mocked(connectToUpstream)).not.toHaveBeenCalled();
+      expect(priv.idleCallCounts.get("gh")).toBe(0);
     });
 
     it("routes meta-tool suggest and returns friendly message with no patterns", async () => {
@@ -3701,6 +3797,37 @@ describe("ConnectServer", () => {
       expect(JSON.parse(text).stepKeys).toEqual(["a", "b"]);
       // And it is dramatically smaller than the un-selected form would be.
       expect(text.length).toBeLessThan(bigList.length / 10);
+    });
+
+    it("binds $ref targets from the body as the upstream sent it, not from the pruned echo", async () => {
+      // The pruner drops an empty array as dead weight -- right for the
+      // reader, wrong for the next step: `a.labels` on the pruned body is a
+      // missing key, and the ref fails with "cannot read labels of
+      // undefined" for a value the server actually returned. Refs read the
+      // raw body; the pruned one is what the reply echoes.
+      const priv = getPrivate(server);
+      const conn = makeConnection("gh", ["get_issue", "set_labels"]);
+      const callTool = vi
+        .fn()
+        .mockResolvedValueOnce({ content: [{ type: "text", text: '{"id":42,"labels":[]}' }] })
+        .mockResolvedValueOnce({ content: [{ type: "text", text: "ok" }] });
+      conn.client.callTool = callTool;
+      priv.connections.set("gh", conn);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      priv.rebuildRoutes();
+
+      const result = await priv.handleToolCall("mcp_connect_exec", {
+        steps: [
+          { id: "a", tool: "gh_get_issue", args: {} },
+          { id: "b", tool: "gh_set_labels", args: { labels: { $ref: "a.labels" } } },
+        ],
+      });
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.ok).toBe(true);
+      // The consumer received the real value.
+      expect(callTool.mock.calls[1][0]).toEqual({ name: "set_labels", arguments: { labels: [] } });
+      // The echo is still the pruned body: the empty array is not replayed.
+      expect(parsed.steps.a).toEqual({ id: 42 });
     });
 
     it("keeps a small side-effect result even when `return` names a later step", async () => {
@@ -4603,6 +4730,17 @@ describe("isAutoActivateEnabled", () => {
     expect(isAutoActivateEnabled()).toBe(false);
     vi.stubEnv("YAW_MCP_AUTO_ACTIVATE", "true");
     expect(isAutoActivateEnabled()).toBe(true);
+  });
+
+  it("is an opt-OUT like every sibling: only 0 / false disable, `yes` and `on` leave it on", () => {
+    // The help text says "set to 0 to disable". The old opt-in parse made
+    // `=yes` a silent disable, which is the opposite of what it promised.
+    vi.stubEnv("YAW_MCP_AUTO_ACTIVATE", "yes");
+    expect(isAutoActivateEnabled()).toBe(true);
+    vi.stubEnv("YAW_MCP_AUTO_ACTIVATE", "on");
+    expect(isAutoActivateEnabled()).toBe(true);
+    vi.stubEnv("YAW_MCP_AUTO_ACTIVATE", "FALSE");
+    expect(isAutoActivateEnabled()).toBe(false);
   });
 
   it("trims the value -- `set YAW_MCP_AUTO_ACTIVATE=1 && ...` from cmd.exe stores '1 '", () => {
@@ -6510,6 +6648,27 @@ describe("discover cache key covers tool filters", () => {
     expect(text).toContain("filtered: 1 of 3");
     expect(text).toContain("loaded (1 tool)");
   });
+
+  it("moves with the compliance floor and the exposure mode, which the body renders", () => {
+    // Both are re-read from the env per call and both change what discover
+    // prints (blocked-by-floor cards, the advertised labels and totals), so
+    // a key that ignored them replayed a stale body for the TTL after a
+    // mid-session change.
+    const priv = getPrivate(server);
+    try {
+      const base = priv.discoverCacheKey(undefined, null, undefined);
+      vi.stubEnv("YAW_MCP_MIN_COMPLIANCE", "B");
+      const floored = priv.discoverCacheKey(undefined, null, undefined);
+      expect(floored).not.toBe(base);
+      vi.stubEnv("YAW_MCP_MIN_COMPLIANCE", "");
+      vi.stubEnv("YAW_MCP_TOOL_EXPOSURE", "lite");
+      const lite = priv.discoverCacheKey(undefined, null, undefined);
+      expect(lite).not.toBe(base);
+      expect(lite).not.toBe(floored);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
 });
 
 describe("discover summary counts only connected servers", () => {
@@ -6567,7 +6726,7 @@ describe("auto-warm failure reaches the discover output", () => {
   it("names the cap refusal that stopped the auto-warm", async () => {
     const priv = getPrivate(server);
     priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
-    vi.spyOn(priv, "twoStageRank").mockResolvedValue([{ namespace: "gh", score: 5 }]);
+    vi.spyOn(priv, "rankIntentCandidates").mockResolvedValue([{ namespace: "gh", score: 5 }]);
     // A cap refusal never reaches activationFailures, so formatHealthWarning
     // renders nothing for it: without this banner line the model cannot tell
     // "refused" from "no clear winner" and re-runs the same discover.
@@ -6587,7 +6746,7 @@ describe("auto-warm failure reaches the discover output", () => {
   it("names the spawn failure that stopped the auto-warm, without poisoning the memo", async () => {
     const priv = getPrivate(server);
     priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
-    vi.spyOn(priv, "twoStageRank").mockResolvedValue([{ namespace: "gh", score: 5 }]);
+    vi.spyOn(priv, "rankIntentCandidates").mockResolvedValue([{ namespace: "gh", score: 5 }]);
     vi.mocked(connectToUpstream).mockRejectedValue(new Error("spawn ENOENT npx"));
 
     const result = await withoutRetryBackoff(() => priv.handleDiscoverWithAutoWarm("github issue"));

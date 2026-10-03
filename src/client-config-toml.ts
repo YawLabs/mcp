@@ -1,5 +1,12 @@
 // TOML client-config adapter (Codex CLI's ~/.codex/config.toml).
 //
+// This file is the CODEC: parse, scan, render, splice, verify. The
+// `ConfigAdapter` face the core reaches it through -- `TOML_ADAPTER` -- lives
+// in target-codex-cli.ts, which is the ONLY module that registers "toml" with
+// `registerConfigAdapter` (see the header of client-config.ts). Nothing here
+// imports that row, and nothing here is registered on its own: importing the
+// codex-cli row is what makes the format readable and writable.
+//
 // Codex reads MCP servers from `[mcp_servers.<name>]` tables in a config.toml
 // that also holds the user's model, theme and per-project trust settings. So
 // the same rule the JSONC helpers in jsonc.ts follow applies here, harder: a
@@ -604,6 +611,10 @@ export function scanTomlSections(text: string): TomlScan {
   return { sections, assignments, continuedLines, eol: detectTomlEol(text) };
 }
 
+// DO NOT EDIT lineStartBefore WITHOUT running the "upsert -- byte-exact" and
+// "remove -- byte-exact" blocks of src/tests/client-config-toml.test.ts -- and
+// WATCHING them: a wrong edit here does not fail them, it HANGS them (see
+// below). A run that never finishes is the signal.
 /** The start offset of the line that ENDS at `end` (`end` is just past a line
  *  break, or the text length).
  *
@@ -623,6 +634,10 @@ function lineStartBefore(text: string, end: number): number {
   return i;
 }
 
+// DO NOT EDIT scanSpan WITHOUT running the "a byte that only LOOKS structural"
+// block of src/tests/client-config-toml.test.ts, and checking that the change
+// you made turns at least one of its assertions red when reverted. Five of the
+// twelve wrong edits measured there left the rest of the suite GREEN.
 /** Advance the string/bracket state machine over [from, to).
  *
  *  EVERY branch below is a decision that one byte is CONTENT rather than
@@ -1113,20 +1128,36 @@ export interface TomlEntryView {
 export type TomlConfigRead =
   /** No file, or nothing but whitespace (Codex reads both as an empty table). */
   | { kind: "absent" }
-  /** Does not parse. `detail` is "line L, column C: <reason>". */
-  | { kind: "malformed"; syntax: typeof TOML_SYNTAX; reason: string; line: number; column: number; detail: string }
+  /** Does not parse. `detail` is the parser's reason WITHOUT the position --
+   *  the same field, meaning the same thing, as the core's
+   *  `ConfigRead.malformed.detail`, so the adapter copies it across and the
+   *  core's refusal adds " at line L column C" from `line` and `column`.
+   *  `positioned` is "line L, column C: <detail>" for a message that prints on
+   *  its own (`verifyTomlSplice`). */
+  | {
+      kind: "malformed";
+      syntax: typeof TOML_SYNTAX;
+      detail: string;
+      line: number;
+      column: number;
+      positioned: string;
+    }
   /** The container key exists and is not a table. Never reparable: Codex
    *  refuses to load such a file, and repairing it would mean rewriting a
    *  root key-value line -- a second kind of splice, for a shape no tool
    *  writes. */
   | { kind: "blocked"; path: string[]; shape: string; reparable: false }
   /** Parses, but one of the named entries is in a spelling the splice will not
-   *  REWRITE. `removable` is true for the one such shape it can still delete
-   *  (an `[[array of tables]]` entry, which is whole lines): uninstall may
-   *  proceed on it, install may not. `remedy` is worded for the splice's own
+   *  REWRITE. The write facade (`applyClientConfigEdits`) refuses EVERY edit
+   *  to such a file, a removal included -- a read of this kind carries no
+   *  entries, so the facade could not verify that a removal left the
+   *  neighbours alone. `removeTomlEntry` itself can still delete the one such
+   *  shape that occupies whole lines (an `[[array of tables]]` entry); that
+   *  is a property of the splicer, reached only by a caller of the splicer,
+   *  and is not reported here. `remedy` is worded for the splice's own
    *  refusal; `fix` is the same by-hand step worded for any surface (see
    *  ShapeProblem). */
-  | { kind: "unspliceable"; key: string; shape: string; remedy: string; fix: string; removable: boolean }
+  | { kind: "unspliceable"; key: string; shape: string; remedy: string; fix: string }
   /** Read. `containerUnspliceable` is set when the container is a root-level
    *  inline table (`mcp_servers = { ... }`) holding none of the named entries:
    *  the read is fine and Codex loads it, but no `[mcp_servers.<name>]` header
@@ -1160,10 +1191,10 @@ export function readTomlConfig(
       return {
         kind: "malformed",
         syntax: TOML_SYNTAX,
-        reason: e.reason,
+        detail: e.reason,
         line: e.line,
         column: e.column,
-        detail: e.detail,
+        positioned: e.detail,
       };
     }
     throw e;
@@ -1192,14 +1223,7 @@ export function readTomlConfig(
   for (const name of entryNames) {
     const problem = entryShapeProblem(scan, parsed, containerPath, name);
     if (problem !== null) {
-      return {
-        kind: "unspliceable",
-        key: name,
-        shape: problem.shape,
-        remedy: problem.remedy,
-        fix: problem.fix,
-        removable: problem.removable,
-      };
+      return { kind: "unspliceable", key: name, shape: problem.shape, remedy: problem.remedy, fix: problem.fix };
     }
   }
   // Object key order is the file's own table order (smol-toml inserts as it
@@ -1239,8 +1263,10 @@ export function tomlEntryNames(read: TomlConfigRead): string[] {
 
 interface ShapeProblem {
   shape: string;
-  /** What to do, worded for the splice's own refusal (`TomlSpliceRefusal`),
-   *  which is printed beside the table install would have written. */
+  /** What to do, worded for the splice's own refusal (`TomlSpliceRefusal`).
+   *  It names the table to write by its header and assumes NOTHING about what
+   *  the surface prints beside it: install's refusal shows no preview, and
+   *  the message reaches `try` and the facade's own error verbatim. */
   remedy: string;
   /** The same by-hand step worded for ANY surface: no "below", no "re-run" --
    *  the surface appends its own "then run ...". Doctor prints this one, and
@@ -1257,11 +1283,6 @@ interface ShapeProblem {
    *  our entry's whole section, deletes it with nothing to flag the loss. A
    *  header at the end of the file owns only the lines written under it. */
   fix: string;
-  /** True when `removeTomlEntry` can still delete it: the entry occupies whole
-   *  lines under a header, so there is a span to take. False when there is no
-   *  header at all (an inline table or dotted keys), which is the case nothing
-   *  here edits. */
-  removable: boolean;
 }
 
 /** Why the span splice will not edit `name`, or null when it will.
@@ -1287,7 +1308,6 @@ function entryShapeProblem(
       shape: `an array of tables ([[${entryPath.map(tomlKey).join(".")}]])`,
       remedy: `Codex reads a server as a single table, so make it one ${headerLabel} table (or remove it), then re-run`,
       fix: `rewrite it by hand as a single ${headerLabel} table (or delete it)`,
-      removable: true,
     };
   }
   if (own.length > 0) return null;
@@ -1296,29 +1316,29 @@ function entryShapeProblem(
   const rootDotted = scan.assignments.some(
     (a) => a.section.length === 0 && a.keyPath.length > 1 && pathStartsWith(a.keyPath, entryPath),
   );
+  // The remedies below name the table by its HEADER and say where to put it,
+  // never "the table below": no surface that prints a remedy prints a preview
+  // beside it, and the message reaches `try` and the facade's error as it is.
   if (rootDotted) {
     return {
       shape: `written as dotted keys at the top level (${entryPath.join(".")}.command = ...)`,
-      remedy: `only a ${headerLabel} table can be rewritten in place -- replace those lines with the table below by hand (or delete them and re-run)`,
+      remedy: `only a ${headerLabel} table can be rewritten in place -- move those lines by hand into a ${headerLabel} table at the end of the file (or delete them), then re-run`,
       fix: `move those lines by hand into a ${headerLabel} table at the end of the file (or delete them)`,
-      removable: false,
     };
   }
   const inContainer = scan.assignments.filter((a) => pathEquals(a.section, containerPath) && a.keyPath[0] === name);
   if (inContainer.some((a) => a.keyPath.length > 1)) {
     return {
       shape: `written as dotted keys under [${containerLabel}] (${name}.command = ...)`,
-      remedy: `only a ${headerLabel} table can be rewritten in place -- replace those lines with the table below by hand (or delete them and re-run)`,
+      remedy: `only a ${headerLabel} table can be rewritten in place -- move those lines by hand into a ${headerLabel} table at the end of the file (or delete them), then re-run`,
       fix: `move those lines by hand into a ${headerLabel} table at the end of the file (or delete them)`,
-      removable: false,
     };
   }
   if (inContainer.some((a) => a.inlineTable)) {
     return {
       shape: `an inline table under [${containerLabel}] (${name} = { ... })`,
-      remedy: `only a ${headerLabel} table can be rewritten in place -- replace that line with the table below by hand (or delete it and re-run)`,
+      remedy: `only a ${headerLabel} table can be rewritten in place -- move that line by hand into a ${headerLabel} table at the end of the file (or delete it), then re-run`,
       fix: `move that line by hand into a ${headerLabel} table at the end of the file (or delete it)`,
-      removable: false,
     };
   }
   if (rootContainerIsInline(scan, containerPath)) {
@@ -1329,14 +1349,12 @@ function entryShapeProblem(
       shape: `inside the inline table ${containerLabel} = { ... }`,
       remedy: `TOML cannot extend an inline table with a later table, so convert it to ${headerLabel}-style tables by hand, then re-run`,
       fix: `convert the inline ${containerLabel} = { ... } to ${headerLabel}-style tables by hand`,
-      removable: false,
     };
   }
   return {
     shape: `not written as a ${headerLabel} table`,
-    remedy: `only a ${headerLabel} table can be rewritten in place -- replace it with the table below by hand (or delete it and re-run)`,
+    remedy: `only a ${headerLabel} table can be rewritten in place -- move it by hand into a ${headerLabel} table at the end of the file (or delete it), then re-run`,
     fix: `move it by hand into a ${headerLabel} table at the end of the file (or delete it)`,
-    removable: false,
   };
 }
 
@@ -1473,15 +1491,6 @@ function deleteSectionEdits(text: string, sections: readonly TomlSection[]): Spa
   });
 }
 
-export interface UpsertTomlOptions {
-  /** Legacy entry names this write also REMOVES. When `name` is absent and a
-   *  legacy table is present, the new table takes the place of the FIRST
-   *  legacy table in file order and every listed legacy table is deleted, so
-   *  a migration is one write with the entry where the user last saw it.
-   *  A legacy entry in an unspliceable spelling refuses the whole write. */
-  replaceLegacy?: readonly string[];
-}
-
 /** Upsert one `[<containerPath>.<name>]` table into `raw`, returning the new
  *  text.
  *
@@ -1496,6 +1505,13 @@ export interface UpsertTomlOptions {
  *  `20`, CRLF, a leading BOM, indentation -- is outside the spliced range and
  *  survives.
  *
+ *  ONE entry, and only that entry. A legacy-key migration is not this
+ *  function's business: install writes it as a separate `remove` edit through
+ *  the write facade, which applies the two splices one after the other (the
+ *  codex-cli tests pin the bytes of that pair, f08 and f08b). An option that
+ *  folded the removal into the upsert used to exist here and was reached from
+ *  tests alone.
+ *
  *  Throws `TomlConfigError` when `raw` does not parse, `TomlSpliceRefusal` for
  *  a spelling the splice will not edit (naming it and what to do), and
  *  `TomlVerifyError` when the result would have changed anything else. The
@@ -1505,9 +1521,7 @@ export function upsertTomlEntry(
   containerPath: readonly string[],
   name: string,
   entry: Record<string, unknown>,
-  options: UpsertTomlOptions = {},
 ): string {
-  const legacyNames = options.replaceLegacy ?? [];
   if (raw === null || raw.trim() === "") {
     // A missing file and an empty one are the same to Codex (a missing
     // config.toml loads as an empty table), so both get the table on its own.
@@ -1531,7 +1545,7 @@ export function upsertTomlEntry(
     );
   }
   const scan = scanTomlSections(raw);
-  refuseUnspliceable(scan, parsed, containerPath, [name, ...legacyNames]);
+  refuseUnspliceable(scan, parsed, containerPath, [name]);
 
   const eol = scan.eol;
   const block = renderTomlEntry(containerPath, name, entry, eol);
@@ -1539,22 +1553,14 @@ export function upsertTomlEntry(
   const edits: SpanEdit[] = [];
 
   const ownSections = scan.sections.filter((s) => pathStartsWith(s.keyPath, entryPath));
-  const legacySections = legacyNames.flatMap((legacy) =>
-    scan.sections.filter((s) => pathStartsWith(s.keyPath, [...containerPath, legacy])),
-  );
-  const anchor = ownSections[0] ?? legacySections[0];
+  const anchor = ownSections[0];
 
   if (anchor !== undefined) {
-    // Replace the first table of the entry (or of the legacy entry it
-    // supersedes) and delete every other table belonging to either -- a
-    // detached `[mcp_servers.mcp.env]` further down the file included.
+    // Replace the first table of the entry and delete every other table
+    // belonging to it -- a detached `[mcp_servers.mcp.env]` further down the
+    // file included.
     edits.push({ start: anchor.start, end: anchor.contentEnd, text: block });
-    edits.push(
-      ...deleteSectionEdits(
-        raw,
-        [...ownSections, ...legacySections].filter((s) => s !== anchor),
-      ),
-    );
+    edits.push(...deleteSectionEdits(raw, ownSections.slice(1)));
   } else {
     if (rootContainerIsInline(scan, containerPath)) {
       throw new TomlSpliceRefusal(
@@ -1567,7 +1573,7 @@ export function upsertTomlEntry(
   }
 
   const next = applyEdits(raw, edits);
-  verifyTomlSplice(raw, next, containerPath, { upsert: { name, entry }, removed: legacyNames });
+  verifyTomlSplice(raw, next, containerPath, { upsert: { name, entry } });
   return next;
 }
 
@@ -1777,7 +1783,7 @@ export function verifyTomlSplice(
     throw new TomlVerifyError(`the edited text does not parse as TOML (${(e as Error).message})`);
   }
   if (afterRead.kind === "malformed") {
-    throw new TomlVerifyError(`the edited text does not parse as TOML (${afterRead.detail})`);
+    throw new TomlVerifyError(`the edited text does not parse as TOML (${afterRead.positioned})`);
   }
   if (afterRead.kind === "blocked") {
     throw new TomlVerifyError(`the edit left "${afterRead.path.join(".")}" as ${afterRead.shape}, not a table`);

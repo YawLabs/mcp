@@ -1,5 +1,9 @@
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("../logger.js", () => ({ log: vi.fn() }));
+
+import { log } from "../logger.js";
 import { computeOutcomeReward } from "../reward.js";
 import {
   buildGraderPrompt,
@@ -9,7 +13,10 @@ import {
   isRewardGraderEnabled,
   isUncertainReward,
   parseGrade,
+  resetNoSamplingNotice,
 } from "../reward-grader.js";
+
+const mockLog = vi.mocked(log);
 
 function mockServer(
   caps: Record<string, unknown> | undefined,
@@ -233,6 +240,28 @@ describe("gradeOutcomeViaSampling", () => {
   it("returns null when the client has no sampling capability", async () => {
     const server = mockServer({}); // no sampling
     expect(await gradeOutcomeViaSampling(server, ctx)).toBeNull();
+  });
+
+  it("logs ONCE per process that the client has no sampling, so an inert REWARD_GRADER opt-in is visible", async () => {
+    // With the grader opted in, every uncertain outcome returns null here on
+    // a client without sampling, and nothing else says the opt-in does
+    // nothing. One info line per process, not one per graded call.
+    resetNoSamplingNotice();
+    mockLog.mockClear();
+    const server = mockServer({});
+    await gradeOutcomeViaSampling(server, ctx);
+    await gradeOutcomeViaSampling(server, ctx);
+    const notices = mockLog.mock.calls.filter(([level, msg]) => level === "info" && /sampling/.test(msg));
+    expect(notices).toHaveLength(1);
+    expect(notices[0][1]).toMatch(/YAW_MCP_REWARD_GRADER/);
+    // A client WITH sampling never triggers it.
+    resetNoSamplingNotice();
+    mockLog.mockClear();
+    await gradeOutcomeViaSampling(
+      mockServer({ sampling: {} }, async () => ({})),
+      ctx,
+    );
+    expect(mockLog.mock.calls.filter(([level]) => level === "info")).toHaveLength(0);
   });
 
   it("grades YES -> 1.0 / PARTIAL -> 0.5 / NO -> 0.0", async () => {

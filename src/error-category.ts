@@ -4,7 +4,16 @@
 // We deliberately never surface the raw error text alongside the
 // category -- third-party MCP servers routinely echo args/secrets in
 // errors (URLs with api_key= query params, request bodies, Python
-// tracebacks containing locals) and we have no general scrubber.
+// tracebacks containing locals). The one scrubber yaw-mcp has
+// (health-score.ts scrubForWarning) is SHAPE-SPECIFIC: it redacts the
+// three shapes it knows -- a scheme-prefixed token (`Bearer ...`), a
+// `name=value` / `name: value` pair under a credential-looking name, and a
+// vendor-prefixed key (`sk-...`, `ghp_...`) -- and nothing else, and its
+// own header says why it cannot be general (the text does not say which
+// values are secrets). A category is the one rendering of
+// an error that cannot leak, so this module keeps to it; a caller that
+// must show the text runs it through scrubForWarning first and accepts
+// the shapes that scrubber does not cover.
 
 export const ERROR_CATEGORIES = [
   "validation_error",

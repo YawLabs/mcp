@@ -320,16 +320,15 @@ describe("classifyError", () => {
   });
 
   // Drift tripwire for the one surviving consumer of these strings.
-  // reward.ts's ERROR_SHAPED_CATEGORIES names seven of the eight by literal
-  // (everything but upstream_error) to decide which soft failures score
-  // REWARD_ERROR_SHAPED. That set is typed ReadonlySet<ErrorCategory>, so a
-  // RENAMED or REMOVED member fails tsc over there -- but an ADDED member
-  // does not: it silently lands in the "not error-shaped" bucket, and a 200
-  // reply carrying the new category grades as a clean full-credit success.
-  // Pin the literal contents here so widening the enum is a deliberate
-  // two-file change (this test fails -> reward.ts's set has to decide
-  // whether the newcomer is error-shaped). The hosted backend that once kept
-  // its own copy of this list is retired; there is no second repo to update.
+  // reward.ts's ERROR_SHAPED_CATEGORIES is DERIVED from this list (everything
+  // but upstream_error) to decide which soft failures score
+  // REWARD_ERROR_SHAPED, so an ADDED member is error-shaped by default: a 200
+  // reply carrying the new category grades at REWARD_ERROR_SHAPED, not as a
+  // clean full-credit success. Pin the literal contents here so widening the
+  // enum is still a deliberate two-file change (this test fails -> reward.ts
+  // has to decide whether the newcomer belongs in the exclusion instead). The
+  // hosted backend that once kept its own copy of this list is retired; there
+  // is no second repo to update.
   it("ERROR_CATEGORIES is the exact pinned list (reward.ts coupling tripwire)", () => {
     expect([...ERROR_CATEGORIES]).toEqual([
       "validation_error",

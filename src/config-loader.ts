@@ -130,11 +130,12 @@ export interface LoadConfigOptions {
  *  Unset, every command behaves exactly as before. */
 export const READONLY_DIAGNOSTICS_ENV = "YAW_MCP_READONLY_DIAGNOSTICS";
 
-/** Is YAW_MCP_READONLY_DIAGNOSTICS on? "1" or "true", case-insensitive -- the
- *  truthy spellings these YAW_MCP_* opt-ins accept (isPersistenceDisabled,
- *  isTrustBypassEnabled, isAutoLoadEnabled). Trimmed like isAutoLoadEnabled,
- *  for the same cmd.exe reason: `set VAR=1 && ...` delivers "1 ". Anything
- *  else, unset and empty included, is off.
+/** Is YAW_MCP_READONLY_DIAGNOSTICS on? The one truthiness rule every
+ *  YAW_MCP_* opt-in applies (isPersistenceDisabled, isTrustBypassEnabled,
+ *  isAutoLoadEnabled): the value is TRIMMED, then "1" or case-insensitive
+ *  "true" is on. Anything else -- unset, empty, "yes", "on", "0" -- is off.
+ *  Trimmed for the cmd.exe reason: `set VAR=1 && ...` delivers "1 ", and an
+ *  untrimmed copy reads that as off on exactly the shell the user set it from.
  *
  *  Takes `env` for the reason isPersistenceDisabled does: doctor and `bundles`
  *  thread an injected environment, and a predicate they cannot hand their own
@@ -313,10 +314,16 @@ function filterStringArray(
   // unset so the resolver falls through to the parent scope instead of
   // resolving to an empty (allow-all) list that shadows it.
   if (strings.length === 0 && raw.length > 0) return undefined;
-  // An all-invalid blockedTools resolves to an EMPTY list rather than to
-  // undefined: unlike servers/blocked there is no parent scope to fall
-  // through to, and `deny nothing` is the honest reading of `every entry you
-  // wrote is unusable`.
+  // With dropInvalid (blockedTools), an array whose STRING entries all fail
+  // the shape check resolves to an EMPTY list, not undefined: there is no
+  // parent scope for blockedTools to fall through to, and `deny nothing` is
+  // the honest reading of `every entry you wrote is unusable`. Note the
+  // asymmetry with the guard just above: an array with no usable STRINGS at
+  // all (`[1, null]`, `[""]`) returns undefined from there for every field,
+  // blockedTools included -- that guard runs first and does not know which
+  // field it is serving. Both answers mean "nothing is denied" to the gate
+  // (isToolDenied treats undefined and [] alike), so the difference is only
+  // visible to a caller comparing the resolved value.
   return kept;
 }
 

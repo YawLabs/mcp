@@ -543,10 +543,12 @@ describe("yaw-mcp trust --list", () => {
     expect(io.errText()).toContain("trust store unusable");
   });
 
-  it("--json reports a malformed store as data and still exits 0", async () => {
-    // The prose branch exits 1; the JSON branch has to stay a parseable
-    // document on stdout, so it carries the failure in `malformed` / `error`
-    // instead of in the exit code.
+  it("--json reports a malformed store as data AND exits 1, like the prose branch and --revoke --json", async () => {
+    // The JSON branch stays a parseable document on stdout, carrying the
+    // failure in `malformed` / `error` -- but the exit code says the list was
+    // not delivered, as it does for prose and for `--revoke --json` on the
+    // same store. It used to exit 0 here and 1 there, so a wrapper keying on
+    // the exit code read one surface as fine and the other as broken.
     mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
     writeFileSync(trustStorePath(synthHome), "not json");
     const io = captureIO();
@@ -558,7 +560,9 @@ describe("yaw-mcp trust --list", () => {
       out: io.push,
       err: io.pushErr,
     });
-    expect(r.exitCode).toBe(0);
+    expect(r.exitCode).toBe(1);
+    // One compact line, like every `secrets --json` envelope.
+    expect(io.text().split("\n")).toEqual([expect.any(String), ""]);
     const parsed = JSON.parse(io.text()) as { malformed: boolean; error: string; trusted: unknown[] };
     expect(parsed.malformed).toBe(true);
     expect(parsed.trusted).toEqual([]);
@@ -1559,5 +1563,81 @@ describe("the approval prompt survives a stray control byte", () => {
     expect(r.exitCode).toBe(1);
     expect(io.errText()).toContain("Aborted");
     expect(await listTrusted({ home: synthHome })).toEqual([]);
+  });
+});
+
+describe("the approval prompt tells a cancel from a decline", () => {
+  /** Drive the real prompt with `keys` as the user's keystrokes. */
+  async function promptWith(keys: string): Promise<{ exitCode: number; io: ReturnType<typeof captureIO> }> {
+    writeBundles(synthCwd, { version: 1, servers: [{ namespace: "solo", name: "Solo", command: "node", args: [] }] });
+    const stdin = new PassThrough();
+    stdin.write(keys);
+    const stdout = new PassThrough();
+    stdout.on("data", () => {});
+    const io = captureIO();
+    const r = await runTrust({
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      isTTY: true,
+      io: { stdin, stdout },
+      out: io.push,
+      err: io.pushErr,
+    });
+    return { exitCode: r.exitCode, io };
+  }
+
+  it("Ctrl+C exits 130 with Cancelled, the code every secrets prompt uses for the same keystroke", async () => {
+    const { exitCode, io } = await promptWith("\x03");
+    expect(exitCode).toBe(130);
+    expect(io.errText()).toContain("Cancelled. Nothing was approved.");
+    expect(io.errText()).not.toContain("Aborted");
+    expect(await listTrusted({ home: synthHome })).toEqual([]);
+  });
+
+  it("a typed no still exits 1 with Aborted, and so does ^D (the NO default)", async () => {
+    const no = await promptWith("n\n");
+    expect(no.exitCode).toBe(1);
+    expect(no.io.errText()).toContain("Aborted. Nothing was approved.");
+    const eof = await promptWith("\x04");
+    expect(eof.exitCode).toBe(1);
+    expect(eof.io.errText()).toContain("Aborted. Nothing was approved.");
+    expect(await listTrusted({ home: synthHome })).toEqual([]);
+  });
+});
+
+describe("the TTY verdict is about the injected streams, not process.std*", () => {
+  function run(io: { stdin: NodeJS.ReadableStream; stdout: NodeJS.WritableStream }): Promise<{ exitCode: number }> {
+    return runTrust({ home: synthHome, cwd: synthCwd, env: {}, io, out: () => {}, err: () => {} });
+  }
+
+  it("injected streams that are not TTYs refuse without --yes, whatever the process streams are", async () => {
+    writeBundles(synthCwd, { version: 1, servers: [] });
+    const capture = captureIO();
+    const r = await runTrust({
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      io: { stdin: new PassThrough(), stdout: new PassThrough() },
+      out: capture.push,
+      err: capture.pushErr,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(capture.errText()).toContain("not a TTY");
+  });
+
+  it("injected streams that ARE TTYs get the prompt, even though the test process has none", async () => {
+    // Before isInteractive read opts.io this asked process.stdin, which under
+    // the test runner is no TTY, so the prompt was refused and the question
+    // below was never written.
+    writeBundles(synthCwd, { version: 1, servers: [] });
+    const stdin = Object.assign(new PassThrough(), { isTTY: true });
+    stdin.write("n\n");
+    const seen: string[] = [];
+    const stdout = Object.assign(new PassThrough(), { isTTY: true });
+    stdout.on("data", (c: Buffer | string) => seen.push(String(c)));
+    const r = await run({ stdin, stdout });
+    expect(r.exitCode).toBe(1);
+    expect(seen.join("")).toContain("Approve this file?");
   });
 });

@@ -426,6 +426,20 @@ describe("value helpers", () => {
     expect(canonicalJson({ n: { deep: [1, { z: 1, a: 2 }] } })).toBe('{"n":{"deep":[1,{"a":2,"z":1}]}}');
   });
 
+  it("tags a Date, so two dates (or a date and an empty table) do not render alike as {}", () => {
+    // smol-toml returns a datetime as a Date subclass with no own keys; the
+    // object branch rendered every one as `{}`. Tagged like the TOML
+    // adapter's own canonValue, and the string stays distinct from the date.
+    const d = new Date("1979-05-27T07:32:00.000Z");
+    expect(canonicalJson(d)).toBe('{"$date":"1979-05-27T07:32:00.000Z"}');
+    expect(canonicalJson(d)).not.toBe(canonicalJson(new Date("1979-05-28T07:32:00.000Z")));
+    expect(canonicalJson(d)).not.toBe(canonicalJson({}));
+    expect(canonicalJson(d)).not.toBe(canonicalJson("1979-05-27T07:32:00.000Z"));
+    expect(canonicalJson({ when: d })).toBe('{"when":{"$date":"1979-05-27T07:32:00.000Z"}}');
+    // An invalid Date has no ISO string; it renders rather than throws.
+    expect(canonicalJson(new Date(Number.NaN))).toBe('{"$date":"invalid"}');
+  });
+
   it("names a value's shape without echoing its contents", () => {
     expect(describeValueShape(null)).toBe("null");
     expect(describeValueShape([])).toBe("an empty array");
@@ -461,8 +475,10 @@ describe("value helpers", () => {
     expect(terminateWithNewline('a = 1\r\n\r\n[t]\r\nb = "x"')).toBe('a = 1\r\n\r\n[t]\r\nb = "x"\r\n');
     expect(terminateWithNewline("{\r}")).toBe("{\r}\r");
     expect(terminateWithNewline("{\n}")).toBe("{\n}\n");
-    // No line break at all to copy: LF, as before.
-    expect(terminateWithNewline("")).toBe("\n");
+    // Empty text has no line to terminate: an emptied config.toml (a removal
+    // took its only table) is written as the zero bytes Codex reads as an
+    // empty table, not as one stray line break.
+    expect(terminateWithNewline("")).toBe("");
     // The FIRST line break is the file's, as detectTomlEol and jsonc.ts read it.
     expect(terminateWithNewline("{\r\n\n}")).toBe("{\r\n\n}\r\n");
     expect(terminateWithNewline("{\n\r\n}")).toBe("{\n\r\n}\n");

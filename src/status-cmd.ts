@@ -276,8 +276,10 @@ export async function collectStatus(opts: StatusCommandOptions = {}): Promise<St
   const globalPath = localBundlesPath(configDir);
   const learningPath = statePath(configDir);
 
-  // Four independent reads, issued together: none of them needs another's
-  // result, and a panel opens on this command.
+  // Three independent async reads, issued together: none of them needs
+  // another's result, and a panel opens on this command. The fourth read,
+  // the vault's existsSync below, is synchronous and so sits outside the
+  // Promise.all.
   const [loaded, grades, state] = await Promise.all([
     loadLocalBundles({ home, cwd, env }),
     // readGradesCache swallows its own read and parse failures and returns {}
@@ -344,6 +346,12 @@ export async function collectStatus(opts: StatusCommandOptions = {}): Promise<St
     version: VERSION,
     config: {
       path: loaded.path,
+      // Byte-exact comparison, on purpose and on an invariant: loadLocalBundles
+      // returns the global path VERBATIM from the same localBundlesPath(
+      // userConfigDir(home)) call made above, never normalized or realpathed,
+      // so a string compare is exact here. A project file is any OTHER path.
+      // If the loader ever starts resolving the path it returns, this must
+      // compare through paths.ts's normalizeForCompare instead.
       scope: loaded.path === null ? null : loaded.path === globalPath ? "user" : "project",
       readable,
       warnings: loaded.warnings,

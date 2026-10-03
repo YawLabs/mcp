@@ -227,7 +227,10 @@ export async function onPath(cmd: string): Promise<boolean> {
 // awaits resolveUvSpawn BEFORE arming its connect timer, and ensureUv
 // memoizes the pending promise -- that one wedged download would then be
 // handed to every later uv/uvx activation for the life of the process.
-// UV_FETCH_TOTAL_MS is the wall-clock bound on the whole download. Sized to
+// UV_FETCH_TOTAL_MS is the wall-clock bound on the whole download: ONE
+// deadline, armed in ensureUv and shared by the .sha256 sidecar fetch and
+// the archive fetch, so the pair cannot quietly take twice the budget (each
+// fetchWithRedirects call used to arm its own). Sized to
 // the ARTIFACT, not to a fast link: the uv archives are 18-23 MB, so a
 // 5-minute bound demanded ~0.6 Mbit/s sustained and killed slow-but-steady
 // links (throttled hotspot, satellite, congested proxy) that used to finish
@@ -237,9 +240,14 @@ export async function onPath(cmd: string): Promise<boolean> {
 const UV_FETCH_TIMEOUT_MS = 30_000;
 const UV_FETCH_TOTAL_MS = 20 * 60_000;
 
-async function fetchWithRedirects(url: string, maxHops = 5): Promise<Buffer> {
+async function fetchWithRedirects(
+  url: string,
+  maxHops = 5,
+  // Shared across the sidecar + archive pair by ensureUv; the default is for
+  // a lone call.
+  totalDeadline: AbortSignal = AbortSignal.timeout(UV_FETCH_TOTAL_MS),
+): Promise<Buffer> {
   let current = url;
-  const totalDeadline = AbortSignal.timeout(UV_FETCH_TOTAL_MS);
   for (let i = 0; i < maxHops; i++) {
     let res: Awaited<ReturnType<typeof request>>;
     try {
@@ -316,11 +324,15 @@ async function extractArchive(archivePath: string, destDir: string): Promise<voi
         );
       }
     }
+    // -LiteralPath, not -Path: -Path is a WILDCARD parameter, so a cache dir
+    // under a LOCALAPPDATA containing `[` or `]` (a bracketed user name) made
+    // Expand-Archive glob the archive name and fail "path not found".
+    // -DestinationPath is literal already.
     await runCommand("powershell.exe", [
       "-NoProfile",
       "-NonInteractive",
       "-Command",
-      `Expand-Archive -Path '${archivePath.replace(/'/g, "''")}' -DestinationPath '${destDir.replace(/'/g, "''")}' -Force`,
+      `Expand-Archive -LiteralPath '${archivePath.replace(/'/g, "''")}' -DestinationPath '${destDir.replace(/'/g, "''")}' -Force`,
     ]);
   } else {
     await runCommand("tar", ["-xzf", archivePath, "-C", destDir]);
@@ -532,13 +544,17 @@ async function resolveUv(): Promise<string> {
   // Promise.all over the two let the tiny sidecar fetch reject first (a 404
   // right after a UV_VERSION bump outruns Astral's upload; a DNS blip) while
   // the 18-23 MB archive download carried on into memory with nothing to
-  // cancel it: each fetch arms its own AbortSignal.timeout and nothing aborted
-  // the survivor, so the rejection the caller saw was followed by up to
+  // cancel it: each fetch armed its own AbortSignal.timeout at the time and
+  // nothing aborted the survivor, so the rejection the caller saw was followed by up to
   // UV_FETCH_TOTAL_MS of wasted transfer. Sidecar-first costs one extra round
   // trip (milliseconds against a multi-second download) and makes every
   // "asset is missing" failure fail before a byte of the archive moves.
-  const shaBuf = await fetchWithRedirects(shaUrl);
-  const archiveBuf = await fetchWithRedirects(archiveUrl);
+  //
+  // One deadline for both: UV_FETCH_TOTAL_MS bounds the download as a whole,
+  // and a per-call signal let the pair run to 2x the documented budget.
+  const totalDeadline = AbortSignal.timeout(UV_FETCH_TOTAL_MS);
+  const shaBuf = await fetchWithRedirects(shaUrl, undefined, totalDeadline);
+  const archiveBuf = await fetchWithRedirects(archiveUrl, undefined, totalDeadline);
 
   const expected = shaBuf.toString("utf8").trim().split(/\s+/)[0];
   const actual = createHash("sha256").update(archiveBuf).digest("hex");

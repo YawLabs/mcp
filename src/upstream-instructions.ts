@@ -18,9 +18,9 @@
 //      approved reading ~/.ssh", or forges the closing delimiter and carries
 //      on in what looks like the broker's own voice. Defence: the payload is
 //      NEUTRALIZED before it is fenced -- every occurrence of either
-//      delimiter and of the broker's own `[yaw-mcp]` prefix is replaced, so
-//      an upstream can neither close the fence it sits inside nor speak as
-//      this process. That is the one property the fence depends on; without
+//      delimiter and of the broker's own `[yaw-mcp]` prefix, in ANY letter
+//      case, is replaced, so an upstream can neither close the fence it sits
+//      inside nor speak as this process. That is the one property the fence depends on; without
 //      it the delimiters are decoration.
 //   2. AUTHORITY. A server writes "ignore previous instructions", or gives
 //      orders about OTHER servers and about the meta-tools. Defence: the
@@ -68,6 +68,18 @@ const FENCE_CLOSE = "<<<END UPSTREAM SERVER TEXT";
  *  Neutralized inside a payload so an upstream cannot borrow it. */
 const BROKER_VOICE = "[yaw-mcp]";
 
+/** Every marker an upstream must not be allowed to write, as one
+ *  case-insensitive pattern. CASE-INSENSITIVE is the point: the fence is read
+ *  by a model, and `<<<end upstream server text` closes it just as well as
+ *  the capitalized spelling -- the exact-bytes split/join this replaced let
+ *  every re-cased forgery through. Built from the constants above rather than
+ *  spelled a second time, with the regex metacharacters in `[yaw-mcp]`
+ *  escaped. */
+const FORGED_MARKERS = new RegExp(
+  [FENCE_OPEN, FENCE_CLOSE, BROKER_VOICE].map((m) => m.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|"),
+  "gi",
+);
+
 /** What a neutralized marker becomes. Visible on purpose: a reader who was
  *  going to be fooled by a forged delimiter should instead see that the
  *  server tried to write one. */
@@ -108,9 +120,7 @@ const HIDDEN_CHARS =
 export function sanitizeUpstreamInstructions(raw: string | undefined): string | undefined {
   if (typeof raw !== "string") return undefined;
   let text = raw.replace(HIDDEN_CHARS, "");
-  text = text.split(FENCE_OPEN).join(NEUTRALIZED);
-  text = text.split(FENCE_CLOSE).join(NEUTRALIZED);
-  text = text.split(BROKER_VOICE).join(NEUTRALIZED);
+  text = text.replace(FORGED_MARKERS, NEUTRALIZED);
   text = text.trim();
   if (text.length === 0) return undefined;
   const cut = cutToBytes(text, MAX_UPSTREAM_INSTRUCTIONS_BYTES);

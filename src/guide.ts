@@ -155,7 +155,13 @@ export async function loadProjectGuide(cwd: string, home?: string, env?: NodeJS.
   const guide = await readGuide(guidePath(dir), "project");
   if (!guide) return null;
   // The probe walks up from the same cwd/home, so it lands on the same
-  // `.yaw-mcp/` this guide came from. Failure to probe is treated as
+  // `.yaw-mcp/` this guide came from. That IS a second directory walk per
+  // load (findProjectConfigDir above, then the same call inside
+  // probeProjectTrust): the probe takes cwd/home/env and finds the dir
+  // itself, with no way to hand it the one already found. Tolerated because
+  // the walk is a handful of stat calls bounded by the home ceiling and this
+  // runs once per load; if probeProjectTrust ever grows a `projectDir` input,
+  // pass `dir` and drop the second walk. Failure to probe is treated as
   // not-approved: the flag is advisory, and the quiet answer is the wrong
   // default for a visibility signal.
   //
@@ -250,7 +256,9 @@ function renderActiveServersSection(
   for (const s of activeServers) {
     const shadow = formatShadowLine(s);
     if (shadow === null) continue;
-    rows.push(`- \`${s.namespace}\` (${s.name}) — ${shadow}`);
+    // ASCII "--", not an em-dash: this text is served to the model, and the
+    // rest of the generated section is plain ASCII.
+    rows.push(`- \`${s.namespace}\` (${s.name}) -- ${shadow}`);
   }
   if (rows.length === 0) return null;
   return [

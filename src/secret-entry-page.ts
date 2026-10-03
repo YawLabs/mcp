@@ -24,8 +24,12 @@
 //   * The Host header must be exactly 127.0.0.1:<port>. A DNS-rebinding page
 //     (evil.example resolving to 127.0.0.1) sends its own name as Host and is
 //     refused before the path is even looked at.
-//   * An Origin header, when the browser sends one, must be this page's own
-//     origin -- a cross-origin form POST is refused. Referrer-Policy is
+//   * An Origin header, WHEN PRESENT, must be this page's own origin, so a
+//     cross-origin form POST from a browser (which always sends one) is
+//     refused. The check runs only when the header is there: a POST with no
+//     Origin at all (curl, a non-browser client) passes it, and what keeps
+//     that safe is the token in the path -- the token is the credential,
+//     and nothing off this machine can learn it. Referrer-Policy is
 //     same-origin rather than no-referrer on purpose: no-referrer makes a
 //     browser send `Origin: null` on the page's OWN form POST, and that would
 //     be refused.

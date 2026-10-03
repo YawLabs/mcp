@@ -10,7 +10,7 @@
 // is what writes, and the closing line says so, because a search that quietly
 // installed would be a surprise in the wrong direction.
 
-import { type CatalogServer, defaultFetchCatalog, type FetchCatalog, normalizeCatalogUrl } from "./catalog.js";
+import { type CatalogServer, type FetchCatalog, normalizeCatalogUrl, withWarnSink } from "./catalog.js";
 import { type CatalogMatch, matchCatalog, suggestCatalogSlugs } from "./catalog-search.js";
 import { createStreamWriter } from "./logger.js";
 
@@ -217,7 +217,9 @@ export async function runSearch(opts: SearchCommandOptions): Promise<SearchComma
   // Same precedence and the same set-but-empty handling as `add`: the fetcher
   // normalizes an empty override back to the default rather than fetching "".
   const catalogUrl = normalizeCatalogUrl(opts.catalogUrl ?? env.YAW_MCP_CATALOG_URL);
-  const fetchCatalog = opts.fetchCatalog ?? defaultFetchCatalog;
+  // The default fetcher's staleness note goes to THIS command's stderr writer
+  // (withWarnSink), not the process's.
+  const fetchCatalog = opts.fetchCatalog ?? withWarnSink(printErr);
 
   let servers: CatalogServer[];
   try {

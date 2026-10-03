@@ -1411,3 +1411,65 @@ describe("a golden v1 vault, written once under the historical derivation", () =
     await expect(unlock(loaded, "not-the-golden-passphrase")).rejects.toThrow(/wrong passphrase/i);
   });
 });
+
+describe("resolveSecretRefs keeps an env key literally named __proto__", () => {
+  it("passes it through as an own property, with or without a reference in its value", async () => {
+    // Keys come out of a parsed bundles.json, where "__proto__" is an own
+    // property; `resolved[k] = v` would route it through Object.prototype's
+    // setter and drop it from the child's env.
+    const vault0 = newVault();
+    const key = await unlock(vault0, "proto-passphrase");
+    const vault = setSecret(vault0, key, "tok", "sekret");
+    const env = JSON.parse('{"__proto__": "plain", "OTHER": "x"}') as Record<string, string>;
+    const plain = resolveSecretRefs(env, vault, key);
+    expect(Object.hasOwn(plain.resolved, "__proto__")).toBe(true);
+    expect(Object.getOwnPropertyDescriptor(plain.resolved, "__proto__")?.value).toBe("plain");
+    expect(Object.getPrototypeOf(plain.resolved)).toBe(Object.prototype);
+
+    const withRef = resolveSecretRefs(JSON.parse('{"__proto__": "v=${secret:tok}"}'), vault, key);
+    expect(Object.getOwnPropertyDescriptor(withRef.resolved, "__proto__")?.value).toBe("v=sekret");
+    expect(withRef.missing).toEqual([]);
+  });
+});
+
+describe("KDF parameters: the CPU axis has a bound and a diagnostic", () => {
+  it("loadVault names the field a bad kdf broke: p=17 is refused as p, not as a generic corrupt vault", async () => {
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    const path = vaultPath(synthHome);
+    const slow = { version: 2, salt: generateSalt().toString("base64"), kdf: { N: 1 << 15, r: 8, p: 17 }, entries: {} };
+    writeFileSync(path, `${JSON.stringify(slow)}\n`);
+    await expect(loadVault(path)).rejects.toThrow(/invalid kdf parameters \(p=17 must be between 1 and 16\)/);
+    // ...and p=16, the ceiling, still loads.
+    writeFileSync(path, `${JSON.stringify({ ...slow, kdf: { ...slow.kdf, p: 16 } })}\n`);
+    expect((await loadVault(path))?.kdf).toEqual({ N: 1 << 15, r: 8, p: 16 });
+  });
+
+  it("unlock logs the parameters at debug when they exceed the default, and stays silent otherwise", async () => {
+    const priorLevel = process.env.LOG_LEVEL;
+    process.env.LOG_LEVEL = "debug";
+    const lines: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation(((chunk: unknown): boolean => {
+      lines.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write);
+    try {
+      // p=2 at the default N and r: twice the CPU, same memory -- legal, and
+      // exactly the shape the memory bound never notices.
+      const slow: VaultFile = { ...newVault(), kdf: { N: 1 << 15, r: 8, p: 2 } };
+      await unlock(slow, "slow-vault-passphrase");
+      const debug = lines.filter((l) => l.includes("Vault KDF parameters exceed"));
+      expect(debug).toHaveLength(1);
+      expect(JSON.parse(debug[0])).toMatchObject({ level: "debug", N: 1 << 15, r: 8, p: 2, defaultP: 1 });
+
+      lock();
+      lines.length = 0;
+      await unlock(newVault(), "default-vault-passphrase");
+      expect(lines.filter((l) => l.includes("Vault KDF parameters exceed"))).toEqual([]);
+    } finally {
+      spy.mockRestore();
+      if (priorLevel === undefined) delete process.env.LOG_LEVEL;
+      else process.env.LOG_LEVEL = priorLevel;
+    }
+  });
+});

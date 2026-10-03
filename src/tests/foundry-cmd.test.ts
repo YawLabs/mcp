@@ -315,4 +315,34 @@ describe("defaultLoadServers", () => {
     expect(servers).toHaveLength(1);
     expect(servers[0].tools).toEqual([]);
   });
+
+  it("names the missing bundles.json in the empty-corpus diagnostic instead of saying 0 servers", async () => {
+    // With no catalog at all, "(0 servers)" told a maintainer their catalog
+    // was empty when the truth was that nothing was found at any consulted
+    // path. The production loader knows which, so the diagnostic says so.
+    rmSync(localBundlesPath(userConfigDir(home)));
+    const dir = mkdtempSync(join(tmpdir(), "yaw-foundry-nocat-"));
+    const errs: string[] = [];
+    try {
+      const r = await runFoundryExport({
+        out: join(dir, "c.json"),
+        cap: 500,
+        json: false,
+        home,
+        cwd,
+        readTraces: () => JSON.stringify({ tokens: ["a"], chosen: "github" }),
+        write: () => {},
+        writeErr: (s) => {
+          errs.push(s);
+        },
+      });
+      expect(r.exitCode).toBe(1);
+      const msg = errs.join("");
+      expect(msg).toContain("no bundles.json found -- looked for ");
+      expect(msg).toContain(localBundlesPath(userConfigDir(home)));
+      expect(msg).not.toContain("(0 servers)");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

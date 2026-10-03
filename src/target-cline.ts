@@ -15,7 +15,7 @@
 // says "json" rather than "jsonc" for exactly that reason, and the strict
 // adapter is what refuses a write into a file Cline could not read.
 
-import { join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { defineTarget, type PathBase, type SiteSpec } from "./install-target-model.js";
 
 /** The Cline VS Code extension's publisher.extension id, which names its
@@ -72,7 +72,11 @@ function editorRoot(base: PathBase, dirName: string): { dir: string; display: st
  *  Cline's own precedence. Values arrive verbatim from `readClientEnv` (empty
  *  already counts as unset); a surrounding-whitespace-only value is treated as
  *  unset here because a path made of spaces is not one the user can have
- *  meant.
+ *  meant. A RELATIVE value is resolved against the process cwd, the rule the
+ *  Codex, Continue and typed rows apply to theirs (Cline itself hands each
+ *  value to `path.resolve`, which does the same): used verbatim, a relative
+ *  path made every consumer's `absolute` relative too, so install, doctor and
+ *  heal each stat-ed it against their OWN cwd and could name three files.
  *
  *  Cline's own `$HOME`-before-`%USERPROFILE%` rule is deliberately NOT
  *  mirrored on Windows: yaw-mcp resolves every client path from one `home`
@@ -83,19 +87,23 @@ function sharedSettingsFile(base: PathBase): { absolute: string; display: string
     const t = v?.trim();
     return t && t.length > 0 ? t : undefined;
   };
+  const absolutized = (v: string): string => (isAbsolute(v) ? v : resolve(v));
   // An env-directed path is shown VERBATIM, the `CLAUDE_CONFIG_DIR`
   // precedent: a `~` spelling would hide the redirect that put the file
   // somewhere else.
   const exact = trimmed(base.env.clineMcpSettingsPath);
-  if (exact) return { absolute: exact, display: exact };
+  if (exact) {
+    const absolute = absolutized(exact);
+    return { absolute, display: absolute };
+  }
   const dataDir = trimmed(base.env.clineDataDir);
   if (dataDir) {
-    const absolute = join(dataDir, "settings", SETTINGS_FILE);
+    const absolute = join(absolutized(dataDir), "settings", SETTINGS_FILE);
     return { absolute, display: absolute };
   }
   const clineDir = trimmed(base.env.clineDir);
   if (clineDir) {
-    const absolute = join(clineDir, "data", "settings", SETTINGS_FILE);
+    const absolute = join(absolutized(clineDir), "data", "settings", SETTINGS_FILE);
     return { absolute, display: absolute };
   }
   return {

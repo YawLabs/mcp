@@ -1,5 +1,5 @@
-// Local server-definitions file -- the source of truth for which MCP
-// servers yaw-mcp loads when running in "no account" Free mode.
+// Local server-definitions file -- the source of truth for the local server
+// set: which MCP servers yaw-mcp loads.
 //
 // File path: ~/.yaw-mcp/bundles.json (user-global) or
 //            <project>/.yaw-mcp/bundles.json (project-local override).
@@ -90,12 +90,26 @@ export function localBundlesPath(configDir: string): string {
   return join(configDir, BUNDLES_FILENAME);
 }
 
-/** Canonical regex for valid MCP server namespaces. validateEntry below is
- *  the only production consumer left -- the remote-config fetcher (config.ts)
- *  that used to share it was deleted with the hosted backend. Still exported
- *  so the test suite (and any future validator) pins the SAME definition
- *  instead of maintaining an independent copy that drifts from the loader's. */
+/** Canonical regex for valid MCP server namespaces. Two production consumers:
+ *  validateEntry below, and config-loader.ts's allow/deny-list validation
+ *  (every profile entry must be a namespace this loader could have produced).
+ *  Exported so both -- and the test suite -- pin the SAME definition instead of
+ *  maintaining an independent copy that drifts from the loader's. */
 export const NAMESPACE_RE = /^[a-z][a-z0-9_]{0,29}$/;
+
+/** The target shape `remove` and `set` accept when no stored entry answers to
+ *  the literal text: a catalog slug (dashes) or a namespace (underscores).
+ *
+ *  Deliberately NOT case-insensitive. Every lookup downstream is exact and
+ *  case-sensitive (namespacesForStoredIdentity compares `slug === target`,
+ *  removeUserBundle filters on the exact namespace) and both stored forms are
+ *  lowercase by construction (CATALOG_SLUG_RE is lowercase-only; deriveNamespace
+ *  lowercases). An /i here accepted `remove GA`, matched nothing, and exited 0
+ *  with "nothing to do" -- while `add GA` is rejected at the gate. ONE
+ *  definition, shared by both verbs, because they document themselves as taking
+ *  the same target and two byte-identical private copies only agreed by
+ *  accident. */
+export const STORED_TARGET_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 
 /** RFC 7230 header-name token charset. Validated at LOAD rather than left to
  *  the transport, because a bad name reaching `new Headers()` throws a
@@ -279,7 +293,15 @@ function validateEntry(entry: unknown, warnings: string[]): UpstreamServerConfig
       // can find the offending line in their own file. No warning in this block
       // ever quotes a VALUE -- see the credential note above.
       for (const [rawName, value] of Object.entries(e.headers as Record<string, unknown>)) {
-        if (typeof value !== "string" || value.trim() === "") {
+        // Two warnings, not one: a number or a null is a shape problem (the
+        // same one env's non-string values report above), while a blank is a
+        // value problem, and telling someone their `42` is "empty" sends them
+        // looking for a blank that is not there.
+        if (typeof value !== "string") {
+          warnings.push(`bundles.json: ignoring header "${rawName}" on "${namespace}" (expected a string value)`);
+          continue;
+        }
+        if (value.trim() === "") {
           warnings.push(`bundles.json: ignoring header "${rawName}" on "${namespace}" (empty value)`);
           continue;
         }
@@ -1001,13 +1023,14 @@ export async function loadLocalBundles(
   };
 }
 
-// --- Write path (used by `yaw-mcp add` / `remove`) --------------------------
+// --- Write path (used by `yaw-mcp add` / `remove` / `set`) ------------------
 //
-// These mutate the USER-GLOBAL ~/.yaw-mcp/bundles.json. They are the only
-// writers of local server definitions in the CLI. A project-local
-// <cwd>/.yaw-mcp/bundles.json FULLY overrides user-global on load (see
-// loadLocalBundles), so the add/remove commands warn separately when a
-// project file would shadow the write -- they don't silently target it.
+// These mutate the USER-GLOBAL ~/.yaw-mcp/bundles.json. Together with `set`
+// (local-set-cmd.ts, which splices one entry through editJsoncPath instead of
+// rewriting the file) they are the only writers of local server definitions
+// in the CLI. A project-local <cwd>/.yaw-mcp/bundles.json FULLY overrides
+// user-global on load (see loadLocalBundles), so the commands warn separately
+// when a project file would shadow the write -- they don't silently target it.
 //
 // LOSSY REWRITE: add/remove serialize the file back out via JSON.stringify
 // (readRawUserBundles -> {version, servers, defaultRuntime?} -> atomicWriteFile).
@@ -1025,9 +1048,10 @@ export async function loadLocalBundles(
 // second write erases the first's entry (and any stored --env value on it).
 // atomicWriteFile only ever prevented TORN files, never lost updates.
 //
-//   1. In-process promise chain (bundleWriteChain): concurrent upsert/remove
-//      calls inside ONE process run one at a time. Same pattern as saveState
-//      in persistence.ts.
+//   1. In-process promise chain (bundleWriteChain, entered through
+//      serializeBundleWrite): concurrent upsert/remove/set calls inside ONE
+//      process run one at a time. Same pattern as saveState in
+//      persistence.ts.
 //
 //   2. Cross-process lockfile (withBundlesLock): two yaw-mcp PROCESSES -- two
 //      terminals running `yaw-mcp add`, or the CLI racing the Yaw Terminal
@@ -1035,6 +1059,11 @@ export async function loadLocalBundles(
 //      (BUNDLES_LOCK_NAME, next to bundles.json) across the whole
 //      read-modify-write, so neither can read a snapshot the other is about
 //      to replace.
+//
+// EVERY writer takes BOTH. `set` lives in another module, so it reaches the
+// chain through serializeBundleWrite rather than by touching the variable; a
+// writer that took only the lock would still serialize against other
+// processes but could interleave with an in-process upsert on the same tick.
 //
 // GUARANTEED: two writers that both take the lock never lose each other's
 // update. NOT guaranteed: a writer that does not take it (an app build that
@@ -1049,6 +1078,20 @@ export async function loadLocalBundles(
 // the first take: this lock opts into acquireUpgradeLock's pid probe, which
 // is correct here because the critical section is in-process.)
 let bundleWriteChain: Promise<void> = Promise.resolve();
+
+/** Run `fn` as the next link of the in-process write chain (serializer 1
+ *  above). The ONE way onto the chain: upsert, remove and `set` all enter
+ *  through here so no writer can skip it. A rejected `fn` still advances the
+ *  chain -- the failure is the caller's to report, and must never wedge every
+ *  later write behind it. */
+export function serializeBundleWrite<T>(fn: () => Promise<T>): Promise<T> {
+  const result = bundleWriteChain.then(fn);
+  bundleWriteChain = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
+}
 
 /** Sidecar the cross-process write lock is taken on, inside the user config
  *  dir next to bundles.json. Exported by NAME so the other writer of that
@@ -1099,24 +1142,10 @@ export async function withBundlesLock<T>(home: string, fn: () => Promise<T>): Pr
   }
 }
 
-/**
- * Derive a namespace from a server's DISPLAY NAME. This MUST stay
- * byte-for-byte identical to the Yaw Terminal app's deriveNamespace
- * (yaw-install-handler.ts) -- both write to the same ~/.yaw-mcp/bundles.json,
- * so a divergent algorithm would make the same catalog server land under two
- * different namespaces (CLI-added vs app/badge-added), duplicating tool
- * prefixes and breaking cross-path dedup + the app's "installed" check.
- *
- * Algorithm (identical to the app): lowercase, strip ALL non-alphanumerics,
- * 's'-prefix a leading non-letter (so "1Password" -> "s1password"), cap at 30,
- * fall back to "server" when nothing survives. Always returns a NAMESPACE_RE-
- * valid string (never null), so callers don't need a failure branch.
- */
-// Re-exported, not redefined. The predicate lives in types.ts alongside the
-// UpstreamServerConfig it describes, so meta-tools can read it without
-// importing this module's fs/lock/auto-upgrade dependency chain -- and so the
-// CLI surfaces that import it from here cannot drift from the one the
-// secrets report uses.
+// The predicate lives in types.ts alongside the UpstreamServerConfig it
+// describes, so meta-tools can read it without importing this module's
+// fs/lock/auto-upgrade dependency chain; re-exported so the CLI surfaces that
+// take it from here share the one definition the secrets report uses.
 export { isRemoteEntry } from "./types.js";
 
 /**
@@ -1157,6 +1186,19 @@ export function namespacesForStoredIdentity(target: string, servers: readonly un
   return [...bySlug, ...byName];
 }
 
+/**
+ * Derive a namespace from a server's DISPLAY NAME. This MUST stay
+ * byte-for-byte identical to the Yaw Terminal app's deriveNamespace
+ * (yaw-install-handler.ts) -- both write to the same ~/.yaw-mcp/bundles.json,
+ * so a divergent algorithm would make the same catalog server land under two
+ * different namespaces (CLI-added vs app/badge-added), duplicating tool
+ * prefixes and breaking cross-path dedup + the app's "installed" check.
+ *
+ * Algorithm (identical to the app): lowercase, strip ALL non-alphanumerics,
+ * 's'-prefix a leading non-letter (so "1Password" -> "s1password"), cap at 30,
+ * fall back to "server" when nothing survives. Always returns a NAMESPACE_RE-
+ * valid string (never null), so callers don't need a failure branch.
+ */
 export function deriveNamespace(name: string): string {
   let ns = name.toLowerCase().replace(/[^a-z0-9]+/g, "");
   if (ns.length === 0) return "server";
@@ -1388,13 +1430,22 @@ function sameLaunch(a: LaunchShape, b: LaunchShape): boolean {
   return a.command === b.command && a.url === b.url && JSON.stringify(a.args ?? []) === JSON.stringify(b.args ?? []);
 }
 
-/** A namespace collision between two different catalog slugs, as data. The
- *  stored half comes straight out of bundles.json (a hand-editable file), so
- *  a terminal caller renders it through its control-byte neutering -- see
+/** Where an incoming entry's `slug` came from. A catalog add stamps the slug
+ *  it resolved; a `--command` / `--url` add stamps the NAME the user typed as
+ *  its slug (so `remove <name>` finds it). The two read differently in a
+ *  refusal -- "catalog server" is a false claim about the second -- and the
+ *  slug alone cannot tell them apart, so the writer says which it is. */
+export type UpsertOrigin = "catalog" | "custom";
+
+/** A namespace collision between two different slugs, as data. The stored
+ *  half comes straight out of bundles.json (a hand-editable file), so a
+ *  terminal caller renders it through its control-byte neutering -- see
  *  formatBundleCollision's `safe` parameter. */
 export interface BundleCollision {
-  /** The catalog slug being added. */
+  /** The slug being added: a catalog slug, or a custom add's name. */
   slug: string;
+  /** Whether `slug` was catalog-resolved or typed by the user (UpsertOrigin). */
+  origin: UpsertOrigin;
   /** The namespace both servers derive. */
   namespace: string;
   /** The stored entry's display name, or its slug when it has no name. */
@@ -1406,10 +1457,14 @@ export interface BundleCollision {
 /** The one spelling of the collision refusal. `safe` is applied to every
  *  interpolated value so a caller printing to a terminal can neuter control
  *  bytes without re-spelling the sentence; the default is verbatim, for the
- *  Error message and for callers that are not terminals. */
+ *  Error message and for callers that are not terminals. "catalog server"
+ *  only when the incoming slug WAS catalog-resolved: for a `--command` /
+ *  `--url` add the slug is the name the user just typed, and nothing about it
+ *  came from the catalog. */
 export function formatBundleCollision(c: BundleCollision, safe: (s: string) => string = (s) => s): string {
+  const what = c.origin === "catalog" ? "catalog server" : "server";
   return (
-    `can't add catalog server "${safe(c.slug)}": namespace "${safe(c.namespace)}" is already used by ` +
+    `can't add ${what} "${safe(c.slug)}": namespace "${safe(c.namespace)}" is already used by ` +
     `"${safe(c.storedLabel)}" (added as "${safe(c.storedSlug)}"). Remove it first with \`yaw-mcp remove ${safe(c.storedSlug)}\`.`
   );
 }
@@ -1475,13 +1530,24 @@ export interface RemoveUserBundleResult {
  * drifted" and "different server with the same display name" are
  * indistinguishable without the slug, and refusing would break the
  * deliberate re-add-to-refresh flow. So it MERGES (gaining the slug
- * stamp) -- but the merge reports a launchChanged note whenever the launch
- * shape it replaced differs (command/args, or the url of a hand-added remote
- * entry -- see launchShapeOf), so a swap is never silent; there is also no
- * stored slug to orphan, so `remove <namespace>` keeps working either way.
+ * stamp); there is no stored slug to orphan, so `remove <namespace>` keeps
+ * working either way.
+ *
+ * EVERY merge that replaces the launch shape reports a launchChanged note
+ * (command/args, or the url of a hand-added remote entry -- see
+ * launchShapeOf), whatever the slugs say. A same-slug re-add is usually a
+ * deliberate refresh, but the slug is not proof of it: a `--command` /
+ * `--url` add stamps the NAME it was given as its slug, so `add fetch
+ * --command ...` over the catalog's "fetch" matches slug-for-slug and
+ * replaces the launch wholesale. Gating the note on slug-lessness made that
+ * swap silent -- the exact class of swap the note exists to make loud.
  *
  * An existing entry is otherwise UPDATED, not overwritten: see
  * mergeServerEntry for exactly what survives. Atomic write.
+ *
+ * `opts.origin` says whether the incoming slug was catalog-resolved or typed
+ * by the user (UpsertOrigin); it only changes the wording of a collision
+ * refusal. Defaults to "catalog", which every pre-existing caller is.
  *
  * Returns the path written, whether an existing entry was updated (vs a
  * fresh add), the entry AS WRITTEN -- callers that report what landed on
@@ -1494,14 +1560,15 @@ export interface RemoveUserBundleResult {
  */
 export function upsertUserBundle(
   entry: Partial<UpstreamServerConfig>,
-  opts: { home?: string } = {},
+  opts: UpsertOptions = {},
 ): Promise<UpsertUserBundleResult> {
-  const result = bundleWriteChain.then(() => doUpsertUserBundle(entry, opts));
-  bundleWriteChain = result.then(
-    () => undefined,
-    () => undefined,
-  );
-  return result;
+  return serializeBundleWrite(() => doUpsertUserBundle(entry, opts));
+}
+
+export interface UpsertOptions {
+  home?: string;
+  /** See upsertUserBundle. */
+  origin?: UpsertOrigin;
 }
 
 /** How doUpsertUserBundle will treat `entry` against the given on-disk
@@ -1511,6 +1578,7 @@ export function upsertUserBundle(
 function resolveUpsertTarget(
   servers: Array<Partial<UpstreamServerConfig> | undefined>,
   entry: Partial<UpstreamServerConfig>,
+  origin: UpsertOrigin,
 ): {
   idx: number;
   matchedByNamespace: boolean;
@@ -1537,20 +1605,23 @@ function resolveUpsertTarget(
       matchedByNamespace,
       refusal: {
         slug: incoming.slug,
+        origin,
         namespace: typeof stored.namespace === "string" ? stored.namespace : (entry.namespace ?? ""),
         storedLabel: typeof stored.name === "string" ? stored.name : stored.slug,
         storedSlug: stored.slug,
       },
     };
   }
-  // Slug-less stored entry: merges on either match path, but a launch swap
-  // must be LOUD -- see the upsertUserBundle doc for why this cannot refuse.
-  // The name-fallback path needs it MORE than the namespace path: a
-  // name-only match is the weaker identity signal. Compared as launch SHAPES
-  // (launchShapeOf), so a stored url-only remote entry -- the documented way
-  // to hand-add a remote server -- counts as a change too: joining only
-  // command/args rendered it as "" and a "nothing stored" guard then
-  // swallowed the note, while the merge carried the stale url along.
+  // Past the refusal, the merge goes ahead on either match path -- but a
+  // launch swap must be LOUD, whatever the slugs say (see the upsertUserBundle
+  // doc: a same-slug match is not proof of a deliberate refresh, because a
+  // custom add stamps its name as its slug). The name-fallback path needs it
+  // MORE than the namespace path: a name-only match is the weaker identity
+  // signal. Compared as launch SHAPES (launchShapeOf), so a stored url-only
+  // remote entry -- the documented way to hand-add a remote server -- counts
+  // as a change too: joining only command/args rendered it as "" and a
+  // "nothing stored" guard then swallowed the note, while the merge carried
+  // the stale url along.
   //
   // The gate asks whether the incoming entry has a launch at all, not whether
   // it is a stdio one. Keying on `incoming.command` meant the note fired for
@@ -1561,7 +1632,7 @@ function resolveUpsertTarget(
   // became reachable when `add --url` shipped.
   let launchChanged: LaunchChange | undefined;
   const incomingHasLaunch = typeof incoming.command === "string" || typeof incoming.url === "string";
-  if (typeof stored.slug !== "string" && incomingHasLaunch) {
+  if (incomingHasLaunch) {
     const from = launchShapeOf(stored);
     const to = launchShapeOf(incoming);
     if (!sameLaunch(from, to)) launchChanged = { from, to };
@@ -1610,7 +1681,7 @@ function mergedUpsertEntry(
  *  could-not-be-parsed error the real run throws for an unreadable file. */
 export async function previewUpsertUserBundle(
   entry: Partial<UpstreamServerConfig>,
-  opts: { home?: string } = {},
+  opts: UpsertOptions = {},
 ): Promise<{
   replaced: boolean;
   refusal: BundleCollision | null;
@@ -1619,14 +1690,14 @@ export async function previewUpsertUserBundle(
   launchChanged?: LaunchChange;
   /** The launch shape of the STORED entry this write would fold onto, when
    *  there is one. Reported alongside `launchChanged` rather than folded into
-   *  it because the two answer different questions: `launchChanged` fires only
-   *  for a SLUG-LESS stored entry (a slug-carrying one either refuses on a
-   *  different slug, or is a deliberate same-slug re-add), while a merge onto a
-   *  slug-carrying entry still replaces command/args wholesale. A caller that
-   *  has to show the user what a write would overwrite -- `import`, whose
-   *  entries never carry a slug and so can never trip the refusal -- needs the
-   *  BEFORE on both paths. Empty ({}) when the stored entry has neither a
-   *  command nor a url; absent when nothing is being replaced. */
+   *  it because the two answer different questions: `launchChanged` is the
+   *  DIFFERENCE (absent when the launch is unchanged, or when the incoming
+   *  entry carries no launch at all), while this is the BEFORE whether or not
+   *  it changes. A caller that has to show the user what a write would fold
+   *  onto -- `import`, whose entries never carry a slug and so can never trip
+   *  the refusal -- needs the before unconditionally. Empty ({}) when the
+   *  stored entry has neither a command nor a url; absent when nothing is
+   *  being replaced. */
   replacing?: LaunchShape;
   /** Same read diagnostics the real run would surface (see readRawUserBundles). */
   warnings: string[];
@@ -1634,7 +1705,7 @@ export async function previewUpsertUserBundle(
   const home = opts.home ?? homedir();
   const warnings: string[] = [];
   const file = await readRawUserBundles(home, warnings);
-  const target = resolveUpsertTarget(file.servers, entry);
+  const target = resolveUpsertTarget(file.servers, entry, opts.origin ?? "catalog");
   return {
     replaced: target.idx >= 0,
     refusal: target.refusal,
@@ -1648,7 +1719,7 @@ export async function previewUpsertUserBundle(
 
 async function doUpsertUserBundle(
   entry: Partial<UpstreamServerConfig>,
-  opts: { home?: string },
+  opts: UpsertOptions,
 ): Promise<UpsertUserBundleResult> {
   const home = opts.home ?? homedir();
   const path = localBundlesPath(userConfigDir(home));
@@ -1657,7 +1728,7 @@ async function doUpsertUserBundle(
   return withBundlesLock(home, async () => {
     const warnings: string[] = [];
     const file = await readRawUserBundles(home, warnings);
-    const target = resolveUpsertTarget(file.servers, entry);
+    const target = resolveUpsertTarget(file.servers, entry, opts.origin ?? "catalog");
     if (target.refusal) throw new BundleCollisionError(target.refusal, warnings);
     const idx = target.idx;
     const replaced = idx >= 0;
@@ -1707,12 +1778,7 @@ async function doUpsertUserBundle(
  * process) so concurrent calls don't lose writes.
  */
 export function removeUserBundle(namespace: string, opts: { home?: string } = {}): Promise<RemoveUserBundleResult> {
-  const result = bundleWriteChain.then(() => doRemoveUserBundle(namespace, opts));
-  bundleWriteChain = result.then(
-    () => undefined,
-    () => undefined,
-  );
-  return result;
+  return serializeBundleWrite(() => doRemoveUserBundle(namespace, opts));
 }
 
 async function doRemoveUserBundle(namespace: string, opts: { home?: string }): Promise<RemoveUserBundleResult> {

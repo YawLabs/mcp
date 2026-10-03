@@ -183,6 +183,36 @@ describe("runHeal -- the outcomes that were already right keep their output and 
     expect(io.stderr()).toBe("");
   });
 
+  it("--dry-run --json is told apart from a live --json by `dryRun`, with the same `healed` and `count`", async () => {
+    // The sweep's `healed` under a dry run is the entries it WOULD re-point,
+    // and `count` is its length either way; `dryRun: true` is what says
+    // nothing was written. A reader that keys on `count` alone reads a plan
+    // as a repair, which is why the field is part of the shape.
+    const io = captureStreams();
+    const { exitCode } = await runHeal({ json: true, dryRun: true }, sweepOf({ healed: [HEALED] }));
+    expect(exitCode).toBe(0);
+    expect(JSON.parse(io.stdout())).toEqual({ healed: [HEALED], unhealable: [], failed: [], count: 1, dryRun: true });
+  });
+
+  it("prints a healed entry's project-local note under it, in the transcript only", async () => {
+    const noted: HealedEntry = {
+      ...HEALED,
+      to: "/repo/node_modules/@yawlabs/mcp/dist/index.js",
+      note: "that path is a project-local install.",
+    };
+    let io = captureStreams();
+    expect((await runHeal({}, sweepOf({ healed: [noted] }))).exitCode).toBe(0);
+    expect(io.stdout()).toBe(
+      `Re-pointed 1 stale entry:\n  claude-code (user): ${CLAUDE}\n    was -> ${GONE}\n    now -> ${noted.to}\n` +
+        "    Note: that path is a project-local install.\n\nRestart the affected client(s) to pick this up.\n",
+    );
+    vi.restoreAllMocks();
+    // Under --json the note is a field of the entry, not a line of its own.
+    io = captureStreams();
+    await runHeal({ json: true }, sweepOf({ healed: [noted] }));
+    expect((JSON.parse(io.stdout()) as HealResult).healed[0].note).toBe("that path is a project-local install.");
+  });
+
   it("a failed repair beside a config it could not check: the list opens stdout with no blank line above it", async () => {
     const io = captureStreams();
     const { exitCode } = await runHeal({}, sweepOf({ unhealable: [UNHEALABLE], failed: [FAILED] }));

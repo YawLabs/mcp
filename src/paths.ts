@@ -184,10 +184,21 @@ export const ALLOW_UNOWNED_ENV = "YAW_MCP_ALLOW_UNOWNED_PROJECT_DIRS";
 // refresh. The warning is advice about a static condition, so the first
 // occurrence carries all of its information; the rest are noise that buries
 // real diagnostics. Keyed on the candidate path, so a DIFFERENT untrusted dir
-// still warns. Unbounded by design: the set can only grow with the number of
-// distinct directories walked in one process, which is bounded by the depth of
-// the trees the session actually visits.
+// still warns. Process-global, so it is CAPPED: a long-lived broker that walks
+// from many cwds (one per MCP client call) would otherwise grow it without
+// bound. At the cap the OLDEST entry is dropped (a Set iterates in insertion
+// order), so a dir seen 257 distinct dirs ago warns again -- a repeat warning
+// is the cheaper failure than a leak.
+const WARNED_UNTRUSTED_DIRS_CAP = 256;
 const warnedUntrustedDirs = new Set<string>();
+
+function rememberWarnedUntrustedDir(candidate: string): void {
+  if (warnedUntrustedDirs.size >= WARNED_UNTRUSTED_DIRS_CAP) {
+    const oldest = warnedUntrustedDirs.values().next().value;
+    if (oldest !== undefined) warnedUntrustedDirs.delete(oldest);
+  }
+  warnedUntrustedDirs.add(candidate);
+}
 
 // `st` is the walk's OWN stat of the candidate -- the one that just proved it
 // is a directory. Re-statting here was a second syscall and a second TOCTOU
@@ -283,7 +294,7 @@ export async function findProjectConfigDir(
         // candidate per process (see warnedUntrustedDirs): the skip itself
         // still happens on every walk, only the log line is deduplicated.
         if (!warnedUntrustedDirs.has(candidate)) {
-          warnedUntrustedDirs.add(candidate);
+          rememberWarnedUntrustedDir(candidate);
           log("warn", "Skipping an untrusted .yaw-mcp/ dir outside $HOME", {
             candidate,
             hint: `owned by another user, or ownership is unverifiable on this platform (set ${ALLOW_UNOWNED_ENV}=1 to trust it)`,

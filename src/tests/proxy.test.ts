@@ -1259,12 +1259,12 @@ describe("routeToolCall — request options", () => {
     expect(opts.resetTimeoutOnProgress).toBeUndefined();
   });
 
-  it("warns at module load when MCP_CALL_TIMEOUT is rejected", async () => {
-    // The diagnostic has to survive where the value is actually resolved: the
-    // constant is latched in a module-level initialiser, so the only place the
-    // operator can be told their knob was ignored is that import. Captured off
-    // the REAL logger (this file does not stub it) to prove stderr at module
-    // load is a path that works, not just that resolveTimeoutEnv calls log().
+  it("warns when MCP_CALL_TIMEOUT is rejected -- at the first proxied call, not at import", async () => {
+    // Resolved lazily and memoized: a module-level read warned at IMPORT, so
+    // every CLI subcommand that happened to load proxy.ts complained about a
+    // knob only a serving broker consumes. Captured off the REAL logger (this
+    // file does not stub it) to prove the stderr path works, not just that
+    // resolveTimeoutEnv calls log().
     const writes: string[] = [];
     const original = process.stderr.write.bind(process.stderr);
     vi.stubEnv("LOG_LEVEL", "warn");
@@ -1275,17 +1275,25 @@ describe("routeToolCall — request options", () => {
       return true;
     };
     try {
-      await import("../proxy.js");
+      const fresh = await import("../proxy.js");
+      expect(writes.find((w) => w.includes("MCP_CALL_TIMEOUT"))).toBeUndefined();
+      const calls: unknown[][] = [];
+      const connections = new Map([["gh", recordingConnection(calls)]]);
+      await fresh.routeToolCall("gh_create_issue", {}, fresh.buildToolRoutes(connections), connections);
+      await fresh.routeToolCall("gh_create_issue", {}, fresh.buildToolRoutes(connections), connections);
+      // The number in effect is the default, on both calls.
+      expect(calls.map((c) => c[2])).toEqual([{ timeout: 60_000 }, { timeout: 60_000 }]);
     } finally {
       process.stderr.write = original;
       vi.unstubAllEnvs();
       vi.resetModules();
     }
-    const warn = writes.find((w) => w.includes("MCP_CALL_TIMEOUT"));
-    expect(warn).toBeDefined();
+    // Once -- memoized after the first resolve.
+    const warns = writes.filter((w) => w.includes("MCP_CALL_TIMEOUT"));
+    expect(warns).toHaveLength(1);
     // The rejected value, the ceiling, and the number actually in effect --
     // without the last one the operator cannot tell what the call is bounded by.
-    expect(JSON.parse(warn as string)).toMatchObject({
+    expect(JSON.parse(warns[0])).toMatchObject({
       level: "warn",
       value: "3e9",
       maxMs: 2_147_483_647,

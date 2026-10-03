@@ -75,6 +75,10 @@ const LEADING_ENV_WORDS = `(?:(?:env|environment)${SEP})?(?:(?:variables?|vars?)
 //
 // Pattern 5 is the "No GITHUB_TOKEN provided" shape; "no" and the verb
 // around the name are both required, so "GITHUB_TOKEN provided" is not a hit.
+//
+// Every pattern carries /g for the matchAll below, and a /g regex keeps
+// lastIndex across calls: no .test() or .exec() may ever touch these, or a
+// hit on one message makes the next scan start mid-string and miss.
 const MISSING_PATTERNS: RegExp[] = [
   new RegExp(`\\bmissing${SEP}(?:required${GAP})?${LEADING_ENV_WORDS}${QUOTE}(${NAME})\\b`, "gi"),
   new RegExp(

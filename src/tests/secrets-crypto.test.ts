@@ -6,8 +6,10 @@ import {
   deriveKey,
   encryptEntry,
   generateSalt,
+  invalidKdfParamsReason,
   isValidKdfParams,
   KEY_LEN,
+  kdfExceedsDefault,
   LEGACY_KDF,
   normalizePassphrase,
   SALT_LEN,
@@ -166,5 +168,42 @@ describe("normalizePassphrase", () => {
     const composed = await deriveKey(COMPOSED, salt);
     expect((await deriveKey(DECOMPOSED, salt)).equals(composed)).toBe(true);
     expect((await deriveKey(DECOMPOSED, salt, LEGACY_KDF, false)).equals(composed)).toBe(false);
+  });
+});
+
+describe("invalidKdfParamsReason names the field, isValidKdfParams is its verdict", () => {
+  it("says which bound broke, so loadVault's corrupt-vault error can quote it", () => {
+    expect(invalidKdfParamsReason({ N: 32768, r: 8, p: 17 })).toBe("p=17 must be between 1 and 16");
+    expect(invalidKdfParamsReason({ N: 32768, r: 8, p: 0 })).toBe("p=0 must be between 1 and 16");
+    expect(invalidKdfParamsReason({ N: 3, r: 8, p: 1 })).toMatch(/^N=3 must be a power of two/);
+    expect(invalidKdfParamsReason({ N: 2, r: 33, p: 1 })).toBe("r=33 must be between 1 and 32");
+    expect(invalidKdfParamsReason({ N: 1 << 18, r: 32, p: 1 })).toMatch(/over the \d+ bound$/);
+    expect(invalidKdfParamsReason({ N: 1 << 16, r: 1, p: 1 })).toMatch(/below 2\^\(16\*r\)/);
+    expect(invalidKdfParamsReason("nope")).toBe("not an object");
+    expect(invalidKdfParamsReason({ N: "32768", r: 8, p: 1 })).toBe("N, r and p must be numbers");
+    expect(invalidKdfParamsReason({ N: 32768, r: 8.5, p: 1 })).toBe("N, r and p must be integers");
+  });
+
+  it("agrees with isValidKdfParams on every case, both ways", () => {
+    for (const v of [DEFAULT_KDF, LEGACY_KDF, { N: 1 << 18, r: 8, p: 16 }]) {
+      expect(invalidKdfParamsReason(v), JSON.stringify(v)).toBe(null);
+      expect(isValidKdfParams(v), JSON.stringify(v)).toBe(true);
+    }
+    for (const v of [{ N: 32768, r: 8, p: 17 }, { N: 3, r: 8, p: 1 }, null]) {
+      expect(invalidKdfParamsReason(v), JSON.stringify(v)).not.toBe(null);
+      expect(isValidKdfParams(v), JSON.stringify(v)).toBe(false);
+    }
+  });
+});
+
+describe("kdfExceedsDefault", () => {
+  it("is true on any axis above DEFAULT_KDF -- p included, which the memory bound never sees", () => {
+    expect(kdfExceedsDefault(DEFAULT_KDF)).toBe(false);
+    expect(kdfExceedsDefault(LEGACY_KDF)).toBe(false);
+    expect(kdfExceedsDefault({ N: DEFAULT_KDF.N, r: DEFAULT_KDF.r, p: 2 })).toBe(true);
+    expect(kdfExceedsDefault({ N: DEFAULT_KDF.N << 1, r: DEFAULT_KDF.r, p: 1 })).toBe(true);
+    expect(kdfExceedsDefault({ N: DEFAULT_KDF.N, r: DEFAULT_KDF.r + 1, p: 1 })).toBe(true);
+    // Cheaper than the default is not "exceeds".
+    expect(kdfExceedsDefault({ N: DEFAULT_KDF.N >> 1, r: 1, p: 1 })).toBe(false);
   });
 });

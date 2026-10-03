@@ -628,9 +628,10 @@ describe("trust store grant / revoke / list round-trip", () => {
 // key as it builds `entries`; the next write persists the folded form.
 //
 // Two ways to reach another platform's fold, and the choice is not cosmetic.
-// READ-ONLY cases fake the global, held ACROSS the awaits (withPlatformAsync),
-// because trustStatusFor reads process.platform internally. Cases that WRITE
-// pass `platform` through the opts instead: a global fake also reaches
+// READ-ONLY cases fake the global, held ACROSS the awaits (withPlatformAsync):
+// readTrustStore and trustStatusFor both take `platform`, but these cases
+// also cover the default-argument path (process.platform) every production
+// caller takes. Cases that WRITE pass `platform` through the opts instead: a global fake also reaches
 // atomic-write's win32-only rename retry and writeTrustStore's POSIX chmod, so
 // a grant/revoke performed under `darwin` on the Windows runner takes the
 // POSIX write path and can flake on EPERM/EBUSY the moment a scanner touches
@@ -1428,5 +1429,53 @@ describe("a version outside the schema range is corrupt, not current", () => {
     const store = await readTrustStore(synthHome);
     expect(store.malformed).toBe(false);
     expect(store.version).toBe(TRUST_SCHEMA_VERSION);
+  });
+});
+
+describe("YAW_MCP_TRUST_PROJECT is parsed under the product rule for a boolean env var", () => {
+  it("trims, and takes `true` in any case -- a CI YAML value with a trailing space or CR still opts out", () => {
+    expect(isTrustBypassEnabled({ [TRUST_BYPASS_ENV]: " 1 " })).toBe(true);
+    expect(isTrustBypassEnabled({ [TRUST_BYPASS_ENV]: "1\r" })).toBe(true);
+    expect(isTrustBypassEnabled({ [TRUST_BYPASS_ENV]: "True" })).toBe(true);
+    expect(isTrustBypassEnabled({ [TRUST_BYPASS_ENV]: " true\n" })).toBe(true);
+  });
+
+  it("still refuses every other spelling, so =0 and =yes leave the gate ON", () => {
+    for (const v of ["0", " 0 ", "yes", "on", "truee", "1 1", " "]) {
+      expect(isTrustBypassEnabled({ [TRUST_BYPASS_ENV]: v }), JSON.stringify(v)).toBe(false);
+    }
+  });
+});
+
+describe("trustStatusFor takes the platform it folds under, like readTrustStore", () => {
+  it("classifies against a store folded for another platform without faking process.platform", async () => {
+    // Two stores, each read AND classified under one injected platform,
+    // neither touching the global. The project dir has a mixed-case segment
+    // so the two folds disagree on every host: a darwin store holds the key
+    // lowercased, a linux store holds it exactly as spelled. A lookup that
+    // fell back to process.platform for its fold would miss one of the two
+    // on any runner -- the linux store on win32/darwin hosts (lookup
+    // lowercased, key not), the darwin store on linux hosts (lookup exact,
+    // key lowercased).
+    const projectDir = join(synthCwd, "MixedCase");
+    const path = projectBundlesPath(projectDir);
+    writeBundles(projectDir, { version: 1, servers: [] });
+    const bytes = readFileSync(path);
+    expect(path).not.toBe(path.toLowerCase());
+    const record = { path, sha256: hashTrustContent(bytes), grantedAt: "2026-01-01T00:00:00.000Z" };
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+
+    // darwin: key stored upper-cased, folded to lower on read; a lookup
+    // folded for darwin matches from any casing.
+    writeFileSync(trustStorePath(synthHome), JSON.stringify({ version: 1, trusted: { [path.toUpperCase()]: record } }));
+    const darwinStore = await readTrustStore(synthHome, "darwin");
+    expect(trustStatusFor(path, bytes, darwinStore, "darwin")).toBe("trusted");
+    expect(trustStatusFor(path, Buffer.from("edited"), darwinStore, "darwin")).toBe("changed");
+
+    // linux: key stored exactly as spelled; only an exact-case lookup hits.
+    writeFileSync(trustStorePath(synthHome), JSON.stringify({ version: 1, trusted: { [path]: record } }));
+    const linuxStore = await readTrustStore(synthHome, "linux");
+    expect(trustStatusFor(path, bytes, linuxStore, "linux")).toBe("trusted");
+    expect(trustStatusFor(path.toUpperCase(), bytes, linuxStore, "linux")).toBe("untrusted");
   });
 });

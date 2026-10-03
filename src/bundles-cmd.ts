@@ -14,8 +14,9 @@
 //           entries from bundles.json (project file winning over user-global)
 //           minus anything the config.json allow/deny profile excludes -- and
 //           partitions the bundles into "ready to activate" vs "partially
-//           installed" vs "ignored" (zero overlap). Also local: no network, no
-//           token needed.
+//           installed". A bundle with zero overlap is omitted from both (and
+//           from --json), not reported as a third set -- see matchBundles in
+//           bundles.ts. Also local: no network, no token needed.
 //
 //           NOT side-effect-free, though: `match` calls loadYawMcpConfig,
 //           which runs the pre-0.12 legacy-path migration before resolving

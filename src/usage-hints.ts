@@ -103,10 +103,13 @@ export function formatUsageHint(usage: NamespaceUsage | undefined, coUsedWith: s
 }
 
 // Dormant-reliability warning rendered inline under the server card in
-// discover(). Returns null unless the persisted learning for this
-// namespace shows ≥3 dispatches AND <80% success. Caller is responsible
-// for suppressing this when the server is currently loaded (the live
-// health warning takes precedence there — see formatHealthWarning).
+// discover(). Returns null unless the persisted learning for this namespace
+// shows at least LEARNING_MIN_OBSERVATIONS dispatches AND a success rate
+// below PENALTY_RATE_THRESHOLD -- the same two constants the dispatch-time
+// penalty reads, so the warning fires exactly when the penalty does. Caller
+// is responsible for suppressing this when the server is currently loaded
+// (the live health warning takes precedence there -- see
+// formatHealthWarning).
 export function formatReliabilityWarning(usage: NamespaceUsage | undefined): string | null {
   if (!usage || usage.dispatched < LEARNING_MIN_OBSERVATIONS) return null;
   const rate = usage.succeeded / usage.dispatched;

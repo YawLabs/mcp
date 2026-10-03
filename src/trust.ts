@@ -57,9 +57,11 @@ export const TRUST_FILENAME = "trusted.json";
 export const TRUST_SCHEMA_VERSION = 1;
 
 /**
- * Escape hatch for CI / automation: when set to a truthy value the project
- * trust check is skipped entirely and a project bundles.json loads as it
- * did before this gate existed. Opting out means any repo you run yaw-mcp
+ * Escape hatch for CI / automation: when set to `1` or `true` (trimmed,
+ * case-insensitive -- see isTrustBypassEnabled; any other value, `yes` and
+ * `0` included, leaves the gate ON) the project trust check is skipped
+ * entirely and a project bundles.json loads as it did before this gate
+ * existed. Opting out means any repo you run yaw-mcp
  * inside can spawn arbitrary commands as you -- only set it where the
  * checkout is already trusted (your own CI, a container you built).
  */
@@ -203,11 +205,17 @@ export function hashTrustContent(contents: Buffer | string): string {
   return createHash("sha256").update(contents).digest("hex");
 }
 
-/** Is the CI/automation escape hatch enabled? Same truthiness convention as
- *  YAW_MCP_DISABLE_PERSISTENCE (persistence.ts:isPersistenceDisabled). */
+/** Is the CI/automation escape hatch enabled? The product rule for a boolean
+ *  env var, as config-loader.ts:isReadOnlyDiagnostics reads it: trimmed,
+ *  then exactly "1" or a case-insensitive "true". Anything else ("yes",
+ *  "on", "0", "") is OFF -- a loose truthy test would read
+ *  YAW_MCP_TRUST_PROJECT=0 as opting out of the gate. Trimmed because a
+ *  value set from a CI YAML or a `.env` line routinely carries a trailing
+ *  space or CR, and "1 " silently keeping the gate on is the kind of failure
+ *  nothing reports. */
 export function isTrustBypassEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  const raw = env[TRUST_BYPASS_ENV];
-  return raw !== undefined && raw !== "" && (raw === "1" || raw.toLowerCase() === "true");
+  const raw = env[TRUST_BYPASS_ENV]?.trim();
+  return raw === "1" || raw?.toLowerCase() === "true";
 }
 
 function emptyStore(
@@ -385,9 +393,18 @@ export type TrustStatus =
  * That property is pinned by trust.test.ts ("ignores the env escape hatch"),
  * which sets the variable before asserting it changes nothing here.
  */
-export function trustStatusFor(path: string, contents: Buffer | string, store: TrustStore): TrustStatus {
+export function trustStatusFor(
+  path: string,
+  contents: Buffer | string,
+  store: TrustStore,
+  platform: NodeJS.Platform = process.platform,
+): TrustStatus {
   if (store.malformed) return "store-unreadable";
-  const record = store.entries[normalizeTrustKey(path)];
+  // Threaded like readTrustStore's, and it has to be the SAME platform the
+  // store was folded under: a key folded for darwin and looked up under the
+  // linux rule misses, and a caller that injects one without the other is
+  // testing the wrong thing.
+  const record = store.entries[normalizeTrustKey(path, platform)];
   if (!record) return "untrusted";
   return record.sha256 === hashTrustContent(contents) ? "trusted" : "changed";
 }
@@ -617,7 +634,14 @@ export function trustedRecords(store: TrustStore): TrustRecord[] {
 }
 
 /** Every granted record, sorted by display path. Empty when the store is
- *  absent OR malformed (nothing is trusted in either case). */
+ *  absent OR malformed (nothing is trusted in either case).
+ *
+ *  @internal Kept for the test suites only. trust.test.ts and
+ *  trust-cmd.test.ts use it as the one-call "what does the store hold now"
+ *  probe in some 45 assertions; it has NO production caller, and should not
+ *  gain one: trust-cmd's --list reads the store once and renders
+ *  trustedRecords(store) from that read (see the comment there for why a
+ *  second read is wrong), and that two-step form is what new callers take. */
 export async function listTrusted(opts: { home?: string } = {}): Promise<TrustRecord[]> {
   return trustedRecords(await readTrustStore(opts.home ?? homedir()));
 }

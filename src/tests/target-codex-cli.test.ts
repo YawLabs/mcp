@@ -377,6 +377,17 @@ describe("where codex-cli's config.toml is", () => {
     expect(siteFor({ codexHome: "" }).resolved.absolute).toBe(join(HOME, ".codex", "config.toml"));
   });
 
+  it("treats a whitespace-only CODEX_HOME as unset, and trims one with padding (the Cline rule)", () => {
+    // `readClientEnv` keeps a value made of spaces (it is not empty), and
+    // `resolve(" ")` would put config.toml under a space-named directory in
+    // the process cwd -- a path no user can have meant.
+    expect(siteFor({ codexHome: " " }).resolved.absolute).toBe(join(HOME, ".codex", "config.toml"));
+    expect(siteFor({ codexHome: "\t \n" }).resolved.absolute).toBe(join(HOME, ".codex", "config.toml"));
+    expect(siteFor({ codexHome: " /elsewhere/codex " }).resolved.absolute).toBe(
+      join("/elsewhere/codex", "config.toml"),
+    );
+  });
+
   it("resolves a relative CODEX_HOME against the current directory", () => {
     // Codex canonicalizes the value against ITS cwd; from here the process
     // cwd is the only defensible reading, and it agrees when both run in the
@@ -737,7 +748,11 @@ describe("install refuses rather than corrupt a file", () => {
         [{ op: "upsert", key: ENTRY_NAME, entry: brokerEntry() }] as ClientConfigEdit[],
         [{ op: "remove", key: ENTRY_NAME }] as ClientConfigEdit[],
       ]) {
-        expect(refusalOf(() => applyClientConfigEdits(view, edits, site))).toContain("yaw-mcp will not edit it");
+        const refusal = refusalOf(() => applyClientConfigEdits(view, edits, site));
+        expect(refusal).toContain("yaw-mcp will not edit it");
+        // The by-hand step rides on the facade's refusal too, as it does on
+        // the unloadable one: `try` prints this verbatim.
+        expect(refusal).toContain(`; ${codec.fix}, then re-run`);
       }
       // The splicer itself is stricter for a rewrite than for a removal, and
       // this is where that difference is visible: an array-of-tables entry is
@@ -750,6 +765,48 @@ describe("install refuses rather than corrupt a file", () => {
       }
     });
   }
+
+  it("classifies a LEGACY entry in a refused spelling as unspliceable, so doctor warns before install writes", () => {
+    // Install trims a legacy entry with a `remove` edit in the same write
+    // that adds ours, and the splice refuses to delete an inline or dotted
+    // spelling. Read as `ok`, that file sent the user to an install that
+    // failed at the write; read as `unspliceable`, doctor prints the by-hand
+    // step and install refuses before it writes.
+    const site = siteFor();
+    for (const legacy of LEGACY_ENTRY_NAMES) {
+      const key = legacy.includes(".") ? `"${legacy}"` : legacy;
+      const raw = `[mcp_servers]\n${key} = { command = "npx" }\n`;
+      const view = classifyClientConfig(raw, site, { transform: CODEX.entry });
+      expect(view.read).toMatchObject({ kind: "unspliceable", key: legacy });
+      expect(view.read.kind === "unspliceable" ? view.read.reason : "").toMatch(/an inline table under/);
+      expect(refusalOf(() => installThrough(raw, site))).toContain(`the "${legacy}" entry`);
+    }
+    // Our own entry's problem is the one reported when both are refused.
+    const both = `[mcp_servers]\nmcp = { command = "npx" }\nyaw-mcp = { command = "npx" }\n`;
+    expect(classifyClientConfig(both, site, { transform: CODEX.entry }).read).toMatchObject({
+      kind: "unspliceable",
+      key: ENTRY_NAME,
+    });
+    // A legacy entry in a TABLE still reads ok and migrates (f08 above); a
+    // third-party sibling in an inline spelling is nobody's to rewrite and
+    // does not take the file hostage.
+    const sibling = `[mcp_servers]\nother = { command = "node" }\n\n[mcp_servers.mcp]\ncommand = "npx"\n`;
+    expect(classifyClientConfig(sibling, site, { transform: CODEX.entry }).read.kind).toBe("ok");
+  });
+
+  it("writes an entry with an empty env through the facade: the read-back check uses the adapter's own omissions", () => {
+    // The renderer writes no `[...env]` sub-table for `env: {}` (Codex's own
+    // rule), so the stored table has no `env` key. The facade used to compare
+    // the entry as handed and refuse the write it had just made correctly.
+    const site = siteFor();
+    const view = classifyClientConfig(fixture("f02-trust-only"), site, { transform: CODEX.entry });
+    const entry = { ...brokerEntry(), env: {} };
+    expect(view.adapter.entryAsWritten?.(entry)).toEqual(brokerEntry());
+    const next = applyClientConfigEdits(view, [{ op: "upsert", key: ENTRY_NAME, entry }], site);
+    expect(next).not.toContain("env");
+    const back = classifyClientConfig(next, site, { transform: CODEX.entry });
+    expect(back.entry()?.value).toEqual(brokerEntry());
+  });
 
   it("refuses to append a table to an inline mcp_servers (g09)", () => {
     // Our entry is not in the file at all, so the READ is fine -- TOML is
@@ -839,10 +896,24 @@ describe("what Codex owns on our entry", () => {
       [{ name: "TOK", source: "elsewhere" }],
       [{ name: "TOK", nope: true }],
       [["TOK"]],
-      [],
     ]) {
       expect(carry?.({ env_vars })).toEqual({});
     }
+    // An EMPTY list is carried, as the Cline row carries an empty autoApprove:
+    // Codex loads `env_vars = []`, and dropping it made every re-run report
+    // drift on the line the user had written.
+    expect(carry?.({ env_vars: [] })).toEqual({ env_vars: [] });
+  });
+
+  it("an entry with `env_vars = []` is a no-op re-run, not drift (the empty list is carried and rewritten)", () => {
+    const site = siteFor();
+    const raw = `${fixture("f01-missing", "expected")}env_vars = []\n`;
+    const result = installThrough(raw, site);
+    expect(result.view.carried()).toEqual({ env_vars: [] });
+    expect(result.entry.env_vars).toEqual([]);
+    expect(result.identical).toBe(true);
+    const back = classifyClientConfig(result.next, site, { transform: CODEX.entry });
+    expect(back.entry()?.value).toMatchObject({ env_vars: [] });
   });
 
   it("carries enabled only as a boolean, and never carries env", () => {
@@ -1454,7 +1525,7 @@ describe("install sets Codex's startup grace at the top of config.toml", () => {
     // And the run after THAT is the no-op again, in bytes too.
     const after = read();
     const again = await install();
-    expect(again.stdout).toContain("Nothing to do: Codex CLI is already configured.");
+    expect(again.stdout).toContain("Nothing to do: Codex CLI (user) is already configured.");
     expect(again.stdout).not.toContain(GRACE);
     expect(again.result.written).toEqual([]);
     expect(read()).toBe(after);
@@ -1510,7 +1581,7 @@ describe("install sets Codex's startup grace at the top of config.toml", () => {
     seed(before);
     const run = await install();
     expect(run.result.exitCode, run.stderr).toBe(0);
-    expect(run.stdout).toContain("Nothing to do: Codex CLI is already configured.");
+    expect(run.stdout).toContain("Nothing to do: Codex CLI (user) is already configured.");
     expect(run.stdout).not.toContain(GRACE);
     expect(run.result.written).toEqual([]);
     expect(read()).toBe(before);
@@ -1530,7 +1601,7 @@ describe("install sets Codex's startup grace at the top of config.toml", () => {
     // nothing -- on stdout or in a stderr warning -- claims that Codex will
     // not load the file.
     expect(`${run.stdout}${run.stderr}`).not.toContain("will not load");
-    expect(run.stdout).toContain("Nothing to do: Codex CLI is already configured.");
+    expect(run.stdout).toContain("Nothing to do: Codex CLI (user) is already configured.");
   });
 
   it("a FLOAT the user wrote is another value: left alone, and the warning names it as written", async () => {
@@ -1618,7 +1689,7 @@ describe("install sets Codex's startup grace at the top of config.toml", () => {
       expect(count(run.stderr, refusedWarning(userFile(), found, step)), before).toBe(1);
       expect(`${run.stdout}${run.stderr}`, before).not.toContain(WHY);
       expect(count(`${run.stdout}${run.stderr}`, GRACE), before).toBe(1);
-      expect(run.stdout, before).toContain("Nothing to do: Codex CLI is already configured.");
+      expect(run.stdout, before).toContain("Nothing to do: Codex CLI (user) is already configured.");
     }
     // The ceiling itself is a value Codex takes (measured on 0.156.1), so it
     // gets the note any other value it takes does.
@@ -2314,7 +2385,7 @@ describe("install sets Codex's startup grace at the top of config.toml", () => {
       expect(run.stdout).not.toContain(STEP);
       expect(run.stderr).toBe("");
       expect(count(run.stdout, GRACE)).toBe(1);
-      expect(run.stdout).toContain("Nothing to do: Codex CLI is already configured.");
+      expect(run.stdout).toContain("Nothing to do: Codex CLI (user) is already configured.");
     });
     // And the row's own default is back.
     expect(CODEX.config.rootDefaults?.[0]?.accepts).toBe("unsigned-integer");

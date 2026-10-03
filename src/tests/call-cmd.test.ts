@@ -86,10 +86,13 @@ function capture() {
 function fakeConnect(opts: { tools?: string[]; result?: unknown; throwOnCall?: Error; connectError?: unknown }): {
   connect: NonNullable<Parameters<typeof runCall>[0]["connect"]>;
   calls: Array<{ name: string; arguments: unknown }>;
+  /** The `timeout` option each tools/call was made with, in call order. */
+  timeouts: Array<number | undefined>;
   connected: UpstreamServerConfig[];
   tornDown: number;
 } {
   const calls: Array<{ name: string; arguments: unknown }> = [];
+  const timeouts: Array<number | undefined> = [];
   const connected: UpstreamServerConfig[] = [];
   const state = { tornDown: 0 };
   const connect = async <T>(
@@ -101,8 +104,13 @@ function fakeConnect(opts: { tools?: string[]; result?: unknown; throwOnCall?: E
     const connection = {
       config,
       client: {
-        callTool: async (req: { name: string; arguments: unknown }) => {
+        callTool: async (
+          req: { name: string; arguments: unknown },
+          _schema?: unknown,
+          options?: { timeout?: number },
+        ) => {
           calls.push(req);
+          timeouts.push(options?.timeout);
           if (opts.throwOnCall) throw opts.throwOnCall;
           return opts.result ?? { content: [{ type: "text", text: "ok" }] };
         },
@@ -127,6 +135,7 @@ function fakeConnect(opts: { tools?: string[]; result?: unknown; throwOnCall?: E
   return {
     connect,
     calls,
+    timeouts,
     connected,
     get tornDown() {
       return state.tornDown;
@@ -363,6 +372,52 @@ describe("runCall -- calling", () => {
     const r = await runCall({ namespace: "gh", tool: "search", home, json: true, connect: fake.connect, ...cap });
     expect(r.exitCode).toBe(0);
     expect(JSON.parse(cap.text())).toEqual(result);
+  });
+
+  it("says so on stderr when the answer is structuredContent only (text mode)", async () => {
+    // A server with an output schema and no text mirror answers with an empty
+    // `content` and a populated `structuredContent`. Printing nothing and
+    // exiting 0 read as "the tool returned nothing"; the hint goes to STDERR so
+    // stdout stays exactly what the tool said in text, which is nothing.
+    const home = makeHome([GH]);
+    const fake = fakeConnect({ result: { content: [], structuredContent: { n: 1 } } });
+    const cap = capture();
+    const r = await runCall({ namespace: "gh", tool: "search", home, connect: fake.connect, ...cap });
+    expect(r.exitCode).toBe(0);
+    expect(cap.text()).toBe("");
+    expect(cap.errText()).toContain("[structured result only -- re-run with --json");
+  });
+
+  it("stays quiet when there is text alongside structuredContent, and when there is neither", async () => {
+    const home = makeHome([GH]);
+    for (const result of [
+      { content: [{ type: "text", text: "hi" }], structuredContent: { n: 1 } },
+      { content: [] },
+      {},
+    ]) {
+      const fake = fakeConnect({ result });
+      const cap = capture();
+      await runCall({ namespace: "gh", tool: "search", home, connect: fake.connect, ...cap });
+      expect(cap.errText()).not.toContain("structured result only");
+    }
+  });
+
+  it("bounds the call with MCP_CALL_TIMEOUT from the INJECTED env, resolved per call", async () => {
+    // CallCommandOptions.env promises the injected env decides; a module-load
+    // read of process.env broke that promise for exactly this knob. Two calls
+    // in one process with two envs must get two ceilings.
+    const home = makeHome([GH]);
+    const fake = fakeConnect({});
+    await runCall({
+      namespace: "gh",
+      tool: "search",
+      home,
+      connect: fake.connect,
+      env: { MCP_CALL_TIMEOUT: "1234" },
+      ...capture(),
+    });
+    await runCall({ namespace: "gh", tool: "search", home, connect: fake.connect, env: {}, ...capture() });
+    expect(fake.timeouts).toEqual([1234, 60_000]);
   });
 
   it("names a non-text content block instead of dropping it", async () => {

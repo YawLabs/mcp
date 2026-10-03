@@ -28,6 +28,16 @@
 // the promptAnswer test seam, the stdin/stdout defaults and the trimmed,
 // lower-cased answer live here once rather than in a copy per command, so a
 // change to the EOF or Ctrl+C mapping reaches every prompt that uses it.
+//
+// Who gets that mapping -- i.e. who reads with the DEFAULT reader: install-cmd
+// and import-cmd (questionOrEmpty on an interface of their own), and
+// local-add-cmd, local-set-cmd, reset-learning-cmd and try-cmd (askYesNo).
+// `yaw-mcp trust` is the one caller that passes its own reader, tty-reader's
+// raw-mode readAnswerFromTTY shared with `secrets`, so NOTHING in
+// questionOrEmpty runs for it: that reader does its own ^C (null, which
+// trust-cmd maps to QUESTION_CANCELLED) and ^D ("", the default) handling, and
+// the two stay aligned by convention, not by code. Keep that list current
+// when a command switches readers.
 
 import { createInterface, type Interface } from "node:readline/promises";
 

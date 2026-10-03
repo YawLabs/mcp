@@ -1,3 +1,4 @@
+import { StringDecoder } from "node:string_decoder";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -40,12 +41,14 @@ import {
   VAULT_CHECK_CORRUPT_ERROR,
   vaultPath,
 } from "./secrets-vault.js";
-import type {
-  UpstreamConnection,
-  UpstreamPromptDef,
-  UpstreamResourceDef,
-  UpstreamServerConfig,
-  UpstreamToolDef,
+import { MAX_TIMEOUT_MS } from "./timeouts.js";
+import {
+  launchIdentity,
+  type UpstreamConnection,
+  type UpstreamPromptDef,
+  type UpstreamResourceDef,
+  type UpstreamServerConfig,
+  type UpstreamToolDef,
 } from "./types.js";
 import { sanitizeUpstreamInstructions } from "./upstream-instructions.js";
 import { resolveUvSpawn } from "./uv-bootstrap.js";
@@ -403,18 +406,11 @@ async function recordResolveAudit(
 
 declare const __VERSION__: string;
 
-/** Node's timer ceiling. setTimeout stores its delay in a signed 32-bit int,
- *  so ANY delay above 2^31-1 ms (~24.9 days) silently becomes 1ms and fires
- *  almost immediately. A `connectTimeoutMs` past that -- a typo'd extra digit
- *  in bundles.json, which the loader's `> 0` check happily accepts -- would
- *  therefore fail the connect instantly while the error message quoted a
- *  multi-day ceiling. That per-server CONFIG value is clamped at the connect
- *  site so the value used and the value reported match.
- *
- *  For the operator-facing ENV knobs it is the top of the ACCEPTED RANGE
- *  rather than a clamp target -- see resolveTimeoutEnv for why the two
- *  differ. */
-export const MAX_TIMEOUT_MS = 2_147_483_647;
+// MAX_TIMEOUT_MS lives in timeouts.ts -- a leaf with no imports -- so CLI
+// paths such as local-set-cmd.ts can validate `connectTimeoutMs` without
+// pulling the SDK client graph in through this module. Re-exported here so
+// existing importers keep compiling.
+export { MAX_TIMEOUT_MS } from "./timeouts.js";
 
 /** Shared parser for the three timeout env knobs -- MCP_CONNECT_TIMEOUT here,
  *  MCP_LIST_TIMEOUT below, MCP_CALL_TIMEOUT in proxy.ts. Every one of them
@@ -439,9 +435,13 @@ export const MAX_TIMEOUT_MS = 2_147_483_647;
  *  this repo already document; a value that is empty once trimmed reads as
  *  unset and takes the default silently. Anything else we refuse gets one warn
  *  naming the rejected value, the ceiling, and the number actually in effect
- *  -- otherwise the operator's knob is ignored with no diagnostic at all. */
-export function resolveTimeoutEnv(name: string, defaultMs: number): number {
-  const raw = process.env[name];
+ *  -- otherwise the operator's knob is ignored with no diagnostic at all.
+ *
+ *  `env` defaults to process.env; call-cmd.ts passes the env it was handed so
+ *  a caller with an injected environment is not read through the real
+ *  process. */
+export function resolveTimeoutEnv(name: string, defaultMs: number, env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env[name];
   if (raw === undefined) return defaultMs;
   const trimmed = raw.trim();
   if (trimmed === "") return defaultMs;
@@ -461,8 +461,26 @@ export function resolveTimeoutEnv(name: string, defaultMs: number): number {
  *  when present; this is the fallback used otherwise. Env override
  *  (MCP_CONNECT_TIMEOUT) tunes the FALLBACK only -- per-server config
  *  always takes precedence so a slow server can be tuned independently
- *  of the global default. */
-const DEFAULT_CONNECT_TIMEOUT = resolveTimeoutEnv("MCP_CONNECT_TIMEOUT", 15_000);
+ *  of the global default.
+ *
+ *  Resolved LAZILY on first use and memoized, like listTimeout() below and
+ *  proxy.ts's callTimeout(). A module-level read fired the "ignored" warn at
+ *  IMPORT, so a CLI subcommand that never connects to anything (`yaw-mcp
+ *  list`, `doctor`) warned about a knob it never consumes. The memo keeps it
+ *  to one warn per process, at the first connect that actually runs under the
+ *  value -- the same per-call shape spawn-gate.ts's resolveMinCompliance has,
+ *  minus the repeat reads, since this one sits on every connect.
+ *
+ *  NAMING: MCP_CONNECT_TIMEOUT, MCP_LIST_TIMEOUT and MCP_CALL_TIMEOUT predate
+ *  the YAW_MCP_ prefix every other knob carries. Deliberately NOT renamed
+ *  here: all three are documented, and a rename needs the honour-the-old-name
+ *  fallback idle-ttl.ts already does for YAW_MCP_IDLE_THRESHOLD /
+ *  MCP_CONNECT_IDLE_THRESHOLD, plus the README and the --help text. */
+let defaultConnectTimeoutMs: number | undefined;
+function defaultConnectTimeout(): number {
+  defaultConnectTimeoutMs ??= resolveTimeoutEnv("MCP_CONNECT_TIMEOUT", 15_000);
+  return defaultConnectTimeoutMs;
+}
 
 // Bound on per-request listTools/listResources/listPrompts after the
 // initial handshake. Without this, a server that completes connect but
@@ -470,10 +488,19 @@ const DEFAULT_CONNECT_TIMEOUT = resolveTimeoutEnv("MCP_CONNECT_TIMEOUT", 15_000)
 // CONNECT_TIMEOUT timer above is already cleared by the time we reach
 // the listX calls). 15s matches the connect ceiling -- if a server
 // can't list its own tools in 15s, surface it as a real failure.
-const LIST_TIMEOUT = resolveTimeoutEnv("MCP_LIST_TIMEOUT", 15_000);
+//
+// Lazy + memoized for the reason defaultConnectTimeout() gives; same naming
+// caveat (MCP_LIST_TIMEOUT lacks the YAW_MCP_ prefix, not renamed).
+let listTimeoutMs: number | undefined;
+function listTimeout(): number {
+  listTimeoutMs ??= resolveTimeoutEnv("MCP_LIST_TIMEOUT", 15_000);
+  return listTimeoutMs;
+}
 
 // Cap captured stderr so a chatty server can't balloon yaw-mcp's memory.
-// 8KB tail is plenty to see the last error message — servers that emit
+// The cap is in UTF-16 CODE UNITS (String.prototype.slice), not bytes: 8K
+// units is 8KB of ASCII and up to ~16-24KB of multi-byte text. A tail that
+// size is plenty to see the last error message -- servers that emit
 // multi-megabyte output to stderr before crashing are doing something
 // pathological anyway.
 const STDERR_RING_CAP = 8 * 1024;
@@ -704,6 +731,34 @@ function secretMatchVariants(value: string): string[] {
   return variants;
 }
 
+/** The LOCAL branch's redaction map: what redactSecretsInOutput may replace
+ *  in a child's stderr. Vault-sourced values go in whole -- every env entry
+ *  that was written as a `${secret:NAME}` ref (resolved form, keyed by the env
+ *  name) plus the bare decrypted values keyed by secret name -- and a LITERAL
+ *  entry goes in only when its NAME reads as a credential under the same
+ *  classifier credentialShapedParentEnv applies to the inherited env. A
+ *  literal under a non-credential name (DATA_DIR, BASE_URL, PROJECT_PATH) is
+ *  configuration the reader needs to see, and redacting it hid the path an
+ *  error was about while protecting nothing.
+ *
+ *  The ref test is a plain substring check on the CONFIG value, the same one
+ *  resolveServerEnv's refKeys uses, so a ref that resolution left alone still
+ *  counts as vault-sourced. Secret values are spread LAST so a vault entry
+ *  name wins over a same-named env key: it is the entry to rotate. */
+function localRedactionMap(
+  configEnv: Record<string, string>,
+  serverEnv: Record<string, string>,
+  secretValues: Record<string, string>,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(serverEnv)) {
+    if (typeof v !== "string") continue;
+    const raw = configEnv[k];
+    if ((typeof raw === "string" && raw.includes("${secret:")) || isCredentialEnvName(k)) out[k] = v;
+  }
+  return { ...out, ...secretValues };
+}
+
 /** The credential-shaped slice of the PARENT env -- the half of the child's
  *  environment no caller hands in. See the SCOPE section of
  *  redactSecretsInOutput below for why it belongs in the redaction map and why
@@ -737,15 +792,25 @@ function credentialShapedParentEnv(): Record<string, string> {
  * pasted into bug reports. We never want the resolved cleartext to land
  * there.
  *
- * Strategy: for each env value that came from a `${secret:NAME}` ref
- * (i.e. anything that wasn't a literal at config time -- we approximate
- * by redacting EVERY env value of meaningful length), replace exact
- * occurrences with `***ENVKEY***`, where ENVKEY is the env var the value
- * was bound to (e.g. a leaked GITHUB_TOKEN value becomes
+ * Strategy: for each value in the redaction map, replace exact occurrences
+ * with `***ENVKEY***`, where ENVKEY is the env var (or vault entry) the
+ * value was bound to (e.g. a leaked GITHUB_TOKEN value becomes
  * `***GITHUB_TOKEN***`). Naming the key keeps the message actionable --
  * the reader learns WHICH credential the server rejected without ever
  * seeing it. We also drop ${secret:NAME} literals themselves to
  * `${secret:***}` in case any leaked unresolved.
+ *
+ * WHAT THE MAP HOLDS (localRedactionMap builds it for the local branch): the
+ * values that came from the vault -- every env entry written as a
+ * `${secret:NAME}` ref, in resolved form, plus the bare decrypted values
+ * keyed by secret name -- and any LITERAL entry whose NAME reads as a
+ * credential under credentials.ts's isCredentialEnvName. It used to be the
+ * entire resolved env, which turned a long literal path or URL (DATA_DIR,
+ * BASE_URL) into `***DATA_DIR***` wherever the child mentioned it: the one
+ * string the error was about, hidden, with no credential protected. On a
+ * remote entry the map is the whole resolved HEADERS block -- headers exist
+ * on that branch to carry credentials, and a header name says nothing a
+ * name heuristic could use.
  *
  * The redactor is conservative: short values (under SECRET_MATCH_MIN_LENGTH,
  * 8 chars) are skipped to avoid mangling unrelated substrings; the goal is to
@@ -776,9 +841,9 @@ function credentialShapedParentEnv(): Record<string, string> {
  *     does need a fixed-width formatter, and is the rarer case of the two.
  *   - A token straddling the stderr-ring cut. The ring is the `stderrRing`
  *     accumulator on the local-spawn path, whose `.slice(-STDERR_RING_CAP)`
- *     keeps only the newest 8K of decoded stderr, so a token written across
- *     that boundary survives into the tail as a SUFFIX, and a suffix matches
- *     nothing.
+ *     keeps only the newest STDERR_RING_CAP code units of decoded stderr, so
+ *     a token written across that boundary survives into the tail as a
+ *     SUFFIX, and a suffix matches nothing.
  *   - An upstream that echoes only a PREFIX ("key lin_api_9f... was
  *     rejected"). Same shape, other end.
  *
@@ -946,7 +1011,6 @@ function redactSecretsInOutput(text: string, env: Record<string, string>): strin
  * thing the reader was about to do anyway.
  */
 function withConfigPointer(message: string, config: UpstreamServerConfig): string {
-  if (!config.namespace) return message;
   // ASCII arrow on purpose: this suffix rides every activation error into the
   // stderr log, and a `->` survives a Windows console codepage where the
   // Unicode arrow renders as mojibake and then gets pasted into bug reports.
@@ -1079,18 +1143,38 @@ interface SpawnAttempt {
    *  and erase the only trace that a server left oam. */
   oamRewriteApplied: boolean;
   oamVersion: string | null;
+  /** The local branch's resolved env from the FIRST attempt, so the downgrade
+   *  respawn reuses it instead of unlocking the vault (and writing a second
+   *  "injected" audit event per secret) for a child that gets the identical
+   *  values. Set only on the local path, and only once resolution succeeded. */
+  resolvedEnv?: { serverEnv: Record<string, string>; secretValues: Record<string, string> };
 }
 
 /** Namespaces whose oam-hosted boot failed this session AND whose node
  *  respawn produced a different outcome (booted fine, or failed a different
- *  way) -- i.e. the ones where oam is actually implicated. The rewrite gate
- *  skips these so a CONFIRMED downgrade STICKS: without the memo, callers
- *  with their own retry loops (runActivateOne's two attempts, the
- *  auto-reconnect path, the transient read_tool connect) would re-pay the oam
- *  boot failure on every outer attempt and on every later reconnect. Nothing
- *  removes an entry short of a process restart, which is why the add is gated
- *  on evidence -- see connectToUpstream. */
-const oamDowngradedNamespaces = new Set<string>();
+ *  way) -- i.e. the ones where oam is actually implicated -- each mapped to
+ *  the launchIdentity (types.ts) of the config that earned the pin. The
+ *  rewrite gate skips a namespace whose CURRENT identity matches, so a
+ *  CONFIRMED downgrade STICKS: without the memo, callers with their own retry
+ *  loops (runActivateOne's two attempts, the auto-reconnect path, the
+ *  transient read_tool connect) would re-pay the oam boot failure on every
+ *  outer attempt and on every later reconnect.
+ *
+ *  Keyed on namespace + launch identity rather than namespace alone because
+ *  bundles.json is a live re-read: a user who fixes the entry mid-session (a
+ *  different package, new args, an explicit `runtime`) has changed what would
+ *  be spawned, and the old evidence says nothing about the new launch. Under
+ *  a namespace-only key the fixed entry stayed on node until restart, and the
+ *  "Connected to upstream" line kept reporting `oamPinned` for a config that
+ *  by then said `runtime: "node"` outright. Nothing else removes an entry
+ *  short of a process restart, which is why the add is gated on evidence --
+ *  see connectToUpstream. */
+const oamDowngradedNamespaces = new Map<string, string>();
+
+/** Is this exact launch the one an earlier downgrade pinned to node? */
+function isPinnedToNode(config: UpstreamServerConfig): boolean {
+  return oamDowngradedNamespaces.get(config.namespace) === launchIdentity(config);
+}
 
 /** Reset the session-scoped oam downgrade memo (test hook). */
 export function resetOamDowngrades(): void {
@@ -1211,8 +1295,10 @@ export async function connectToUpstream(
       error: err.message,
     });
     // The memo is deliberately NOT written before this respawn. Nothing clears
-    // it for the life of the process, so adding it up front pins the namespace
-    // to node even when the node attempt fails IDENTICALLY -- and an identical
+    // it for the life of the process (a changed launch identity stops MATCHING
+    // it, but this config's identity is the one being pinned), so adding it up
+    // front pins the namespace to node even when the node attempt fails
+    // IDENTICALLY -- and an identical
     // failure is evidence oam was never the cause (a server missing
     // GITHUB_TOKEN fails install_failure on both runtimes). server.ts's
     // maybeElicitAndRetry then supplies the credential and re-connects
@@ -1221,13 +1307,14 @@ export async function connectToUpstream(
     // memo -- it passes disableOamRewrite = true, which bypasses the gate
     // directly.
     //
-    // The respawn runs the WHOLE of connectToUpstreamOnce again, resolveServerEnv
-    // included, so `yaw-mcp secrets audit` records a second "injected" event per
-    // secret name for this one logical activation. Accepted, not threaded
-    // around: two child envs really did receive the value (the oam child and
-    // the node child), and "injected" is defined as "went into a spawn env" --
-    // suppressing the second event would make the audit under-report exactly
-    // the spawn that ended up serving traffic.
+    // The respawn re-runs connectToUpstreamOnce but NOT the vault: the first
+    // attempt parked its resolved env on `attempt` (SpawnAttempt.resolvedEnv)
+    // and the second launch reuses it, so `yaw-mcp secrets audit` records ONE
+    // "injected" event per secret name for this logical activation -- one
+    // event per thing the operator did, not per child the broker tried on
+    // their behalf. The node child receives the identical values the oam
+    // child did, so nothing the audit could say about the second spawn is not
+    // already said by the first.
     try {
       // The downgrade respawn is a SECOND full boot -- another spawn, another
       // handshake, another inventory -- and it was invisible from outside: the
@@ -1244,8 +1331,9 @@ export async function connectToUpstream(
         true,
         progress,
       );
-      // node booted where oam did not: oam IS implicated, so make it stick.
-      oamDowngradedNamespaces.add(config.namespace);
+      // node booted where oam did not: oam IS implicated, so make it stick
+      // for THIS launch (see the memo's doc for why the identity is the key).
+      oamDowngradedNamespaces.set(config.namespace, launchIdentity(config));
       return connection;
     } catch (nodeErr) {
       // A DIFFERENT ActivationError category still points at something
@@ -1255,7 +1343,7 @@ export async function connectToUpstream(
       // boot is far cheaper than silently disabling oam hosting for the rest of
       // the process on evidence that never implicated it.
       if (nodeErr instanceof ActivationError && nodeErr.category !== err.category) {
-        oamDowngradedNamespaces.add(config.namespace);
+        oamDowngradedNamespaces.set(config.namespace, launchIdentity(config));
       } else {
         log("warn", "node respawn also failed; not pinning this server to node (oam was likely not the cause)", {
           namespace: config.namespace,
@@ -1363,10 +1451,60 @@ async function connectToUpstreamOnce(
     // case-insensitive. Everything else from process.env (PATH, HOME, proxy
     // vars, etc.) is intentionally forwarded so the child spawns/runs in the
     // user's normal environment; server-specific secrets come via serverEnv,
-    // which resolveServerEnv resolves from the vault BELOW -- after the uv and
-    // oam resolvers, so a locked vault pays a uv bootstrap and an oam probe
-    // before it refuses.
+    // which resolveServerEnv resolves from the vault NEXT.
     const parentEnv = stripInternalSecretsFromEnv(process.env);
+
+    // Mirror image of the remote branch's env warning below. A local server
+    // has no HTTP request to put a header on, so `headers` here is the same
+    // silent drop this field exists to fix, pointing the other way. Keys
+    // only in the structured field -- never values.
+    if (config.headers && Object.keys(config.headers).length > 0) {
+      log("warn", "Ignoring headers on a local server: headers apply only to remote (HTTP/SSE) upstreams", {
+        namespace: config.namespace,
+        keys: Object.keys(config.headers),
+      });
+    }
+
+    // Resolve ${secret:NAME} references in the server's env against the
+    // local secret vault. Fail-CLOSED: when the env carries refs and
+    // YAW_MCP_VAULT_PASSPHRASE is unset (or no vault exists, or a name is
+    // missing/undecryptable), resolveServerEnv THROWS and the server never
+    // spawns -- the literal `${secret:NAME}` is NOT passed through to the
+    // child. A ref-free env skips the vault entirely and passes through
+    // unchanged. The throw is a plain Error (or the typed
+    // VaultPassphraseRequiredError), so the oam boot-probe downgrade in
+    // connectToUpstream deliberately does not retry it.
+    //
+    // BEFORE the uv and oam resolvers, on purpose. This is the one refusal on
+    // the local path that costs nothing to decide, and it used to come after
+    // a uv bootstrap (a ~20MB download on a cold cache) and an oam probe that
+    // a locked vault then threw away. It also sits OUTSIDE the resolvers'
+    // try/catch below, which wraps whatever it catches in an ActivationError:
+    // the typed vault error has to reach server.ts unwrapped or the passphrase
+    // prompt never fires. The secrets audit's "injected" event is therefore
+    // recorded before the launch command is known; it already meant "resolved
+    // into the env a spawn was about to receive" rather than "a child ran"
+    // (an ENOENT at spawn never un-recorded it), so its meaning has not moved.
+    //
+    // The bare decrypted values ride alongside the composed ones in the
+    // redaction map. A child that echoes only the token -- not the whole
+    // `Bearer <token>` string it was spliced into -- would otherwise match
+    // nothing, the redactor being exact-substring.
+    //
+    // Reused across the oam->node downgrade respawn via `attempt`: the second
+    // launch gets the identical env the first one did, without a second vault
+    // unlock or a second "injected" audit event per secret.
+    let serverEnv: Record<string, string>;
+    let secretValues: Record<string, string> = {};
+    if (attempt.resolvedEnv) {
+      ({ serverEnv, secretValues } = attempt.resolvedEnv);
+    } else {
+      serverEnv = await resolveServerEnv(config.env ?? {}, config.namespace, undefined, undefined, (v) => {
+        secretValues = v;
+      });
+      attempt.resolvedEnv = { serverEnv, secretValues };
+    }
+    resolvedServerEnv = localRedactionMap(config.env ?? {}, serverEnv, secretValues);
     // Resolve the launch command: `uv`/`uvx` to our managed binary, then
     // node/npx onto the oam runtime. BOTH resolvers can throw (unsupported
     // platform, download/checksum failure, a wedged oam binary), and the
@@ -1407,7 +1545,7 @@ async function connectToUpstreamOnce(
       const configured = config.runtime ?? (await defaultRuntime());
       const optedIn = configured !== null;
       const effectiveRuntime = configured ?? "oam";
-      if (effectiveRuntime === "oam" && !disableOamRewrite && !oamDowngradedNamespaces.has(config.namespace)) {
+      if (effectiveRuntime === "oam" && !disableOamRewrite && !isPinnedToNode(config)) {
         // Awaited since issue #91: the oam probe is async so a wedged oam binary
         // cannot block the event loop here. The probe result is cached, so only
         // the first connect of the process actually waits on it.
@@ -1430,34 +1568,6 @@ async function connectToUpstreamOnce(
     }
     spawnedCommand = resolved.command;
 
-    // Resolve ${secret:NAME} references in the server's env against the
-    // local secret vault. Fail-CLOSED: when the env carries refs and
-    // YAW_MCP_VAULT_PASSPHRASE is unset (or no vault exists, or a name is
-    // missing/undecryptable), resolveServerEnv THROWS and the server never
-    // spawns -- the literal `${secret:NAME}` is NOT passed through to the
-    // child. A ref-free env skips the vault entirely and passes through
-    // unchanged. The throw is a plain Error, so the oam boot-probe
-    // downgrade below deliberately does not retry it.
-    // Mirror image of the remote branch's env warning below. A local server
-    // has no HTTP request to put a header on, so `headers` here is the same
-    // silent drop this field exists to fix, pointing the other way. Keys
-    // only in the structured field -- never values.
-    if (config.headers && Object.keys(config.headers).length > 0) {
-      log("warn", "Ignoring headers on a local server: headers apply only to remote (HTTP/SSE) upstreams", {
-        namespace: config.namespace,
-        keys: Object.keys(config.headers),
-      });
-    }
-
-    // The bare decrypted values ride alongside the composed ones in the
-    // redaction map. A child that echoes only the token -- not the whole
-    // `Bearer <token>` string it was spliced into -- would otherwise match
-    // nothing, the redactor being exact-substring.
-    let secretValues: Record<string, string> = {};
-    const serverEnv = await resolveServerEnv(config.env ?? {}, config.namespace, undefined, undefined, (v) => {
-      secretValues = v;
-    });
-    resolvedServerEnv = { ...serverEnv, ...secretValues };
     const stdioTransport = new StdioClientTransport({
       command: resolved.command,
       args: resolved.args,
@@ -1467,8 +1577,23 @@ async function connectToUpstreamOnce(
     // Attach the stderr listener *before* the transport is started so we
     // never lose the earliest output (install errors, missing-env errors,
     // etc. that get written before the server crashes on init).
+    //
+    // LOAD-BEARING, not just a diagnostic: the transport is built with
+    // stderr: "pipe", and this listener is that pipe's ONLY consumer. Remove
+    // it and nothing drains the child's stderr; a server that logs more than
+    // the OS pipe buffer (64KB on Linux, as little as 4KB on some Windows
+    // configurations) then blocks on its next stderr write and never answers
+    // initialize -- an init_timeout with an empty tail, for a child that was
+    // merely verbose.
+    //
+    // Decoded through a StringDecoder rather than per-chunk toString(): a
+    // multi-byte sequence split across two 'data' events decodes to U+FFFD at
+    // both ends, which turns a non-ASCII path or message in the tail into
+    // mojibake and defeats the exact-substring redactor for any credential
+    // that happens to straddle a chunk boundary.
+    const stderrDecoder = new StringDecoder("utf8");
     stdioTransport.stderr?.on("data", (chunk: Buffer) => {
-      stderrRing = (stderrRing + chunk.toString("utf8")).slice(-STDERR_RING_CAP);
+      stderrRing = (stderrRing + stderrDecoder.write(chunk)).slice(-STDERR_RING_CAP);
     });
     transport = stdioTransport;
   } else {
@@ -1627,7 +1752,7 @@ async function connectToUpstreamOnce(
   const connectTimeoutMs = Math.min(
     typeof config.connectTimeoutMs === "number" && config.connectTimeoutMs > 0
       ? config.connectTimeoutMs
-      : DEFAULT_CONNECT_TIMEOUT,
+      : defaultConnectTimeout(),
     MAX_TIMEOUT_MS,
   );
   let timedOut = false;
@@ -1737,7 +1862,7 @@ async function connectToUpstreamOnce(
     runtimeFields = disableOamRewrite
       ? { runtime: "node", downgradedFromOam: true }
       : { runtime: "oam", oamVersion: attempt.oamVersion };
-  } else if (config.type === "local" && oamDowngradedNamespaces.has(config.namespace)) {
+  } else if (config.type === "local" && isPinnedToNode(config)) {
     runtimeFields = { runtime: "node", downgradedFromOam: true, oamPinned: true };
   }
   log("info", "Connected to upstream", {
@@ -1761,7 +1886,6 @@ async function connectToUpstreamOnce(
     client.onclose = () => {
       if (connection.status === "connected") {
         connection.status = "error";
-        connection.error = "Upstream disconnected unexpectedly";
         log("warn", "Upstream disconnected unexpectedly", { namespace: config.namespace });
         if (onDisconnect) onDisconnect(config.namespace);
       } else {
@@ -1832,8 +1956,11 @@ async function connectToUpstreamOnce(
           try {
             connection.tools = await fetchToolsFromUpstream(client, config.namespace);
             onListChanged(config.namespace);
-          } catch (err: any) {
-            log("warn", "Failed to refresh tools from upstream", { namespace: config.namespace, error: err.message });
+          } catch (err) {
+            log("warn", "Failed to refresh tools from upstream", {
+              namespace: config.namespace,
+              error: err instanceof Error ? err.message : String(err),
+            });
           }
         }),
       );
@@ -1851,10 +1978,10 @@ async function connectToUpstreamOnce(
           try {
             connection.resources = await fetchResourcesFromUpstream(client, config.namespace, { throwOnError: true });
             onListChanged(config.namespace);
-          } catch (err: any) {
+          } catch (err) {
             log("warn", "Failed to refresh resources from upstream", {
               namespace: config.namespace,
-              error: err.message,
+              error: err instanceof Error ? err.message : String(err),
             });
           }
         }),
@@ -1864,10 +1991,10 @@ async function connectToUpstreamOnce(
           try {
             connection.prompts = await fetchPromptsFromUpstream(client, config.namespace, { throwOnError: true });
             onListChanged(config.namespace);
-          } catch (err: any) {
+          } catch (err) {
             log("warn", "Failed to refresh prompts from upstream", {
               namespace: config.namespace,
-              error: err.message,
+              error: err instanceof Error ? err.message : String(err),
             });
           }
         }),
@@ -1957,10 +2084,10 @@ export async function disconnectFromUpstream(connection: UpstreamConnection): Pr
   connection.status = "disconnected";
   try {
     await connection.client.close();
-  } catch (err: any) {
+  } catch (err) {
     log("warn", "Error disconnecting from upstream", {
       namespace: connection.config.namespace,
-      error: err.message,
+      error: err instanceof Error ? err.message : String(err),
     });
   }
   log("info", "Disconnected from upstream", { namespace: connection.config.namespace });
@@ -2062,7 +2189,7 @@ export async function fetchResourcesFromUpstream(
   try {
     const raw = await fetchAllPages(
       async (cursor) => {
-        const result = await client.listResources(cursor === undefined ? {} : { cursor }, { timeout: LIST_TIMEOUT });
+        const result = await client.listResources(cursor === undefined ? {} : { cursor }, { timeout: listTimeout() });
         return { items: result.resources ?? [], nextCursor: result.nextCursor };
       },
       MAX_RESOURCES_PER_SERVER,
@@ -2103,7 +2230,7 @@ export async function fetchPromptsFromUpstream(
   try {
     const raw = await fetchAllPages(
       async (cursor) => {
-        const result = await client.listPrompts(cursor === undefined ? {} : { cursor }, { timeout: LIST_TIMEOUT });
+        const result = await client.listPrompts(cursor === undefined ? {} : { cursor }, { timeout: listTimeout() });
         return { items: result.prompts ?? [], nextCursor: result.nextCursor };
       },
       MAX_PROMPTS_PER_SERVER,
@@ -2167,7 +2294,7 @@ export async function fetchToolsFromUpstream(
   try {
     all = await fetchAllPages(
       async (cursor) => {
-        const result = await client.listTools(cursor === undefined ? {} : { cursor }, { timeout: LIST_TIMEOUT });
+        const result = await client.listTools(cursor === undefined ? {} : { cursor }, { timeout: listTimeout() });
         return { items: result.tools ?? [], nextCursor: result.nextCursor };
       },
       MAX_TOOLS_PER_SERVER,

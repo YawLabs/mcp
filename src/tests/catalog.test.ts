@@ -9,6 +9,7 @@ import {
   type FetchCatalog,
   resolveCatalogSlug,
   tokenizeCommand,
+  withWarnSink,
 } from "../catalog.js";
 
 // The one slug gate `add` and `try` share. Each verb used to carry a private
@@ -673,5 +674,45 @@ describe("defaultFetchCatalog", () => {
         stderrSpy.mockRestore();
       }
     });
+  });
+});
+
+describe("resolveCatalogSlug -- routes the default fetcher's staleness note to `warn`", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("delivers the note to the caller's sink and still resolves", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          servers: [{ slug: "a", install: { command: "npx a" } }],
+          generated_at: "2020-01-01T00:00:00.000Z",
+        }),
+      })),
+    );
+    const warned: string[] = [];
+    const r = await resolveCatalogSlug("a", { warn: (l) => warned.push(l) });
+    expect(r.command).toBe("npx");
+    expect(warned).toHaveLength(1);
+    expect(warned[0]).toContain("was generated 2020-01-01");
+  });
+
+  it("withWarnSink is a plain FetchCatalog that carries the sink", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ servers: [{ slug: "a" }], generated_at: "2020-01-01T00:00:00.000Z" }),
+      })),
+    );
+    const warned: string[] = [];
+    const fetchCatalog: FetchCatalog = withWarnSink((l) => warned.push(l));
+    expect((await fetchCatalog(DEFAULT_CATALOG_URL)).map((s) => s.slug)).toEqual(["a"]);
+    expect(warned).toHaveLength(1);
   });
 });

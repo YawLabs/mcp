@@ -9,6 +9,7 @@ import {
   healStaleBrokerEntries,
   maybeHealStaleBrokerEntries,
 } from "../heal-entries.js";
+import { claudeCodeProjectKey } from "../install-targets.js";
 import { MIN_OAM_VERSION, type OamProbe } from "../oam-spawn.js";
 import { describeWriteFailure } from "../write-failure.js";
 
@@ -690,7 +691,7 @@ describe("maybeHealStaleBrokerEntries -- a rewrite that does not land", () => {
           return null;
         }
       })
-      .filter((rec) => rec !== null && rec.msg === "Could not heal a stale yaw-mcp entry");
+      .filter((rec) => rec !== null && rec.msg === "Could not re-point a stale yaw-mcp entry");
     expect(records).toHaveLength(1);
     expect(records[0]).toMatchObject({
       level: "warn",
@@ -698,5 +699,85 @@ describe("maybeHealStaleBrokerEntries -- a rewrite that does not land", () => {
       path: p,
       error: describeWriteFailure(p, err),
     });
+  });
+});
+
+describe("healStaleBrokerEntries -- every project's local-scope container, not only the cwd's", () => {
+  /** ~/.claude.json with one local-scope broker entry per project key. */
+  function claudeJsonWithProjects(entries: Record<string, string>): string {
+    const projects: Record<string, unknown> = {};
+    for (const [key, entryPath] of Object.entries(entries)) {
+      projects[key] = { mcpServers: { mcp: { command: OAM_BIN, args: ["run", "--no-check", entryPath] } } };
+    }
+    return `${JSON.stringify({ projects }, null, 2)}\n`;
+  }
+
+  it("re-points a stale entry in a project the process is NOT sitting in", async () => {
+    // Local scope resolves to projects[<cwd>], and the sweep used to read only
+    // that container. A machine with three checkouts that each ran `install
+    // claude-code --scope local` holds three such containers, and an app
+    // upgrade kills all three at once; the other two stayed dead until the
+    // user happened to run something from inside each of them.
+    const p = join(home, ".claude.json");
+    const other = process.platform === "win32" ? "C:\\work\\other" : "/work/other";
+    const third = process.platform === "win32" ? "C:\\work\\third" : "/work/third";
+    writeFileSync(p, claudeJsonWithProjects({ [other]: DEAD, [third]: liveEntry }));
+    const healed = await heal({ env: {}, cwd: home });
+    const local = healed.filter((h) => h.clientId === "claude-code" && h.scope === "local");
+    expect(local.map((h) => [h.path, h.from, h.to])).toEqual([[p, DEAD, liveEntry]]);
+    const after = JSON.parse(readFileSync(p, "utf8")) as {
+      projects: Record<string, { mcpServers: { mcp: { args: string[] } } }>;
+    };
+    expect(after.projects[other].mcpServers.mcp.args[2]).toBe(liveEntry);
+    // The working one is untouched (gate 2), and no container for the cwd was
+    // conjured: the file's keys are exactly the two it had.
+    expect(after.projects[third].mcpServers.mcp.args[2]).toBe(liveEntry);
+    expect(Object.keys(after.projects)).toEqual([other, third]);
+  });
+
+  it("heals the cwd's own container and the others in one sweep, each once", async () => {
+    const p = join(home, ".claude.json");
+    const other = process.platform === "win32" ? "C:\\work\\other" : "/work/other";
+    // The cwd key as Claude Code spells it: resolveInstallSites keys local
+    // scope by the absolute project dir, which for `cwd: home` is `home`.
+    const mine = claudeCodeProjectKey(home);
+    const before = claudeJsonWithProjects({ [mine]: DEAD, [other]: DEAD });
+    writeFileSync(p, before);
+    const healed = await heal({ env: {}, cwd: home });
+    const local = healed.filter((h) => h.clientId === "claude-code" && h.scope === "local");
+    expect(local).toHaveLength(2);
+    expect(readFileSync(p, "utf8")).toBe(claudeJsonWithProjects({ [mine]: liveEntry, [other]: liveEntry }));
+  });
+});
+
+describe("healStaleBrokerEntries -- a repair onto a project-local path says so", () => {
+  it("carries install's own project-local caveat on the entry", async () => {
+    // The sweep rewrote to `<cwd>/node_modules/...` -- the same path install
+    // warns about when it writes it ("Removing this checkout's node_modules
+    // ... breaks the entry") -- and said nothing. The note is the one
+    // sentence, on the entry, for each caller to print.
+    const local = join(home, "node_modules", "@yawlabs", "mcp", "dist", "index.js");
+    mkdirSync(dirname(local), { recursive: true });
+    writeFileSync(local, "// broker\n");
+    const p = writeCodexConfig(tomlEntry(DEAD));
+    const healed = await heal({ env: {}, cwd: home, resolveOamEntry: () => local });
+    const codex = healed.filter((h) => h.clientId === "codex-cli");
+    expect(codex.map((h) => h.to)).toEqual([local]);
+    expect(codex[0].note).toBe(
+      `that path is a project-local install (${local}). Removing this checkout's node_modules ` +
+        `(\`rm -rf node_modules\`, \`npm prune\`, a rename) breaks the entry in ${p}. ` +
+        "`npm i -g @yawlabs/mcp` and re-run `yaw-mcp install` for a machine-durable path.",
+    );
+  });
+
+  it("has no note for a path outside the tree the sweep ran in", async () => {
+    // liveEntry sits under <home>/live, and the sweep runs from <home>: not
+    // this checkout's node_modules, so nothing to warn about.
+    writeCodexConfig(tomlEntry(DEAD));
+    const healed = await heal({ env: {}, cwd: home });
+    const codex = healed.filter((h) => h.clientId === "codex-cli");
+    expect(codex).toHaveLength(1);
+    expect(codex[0].note).toBeUndefined();
+    expect("note" in codex[0]).toBe(false);
   });
 });

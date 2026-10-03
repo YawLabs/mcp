@@ -212,7 +212,10 @@ export interface ExploreServerResponse {
 export interface TrialMarker {
   schemaVersion: number;
   slug: string;
-  name: string;
+  // No `name` (the server's display name) any more: it was written on every
+  // marker and read by nothing -- not doctor, not cleanup, not a test. `slug`
+  // is what every reader keys on. Markers that still carry it parse fine
+  // (unknown fields are ignored).
   /** Epoch ms when doctor's GC pass should evict the entry. */
   expiresAt: number;
   /** Absolute path of the client config file the entry was written to. */
@@ -285,8 +288,10 @@ export interface TryCommandOptions {
   /** Override for tests; defaults to the catalog read in defaultFetchExplore.
    *  `catalogUrl` carries runTry's resolved $YAW_MCP_CATALOG_URL override
    *  (undefined when unset or empty) so the seam never has to read
-   *  process.env behind the caller's injected `env`. */
-  fetchExplore?: (slug: string, catalogUrl?: string) => Promise<ExploreServerResponse>;
+   *  process.env behind the caller's injected `env`. `warn` is the sink for
+   *  the catalog's staleness note, so it lands on this command's stderr
+   *  writer rather than the real process.stderr. */
+  fetchExplore?: (slug: string, catalogUrl?: string, warn?: (line: string) => void) => Promise<ExploreServerResponse>;
   out?: (s: string) => void;
   err?: (s: string) => void;
   /** Override for tests; defaults to Date.now(). */
@@ -296,7 +301,8 @@ export interface TryCommandOptions {
 export interface TryCleanupOptions {
   slug?: string;
   home?: string;
-  os?: InstallOS;
+  // No `os`: cleanup never probes a client table, it edits the file the marker
+  // names, so the OS has nothing to decide here.
   /** Skip the confirmation. Required off a TTY. */
   force?: boolean;
   out?: (s: string) => void;
@@ -471,15 +477,28 @@ export function trialMarkerPath(slug: string, home: string = homedir()): string 
  *  any JSON or TOML file on disk. `try` only ever writes `yaw-mcp-try-<slug>`
  *  at schemaVersion TRIAL_SCHEMA_VERSION, with a `format` this build reads;
  *  anything else is corrupt, hand-edited, or from a writer we don't know. */
-function rejectUntrustedMarker(marker: { entryName: string; schemaVersion?: number; format?: unknown }): string | null {
+function rejectUntrustedMarker(marker: {
+  entryName: string;
+  schemaVersion?: unknown;
+  format?: unknown;
+}): string | null {
   if (!marker.entryName.startsWith(TRIAL_ENTRY_PREFIX)) {
     return `names a non-trial entry ("${marker.entryName}", expected "${TRIAL_ENTRY_PREFIX}*")`;
   }
   // An ABSENT schemaVersion is read as v1 (see the file header): markers
   // written by hand or by older tooling omit it, and rejecting those would
-  // strand a live trial entry with nothing able to reclaim it. A version
-  // ABOVE ours is the case the field exists for -- a newer yaw-mcp may mean
-  // something different by containerPath/entryName, and we don't guess.
+  // strand a live trial entry with nothing able to reclaim it. A PRESENT one
+  // that is not a number is refused outright: `schemaVersion` is typed
+  // `unknown` here because the value comes verbatim off disk, and a string
+  // "99" used to fail the `> TRIAL_SCHEMA_VERSION` check below by type alone
+  // and fall through to v1 handling -- the one shape the version guard exists
+  // to refuse, waved through by its spelling.
+  if (marker.schemaVersion !== undefined && typeof marker.schemaVersion !== "number") {
+    return `carries a schemaVersion that is not a number (${JSON.stringify(marker.schemaVersion)})`;
+  }
+  // A version ABOVE ours is the case the field exists for -- a newer yaw-mcp
+  // may mean something different by containerPath/entryName, and we don't
+  // guess.
   if (typeof marker.schemaVersion === "number" && marker.schemaVersion > TRIAL_SCHEMA_VERSION) {
     return `was written by a newer yaw-mcp (schemaVersion ${marker.schemaVersion} > ${TRIAL_SCHEMA_VERSION})`;
   }
@@ -781,8 +800,12 @@ async function peelTrialEntry(
 // resolves every other env lookup through its injectable `opts.env`, and a
 // lone process.env read inside the seam means an embedded caller (or a test)
 // that supplies `env` is silently overridden by the ambient environment.
-async function defaultFetchExplore(slug: string, catalogUrl?: string): Promise<ExploreServerResponse> {
-  const resolved = await resolveCatalogSlug(slug, { catalogUrl });
+async function defaultFetchExplore(
+  slug: string,
+  catalogUrl?: string,
+  warn?: (line: string) => void,
+): Promise<ExploreServerResponse> {
+  const resolved = await resolveCatalogSlug(slug, { catalogUrl, warn });
   const out: ExploreServerResponse = {
     slug: resolved.slug,
     name: resolved.name,
@@ -795,10 +818,11 @@ async function defaultFetchExplore(slug: string, catalogUrl?: string): Promise<E
   return out;
 }
 
-/** Auto-detect which AI client to install the trial into. Probes in the
- *  same order as `yaw-mcp install --list` (claude-code -> claude-desktop ->
- *  cursor -> vscode, per INSTALL_TARGETS -- one slot per client AND scope),
- *  picking the first slot whose config file already EXISTS and could be read
+/** Auto-detect which AI client to install the trial into. Probes every
+ *  INSTALL_TARGETS row in the same order as `yaw-mcp install --list`
+ *  (claude-code first, then claude-desktop, cursor, vscode and the rest of
+ *  the table -- one slot per client AND scope; the table, not this comment,
+ *  is the list), picking the first slot whose config file already EXISTS and could be read
  *  and parsed (probeUsable). Failing that it takes the first client merely
  *  AVAILABLE on this OS, which is always claude-code (the most likely target)
  *  since that is first in INSTALL_TARGETS and ships on every InstallOS.
@@ -932,7 +956,7 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
     env.YAW_MCP_CATALOG_URL !== undefined && env.YAW_MCP_CATALOG_URL.length > 0 ? env.YAW_MCP_CATALOG_URL : undefined;
   let server: ExploreServerResponse;
   try {
-    server = await fetchExplore(slug, catalogUrl);
+    server = await fetchExplore(slug, catalogUrl, printErr);
   } catch (e) {
     // Prefixed like every other message this command prints. It was the one
     // bare line here, so a user reading a piped stderr (or a bug report) could
@@ -1106,7 +1130,7 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   }
   // Required keys whose value came from the ambient shell, NOT --env. Unlike
   // `add`, `try` DOES persist these inline (see divergence note above); the
-  // note at step 9 tells the user the secret was sourced from their shell so
+  // note at step 8 tells the user the secret was sourced from their shell so
   // they're aware it now lives in the client config on disk.
   // `!overrides[k]` alone covers both "key absent" and "key present but empty"
   // -- "" is falsy, so the old `|| overrides[k] === ""` disjunct could never
@@ -1159,7 +1183,7 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   // so a preview never promises a write the real run declines.
   //
   // Unreachable today, and kept on purpose. Step 3 prefers a user scope
-  // whenever the client has one and all six shipped targets do, so `scope`
+  // whenever the client has one and every shipped target does, so `scope`
   // is always "user" by the time control arrives here. It last fired while
   // VS Code was project-only. Keeping it is what makes a project-only client
   // added later refuse rather than silently commit the secret; there is no
@@ -1192,7 +1216,6 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   const marker: TrialMarker = {
     schemaVersion: TRIAL_SCHEMA_VERSION,
     slug,
-    name: server.name,
     expiresAt,
     clientPath: resolved.absolute,
     clientName: clientId,
@@ -1508,7 +1531,7 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
     return { exitCode: 1, written: [] };
   }
 
-  // Step 9: nudge. The keep-it path is local (`add` writes the server into
+  // Step 8: nudge. The keep-it path is local (`add` writes the server into
   // ~/.yaw-mcp/bundles.json) -- there is no account and no signup page.
   const ttlPretty = formatTtl(ttlMs);
   // `entryName`, not a rebuilt literal: the name printed here has to be the

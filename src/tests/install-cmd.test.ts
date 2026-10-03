@@ -260,6 +260,18 @@ describe("parseInstallArgs", () => {
     if (!projectDir.ok) expect(projectDir.error).toContain("--project-dir requires a value");
   });
 
+  it("rejects an unknown SINGLE-dash flag rather than treating it as the client, as uninstall does", () => {
+    // `-x claude-code` used to parse `-x` as a positional and refuse it as
+    // "Unknown client: -x" -- a message about the client list for a typo in
+    // a flag. parseUninstallArgs already refused it as a flag.
+    const r = parseInstallArgs(["-x", "claude-code"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/^Unknown flag: -x\n/);
+    const alone = parseInstallArgs(["-f"]);
+    expect(alone.ok).toBe(false);
+    if (!alone.ok) expect(alone.error).toMatch(/^Unknown flag: -f\n/);
+  });
+
   it("still accepts values that merely contain a dash", () => {
     // The guard is about a LEADING dash. A token or a path with one inside it
     // (`mcp_pat_a-b`, `/repos/my-project`) is an ordinary value.
@@ -1897,6 +1909,47 @@ describe("runInstall — home override hermeticity (claude-desktop on Windows)",
       if (prev === undefined) delete process.env.APPDATA;
       else process.env.APPDATA = prev;
     }
+  });
+});
+
+describe("runInstall — %APPDATA% pointing at a regular file is named (claude-desktop on Windows)", () => {
+  it("names the file in the way AND the variable that put the config under it", async () => {
+    // locationEnvHint finds the variable by unsetting it and asking the
+    // resolver whether the file moves. It unset `clientEnv.appData` -- which
+    // the resolver never reads: %APPDATA% reaches it as the already-chosen
+    // `appData` argument. So the file never moved, APPDATA was never named,
+    // and a redirected %APPDATA% that was a FILE got the bare "is a file, not
+    // a directory -- move or rename it" step for the four rows under it.
+    // `appData` is passed explicitly, as the dispatcher's resolveAppDataDir
+    // would choose it from the env; `clientEnv.appData` is what readClientEnv
+    // reports for the same variable.
+    const afile = join(synthHome, "appdata-file");
+    writeFileSync(afile, "not a directory\n");
+    const file = join(afile, "Claude", "claude_desktop_config.json");
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-desktop",
+      scope: "user",
+      os: "windows",
+      home: synthHome,
+      appData: afile,
+      clientEnv: { appData: afile },
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(r.written).toEqual([]);
+    const clause =
+      `${afile} is a file, not a directory, and APPDATA (set to ${afile}) puts claude_desktop_config.json under it -- ` +
+      "point APPDATA at a directory, then re-run.";
+    // Windows reads the path under a file as missing and fails at the write's
+    // mkdir; POSIX fails the READ with ENOTDIR first. Either way the clause
+    // names the variable.
+    expect(
+      [`yaw-mcp install: failed to write ${file}: ${clause}\n`, `yaw-mcp install: cannot read ${file}: ${clause}\n`],
+      cap.stderr(),
+    ).toContain(cap.stderr());
+    expect(readFileSync(afile, "utf8")).toBe("not a directory\n");
   });
 });
 
@@ -4347,14 +4400,15 @@ describe("runInstall --list — display + flag handling", () => {
 });
 
 describe("parseInstallArgs — --list and write-decision flags", () => {
-  it("refuses --list combined with --force or --skip", () => {
+  it("refuses --list combined with any write-decision flag: --force, --skip, --repair, --keep-legacy", () => {
     // Same silent-ignore class as --all --scope: runInstallList never writes a
-    // file, so it never consults either flag, and an accepted-then-dropped flag
-    // reads as honored.
-    for (const flag of ["--force", "--skip"]) {
+    // file, so it never consults any of them, and an accepted-then-dropped
+    // flag reads as honored. --repair and --keep-legacy are decisions about
+    // the write too, and were the two the guard used to let through.
+    for (const flag of ["--force", "--skip", "--repair", "--keep-legacy"]) {
       const r = parseInstallArgs(["--list", flag]);
-      expect(r.ok).toBe(false);
-      if (!r.ok) expect(r.error).toContain(flag);
+      expect(r.ok, flag).toBe(false);
+      if (!r.ok) expect(r.error).toContain(`cannot honor ${flag}`);
     }
   });
 
@@ -4548,7 +4602,9 @@ describe("runInstall — idempotence (re-run over an entry that already matches)
     expect(r.written).toEqual([]);
     expect(cap.stderr()).toBe("");
     expect(cap.stdout()).toContain("is already correct");
-    expect(cap.stdout()).toContain("Nothing to do");
+    // The ONE spelling of the no-op line, scope included -- the dry-run
+    // preview's; the live path used to drop the scope.
+    expect(cap.stdout()).toContain("\nNothing to do: Claude Code (user) is already configured.");
     // Not merely "the same content": the same BYTES. A rewrite that happens to
     // round-trip still moves mtime, still races a live Claude Code session,
     // and still shows up in a backup diff.
@@ -7697,6 +7753,35 @@ describe("runInstall -- .mcp.json is STRICT JSON, so a commented one is refused"
     // refusal wins over it rather than being the only fault present.
     expect(stderr).not.toContain(unloadableRefusal(raw));
     expect(stderr.filter((l) => l.includes(unloadableConfigFix("re-run")))).toEqual([]);
+    expect(readFileSync(mcpJson(), "utf8")).toBe(raw);
+    // And stdout is the bare header: the refusal returns before any line
+    // about a write (see the ordering test below).
+    expectRefusedStdout(cap.stdout());
+  });
+
+  it("refuses a non-reparable container BEFORE any Runtime line reaches stdout", async () => {
+    // The refusal used to sit at the write, after the buffered Runtime lines
+    // had been flushed: "Runtime: node (npx ...)" on stdout, then the refusal
+    // on stderr about an entry that was never written. It now returns beside
+    // the unspliceable refusal, so stdout is the two header lines and nothing
+    // else -- no Runtime line, no Note, no Done -- on a file with no other
+    // fault to lead with. The stderr line is unchanged. A NON-EMPTY array is
+    // the one non-reparable shape (a scalar, null or an empty array is
+    // repaired in place, as it holds nothing to lose).
+    const raw = '{\n  "mcpServers": [{ "name": "spend", "url": "https://x" }]\n}\n';
+    const { cap, result } = run(raw, PINNED);
+    const r = await result;
+    expect(r.exitCode).toBe(1);
+    expect(r.written).toEqual([]);
+    expect(r.wouldWrite).toEqual([]);
+    expect(linesOf(cap.stderr())).toEqual([
+      `yaw-mcp install: "mcpServers" in ${mcpJson()} is an array of 1, not a JSON object -- refusing to overwrite it; ${blockedContainerFix("re-run")}.`,
+    ]);
+    expectRefusedStdout(cap.stdout());
+    expect(linesOf(cap.stdout()).filter((l) => l.startsWith("Runtime:"))).toEqual([]);
+    // `messages` is BOTH streams in print order: the header, then the refusal
+    // -- and nothing between them, which is the ordering claim.
+    expect(r.messages).toEqual(["Target: Claude Code (project)", `File:   ${mcpJson()}`, linesOf(cap.stderr())[0]]);
     expect(readFileSync(mcpJson(), "utf8")).toBe(raw);
   });
 

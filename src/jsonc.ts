@@ -27,6 +27,7 @@
 // Escape sequences inside strings are honored (`"a\\"` stays closed),
 // so a literal `"abc // def"` keeps its `//`.
 
+import * as jsoncParser from "jsonc-parser";
 import {
   applyEdits,
   createScanner,
@@ -46,7 +47,6 @@ export function stripJsoncComments(src: string): string {
   let i = 0;
   const len = src.length;
   let inString = false;
-  let stringChar = "";
   while (i < len) {
     const c = src[i];
     if (inString) {
@@ -58,13 +58,16 @@ export function stripJsoncComments(src: string): string {
         i += 2;
         continue;
       }
-      if (c === stringChar) inString = false;
+      if (c === '"') inString = false;
       i++;
       continue;
     }
-    if (c === '"' || c === "'") {
+    // `"` alone opens a string. JSON has no single-quoted string, so an
+    // apostrophe outside a string is just a byte -- treating it as a delimiter
+    // once put the rest of a file "inside a string" after a stray `'` and let
+    // a real `//` comment through to JSON.parse.
+    if (c === '"') {
       inString = true;
-      stringChar = c;
       out += c;
       i++;
       continue;
@@ -103,7 +106,6 @@ export function stripTrailingCommas(src: string): string {
   let i = 0;
   const len = src.length;
   let inString = false;
-  let stringChar = "";
   while (i < len) {
     const c = src[i];
     if (inString) {
@@ -113,13 +115,13 @@ export function stripTrailingCommas(src: string): string {
         i += 2;
         continue;
       }
-      if (c === stringChar) inString = false;
+      if (c === '"') inString = false;
       i++;
       continue;
     }
-    if (c === '"' || c === "'") {
+    // `"` alone, as in stripJsoncComments: JSON has no single-quoted string.
+    if (c === '"') {
       inString = true;
-      stringChar = c;
       out += c;
       i++;
       continue;
@@ -220,17 +222,23 @@ const FORMATTING_OPTIONS: FormattingOptions = {
   eol: "\n",
 };
 
-// jsonc-parser declares its token kinds (`SyntaxKind`) as an ambient const
-// enum, which this repo's `isolatedModules` setting does not let us read at
-// runtime, so the kinds the splicer needs are spelled as their values here.
-// A wrong value fails the splice tests in src/tests/jsonc-splice.test.ts.
-const TOKEN_CLOSE_BRACE = 2;
-const TOKEN_CLOSE_BRACKET = 4;
-const TOKEN_COMMA = 5;
-const TOKEN_LINE_COMMENT = 12;
-const TOKEN_BLOCK_COMMENT = 13;
-const TOKEN_LINE_BREAK = 14;
-const TOKEN_WHITESPACE = 15;
+// jsonc-parser's token kinds, read off the package's OWN runtime `SyntaxKind`
+// object rather than hardcoded, so a renumbering in a jsonc-parser release
+// changes these with it. The package declares `SyntaxKind` as an ambient
+// `const enum`, which `isolatedModules` refuses to read by member
+// (`SyntaxKind.CommaToken` is TS2748) -- but the ESM build exports a real
+// object of that name, so it is reached through the namespace import and a
+// cast that says what shape it has. A missing member would be `undefined` and
+// match no token, which the splice tests in src/tests/jsonc-splice.test.ts
+// fail on, as they would on a wrong value.
+const SYNTAX_KIND = (jsoncParser as unknown as { SyntaxKind: Record<string, number> }).SyntaxKind;
+const TOKEN_CLOSE_BRACE = SYNTAX_KIND.CloseBraceToken;
+const TOKEN_CLOSE_BRACKET = SYNTAX_KIND.CloseBracketToken;
+const TOKEN_COMMA = SYNTAX_KIND.CommaToken;
+const TOKEN_LINE_COMMENT = SYNTAX_KIND.LineCommentTrivia;
+const TOKEN_BLOCK_COMMENT = SYNTAX_KIND.BlockCommentTrivia;
+const TOKEN_LINE_BREAK = SYNTAX_KIND.LineBreakTrivia;
+const TOKEN_WHITESPACE = SYNTAX_KIND.Trivia;
 
 const isHorizontalSpace = (c: string | undefined): boolean => c === " " || c === "\t";
 const isLineBreak = (c: string | undefined): boolean => c === "\n" || c === "\r";

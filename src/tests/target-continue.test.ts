@@ -445,6 +445,18 @@ describe("where the file goes", () => {
     // absolute value is the safe one.
   });
 
+  it("treats a whitespace-only CONTINUE_GLOBAL_DIR as unset, like the Cline row treats its variables", () => {
+    const blank = resolveInstallPath({
+      clientId: "continue",
+      scope: "user",
+      os: "linux",
+      home,
+      clientEnv: { continueGlobalDir: "   " },
+    });
+    expect(blank.absolute).toBe(join(home, ".continue", "mcpServers", "yaw-mcp.json"));
+    expect(blank.display).toBe("~/.continue/mcpServers/yaw-mcp.json");
+  });
+
   it("treats an EMPTY CONTINUE_GLOBAL_DIR as unset, exactly as Continue's core does", () => {
     // paths.ts guards with `if (configPath)`, so "" falls through to
     // `path.join(os.homedir(), ".continue")`. Anything else would resolve an
@@ -512,7 +524,7 @@ describe("install creates the file it owns", () => {
     expect(result.exitCode).toBe(0);
     expect(read()).toBe(FRESH);
     expect(statSync(userFilePath()).mtimeMs).toBe(before);
-    expect(stdout).toContain("Nothing to do: Continue is already configured.");
+    expect(stdout).toContain("Nothing to do: Continue (user) is already configured.");
     // The note rides on a WRITE. Printing it over a no-op would tell the user
     // to reload a window for a change that did not happen.
     expect(stdout).not.toContain("Note: Continue's IDE extensions");

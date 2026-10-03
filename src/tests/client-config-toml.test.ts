@@ -245,12 +245,14 @@ describe("parse and classify", () => {
     // break. Measured against smol-toml 1.8.0.
     expect(read.line).toBe(2);
     expect(read.column).toBe(15);
-    expect(read.reason).toBe("control characters are not allowed in strings");
-    expect(read.detail).toBe("line 2, column 15: control characters are not allowed in strings");
+    // `detail` is the position-less reason, the core's own meaning of the
+    // field, so the adapter copies it; `positioned` carries the position.
+    expect(read.detail).toBe("control characters are not allowed in strings");
+    expect(read.positioned).toBe("line 2, column 15: control characters are not allowed in strings");
     expect(read.syntax).toBe("TOML");
     // The reason must NOT carry smol-toml's multi-line source excerpt: the
     // repo's refusals are one line.
-    expect(read.reason).not.toContain("\n");
+    expect(read.detail).not.toContain("\n");
   });
 
   it("throws TomlConfigError, not smol-toml's own error, with a one-line message", () => {
@@ -824,8 +826,6 @@ describe("upsert -- byte-exact", () => {
     ["f04-crlf-bom", "expected.toml", BROKER, [], "keeps the BOM and writes CRLF"],
     ["f05-identical", "expected.toml", BROKER, [], "rewrites an identical entry to the same bytes"],
     ["f06-codex-add-shape", "expected-repair.toml", BROKER, [], "adds the timeout to what codex mcp add wrote"],
-    ["f08-legacy", "expected.toml", BROKER, ["yaw-mcp"], "takes a legacy table's place"],
-    ["f08b-legacy-quoted", "expected.toml", BROKER, ["mcp.hosting"], "takes a quoted legacy table's place"],
     ["g01-mlbasic-header", "expected.toml", BROKER, [], "ignores a header inside a multi-line basic string"],
     ["g02-mlliteral-header", "expected.toml", BROKER, [], "ignores a header inside a multi-line literal string"],
     ["g03-quoted-ws-header", "expected.toml", BROKER, [], "replaces a whitespace-and-quoted header in place"],
@@ -846,10 +846,13 @@ describe("upsert -- byte-exact", () => {
     ["g23-string-structural", "expected.toml", BROKER, [], "replaces our table below a `[` inside single-line strings"],
     ["g24-indented", "expected.toml", BROKER, [], "replaces an INDENTED table, and keeps the sibling's indent"],
   ];
-  for (const [id, expectedFile, entry, legacy, what] of cases) {
+  // A legacy table's replacement (f08, f08b) is not an upsert option: install
+  // writes it as a `remove` edit beside the upsert, and target-codex-cli.test.ts
+  // pins those two fixtures' bytes through the write facade.
+  for (const [id, expectedFile, entry, , what] of cases) {
     it(`${id}: ${what}`, () => {
       const input = fixture(id, "input.toml");
-      const next = upsertTomlEntry(input, CONTAINER, ENTRY, entry, { replaceLegacy: legacy });
+      const next = upsertTomlEntry(input, CONTAINER, ENTRY, entry);
       expect(next).toBe(fixture(id, expectedFile));
       // Semantics, not just bytes: Codex must read back the entry we meant.
       expect(tomlEntryFields(readTomlConfig(next, CONTAINER), ENTRY)).toEqual(entryAsWritten(entry));
@@ -1078,14 +1081,14 @@ describe("round trip", () => {
 });
 
 describe("refusals -- the spellings a span splice will not edit", () => {
-  const shapes: Array<[string, string, RegExp, boolean]> = [
-    ["f09-inline", ENTRY, /an inline table under \[mcp_servers\] \(mcp = \{ \.\.\. \}\)/, false],
-    ["f16-dotted", ENTRY, /dotted keys at the top level/, false],
-    ["g14-dotted-in-container", ENTRY, /dotted keys under \[mcp_servers\]/, false],
-    ["g10-array-entry", ENTRY, /an array of tables/, true],
-    ["g09-inline-root", "sib", /inside the inline table mcp_servers = \{ \.\.\. \}/, false],
+  const shapes: Array<[string, string, RegExp]> = [
+    ["f09-inline", ENTRY, /an inline table under \[mcp_servers\] \(mcp = \{ \.\.\. \}\)/],
+    ["f16-dotted", ENTRY, /dotted keys at the top level/],
+    ["g14-dotted-in-container", ENTRY, /dotted keys under \[mcp_servers\]/],
+    ["g10-array-entry", ENTRY, /an array of tables/],
+    ["g09-inline-root", "sib", /inside the inline table mcp_servers = \{ \.\.\. \}/],
   ];
-  for (const [id, name, shape, removable] of shapes) {
+  for (const [id, name, shape] of shapes) {
     it(`${id}: refuses to rewrite it, and names the shape`, () => {
       const input = fixture(id, "input.toml");
       expect(() => upsertTomlEntry(input, CONTAINER, name, BROKER)).toThrow(TomlSpliceRefusal);
@@ -1096,10 +1099,13 @@ describe("refusals -- the spellings a span splice will not edit", () => {
       if (read.kind !== "unspliceable") return;
       expect(read.key).toBe(name);
       expect(read.shape).toMatch(shape);
-      expect(read.removable).toBe(removable);
       // Every refusal names an action. "Refuse" without a remedy is the
-      // failure mode this assertion exists to stop.
+      // failure mode this assertion exists to stop. And the action stands on
+      // its own: no refusal prints a preview beside it, so none may point at
+      // "the table below".
       expect(read.remedy).toMatch(/by hand|re-run/);
+      expect(read.remedy).not.toContain("below");
+      expect(read.fix).not.toContain("below");
     });
   }
 
@@ -1189,11 +1195,11 @@ describe("refusals -- the spellings a span splice will not edit", () => {
     expect(upsertTomlEntry(input, CONTAINER, ENTRY, BROKER)).not.toContain("tools");
   });
 
-  it("refuses a legacy entry in an unspliceable spelling rather than half-migrating", () => {
+  it("refuses to REMOVE a legacy entry in an unspliceable spelling, so a migration cannot half-happen", () => {
+    // Install migrates a legacy entry as a `remove` edit beside its upsert;
+    // the removal is where an inline spelling is refused, by name.
     const input = lf("[mcp_servers]", 'yaw-mcp = { command = "npx" }');
-    expect(() => upsertTomlEntry(input, CONTAINER, ENTRY, BROKER, { replaceLegacy: ["yaw-mcp"] })).toThrow(
-      /the "yaw-mcp" entry is an inline table/,
-    );
+    expect(() => removeTomlEntry(input, CONTAINER, "yaw-mcp")).toThrow(/the "yaw-mcp" entry is an inline table/);
   });
 });
 
@@ -1777,13 +1783,11 @@ describe("the line-shaped decisions around the edit", () => {
     expect(removeTomlEntry(raw, CONTAINER, ENTRY)).toBe(lf("[tui]", 'theme = "d"', "", "[other]", "k = 1"));
   });
 
-  it("sorts the edits, so a legacy table ABOVE ours is not applied out of order", () => {
-    // A migration writes two edits: replace ours, delete the legacy one. When
-    // the legacy table is EARLIER in the file the two are pushed in the wrong
-    // order, and only the sort in `applyEdits` saves it -- without it the
-    // overlap guard fires and the whole write is refused.
+  it("a legacy table ABOVE ours migrates as two splices, upsert then remove, to one table", () => {
+    // The pair install's write facade applies, in its order: replace ours in
+    // place, then delete the legacy table that sits EARLIER in the file.
     const raw = lf("[mcp_servers.yaw-mcp]", 'command = "legacy"', "", "[mcp_servers.mcp]", 'command = "old"');
-    const next = upsertTomlEntry(raw, CONTAINER, ENTRY, BROKER, { replaceLegacy: ["yaw-mcp"] });
+    const next = removeTomlEntry(upsertTomlEntry(raw, CONTAINER, ENTRY, BROKER), CONTAINER, "yaw-mcp");
     expect(next).toBe(
       lf("[mcp_servers.mcp]", 'command = "npx"', 'args = ["-y", "@yawlabs/mcp@latest"]', "startup_timeout_sec = 60.0"),
     );

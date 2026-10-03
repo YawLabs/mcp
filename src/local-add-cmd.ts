@@ -1,7 +1,7 @@
 // `yaw-mcp add <slug>` / `remove <slug>` / `list`
 //
 // These manage the LOCAL server set in ~/.yaw-mcp/bundles.json -- the file
-// yaw-mcp loads in no-account (Free) mode. This is deliberately distinct from
+// yaw-mcp loads its servers from. This is deliberately distinct from
 // `yaw-mcp install <client>`, which wires the yaw-mcp aggregator INTO an AI
 // client's config. "install" connects a client; "add" adds a server.
 //
@@ -17,7 +17,7 @@
 
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { CATALOG_SLUG_RE, type FetchCatalog, resolveCatalogSlug, tokenizeCommand } from "./catalog.js";
+import { CATALOG_SLUG_RE, ENV_KEY_RE, type FetchCatalog, resolveCatalogSlug, tokenizeCommand } from "./catalog.js";
 import { readClientEnv } from "./client-config.js";
 import { probeClientsAsync } from "./doctor-cmd.js";
 import { type GradesCache, readGradesCache } from "./grades-cache.js";
@@ -38,6 +38,8 @@ import {
   namespacesForStoredIdentity,
   previewUpsertUserBundle,
   removeUserBundle,
+  STORED_TARGET_RE,
+  type UpsertOrigin,
   upsertUserBundle,
 } from "./local-bundles.js";
 import { createStreamWriter } from "./logger.js";
@@ -58,10 +60,11 @@ export const ADD_USAGE = `Usage: yaw-mcp add <slug> [flags]
        yaw-mcp add <name> --command "<launch line>" [flags]
        yaw-mcp add <name> --url <https://...> [flags]
 
-  Add an MCP server to your local ~/.yaw-mcp/bundles.json so yaw-mcp loads it
-  (no account needed). With neither --command nor --url, <slug> is resolved
+  Add an MCP server to the local server set in ~/.yaw-mcp/bundles.json so
+  yaw-mcp loads it. With neither --command nor --url, <slug> is resolved
   from the yaw.sh/mcp catalog; with either, you are defining the server
-  yourself and no catalog is fetched -- so this also works offline.
+  yourself and no catalog is fetched -- so this also works offline, and
+  --catalog is refused beside them (there is nothing for it to point at).
 
   This is NOT the same as \`yaw-mcp install\` -- install wires the yaw-mcp
   aggregator into an AI client; add adds an MCP server to yaw-mcp itself.
@@ -84,8 +87,10 @@ export const ADD_USAGE = `Usage: yaw-mcp add <slug> [flags]
   --env KEY=value   Provide a required env var's value. Repeatable. Required
                     vars not given here AND not in your shell block the add.
                     The value lands in your shell history and process argv
-                    like any argument, and is stored in plain text (file mode
-                    0600) in bundles.json. For a real credential, store it
+                    like any argument, and is stored in plain text in
+                    bundles.json (file mode 0600 on macOS/Linux; on Windows
+                    the file is only as private as your user profile's
+                    ACL). For a real credential, store it
                     with \`yaw-mcp secrets set NAME\` and pass
                     --env KEY='\${secret:NAME}' instead: the vault resolves it
                     at launch and only the reference is written. The single
@@ -135,7 +140,10 @@ function parseEnvFlag(v: string | undefined, bag: Record<string, string>): strin
   if (!v?.includes("=")) return "--env requires KEY=value";
   const eq = v.indexOf("=");
   const key = v.slice(0, eq);
-  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) return `--env: invalid KEY "${key}"`;
+  // ENV_KEY_RE is the one definition of "a shell identifier" -- shared with
+  // `set env.KEY=` and with the catalog's requiredEnv filter, so the three
+  // surfaces that write an env key agree on what one is.
+  if (!ENV_KEY_RE.test(key)) return `--env: invalid KEY "${key}"`;
   bag[key] = v.slice(eq + 1);
   return null;
 }
@@ -279,6 +287,16 @@ export function parseAddArgs(
   if (opts.transport !== undefined && opts.url === undefined) {
     return { ok: false, error: "--transport applies to a remote server: pass --url." };
   }
+  // Same rule for --catalog in the other direction: a --command / --url add
+  // fetches no catalog, so a --catalog beside it was accepted and did nothing
+  // -- and a user who passed it to point a custom add at a private catalog
+  // had no way to learn the override never ran.
+  if (opts.catalogUrl !== undefined && custom) {
+    return {
+      ok: false,
+      error: "--catalog applies to a catalog add: with --command or --url no catalog is fetched, so drop it.",
+    };
+  }
   if (Object.keys(env).length > 0) {
     if (opts.url !== undefined) {
       // Not a style preference: upstream.ts ignores `env` on a remote entry
@@ -343,7 +361,30 @@ function jsonEntry(entry: Partial<UpstreamServerConfig>): Record<string, unknown
  *  and this test is the same for both. */
 function ambientOnlyKeys(keys: string[], entry: Partial<UpstreamServerConfig>, env: NodeJS.ProcessEnv): string[] {
   const stored = (entry.env ?? {}) as Record<string, string>;
-  return keys.filter((k) => (stored[k] ?? "").trim() === "" && (env[k] ?? "").trim() !== "");
+  return keys.filter((k) => (stored[k] ?? "").trim() === "" && (readEnvVar(env, k) ?? "").trim() !== "");
+}
+
+/** The shell's value for `key`, with the platform's own case rule. Windows
+ *  environment variables are case-insensitive, and process.env mirrors that
+ *  (`process.env.Path` and `process.env.PATH` are one variable) -- but a
+ *  plain object built by spreading it is not, so a gate that spread
+ *  `{ ...env, ...overrides }` and read `supplied[k]` refused a required
+ *  `GITHUB_TOKEN` that the shell held as `Github_Token`, while the
+ *  ambient-env note right after it (reading process.env directly) called the
+ *  same var present. One lookup, used by every reader of the shell env in
+ *  this file, so the gate and the notes cannot disagree about one variable.
+ *  Exact on POSIX, where the two spellings really are two variables. */
+function readEnvVar(
+  env: NodeJS.ProcessEnv,
+  key: string,
+  platform: NodeJS.Platform = process.platform,
+): string | undefined {
+  if (platform !== "win32") return env[key];
+  const wanted = key.toUpperCase();
+  for (const [k, v] of Object.entries(env)) {
+    if (k.toUpperCase() === wanted) return v;
+  }
+  return undefined;
 }
 
 /** Optional keys the entry carries EMPTY that the shell does not set either:
@@ -353,7 +394,7 @@ function ambientOnlyKeys(keys: string[], entry: Partial<UpstreamServerConfig>, e
  *  entry whose optional value was filled since must not call it unset. */
 function unsetOptionalKeys(keys: string[], entry: Partial<UpstreamServerConfig>, env: NodeJS.ProcessEnv): string[] {
   const stored = (entry.env ?? {}) as Record<string, string>;
-  return keys.filter((k) => (stored[k] ?? "").trim() === "" && (env[k] ?? "").trim() === "");
+  return keys.filter((k) => (stored[k] ?? "").trim() === "" && (readEnvVar(env, k) ?? "").trim() === "");
 }
 
 /** The dry run's `env keys:` line, with each optional key marked. The seeded
@@ -618,6 +659,9 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
   // The same shape gates both modes: it is a catalog slug in one and the name
   // of a server you are defining in the other, and lowercase-dashes suits both.
   const custom = opts.command !== undefined || opts.url !== undefined;
+  // Told to the write path so a collision refusal does not call a hand-typed
+  // name a "catalog server" (see UpsertOrigin).
+  const origin: UpsertOrigin = custom ? "custom" : "catalog";
   if (!CATALOG_SLUG_RE.test(slug)) {
     const what = custom ? "name" : "slug";
     printErr(`yaw-mcp add: invalid ${what} "${slug}" (lowercase letters, digits, and dashes only).`);
@@ -697,6 +741,10 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
         // normalizeCatalogUrl in catalog.ts for why that guard lives there.
         catalogUrl: opts.catalogUrl ?? env.YAW_MCP_CATALOG_URL,
         fetchCatalog: opts.fetchCatalog,
+        // The staleness note goes to THIS command's stderr writer, not the
+        // process's: an embedded caller that captured `err` otherwise saw the
+        // note escape to the real terminal.
+        warn: printErr,
       });
     } catch (e) {
       printErr(`yaw-mcp add: ${(e as Error).message}`);
@@ -720,13 +768,18 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
   // to add -- the contradiction the flag exists to remove. The refusal still
   // NAMES the optional vars, apart and marked, because this is the one place
   // the user sees what the server takes before the write happens.
-  const supplied = { ...env, ...(opts.envOverrides ?? {}) } as Record<string, string | undefined>;
+  //
+  // --env first, then the shell -- through readEnvVar, the same lookup the
+  // ambient-env notes use, so the gate and the notes agree on whether a var is
+  // present (on Windows that means case-insensitively; see readEnvVar).
+  const overrides = opts.envOverrides ?? {};
+  const supplied = (k: string): string => overrides[k] ?? readEnvVar(env, k) ?? "";
   // Trim before the emptiness test so a whitespace-only value (FOO=" ") counts
   // as missing instead of slipping through and persisting a blank-ish secret to
   // bundles.json -- matching the required-env gate in runTry (try-cmd.ts).
   // Named by FUNCTION, not line: the line number this used to cite drifted into
   // an unrelated helper two refactors later.
-  const missing = server.requiredEnvKeys.filter((k) => (supplied[k] ?? "").trim() === "");
+  const missing = server.requiredEnvKeys.filter((k) => supplied(k).trim() === "");
   if (missing.length > 0) {
     printErr(`yaw-mcp add: ${server.name} needs the following env var(s) before it can run:`);
     for (const k of missing) printErr(`  - ${k}`);
@@ -830,7 +883,7 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
     // the real write path's resolution logic, so the two cannot drift.
     let preview: Awaited<ReturnType<typeof previewUpsertUserBundle>>;
     try {
-      preview = await previewUpsertUserBundle(entry, { home });
+      preview = await previewUpsertUserBundle(entry, { home, origin });
     } catch (e) {
       // Same unreadable-file failure the real run surfaces -- including its
       // de-duplicated path (see nameBundlesFileOnce).
@@ -936,7 +989,7 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
 
   let res: Awaited<ReturnType<typeof upsertUserBundle>>;
   try {
-    res = await upsertUserBundle(entry, { home });
+    res = await upsertUserBundle(entry, { home, origin });
   } catch (e) {
     // The collision refusal quotes the STORED entry's name and slug -- fields
     // out of bundles.json -- so it is re-rendered through displaySafe rather
@@ -966,10 +1019,10 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
   const written = res.entry;
   const finalNamespace = typeof written.namespace === "string" ? written.namespace : namespace;
 
-  // A slug-less stored entry (app-written, pre-0.76 CLI) merges even when
-  // the launch command differs -- identity is unknowable without the slug,
-  // and refusing would break re-add-to-refresh. The swap must never be
-  // SILENT though: name what changed, on stderr so it survives --json.
+  // A merge that replaced the launch shape -- a slug-less app-written entry
+  // refreshed from the catalog, a catalog entry overwritten by `add <name>
+  // --command`, or the reverse. The swap must never be SILENT: name what
+  // changed, on stderr so it survives --json.
   if (res.launchChanged) {
     printErr(
       `Note: the entry's launch command changed:\n${renderLaunchChange(res.launchChanged)}\nIf the previous entry was a different server you meant to keep, restore it from the app or edit bundles.json.`,
@@ -1046,18 +1099,6 @@ export const REMOVE_USAGE = `Usage: yaw-mcp remove <slug-or-namespace> [--force]
   --force, -y, --yes  Skip the confirmation. Required when stdin or stdout
                       is not a TTY (there is nothing to ask on).`;
 
-// slug (dashes) or namespace (underscores) shape -- the two forms a user might
-// pass to remove.
-//
-// Deliberately NOT case-insensitive. Both lookups downstream are exact and
-// case-sensitive (namespacesForStoredSlug compares `slug === target`,
-// removeUserBundle filters on the exact namespace) and both stored forms are
-// lowercase by construction (CATALOG_SLUG_RE is lowercase-only; deriveNamespace
-// lowercases). An /i here therefore accepted `remove GA`, matched nothing, and
-// exited 0 with "nothing to do" -- while `add GA` is rejected at the gate. Same
-// input, opposite verdicts. Reject it here so the two verbs agree.
-const REMOVE_TARGET_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
-
 export interface RemoveCommandOptions {
   target?: string;
   /** Skip the destructive-action confirmation. Required off a TTY. */
@@ -1100,7 +1141,7 @@ export function parseRemoveArgs(
     // Single dash included, not just "--": now that -y is a real flag, a
     // mistyped short flag must be reported as an unknown flag instead of
     // becoming the removal TARGET. (No valid target starts with "-";
-    // REMOVE_TARGET_RE requires a leading alphanumeric.)
+    // STORED_TARGET_RE requires a leading alphanumeric.)
     if (a.startsWith("-")) return { ok: false, error: `Unknown flag: ${a}\n${REMOVE_USAGE}` };
     positional.push(a);
   }
@@ -1223,12 +1264,6 @@ function findRemovalTarget(candidates: string[], servers: unknown[] | null): Rem
   return null;
 }
 
-// The slug/name lookup this used to spell inline is namespacesForStoredIdentity
-// (local-bundles.ts), shared with `set` so the two verbs resolve one target the
-// same way. It reads the same raw servers array the removal preview does
-// (readRawServers); an absent, unreadable or malformed file yields [] and
-// leaves the existing miss / parse-error paths to report themselves.
-
 /** How the entry would be launched, as one reviewable line. Mirrors
  *  trust-cmd's renderLaunch, but reads an UNVALIDATED raw entry (see
  *  findRemovalTarget) so every field is type-checked before use. The
@@ -1313,7 +1348,7 @@ export async function runRemove(opts: RemoveCommandOptions): Promise<AddCommandR
 
   // The shape gate runs AFTER the identity lookup, not before it, and that
   // ordering is the whole of the name feature: a display name can hold spaces,
-  // capitals and dots, none of which REMOVE_TARGET_RE admits, so checking
+  // capitals and dots, none of which STORED_TARGET_RE admits, so checking
   // first refused every imported server by the only name its owner has been
   // shown. It is demoted, not deleted -- a target that no stored entry answers
   // to is still a usage error (exit 2), which is what keeps `remove GA` from
@@ -1322,7 +1357,7 @@ export async function runRemove(opts: RemoveCommandOptions): Promise<AddCommandR
   // The read above cannot report a target as valid on a file it could not
   // parse (byIdentity is [] then), so a malformed bundles.json still reaches
   // the write path below and surfaces its own parse error.
-  if (byIdentity.length === 0 && !REMOVE_TARGET_RE.test(opts.target)) {
+  if (byIdentity.length === 0 && !STORED_TARGET_RE.test(opts.target)) {
     printErr(
       `yaw-mcp remove: "${displaySafe(opts.target)}" isn't a valid slug or namespace (lowercase letters, digits, dashes and underscores only), and no configured server carries that name.`,
     );

@@ -45,7 +45,8 @@ const USAGE =
   "upgrade leaves behind when it deletes the directory the entry named.\n" +
   "Only an entry yaw-mcp wrote AND that is currently broken is touched.\n" +
   "\n" +
-  "  --json      Machine-readable result\n" +
+  "  --json      Machine-readable result: { healed, unhealable, failed, count, dryRun };\n" +
+  "              with --dry-run, `healed` and `count` are what WOULD be re-pointed\n" +
   "  --dry-run   Report what would change; write nothing\n" +
   "  --quiet     No human transcript\n";
 
@@ -67,7 +68,10 @@ export function parseHealArgs(
 }
 
 function describe(h: HealedEntry): string {
-  return `  ${h.clientId} (${h.scope}): ${h.path}\n    was -> ${h.from}\n    now -> ${h.to}`;
+  const lines = [`  ${h.clientId} (${h.scope}): ${h.path}`, `    was -> ${h.from}`, `    now -> ${h.to}`];
+  // install's own caveat when it writes the same path (see HealedEntry.note).
+  if (h.note !== undefined) lines.push(`    Note: ${h.note}`);
+  return lines.join("\n");
 }
 
 /** The stderr block for the stale entries this run could not re-point: which
@@ -118,9 +122,16 @@ export async function runHeal(
   };
 
   if (options.json === true) {
-    // `failed` is new; the other four fields keep their meaning (`count` is
-    // still repairs only), so a reader that knows only those reads what it
-    // always did.
+    // THE JSON SHAPE: `healed`, `unhealable`, `failed`, `count`, `dryRun`.
+    // `count` is `healed.length`, and `healed` under `dryRun: true` is the
+    // entries the run WOULD re-point -- nothing was written. So a reader that
+    // wants "repairs that landed" reads `count` only when `dryRun` is false;
+    // the two fields together are what makes `--dry-run --json` and a live
+    // `--json` distinguishable, since the entry lists are otherwise identical
+    // for the same files. A `healed` entry carries `note` only when its new
+    // path is a project-local install (see HealedEntry.note). `failed` is the
+    // newest field; the others keep their meaning, so a reader that knows
+    // only those reads what it always did.
     process.stdout.write(
       `${JSON.stringify({ healed, unhealable, failed, count: healed.length, dryRun: options.dryRun === true }, null, 2)}\n`,
     );

@@ -354,6 +354,28 @@ describe("acquireSidecarsLock", () => {
     expect(statSync(lock).mtimeMs - taken).toBeGreaterThanOrEqual(3 * SIDECAR_LOCK_HEARTBEAT_MS - 1000);
     release?.();
   });
+
+  it("stops the heartbeat once the file at the lock path is no longer this process's", () => {
+    // The heartbeat touched the PATH; the lock is the inode. Stolen as stale
+    // and retaken by another process, the path holds THAT process's lock --
+    // and a blind touch would keep the thief's lock fresh for as long as this
+    // holder lived, making it unstealable in turn. The touch has to verify
+    // the pid it wrote is still the one on disk.
+    vi.useFakeTimers();
+    const release = acquireSidecarsLock(dir);
+    expect(release).not.toBeNull();
+    const lock = join(dir, SIDECARS_LOCK_NAME);
+    // Another process's lock under our path (a pid that is not ours).
+    writeFileSync(lock, `${process.pid + 100000}\n`);
+    const foreign = statSync(lock).mtimeMs;
+
+    vi.advanceTimersByTime(3 * SIDECAR_LOCK_HEARTBEAT_MS);
+
+    expect(statSync(lock).mtimeMs, "a foreign lock must not be kept warm").toBe(foreign);
+    // And the ownership-checked release leaves it alone too.
+    release?.();
+    expect(existsSync(lock)).toBe(true);
+  });
 });
 
 describe("parseSidecarsArgs", () => {
@@ -370,6 +392,16 @@ describe("parseSidecarsArgs", () => {
     const bad = parseSidecarsArgs(["install", "--wat"]);
     expect(bad).toMatchObject({ ok: false });
     expect((bad as { error: string }).error).toContain("--wat");
+  });
+
+  it("refuses a repeated `install` rather than parsing it as one", () => {
+    // `sidecars install install` used to be accepted: the second positional
+    // only re-set a boolean. A doubled verb is a mis-pasted command line, and
+    // the parser refuses every other unexpected positional.
+    const twice = parseSidecarsArgs(["install", "install"]);
+    expect(twice).toMatchObject({ ok: false });
+    expect((twice as { error: string }).error).toContain('"install" given twice');
+    expect(parseSidecarsArgs(["install", "--json", "install"])).toMatchObject({ ok: false });
   });
 });
 

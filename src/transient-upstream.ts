@@ -86,6 +86,16 @@ export async function withTransientUpstream<T>(
   try {
     return await use(connection);
   } finally {
+    // COST, for anyone chasing "one call through read_tool / `yaw-mcp call`
+    // is slow": this disconnect is the SDK's STAGED stdio close
+    // (StdioClientTransport.close) -- end the child's stdin and wait up to 2s
+    // for it to exit, then SIGTERM and up to 2s more, then SIGKILL. A child
+    // that ignores stdin EOF, which many npx-launched servers do, therefore
+    // charges every transient connect ~4s of teardown on top of its boot.
+    // Nothing here can shorten that without reaching into the SDK's timers,
+    // and the session path never notices because it closes once per server
+    // rather than once per call.
+    //
     // Belt and braces: disconnectFromUpstream already catches its own close
     // failure and logs a warn (upstream.ts), so this catch fires only if it
     // ever grows a throwing path. It is cheap, and the cost of getting it

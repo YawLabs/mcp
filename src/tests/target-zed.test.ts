@@ -298,7 +298,18 @@ describe("where zed keeps its settings", () => {
     expect(abs.absolute).toBe(join("/xdg", "zed", "settings.json"));
     expect(abs.display).toBe("$XDG_CONFIG_HOME/zed/settings.json");
 
-    for (const relative of ["conf", "./conf", ""]) {
+    // Trimmed before the absolute test, the way the Cline row trims its
+    // variables: a padded absolute value is still the redirect it names.
+    const padded = resolveInstallPath({
+      clientId: "zed",
+      scope: "user",
+      os: "linux",
+      home: HOME,
+      clientEnv: { xdgConfigHome: " /xdg " },
+    });
+    expect(padded.absolute).toBe(join("/xdg", "zed", "settings.json"));
+
+    for (const relative of ["conf", "./conf", "", "   "]) {
       const r = resolveInstallPath({
         clientId: "zed",
         scope: "user",
@@ -450,7 +461,7 @@ describe("installing into Zed's verbatim default template", () => {
 
     const again = await install();
     expect(again.exitCode, again.stderr).toBe(0);
-    expect(again.stdout).toContain("Nothing to do: Zed is already configured.");
+    expect(again.stdout).toContain("Nothing to do: Zed (user) is already configured.");
     expect(readFileSync(path, "utf8")).toBe(first);
     const after = statSync(path);
     expect(after.size).toBe(stamp.size);

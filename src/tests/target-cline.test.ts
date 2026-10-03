@@ -422,6 +422,25 @@ describe("cline resolves one (client, scope) to a shared file plus a site per ed
     const blank = machine("linux", { clineDataDir: "   " });
     expect(sitesOf(blank)[0].resolved.absolute).toBe(join(blank.home, ".cline", "data", "settings", SETTINGS_FILE));
 
+    // A RELATIVE value is resolved against the process cwd, as Cline's own
+    // `path.resolve` does and as the Codex, Continue and typed rows do with
+    // theirs. Used verbatim it made `absolute` relative, and every consumer
+    // then stat-ed it against its own cwd. `process.cwd()` is spelled out so
+    // the expectation does not go through the function under test.
+    expect(shared({ clineMcpSettingsPath: "rel/file.json" }).resolved.absolute).toBe(
+      join(process.cwd(), "rel", "file.json"),
+    );
+    expect(shared({ clineDataDir: "data" }).resolved.absolute).toBe(
+      join(process.cwd(), "data", "settings", SETTINGS_FILE),
+    );
+    expect(shared({ clineDir: "./cline" }).resolved.absolute).toBe(
+      join(process.cwd(), "cline", "data", "settings", SETTINGS_FILE),
+    );
+    // And the display follows the resolved path, since that is the file.
+    expect(shared({ clineDataDir: "data" }).resolved.display).toBe(
+      join(process.cwd(), "data", "settings", SETTINGS_FILE),
+    );
+
     // An env-directed path is shown verbatim: a `~` spelling would hide the
     // redirect that moved the file.
     expect(shared({ clineDataDir: "/data" }).resolved.display).toBe(join("/data", "settings", SETTINGS_FILE));

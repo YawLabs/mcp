@@ -503,7 +503,7 @@ function logInstallTail(
  *  the two surfaces drifted into disagreeing about where claude-desktop's
  *  config lives on Windows -- install wrote the real one while --list reported
  *  the HOME-derived one. */
-function resolveAppData(opts: InstallCommandOptions): string | undefined {
+function resolveAppData(opts: { appData?: string; home?: string }): string | undefined {
   return resolveAppDataDir({ appData: opts.appData, home: opts.home });
 }
 
@@ -684,7 +684,7 @@ export function describeUnreadableConfig(cmd: string, path: string, err: unknown
  *  itself is read from the table, never restated here. */
 export function clientUnavailableMessage(
   cmd: string,
-  target: (typeof INSTALL_TARGETS)[number],
+  target: InstallTarget,
   os: InstallOS,
   genericFix: string,
 ): string {
@@ -892,7 +892,7 @@ export function resolveInstallSite(
       scope,
       os,
       home: opts.home,
-      appData: resolveAppDataDir({ appData: opts.appData, home: opts.home }),
+      appData: resolveAppData(opts),
       projectDir,
       claudeConfigDir: opts.claudeConfigDir,
       // A MODULAR row resolves its own path from these (Zed's
@@ -1015,6 +1015,19 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   const selectedSites = selectSites(plan.sites);
   const site = selectedSites[0];
   const extraSites = selectedSites.slice(1);
+  // `selectedSites[0]` is a bare index, so `site` is `undefined` for a row
+  // whose every declared site is conditional and none of whose detect dirs
+  // exist. No row declares such a set today (each keeps one `detectDir: null`
+  // site first, and a row without a `sites` hook has exactly one), so this is
+  // a named refusal for a row that might -- not a TypeError deep in the read
+  // below, over a `.resolved` of undefined, that names no client and no file.
+  if (site === undefined) {
+    err(
+      `yaw-mcp install: ${target.label} (${scope}) has no config file on this machine -- none of the copies ` +
+        "the row declares belongs to an installed editor, so there is nothing to write into.",
+    );
+    return { written: [], wouldWrite: [], messages, exitCode: 1 };
+  }
   /** `projects[...]` keys that name THIS project with the other drive-letter
    *  case and already carry yaw-mcp wiring. Reported, never written to -- see
    *  claudeCodeContainerPaths for why install adds rather than migrates. */
@@ -1099,6 +1112,23 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     err(
       `yaw-mcp install: the "${read.key}" entry in ${resolved.absolute} is ${read.reason}, which install will not edit -- ` +
         `refusing to overwrite it; ${unspliceableFix(read)}, then re-run.`,
+    );
+    return { written: [], wouldWrite: [], messages, exitCode: 1 };
+  }
+  // A container key that already holds a non-object this run will NOT repair
+  // (a non-empty array, a string -- a shape that can carry real server
+  // definitions, see `blocked.reparable`) is a refusal of the same class as
+  // the one above, and it is made HERE, beside it, for the same reason: every
+  // path through this run ends in it (the read carries no entries, so `--skip`
+  // never sees one to leave, and the entry can never read as identical), so
+  // nothing printed between here and the write is true. It used to sit at the
+  // write itself, AFTER the buffered Runtime lines were flushed and after the
+  // kept-root-default Notes -- "Runtime: will run on oam" over an entry that
+  // was then refused. The REPARABLE shape (an empty array, null) stays with
+  // the write, where the repair is planned as the first edit.
+  if (read.kind === "blocked" && !read.reparable) {
+    err(
+      `yaw-mcp install: "${read.path.join(".")}" in ${resolved.absolute} is ${read.shape}, not ${containerNounFor(view.adapter.syntax)} -- refusing to overwrite it; ${blockedContainerFix("re-run", view.adapter.syntax)}.`,
     );
     return { written: [], wouldWrite: [], messages, exitCode: 1 };
   }
@@ -1483,12 +1513,10 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     else if (opts.promptAnswer === "skip") {
       // The test seam's third answer. `--skip` itself short-circuits far
       // above (before the oam probe), so this is the only route left to a
-      // prompt answered "skip" -- and it must land on the same message.
-      log(
-        opts.dryRun
-          ? `Would leave existing "${ENTRY_NAME}" entry untouched (--skip). Nothing to do.`
-          : `Existing "${ENTRY_NAME}" entry left untouched. Nothing to do.`,
-      );
+      // prompt answered "skip" -- and it must land on the same message. Never
+      // under --dry-run: the branch above maps a dry run to "overwrite"
+      // before this one is reached, so there is no "Would leave" spelling.
+      log(`Existing "${ENTRY_NAME}" entry left untouched. Nothing to do.`);
       return { written: [], wouldWrite: [], messages, exitCode: 0 };
     } else if (opts.promptAnswer) decision = opts.promptAnswer;
     else if (opts.io?.isTTY ?? (Boolean(process.stdin.isTTY) && Boolean(process.stdout.isTTY))) {
@@ -1700,16 +1728,12 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     // Settled BEFORE the write: a repair has to be the first edit, and one is
     // always enough because every deeper segment is necessarily absent
     // afterwards and the upsert materialises it.
+    // Only the REPARABLE shape reaches here: the non-reparable one was refused
+    // up beside the unspliceable refusal, before anything was printed about
+    // a write.
     if (read.kind === "blocked") {
-      const keyPath = read.path.join(".");
-      if (!read.reparable) {
-        err(
-          `yaw-mcp install: "${keyPath}" in ${resolved.absolute} is ${read.shape}, not ${containerNounFor(view.adapter.syntax)} -- refusing to overwrite it; ${blockedContainerFix("re-run", view.adapter.syntax)}.`,
-        );
-        return { written: [], wouldWrite: [], messages, exitCode: 1 };
-      }
       edits.push({ op: "repair", path: read.path });
-      repairedContainer = { keyPath, shape: read.shape };
+      repairedContainer = { keyPath: read.path.join("."), shape: read.shape };
     }
     // Identical entry with a legacy key to trim: the only edit is the removal,
     // so the entry's own bytes are left exactly where the user (or a previous
@@ -1835,16 +1859,9 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   // read below: the dry-run preview, the already-configured no-op and a real
   // write all reach it, and each of them leaves an entry that program would
   // not load. Keyed on the row's `programProbe`, never on its id.
-  const staleProgram = await staleProgramWarning({
-    clientId: target.clientId,
-    scope,
-    os,
-    home,
-    appData: resolveAppData(opts),
-    projectDir,
-    claudeConfigDir: opts.claudeConfigDir,
-    clientEnv: opts.clientEnv,
-  });
+  // `rowArgs` is the resolve the plan was made with, so the probe looks where
+  // the row's own path did rather than at a second spelling of the same args.
+  const staleProgram = await staleProgramWarning({ clientId: target.clientId, scope, ...rowArgs });
   if (staleProgram !== null) err(`yaw-mcp install: warning -- ${staleProgram}`);
 
   // Read AFTER every refusal above, for the same reason the oam probe is: a
@@ -2170,12 +2187,18 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   // to react to an edit that did not happen -- the same class of untrue claim
   // the buffered Runtime lines avoid.
   if (written.length === 0) {
-    log(`\nNothing to do: ${target.label} is already configured.`);
+    // The dry-run preview's spelling, scope included: one line for a script to
+    // match whichever path a no-op took.
+    log(`\nNothing to do: ${target.label} (${scope}) is already configured.`);
     return { written, wouldWrite: [], messages, exitCode: 0 };
   }
   if (target.notes) log(`Note: ${target.notes}`);
   // Only over a grant that is actually in the file: already there, or written
   // by this run. A patch that was skipped or failed printed its own warning.
+  // `scopedGrantNote` is only ever non-null when `primaryPatch` is (it is
+  // composed from the patch's path, see where it is planned), so the note's
+  // own check is the whole condition; the second clause is there to narrow
+  // the type, not because it can be false on its own.
   if (scopedGrantNote !== null && primaryPatch !== null) {
     if (!primaryPatch.changed || written.includes(primaryPatch.path)) log(scopedGrantNote);
   }
@@ -2392,6 +2415,14 @@ async function staleProgramWarning(opts: ResolvePathOptions): Promise<string | n
   if (probe === null) return null;
   let bytes: Buffer;
   try {
+    // The WHOLE file, on every run that reaches the warning -- the dry-run
+    // preview and the already-configured no-op included, since each leaves an
+    // entry the program would not load. For typed that is its CLI bundle, a
+    // few MB, read once per `install typed`. Not skipped on the no-op path on
+    // purpose: the warning is about the program, not about this run's write,
+    // and a user re-running install after `typed update` is exactly who needs
+    // it to fire again. A marker can sit anywhere in the bytes, so a partial
+    // read would be a guess.
     bytes = await readFile(probe.file);
   } catch {
     return null;
@@ -2885,7 +2916,12 @@ export function parseInstallArgs(argv: string[]):
       case "--help":
         return { ok: true, options: { helpRequested: true } as InstallCommandOptions };
       default:
-        if (a.startsWith("--")) return { ok: false, error: `Unknown flag: ${a}\n${USAGE}` };
+        // Single dash included, as parseUninstallArgs refuses it: `-h` is a
+        // real flag here, so a mistyped short one (`-f`, `-x`) must be
+        // reported rather than become the client argument and be refused as
+        // "Unknown client: -x" -- a message that sends the user to the client
+        // list for a typo in a flag.
+        if (a.startsWith("-")) return { ok: false, error: `Unknown flag: ${a}\n${USAGE}` };
         positional.push(a);
     }
   }
@@ -2925,8 +2961,19 @@ export function parseInstallArgs(argv: string[]):
     // read-only, and the cross-OS guard above documents `--os <other>
     // --dry-run` as the preview spelling, so refusing it would break a
     // combination this parser advertises.
-    if (opts.listOnly && (opts.force || opts.skip)) {
-      const flag = opts.force ? "--force" : "--skip";
+    // All FOUR write-decision flags: --repair and --keep-legacy are decisions
+    // about the write too, and were the two this guard let through.
+    const dropped = opts.force
+      ? "--force"
+      : opts.skip
+        ? "--skip"
+        : opts.repair
+          ? "--repair"
+          : opts.keepLegacy
+            ? "--keep-legacy"
+            : null;
+    if (opts.listOnly && dropped !== null) {
+      const flag = dropped;
       return {
         ok: false,
         error: `yaw-mcp install: --list never writes a file, so it cannot honor ${flag}. Drop ${flag}, or install the client you want.\n${USAGE}`,
@@ -3299,11 +3346,12 @@ function displayPath(abs: string, home: string, os: InstallOS): string {
  *  this OS (user scope where supported), naming any it skips -- including a
  *  client that ships here but has no documented path for the config file
  *  yaw-mcp writes (`notConfigurableOn`). For clients without a user scope,
- *  falls back to the first non-project scope; clients that ONLY have project
- *  scopes (vscode) are included just when --project-dir is passed, otherwise
- *  skipped. Mirrors the per-client run behavior: prompts and
- *  --force/--repair/--skip propagate, so `--all --force` drops each entry's
- *  env exactly as a per-client --force does.
+ *  falls back to the first scope that needs no project directory; a client
+ *  with ONLY project-dir scopes is skipped and named, because the parser
+ *  refuses `--all --project-dir` (every row carries a user scope today, so
+ *  no client is skipped on that ground). Mirrors the per-client run
+ *  behavior: prompts and --force/--repair/--skip propagate, so `--all --force`
+ *  drops each entry's env exactly as a per-client --force does.
  *
  *  Exit code, aggregated from the per-client results:
  *    0  every planned client succeeded -- written, already correct, or left
@@ -3323,7 +3371,11 @@ async function runInstallAll(
   messages: string[],
 ): Promise<InstallResult> {
   const os = opts.os ?? CURRENT_OS;
-  const targets = (opts.targets ?? INSTALL_TARGETS).filter((t) => t.availableOn.includes(os));
+  // ONE table for the whole run: `opts.targets` is the test seam that narrows
+  // it, and the skip report below has to read the same table the plans do,
+  // or a narrowed run names a client it was never asked about.
+  const table = opts.targets ?? INSTALL_TARGETS;
+  const targets = table.filter((t) => t.availableOn.includes(os));
   if (targets.length === 0) {
     err(`yaw-mcp install --all: no installable clients on ${os}.`);
     // `messages`, not [] -- the err() above (and any deprecation warning
@@ -3331,24 +3383,27 @@ async function runInstallAll(
     return { written: [], wouldWrite: [], messages, exitCode: 1 };
   }
 
-  // Pick one scope per client: user where supported, else the first
-  // non-project-dir scope. Clients that ONLY have project-dir scopes
-  // (vscode) are included only when --project-dir was passed.
-  // `usesProjectDir` rides along per plan because runInstall now REFUSES a
-  // --project-dir the resolved scope would silently drop. Under `--all
-  // --project-dir` most plans are user-scoped and only the project-only client
-  // reads the flag, so each sub-install is handed just the flags its own scope
-  // consults (see the recursion below).
+  // Pick one scope per client: user where supported, else the first scope
+  // that needs no project directory. A client with ONLY project-dir scopes is
+  // skipped and named: the parser refuses `--all --project-dir`, so there is
+  // no flag that could pull it in (the branch that once did, when vscode had
+  // only workspace scopes, was unreachable and is gone).
+  // `usesProjectDir` rides along per plan because runInstall REFUSES a
+  // --project-dir the resolved scope would silently drop: each sub-install is
+  // handed the flag only when its own scope consults it (see the recursion
+  // below). Derived from the scope spec, not asserted false, so a user scope
+  // that came to need one would be handed it.
   type Plan = { clientId: InstallClientId; scope: InstallScope; usesProjectDir: boolean };
   const plans: Plan[] = [];
   const skipped: Array<{ clientId: InstallClientId; reason: string }> = [];
   // A client that ships on this OS but that yaw-mcp cannot configure is named
   // rather than silently left out: on a Linux box running the Claude Desktop
-  // beta, `--all` otherwise reads as having forgotten it. No availableOn
-  // check: a reason is only ever recorded for an OS missing from
-  // `availableOn` (install-targets.test.ts pins that), so a client skipped
-  // here is never also one of `targets`.
-  for (const t of INSTALL_TARGETS) {
+  // beta, `--all` otherwise reads as having forgotten it. Over the SAME table
+  // the plans come from, so a narrowed `opts.targets` run reports only its
+  // own rows. No availableOn check: a reason is only ever recorded for an OS
+  // missing from `availableOn` (install-targets.test.ts pins that), so a
+  // client skipped here is never also one of `targets`.
+  for (const t of table) {
     const why = t.notConfigurableOn?.[os];
     if (why !== undefined) skipped.push({ clientId: t.clientId, reason: why });
   }
@@ -3361,10 +3416,6 @@ async function runInstallAll(
     const firstNoProj = t.scopes.find((s) => !s.requiresProjectDir);
     if (firstNoProj) {
       plans.push({ clientId: t.clientId, scope: firstNoProj.scope, usesProjectDir: false });
-      continue;
-    }
-    if (opts.projectDir) {
-      plans.push({ clientId: t.clientId, scope: t.scopes[0].scope, usesProjectDir: t.scopes[0].requiresProjectDir });
       continue;
     }
     skipped.push({
@@ -3777,15 +3828,20 @@ interface RemovalSite {
 
 /** A path as a same-file comparison key: `resolve`d, and lowercased when the
  *  HOST is win32, whose filesystem reads `C:\Users\me` and `c:\users\ME` as one
- *  directory. Keyed on process.platform and never on `--os`: the question is
+ *  directory. Keyed on the PLATFORM and never on `--os`: the question is
  *  whether two strings name one file on the machine this run reads, and a
  *  cross-OS preview reads this machine's files too. A plain `!==` let a
  *  `--project-dir` spelled with a lowercase drive letter (what process.cwd()
  *  returns after `cd c:\...`) name the home's settings.json under another key,
- *  and uninstall then revoked a grant a user-scope entry still used. */
-function samePathKey(p: string): string {
+ *  and uninstall then revoked a grant a user-scope entry still used.
+ *
+ *  The same policy as heal's `norm` and `isProjectLocalEntry`: case is folded
+ *  only where the filesystem folds it. `platform` defaults to this process's
+ *  and is a parameter (never read from `--os`) so a test can ask about the
+ *  other one; every caller in this file takes the default. */
+function samePathKey(p: string, platform: NodeJS.Platform = process.platform): string {
   const abs = resolve(p);
-  return process.platform === "win32" ? abs.toLowerCase() : abs;
+  return platform === "win32" ? abs.toLowerCase() : abs;
 }
 
 /** Whether the client that owns `view` loads yaw-mcp's "mcp" entry from it: the
@@ -3867,16 +3923,30 @@ function locationEnvHint(
 ): WriteFailureEnvHint | undefined {
   const env = where.clientEnv ?? {};
   for (const name of CLIENT_ENV_VARS) {
+    // The variable's key in ClientEnvValues, found by setting that ONE
+    // variable and seeing which key comes back. This relies on readClientEnv
+    // never emitting a key for a variable it did not see (it assigns each key
+    // only when the value is set and non-empty -- there is no `key: undefined`
+    // in its output), so `[0]` is the key for `name` and not whichever key
+    // happens to be enumerated first.
     const key = Object.keys(readClientEnv({ [name]: "set" }))[0] as keyof ClientEnvValues | undefined;
     if (key === undefined) continue;
     const value = key === "claudeConfigDir" ? (where.claudeConfigDir ?? env.claudeConfigDir) : env[key];
     if (value === undefined || value.length === 0) continue;
     let unmoved: string;
     try {
+      // Two variables arrive at the resolver OUTSIDE `clientEnv`, and have to
+      // be unset where the resolver reads them: CLAUDE_CONFIG_DIR as
+      // `claudeConfigDir`, and %APPDATA% as `appData` -- which the resolver
+      // takes as already chosen (`resolveAppDataDir`) and defaults off `home`
+      // when absent. Unsetting `clientEnv.appData` alone moved nothing, so a
+      // %APPDATA% pointing at a regular file was never named for the four
+      // rows that live under it (claude-desktop, vscode, zed, cline).
       unmoved = resolveInstallPath({
         clientId: target.clientId,
         scope,
         ...where,
+        appData: key === "appData" ? undefined : where.appData,
         claudeConfigDir: key === "claudeConfigDir" ? undefined : where.claudeConfigDir,
         clientEnv: { ...env, [key]: undefined },
       }).absolute;
@@ -4107,6 +4177,16 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
   const selectedSites = selectSites(plan.sites);
   const site = selectedSites[0];
   const extraSites = selectedSites.slice(1);
+  // Same guard as install's, for the same reason: a bare `[0]` over a row
+  // whose every site is conditional and absent would be a TypeError below,
+  // naming nothing. No row declares such a set today.
+  if (site === undefined) {
+    err(
+      `yaw-mcp uninstall: ${target.label} (${scope}) has no config file on this machine -- none of the copies ` +
+        "the row declares belongs to an installed editor, so there is nothing to remove from.",
+    );
+    return { written: [], wouldWrite: [], messages, exitCode: 1 };
+  }
   /** Every container carrying wiring for this project -- see RemovalSite. */
   const sites: RemovalSite[] = [];
   // Fingerprinted BEFORE the read and compared again ahead of the write, for

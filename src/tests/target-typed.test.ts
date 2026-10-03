@@ -1225,6 +1225,17 @@ describe("a typed CLI too old to read ~/.config/typed/mcp.json", () => {
     expect(staleLines(stderr)).toEqual([]);
   });
 
+  it("treats a whitespace-only TYPED_CLI_BUNDLE as unset, probing the default install", async () => {
+    // The Cline row's rule for its three variables, applied here too: a path
+    // made of spaces is not one the user can have meant. Before, "   " was an
+    // override -- probed as a relative file that does not exist (so no
+    // warning at all), and the warning's wording would have named the
+    // variable had it fired.
+    seed(defaultBundle(), OLD_BUNDLE);
+    const { stderr } = await install("typed", { clientEnv: { typedCliBundle: "   " } });
+    expect(staleLines(stderr)).toEqual([staleLine(defaultBundle())]);
+  });
+
   it("probes TYPED_CLI_BUNDLE when it is set, not the default install", async () => {
     const override = join(home, "dev", "cli.mjs");
     // The default install is old; the bundle the launcher actually runs is not.

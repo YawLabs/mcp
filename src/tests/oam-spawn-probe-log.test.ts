@@ -19,7 +19,8 @@ import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vites
 const priorLogLevel = process.env.LOG_LEVEL;
 process.env.LOG_LEVEL = "debug";
 
-const { MIN_OAM_VERSION, probeOam, resetOamBinCache, rewriteForOam, winNormalize } = await import("../oam-spawn.js");
+const { isShellShimSpawnRefusal, MIN_OAM_VERSION, probeOam, resetOamBinCache, rewriteForOam, winNormalize } =
+  await import("../oam-spawn.js");
 
 // Put it back: vitest gives each FILE a fresh module registry, not a fresh
 // process.env, so a worker reused for a later file would otherwise inherit
@@ -84,6 +85,63 @@ function enoent(bin: string): Error {
   err.code = "ENOENT";
   return err;
 }
+
+describe("probeOam on a .cmd/.bat OAM_BIN: a shim that needs a shell, not a broken oam", () => {
+  const priorOamBin = process.env.OAM_BIN;
+
+  beforeEach(() => resetOamBinCache());
+
+  afterEach(() => {
+    resetOamBinCache();
+    if (priorOamBin === undefined) delete process.env.OAM_BIN;
+    else process.env.OAM_BIN = priorOamBin;
+  });
+
+  /** What Node raises for a shell-less batch spawn since the CVE-2024-27980 fix. */
+  function einval(bin: string): Error {
+    const err = new Error(`spawn ${bin} EINVAL`) as Error & { code?: string };
+    err.code = "EINVAL";
+    return err;
+  }
+
+  it("classifies EINVAL on a .cmd/.bat name as the shim case, on win32 only", () => {
+    expect(isShellShimSpawnRefusal("EINVAL", "C:\\tools\\oam.cmd", "win32")).toBe(true);
+    expect(isShellShimSpawnRefusal("EINVAL", "C:\\tools\\OAM.BAT", "win32")).toBe(true);
+    // An .exe that EINVALs is a real failure, and off Windows a .cmd is a file.
+    expect(isShellShimSpawnRefusal("EINVAL", "C:\\tools\\oam.exe", "win32")).toBe(false);
+    expect(isShellShimSpawnRefusal("EINVAL", "/opt/oam.cmd", "linux")).toBe(false);
+    expect(isShellShimSpawnRefusal("ENOENT", "C:\\tools\\oam.cmd", "win32")).toBe(false);
+  });
+
+  it.runIf(process.platform === "win32")(
+    "names the shim in the warn and in failureDetail instead of 'oam --version failed'",
+    async () => {
+      // The probe spawns shell:false on purpose (oam is a real executable), so a
+      // .cmd shim in OAM_BIN EINVALs before it runs. Reporting that as a broken
+      // oam sends the user to reinstall a working one; the fix is the variable.
+      const shim = "C:\\tools\\oam.cmd";
+      process.env.OAM_BIN = shim;
+
+      let probe: Awaited<ReturnType<typeof probeOam>> | undefined;
+      const lines = await captureLines(async () => {
+        probe = await probeOam(async (bin) => {
+          throw einval(bin);
+        });
+      });
+
+      expect(probe?.bin).toBeNull();
+      expect(probe?.failure).toBe("spawn");
+      expect(probe?.failureDetail).toContain(".cmd/.bat shim");
+      expect(probe?.failureDetail).toContain(shim);
+
+      const note = lines.find((l) => String(l.msg ?? "").includes("names a .cmd/.bat shim"));
+      expect(note, "the shim case fell through to the generic '--version failed' warn").toBeDefined();
+      expect(note?.level).toBe("warn");
+      expect(note?.bin).toBe(shim);
+      expect(lines.find((l) => String(l.msg ?? "").includes("oam --version failed"))).toBeUndefined();
+    },
+  );
+});
 
 describe("probeOam ENOENT: absence vs a stale OAM_BIN", () => {
   const priorOamBin = process.env.OAM_BIN;

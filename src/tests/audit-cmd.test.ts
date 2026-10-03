@@ -917,3 +917,49 @@ describe("cmd.exe metacharacter gate", () => {
     });
   });
 });
+
+describe("runAudit -- scrubbed echoes", () => {
+  let home: string;
+  afterEach(() => {
+    if (home) rmSync(home, { recursive: true, force: true });
+  });
+
+  it("scrubs a runner failure before it reaches stderr", async () => {
+    // By the time the runner throws, the target env holds the resolved vault
+    // secrets and the raw argv; a spawn error can quote either.
+    home = makeHome([{ namespace: "ctxlint", name: "ctxlint", type: "local", command: "node", args: ["x.js"] }]);
+    const io = captureIO();
+    const r = await runAudit({
+      namespace: "ctxlint",
+      home,
+      cwd: home,
+      out: io.push,
+      err: io.pushErr,
+      runner: async () => {
+        throw new Error("spawn failed with GH_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz012345 in env");
+      },
+    });
+    expect(r.exitCode).toBe(2);
+    const err = io.err.join("");
+    expect(err).toContain('compliance suite failed for "ctxlint"');
+    expect(err).toContain("spawn failed");
+    expect(err).not.toContain("ghp_abcdefghijklmnopqrstuvwxyz012345");
+  });
+
+  it("scrubs a remote server's url in the not-auditable line", async () => {
+    home = makeHome([{ namespace: "remote", type: "remote", url: "https://mcp.example.com/sse?api_key=sekret123" }]);
+    const io = captureIO();
+    const r = await runAudit({
+      namespace: "remote",
+      home,
+      cwd: home,
+      out: io.push,
+      err: io.pushErr,
+      runner: async () => ({ grade: "A", score: 100 }),
+    });
+    expect(r.exitCode).toBe(2);
+    const err = io.err.join("");
+    expect(err).toContain('"remote" is a remote server (https://mcp.example.com/sse?');
+    expect(err).not.toContain("sekret123");
+  });
+});
