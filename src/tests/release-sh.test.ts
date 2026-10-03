@@ -183,7 +183,7 @@ function extractBlock(start: string, end: string): string {
   return `${lines.slice(from, to + 1).join("\n")}\n`;
 }
 
-/** The single-line `if echo "$out" | grep -qE '...'` inside run_npm_check. */
+/** The single-line `if grep -qE '...' <<<"$out"` inside run_npm_check. */
 function extractToolchainPattern(): string {
   const line = releaseSh.split("\n").find((l) => l.includes("grep -qE") && l.includes("Cannot find (module|package)"));
   if (!line) {
@@ -620,20 +620,20 @@ describe("release.sh version-ordering guard", () => {
 
   it("hard-fails a fresh bump when the registry is unreadable", () => {
     const r = run({ LATEST_NPM: "", RESUMING: "false" });
-    expect(r.out).toContain("FAIL npm view returned nothing");
+    expect(r.out).toContain("FAIL npm's packument returned no 'latest'");
     expect(r.out).toContain("cannot verify version ordering");
     expect(r.out).not.toContain("CONTINUED");
   });
 
   it("warns and continues on a resume", () => {
     const r = run({ LATEST_NPM: "", RESUMING: "true" });
-    expect(r.out).toContain("WARN npm view returned nothing");
+    expect(r.out).toContain("WARN npm's packument returned no 'latest'");
     expect(r.out).toContain("CONTINUED");
   });
 
   it("warns and continues under ALLOW_UNVERIFIED_VERSION=1", () => {
     const r = run({ LATEST_NPM: "", RESUMING: "false", ALLOW_UNVERIFIED_VERSION: "1" });
-    expect(r.out).toContain("WARN npm view returned nothing");
+    expect(r.out).toContain("WARN npm's packument returned no 'latest'");
     expect(r.out).toContain("CONTINUED");
   });
 
@@ -690,6 +690,7 @@ describe("release.sh tag-at-HEAD guard", () => {
       `git() {
   case "$1 $2" in
     "tag -l") ${opts.tagSha ? 'echo "v0.81.0"' : "true"} ;;
+    "rev-parse -q") ${opts.tagSha ? "return 0" : "return 1"} ;;
     "rev-list -n1") echo "${opts.tagSha ?? ""}" ;;
     "tag -a") echo "TAG_CREATED" ;;
     *) return 0 ;;
@@ -746,10 +747,12 @@ describe("release.sh non-interactive confirm brake", () => {
   const block = extractBlock('if [ "$SKIP_CONFIRM" != "true" ] && [ "$RESUMING" != "true" ]; then', "fi");
   const dir = newTmp("release-tty-");
 
-  it("aborts with exit 0 before any mutation when stdin is not a terminal", () => {
-    // Every fixture test in this file relies on this brake: if it ever exits 1
-    // or reads anyway, those runs would proceed into the gates, the push and
-    // the publish.
+  it("aborts with exit 1 before any mutation when stdin is not a terminal", () => {
+    // Every fixture test in this file relies on this brake: if it ever reads
+    // anyway, those runs would proceed into the gates, the push and the
+    // publish. Exit 1, not 0: the caller here is a wrapper by definition, and
+    // it reads the exit code -- a 0 told it the release happened. Only the
+    // interactive decline keeps its 0.
     const body = [
       STUB_HELPERS,
       'VERSION="9.9.9"',
@@ -762,7 +765,7 @@ describe("release.sh non-interactive confirm brake", () => {
     const r = runBash(body, dir);
     expect(r.out).toContain("Aborted: stdin is not a terminal");
     expect(r.out).not.toContain("REACHED_STEP_1");
-    expect(r.status).toBe(0);
+    expect(r.status).toBe(1);
   });
 });
 
@@ -1325,6 +1328,23 @@ describe("release.sh step-4 npm publish", () => {
     expect(r.out).toContain("WARN npm publish attempt 2 EOTPed");
     expect(r.out).toContain("FAIL npm publish failed after 3 OTP-class attempts");
     expect(r.out).not.toContain("CONTINUED");
+    // EAUTH on npm's code line is OTP-class too, in either of npm's spellings.
+    const eauth = run({ out: "npm ERR! code EAUTH\nnpm ERR! Unable to authenticate", rc: 1 });
+    expect(eauth.calls).toBe(3);
+    expect(eauth.out).toContain("FAIL npm publish failed after 3 OTP-class attempts");
+  });
+
+  it("reads OTP-class only off npm's own code line, not off letters elsewhere in the log", () => {
+    // The old pattern was a bare `EOTP|EAUTH|one-time password|OTP`: "OTP"
+    // inside the tarball's integrity string turned a packaging error into
+    // three attempts and a minute of sleeping on a challenge npm never sent.
+    const r = run({
+      out: "npm notice integrity: sha512-aaOTPbbEOTPcc==\nnpm error code E409\nnpm error 409 Conflict - PUT https://registry.npmjs.org/@yawlabs%2fmcp",
+      rc: 1,
+    });
+    expect(r.calls).toBe(1);
+    expect(r.out).toContain("FAIL npm publish failed (non-OTP error");
+    expect(r.out).not.toContain("EOTPed");
   });
 
   const SEGV = "npm notice Publishing to https://registry.npmjs.org/\nSegmentation fault";
@@ -2012,6 +2032,7 @@ describe("release.sh behaviour-change gate (fixture run)", () => {
     const r = run(["y", "YAW_MCP_NEW_THING"]);
     expect(r.out).toContain("found in the Unreleased section");
     expect(r.out).toContain("CONTINUED");
+    expect(r.status).toBe(0);
   });
 
   it("does not answer itself when the operator types 'yes' rather than 'y'", () => {
@@ -2035,6 +2056,9 @@ describe("release.sh behaviour-change gate (fixture run)", () => {
     expect(r.out).not.toContain("unknown option");
     expect(r.out).not.toContain("Usage: grep");
     expect(r.out).not.toContain("CONTINUED");
+    // The gate refusing is not the operator declining: a wrapper reading the
+    // exit code must not take this abort for a release.
+    expect(r.status).toBe(1);
   });
 
   it("accepts a flag-shaped switch that IS documented", () => {
@@ -2057,12 +2081,14 @@ describe("release.sh behaviour-change gate (fixture run)", () => {
     const r = run(["y", "YAW_MCP_OLD_THING"]);
     expect(r.out).toContain("does not appear");
     expect(r.out).not.toContain("CONTINUED");
+    expect(r.status).toBe(1);
   });
 
   it("refuses a blank switch", () => {
     const r = run(["y", "   "]);
     expect(r.out).toContain("documented way back");
     expect(r.out).not.toContain("CONTINUED");
+    expect(r.status).toBe(1);
   });
 
   it("trims surrounding whitespace off the switch", () => {
@@ -2223,7 +2249,9 @@ describe("release.sh oam floor gate placement", () => {
     expect(releaseSh).not.toContain("ALLOW_STALE_OAM_FLOOR");
     // ...and nothing between the confirm prompt and step 1 commits anything:
     // the only `git commit` left is step 3's bump.
-    const commits = releaseSh.split("\n").filter((l) => /^\s*(MSYS_NO_PATHCONV=1 )?git .*\bcommit\b/.test(l));
+    // The subcommand, not the word: the stale-tag guard's `merge-base
+    // --is-ancestor "refs/tags/<t>^{commit}"` is a read, not a commit.
+    const commits = releaseSh.split("\n").filter((l) => /^\s*(MSYS_NO_PATHCONV=1 )?git (-c \S+ )*commit\b/.test(l));
     expect(commits).toHaveLength(1);
     expect(commits[0]).toContain('"v${VERSION}"');
   });
@@ -2293,8 +2321,112 @@ describe("release.sh origin/main sync guard", () => {
 
   it("proceeds on a resume, where a prior push already moved main", () => {
     const r = run("ahead", true);
-    expect(r.out).toContain("resuming after a prior push");
+    expect(r.out).toContain("resuming a prior run");
     expect(r.out).toContain("CONTINUED");
+  });
+});
+
+describe("release.sh stale-tag guard", () => {
+  // `git push --follow-tags` carries every annotated tag origin lacks that the
+  // pushed main reaches -- not only this run's -- and the pre-flight fetch
+  // (--prune, never --prune-tags) removes no local tag, so the tag a
+  // dead-release recovery deleted on origin would come back on the next
+  // release's push. The guard reads origin's tags for real: a local bare repo.
+  const block = extractBlock("# >>> stale-tag guard", "# <<< stale-tag guard");
+  const helper = extractBlock("coreutils_timeout_bin() {", "}");
+
+  function repo(): { work: string; bare: string } {
+    const root = newTmp("release-stale-");
+    const bare = join(root, "origin.git");
+    git(root, ["init", "-q", "--bare", "-b", "main", bare]);
+    const work = join(root, "work");
+    mkdirSync(work);
+    git(work, ["init", "-q", "-b", "main"]);
+    writeFileSync(join(work, "a.txt"), "a\n");
+    git(work, ["add", "a.txt"]);
+    git(work, ["commit", "-q", "-m", "base"]);
+    git(work, ["remote", "add", "origin", shPath(bare)]);
+    git(work, ["push", "-q", "origin", "main"]);
+    // The bump commit and this run's own tag, as step 3 leaves them.
+    writeFileSync(join(work, "b.txt"), "b\n");
+    git(work, ["add", "b.txt"]);
+    git(work, ["commit", "-q", "-m", "v9.9.9"]);
+    git(work, ["tag", "-a", "v9.9.9", "-m", "v9.9.9"]);
+    return { work, bare };
+  }
+
+  function run(work: string): RunResult {
+    const body = [STUB_HELPERS, 'VERSION="9.9.9"', helper, block, 'echo "CONTINUED"'].join("\n");
+    return runOutside(work, body);
+  }
+
+  it("lets this run's own tag through", () => {
+    const { work } = repo();
+    const r = run(work);
+    expect(r.out).toContain("INFO No stale local tag for --follow-tags to carry");
+    expect(r.out).toContain("CONTINUED");
+  });
+
+  it("stops the push on an annotated tag origin lacks that main reaches, naming it", () => {
+    const { work } = repo();
+    git(work, ["tag", "-a", "v0.1.0", "-m", "v0.1.0", "HEAD~1"]);
+    const r = run(work);
+    expect(r.out).toContain("FAIL Local annotated tag(s) v0.1.0 are absent from origin");
+    expect(r.out).toContain("git tag -d <tag>");
+    expect(r.out).not.toContain("CONTINUED");
+  });
+
+  it("ignores what --follow-tags would not push: a lightweight tag, a tag on origin, a tag off main", () => {
+    const { work } = repo();
+    git(work, ["tag", "scratch", "HEAD~1"]);
+    git(work, ["tag", "-a", "v0.0.1", "-m", "v0.0.1", "HEAD~1"]);
+    git(work, ["push", "-q", "origin", "v0.0.1"]);
+    git(work, ["checkout", "-q", "-b", "side", "HEAD~1"]);
+    writeFileSync(join(work, "c.txt"), "c\n");
+    git(work, ["add", "c.txt"]);
+    git(work, ["commit", "-q", "-m", "side"]);
+    git(work, ["tag", "-a", "v0.0.2", "-m", "v0.0.2"]);
+    git(work, ["checkout", "-q", "main"]);
+    const r = run(work);
+    expect(r.out).toContain("INFO No stale local tag for --follow-tags to carry");
+    expect(r.out).toContain("CONTINUED");
+  });
+
+  it("matches tag names whole, so v1.0.1 on origin does not vouch for a local v1.0.10", () => {
+    const { work } = repo();
+    git(work, ["tag", "-a", "v1.0.1", "-m", "v1.0.1", "HEAD~1"]);
+    git(work, ["push", "-q", "origin", "v1.0.1"]);
+    git(work, ["tag", "-a", "v1.0.10", "-m", "v1.0.10", "HEAD~1"]);
+    const r = run(work);
+    expect(r.out).toContain("FAIL Local annotated tag(s) v1.0.10 are absent from origin");
+    expect(r.out).not.toContain("CONTINUED");
+  });
+
+  it("fails closed when origin's tags cannot be read", () => {
+    const { work } = repo();
+    git(work, ["remote", "set-url", "origin", shPath(join(work, "no-such-origin.git"))]);
+    const r = run(work);
+    expect(r.out).toContain("FAIL Could not list origin's tags (git ls-remote exited");
+    expect(r.out).not.toContain("CONTINUED");
+  });
+
+  it("sits after the branch re-check and immediately ahead of the push", () => {
+    const lines = releaseSh.split("\n");
+    const at = (l: string) => {
+      const i = lines.indexOf(l);
+      if (i === -1) {
+        throw new Error(`release.sh anchor not found: ${JSON.stringify(l)}`);
+      }
+      return i;
+    };
+    const order = [
+      at("CURRENT_BRANCH=$(current_branch)"),
+      at("# >>> stale-tag guard"),
+      at("# <<< stale-tag guard"),
+      at("git push origin main --follow-tags"),
+    ];
+    expect(order).toEqual([...order].sort((a, b) => a - b));
+    expect(at("git push origin main --follow-tags") - at("# <<< stale-tag guard")).toBe(2);
   });
 });
 
@@ -2319,19 +2451,20 @@ describe("release.sh oam floor gate (stubbed full run)", () => {
     "#!/bin/bash",
     'echo "npm $*" >> "$FAKE_STATE/npm.log"',
     'case "$1" in',
-    "  view)",
-    '    case "$2" in',
-    '      "@yawlabs/mcp") echo "1.0.1" ;;',
-    // A pinned-version `npm view` is the cached packument read step 5 died on
-    // (npm_version_manifest in release.sh has the measurements). Nothing in
-    // the script may make it any more, so rather than answer it the stub makes
-    // one impossible to miss.
-    '      "@yawlabs/mcp@"*) echo "npm view @yawlabs/mcp@<version> is the cached packument read release.sh must not make" >&2; exit 1 ;;',
-    "    esac ;;",
+    // Any `npm view` is the edge-cached packument read (npm_version_manifest
+    // in release.sh has the measurements): the pinned-version form step 5
+    // died on, and the bare form the backward-version guard read `latest`
+    // from, which could pass a stale latest. Nothing in the script may make
+    // either any more -- the guard reads the packument through curl with the
+    // cache-buster, served below -- so rather than answer, the stub makes one
+    // impossible to miss.
+    '  view) echo "npm view $2 is the cached packument read release.sh must not make" >&2; exit 1 ;;',
     "  whoami) echo fixture ;;",
     "  run)",
     '    case "$2" in',
-    '      lint) echo "Checked 3 files" ;;',
+    // lint-silent: biome exiting 0 without its "Checked N files" summary --
+    // the shape of a check that ran over nothing.
+    '      lint) [ -f "$FAKE_STATE/lint-silent" ] || echo "Checked 3 files" ;;',
     "      typecheck) ;;",
     "      verify:oam-floor)",
     '        if [ -f "$FAKE_STATE/oam-missing" ]; then',
@@ -2370,6 +2503,12 @@ describe("release.sh oam floor gate (stubbed full run)", () => {
     "  *registry.modelcontextprotocol.io/v0/servers/io.github.YawLabs%2Fmcp/versions/*)",
     '    u="$*"; v="${u##*/versions/}"; v="${v%%\\?*}"',
     `    if [ -f "$FAKE_STATE/mcp-published-$v" ]; then printf '{"server":{"name":"io.github.YawLabs/mcp","version":"%s"},"_meta":{"io.modelcontextprotocol.registry/official":{"status":"active"}}}' "$v"; else echo "curl: (22) The requested URL returned error: 404" >&2; exit 22; fi ;;`,
+    // npm's packument -- the abbreviated form, which carries dist-tags -- the
+    // read behind the backward-version guard's `latest` (npm_latest_version).
+    // Its URL has no path segment after the package name, which is what keeps
+    // it apart from the per-version document below.
+    "  *registry.npmjs.org/@yawlabs%2Fmcp?*)",
+    `    printf '{"name":"@yawlabs/mcp","dist-tags":{"latest":"1.0.1"},"versions":{},"modified":"2026-10-03T00:00:00.000Z"}' ;;`,
     // npm's per-version document, the read behind every "is it on npm?"
     // question (npm_version_manifest). An unpublished version is a 404, which
     // `curl -f` reports as exit 22, as the real one does; so is a published
@@ -2592,11 +2731,16 @@ describe("release.sh oam floor gate (stubbed full run)", () => {
     expect(r.status).toBe(0);
     // npm's per-version document, and only it, answered every "is it on npm?"
     // question, from the pre-flight probe to the final tarball check; the
-    // cached packument read step 5 used to die on is gone from the whole run.
-    expect(npmLog(f)).not.toMatch(/^npm view @yawlabs\/mcp@/m);
-    expect(readFileSync(join(f.state, "curl.log"), "utf8")).toMatch(
-      /registry\.npmjs\.org\/@yawlabs%2Fmcp\/1\.0\.2\?_=\d+/,
-    );
+    // cached packument read step 5 used to die on is gone from the whole run,
+    // and so is the bare `npm view` the backward-version guard read `latest`
+    // from -- that is a cache-busted curl of the packument now.
+    expect(npmLog(f)).not.toMatch(/^npm view/m);
+    expect(r.out).toContain("Version 1.0.2 > published latest 1.0.1");
+    const curlLogEarly = readFileSync(join(f.state, "curl.log"), "utf8");
+    expect(curlLogEarly).toMatch(/registry\.npmjs\.org\/@yawlabs%2Fmcp\?_=\d+/);
+    expect(curlLogEarly).toMatch(/registry\.npmjs\.org\/@yawlabs%2Fmcp\/1\.0\.2\?_=\d+/);
+    // The stale-tag guard ran against the bare origin before the push.
+    expect(r.out).toContain("No stale local tag for --follow-tags to carry");
     expect(r.out).toContain("npm: @yawlabs/mcp@1.0.2");
     expect(r.out).toContain("npm tarball: content matches this build");
     // The verifier ran once, between the type check and the tests.
@@ -2690,6 +2834,22 @@ describe("release.sh oam floor gate (stubbed full run)", () => {
         .filter((l) => l.startsWith("npm publish")),
     ).toHaveLength(1);
     expect(subjects(f.bare, "main")).toEqual(["v1.0.2", "fixture"]);
+  });
+
+  it("fails the lint gate on an exit 0 that printed no verdict, before the bump, the tag and the push", () => {
+    // run_npm_check used to return 0 on npm's exit code alone; a biome that
+    // checked nothing (an ignored path, an empty file list) exits 0 without
+    // its "Checked N files" line, and that passed the gate.
+    const f = setup();
+    writeFileSync(join(f.state, "lint-silent"), "");
+    const r = release(f);
+    expect(r.out).toContain("Lint exited 0 but printed no verdict -- refusing to pass a gate on silence");
+    expect(r.status).toBe(1);
+    expect(npmLog(f)).toContain("npm run lint");
+    expect(npmLog(f)).not.toContain("npm run typecheck");
+    expect(subjects(f.bare, "main")).toEqual(["fixture"]);
+    expect(git(f.bare, ["tag", "-l"]).trim()).toBe("");
+    expect(JSON.parse(readFileSync(join(f.work, "package.json"), "utf8")).version).toBe("1.0.1");
   });
 
   it("fails the release at step 1 on the verifier's FAIL line, before the bump, the tag and the push", () => {

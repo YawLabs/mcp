@@ -60,8 +60,9 @@
 #                                    origin/main sync guard then runs against a
 #                                    STALE remote-tracking ref. Deliberate
 #                                    degraded runs only.
-#   ALLOW_UNVERIFIED_VERSION=1       Proceed when `npm view` cannot read the
-#                                    registry, skipping the backward-version
+#   ALLOW_UNVERIFIED_VERSION=1       Proceed when npm's packument (the read
+#                                    behind the `latest` dist-tag) cannot be
+#                                    fetched, skipping the backward-version
 #                                    ordering guard for that run. Implied on a
 #                                    resume, where the version was already
 #                                    chosen by the earlier run.
@@ -163,7 +164,7 @@ trap 'FAIL_LINE=$LINENO' ERR
 cleanup() {
   rc=$?
   if [ $rc -ne 0 ]; then
-    echo -e "\n  ✗ Release failed at line ${FAIL_LINE:-unknown} (exit code $rc)\n" >&2
+    echo -e "\n  [x] Release failed at line ${FAIL_LINE:-unknown} (exit code $rc)\n" >&2
   fi
   if [ -n "$WORKDIR" ] && [ -d "$WORKDIR" ]; then
     rm -rf "$WORKDIR"
@@ -183,11 +184,11 @@ if [ "${NO_COLOR:-0}" = "1" ] || [ ! -t 1 ]; then
 fi
 
 step() { echo -e "\n${CYAN}=== [$1/$TOTAL_STEPS] $2 ===${NC}"; }
-info() { echo -e "${GREEN}  ✓ $1${NC}"; }
+info() { echo -e "${GREEN}  [ok] $1${NC}"; }
 warn() { echo -e "${YELLOW}  ! $1${NC}"; }
 # BASH_LINENO[0] is the line of the CALL to fail() -- an explicit `exit 1`
 # never fires the ERR trap, so record the caller's line here instead.
-fail() { FAIL_LINE="${BASH_LINENO[0]}"; echo -e "${RED}  ✗ $1${NC}"; exit 1; }
+fail() { FAIL_LINE="${BASH_LINENO[0]}"; echo -e "${RED}  [x] $1${NC}"; exit 1; }
 
 # MCP publisher version -- pinned like any other tool we shell out to. The
 # sha256 is fetched at release time from the registry's per-release
@@ -260,10 +261,25 @@ run_npm_check() {
   # analysis below runs.
   out=$(npm run "$script" 2>&1) || rc=$?
   printf '%s\n' "$out"
-  if echo "$out" | grep -qE "$fail_re"; then
+  # Every grep over $out below reads it from a here-string, never from a
+  # pipe: under `set -o pipefail`, `producer | grep -q` reports a MISS when
+  # grep quits on its first match and the producer dies of SIGPIPE (141) on a
+  # large $out -- the test suite's output is exactly that large.
+  if grep -qE "$fail_re" <<<"$out"; then
     fail "$label failed"
   fi
-  [ "$rc" -eq 0 ] && return 0
+  if [ "$rc" -eq 0 ]; then
+    # A clean exit is not a verdict. Every gate that has a completion marker
+    # passes it as done_re, and an rc of 0 with that marker absent is a tool
+    # that ran nothing it was meant to run: biome handed an empty file list,
+    # a vitest that found no test files, a verifier that printed neither of
+    # its lines. Passing a release on that silence is the one shape of pass
+    # no later step can catch, since there is no CI behind this script.
+    if [ -n "$done_re" ] && ! grep -qE "$done_re" <<<"$out"; then
+      fail "$label exited 0 but printed no verdict -- refusing to pass a gate on silence (expected output matching '${done_re}')"
+    fi
+    return 0
+  fi
   # A lint CRASH is never tolerated, on any host. The ARM64 tolerance below
   # accepts a 139/134 when the tool's success marker was printed; for lint that
   # would pass a release on a verdict no process ever returned, and a crashing
@@ -271,11 +287,11 @@ run_npm_check() {
   # the done_re passed at the Lint call site no longer tolerates anything.
   # scripts/lint.mjs turns a biome crash into exit 1 with its own "[lint] biome
   # crashed with / killed by" line, so that shape is matched here as well.
-  if [[ "$script" == lint* ]] && { [ "$rc" -eq 139 ] || [ "$rc" -eq 134 ] || echo "$out" | grep -qE '^\[lint\] biome (killed by|crashed with)'; }; then
+  if [[ "$script" == lint* ]] && { [ "$rc" -eq 139 ] || [ "$rc" -eq 134 ] || grep -qE '^\[lint\] biome (killed by|crashed with)' <<<"$out"; }; then
     fail "$label crashed (exit $rc) -- no lint verdict was produced, so the release stops here. Fix the crash (scripts/lint.mjs honours YAWLABS_BIOME_BIN / YAWLABS_BIOME_NATIVE), or as an explicit last resort re-run with SKIP_LINT=1 ./release.sh ${VERSION} -- that publishes unlinted, and there is no CI to catch it."
   fi
   if [ "$IS_MINGW_ARM64" = true ] && { [ "$rc" -eq 139 ] || [ "$rc" -eq 134 ]; }; then
-    if [ -n "$done_re" ] && echo "$out" | grep -qE "$done_re"; then
+    if [ -n "$done_re" ] && grep -qE "$done_re" <<<"$out"; then
       warn "$label: npm exited $rc (ARM64 npm-run cleanup segfault) but the tool completed with no findings -- tolerating"
       return 0
     fi
@@ -303,7 +319,7 @@ run_npm_check() {
   # fail_re comment documents. A false match here can only reword an
   # already-failing gate, never fail a passing one. The step-2 build gate is a
   # separate code path and is NOT covered here.
-  if echo "$out" | grep -qE ': not found$|: command not found|is not recognized as an internal|Cannot find (module|package)|installed .* for another platform'; then
+  if grep -qE ': not found$|: command not found|is not recognized as an internal|Cannot find (module|package)|installed .* for another platform' <<<"$out"; then
     fail "$label failed (exit $rc) -- the toolchain could not resolve its own executable (see the error above). node_modules is missing or only partially installed. Run \`npm ci\`, then re-run ./release.sh ${VERSION}."
   fi
   fail "$label failed (exit $rc)"
@@ -633,6 +649,57 @@ npm_has_version() {
   npm_version_manifest "$1" >/dev/null
 }
 
+# The version npm's `latest` dist-tag names for @yawlabs/mcp, for the
+# backward-version guard. Prints it and returns 0; prints nothing and returns
+# 1 when the registry cannot be read or the body carries no such tag.
+#
+# This is the packument read -- GET /@yawlabs%2Fmcp, the document
+# npm_version_manifest explains `npm view` fetches from Cloudflare's edge
+# under a 300 s max-age -- and the guard needs it CURRENT: a `latest` from
+# before the previous release passes a version at or below the true latest
+# through here, and npm then rejects it in step 4, after the bump commit, the
+# tag and the push. So it goes through curl with the same cache-busting `_`
+# query the other reads carry (measured 2026-10-03: CF-Cache-Status: MISS on
+# a fresh query, where `npm view` had measured HIT with Age: 105), and asks
+# for the abbreviated packument (Accept: application/vnd.npm.install-v1+json
+# -- name, dist-tags, versions, modified; 64 KB against the full document's
+# several hundred). Probe-only like its siblings: any failure is an empty
+# answer, which the guard below treats as "could not read", never as "no
+# versions".
+npm_latest_version() {
+  local body
+  body=$(curl -fsSL --max-time 20 -H 'Accept: application/vnd.npm.install-v1+json' -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
+    "https://registry.npmjs.org/@yawlabs%2Fmcp?_=$(date +%s)${RANDOM}" 2>/dev/null || echo "")
+  [ -n "$body" ] || return 1
+  printf %s "$body" | node -e '
+    let s = "";
+    process.stdin.on("data", (d) => { s += d; });
+    process.stdin.on("end", () => {
+      let v;
+      try { v = JSON.parse(s)["dist-tags"].latest; } catch { v = undefined; }
+      if (typeof v !== "string" || !/^[0-9]+\.[0-9]+\.[0-9]+$/.test(v)) process.exit(1);
+      process.stdout.write(v);
+    });
+  '
+}
+
+# The coreutils timeout(1) on PATH -- `timeout` or `gtimeout` -- by name, or
+# nothing when neither is the coreutils one (BusyBox and Windows' own
+# timeout.exe are different programs, hence the banner check; GNU's and
+# uutils' both say coreutils). Step 5's mcp_timeout_setup keeps a copy of this
+# lookup rather than calling it: that block is lifted out and run on its own
+# by the release-sh tests, so it cannot depend on a helper defined up here.
+coreutils_timeout_bin() {
+  local t
+  for t in timeout gtimeout; do
+    command -v "$t" >/dev/null 2>&1 || continue
+    case "$("$t" --version 2>/dev/null || true)" in
+      *coreutils*) printf %s "$t"; return 0 ;;
+    esac
+  done
+  return 0
+}
+
 # One dotted field out of a manifest npm_version_manifest printed, e.g.
 # `npm_manifest_field "$body" dist.integrity`. Prints the string value, or
 # nothing for a missing path, a non-string or an unparseable body -- the final
@@ -787,7 +854,11 @@ if [ -n "$REMOTE_HEAD" ] && [ "$LOCAL_HEAD" != "$REMOTE_HEAD" ]; then
   # verify:oam-floor -- --raise), landed like any other change, so every
   # commit local main has and origin/main lacks is the operator's own.
   if [ "$RESUMING" = true ]; then
-    info "Local HEAD differs from origin/main (resuming after a prior push) -- proceeding"
+    # A resume reaches here from either side of the push: the prior run may
+    # have pushed the bump (HEAD and origin/main then differ until the fetch
+    # above has caught up) or died between the commit and the push (HEAD is
+    # one bump commit ahead). Both are the same resume.
+    info "Local HEAD differs from origin/main (resuming a prior run) -- proceeding"
   elif git merge-base --is-ancestor "$REMOTE_HEAD" "$LOCAL_HEAD" 2>/dev/null; then
     # Strictly AHEAD: origin/main is an ancestor of HEAD, so there is nothing
     # to pull. Telling the operator to `git pull --ff-only` here is the wrong
@@ -806,13 +877,14 @@ fi
 # message. A version that is ALREADY published is a legitimate resume (later
 # steps skip it), so only a not-yet-published version at or below the current
 # npm latest is blocked.
-LATEST_NPM=$(npm view "@yawlabs/mcp" version 2>/dev/null || echo "")
-# `npm view` cannot distinguish "the registry read failed" from "the package is
-# unpublished" -- both yield an empty string -- and the ordering guard below is
-# gated on LATEST_NPM being non-empty, so a transient 5xx, proxy hiccup or DNS
-# blip silently turned the whole backward-version check into a no-op, with zero
-# output saying so. @yawlabs/mcp has been published continuously since 2026-05,
-# so an empty result here is ALWAYS a read failure, never a first publish.
+LATEST_NPM=$(npm_latest_version || echo "")
+# npm_latest_version cannot distinguish "the registry read failed" from "the
+# package is unpublished" -- both yield an empty string -- and the ordering
+# guard below is gated on LATEST_NPM being non-empty, so a transient 5xx, proxy
+# hiccup or DNS blip silently turned the whole backward-version check into a
+# no-op, with zero output saying so. @yawlabs/mcp has been published
+# continuously since 2026-05, so an empty result here is ALWAYS a read failure,
+# never a first publish.
 #
 # The gap this closes is narrow but real. A fat-finger onto a PREVIOUSLY
 # RELEASED number is already caught by the tag-collision guard below, since the
@@ -829,9 +901,9 @@ LATEST_NPM=$(npm view "@yawlabs/mcp" version 2>/dev/null || echo "")
 # npm-auth guard below makes on ALREADY_PUBLISHED.
 if [ -z "$LATEST_NPM" ]; then
   if [ "$RESUMING" = true ] || [ "${ALLOW_UNVERIFIED_VERSION:-}" = "1" ]; then
-    warn "npm view returned nothing for @yawlabs/mcp -- the registry is unreadable, so the backward-version ordering guard is SKIPPED for this run"
+    warn "npm's packument returned no 'latest' for @yawlabs/mcp -- the registry is unreadable, so the backward-version ordering guard is SKIPPED for this run"
   else
-    fail "npm view returned nothing for @yawlabs/mcp -- cannot verify version ordering. The package IS published, so this is a registry read failure, not a first publish; continuing would silently disable the backward-version guard. Retry, or set ALLOW_UNVERIFIED_VERSION=1 to proceed deliberately."
+    fail "npm's packument returned no 'latest' for @yawlabs/mcp -- cannot verify version ordering. The package IS published, so this is a registry read failure, not a first publish; continuing would silently disable the backward-version guard. Retry, or set ALLOW_UNVERIFIED_VERSION=1 to proceed deliberately."
   fi
 fi
 ALREADY_PUBLISHED=""
@@ -871,9 +943,12 @@ WHOAMI_ERR=$(mktemp)
 NPM_WHO=$(npm whoami 2>"$WHOAMI_ERR") || WHOAMI_RC=$?
 WHOAMI_DIAG=$(cat "$WHOAMI_ERR" 2>/dev/null || true)
 rm -f "$WHOAMI_ERR"
+# Both streams in one variable, read through a here-string rather than piped
+# into grep: under pipefail a `printf | grep -q` can report a miss on SIGPIPE.
+WHOAMI_TEXT=$(printf '%s\n%s' "$NPM_WHO" "$WHOAMI_DIAG")
 if [ "$WHOAMI_RC" -eq 0 ] && [ -n "$NPM_WHO" ]; then
   info "npm auth: ${NPM_WHO}"
-elif printf '%s\n%s' "$NPM_WHO" "$WHOAMI_DIAG" | grep -qE 'ENEEDAUTH|E401|need auth|log in'; then
+elif grep -qE 'ENEEDAUTH|E401|need auth|log in' <<<"$WHOAMI_TEXT"; then
   if [ "$ALREADY_PUBLISHED" = "$VERSION" ]; then
     warn "npm is not authenticated, but @yawlabs/mcp@${VERSION} is already published so step 4 will skip the publish -- continuing. Restore the ~/.npmrc automation token before the next release."
   else
@@ -920,10 +995,16 @@ if [ "$SKIP_CONFIRM" != "true" ] && [ "$RESUMING" != "true" ]; then
   # "pass" on an empty answer and only then hit this abort -- a gate answering
   # itself, even though the release stopped anyway. Checking here means neither
   # prompt is ever reached without someone able to answer it.
+  #
+  # Exit 1, not 0: nothing was released, and the caller here is by definition
+  # a wrapper (a pipe, nohup, an agent harness), which reads the exit code and
+  # nothing else. A 0 told it the release happened. The interactive decline at
+  # the bottom of this block keeps its 0 -- a human who answered N is looking
+  # at the output, and a failure banner there would be wrong.
   if [ ! -t 0 ]; then
     echo "Aborted: stdin is not a terminal, so the confirm prompt cannot be answered."
     echo "Re-run with -y (or SKIP_CONFIRM=1 ./release.sh ${VERSION}) to release non-interactively."
-    exit 0
+    exit 1
   fi
   # Behaviour-change prompt, deliberately BEFORE the release confirm rather
   # than folded into it. This package has real installs, and the failure it
@@ -957,22 +1038,35 @@ if [ "$SKIP_CONFIRM" != "true" ] && [ "$RESUMING" != "true" ]; then
     read -p "  Off switch (env var / flag), or blank to abort: " -r OFF_SWITCH || OFF_SWITCH=""
     OFF_SWITCH="${OFF_SWITCH#"${OFF_SWITCH%%[![:space:]]*}"}"
     OFF_SWITCH="${OFF_SWITCH%"${OFF_SWITCH##*[![:space:]]}"}"
+    # The two aborts in this gate exit 1: they are the gate REFUSING, not the
+    # operator declining, and nothing was released. Only the Continue? (y/N)
+    # decline below exits 0.
     if [ -z "$OFF_SWITCH" ]; then
       echo "Aborted: a default-on behaviour change ships with a documented way back, or it does not ship."
-      exit 0
+      exit 1
     fi
     # Scoped to the UNRELEASED section, not the whole file. The point of the
     # gate is that THIS release documents the switch; an unscoped grep is
     # satisfied by a name mentioned three releases ago, which is exactly the
     # case where the operator most needs to be stopped.
+    #
+    # CONVENTION this depends on: CHANGELOG.md keeps a `## Unreleased` heading
+    # and this script never renames it -- nothing in steps 3-5 touches the
+    # changelog, so the release's notes are expected to sit under Unreleased
+    # at the moment this prompt runs, and whoever retitles that heading to the
+    # version does it after the release, as docs. If the heading has already
+    # been renamed to `## <version>` when this runs, the awk below finds no
+    # Unreleased section, the grep misses, and the gate aborts on a switch
+    # that IS documented. The fix in that case is to answer the prompt from a
+    # tree whose heading still reads Unreleased, not to loosen this grep.
     UNRELEASED_BODY=$(awk '/^## [Uu]nreleased/ { inside = 1; next } inside && /^## / { exit } inside { print }' CHANGELOG.md 2>/dev/null || true)
     # `-e` so a flag-shaped switch is a PATTERN, not an option. Without it
     # `grep -qF "--no-cap"` exits 2 with "unknown option", and the message
     # below then told the operator the name was absent from a file that
     # contains it -- an abort on the answer the prompt above asks for.
-    if ! printf '%s\n' "$UNRELEASED_BODY" | grep -qF -e "$OFF_SWITCH"; then
+    if ! grep -qF -e "$OFF_SWITCH" <<<"$UNRELEASED_BODY"; then
       echo "Aborted: '${OFF_SWITCH}' does not appear in CHANGELOG.md's Unreleased section -- document it there first."
-      exit 0
+      exit 1
     fi
     echo -e "  ${CYAN}${OFF_SWITCH}${NC} found in the Unreleased section."
   fi
@@ -994,7 +1088,7 @@ if [ "$SKIP_CONFIRM" != "true" ] && [ "$RESUMING" != "true" ]; then
 fi
 
 step 1 "Lint + typecheck + tests + oam floor"
-run_npm_check "Lint" lint 'Found [0-9]+ error' 'Checked [0-9]+ files'  # done_re is inert -- run_npm_check's lint-crash guard hard-fails every 139/134 before the ARM64 tolerance block that would read it; kept so narrowing that guard re-arms it.
+run_npm_check "Lint" lint 'Found [0-9]+ error' 'Checked [1-9][0-9]* files'  # done_re is live on the exit-0 path: biome's "Checked N files" summary must appear, with N >= 1, or the gate fails on silence -- "Checked 0 files" is biome handed only ignored paths, the very shape the guard exists for. On the 139/134 path it is inert -- the lint-crash guard hard-fails before the ARM64 tolerance block that would read it.
 run_npm_check "Type check" typecheck 'error TS[0-9]' '' 'npx tsc --noEmit'
 # >>> oam floor gate
 # scripts/verify-oam-floor.mjs hosts a stdio @modelcontextprotocol/sdk server
@@ -1095,7 +1189,7 @@ else
   bump_rc=0
   npm version "$VERSION" --no-git-tag-version || bump_rc=$?
   if [ "$bump_rc" -ne 0 ]; then
-    BUMPED_VERSION=$(node -p "require('./package.json').version" 2>/dev/null || echo "")
+    BUMPED_VERSION=$(current_pkg_version 2>/dev/null || echo "")
     if [ "$IS_MINGW_ARM64" = true ] && { [ "$bump_rc" -eq 139 ] || [ "$bump_rc" -eq 134 ]; } && [ "$BUMPED_VERSION" = "$VERSION" ]; then
       warn "npm version exited $bump_rc (ARM64 npm exit-cleanup segfault) but package.json now reads v${VERSION} -- tolerating"
     else
@@ -1126,7 +1220,9 @@ else
 fi
 
 # >>> tag-at-HEAD guard
-if git tag -l "v${VERSION}" | grep -q "v${VERSION}"; then
+# rev-parse --verify, as the pre-flight collision guard reads it: `git tag -l
+# | grep -q` is a pipe under pipefail, and a substring match besides.
+if git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null 2>&1; then
   # A pre-existing tag is the normal resume shape, but "the tag exists" is not
   # the same as "the tag describes what step 4 is about to publish". If the
   # operator committed a fix on main after an interrupted run had already
@@ -1201,6 +1297,56 @@ if [ "$CURRENT_BRANCH" != "main" ]; then
   fi
   fail "On branch '${CURRENT_BRANCH}', not main -- refusing to run 'git push origin main --follow-tags'. It would push the local main ref (which does NOT contain the v${VERSION} bump commit) and silently skip the tag. Merge or check out main, then re-run ./release.sh ${VERSION}."
 fi
+
+# >>> stale-tag guard
+# --follow-tags pushes EVERY annotated tag that is missing from origin and
+# reachable from the pushed ref -- not only v${VERSION}. The pre-flight fetch
+# runs --prune, which drops stale remote-tracking branches but not tags (that
+# is --prune-tags, which it does not pass), so a local tag origin no longer
+# holds -- what the "bump past a dead release, delete its tag on origin"
+# recovery leaves behind -- survives every fetch and rides along on this
+# push, re-creating on origin a release tag that was deleted on purpose. The
+# one tag this run may add is its own; any other that --follow-tags would
+# carry stops the push, by name.
+#
+# ls-remote, because there is no remote-tracking view of tags to read
+# locally. Bounded through coreutils timeout(1) where there is one, as step
+# 5's registry calls are -- git has no deadline flag, and an ls-remote that
+# never answers would hang the release here, after the bump commit. Fails
+# CLOSED when the read does not answer: the push right after needs the same
+# remote, so there is nothing to gain from guessing.
+STALE_TAG_TIMEOUT_BIN=$(coreutils_timeout_bin)
+REMOTE_TAG_RC=0
+if [ -n "$STALE_TAG_TIMEOUT_BIN" ]; then
+  REMOTE_TAG_LIST=$("$STALE_TAG_TIMEOUT_BIN" --foreground -k 10 60 git ls-remote --tags --refs origin 2>&1) || REMOTE_TAG_RC=$?
+else
+  warn "Neither timeout nor gtimeout on PATH is the coreutils one -- the read of origin's tags before the push runs unbounded"
+  REMOTE_TAG_LIST=$(git ls-remote --tags --refs origin 2>&1) || REMOTE_TAG_RC=$?
+fi
+if [ "$REMOTE_TAG_RC" -ne 0 ]; then
+  printf '%s\n' "$REMOTE_TAG_LIST" >&2
+  fail "Could not list origin's tags (git ls-remote exited ${REMOTE_TAG_RC}; output above) -- refusing to push without knowing which local tags --follow-tags would add. Fix connectivity or auth and re-run ./release.sh ${VERSION}: the bump commit and v${VERSION} are local, and the re-run resumes from them."
+fi
+# One ref per line, matched whole (-x) so v1.0.1 cannot pass as v1.0.10.
+REMOTE_TAG_REFS=$(awk '{ print $2 }' <<<"$REMOTE_TAG_LIST")
+STALE_TAGS=""
+while read -r LOCAL_TAG_TYPE LOCAL_TAG; do
+  [ -n "$LOCAL_TAG" ] || continue
+  [ "$LOCAL_TAG" = "v${VERSION}" ] && continue
+  grep -qxF -e "refs/tags/${LOCAL_TAG}" <<<"$REMOTE_TAG_REFS" && continue
+  # Absent from origin. Only what --follow-tags would push counts: an
+  # ANNOTATED tag (objecttype tag) whose commit is reachable from the main
+  # being pushed. A lightweight tag never rides along, nor does one pointing
+  # off the pushed history, so neither blocks a release.
+  [ "$LOCAL_TAG_TYPE" = "tag" ] || continue
+  git merge-base --is-ancestor "refs/tags/${LOCAL_TAG}^{commit}" HEAD 2>/dev/null || continue
+  STALE_TAGS="${STALE_TAGS} ${LOCAL_TAG}"
+done <<<"$(git for-each-ref --format='%(objecttype) %(refname:short)' refs/tags)"
+if [ -n "$STALE_TAGS" ]; then
+  fail "Local annotated tag(s)${STALE_TAGS} are absent from origin, and 'git push --follow-tags' would push them alongside v${VERSION}. A release tag deleted on origin on purpose must not come back: delete each here too (git tag -d <tag>) and re-run ./release.sh ${VERSION} -- the bump commit and v${VERSION} are local, and the re-run resumes from them. If one is meant to exist on origin, push it deliberately first (git push origin <tag>)."
+fi
+info "No stale local tag for --follow-tags to carry"
+# <<< stale-tag guard
 
 git push origin main --follow-tags
 info "Pushed to origin"
@@ -1293,7 +1439,11 @@ else
         break
       fi
     fi
-    if ! grep -qE 'EOTP|EAUTH|one-time password|OTP' "$PUBLISH_LOG"; then
+    # Anchored on npm's own "code" line, the way the ARM64 branch above is: a
+    # bare EOTP|OTP matched any of those letters anywhere in the log -- an
+    # "OTP" inside the tarball's integrity string, say -- and read a packaging
+    # error as an OTP challenge worth two more attempts and 60 s of sleep.
+    if ! grep -qE 'npm (error|ERR!) code (EOTP|EAUTH)|one-time password' "$PUBLISH_LOG"; then
       rm -f "$PUBLISH_LOG"
       fail "npm publish failed (non-OTP error -- see output above). If E401/E404, your ~/.npmrc session is stale: see CLAUDE.md npm-token-restore."
     fi
@@ -1823,7 +1973,7 @@ else
   warn "package.json shows ${PKG_FINAL} (expected $VERSION)"
 fi
 
-if git tag -l "v${VERSION}" | grep -q "v${VERSION}"; then
+if git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null 2>&1; then
   info "git tag: v${VERSION}"
 else
   warn "git tag v${VERSION} not found"

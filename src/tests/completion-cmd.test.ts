@@ -1,3 +1,15 @@
+// SUBCOMMAND_SPEC's flag lists are pinned in BOTH directions against the live
+// argv parsers:
+//   spec -> parser: every completable flag is one the parser accepts ("only
+//                   advertises flags the real parser accepts" below);
+//   parser -> spec: every long flag the parser accepts is completable, bar an
+//                   explicit DELIBERATELY_UNSUGGESTED entry ("completes every
+//                   long flag the real parser accepts" below).
+// Before the second half existed the spec could lag the parser silently --
+// try-cleanup and reset-learning grew --force/--yes and `add` grew its whole
+// custom-server mode without Tab ever learning about them.
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { parseAuditArgs } from "../audit-cmd.js";
 import { parseBundlesArgs } from "../bundles-cmd.js";
@@ -16,7 +28,7 @@ import { parseHealArgs } from "../heal-cmd.js";
 import { parseImportArgs } from "../import-cmd.js";
 import { parseInstallArgs, parseUninstallArgs } from "../install-cmd.js";
 import { parseAddArgs, parseListArgs, parseRemoveArgs } from "../local-add-cmd.js";
-import { parseSetArgs } from "../local-set-cmd.js";
+import { parseSetArgs, parseToggleArgs } from "../local-set-cmd.js";
 import { parseResetLearningArgs } from "../reset-learning-cmd.js";
 import { parseSearchArgs } from "../search-cmd.js";
 import { parseSecretsArgs } from "../secrets-cmd.js";
@@ -473,9 +485,11 @@ const FLAG_PARSERS: Record<string, (argv: string[]) => ProbeResult> = {
   call: parseCallArgs,
   search: parseSearchArgs,
   set: parseSetArgs,
-  // enable/disable share set's parser: they ARE `set <target> isActive=<bool>`.
-  enable: parseSetArgs,
-  disable: parseSetArgs,
+  // enable/disable RUN as `set <target> isActive=<bool>` but PARSE through
+  // parseToggleArgs (index.ts), which takes --json/--help only. Probing
+  // parseSetArgs here would credit them with set's --force/--yes.
+  enable: (argv) => parseToggleArgs(argv, true),
+  disable: (argv) => parseToggleArgs(argv, false),
   list: parseListArgs,
   status: parseStatusArgs,
   sidecars: parseSidecarsArgs,
@@ -501,6 +515,62 @@ const FLAG_PARSERS: Record<string, (argv: string[]) => ProbeResult> = {
 // verbatim to the mcp-compliance child (npxArgs in compliance-cmd.ts), so there
 // is nothing in this repo to check them against. `help` carries no flags.
 const NO_LOCAL_PARSER = new Set(["compliance", "help"]);
+
+// The source files the FLAG_PARSERS live in. The reverse-direction check
+// below harvests every `--long-flag` literal from ALL of them into one
+// candidate pool and probes each verb's parser with each candidate, so a
+// flag only has to be spelled somewhere in this set to be found -- a parser
+// that delegates to a sibling file's helper still gets its flags probed, as
+// long as that helper is listed here. Source-scanning is the candidate
+// GENERATOR only; acceptance is decided behaviorally by the parser.
+const PARSER_SOURCES = [
+  "audit-cmd.ts",
+  "bundles-cmd.ts",
+  "call-cmd.ts",
+  "completion-cmd.ts",
+  "doctor-cmd.ts",
+  "foundry-cmd.ts",
+  "heal-cmd.ts",
+  "import-cmd.ts",
+  "install-cmd.ts",
+  "local-add-cmd.ts",
+  "local-set-cmd.ts",
+  "reset-learning-cmd.ts",
+  "search-cmd.ts",
+  "secrets-cmd.ts",
+  "sidecars-cmd.ts",
+  "status-cmd.ts",
+  "trust-cmd.ts",
+  "try-cmd.ts",
+  "upgrade-cmd.ts",
+];
+
+// Long flags a parser accepts that the spec deliberately does NOT complete.
+// Each needs a reason: completing a flag teaches it, so the only good reason
+// is that the flag is kept for compatibility and should not be learned.
+const DELIBERATELY_UNSUGGESTED: Record<string, string[]> = {
+  // Deprecated: accepted, warned about, ignored (see the spec's install entry).
+  install: ["--token", "--no-yaw-mcp-config"],
+};
+
+/** Every `--long-flag` literal spelled in the parser sources. Long flags only:
+ *  the spec completes long forms (`--yes`, not `-y`), and the shells get the
+ *  short aliases from the usage text. */
+function harvestFlagLiterals(): string[] {
+  const found = new Set<string>();
+  for (const file of PARSER_SOURCES) {
+    const src = readFileSync(fileURLToPath(new URL(`../${file}`, import.meta.url)), "utf8");
+    for (const m of src.matchAll(/--[a-z][a-z0-9-]*/g)) found.add(m[0]);
+  }
+  return [...found].sort();
+}
+
+/** True when the parser rejected `argv[0]` as a flag it does not know, as
+ *  opposed to accepting it and complaining about something else (a missing
+ *  value, a missing positional). */
+function rejectedAsUnknown(r: ProbeResult): boolean {
+  return !r.ok && /unknown (flag|argument|option)/i.test(r.error);
+}
 
 describe("SUBCOMMAND_SPEC coverage", () => {
   it("covers every dispatched subcommand (no drift vs the real KNOWN_SUBCOMMANDS table)", () => {
@@ -597,6 +667,39 @@ describe("SUBCOMMAND_SPEC coverage", () => {
           /unknown (flag|argument|option)/i,
         );
       }
+    }
+  });
+
+  it("completes every long flag the real parser accepts (parser -> spec direction)", () => {
+    // The mirror of the test above. Approach: harvest every `--flag` literal
+    // from the parser sources (PARSER_SOURCES) as the CANDIDATE pool, then
+    // ask each verb's parser about each candidate; a candidate the parser does
+    // not reject as unknown is a flag it accepts, and every such flag must be
+    // in the spec (or in DELIBERATELY_UNSUGGESTED with a reason). The pool is
+    // deliberately the union across all parsers: probing `add` with `set`'s
+    // --force costs nothing and is the only way a shared helper's flag gets
+    // asked about.
+    //
+    // The "rejects a known-unknown flag" probe first is what makes the rest
+    // meaningful: a parser that swallowed unknown flags as positionals would
+    // "accept" the whole pool and the superset check would demand all of it.
+    const candidates = harvestFlagLiterals();
+    expect(candidates).toEqual(expect.arrayContaining(["--force", "--json", "--help"]));
+    for (const spec of SUBCOMMAND_SPEC) {
+      if (NO_LOCAL_PARSER.has(spec.name)) continue;
+      const parse = FLAG_PARSERS[spec.name];
+      expect(parse, `no parser wired for "${spec.name}"`).toBeDefined();
+      expect(
+        rejectedAsUnknown(parse(["--definitely-not-a-flag"])),
+        `\`yaw-mcp ${spec.name}\` did not reject an unknown flag as unknown -- the superset check below cannot trust it`,
+      ).toBe(true);
+      const allowed = new Set([...spec.flags, ...(DELIBERATELY_UNSUGGESTED[spec.name] ?? [])]);
+      const accepted = candidates.filter((flag) => !rejectedAsUnknown(parse([flag])));
+      const missing = accepted.filter((flag) => !allowed.has(flag));
+      expect(
+        missing,
+        `\`yaw-mcp ${spec.name}\` accepts ${missing.join(", ")} but SUBCOMMAND_SPEC does not complete it -- add it to the spec or to DELIBERATELY_UNSUGGESTED`,
+      ).toEqual([]);
     }
   });
 

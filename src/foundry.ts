@@ -2,9 +2,10 @@
 // routing-eval corpus.
 //
 // The goal is to let a user OPT IN to collecting a corpus of "intent ->
-// candidate namespaces -> chosen namespace" decisions that a future eval
-// could replay to measure routing quality -- WITHOUT ever persisting the
-// raw English intent the user typed. Two layers keep it privacy-safe:
+// chosen namespace" decisions that a future eval could replay to measure
+// routing quality -- WITHOUT ever persisting the raw English intent the user
+// typed. (The ranker's candidate shortlist is NOT part of a trace: see the
+// note on FoundryTrace below.) Two layers keep it privacy-safe:
 //
 //   1. Path-splitting in `tokenizeQuery` (src/relevance.ts) already shreds
 //      most structure: it lowercases and splits on every non-alphanumeric run,
@@ -129,23 +130,43 @@ interface RawScrubRule {
 // shape costs essentially no real phone coverage.
 const DOTTED_NUMERIC_RE = /^\d+(?:\.\d+){3,}$/;
 
+// A calendar date: ISO `2024-01-15`, or the dotted day.month.year form
+// (`15.01.2024`, `15.1.24`). One date is 8 digits and never clears the phone
+// floor on its own; the shape matters only because two ADJACENT dates (a
+// range: "between 2024-01-15 2024-01-16") arrive as a single 16-digit match,
+// exactly the way an IPv4 pair does. A dotted phone (555.123.4567) does not
+// fit: its first group is three digits, and a day is at most two.
+const DATE_RE = /^(?:\d{4}-\d{2}-\d{2}|\d{1,2}\.\d{1,2}\.\d{2,4})$/;
+
+/** Not a phone number, whatever its digit count: an IP literal, a dotted
+ *  version, or a calendar date. Judged per whitespace-separated group. */
+function isNonPhoneLiteral(group: string): boolean {
+  return DOTTED_NUMERIC_RE.test(group) || DATE_RE.test(group);
+}
+
 /** True when a nominated phone-shape run really looks like a phone number.
  *  The nominating regex is deliberately loose (any run of digits and phone
- *  punctuation), so it also matched ISO dates and IP literals; both fall out
- *  here. */
+ *  punctuation), so it also matches ISO dates and IP literals; those fall
+ *  out here. */
 function isPhoneShape(match: string): boolean {
-  // Real numbers carry 9+ digits (NANP is 10, E.164 allows up to 15). An ISO
-  // date has 8 ("2024-01-15") and a short dotted version fewer still.
-  const digits = match.replace(/[^0-9]/g, "");
-  if (digits.length < 9) return false;
   // The exclusion is per-GROUP, not per-match. Whitespace is inside the
   // nominating character class, so two adjacent IPv4 literals
-  // ("192.168.1.100 10.0.0.1") arrive as ONE match that no whole-match test
-  // recognizes -- and the pair clears the 9-digit floor on its own even
-  // though neither literal does. Splitting on whitespace first judges each
-  // literal as itself; a single group reduces to the old whole-match test.
-  const groups = match.trim().split(/\s+/);
-  return !groups.every((g) => DOTTED_NUMERIC_RE.test(g));
+  // ("192.168.1.100 10.0.0.1") or two adjacent dates ("2024-01-15
+  // 2024-01-16") arrive as ONE match that no whole-match test recognizes --
+  // and the pair clears the 9-digit floor on its own even though neither
+  // literal does. So each group is judged as itself, the recognized
+  // non-phone literals are set aside, and only the digits that REMAIN are
+  // counted against the floor: a date followed by a real phone number is
+  // still a phone number, and a date next to a short number ("2024-01-15
+  // 555") is not. A single group reduces to the old whole-match test.
+  const rest = match
+    .trim()
+    .split(/\s+/)
+    .filter((g) => !isNonPhoneLiteral(g));
+  // Real numbers carry 9+ digits (NANP is 10, E.164 allows up to 15). An ISO
+  // date has 8 ("2024-01-15") and a short dotted version fewer still.
+  const digits = rest.join("").replace(/[^0-9]/g, "");
+  return digits.length >= 9;
 }
 
 // Standards, algorithms and encodings share Jira's PROJ-1234 shape. They are

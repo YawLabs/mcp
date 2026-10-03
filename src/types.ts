@@ -121,9 +121,12 @@ export function isRemoteEntry(entry: { type?: string; command?: string; url?: st
  *  entries with the same launch identity produce the same upstream, so a live
  *  connection to one is a live connection to the other.
  *
- *  Deliberately EXCLUDES `name`, `description`, `toolCache`, `complianceGrade`
- *  and `isActive`. The first four are presentation and ranking metadata -- a
- *  reworded description must never cost the user a running server -- and
+ *  Deliberately EXCLUDES `name`, `description`, `toolCache`, `complianceGrade`,
+ *  `pinned` and `isActive`. The first four are presentation and ranking
+ *  metadata -- a reworded description must never cost the user a running
+ *  server. `pinned` only tells the idle reaper whether it may UNLOAD the
+ *  server; it changes nothing about what a fresh activation would start, so
+ *  toggling it must not tear down the connection it exists to protect. And
  *  `isActive` is a separate question the caller asks on its own (a server
  *  switched to false has to come down even though its launch identity is
  *  untouched), so folding it in here would blur "the config for this server
@@ -276,5 +279,4 @@ export interface UpstreamConnection {
    */
   instructions?: string;
   status: ConnectionStatus;
-  error?: string;
 }

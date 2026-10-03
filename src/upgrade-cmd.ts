@@ -1,19 +1,19 @@
-// `yaw-mcp upgrade` — installs (or tells the user how to install) the
+// `yaw-mcp upgrade` -- installs (or tells the user how to install) the
 // newest version of `@yawlabs/mcp`. Detects the invocation mode from
 // process.argv[1] so the action matches how yaw-mcp is actually
 // reaching this process:
-//   - global npm (`npm install -g @yawlabs/mcp`)  → `npm install -g @yawlabs/mcp@latest`
-//   - pnpm / bun global store                      → `pnpm add -g` / `bun add -g @yawlabs/mcp@latest`
-//   - local node_modules                           → `npm install @yawlabs/mcp@latest` in that tree's root
-//   - npx cache                                    → restart the MCP client; `npx -y` always pulls the latest
-//   - bundled inside Yaw Terminal (asar.unpacked)  → nothing to run; it updates with the app
-//   - standalone SEA binary (track retired 0.70.3) → `npm install -g @yawlabs/mcp@latest`; delete the old executable
-//   - unknown / dev checkout                       → print the command and let the user decide
+//   - global npm (`npm install -g @yawlabs/mcp`)  -> `npm install -g @yawlabs/mcp@latest`
+//   - pnpm / bun global store                      -> `pnpm add -g` / `bun add -g @yawlabs/mcp@latest`
+//   - local node_modules                           -> `npm install @yawlabs/mcp@latest` in that tree's root
+//   - npx cache                                    -> restart the MCP client; `npx -y` always pulls the latest
+//   - bundled inside Yaw Terminal (asar.unpacked)  -> nothing to run; it updates with the app
+//   - standalone SEA binary (track retired 0.70.3) -> `npm install -g @yawlabs/mcp@latest`; delete the old executable
+//   - unknown / dev checkout                       -> print the command and let the user decide
 //
 // The --run flag spawns the owning tool for the global-npm, pnpm-global,
 // bun-global, and local-node-modules cases; for "npx" there is nothing
 // to do and --run just prints the "restart your client" hint. Never
-// spawns destructive commands — only `npm install [-g]` / `pnpm add -g` /
+// spawns destructive commands -- only `npm install [-g]` / `pnpm add -g` /
 // `bun add -g` of exactly our package is allowed, and stdout/stderr
 // stream through to the caller unchanged.
 //
@@ -26,7 +26,12 @@
 //      therefore still 1: the flag combination reports, it does not upgrade.
 //   2  usage error (unknown flag), OR --run on an install method that
 //      can't be auto-upgraded (binary / dev-checkout / unknown)
-//   3  --run attempted the upgrade and the child process failed
+//   3  --run attempted the upgrade and the child process failed, OR --run
+//      found another yaw-mcp process already upgrading this global-npm
+//      prefix (the background self-upgrade, or a second `upgrade --run`) and
+//      did not spawn beside it. Same code on purpose: in both cases the
+//      install the user asked for did not happen in THIS invocation and a
+//      retry is the right next move.
 //
 // After a `--run` whose child exited 0, the RUNNING copy is checked too: the
 // package.json of the `@yawlabs/mcp` directory argv[1] was loaded from is
@@ -42,9 +47,9 @@
 // `<root>/node_modules/.pnpm/<pkg>/node_modules/@yawlabs/mcp` layout resolve
 // to the correct root, so a nested copy is reported, not refused.
 //
-// OFFLINE — a scripting hazard of the same class as the 1→2 trap below.
+// OFFLINE -- a scripting hazard of the same class as the 1->2 trap below.
 // When the registry can't be reached, staleness is UNKNOWN, and EVERY
-// method — including a stale global-npm — exits 0 after printing
+// method -- including a stale global-npm -- exits 0 after printing
 // "couldn't reach the npm registry (offline? firewall?)". So exit 0 means
 // "nothing to do OR never checked", not "up to date": a CI step shaped
 // like `yaw-mcp upgrade || yaw-mcp upgrade --run` behind a firewall
@@ -54,7 +59,7 @@
 // staleness cannot be computed, not because the install is current).
 // Pinned by the offline tests in src/tests/upgrade-cmd.test.ts.
 //
-// SCRIPTING TRAP — the 1→2 transition for NON-RUNNABLE methods (binary,
+// SCRIPTING TRAP -- the 1->2 transition for NON-RUNNABLE methods (binary,
 // dev-checkout, unknown): for these, plain `upgrade` on a stale install
 // returns 1 ("upgrade available, --run not passed"), but they can NEVER
 // be auto-run, so the advertised `--run` deterministically returns 2,
@@ -66,7 +71,7 @@
 // promising --run will fix it. Branch on the `method` field of the
 // --json snapshot (or on exit 2) instead of blindly chaining --run.
 //
-// `yaw-mcp doctor` shows the same staleness status — upgrade is purely
+// `yaw-mcp doctor` shows the same staleness status -- upgrade is purely
 // the "what do I type to fix it" surface. Kept separate so scripts
 // that already run doctor can chain into `yaw-mcp upgrade --run` and
 // have the shell do the right thing deterministically.
@@ -77,6 +82,7 @@ import { join } from "node:path";
 import { stripInternalSecretsFromEnv } from "./internal-secret-env.js";
 import { createStreamWriter } from "./logger.js";
 import { compareVersions, MIN_OAM_VERSION, type OamProbe, probeOam } from "./oam-spawn.js";
+import { isTestSandbox } from "./opt-out-env.js";
 
 declare const __VERSION__: string;
 
@@ -130,6 +136,10 @@ export interface UpgradeCommandOptions {
    *  package.json version (see defaultInstalledVersion). Null means "could not
    *  read it", which skips the check rather than warning on a guess. */
   installedVersion?: (pkgDir: string) => string | null | Promise<string | null>;
+  /** Test hook: replace the prefix lock a global-npm `--run` takes before it
+   *  spawns (see defaultAcquireLock). Called with the running install's
+   *  prefix; null means "another process holds it". */
+  acquireLock?: (prefixDir: string) => (() => void) | null;
 }
 
 export interface UpgradeCommandResult {
@@ -153,7 +163,7 @@ export type InstallMethod =
  *  install root: a bare `/lib/node_modules/@yawlabs/mcp/` marker also matched a
  *  workspace package directory literally named `lib`
  *  (`<repo>/packages/lib/node_modules/@yawlabs/mcp/...`), which then drove
- *  auto-upgrade's `npm install -g --prefix <repo>/packages` — writing a global
+ *  auto-upgrade's `npm install -g --prefix <repo>/packages` -- writing a global
  *  tree plus bin shims into the user's repo and overwriting the
  *  workspace-pinned version.
  *
@@ -162,7 +172,7 @@ export type InstallMethod =
  *  is classified `local-node-modules`, refineInstallMethod's `npm prefix -g`
  *  probe reclassifies it for the CLI, and maybeAutoUpgrade merely logs the
  *  manual path instead of spawning). An exotic prefix that isn't listed here
- *  therefore degrades safely — do NOT widen this back to a bare
+ *  therefore degrades safely -- do NOT widen this back to a bare
  *  `/lib/node_modules/`.
  *    /usr/lib, /usr/local/lib   distro packages and `make install` defaults
  *    /opt/<tool>/lib            homebrew (/opt/homebrew), /opt/node, /opt/nodejs
@@ -244,7 +254,7 @@ export function parseUpgradeArgs(
 }
 
 /** Classify how yaw-mcp is being invoked. The argv[1] path is the most
- *  reliable signal — npm/npx land it in distinct directories. Falls
+ *  reliable signal -- npm/npx land it in distinct directories. Falls
  *  through to `unknown` rather than guessing, which lets --json
  *  consumers branch without false positives.
  *
@@ -311,7 +321,7 @@ function classifyEntrypoint(argvPath: string): InstallMethod {
   // `npx -y @yawlabs/mcp` stages packages under ~/.npm/_npx/<hex>/
   // node_modules/@yawlabs/mcp/ (or platform equivalent; on Windows the
   // cache is under npm-cache/_npx/...). Require the full npm-cache
-  // context — `_npx/<hex>/node_modules/@yawlabs/mcp/` — rather than a
+  // context -- `_npx/<hex>/node_modules/@yawlabs/mcp/` -- rather than a
   // bare `_npx` segment: a user project path that merely CONTAINS a
   // `_npx` directory would otherwise be misclassified as an npx run.
   // Consistent with the global markers below, which all anchor on the
@@ -320,7 +330,7 @@ function classifyEntrypoint(argvPath: string): InstallMethod {
   // The copy Yaw Terminal ships inside its Electron resources
   // (resources/app.asar.unpacked/node_modules/@yawlabs/mcp). It LOOKS
   // like local-node-modules, but running `npm install` against the
-  // app's resources dir would corrupt the install — this copy only
+  // app's resources dir would corrupt the install -- this copy only
   // updates when the app itself updates. Must be checked BEFORE the
   // generic node_modules marker below.
   if (/\/app\.asar\.unpacked\//.test(normalized)) return "bundled-app";
@@ -332,11 +342,21 @@ function classifyEntrypoint(argvPath: string): InstallMethod {
   // global vs local from argv alone, use the npm prefix marker on
   // common platforms and a `\\npm\\node_modules\\` Windows marker.
   if (/\/npm\/node_modules\/@yawlabs\/mcp\//.test(normalized)) return "global-npm";
-  // `<prefix>/lib/node_modules` — anchored on real Node-root shapes; see the
+  // `<prefix>/lib/node_modules` -- anchored on real Node-root shapes; see the
   // two regex definitions above for why a bare `/lib/` marker was unsafe.
   if (POSIX_GLOBAL_LIB_PREFIX.test(normalized)) return "global-npm";
   if (MANAGED_NODE_LIB_PREFIX.test(normalized)) return "global-npm";
   if (/\/AppData\/Roaming\/npm\/node_modules\/@yawlabs\/mcp\//.test(normalized)) return "global-npm";
+  // `~/.npm-global` is the prefix npm's own docs tell a user to create to
+  // escape a sudo-owned default (`npm config set prefix ~/.npm-global`), so it
+  // is the ONE custom prefix with a conventional name. Both global layouts:
+  // `<prefix>/lib/node_modules` on POSIX, `<prefix>/node_modules` on Windows.
+  // Anchored on the directory name AND the package segment like every marker
+  // above; a project tree is never called `.npm-global`. Without this, that
+  // user's copy read as local-node-modules and never background-upgraded,
+  // while the serve log told them `upgrade --run` works (it does, via the
+  // `npm prefix -g` probe -- but the background path has no such probe).
+  if (/\/\.npm-global\/(?:lib\/)?node_modules\/@yawlabs\/mcp\//.test(normalized)) return "global-npm";
   // Windows npm prefixes that live in a `bin` dir (scoop's nodejs persist
   // dir, custom prefixes): globals land at <prefix>/node_modules with
   // <prefix> itself named `bin`. A project tree whose root dir is
@@ -373,7 +393,7 @@ function classifyEntrypoint(argvPath: string): InstallMethod {
 export function localInstallRoot(argvPath: string | undefined): string | null {
   if (!argvPath) return null;
   // Separator normalization preserves length, so an index found in the
-  // normalized string addresses the same spot in the original — slicing
+  // normalized string addresses the same spot in the original -- slicing
   // the original keeps Windows drive letters and backslashes intact.
   const idx = argvPath.replace(/\\/g, "/").indexOf("/node_modules/");
   return idx > 0 ? argvPath.slice(0, idx) : null;
@@ -422,12 +442,12 @@ function packageDirOf(p: string): string | null {
 }
 
 /** Version field of `<pkgDir>/package.json`, or null when it cannot be read or
- *  carries no string version. Auto-skips under vitest (mirrors
+ *  carries no string version. Auto-skips under a test harness (mirrors
  *  npmGlobalPrefix): the fixtures' argv paths are fictional, and a real
  *  install that happened to sit at one of them would make the check's outcome
  *  depend on the machine. Tests inject opts.installedVersion. */
 function defaultInstalledVersion(pkgDir: string): string | null {
-  if (process.env.VITEST) return null;
+  if (isTestSandbox()) return null;
   try {
     const parsed = JSON.parse(readFileSync(join(pkgDir, "package.json"), "utf8")) as { version?: unknown };
     return typeof parsed.version === "string" ? parsed.version : null;
@@ -437,7 +457,7 @@ function defaultInstalledVersion(pkgDir: string): string | null {
 }
 
 /** Ask npm where its global prefix actually is. Returns null when npm
- *  isn't reachable, exits non-zero, or doesn't answer within 3s — refinement
+ *  isn't reachable, exits non-zero, or doesn't answer within 3s -- refinement
  *  is then skipped and the path-marker classification stands.
  *
  *  Exported because auto-upgrade's multi-prefix warning needs the same probe:
@@ -509,11 +529,11 @@ export type ProbeSpawn = (
 };
 
 export async function npmGlobalPrefix(spawnImpl?: ProbeSpawn): Promise<string | null> {
-  // Auto-skip under vitest (mirrors doctor-cmd's registry probe) so unit
-  // tests never spawn a real npm; tests exercising refinement inject
+  // Auto-skip under a test harness (mirrors doctor-cmd's registry probe) so
+  // unit tests never spawn a real npm; tests exercising refinement inject
   // their own probe via opts.npmPrefix, and a test of THIS function's spawn
   // injects the spawn itself.
-  if (process.env.VITEST && !spawnImpl) return null;
+  if (isTestSandbox() && !spawnImpl) return null;
   const spawnFn = spawnImpl ?? (spawn as unknown as ProbeSpawn);
   return new Promise((resolve) => {
     const child = spawnFn("npm", ["prefix", "-g"], {
@@ -681,6 +701,12 @@ export function buildUpgradePlan(input: {
   // reason: a git-tag-shaped "v0.45.0" would otherwise fail to parse, compare
   // equal, and silently report a stale install as current.
   const stripV = (s: string): string => (s.startsWith("v") ? s.slice(1) : s);
+  // compareVersions answers 0 for anything it cannot parse, so a non-semver
+  // `current` (a hand-edited package.json, a build stamp) reads as EQUAL to
+  // latest and the install as not stale. That is the safe direction: a parse
+  // failure must never drive an `npm install -g` the user did not ask for, and
+  // "nothing to do" is recoverable (doctor shows the raw strings) where a
+  // spurious upgrade is not. sidecar-refresh.ts makes the same call.
   const stale = latest !== null && current !== "dev" && compareVersions(stripV(current), stripV(latest)) < 0;
 
   // The spawnable methods print exactly the line --run would execute (from
@@ -772,7 +798,7 @@ export async function fetchLatestVersion(opts: FetchLatestVersionOptions = {}): 
 
 /** probeOam's below-floor branch emits a broker-flavoured JSON warn on stderr
  *  ("oam is installed but below the minimum supported version..."). That is the
- *  right and only report under `serve`, where nothing else is printing — but in
+ *  right and only report under `serve`, where nothing else is printing -- but in
  *  `upgrade` the prose note below already says the same thing in the shape a
  *  human reads, so the warn is a second, uglier copy of one advisory landing on
  *  the same terminal. Raise the logger threshold for the duration of the probe
@@ -798,17 +824,17 @@ async function probeOamQuietly(): Promise<OamProbe> {
  *  releases (to the last one `verify:oam-floor` passed on), so the very act of
  *  upgrading yaw-mcp can raise the floor past the user's oam and silently drop
  *  every sidecar from oam to node/npx. That state is otherwise surfaced only as one warn line on the
- *  broker's stderr (which MCP clients hide) and in `yaw-mcp doctor` — while
+ *  broker's stderr (which MCP clients hide) and in `yaw-mcp doctor` -- while
  *  `upgrade`, the command a user runs precisely to "get current", printed
  *  "nothing to do".
  *
- *  The try/catch makes the note strictly advisory — a probe that throws must
+ *  The try/catch makes the note strictly advisory -- a probe that throws must
  *  never fail `upgrade`. */
 async function oamFloorLines(probe?: UpgradeCommandOptions["oamProbe"]): Promise<string[]> {
-  // Auto-skip under vitest when no probe was injected (mirrors npmGlobalPrefix):
-  // an un-injected unit test must never spawn a real `oam --version`, whose
-  // answer varies per machine.
-  if (!probe && process.env.VITEST) return [];
+  // Auto-skip under a test harness when no probe was injected (mirrors
+  // npmGlobalPrefix): an un-injected unit test must never spawn a real
+  // `oam --version`, whose answer varies per machine.
+  if (!probe && isTestSandbox()) return [];
   try {
     const oam = probe ? await probe() : await probeOamQuietly();
     if (!oam.belowMin) return [];
@@ -836,15 +862,40 @@ async function oamFloorLines(probe?: UpgradeCommandOptions["oamProbe"]): Promise
  *  auto-upgrade.ts statically imports this module, so a static back-import
  *  would create a cycle. (oam-spawn, by contrast, imports nothing from here,
  *  which is why THAT one is a plain static import at the top of the file.)
- *  Auto-skips under vitest (mirrors npmGlobalPrefix): the
+ *  Auto-skips under a test harness (mirrors npmGlobalPrefix): the
  *  walk realpaths argv[1], so on a machine that really has a global install
  *  an un-injected unit test's spawn args would flip from bare `-g` to
  *  `--prefix` depending on the machine. Tests exercising the prefix path
  *  inject opts.runningPrefix. */
 async function defaultRunningPrefix(argvPath: string | undefined): Promise<string | null> {
-  if (process.env.VITEST) return null;
+  if (isTestSandbox()) return null;
   const { detectRunningInstallPrefix } = await import("./auto-upgrade.js");
   return detectRunningInstallPrefix(argvPath);
+}
+
+/** The lock a global-npm `--run` takes in the running install's prefix before
+ *  it spawns `npm install -g`. auto-upgrade's acquireUpgradeLock under its
+ *  default name, so this command contends with the background self-upgrade
+ *  (and with sidecar-refresh, whose lock name deliberately equals it) on the
+ *  SAME file: two npm reify passes into one prefix retire and extract the
+ *  same package dir concurrently, and until this lock existed `upgrade --run`
+ *  was the one writer of that tree that never took it. Dynamic import for the
+ *  same cycle reason as defaultRunningPrefix. Auto-skips under a test harness
+ *  (a no-op release, never contention): the fixtures' prefixes are fictional,
+ *  and a real lockfile under one of them is a side effect on the machine.
+ *  Tests inject opts.acquireLock. */
+async function defaultAcquireLock(prefixDir: string): Promise<(() => void) | null> {
+  if (isTestSandbox()) return () => {};
+  const { acquireUpgradeLock } = await import("./auto-upgrade.js");
+  return acquireUpgradeLock(prefixDir);
+}
+
+/** Path of the lock defaultAcquireLock takes, for the "someone else holds it"
+ *  message: the one thing an operator can do with a refused run is look at
+ *  the file (and its pid). Mirrors sidecars-cmd's locked message. */
+async function upgradeLockPath(prefixDir: string): Promise<string> {
+  const { UPGRADE_LOCK_NAME } = await import("./auto-upgrade.js");
+  return join(prefixDir, UPGRADE_LOCK_NAME);
 }
 
 async function defaultSpawn(cmd: string, args: string[], cwd?: string): Promise<number> {
@@ -940,8 +991,10 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
   //     the spawn argv stays raw (see quoteArgForDisplay in auto-upgrade.ts).
   let globalPrefixArg: string | null = null;
   let suggestedCommand = plan.command;
+  // The RAW prefix outlives this block: the --run path below locks it.
+  let rawPrefix: string | null = null;
   if (method === "global-npm") {
-    const rawPrefix = await (opts.runningPrefix ?? defaultRunningPrefix)(argvPath);
+    rawPrefix = await (opts.runningPrefix ?? defaultRunningPrefix)(argvPath);
     if (rawPrefix !== null) {
       const { quoteArgForDisplay, quoteShellArgIfNeeded } = await import("./auto-upgrade.js");
       // opts.platform threads through to BOTH quoters: only win32 can refuse a
@@ -989,7 +1042,7 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
     return { exitCode: plan.stale ? 1 : 0, lines };
   }
 
-  // Offline or registry unreachable — still useful to print the method +
+  // Offline or registry unreachable -- still useful to print the method +
   // suggested command so the user can run it when they're back online.
   if (latest === null) {
     print("yaw-mcp upgrade: couldn't reach the npm registry (offline? firewall?).");
@@ -1056,7 +1109,7 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
     const emit = opts.run ? printErr : print;
     emit("yaw-mcp is running as a standalone binary -- manual upgrade required.");
     emit(`There's no package manager to upgrade it, and \`--run\` can't automate this: ${BINARY_RETIRED_HINT}`);
-    // 1→2 scripting trap (see the "SCRIPTING TRAP" note in the file header):
+    // 1->2 scripting trap (see the "SCRIPTING TRAP" note in the file header):
     // plain `upgrade` returns 1, but `--run` returns 2 because a binary can
     // never be auto-run. The message above states "manual upgrade required"
     // so scripts don't blindly retry with --run. The exit-code contract is
@@ -1066,7 +1119,7 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
 
   // Auto-runnable methods spawn the OWNING tool with whitelisted args for
   // exactly our package: npm for global/local npm trees, pnpm/bun for
-  // their global stores. dev-checkout stays manual — the user owns that
+  // their global stores. dev-checkout stays manual -- the user owns that
   // tree and the right command depends on their setup. unknown stays
   // manual because we don't know which install we'd be mutating.
   // One whitelist for every spawn surface: UPGRADE_COMMANDS. The `--prefix`
@@ -1103,7 +1156,7 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
       print("Run `yaw-mcp upgrade --run` to upgrade in place, or run it yourself:");
     } else {
       // Non-runnable method (dev-checkout / unknown): manual upgrade required.
-      // 1→2 scripting trap — see the file-header "SCRIPTING TRAP" note: this
+      // 1->2 scripting trap -- see the file-header "SCRIPTING TRAP" note: this
       // returns 1 here, but `--run` returns 2 below, never 0. Don't promise
       // --run will fix it.
       print("Manual upgrade required (--run can't safely automate this install method). Run it yourself:");
@@ -1116,17 +1169,39 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
     return { exitCode: 1, lines };
   }
 
-  // --run: attempt the upgrade. Only whitelisted commands — never
+  // --run: attempt the upgrade. Only whitelisted commands -- never
   // pass arbitrary user input into a shell.
   if (!runSpec) {
     // Non-runnable method reached via --run: manual upgrade required. This is
-    // the exit-2 half of the documented 1→2 scripting trap (file-header note).
+    // the exit-2 half of the documented 1->2 scripting trap (file-header note).
     printErr(
       `yaw-mcp upgrade --run: a "${method}" install can't be upgraded automatically (manual upgrade required). Run it yourself:`,
     );
     printErr("");
     printErr(`  ${commandLine}`);
     return { exitCode: 2, lines };
+  }
+
+  // Serialize against the OTHER writers of a global-npm prefix -- the
+  // background self-upgrade every `serve` may start (maybeAutoUpgrade), and a
+  // second `upgrade --run` in another terminal -- before spawning. Both of
+  // those take acquireUpgradeLock in the running prefix; this command did
+  // not, so it was the one `npm install -g` into that tree that could land
+  // beside another. Only when the prefix is known: without one the spawn
+  // carries no `--prefix` and npm writes into its own, which no detected lock
+  // directory names (auto-upgrade's "where we WOULD install" note). Null is a
+  // live holder: say so and stop -- the install the holder is running is the
+  // one this command would have run, and a retry once it finishes is cheap.
+  // Exit 3, the "attempted and did not install" code (see the header).
+  let releaseLock: (() => void) | null = null;
+  if (method === "global-npm" && rawPrefix !== null) {
+    releaseLock = await (opts.acquireLock ?? defaultAcquireLock)(rawPrefix);
+    if (releaseLock === null) {
+      printErr(
+        `yaw-mcp upgrade --run: another yaw-mcp process is upgrading this install (lock: ${await upgradeLockPath(rawPrefix)}); try again once it finishes.`,
+      );
+      return { exitCode: 3, lines };
+    }
   }
 
   const runner = opts.spawnImpl ?? defaultSpawn;
@@ -1137,7 +1212,16 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
   }
   print(`  ${commandLine}`);
   print("");
-  const code = await runner(runSpec.cmd, runSpec.args, runSpec.cwd);
+  let code: number;
+  try {
+    code = await runner(runSpec.cmd, runSpec.args, runSpec.cwd);
+  } finally {
+    // Released on EVERY way out of the spawn -- a non-zero child, a runner
+    // that throws -- or the next `serve` reads this prefix as locked for the
+    // whole stale window over a failure already reported here. The post-run
+    // version check below needs no lock: it only reads.
+    releaseLock?.();
+  }
   if (code === 0) {
     print("");
     print(`OK: Upgraded @yawlabs/mcp to ${latest}`);
@@ -1158,6 +1242,12 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
     // install time, so a copy that comes back NEWER than the pre-install fetch
     // landed exactly where it should and is not the wrong-tree case.
     const bare = (s: string): string => (s.startsWith("v") ? s.slice(1) : s);
+    // compareVersions answers 0 for an unparseable `running` (a package.json
+    // whose version is not semver), so the warning is silently SKIPPED for
+    // that copy. Safe direction for an advisory: an unverifiable on-disk
+    // version is not evidence of a wrong-tree install, and crying wolf here
+    // would send the user to upgrade a tree that may already be current.
+    // buildUpgradePlan documents the same choice for the staleness verdict.
     if (running !== null && compareVersions(bare(running), bare(latest)) < 0) {
       printErr("");
       printErr(`WARNING: the copy this command ran from still reports ${running}, not ${latest}:`);

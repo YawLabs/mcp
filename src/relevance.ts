@@ -12,9 +12,10 @@
 // Stage 2 (on the server side) will handle semantic matches when it lands";
 // the hosted backend that Stage 2 would have run on is retired, so there is
 // no second stage to land and this file is the whole ranker. (server.ts's
-// twoStageRank keeps a name left over from that plan -- it calls rankServers
-// once and slices the top K; the optional LLM tiebreak that follows in
-// dispatch is a disambiguator over those candidates, not a ranking stage.)
+// rankIntentCandidates -- formerly twoStageRank, a name left over from that
+// plan -- calls rankServers once and slices the top K; the optional LLM
+// tiebreak that follows in dispatch is a disambiguator over those candidates,
+// not a ranking stage.)
 // If semantic matching is ever wanted it has to be built here, locally, not
 // waited for.
 
@@ -518,11 +519,11 @@ function scoreAgainstIndex(queryTerms: string[], index: RankingIndex): RankedRes
     }
   }
 
-  results.sort((a, b) => {
-    if (b.score !== a.score) return b.score - a.score;
-    // Stable tie-break by namespace so test assertions don't flake
-    return a.namespace < b.namespace ? -1 : 1;
-  });
+  // Stable tie-break by namespace so test assertions don't flake. localeCompare
+  // (as rankTools below) rather than `a < b ? -1 : 1`: that form returned 1
+  // for BOTH orderings of two equal namespaces, an inconsistent comparator
+  // whose output order is then whatever the sort algorithm happens to do.
+  results.sort((a, b) => b.score - a.score || a.namespace.localeCompare(b.namespace));
 
   return results;
 }
@@ -538,6 +539,20 @@ export interface RankedTool {
   name: string;
   description?: string;
   score: number;
+}
+
+/** Did the query name this namespace? True when the query carries the
+ *  namespace whole ("aws_s3" survives tokenizeQuery only when the caller
+ *  wrote it without the underscore, so that form is checked verbatim) OR
+ *  every identifier token of it ("aws" and "s3" for `aws_s3`). A whole-string
+ *  test alone could never award the bonus to a multi-segment namespace,
+ *  because the query is tokenized on the same separators the namespace is
+ *  built from. A namespace that tokenizes to nothing never matches: an
+ *  `every` over an empty list would be vacuously true. */
+function queryNamesNamespace(queryTerms: Set<string>, namespace: string): boolean {
+  if (queryTerms.has(namespace.toLowerCase())) return true;
+  const parts = tokenizeIdent(namespace);
+  return parts.length > 0 && parts.every((p) => queryTerms.has(p));
 }
 
 /** Rank TOOLS across servers, rather than ranking the servers that hold them.
@@ -556,8 +571,10 @@ export interface RankedTool {
  *  a 60-tool server a systematically different score from the identical tool
  *  on a 3-tool one. The weighting still mirrors FIELD_WEIGHTS (a name hit
  *  outweighs a description hit) so the two rankers agree about what "matches"
- *  means, and the same tokenizers are used on both sides so a term that
- *  survives for one survives for the other. */
+ *  means, and each field is tokenized at the floor rankServers uses for the
+ *  same field -- the identifier floor for tool names, the prose floor for
+ *  descriptions -- so a term that survives for one ranker survives for the
+ *  other. */
 export function rankTools(query: string, servers: RankableServer[]): RankedTool[] {
   const queryTerms = new Set(tokenizeQuery(query));
   if (queryTerms.size === 0 || servers.length === 0) return [];
@@ -565,10 +582,14 @@ export function rankTools(query: string, servers: RankableServer[]): RankedTool[
   const out: RankedTool[] = [];
   for (const server of servers) {
     for (const tool of server.tools) {
-      // tokenize(), not a private split: the identifier-aware tokenizer is
-      // what turns `create_issue` into ["create","issue"] AND keeps the joined
-      // form, so a query of "issue" and a query of "create_issue" both hit.
-      const nameTerms = new Set(tokenize(tool.name));
+      // tokenizeIdent for the NAME, matching buildDocFields: a tool name is an
+      // identifier, so `s3_upload` has to yield ["s3", "upload"] here exactly
+      // as it does in the server index, or find_tool("s3") can never hit a
+      // tool rankServers would have credited. (This used the prose tokenizer,
+      // whose 3-char floor dropped `s3`, `pr`, `db` from every tool name, and
+      // the comment claimed a joined form was kept that no tokenizer here has
+      // ever produced.) Descriptions keep the prose floor, as in the index.
+      const nameTerms = new Set(tokenizeIdent(tool.name));
       const descTerms = new Set(tokenize(tool.description));
       let score = 0;
       for (const term of queryTerms) {
@@ -578,7 +599,7 @@ export function rankTools(query: string, servers: RankableServer[]): RankedTool[
       // A namespace hit is worth something but must not carry a tool on its
       // own: "github" should surface github's tools BELOW a tool actually
       // named for what was asked, on any server.
-      if (score > 0 && queryTerms.has(server.namespace.toLowerCase())) score += 0.5;
+      if (score > 0 && queryNamesNamespace(queryTerms, server.namespace)) score += 0.5;
       if (score > 0) out.push({ namespace: server.namespace, name: tool.name, description: tool.description, score });
     }
   }
@@ -612,13 +633,3 @@ export function rankServers(context: string, servers: RankableServer[]): RankedR
 
   return scoreAgainstIndex(queryTerms, index);
 }
-
-// A single-server `scoreRelevance` wrapper used to live here, documented as
-// "kept for legacy callers that score one candidate at a time." No such
-// caller existed anywhere in the repo -- only its own tests -- and it carried
-// a bypass of indexCache (plus a regression test guarding that bypass) whose
-// only purpose was to stop a loop over the wrapper from evicting the real
-// corpus index. Deleted rather than re-documented: rankServers with a
-// one-element array is the same computation, and the eviction subtlety stops
-// existing along with the function. Tests that want a single score go through
-// rankServers(query, [server])[0]?.score ?? 0.

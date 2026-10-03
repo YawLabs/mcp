@@ -34,18 +34,25 @@ const CONTINUE_FILE = "yaw-mcp.json";
  *  `readClientEnv` reports the value verbatim instead of applying one policy
  *  for every client (Zed's variable is ignored when relative; this one is
  *  not). A relative value is inherently a guess, because the IDE resolves it
- *  against ITS process cwd, not ours. */
-function continueGlobalDir(base: PathBase): { dir: string; display: string } {
-  const raw = base.env.continueGlobalDir;
+ *  against ITS process cwd, not ours. Surrounding whitespace is stripped
+ *  first, as the Cline row strips it: a value of spaces is not a directory
+ *  the user meant, and is treated as unset.
+ *
+ *  `envDirected` says which branch answered, so the caller does not have to
+ *  infer it by comparing `display` against `dir` -- a comparison that happens
+ *  to hold today only because the env branch spells the two the same. */
+function continueGlobalDir(base: PathBase): { dir: string; display: string; envDirected: boolean } {
+  const raw = base.env.continueGlobalDir?.trim();
   if (raw && raw.length > 0) {
     const dir = isAbsolute(raw) ? raw : resolve(raw);
     // Shown verbatim, the CLAUDE_CONFIG_DIR precedent: a `~` spelling would
     // hide the redirect that put the file somewhere else.
-    return { dir, display: dir };
+    return { dir, display: dir, envDirected: true };
   }
   return {
     dir: join(base.home, ".continue"),
     display: base.os === "windows" ? "%USERPROFILE%\\.continue" : "~/.continue",
+    envDirected: false,
   };
 }
 
@@ -62,7 +69,7 @@ function resolveContinuePath(base: PathBase): ResolvedPath {
   const absolute = join(global.dir, "mcpServers", CONTINUE_FILE);
   // An env-directed dir is already absolute and is shown as-is; the default
   // keeps the `~` / `%USERPROFILE%` spelling the other rows use.
-  const display = global.display === global.dir ? absolute : [global.display, "mcpServers", CONTINUE_FILE].join(sep);
+  const display = global.envDirected ? absolute : [global.display, "mcpServers", CONTINUE_FILE].join(sep);
   return { absolute, display, containerPath: ["mcpServers"] };
 }
 

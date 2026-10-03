@@ -8,6 +8,7 @@ import {
   readFileSync,
   rmSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -32,6 +33,7 @@ vi.mock("node:fs/promises", async (importOriginal) => {
     chmod: vi.fn(actual.chmod),
     stat: vi.fn(actual.stat),
     rename: vi.fn(actual.rename),
+    readdir: vi.fn(actual.readdir),
   };
 });
 
@@ -47,7 +49,7 @@ vi.mock("node:timers/promises", async (importOriginal) => {
   return { ...actual, setTimeout: vi.fn(async () => undefined) };
 });
 
-import { chmod, mkdir, rename, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readdir, rename, stat, writeFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 
 /**
@@ -259,6 +261,51 @@ describe("atomicWriteFile", () => {
     await atomicWriteFile(file, "ok");
     const siblings = readdirSync(dir);
     expect(siblings).toEqual(["clean.json"]);
+  });
+
+  it("sweeps a stale .tmp- orphan of the SAME target on the next successful write, and nothing else", async () => {
+    // A hard kill between the tmp write and the rename leaves
+    // `<file>.tmp-<pid>-<ms>-<n>` behind with no unlink to follow. The next
+    // write to that target sweeps such a sibling once it is older than ten
+    // minutes; a fresh one (a concurrent writer's, seconds old) and an
+    // orphan of ANOTHER target are left alone, whatever their age.
+    const file = join(dir, "state.json");
+    const stale = `${file}.tmp-1234-1-7`;
+    const fresh = `${file}.tmp-1234-2-8`;
+    const otherStale = join(dir, "other.json.tmp-1234-3-9");
+    const lookalike = `${file}.tmp-not-a-tmp`;
+    for (const p of [stale, fresh, otherStale, lookalike]) writeFileSync(p, "orphan");
+    const elevenMinutesAgo = new Date(Date.now() - 11 * 60 * 1000);
+    utimesSync(stale, elevenMinutesAgo, elevenMinutesAgo);
+    utimesSync(otherStale, elevenMinutesAgo, elevenMinutesAgo);
+    utimesSync(lookalike, elevenMinutesAgo, elevenMinutesAgo);
+
+    await atomicWriteFile(file, "ok");
+
+    expect(readFileSync(file, "utf8")).toBe("ok");
+    expect(existsSync(stale)).toBe(false);
+    expect(existsSync(fresh)).toBe(true);
+    expect(existsSync(otherStale)).toBe(true);
+    expect(existsSync(lookalike)).toBe(true);
+  });
+
+  it("does not sweep when the tmp write itself fails, and the sweep's own errors never surface", async () => {
+    // The sweep runs only after the tmp file landed: a write refused by the
+    // directory is not a licence to delete in it. And it is best-effort end
+    // to end: an injected readdir failure changes nothing about the write.
+    const file = join(dir, "state.json");
+    const stale = `${file}.tmp-1234-1-7`;
+    writeFileSync(stale, "orphan");
+    const elevenMinutesAgo = new Date(Date.now() - 11 * 60 * 1000);
+    utimesSync(stale, elevenMinutesAgo, elevenMinutesAgo);
+    vi.mocked(writeFile).mockRejectedValueOnce(errnoError("ENOSPC"));
+    await expect(atomicWriteFile(file, "ok")).rejects.toMatchObject({ code: "ENOSPC" });
+    expect(existsSync(stale)).toBe(true);
+
+    vi.mocked(readdir).mockRejectedValueOnce(errnoError("EACCES"));
+    await atomicWriteFile(file, "ok");
+    expect(readFileSync(file, "utf8")).toBe("ok");
+    expect(existsSync(stale)).toBe(true);
   });
 
   it("with dirMode births every parent directory it creates at that mode", async () => {

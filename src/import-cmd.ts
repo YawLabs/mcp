@@ -191,11 +191,17 @@ export interface ImportCommandOptions {
   err?: (s: string) => void;
   /** Test hook: override the TTY verdict instead of reading process.std*. */
   isTTY?: boolean;
-  /** Test hook: answer the removal prompt without a real TTY read. It does
-   *  NOT answer the bundles.json overwrite question, which reads `io`. */
+  /** Test hook: answer BOTH prompts without a real TTY read -- the
+   *  originals-removal question (y / n) and the bundles.json overwrite
+   *  question (o / s / a, applied to every entry asked about). One answer
+   *  serves both because a test that sets it has opted out of stdin
+   *  entirely; a test that needs per-entry answers, or the real readline
+   *  path, drives `io` instead and leaves this unset. `isInteractive` reads a
+   *  set value as "there is a terminal", so neither question falls through
+   *  to the off-TTY refusal. */
   promptAnswer?: string;
-  /** The streams both questions are asked on; process.stdin / process.stdout
-   *  when absent. */
+  /** The streams both questions are asked on when `promptAnswer` is unset;
+   *  process.stdin / process.stdout when absent. */
   io?: { stdin: NodeJS.ReadableStream; stdout: NodeJS.WritableStream; terminal?: boolean };
 }
 
@@ -385,6 +391,18 @@ function toEntry(key: string, value: unknown, vars: ClientVars | null): BuiltEnt
   const command = typeof v.command === "string" && v.command.trim() !== "" ? expand(v.command) : undefined;
   const url = typeof v.url === "string" && v.url.trim() !== "" ? expand(v.url) : undefined;
   if (!command && !url) return null;
+  // Both at once is the loader's "genuinely ambiguous" shape (validateEntry
+  // defaults it to local and lets command win). The import makes the same
+  // call -- but SAYS so, naming the url it leaves behind, because the header
+  // promises nothing is dropped in silence and the url can be the half the
+  // user actually meant. Through `discarded`, so it prints beside the
+  // env/headers notes as a warning naming the client file.
+  const dropped: string[] = [];
+  if (command && url) {
+    dropped.push(
+      `ignoring 'url' on "${displaySafe(key)}" (the entry also has a command, so it is imported as a local stdio server) -- ${displaySafe(url)} was not carried over`,
+    );
+  }
 
   const namespace = deriveNamespace(key);
   const base: Partial<UpstreamServerConfig> = {
@@ -426,7 +444,7 @@ function toEntry(key: string, value: unknown, vars: ClientVars | null): BuiltEnt
       ...(env ? { env } : {}),
     },
     credentialKeys: Object.keys(env ?? {}),
-    discarded: discardNotes("env", key, rawEnv),
+    discarded: [...dropped, ...discardNotes("env", key, rawEnv)],
     unresolved: [...unresolved],
   };
 }
@@ -571,7 +589,18 @@ async function askBundleCollisions(
   changing: readonly ImportCandidate[],
   bundlesFile: string,
   io: ImportCommandOptions["io"],
+  promptAnswer: string | undefined,
 ): Promise<CollisionAnswers> {
+  // The test seam, read the way a typed line would be: same trim, same
+  // first-letter dispatch, same answer for every entry. No readline is opened,
+  // so a test that sets it can never block on a stdin nothing writes to.
+  if (promptAnswer !== undefined) {
+    const answer = promptAnswer.trim().toLowerCase();
+    if (answer.startsWith("a")) return "abort";
+    const answers = new Map<ImportCandidate, "overwrite" | "skip">();
+    for (const c of changing) answers.set(c, answer.startsWith("o") ? "overwrite" : "skip");
+    return answers;
+  }
   const rl = createInterface({
     input: io?.stdin ?? process.stdin,
     output: io?.stdout ?? process.stdout,
@@ -1424,7 +1453,7 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
         );
         return { exitCode: 2, written: [] };
       }
-      const asked = await askBundleCollisions(changing, bundlesFile, opts.io);
+      const asked = await askBundleCollisions(changing, bundlesFile, opts.io, opts.promptAnswer);
       if (asked === "abort") {
         printErr("yaw-mcp import: Aborted. Nothing was written.");
         return { exitCode: 1, written: [] };

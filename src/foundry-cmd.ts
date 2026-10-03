@@ -123,7 +123,20 @@ export interface FoundryExportOptions {
 // had no coverage at all, which is how the empty-tools snapshot the hydration
 // below fixes went unnoticed.
 export async function defaultLoadServers(cwd: string | undefined, home: string): Promise<RankableServer[]> {
-  const { config } = await loadLocalBundles({ cwd, home });
+  return (await loadServerCatalog(cwd, home)).servers;
+}
+
+/** The catalog plus WHERE it came from, so the empty-corpus diagnostic can
+ *  name a missing bundles.json instead of reporting "0 servers" -- which
+ *  reads as "your catalog is empty" when the truth is "no catalog was found
+ *  at any of the paths the loader consults". `bundlesPath` is null when no
+ *  file was found (a present-but-malformed file still names its path, and
+ *  its own warnings explain the empty server list). */
+export async function loadServerCatalog(
+  cwd: string | undefined,
+  home: string,
+): Promise<{ servers: RankableServer[]; bundlesPath: string | null; consultedPaths: string[] }> {
+  const { config, path: bundlesPath, consultedPaths } = await loadLocalBundles({ cwd, home });
   // Hydrate the PERSISTED tool cache, mirroring ConnectServer.rankableFor.
   // bundles.json's loader does not carry `toolCache` through its field
   // whitelist, so a snapshot built from the config alone gives every server
@@ -139,12 +152,13 @@ export async function defaultLoadServers(cwd: string | undefined, home: string):
   // servers so that is visible instead of silent. `s.toolCache` stays as the
   // fallback in case a future bundles.json does carry the field.
   const state = await loadState(statePath(userConfigDir(home)));
-  return (config?.servers ?? []).map((s) => ({
+  const servers = (config?.servers ?? []).map((s) => ({
     namespace: s.namespace,
     name: s.name,
     description: s.description,
     tools: state.toolCache[s.namespace]?.tools ?? s.toolCache ?? [],
   }));
+  return { servers, bundlesPath, consultedPaths };
 }
 
 export async function runFoundryExport(opts: FoundryExportOptions): Promise<{ exitCode: number; lines: string[] }> {
@@ -184,7 +198,22 @@ export async function runFoundryExport(opts: FoundryExportOptions): Promise<{ ex
     return { exitCode: 1, lines };
   }
 
-  const servers = opts.loadServers ? await opts.loadServers() : await defaultLoadServers(opts.cwd, home);
+  let servers: RankableServer[];
+  // Where the catalog came from, for the diagnostic below. Only the production
+  // loader can report "no bundles.json at all"; an injected catalog is
+  // whatever the caller passed, so an empty one really is 0 servers.
+  let catalogNote: string;
+  if (opts.loadServers) {
+    servers = await opts.loadServers();
+    catalogNote = `${servers.length} ${servers.length === 1 ? "server" : "servers"}`;
+  } else {
+    const catalog = await loadServerCatalog(opts.cwd, home);
+    servers = catalog.servers;
+    catalogNote =
+      catalog.bundlesPath === null
+        ? `no bundles.json found -- looked for ${catalog.consultedPaths.join(" and ")}`
+        : `${servers.length} ${servers.length === 1 ? "server" : "servers"} in ${catalog.bundlesPath}`;
+  }
   const corpus = buildCorpusFromTraces(traces, servers, { cap: opts.cap });
 
   if (corpus.entries.length === 0) {
@@ -201,9 +230,7 @@ export async function runFoundryExport(opts: FoundryExportOptions): Promise<{ ex
       else if (reason === "empty-tokens") emptyTokens++;
     }
     printErr(
-      `yaw-mcp foundry: ${traces.length} ${traces.length === 1 ? "trace" : "traces"} but 0 usable entries -- ${unknownChosen} chose a server that is not in the local catalog (${servers.length} ${
-        servers.length === 1 ? "server" : "servers"
-      }) and ${emptyTokens} carried no tokens.`,
+      `yaw-mcp foundry: ${traces.length} ${traces.length === 1 ? "trace" : "traces"} but 0 usable entries -- ${unknownChosen} chose a server that is not in the local catalog (${catalogNote}) and ${emptyTokens} carried no tokens.`,
     );
     // 1, not 2: this is a runtime outcome (the harvest and the catalog do not
     // overlap), and 2 means "you typed the command wrong" everywhere else in

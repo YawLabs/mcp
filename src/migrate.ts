@@ -35,7 +35,11 @@ import { log } from "./logger.js";
 import { CONFIG_DIRNAME, isUnderHome, realpathOrSelf, userConfigDir } from "./paths.js";
 
 export const LEGACY_GLOBAL_FILENAME = ".yaw-mcp.json";
-export const LEGACY_PROJECT_FILENAME = ".yaw-mcp.json";
+// The SAME file name at a project root: pre-0.12 told the two scopes apart by
+// directory, not by name. Derived rather than spelled twice so the two cannot
+// drift; the two names stay because each call site reads better naming the
+// scope it is about.
+export const LEGACY_PROJECT_FILENAME = LEGACY_GLOBAL_FILENAME;
 export const LEGACY_LOCAL_FILENAME = ".yaw-mcp.local.json";
 
 const NEW_CONFIG_FILENAME = "config.json";

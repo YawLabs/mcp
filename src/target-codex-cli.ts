@@ -143,6 +143,7 @@ import {
 } from "./client-config.js";
 import {
   canonTomlConfig,
+  entryAsWritten,
   insertTomlRootKey,
   readTomlConfig,
   readTomlRootKey,
@@ -153,7 +154,13 @@ import {
   tomlEntryNames,
   upsertTomlEntry,
 } from "./client-config-toml.js";
-import { defineTarget, ENTRY_NAME, type PathBase, type ResolvedPath } from "./install-target-model.js";
+import {
+  defineTarget,
+  ENTRY_NAME,
+  LEGACY_ENTRY_NAMES,
+  type PathBase,
+  type ResolvedPath,
+} from "./install-target-model.js";
 
 /** Codex's container key, and the one place this file spells it. */
 const CONTAINER_KEY = "mcp_servers";
@@ -181,15 +188,21 @@ function tomlPosition(raw: string, line: number, column: number): ConfigPosition
   return { offset: Math.min(offset + column - 1, raw.length), line, column };
 }
 
-/** The names `classify` asks about SPLICEABILITY.
+/** The names `classify` asks about SPLICEABILITY: ours, and the legacy
+ *  spellings install migrates.
  *
- *  Ours alone, deliberately. An `unspliceable` read refuses every edit through
- *  the write facade, so asking about a name we are not about to rewrite would
- *  turn a neighbouring oddity -- an inline `yaw-mcp` left by hand -- into a
- *  file yaw-mcp declines to touch at all. A legacy or sibling entry in such a
- *  spelling is refused at the WRITE instead, by the splice itself, with the
- *  shape and the remedy in the message. */
-const SPLICEABLE_NAMES = [ENTRY_NAME];
+ *  Ours first, so a problem with our own entry is the one reported when both
+ *  are in a refused spelling. The legacy names are in the list because install
+ *  EDITS a legacy entry: it trims one with a `remove` edit in the same write
+ *  that adds ours, and the splice refuses to delete an inline or dotted
+ *  spelling. With the legacy names left out, such a file read `ok`, doctor
+ *  called it healthy, and install failed at the write with the splicer's own
+ *  message; now the read says `unspliceable` with the by-hand step, doctor
+ *  prints that step ahead of install, and install refuses before it writes.
+ *  A SIBLING server (a third-party entry) in such a spelling is still not
+ *  asked about: nothing rewrites it, so refusing the whole file over it would
+ *  only take yaw-mcp's own entry hostage. */
+const SPLICEABLE_NAMES = [ENTRY_NAME, ...LEGACY_ENTRY_NAMES];
 
 function entryViewsOf(read: TomlConfigRead, transform?: EntryTransform): EntryView[] {
   if (read.kind !== "ok") return [];
@@ -205,14 +218,15 @@ function classifyToml(raw: string, addr: EntryAddress, transform?: EntryTransfor
     case "absent":
       return { kind: "absent" };
     case "malformed":
-      // `detail` is the reason WITHOUT the position: the facade's refusal adds
-      // " at line L column C" of its own, and TomlConfigError.detail already
-      // embeds one, so passing that would print the position twice.
+      // `detail` is the reason WITHOUT the position, in both unions: the
+      // facade's refusal adds " at line L column C" of its own from
+      // `position`. (The codec's `positioned` field carries the one WITH it,
+      // for messages that print alone.)
       return {
         kind: "malformed",
         syntax: TOML_SYNTAX,
         reason: "syntax",
-        detail: read.reason,
+        detail: read.detail,
         position: tomlPosition(raw, read.line, read.column),
       };
     case "blocked":
@@ -329,6 +343,9 @@ export const TOML_ADAPTER: ConfigAdapter = {
   // default (`ConfigShape.rootDefaults`). The JSON family implements neither.
   readRootKey: readTomlRoot,
   insertRootKey: insertTomlRoot,
+  // The renderer's own omissions (an empty `env: {}` writes no sub-table), so
+  // the facade's read-back check compares against what this syntax writes.
+  entryAsWritten,
 };
 
 registerConfigAdapter("toml", TOML_ADAPTER);
@@ -370,7 +387,11 @@ function resolveCodexPath(base: PathBase): ResolvedPath {
       containerPath,
     };
   }
-  const codexHome = base.env.codexHome;
+  // Trimmed, and a whitespace-only value counts as unset -- the Cline row's
+  // rule for its own path variables: a directory made of spaces is not one
+  // the user can have meant, and `resolve(" ")` would quietly put config.toml
+  // under a space-named directory in the process cwd.
+  const codexHome = base.env.codexHome?.trim();
   if (codexHome !== undefined && codexHome.length > 0) {
     const absolute = join(isAbsolute(codexHome) ? codexHome : resolve(codexHome), "config.toml");
     return { absolute, display: absolute, containerPath };
@@ -412,10 +433,15 @@ function isEnvVarItem(item: unknown): boolean {
  *  an ill-typed value forward writes back something the client rejects, and a
  *  wrong type here is not a value Codex tolerates -- it refuses to load the
  *  file. `env` is deliberately absent: the core carries that one, with its own
- *  string-only filter and its own --force drop line. */
+ *  string-only filter and its own --force drop line.
+ *
+ *  An EMPTY `env_vars = []` is carried too, the way the Cline row carries an
+ *  empty `autoApprove: []`. It is a line the user wrote and Codex loads; drop
+ *  it and the re-rendered entry lacks it, so every re-run reports drift and
+ *  prompts until --repair rewrites the file without the line the user had. */
 function carryCodexFields(stored: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
-  if (Array.isArray(stored.env_vars) && stored.env_vars.length > 0 && stored.env_vars.every(isEnvVarItem)) {
+  if (Array.isArray(stored.env_vars) && stored.env_vars.every(isEnvVarItem)) {
     out.env_vars = [...stored.env_vars];
   }
   if (typeof stored.enabled === "boolean") out.enabled = stored.enabled;

@@ -91,6 +91,15 @@ export async function appendAuditEvent(input: AuditEventInput, home: string = ho
       // writes the log born 0o600, so the file and any parent dir it creates
       // are locked down from birth -- matching saveVault. The chmod below
       // just normalizes the umask masking.
+      //
+      // Create race, documented not closed: two processes that both see the
+      // log absent both take this branch, and the second rename replaces the
+      // first's one-line file -- one line is lost. Benign for the same
+      // reasons the trim race in trimToTailCap is: the file holds NAMES only,
+      // the result is always a complete NDJSON file (never torn), and the
+      // window is the very first append on this machine. appendFile with
+      // O_APPEND would close it but would not create the 0o700 parent dir
+      // atomicWriteFile does, and a lock is not worth one lost line.
       await atomicWriteFile(path, line, "utf8", 0o600, 0o700);
     } else {
       await appendFile(path, line, "utf8");

@@ -39,11 +39,19 @@ describe("installNudgeEnabled (the gate)", () => {
     expect(installNudgeEnabled({}, { installNudge: true })).toBe(true);
   });
 
-  it("only a literal '1' enables via env (no truthy coercion)", () => {
-    expect(installNudgeEnabled({ YAW_MCP_INSTALL_NUDGE: "true" }, null)).toBe(false);
-    expect(installNudgeEnabled({ YAW_MCP_INSTALL_NUDGE: "yes" }, null)).toBe(false);
-    expect(installNudgeEnabled({ YAW_MCP_INSTALL_NUDGE: "0" }, null)).toBe(false);
-    expect(installNudgeEnabled({ YAW_MCP_INSTALL_NUDGE: "" }, null)).toBe(false);
+  it("env takes the product's opt-in spellings: 1 or true, any case, trimmed", () => {
+    // The mirror of isFeatureDisabled's `0` / `false` rule in opt-out-env.ts.
+    // The trimmed case is the one cmd.exe produces: `set VAR=1 && ...` keeps
+    // the space before `&&`, so the value arrives as "1 ".
+    for (const on of ["true", "TRUE", "True", " 1 ", "1\t", " true "]) {
+      expect(installNudgeEnabled({ YAW_MCP_INSTALL_NUDGE: on }, null), JSON.stringify(on)).toBe(true);
+    }
+  });
+
+  it("anything else leaves it off (no truthy coercion, near-misses fail closed)", () => {
+    for (const off of ["yes", "on", "0", "", "   ", "11", "1abc", "false", "truee"]) {
+      expect(installNudgeEnabled({ YAW_MCP_INSTALL_NUDGE: off }, null), JSON.stringify(off)).toBe(false);
+    }
   });
 
   it("env OR config — either independently flips it on", () => {

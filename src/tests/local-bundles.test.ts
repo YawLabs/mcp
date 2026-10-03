@@ -387,7 +387,7 @@ describe("loadLocalBundles", () => {
     const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
     expect(r.config?.servers[0].headers).toEqual({ "X-Real": " keep " });
     expect(r.warnings.some((w) => w.includes('ignoring header "Authorization" on "api" (empty value)'))).toBe(true);
-    expect(r.warnings.some((w) => w.includes('ignoring header "X-Num" on "api" (empty value)'))).toBe(true);
+    expect(r.warnings.some((w) => w.includes('ignoring header "X-Num" on "api" (expected a string value)'))).toBe(true);
   });
 
   it("warns on and drops a header name outside the RFC 7230 token charset", async () => {

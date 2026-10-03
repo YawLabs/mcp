@@ -125,11 +125,28 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
     flags: ["--scope", "--project-dir", "--os", "--force", "--yes", "--keep-legacy", "--dry-run", "--help"],
   },
   // Local servers -- manage ~/.yaw-mcp/bundles.json (no account).
+  // --command / --url / --header / --transport / --description are the
+  // custom-server mode (a server you define rather than a catalog slug), and a
+  // user who cannot tab them never learns `add` has that mode at all. Mirrors
+  // parseAddArgs in src/local-add-cmd.ts -- and completion-cmd.test.ts now
+  // pins BOTH directions, so a flag added to the parser without an entry here
+  // fails the build.
   {
     name: "add",
     description: "Add a catalog server to bundles.json",
     positional: [["<slug>"]],
-    flags: ["--env", "--dry-run", "--json", "--catalog", "--help"],
+    flags: [
+      "--env",
+      "--command",
+      "--url",
+      "--header",
+      "--transport",
+      "--description",
+      "--dry-run",
+      "--json",
+      "--catalog",
+      "--help",
+    ],
   },
   // Same client list as install/uninstall -- one INSTALL_CLIENTS constant
   // feeds all three, so a new client cannot appear in one and not the others.
@@ -215,7 +232,15 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
     positional: [["<slug>"]],
     flags: ["--client", "--ttl", "--env", "--dry-run", "--yes", "--help"],
   },
-  { name: "try-cleanup", description: "Remove a wired trial", positional: [["<slug>"]], flags: ["--help"] },
+  // --force / --yes skip the confirmation that gates the client-config
+  // rewrite (required off a TTY), so they MUST complete for the same reason
+  // `remove`'s do. Mirrors parseTryCleanupArgs in src/try-cmd.ts.
+  {
+    name: "try-cleanup",
+    description: "Remove a wired trial",
+    positional: [["<slug>"]],
+    flags: ["--force", "--yes", "--help"],
+  },
   // Inspection.
   // Flags mirror parseStatusArgs in src/status-cmd.ts -- keep them in sync.
   {
@@ -241,7 +266,13 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
   },
   // Maintenance.
   { name: "upgrade", description: "Upgrade @yawlabs/mcp to the latest version", flags: ["--run", "--json", "--help"] },
-  { name: "reset-learning", description: "Clear cross-session learning history", flags: ["--help"] },
+  // Same confirmation bypass as try-cleanup: parseResetLearningArgs accepts
+  // --force / -y / --yes, and off a TTY the delete refuses without one.
+  {
+    name: "reset-learning",
+    description: "Clear cross-session learning history",
+    flags: ["--force", "--yes", "--help"],
+  },
   {
     name: "completion",
     description: "Print a shell completion script",

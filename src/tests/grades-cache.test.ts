@@ -14,7 +14,7 @@ import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { CachedGrade } from "../grades-cache.js";
-import { gradesCachePath, readGradesCache, writeGrade } from "../grades-cache.js";
+import { gradesCachePath, readGradesCache, stealStaleLock, writeGrade } from "../grades-cache.js";
 import { CONFIG_DIRNAME } from "../paths.js";
 
 // ---------------------------------------------------------------------------
@@ -327,6 +327,44 @@ describe("writeGrade -- cross-process lock", () => {
   it("leaves no lock behind after an ordinary write", async () => {
     await writeGrade("gh", VALID_ENTRY, synthHome);
     expect(existsSync(lockPath(synthHome))).toBe(false);
+  });
+
+  it("restores a live lock it caught mid-steal under the holder's ORIGINAL mtime", async () => {
+    // The race: our stat said stale, another process retook the path with a
+    // fresh lock before our rename landed, and the rename caught the live
+    // one. It goes back under its own token -- but a restore is a NEW file,
+    // so without a utimes it carried a fresh mtime and the holder's lease was
+    // silently extended by up to the whole stale age. Driven through the
+    // steal directly: the window cannot be hit deterministically via writeGrade.
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    const lock = lockPath(synthHome);
+    writeFileSync(lock, "live-holder\n");
+    const taken = new Date(Date.now() - 3_000);
+    utimesSync(lock, taken, taken);
+    const isLive = (ageMs: number): boolean => ageMs > -5_000 && ageMs < 10_000;
+    expect(await stealStaleLock(lock, isLive)).toBe(true);
+    // Put back, same token, and no younger than it was.
+    expect(readFileSync(lock, "utf8")).toBe("live-holder\n");
+    expect(Math.abs(statSync(lock).mtimeMs - taken.getTime())).toBeLessThan(1_000);
+    // The stolen copy is gone.
+    expect(readdirSync(join(synthHome, CONFIG_DIRNAME)).filter((f) => f.includes(".lock.stale-"))).toEqual([]);
+  });
+
+  it("sweeps stale-file litter older than the stale age at lock take, and leaves young litter alone", async () => {
+    // A stealer whose final rm failed (an AV handle on Windows) leaves
+    // `grades.json.lock.stale-<pid>-<n>` behind, and nothing ever looked for
+    // it again. A young one is another stealer mid-flight and must survive.
+    const dir = join(synthHome, CONFIG_DIRNAME);
+    mkdirSync(dir, { recursive: true });
+    const old = join(dir, "grades.json.lock.stale-4242-1");
+    const young = join(dir, "grades.json.lock.stale-4242-2");
+    writeFileSync(old, "dead\n");
+    writeFileSync(young, "mid-steal\n");
+    const past = new Date(Date.now() - 60_000);
+    utimesSync(old, past, past);
+    await writeGrade("gh", VALID_ENTRY, synthHome);
+    expect(existsSync(old)).toBe(false);
+    expect(existsSync(young)).toBe(true);
   });
 });
 

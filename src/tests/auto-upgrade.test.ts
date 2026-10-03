@@ -9,8 +9,10 @@ import {
   quoteShellArgIfNeeded,
   readCheckMemo,
   recordAttemptAt,
+  runsUnderNpmConfigPrefix,
   writeCheckMemo,
 } from "../auto-upgrade.js";
+import { BINARY_RETIRED_HINT } from "../upgrade-cmd.js";
 
 // ═══════════════════════════════════════════════════════════════════════
 // maybeAutoUpgrade — fire-and-forget startup self-upgrade check.
@@ -1176,6 +1178,40 @@ describe("maybeAutoUpgrade -- advice for the non-spawnable methods", () => {
     expect(fields).toMatchObject({ method: "dev-checkout" });
   });
 
+  it("names the unrecognised-prefix case in the local-node-modules advice, without dropping `upgrade --run`", async () => {
+    // A global install under a prefix the markers do not know lands on this
+    // same verdict, and for that user "the version pinned in your project's
+    // node_modules" is false. `upgrade --run` is still the right command (its
+    // `npm prefix -g` probe reclassifies the copy), so it has to stay; the
+    // sentence just has to say why THIS process did nothing.
+    const [, message] = await adviseFor(LOCAL_NODE_MODULES_PATH);
+    expect(message).toContain("yaw-mcp upgrade --run");
+    expect(message).toContain("custom npm prefix");
+    expect(message).toContain("did not recognise");
+    // The old wording called a project tree a "global"; the new clause must
+    // not bring the word back.
+    expect(message).not.toContain("global");
+  });
+
+  it("gives a standalone binary the ONE retired-binary hint upgrade-cmd owns", async () => {
+    // upgrade / doctor / this log used to agree only by hand; the string is
+    // imported now, so a reworded hint cannot leave the serve log on the old
+    // text (which hand-spelled the npm command a second time).
+    mockRealpathSync.mockReturnValue(NO_PREFIX_REALPATH);
+    const spawnImpl = vi.fn();
+    await maybeAutoUpgrade({
+      currentVersion: "0.47.0",
+      isSeaImpl: () => true,
+      fetchLatestImpl: async () => "0.47.8",
+      spawnImpl,
+    });
+    expect(spawnImpl).not.toHaveBeenCalled();
+    // Not adviceLog(): the binary line says "behind npm", not "out of date".
+    const infos = mockLog.mock.calls.filter((c) => c[0] === "info" && String(c[1]).includes("standalone binary"));
+    expect(infos).toHaveLength(1);
+    expect(String(infos[0][1])).toContain(BINARY_RETIRED_HINT);
+  });
+
   it("never spawns `npm install -g --prefix <repo>/packages` for a workspace package named `lib`", async () => {
     // The bare `/lib/node_modules/` marker classified this as global-npm, and
     // detectRunningInstallPrefix strips the trailing `/lib` -- so the background
@@ -1192,15 +1228,149 @@ describe("maybeAutoUpgrade -- advice for the non-spawnable methods", () => {
 // upgrade this session", never to a spawn against a bogus version.
 // ═══════════════════════════════════════════════════════════════════════
 
+// ═══════════════════════════════════════════════════════════════════════
+// The harness guard. Under VITEST every default is a no-op -- INCLUDING the
+// registry probe, which is the gate that makes the feature a consistent
+// no-op for a yaw-mcp spawned by some downstream package's test suite.
+// Before it, the memos and the lock were off while the fetch was live, so a
+// stale global copy ran a real, unserialized `npm install -g` on every start
+// of that suite.
+// ═══════════════════════════════════════════════════════════════════════
+
+describe("maybeAutoUpgrade -- the test-harness guard", () => {
+  beforeEach(resetSpawnRecorder);
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    resetSpawnRecorder();
+  });
+
+  it("under VITEST, with no injected fetch, makes NO registry call and spawns NOTHING", async () => {
+    expect(process.env.VITEST, "this suite runs under vitest").toBeTruthy();
+    const fetchMock = vi.fn(
+      async () => ({ ok: true, json: async () => ({ version: "9.9.9" }) }) as unknown as Response,
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    mockRealpathSync.mockReturnValue(NO_PREFIX_REALPATH);
+
+    await maybeAutoUpgrade({ currentVersion: "0.47.0", argvPath: GLOBAL_NPM_PATH });
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(cp.calls).toHaveLength(0);
+  });
+
+  it("an injected fetch is NOT gated -- that is how the unit tests reach the real path", async () => {
+    const spawnImpl = vi.fn();
+    mockRealpathSync.mockReturnValue(NO_PREFIX_REALPATH);
+    await maybeAutoUpgrade({
+      currentVersion: "0.47.0",
+      argvPath: GLOBAL_NPM_PATH,
+      fetchLatestImpl: async () => "0.47.8",
+      spawnImpl,
+    });
+    expect(spawnImpl).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// runsUnderNpmConfigPrefix -- the cheap half of `npm prefix -g` for the
+// background path: a copy under the prefix npm exported into our env.
+// ═══════════════════════════════════════════════════════════════════════
+
+describe("runsUnderNpmConfigPrefix", () => {
+  const PREFIX = join(sep, "home", "u", "tools");
+  const POSIX_LAYOUT = join(PREFIX, "lib", "node_modules", "@yawlabs", "mcp", "dist", "index.js");
+  const WIN_LAYOUT = join(PREFIX, "node_modules", "@yawlabs", "mcp", "dist", "index.js");
+
+  beforeEach(resetSpawnRecorder);
+  afterEach(resetSpawnRecorder);
+
+  it("recognises both global layouts under the exported prefix", () => {
+    expect(runsUnderNpmConfigPrefix(POSIX_LAYOUT, { npm_config_prefix: PREFIX })).toBe(true);
+    expect(runsUnderNpmConfigPrefix(WIN_LAYOUT, { npm_config_prefix: PREFIX })).toBe(true);
+    // A trailing separator on the prefix is how a shell often leaves it.
+    expect(runsUnderNpmConfigPrefix(POSIX_LAYOUT, { npm_config_prefix: `${PREFIX}${sep}` })).toBe(true);
+  });
+
+  it("answers false when the variable is unset, empty, or names some other tree", () => {
+    expect(runsUnderNpmConfigPrefix(POSIX_LAYOUT, {})).toBe(false);
+    expect(runsUnderNpmConfigPrefix(POSIX_LAYOUT, { npm_config_prefix: "" })).toBe(false);
+    expect(runsUnderNpmConfigPrefix(POSIX_LAYOUT, { npm_config_prefix: join(sep, "opt", "other") })).toBe(false);
+    // A project that merely lives UNDER the prefix is not a global install.
+    expect(
+      runsUnderNpmConfigPrefix(join(PREFIX, "proj", "node_modules", "@yawlabs", "mcp", "dist", "index.js"), {
+        npm_config_prefix: PREFIX,
+      }),
+    ).toBe(false);
+    expect(runsUnderNpmConfigPrefix(undefined, { npm_config_prefix: PREFIX })).toBe(false);
+  });
+
+  it("maybeAutoUpgrade reclassifies such a copy as global-npm and upgrades it with --prefix", async () => {
+    // The literal path matches no marker (not a default prefix, not a version
+    // manager, not ~/.npm-global), so the markers say local-node-modules --
+    // the verdict that never background-upgrades. With npm's own prefix in
+    // the env the copy is a global install after all. The realpath mock stays
+    // the identity here: comparablePath realpaths the PREFIX too, and a fixed
+    // return value would hand it the entry path.
+    const spawnImpl = vi.fn();
+    await maybeAutoUpgrade({
+      currentVersion: "0.47.0",
+      argvPath: POSIX_LAYOUT,
+      env: { npm_config_prefix: PREFIX },
+      fetchLatestImpl: async () => "0.47.8",
+      spawnImpl,
+    });
+    expect(spawnImpl).toHaveBeenCalledWith(
+      "npm",
+      ["install", "-g", "--prefix", PREFIX, "@yawlabs/mcp@latest"],
+      RELEASE_LOCK,
+    );
+  });
+
+  it("leaves the local-node-modules verdict alone when the env names no prefix", async () => {
+    const spawnImpl = vi.fn();
+    await maybeAutoUpgrade({
+      currentVersion: "0.47.0",
+      argvPath: POSIX_LAYOUT,
+      env: {},
+      fetchLatestImpl: async () => "0.47.8",
+      spawnImpl,
+    });
+    expect(spawnImpl).not.toHaveBeenCalled();
+  });
+});
+
+/** Every default EXCEPT the fetch and the spawn, injected as no-ops. The
+ *  describe below turns the harness guard off to reach the real registry
+ *  probe, so these are what keep the memo and lock defaults off the machine. */
+const REAL_FETCH_DEPS = {
+  checkedRecentlyImpl: () => null,
+  recordCheckImpl: () => {},
+  attemptedRecentlyImpl: () => false,
+  recordAttemptImpl: () => {},
+  acquireLockImpl: () => () => {},
+};
+
 /** Minimal duck-typed stand-in for the two members fetchLatestVersion uses. */
 function fakeResponse(ok: boolean, json: () => Promise<unknown>): Response {
   return { ok, json } as unknown as Response;
 }
 
 describe("fetchLatestVersion -- the built-in registry probe", () => {
-  beforeEach(resetSpawnRecorder);
+  beforeEach(() => {
+    resetSpawnRecorder();
+    // The default registry probe is gated OFF under a test harness
+    // (defaultFetchLatest reads isTestSandbox): that gate is what keeps a
+    // yaw-mcp spawned by some downstream suite from running a real
+    // `npm install -g`. These tests are about the real probe, so the gate
+    // is lifted for their duration -- and lifting it lifts the SAME gate on
+    // every other default (the memos, the lock), which is why each call
+    // below injects REAL_FETCH_DEPS: with the harness guard off, an
+    // un-injected default would write a memo into the real tmpdir.
+    vi.stubEnv("VITEST", "");
+  });
 
   afterEach(() => {
+    vi.unstubAllEnvs();
     vi.unstubAllGlobals();
     resetSpawnRecorder();
   });
@@ -1213,7 +1383,7 @@ describe("fetchLatestVersion -- the built-in registry probe", () => {
     mockRealpathSync.mockReturnValue(NO_PREFIX_REALPATH);
 
     const spawnImpl = vi.fn();
-    await maybeAutoUpgrade({ currentVersion: "0.47.0", argvPath: GLOBAL_NPM_PATH, spawnImpl });
+    await maybeAutoUpgrade({ ...REAL_FETCH_DEPS, currentVersion: "0.47.0", argvPath: GLOBAL_NPM_PATH, spawnImpl });
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [url, init] = fetchMock.mock.calls[0];
@@ -1242,7 +1412,7 @@ describe("fetchLatestVersion -- the built-in registry probe", () => {
     mockRealpathSync.mockReturnValue(NO_PREFIX_REALPATH);
 
     const spawnImpl = vi.fn();
-    await maybeAutoUpgrade({ currentVersion: "0.47.0", argvPath: GLOBAL_NPM_PATH, spawnImpl });
+    await maybeAutoUpgrade({ ...REAL_FETCH_DEPS, currentVersion: "0.47.0", argvPath: GLOBAL_NPM_PATH, spawnImpl });
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(spawnImpl).not.toHaveBeenCalled();
@@ -1258,7 +1428,7 @@ describe("fetchLatestVersion -- the built-in registry probe", () => {
 
     const spawnImpl = vi.fn();
     await expect(
-      maybeAutoUpgrade({ currentVersion: "0.47.0", argvPath: GLOBAL_NPM_PATH, spawnImpl }),
+      maybeAutoUpgrade({ ...REAL_FETCH_DEPS, currentVersion: "0.47.0", argvPath: GLOBAL_NPM_PATH, spawnImpl }),
     ).resolves.toBeUndefined();
     expect(spawnImpl).not.toHaveBeenCalled();
   });
@@ -1275,7 +1445,7 @@ describe("fetchLatestVersion -- the built-in registry probe", () => {
       vi.stubGlobal("fetch", fetchMock);
       mockRealpathSync.mockReturnValue(NO_PREFIX_REALPATH);
 
-      await maybeAutoUpgrade({ currentVersion: "0.47.0", argvPath: GLOBAL_NPM_PATH });
+      await maybeAutoUpgrade({ ...REAL_FETCH_DEPS, currentVersion: "0.47.0", argvPath: GLOBAL_NPM_PATH });
 
       expect(fetchMock).not.toHaveBeenCalled();
       expect(cp.calls).toHaveLength(0);
@@ -1291,7 +1461,7 @@ describe("fetchLatestVersion -- the built-in registry probe", () => {
     // skipped for a version of "dev".
     const fetchMock = vi.fn(async () => fakeResponse(true, async () => ({ version: "9.9.9" })));
     vi.stubGlobal("fetch", fetchMock);
-    await maybeAutoUpgrade({ currentVersion: "dev", argvPath: GLOBAL_NPM_PATH });
+    await maybeAutoUpgrade({ ...REAL_FETCH_DEPS, currentVersion: "dev", argvPath: GLOBAL_NPM_PATH });
     expect(fetchMock).not.toHaveBeenCalled();
     expect(cp.calls).toHaveLength(0);
   });

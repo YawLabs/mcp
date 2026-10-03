@@ -57,9 +57,16 @@ export const DISABLE_PERSISTENCE_ENV = "YAW_MCP_DISABLE_PERSISTENCE";
  * predicate they cannot pass their own env to is a predicate they cannot share.
  * The default is evaluated per call, so a test mutating process.env between
  * calls still gets the current value.
+ *
+ * The rule, shared with every YAW_MCP_* opt-in (isReadOnlyDiagnostics,
+ * isTrustBypassEnabled, isAutoLoadEnabled): TRIMMED, then "1" or
+ * case-insensitive "true" is on; anything else, unset and empty included, is
+ * off. Trimmed because cmd.exe's `set VAR=1 && ...` keeps the space before
+ * `&&`, so the value arrives as "1 " on Windows -- and this predicate was the
+ * one copy that did not trim, so persistence stayed ON for exactly that shell.
  */
 export function isPersistenceDisabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  const raw = env[DISABLE_PERSISTENCE_ENV];
+  const raw = env[DISABLE_PERSISTENCE_ENV]?.trim();
   if (raw === undefined || raw === "") return false;
   return raw === "1" || raw.toLowerCase() === "true";
 }
@@ -311,10 +318,12 @@ async function doSaveState(state: SavableState, filePath: string): Promise<void>
   const payload: PersistedState = {
     version: STATE_SCHEMA_VERSION,
     savedAt: Date.now(),
-    learning: state.learning,
-    packHistory: state.packHistory,
     // Sanitize on the way out too: the caps must hold for the bytes we
-    // WRITE, not merely for what a later load is willing to read back.
+    // WRITE, not merely for what a later load is willing to read back, and
+    // they hold for every section -- not only the tool cache -- so the bound
+    // on the file is this module's guarantee rather than each writer's.
+    learning: capLearning(sanitizeLearning(state.learning)),
+    packHistory: capPackHistory(sanitizePackHistory(state.packHistory)),
     toolCache: sanitizeToolCache(state.toolCache),
   };
   try {
@@ -322,6 +331,33 @@ async function doSaveState(state: SavableState, filePath: string): Promise<void>
   } catch (err) {
     log("warn", "Failed to save yaw-mcp state", { error: errorMessage(err) });
   }
+}
+
+/** Most pack-history calls persisted. The same bound PackDetector keeps in
+ *  memory (DEFAULT_MAX_HISTORY in pack-detect.ts, not exported -- it is a
+ *  constructor default there, and the write-side cap belongs to the module
+ *  that owns the file). Newest entries win: the history is append-ordered,
+ *  so the tail is what the detector would have kept. */
+export const PACK_HISTORY_MAX_ENTRIES = 100;
+
+/** Most learning namespaces persisted. Learning is keyed by namespace and a
+ *  namespace is one installed server, so this is comfortably above any real
+ *  install; the cap exists so a runaway writer (or a hand-edit) cannot grow
+ *  state.json without bound. The most recently USED namespaces are kept,
+ *  which is also what makes the learning worth keeping. */
+export const LEARNING_MAX_NAMESPACES = 512;
+
+function capPackHistory(history: PersistedPackCall[]): PersistedPackCall[] {
+  return history.length > PACK_HISTORY_MAX_ENTRIES ? history.slice(-PACK_HISTORY_MAX_ENTRIES) : history;
+}
+
+function capLearning(learning: Record<string, PersistedLearningUsage>): Record<string, PersistedLearningUsage> {
+  const entries = Object.entries(learning);
+  if (entries.length <= LEARNING_MAX_NAMESPACES) return learning;
+  entries.sort((a, b) => b[1].lastUsedAt - a[1].lastUsedAt);
+  const out: Record<string, PersistedLearningUsage> = {};
+  for (const [k, v] of entries.slice(0, LEARNING_MAX_NAMESPACES)) setJsonKey(out, k, v);
+  return out;
 }
 
 function sanitizeLearning(input: unknown): Record<string, PersistedLearningUsage> {

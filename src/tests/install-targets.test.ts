@@ -8,6 +8,7 @@ import {
   claudeCodeContainerPaths,
   claudeCodeContainerPathVariants,
   claudeCodeProjectKey,
+  claudeCodeProjectSites,
   ENTRY_NAME,
   escapeCmdArg,
   INSTALL_TARGETS,
@@ -1537,5 +1538,73 @@ describe("resolveInstallSites", () => {
       expect(fromPath, `${c.clientId} ${c.scope} should throw`).not.toBe("");
       expect(fromSites).toBe(fromPath);
     }
+  });
+});
+
+describe("isProjectLocalEntry -- case is folded only where the filesystem folds it", () => {
+  // The same policy as heal's `norm` and uninstall's `samePathKey`. Folding
+  // unconditionally called `/opt/Yaw` and `/opt/yaw` one tree on Linux, where
+  // they are two, so a checkout under one earned the other's note.
+  const entry = "/home/j/Repo/node_modules/@yawlabs/mcp/dist/index.js";
+  it("win32 folds: a drive-letter or directory case difference is the same tree", () => {
+    expect(
+      isProjectLocalEntry(
+        "C:\\Users\\J\\Repo\\node_modules\\@yawlabs\\mcp\\dist\\index.js",
+        "c:/users/j/repo",
+        "win32",
+      ),
+    ).toBe(true);
+    expect(isProjectLocalEntry(entry, "/home/j/repo", "win32")).toBe(true);
+  });
+  it("POSIX does not: a case-variant directory is another tree", () => {
+    expect(isProjectLocalEntry(entry, "/home/j/repo", "linux")).toBe(false);
+    expect(isProjectLocalEntry(entry, "/home/j/Repo", "linux")).toBe(true);
+    expect(isProjectLocalEntry(entry, "/home/j/repo", "darwin")).toBe(false);
+  });
+});
+
+describe("claudeCodeProjectSites", () => {
+  const base = { os: "linux" as InstallOS, home: "/home/u" };
+  const local = () =>
+    resolveInstallSites({ ...base, clientId: "claude-code", scope: "local", projectDir: "/work/a" })[0];
+
+  it("fans a local-scope site out to one site per OTHER project key, its own first", () => {
+    const site = local();
+    const out = claudeCodeProjectSites(site, (prefix) =>
+      prefix.join("/") === "projects" ? ["/work/b", "/work/a", "/work/c"] : [],
+    );
+    expect(out.map((s) => s.resolved.containerPath)).toEqual([
+      ["projects", "/work/a", "mcpServers"],
+      ["projects", "/work/b", "mcpServers"],
+      ["projects", "/work/c", "mcpServers"],
+    ]);
+    // Same file, same format: only the container differs.
+    for (const s of out) {
+      expect(s.resolved.absolute).toBe(site.resolved.absolute);
+      expect(s.format).toBe(site.format);
+    }
+    // The lister is asked for the projects prefix and nothing else.
+    const asked: string[] = [];
+    claudeCodeProjectSites(site, (prefix) => {
+      asked.push(prefix.join("/"));
+      return [];
+    });
+    expect(asked).toEqual(["projects"]);
+  });
+
+  it("answers the site alone for a file with no projects, a lister that fails, and any other container", () => {
+    const site = local();
+    expect(claudeCodeProjectSites(site, () => [])).toEqual([site]);
+    const user = resolveInstallSites({ ...base, clientId: "claude-code", scope: "user" })[0];
+    const asked: string[] = [];
+    expect(
+      claudeCodeProjectSites(user, (prefix) => {
+        asked.push(prefix.join("/"));
+        return ["/work/b"];
+      }),
+    ).toEqual([user]);
+    expect(asked).toEqual([]);
+    const codex = resolveInstallSites({ ...base, clientId: "codex-cli", scope: "user" })[0];
+    expect(claudeCodeProjectSites(codex, () => ["/work/b"])).toEqual([codex]);
   });
 });

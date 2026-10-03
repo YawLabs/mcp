@@ -2264,6 +2264,19 @@ describe("probeOam hardening", () => {
     expect(c.result()).toBe("0.12.1-rc.1");
   });
 
+  it("keeps the WHOLE held token in the carry, so a long prerelease split across chunks is not truncated", () => {
+    // The carry used to be 32 chars. A held match longer than that left only
+    // its tail in the re-scan, so the next chunk could not extend it and
+    // result() finalized the truncated prerelease. 47 chars here, well past
+    // the old carry and under the new one.
+    const head = "0.12.1-rc.1.alpha.beta.gamma.delta.epsilon.zeta";
+    expect(head.length).toBeGreaterThan(32);
+    const c = createProbeCollector();
+    c.push(`oam ${head}`);
+    c.push(".eta\n");
+    expect(c.result()).toBe(`${head}.eta`);
+  });
+
   it("still reports a flush version when the stream closes without another chunk", () => {
     // The other half of holding it: `oam 0.12.1` with no trailing newline is
     // the whole output, so result() has to finalize what is held rather than

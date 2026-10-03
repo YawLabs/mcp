@@ -1,7 +1,38 @@
 import { describe, expect, it } from "vitest";
-import { type CapContent, capContent, DEFAULT_MAX_RESULT_BYTES, resolveMaxResultBytes } from "../result-cap.js";
+import {
+  type CapContent,
+  capContent,
+  cutToBytes,
+  DEFAULT_MAX_RESULT_BYTES,
+  resolveMaxResultBytes,
+} from "../result-cap.js";
 
 const text = (s: string): CapContent => ({ type: "text", text: s });
+
+describe("cutToBytes", () => {
+  it("strips the replacement char a severed multi-byte sequence decodes to", () => {
+    const s = "ab\u{1F600}"; // 61 62 F0 9F 98 80
+    for (const max of [3, 4, 5]) expect(cutToBytes(s, max)).toBe("ab");
+    expect(cutToBytes(s, 6)).toBe(s);
+  });
+
+  it("keeps a source U+FFFD that ends exactly at the cut", () => {
+    const s = "ab�cd"; // 61 62 EF BF BD 63 64
+    expect(cutToBytes(s, 5)).toBe("ab�");
+  });
+
+  it("never returns more than maxBytes when a source U+FFFD straddles the cut", () => {
+    // The decoder repairs a partial EF / EF BF into the genuine U+FFFD the
+    // source holds there, so the decoded cut is a true prefix of the text
+    // -- and 1-2 bytes over budget. The old prefix test kept it.
+    const s = "ab�cd";
+    for (const max of [3, 4]) {
+      const out = cutToBytes(s, max);
+      expect(Buffer.byteLength(out, "utf8")).toBeLessThanOrEqual(max);
+      expect(out).toBe("ab");
+    }
+  });
+});
 
 describe("resolveMaxResultBytes", () => {
   it("defaults to the documented ceiling", () => {
@@ -118,6 +149,20 @@ describe("capContent", () => {
     // The middle block is cut, and the block after it is gone.
     expect(r.content.some((c) => c.text === "tail")).toBe(false);
     expect(r.content[r.content.length - 1]?.text).toContain("content block(s) were dropped");
+  });
+
+  it("counts dropped blocks by position, not by the first equal reference", () => {
+    // The same block object three times: the third one crosses the ceiling
+    // and is the only one dropped. An identity search (indexOf) found the
+    // FIRST copy and reported all three as dropped.
+    const block = text("z".repeat(1_500));
+    // Two blocks plus 600: the notice reserve is a few hundred bytes, so the
+    // second block still fits and what is left for the third is under the
+    // 512-byte useful-tail floor -- dropped whole, not truncated.
+    const r = capContent([block, block, block], 2 * JSON.stringify(block).length + 600);
+    expect(r.capped).toBe(true);
+    expect(r.content.filter((c) => c.text === block.text)).toHaveLength(2);
+    expect(r.content[r.content.length - 1]?.text).toContain("1 further content block(s) were dropped");
   });
 
   it("does not split a multi-byte character", () => {

@@ -17,6 +17,18 @@
 // transport.close() explicitly. On EOF nothing does. Hooking stdin here is
 // therefore the fix, not a belt-and-braces addition to an SDK path that
 // already works.
+//
+// TIMING CONSTRAINT the callback runs under. index.ts arms a 10s force-exit
+// (`setTimeout(() => process.exit(1), 10_000)`, ref'd on purpose) the moment
+// shutdown starts, and the teardown it bounds is the SDK's STAGED stdio close
+// per upstream: end stdin, wait up to 2s, SIGTERM, wait up to 2s, SIGKILL
+// (StdioClientTransport.close) -- up to 4s per child that ignores EOF, run
+// in parallel across the connections, then server.close(). server.ts sizes
+// its SHUTDOWN_DRAIN_MS (2s) against that same 10s cap, so the budget is:
+// drain 2s + staged close 4s + headroom. Anything new that a shutdown
+// trigger makes the callback wait on comes out of that headroom, and past it
+// the process exits 1 instead of 0 -- which a desktop client then reports
+// as a crashed server. The number itself is index.ts's to change.
 
 /** Structural minimum of an EventEmitter this module attaches to. Kept
  *  deliberately loose (rather than Pick<NodeJS.Process, "on">) because

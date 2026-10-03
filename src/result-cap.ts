@@ -101,9 +101,18 @@ export function cutToBytes(text: string, maxBytes: number): string {
   if (buf.byteLength <= maxBytes) return text;
   const cut = buf.subarray(0, maxBytes).toString("utf8");
   // Only a cut that actually severed a sequence ends in U+FFFD, and the
-  // source could legitimately contain one -- but it cannot have gained one
-  // at the very end that the full text does not have there.
-  return cut.endsWith("�") && !text.startsWith(cut) ? cut.slice(0, -1) : cut;
+  // source could legitimately contain one. Told apart in BYTES, not by a
+  // string prefix test: the decoded cut is kept only when it re-encodes to
+  // exactly the bytes it was cut from AND still fits. A severed sequence
+  // fails the first (the partial lead bytes come back as EF BF BD); a source
+  // U+FFFD straddling the cut passes the first -- the decoder "repairs" the
+  // partial EF / EF BF into the genuine character -- but fails the second,
+  // 1-2 bytes over. (`text.startsWith(cut)` was the previous test; it is
+  // true for that straddling case too, which let the result run over.)
+  if (!cut.endsWith("�")) return cut;
+  const reencoded = Buffer.from(cut, "utf8");
+  const intact = reencoded.byteLength <= maxBytes && reencoded.equals(buf.subarray(0, reencoded.byteLength));
+  return intact ? cut : cut.slice(0, -1);
 }
 
 /** The largest prefix of `item.text` whose ASSEMBLED, SERIALIZED block fits
@@ -254,7 +263,12 @@ export function capContent(content: CapContent[], maxBytes: number): CapResult {
   const noticeReserve = MAX_NOTICE_BYTES;
   const contentBudget = maxBytes - noticeReserve;
 
-  for (const item of content) {
+  // Indexed, not `for..of`: the dropped-block arithmetic below needs this
+  // block's position, and `content.indexOf(item)` is an identity search that
+  // returns the FIRST equal reference -- a repeated block object (the same
+  // literal pushed twice) would be located at its earlier position.
+  for (let i = 0; i < content.length; i++) {
+    const item = content[i];
     const size = serializedBytes(item);
     if (Number.isFinite(size) && used + size <= contentBudget) {
       kept.push(item);
@@ -273,11 +287,11 @@ export function capContent(content: CapContent[], maxBytes: number): CapResult {
         kept.push(fitted.block);
         used += fitted.size;
         truncatedText = true;
-        droppedBlocks += content.length - content.indexOf(item) - 1;
+        droppedBlocks += content.length - i - 1;
         break;
       }
     }
-    droppedBlocks += content.length - content.indexOf(item);
+    droppedBlocks += content.length - i;
     break;
   }
 

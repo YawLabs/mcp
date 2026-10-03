@@ -205,9 +205,11 @@ describe("extractArchive apostrophe path (gap 12)", () => {
     expect(psCall, "extractArchive should have invoked powershell.exe runCommand").toBeDefined();
 
     const command = (psCall as NonNullable<typeof psCall>).args.at(-1) as string;
-    expect(command.startsWith("Expand-Archive -Path '")).toBe(true);
+    // -LiteralPath, not -Path: -Path is a wildcard parameter, and a `[` in
+    // LOCALAPPDATA made it fail "path not found" (see extractArchive).
+    expect(command.startsWith("Expand-Archive -LiteralPath '")).toBe(true);
     // The ASCII apostrophe in "O'Brien" must be doubled to "O''Brien" in BOTH
-    // the -Path and -DestinationPath quoted literals.
+    // the -LiteralPath and -DestinationPath quoted literals.
     expect(command).toContain("O''Brien");
     // And no single (un-doubled) "O'Brien" remains from the path segment.
     expect(command).not.toContain("O'Brien");

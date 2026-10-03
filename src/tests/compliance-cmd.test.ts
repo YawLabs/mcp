@@ -820,8 +820,9 @@ describe("compliance suite launch", () => {
   });
 });
 
-// Registering a `process.once` SIGINT listener suppresses node's default "die
-// on the signal" behaviour, so the handler owns the promise that the run ends.
+// Registering a SIGINT listener (`process.on`, so a repeat Ctrl-C lands on it
+// too) suppresses node's default "die on the signal" behaviour, so the handler
+// owns the promise that the run ends.
 // killTree is best-effort (it shells out to taskkill on Windows and swallows
 // the error), and when it fails to land the first Ctrl-C was consumed for
 // nothing: the CLI sat on a child that would never close until a SECOND
@@ -1213,5 +1214,36 @@ describe("runComplianceCommand cancellation", () => {
     expect(r.code).toBe(1);
     expect(r.out).toContain("Compliance: F");
     expect(r.err).toBe("");
+  });
+});
+
+describe("runComplianceCommand -- a second interrupt lands on the same handler", () => {
+  it("keeps the listener installed after the first Ctrl-C (process.on, not once)", async () => {
+    // With `process.once` the listener was gone after the first Ctrl-C, so a
+    // second one (the reflex when the first seems to do nothing) took node's
+    // default and killed the CLI with the child tree orphaned.
+    const started = mockSpawnedChild();
+    try {
+      const mod = await import("../compliance-cmd.js");
+      const cap = captureIo();
+      const pending = mod.runComplianceCommand(["https://example.com/mcp"], cap.io);
+      const child = await started;
+      const listeners = process.listeners("SIGINT");
+      const handler = listeners[listeners.length - 1] as (s: NodeJS.Signals) => void;
+      expect(handler).toBeTypeOf("function");
+      handler("SIGINT");
+      expect(process.listeners("SIGINT")).toContain(handler);
+      // Idempotent: a repeat re-kills and returns, it does not re-arm.
+      handler("SIGINT");
+      child.emit("close", null);
+      expect(await pending).toBe(INTERRUPT_EXIT_CODE);
+      // Released once the run settled: nothing leaks into the rest of the CLI.
+      expect(process.listeners("SIGINT")).not.toContain(handler);
+      expect(process.listeners("SIGTERM")).not.toContain(handler);
+      expect(cap.err()).toBe("\nmcp-compliance interrupted.\n");
+    } finally {
+      vi.doUnmock("node:child_process");
+      vi.resetModules();
+    }
   });
 });

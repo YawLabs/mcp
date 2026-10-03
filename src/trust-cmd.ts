@@ -17,7 +17,8 @@
 //   yaw-mcp trust --revoke [p]   withdraw approval
 //
 // Exit codes: 0 success, 1 refused / aborted / nothing to approve,
-// 2 argv error (matching the sibling subcommands).
+// 2 argv error (matching the sibling subcommands), 130 Ctrl+C at the
+// approval prompt (128 + SIGINT, as every `secrets` prompt exits).
 
 import { readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -26,10 +27,7 @@ import { localBundlesPath, previewBundlesContent, probeProjectTrust } from "./lo
 import { createStreamWriter } from "./logger.js";
 import { isRegistrySpec, specConstraint } from "./oam-spawn.js";
 import { ALLOW_UNOWNED_ENV, CONFIG_DIRNAME } from "./paths.js";
-import { askYesNo } from "./readline-question.js";
-// One prompt reader shared with `secrets` -- see readTrustAnswer at the bottom
-// of this file for why this crosses a command boundary.
-import { readAnswerFromTTY } from "./secrets-cmd.js";
+import { askYesNo, QUESTION_CANCELLED, type QuestionCancelled } from "./readline-question.js";
 import {
   grantTrust,
   hashTrustContent,
@@ -41,6 +39,10 @@ import {
   trustedRecords,
   trustStorePath,
 } from "./trust.js";
+// One prompt reader shared with `secrets` -- see readTrustAnswer at the bottom
+// of this file for why. A leaf module, so sharing it does not pull the
+// secret-vault graph into a command that never opens the vault.
+import { readAnswerFromTTY } from "./tty-reader.js";
 import type { UpstreamServerConfig } from "./types.js";
 
 export const TRUST_USAGE = `Usage: yaw-mcp trust [--yes]
@@ -66,9 +68,10 @@ export const TRUST_USAGE = `Usage: yaw-mcp trust [--yes]
                     since approval are flagged \`stale (content changed)\`.
   --revoke [<path>] Withdraw approval for <path>, or for the project found
                     from the current directory when <path> is omitted.
-  --json            Machine-readable output for --list and --revoke.
+  --json            Machine-readable output for --list and --revoke: one
+                    compact JSON document on stdout, as \`secrets --json\`.
 
-  ${TRUST_BYPASS_ENV}=1 in the environment skips the check entirely
+  ${TRUST_BYPASS_ENV}=1 (or =true) in the environment skips the check entirely
   (CI/automation only -- it lets any repo you run inside spawn commands
   as you).`;
 
@@ -234,6 +237,11 @@ async function runTrustGrant(opts: TrustCommandOptions): Promise<TrustCommandRes
   // the review is still the thing being approved. probe.status collapses all
   // three into "store-unreadable", so the kind has to come from the store.
   if (probe.status === "store-unreadable") {
+    // The store's second read on this grant (the probe read it to classify;
+    // grantTrust reads it twice more, before and after the prompt). Re-read
+    // rather than carried from the probe because the probe hands back only
+    // the collapsed status, not the kind -- and the kind is what decides
+    // between refusing here and letting a "parse" store be rebuilt.
     const store = await readTrustStore(home);
     if (store.malformedKind === "io" || store.malformedKind === "schema") {
       printStoreRefusal(printErr, {
@@ -330,6 +338,13 @@ async function runTrustGrant(opts: TrustCommandOptions): Promise<TrustCommandRes
         ? "  Approve this file? It defines no servers. [y/N] "
         : `  Read ${serverCount === 1 ? "the 1 command" : `all ${serverCount} commands`} above. Approve this file? [y/N] `;
     const answer = await askYesNo(opts, question, readTrustAnswer);
+    if (answer === QUESTION_CANCELLED) {
+      // ^C at the prompt: 130 (128 + SIGINT), the exit every `secrets`
+      // prompt takes for the same keystroke, so a wrapper can tell a cancel
+      // from a typed "no". Nothing was approved either way.
+      printErr("yaw-mcp trust: Cancelled. Nothing was approved.");
+      return { exitCode: 130 };
+    }
     if (answer !== "y" && answer !== "yes") {
       printErr("yaw-mcp trust: Aborted. Nothing was approved.");
       return { exitCode: 1 };
@@ -708,12 +723,17 @@ async function runTrustList(opts: TrustCommandOptions): Promise<TrustCommandResu
     const msg = `trust store unusable: ${store.malformedReason ?? "unknown"} -- NOTHING is trusted until ${fix}`;
     if (opts.json) {
       out(
-        `${JSON.stringify({ storePath: trustStorePath(home), malformed: true, bypassed, error: msg, trusted: [] }, null, 2)}\n`,
+        `${JSON.stringify({ storePath: trustStorePath(home), malformed: true, bypassed, error: msg, trusted: [] })}\n`,
       );
     } else {
       err(`yaw-mcp trust: ${msg}\n`);
     }
-    return { exitCode: opts.json ? 0 : 1 };
+    // Exit 1 under --json too. The JSON document still carries the failure
+    // in `malformed` / `error` (stdout stays parseable), but the command did
+    // not deliver the list it was asked for, and `--revoke --json` already
+    // exits 1 on the same store -- a wrapper keying on the exit code must
+    // not read one surface as fine and the other as broken.
+    return { exitCode: 1 };
   }
 
   // The rows come from the store already in hand. listTrusted would read the
@@ -726,7 +746,7 @@ async function runTrustList(opts: TrustCommandOptions): Promise<TrustCommandResu
   }
 
   if (opts.json) {
-    out(`${JSON.stringify({ storePath: trustStorePath(home), malformed: false, bypassed, trusted: rows }, null, 2)}\n`);
+    out(`${JSON.stringify({ storePath: trustStorePath(home), malformed: false, bypassed, trusted: rows })}\n`);
     return { exitCode: 0 };
   }
 
@@ -849,7 +869,7 @@ async function runTrustRevoke(opts: TrustCommandOptions): Promise<TrustCommandRe
     const probe = await probeProjectTrust({ cwd, home, env });
     if (probe.path === null) {
       const msg = `no .yaw-mcp/ directory found by walking up from ${displaySafe(cwd)}; pass an explicit path (see \`yaw-mcp trust --list\`)`;
-      if (opts.json) out(`${JSON.stringify({ ok: false, error: msg }, null, 2)}\n`);
+      if (opts.json) out(`${JSON.stringify({ ok: false, error: msg })}\n`);
       else printErr(`yaw-mcp trust --revoke: ${msg}`);
       return { exitCode: 1 };
     }
@@ -872,14 +892,12 @@ async function runTrustRevoke(opts: TrustCommandOptions): Promise<TrustCommandRe
           ? "upgrade with `npm i -g @yawlabs/mcp@latest` (do NOT delete it -- your approvals are still in there)"
           : "fix or delete it";
     const msg = `trust store unusable: ${res.malformedReason ?? "unknown"} -- nothing was revoked; ${fix}, then re-run`;
-    if (opts.json) out(`${JSON.stringify({ ok: false, path: target, removed: false, error: msg }, null, 2)}\n`);
+    if (opts.json) out(`${JSON.stringify({ ok: false, path: target, removed: false, error: msg })}\n`);
     else printErr(`yaw-mcp trust --revoke: ${msg}`);
     return { exitCode: 1 };
   }
   if (opts.json) {
-    out(
-      `${JSON.stringify({ ok: true, path: target, removed: res.removed, storePath: res.storePath, bypassed }, null, 2)}\n`,
-    );
+    out(`${JSON.stringify({ ok: true, path: target, removed: res.removed, storePath: res.storePath, bypassed })}\n`);
     return { exitCode: 0 };
   }
   // A no-op revoke exits 0: "make it not approved" is satisfied either way
@@ -909,11 +927,18 @@ async function runTrustRevoke(opts: TrustCommandOptions): Promise<TrustCommandRe
 // --- prompt -----------------------------------------------------------------
 
 /** Both ends must be a TTY: stdin to read the answer, stdout to show the
- *  question. Mirrors secrets-cmd.ts:isInteractiveTTY. */
+ *  question. The same rule as secrets-cmd.ts:isInteractiveTTY, and like it
+ *  this reads the INJECTED streams (opts.io) before process.std*: askYesNo
+ *  asks on opts.io, so the verdict has to be about the streams the prompt
+ *  would actually use. The two test hooks come first: isTTY forces the
+ *  verdict outright, and a canned promptAnswer never reads anything, so
+ *  there is nothing that needs to be a TTY. */
 function isInteractive(opts: TrustCommandOptions): boolean {
   if (opts.isTTY !== undefined) return opts.isTTY;
   if (opts.promptAnswer !== undefined) return true;
-  return Boolean(process.stdin.isTTY) && Boolean(process.stdout.isTTY);
+  const stdin = opts.io?.stdin ?? process.stdin;
+  const stdout = opts.io?.stdout ?? process.stdout;
+  return (stdin as { isTTY?: boolean }).isTTY === true && (stdout as { isTTY?: boolean }).isTTY === true;
 }
 
 /** The reader the approval prompt hands askYesNo in place of its readline
@@ -930,13 +955,15 @@ function isInteractive(opts: TrustCommandOptions): boolean {
  *  decline). Two implementations of "read one confirmation" drift; there is
  *  now one.
  *
- *  null = ^C, handed on as "": the prompt already defaults to NO, so a cancel
- *  lands on the same "Aborted. Nothing was approved." path as any other non-y
- *  answer, never on askYesNo's QUESTION_CANCELLED. */
+ *  null = ^C, handed on as QUESTION_CANCELLED -- the value askYesNo's default
+ *  reader produces for the same keystroke -- so the grant path can tell "the
+ *  user left" (exit 130, like every secrets prompt) from "the user said no"
+ *  (exit 1, Aborted). Folding ^C into "" used to make both exit 1. ^D still
+ *  comes back "" from the reader and takes the NO default. */
 async function readTrustAnswer(
   input: NodeJS.ReadableStream,
   output: NodeJS.WritableStream,
   question: string,
-): Promise<string> {
-  return (await readAnswerFromTTY(input, output, question)) ?? "";
+): Promise<string | QuestionCancelled> {
+  return (await readAnswerFromTTY(input, output, question)) ?? QUESTION_CANCELLED;
 }

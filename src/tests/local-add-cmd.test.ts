@@ -4006,3 +4006,152 @@ describe("runAdd optional env", () => {
     expect(loaded.config).toBeNull();
   });
 });
+
+describe("runAdd -- a custom add over a stored entry [full-pass 2026-10-03]", () => {
+  it("a --command add over the catalog entry with the SAME slug reports the launch swap", async () => {
+    // `add fetch --command ...` stamps the name "fetch" as its slug, so it
+    // matches the catalog's "fetch" slug-for-slug. The note used to be gated
+    // on the stored entry being slug-less, which made exactly this swap --
+    // a catalog launch replaced wholesale by a hand-typed one -- silent.
+    const io = captureIO();
+    const common = {
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s: string) => io.out.push(s),
+      err: (s: string) => io.err.push(s),
+    };
+    expect((await runAdd({ ...common, slug: "fetch", fetchCatalog })).exitCode).toBe(0);
+    io.err.length = 0;
+    const r = await runAdd({ ...common, slug: "fetch", command: "docker run my/fetch" });
+    expect(r.exitCode).toBe(0);
+    const err = io.errText();
+    expect(err).toContain("launch command changed");
+    expect(err).toContain("npx -y @yawlabs/fetch-mcp");
+    expect(err).toContain("docker run my/fetch");
+    // And the reverse direction, catalog over custom, is just as loud.
+    io.err.length = 0;
+    expect((await runAdd({ ...common, slug: "fetch", fetchCatalog })).exitCode).toBe(0);
+    expect(io.errText()).toContain("launch command changed");
+  });
+
+  it("the same-launch re-add stays quiet", async () => {
+    const io = captureIO();
+    const common = {
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s: string) => io.out.push(s),
+      err: (s: string) => io.err.push(s),
+    };
+    expect((await runAdd({ ...common, slug: "fetch", fetchCatalog })).exitCode).toBe(0);
+    io.err.length = 0;
+    expect((await runAdd({ ...common, slug: "fetch", fetchCatalog })).exitCode).toBe(0);
+    expect(io.errText()).not.toContain("launch command changed");
+  });
+
+  it("the collision refusal does not call a hand-typed name a catalog server", async () => {
+    // Stored: the catalog's "redis-yawlabs", whose name derives to "redis".
+    await upsertUserBundle(
+      {
+        namespace: "redis",
+        name: "Redis",
+        slug: "redis-yawlabs",
+        command: "npx",
+        args: ["-y", "r"],
+        isActive: true,
+      } as Parameters<typeof upsertUserBundle>[0],
+      { home: synthHome },
+    );
+    const io = captureIO();
+    const r = await runAdd({
+      slug: "redis",
+      command: "docker run redis-mcp",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(1);
+    expect(io.errText()).toContain(
+      'can\'t add server "redis": namespace "redis" is already used by "Redis" (added as "redis-yawlabs")',
+    );
+    expect(io.errText()).not.toContain("catalog server");
+    // The dry run says the same thing.
+    const io2 = captureIO();
+    await runAdd({
+      slug: "redis",
+      command: "docker run redis-mcp",
+      dryRun: true,
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s) => io2.out.push(s),
+      err: (s) => io2.err.push(s),
+    });
+    expect(io2.errText()).toContain('would refuse: can\'t add server "redis"');
+    // A CATALOG add in the same spot still says "catalog server".
+    const io3 = captureIO();
+    await runAdd({
+      slug: "fetch",
+      fetchCatalog: async () => [{ slug: "fetch", name: "Redis", install: { command: "npx -y x", runtime: "node" } }],
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s) => io3.out.push(s),
+      err: (s) => io3.err.push(s),
+    });
+    expect(io3.errText()).toContain('can\'t add catalog server "fetch"');
+  });
+
+  it("refuses --catalog beside --command or --url instead of ignoring it", () => {
+    const withCommand = parseAddArgs(["mine", "--command", "npx -y mine", "--catalog", "https://c.test/cat.json"]);
+    expect(withCommand.ok).toBe(false);
+    expect(!withCommand.ok && withCommand.error).toContain("--catalog applies to a catalog add");
+    const withUrl = parseAddArgs(["mine", "--url", "https://m.test/mcp", "--catalog", "https://c.test/cat.json"]);
+    expect(withUrl.ok).toBe(false);
+    expect(!withUrl.ok && withUrl.error).toContain("--catalog applies to a catalog add");
+    // Still fine on a catalog add.
+    const plain = parseAddArgs(["fetch", "--catalog", "https://c.test/cat.json"]);
+    expect(plain.ok).toBe(true);
+  });
+
+  it.runIf(process.platform === "win32")(
+    "on Windows the required-env gate reads the shell env case-insensitively, like the notes do",
+    async () => {
+      // process.env is case-insensitive on win32, so the ambient-env note (which
+      // reads it directly) called `tailscale_api_key` present while the gate
+      // (which spread it into a plain object) refused the add for lack of
+      // TAILSCALE_API_KEY. Both now go through one lookup.
+      const io = captureIO();
+      const r = await runAdd({
+        slug: "tailscale",
+        home: synthHome,
+        cwd: synthCwd,
+        env: { tailscale_api_key: "tskey-lower" },
+        fetchCatalog,
+        out: (s) => io.out.push(s),
+        err: (s) => io.err.push(s),
+      });
+      expect(r.exitCode).toBe(0);
+      expect(io.errText()).not.toMatch(/needs the following env var/);
+      expect(io.errText()).toMatch(/TAILSCALE_API_KEY .*read from your shell env and NOT persisted/);
+    },
+  );
+
+  it.runIf(process.platform !== "win32")("on POSIX the required-env gate is exact-case, like the shell", async () => {
+    const io = captureIO();
+    const r = await runAdd({
+      slug: "tailscale",
+      home: synthHome,
+      cwd: synthCwd,
+      env: { tailscale_api_key: "tskey-lower" },
+      fetchCatalog,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(1);
+    expect(io.errText()).toMatch(/needs the following env var/);
+  });
+});

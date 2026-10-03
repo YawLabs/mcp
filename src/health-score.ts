@@ -136,6 +136,15 @@ export function formatHealthWarning(
 // class excludes `<` it then finds nothing left to consume.
 const REDACTED = "<redacted>";
 
+// The bare short names at the end (`auth`, `sig`, `pwd`, `token`) OVER-REDACT
+// on purpose. `sig=` appears in signed URLs (Azure SAS, pre-signed S3) where
+// it IS the credential, but also in query strings where it is a harmless
+// content hash; `auth=` is an OAuth code one time and a boolean flag the
+// next; `pwd=` can be a working directory. The rule below cannot tell them
+// apart, so every `sig=<value>` is redacted whole -- a diagnostic that loses
+// a checksum is still readable, and the header's trade (hiding beats
+// inverting) says a leaked SAS token is the worse outcome. Do not narrow
+// these to "only when the value looks random": that is attempt 2 again.
 const SECRET_KEY_NAMES =
   "api[-_]?key|apikey|access[-_]?token|refresh[-_]?token|id[-_]?token|client[-_]?secret|" +
   "private[-_]?key|secret|password|passwd|pwd|token|authorization|auth|credential|signature|sig";
@@ -299,8 +308,8 @@ const SECRET_PATTERNS: ReadonlyArray<{ re: RegExp; replace: (match: string, ...g
  *  reaches discover() output.
  *
  *  error-category.ts's header states the never-surface-raw-text policy and
- *  cites "no general scrubber" as the reason. This is not a general scrubber
- *  and does not pretend to be one -- it cannot know a third-party server's
+ *  points here as the one, shape-specific scrubber. This is not a general
+ *  scrubber and does not pretend to be one -- it cannot know a third-party server's
  *  private encoding. It closes the shapes actually observed leaking (URLs
  *  with `?api_key=`, echoed request bodies, `Authorization:` header dumps,
  *  vendor-prefixed keys), so the excerpt that IS load-bearing for the model

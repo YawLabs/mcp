@@ -4781,3 +4781,117 @@ describe("runSecrets --json -- every stderr line is a JSON object", () => {
 });
 
 type SecretsActionForTest = NonNullable<Parameters<typeof runSecrets>[0]["action"]>;
+
+// -----------------------------------------------------------------------
+// Two pins on `set` against a legacy (schema v1, check-less) vault. Both
+// exist because the behaviour is otherwise silent: setSecret keeps the
+// loaded vault's version, so the schema notice is the ONLY surface that says
+// a v1 file stayed v1, and an emptied legacy vault re-prompts for a
+// passphrase exactly like a fresh one would.
+// -----------------------------------------------------------------------
+
+describe("runSecrets set on a legacy vault -- the two things it has to say", () => {
+  const io = { out: vi.fn(), err: vi.fn() };
+  const stdout = { isTTY: true, write: vi.fn() } as unknown as NodeJS.WritableStream;
+  const V1_PASS = "legacy-passphrase-xyz";
+  let home: string;
+
+  const errText = (): string => io.err.mock.calls.map((c) => c[0] as string).join("");
+  const promptText = (): string =>
+    (stdout.write as unknown as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0] as string).join("");
+
+  /** A vault as a pre-v2 build wrote it: version 1, no kdf, no check marker,
+   *  `names` encrypted WITHOUT the name binding. */
+  async function writeV1Vault(names: string[]): Promise<void> {
+    const salt = generateSalt();
+    const key = await deriveKey(V1_PASS, salt, LEGACY_KDF);
+    const entries: Record<string, EncryptedEntry> = {};
+    for (const n of names) entries[n] = encryptEntry(`${n}-value`, key);
+    writeFileSync(vaultPath(home), `${JSON.stringify({ version: 1, salt: salt.toString("base64"), entries })}\n`);
+  }
+
+  beforeEach(async () => {
+    io.out.mockReset();
+    io.err.mockReset();
+    (stdout.write as unknown as ReturnType<typeof vi.fn>).mockReset();
+    lock();
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    home = makeHome();
+    await mkdir(nodePath.join(home, ".yaw-mcp"), { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+    lock();
+  });
+
+  it("set prints the schema-behind notice exactly once, and the file it wrote is still v1", async () => {
+    await writeV1Vault(["GH"]);
+    const r = await runSecrets({ action: "set", name: "NEW", value: "v", passphrase: V1_PASS, home }, io);
+    expect(r.exitCode).toBe(0);
+    const notices = errText()
+      .split("\n")
+      .filter((l) => l.includes("schema v1"));
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toContain("yaw-mcp secrets rotate");
+    expect(JSON.parse(readFileSync(vaultPath(home), "utf8")).version).toBe(1);
+    // ...and the same single line under --json, as its own JSON record.
+    io.err.mockReset();
+    lock();
+    await runSecrets({ action: "set", name: "NEW2", value: "v", passphrase: V1_PASS, home, json: true }, io);
+    expect(errJsonLines(io).filter((l) => l.warning === "schema-behind")).toHaveLength(1);
+  });
+
+  it("set on a legacy vault that `remove` emptied says the passphrase it asks for becomes the vault's", async () => {
+    // remove the only entry: a check-less vault with no entries is left,
+    // which unlock() cannot verify anything against -- the next set
+    // re-establishes the passphrase through the confirm-twice prompt.
+    await writeV1Vault(["GH"]);
+    const removed = await runSecrets({ action: "remove", name: "GH", passphrase: V1_PASS, force: true, home }, io);
+    expect(removed.exitCode).toBe(0);
+    lock();
+
+    const stdin = new FakeTTYStdin(["brand-new-passphrase\r", "brand-new-passphrase\r"]);
+    const r = await runSecrets(
+      {
+        action: "set",
+        name: "NEW",
+        value: "v",
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(0);
+    const text = promptText();
+    expect(text).toContain("is empty, so it has no passphrase");
+    // Before the first prompt, not after: it has to be on screen when the
+    // user decides what to type.
+    expect(text.indexOf("is empty")).toBeLessThan(text.indexOf("Vault passphrase: "));
+    expect(text).toContain("Confirm passphrase: ");
+    // The old passphrase no longer opens it; the one just entered does.
+    lock();
+    expect((await runSecrets({ action: "get", name: "NEW", passphrase: V1_PASS, home }, io)).exitCode).toBe(1);
+    lock();
+    expect(
+      (await runSecrets({ action: "get", name: "NEW", passphrase: "brand-new-passphrase", home }, io)).exitCode,
+    ).toBe(0);
+  });
+
+  it("a genuinely fresh vault gets the confirm-twice prompt with no such note", async () => {
+    const stdin = new FakeTTYStdin(["brand-new-passphrase\r", "brand-new-passphrase\r"]);
+    const r = await runSecrets(
+      {
+        action: "set",
+        name: "NEW",
+        value: "v",
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(0);
+    expect(promptText()).toContain("Confirm passphrase: ");
+    expect(promptText()).not.toContain("is empty");
+  });
+});

@@ -54,7 +54,7 @@ import { computeSecretsReport, META_TOOL_NAMES, META_TOOLS, SERVER_INSTRUCTIONS 
 import { isFeatureDisabled } from "./opt-out-env.js";
 import { PackDetector } from "./pack-detect.js";
 import { isPersistenceDisabled, loadState, type PersistedToolCacheEntry, saveState } from "./persistence.js";
-import { createProgressReporter, isProgressRequested, type ProgressReporter } from "./progress.js";
+import { createProgressReporter, isProgressRequested, type ProgressExtra, type ProgressReporter } from "./progress.js";
 import {
   type BuiltinResource,
   brandRoutingFault,
@@ -401,11 +401,14 @@ export function resolveIdleThreshold(): number {
 // Re-read on every call (same discipline as resolveMinCompliance /
 // isAutoLoadEnabled) so a mid-session env change -- or a test stubbing the
 // env between cases -- takes effect without restarting the process.
+//
+// The shared opt-out parse (opt-out-env.ts), like every other default-on
+// feature: `0` and `false` (trimmed) turn it off and EVERYTHING else leaves
+// it on. This used to be an opt-IN parse (`1` / `true` on, anything else
+// off), so `=yes` or `=on` silently disabled the feature while the help text
+// said "set to 0 to disable".
 export function isAutoActivateEnabled(): boolean {
-  // Trimmed for the same cmd.exe trailing-space reason as isAutoLoadEnabled.
-  const raw = process.env.YAW_MCP_AUTO_ACTIVATE?.trim();
-  if (raw === undefined || raw === "") return true;
-  return raw === "1" || raw.toLowerCase() === "true";
+  return !isFeatureDisabled("YAW_MCP_AUTO_ACTIVATE");
 }
 
 // Marker phrases that identify an INTERNAL routing/cache fault rather than
@@ -504,8 +507,11 @@ export function resolveNamespaces(args: Record<string, unknown>): string[] {
  * The timer is cleared on the fast path and unref'd on the slow one, so a
  * bounded wait can neither leak a handle nor hold an embedded host's event
  * loop open past the wait itself.
+ *
+ * Module-private: shutdown() is its one caller. sidecars-cmd.ts has its own
+ * guarded wait and only names this one in a comment.
  */
-export function settledWithin(p: Promise<unknown>, ms: number): Promise<boolean> {
+function settledWithin(p: Promise<unknown>, ms: number): Promise<boolean> {
   return new Promise<boolean>((resolve) => {
     const timer = setTimeout(() => resolve(false), ms);
     if (typeof timer.unref === "function") timer.unref();
@@ -708,6 +714,14 @@ export class ConnectServer {
    *  them, doctor exits 2 on them) -- this is the third surface. */
   private configWarnings: string[] = [];
   private configVersion: string | null = null;
+  // The bundles.json path the running config was loaded FROM (null for a
+  // handed-in config, or when no file existed). applyReloadedBundles reads
+  // it to tell "there was never a file" from "the file we loaded is gone":
+  // the first is an empty config, the second is a degraded re-read that must
+  // keep the running one. bundlesVanishedWarned latches the warning so a
+  // file that stays gone logs once, not once per meta-tool boundary.
+  private bundlesLoadedFrom: string | null = null;
+  private bundlesVanishedWarned = false;
   /** Every path the LAST completed load consulted, and the mtime+size
    *  fingerprint it had at that moment. Together they are the gate on the
    *  lazy re-read at meta-tool boundaries (maybeReloadBundles): when the
@@ -1179,6 +1193,31 @@ export class ConnectServer {
     });
   };
 
+  /** The active servers the startup pre-warm still has to spawn to learn:
+   *  no trusted tool list yet, or a learned one past its refresh window.
+   *  The same predicate prewarmDormantServers selects by, read NOW rather
+   *  than at its snapshot, so a server the sweep has already finished drops
+   *  out as soon as its list lands in the cache. */
+  private serversPrewarmIsLearning(): UpstreamServerConfig[] {
+    return this.getProfiledActiveServers().filter(
+      (s) => !this.hasKnownTools(s) || this.isLearnedCacheStale(s.namespace),
+    );
+  }
+
+  /** Could the running pre-warm still produce a route for any of these
+   *  namespaced tool names? Only if one of them is prefixed by a namespace
+   *  the sweep has yet to learn -- a tool name is `<namespace>_<tool>`, so a
+   *  prefix that matches no such server is a route no sweep will ever add. */
+  private prewarmCouldRoute(toolNames: string[]): boolean {
+    const learning = this.serversPrewarmIsLearning();
+    return toolNames.some((name) => learning.some((s) => name.startsWith(`${s.namespace}_`)));
+  }
+
+  /** Is there any server the running pre-warm has yet to learn? */
+  private prewarmStillLearning(): boolean {
+    return this.serversPrewarmIsLearning().length > 0;
+  }
+
   /** Wait for the startup pre-warm, if it is still running, for at most
    *  STARTUP_PREWARM_WAIT_MS, or until `signal` aborts. Resolves either way:
    *  past the bound the caller answers from what is known, exactly as it did
@@ -1206,8 +1245,9 @@ export class ConnectServer {
    *  Measured on a loaded Windows ARM64 box, a fresh install's pre-warm of
    *  two npx/oam servers finished 4-6 s after initialize; this leaves room
    *  for a larger bundle without holding a call anywhere near a client's
-   *  tool timeout (Codex: 300 s). Not readonly, so a test can shrink it. */
-  private static STARTUP_PREWARM_WAIT_MS = 20_000;
+   *  tool timeout (Codex: 300 s). Neither private nor readonly, so a test can
+   *  shrink it without a cast; nothing outside the tests writes it. */
+  static STARTUP_PREWARM_WAIT_MS = 20_000;
 
   /** The line a load reply needs for a client that never re-lists tools
    *  (NO_RELIST_CLIENTS), or null for every other client.
@@ -1633,10 +1673,29 @@ export class ConnectServer {
       });
       return false;
     }
+    // Also degraded: NO file at any location, after this session loaded one.
+    // The loader cannot tell a bundles.json the user deleted (or that an
+    // editor's atomic save left momentarily absent) from a machine that never
+    // had one, but this session can: it remembers where the running config
+    // came from. Adopting the empty result here tore every connection down
+    // as "removed" and told the model nothing was installed. Keep the running
+    // config and say so; a later re-read that finds a file adopts it.
+    if (result.config === null && result.path === null && this.bundlesLoadedFrom !== null) {
+      this.configWarnings = [
+        `bundles.json is no longer readable at ${this.bundlesLoadedFrom}; still serving the servers loaded from it. Restore the file (or run \`yaw-mcp add\`) to change the set.`,
+      ];
+      if (!this.bundlesVanishedWarned) {
+        this.bundlesVanishedWarned = true;
+        log("warn", "bundles.json vanished; keeping the running config", { path: this.bundlesLoadedFrom });
+      }
+      return false;
+    }
 
     const previousVersion = this.configVersion;
     this.configWarnings = result.warnings;
     this.adoptConfig(result.config);
+    this.bundlesLoadedFrom = result.path;
+    this.bundlesVanishedWarned = false;
     // Re-overlay grades for the same reason start() overlays them before
     // anything reads the config: freshly-parsed entries carry no
     // complianceGrade (validateEntry drops it), so without this a reload would
@@ -1791,9 +1850,10 @@ export class ConnectServer {
       }
       log("info", "Config changed; unloading server", { namespace, reason: stale });
       await disconnectFromUpstream(connection);
-      // Same teardown as an explicit deactivate -- one copy, so the three
-      // teardown sites can never drift over what survives an unload.
-      this.forgetNamespace(namespace);
+      // Same teardown as an explicit deactivate -- one copy, so the four
+      // teardown sites can never drift over what survives an unload, nor
+      // over the identity check that keeps a re-activation's child alive.
+      this.forgetNamespace(namespace, connection);
       deactivated++;
     }
     this.bundlesReconcilePending = deferred;
@@ -1936,6 +1996,7 @@ export class ConnectServer {
     // Kept, not just logged -- see the field. handleDiscover renders these.
     this.configWarnings = result.warnings;
     this.adoptConfig(result.config);
+    this.bundlesLoadedFrom = result.path;
     // Baseline for the lazy re-read at meta-tool boundaries. Taken from the
     // loader's OWN report of what it consulted rather than from `path`, for
     // the reasons LoadLocalBundlesResult.consultedPaths spells out.
@@ -2303,17 +2364,15 @@ export class ConnectServer {
             const conn = this.connections.get(server.namespace);
             if (conn) {
               await disconnectFromUpstream(conn).catch(() => {});
-              // Re-read the map after the await and only drop the entry when
-              // it is still OUR connection. disconnectFromUpstream marks the
-              // old connection "disconnected" synchronously, so an explicit
-              // activate that starts during the close sees a dead connection,
-              // spawns a fresh child, and re-registers under the same key.
-              // An unconditional delete here would orphan that child: live,
-              // unreferenced, and invisible to shutdown().
-              if (this.connections.get(server.namespace) === conn) {
-                this.connections.delete(server.namespace);
-                this.idleCallCounts.delete(server.namespace);
-              }
+              // The shared teardown, which re-reads the map after the await
+              // and only drops the entry when it is still OUR connection
+              // (see forgetNamespace for the race). It also clears the
+              // adaptive-patience latch, which a prewarm connection that
+              // aged through observation ticks could otherwise leave behind
+              // for the next load of the same namespace. A prewarm
+              // connection has no sessionActivated / toolFilters entry to
+              // lose: prewarm never advertises or filters.
+              this.forgetNamespace(server.namespace, conn);
             }
             anyPopulated = true;
           } catch (err) {
@@ -2364,8 +2423,12 @@ export class ConnectServer {
     // `signal` rides along with the two progress fields because the SDK's
     // RequestHandlerExtra has always carried it -- it was simply never read,
     // so a downstream cancel aborted this handler and left the upstream call
-    // running. The proxy path below forwards it.
-    extra?: { sendNotification?: any; _meta?: Record<string, unknown>; signal?: AbortSignal },
+    // running. The proxy path below forwards it. Typed as the progress
+    // module's own narrowing of RequestHandlerExtra (ProgressExtra) plus the
+    // signal, rather than `any`: the SDK's full type carries request-scoped
+    // fields this handler never reads, and the narrow shape is what both
+    // callers (the CallTool handler and handleExec's per-step call) satisfy.
+    extra?: NonNullable<ProgressExtra> & { signal?: AbortSignal },
     // When deferLearning is set (exec steps), the proxy path does NOT record
     // the cross-session learning signal — handleExec records step-level,
     // cascading-blame credit instead so a failing consumer doesn't wrongly
@@ -2381,7 +2444,19 @@ export class ConnectServer {
     // returns the UPSTREAM's body, and an image / audio / resource content
     // block carries no text. The meta-tool branches below all produce text and
     // are assignable to this wider shape.
-  ): Promise<{ content: Array<{ type: string; text?: string }>; isError?: boolean }> {
+    //
+    // `stepContent` is set ONLY for an exec step (opts.deferLearning): the
+    // body as the upstream sent it, before the prune and the size cap below
+    // rewrote `content`. handleExec binds $ref targets from it, so a later
+    // step reads the real value -- an empty array the pruner dropped, a tail
+    // the cap cut -- while the pruned/capped `content` is what the exec
+    // reply echoes. Never set on the client-facing path, so it never reaches
+    // the wire.
+  ): Promise<{
+    content: Array<{ type: string; text?: string }>;
+    isError?: boolean;
+    stepContent?: Array<{ type: string; text?: string }>;
+  }> {
     const progress = createProgressReporter(extra);
     // THE meta-tool boundary. Everything about why it is here and not
     // anywhere else is on maybeReloadBundles; the two load-bearing facts at
@@ -2402,10 +2477,14 @@ export class ConnectServer {
       // survive the `!context` falsiness check and throw a TypeError inside
       // the BM25 tokenizer -- surfacing as a raw JSON-RPC internal error
       // instead of a tool result.
-      // Ticked like every other observation meta-tool. Auto-warm is safe
-      // under it: runActivateOne resets the namespace it just loaded to zero
-      // idle, so the tick below ages everything EXCEPT the server discover
-      // just decided was the relevant one.
+      // Ticked like every other observation meta-tool, CREDITING the server
+      // auto-warm picked. runActivateOne resets a freshly-loaded namespace to
+      // zero idle, but the tick runs AFTER the handler and ages every
+      // connected namespace it is not told about -- so without the credit
+      // the server discover just decided was the relevant one came out of
+      // its own discover one tick idle, and the already-connected shortcut
+      // (no activation, nothing reset) aged it like any bystander.
+      const warmed: string[] = [];
       return this.observed(
         this.attachGuideNudge(
           await this.handleDiscoverWithAutoWarm(
@@ -2418,8 +2497,10 @@ export class ConnectServer {
             // than competing with it -- a focused discover still ages the
             // other namespaces exactly like an unfocused one.
             typeof args.server === "string" ? args.server : undefined,
+            (ns) => warmed.push(ns),
           ),
         ),
+        warmed,
       );
     }
     if (name === META_TOOLS.dispatch.name) {
@@ -2803,6 +2884,13 @@ export class ConnectServer {
       // few hundred bytes on a path that is already an error.
       const upstreamBytes = measureResultBytes(result);
 
+      // Snapshot for an exec step BEFORE either rewrite below touches
+      // `content` (see the return type). Both passes build a new array and
+      // new text blocks rather than editing in place, so holding the old
+      // reference is enough. Not taken on the client-facing path: the
+      // snapshot would only be garbage there, and must never be echoed.
+      const stepContent = opts?.deferLearning && Array.isArray(result.content) ? result.content : undefined;
+
       // Prune the response before it hits the LLM. Rules are
       // conservative (drop null / undefined / empty collections,
       // collapse runs of blank lines) so we trim obvious dead weight
@@ -2972,6 +3060,7 @@ export class ConnectServer {
       if (!opts?.deferIdleTracking) {
         await this.trackUsageAndAutoDeactivate(route.namespace);
       }
+      if (stepContent) return { ...result, stepContent };
     }
 
     return result;
@@ -3041,7 +3130,7 @@ export class ConnectServer {
   // Local BM25 ranking over the profiled active servers. Shared by
   // discover's auto-warm gate and dispatch so both pick the same winner
   // for the same intent.
-  private async twoStageRank(
+  private async rankIntentCandidates(
     context: string,
     servers: UpstreamServerConfig[],
   ): Promise<Array<{ namespace: string; score: number }>> {
@@ -3149,6 +3238,11 @@ export class ConnectServer {
     // the banner announces a session state change the model must know about,
     // and suppressing it would hide an activation.
     focusNamespace?: string,
+    // Called with the namespace this discover decided was the relevant one
+    // (freshly warmed, or already connected and claimed), so the caller's
+    // observation tick can credit it instead of ageing it. A callback rather
+    // than a field on the return value, which goes to the client verbatim.
+    onWarmed?: (namespace: string) => void,
   ): Promise<{ content: Array<{ type: string; text: string }> }> {
     if (!context || !isAutoActivateEnabled()) return this.handleDiscover(context, focusNamespace);
 
@@ -3157,7 +3251,7 @@ export class ConnectServer {
 
     // Use the same ranker dispatch uses so discover + dispatch pick the
     // same winner for the same intent.
-    const ranked = await this.twoStageRank(context, activeServers);
+    const ranked = await this.rankIntentCandidates(context, activeServers);
     if (ranked.length === 0) return this.handleDiscover(context, focusNamespace);
 
     // Only auto-warm if one candidate dominates: top score clears the
@@ -3200,12 +3294,14 @@ export class ConnectServer {
         // tools/list surface moved.
         await this.notifyAllListsChanged();
       }
+      onWarmed?.(top.namespace);
       return this.buildDiscoverOutput(context, top.namespace, focusNamespace);
     }
 
     progress?.(`Auto-warming top candidate "${top.namespace}"`);
     const result = await this.activateOne(top.namespace, progress);
     if (result.ok) {
+      onWarmed?.(top.namespace);
       // Auto-warm exists so a one-shot discover(context) is enough to
       // start calling tools -- under the default gateway exposure that
       // only holds if the warmed namespace is advertised, so record it
@@ -3222,7 +3318,7 @@ export class ConnectServer {
     }
 
     // Pass the namespace we ACTUALLY warmed, not a bare boolean: the
-    // banner below must name the server twoStageRank picked, which is
+    // banner below must name the server rankIntentCandidates picked, which is
     // not necessarily the head of the list the output renders.
     const output = this.buildDiscoverOutput(context, result.ok ? top.namespace : null, focusNamespace);
     if (result.ok) return output;
@@ -3306,7 +3402,15 @@ export class ConnectServer {
     // moves them today: any future writer of configWarnings gets the
     // invalidation for free instead of having to remember it.
     const warningSignature = JSON.stringify(this.configWarnings);
-    return `${this.configVersion ?? ""}|${context ?? ""}|${warmedNamespace ?? ""}|${activeNamespaces}|${filterSignature}|${advertisedSignature}|${focusNamespace ?? ""}|${warningSignature}`;
+    // Two more inputs the body renders that nothing above derives from: the
+    // compliance floor (which servers the cards call blocked, and the floor
+    // line itself) and the exposure mode (the per-server "advertised" label
+    // and the tools-in-context total). Both are re-read from the env per
+    // call, so a mid-session change moved the body without moving the key
+    // and a discover inside the TTL replayed the old one.
+    const floorSignature = resolveMinCompliance() ?? "";
+    const exposureSignature = this.currentExposure();
+    return `${this.configVersion ?? ""}|${context ?? ""}|${warmedNamespace ?? ""}|${activeNamespaces}|${filterSignature}|${advertisedSignature}|${focusNamespace ?? ""}|${warningSignature}|${floorSignature}|${exposureSignature}`;
   }
 
   /** The "there is nothing to route to" text, for discover / dispatch /
@@ -4152,10 +4256,21 @@ export class ConnectServer {
   private estimateTokensFor(namespace: string): number | undefined {
     const conn = this.connections.get(namespace);
     if (conn && conn.tools.length > 0) return estimateFromConnectedTools(conn.tools).tokens;
-    const config = (this.config?.servers ?? []).find((s) => s.namespace === namespace);
-    const cache = config ? this.mergeToolCache(config).toolCache : this.toolCache.get(namespace);
+    const cache = this.cachedToolsFor(namespace);
     if (!cache || cache.length === 0) return undefined;
     return estimateFromToolCache(cache).tokens;
+  }
+
+  /** The tool list known for a namespace WITHOUT a live connection: the
+   *  merged cache (this session's learned list over the curated one in
+   *  bundles.json) while the config still defines the server, else whatever
+   *  this session learned about it. The one lookup estimateTokensFor and
+   *  unmatchedFilterNames both need, kept in one place so neither can drift
+   *  to the raw this.toolCache and pick an empty learned list over a curated
+   *  one. */
+  private cachedToolsFor(namespace: string): Array<{ name: string; description?: string }> | undefined {
+    const config = this.config?.servers.find((s) => s.namespace === namespace);
+    return config ? this.mergeToolCache(config).toolCache : this.toolCache.get(namespace);
   }
 
   // The BROKER's rendering of the shared spawn gate. The decision itself lives
@@ -5353,8 +5468,12 @@ export class ConnectServer {
     if (entry.kind === "unreachable") {
       // No page, or no browser to show it in: asking again this session
       // would put up the same prompt and hit the same wall. An expired page
-      // is different -- the user may simply have been away -- so it keeps
-      // whatever budget is left.
+      // is different -- the user may simply have been away -- so it does
+      // not latch HERE. It still spent an attempt: the budget is counted at
+      // the top of this method, BEFORE the outcome is known, so the latch on
+      // MAX_VAULT_PASSPHRASE_PROMPTS may already have fired above for this
+      // very prompt. "Keeps the budget" means only that an expiry does not
+      // end the asking early.
       if (entry.reason !== "expired") this.vaultPassphraseElicited = true;
       return { kind: "unreachable", reason: entry.reason };
     }
@@ -5643,9 +5762,7 @@ export class ConnectServer {
     if (conn && conn.status === "connected") {
       known = conn.tools.map((t) => t.name);
     } else {
-      const config = this.config?.servers.find((s) => s.namespace === namespace);
-      const cache = config ? this.mergeToolCache(config).toolCache : this.toolCache.get(namespace);
-      known = (cache ?? []).map((t) => t.name);
+      known = (this.cachedToolsFor(namespace) ?? []).map((t) => t.name);
     }
     if (known.length === 0) return [];
     const have = new Set(known);
@@ -5699,7 +5816,9 @@ export class ConnectServer {
     progress?: ProgressReporter,
     routeEffortOverride?: string,
   ): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
-    const trimmed = intent?.trim?.() ?? "";
+    // `intent` is a string by type and by every caller (handleToolCall
+    // coerces a non-string arg to "" before this), so a plain trim is enough.
+    const trimmed = intent.trim();
     if (trimmed.length === 0) {
       return {
         content: [{ type: "text", text: "intent is required. Describe the task you want to accomplish." }],
@@ -5722,7 +5841,7 @@ export class ConnectServer {
     }
 
     progress?.(`Ranking ${activeServers.length} ${activeServers.length === 1 ? "server" : "servers"}…`);
-    const rankedRaw = await this.twoStageRank(trimmed, activeServers);
+    const rankedRaw = await this.rankIntentCandidates(trimmed, activeServers);
     // Apply health-aware penalty: recent activation failures and high
     // error rates shrink the score so dispatch prefers working servers
     // when multiple match. Never boosts above raw score — all else
@@ -5768,7 +5887,13 @@ export class ConnectServer {
     // best-of-3 on milder ambiguity.
     const safeBudget = Math.max(1, Math.min(10, Math.floor(budget)));
     const effort = parseRouteEffort(routeEffortOverride ?? process.env.YAW_MCP_ROUTE_EFFORT);
-    if (safeBudget === 1 && shouldSample(ranked, effort)) {
+    // The capability check is hoisted out of bestOfNViaSampling (which also
+    // makes it, and returns null) so that a client WITHOUT sampling never
+    // sees the "asking LLM to pick" progress line: that line promised a
+    // round-trip that was never going to happen, and the silent null that
+    // followed read as the LLM having picked nothing.
+    const clientCanSample = this.server.getClientCapabilities()?.sampling !== undefined;
+    if (safeBudget === 1 && clientCanSample && shouldSample(ranked, effort)) {
       progress?.("Top candidates close — asking LLM to pick…");
       const serversByNamespace = new Map(activeServers.map((s) => [s.namespace, s]));
       // activeServers came through getProfiledActiveServers, so each one's
@@ -5876,9 +6001,9 @@ export class ConnectServer {
   }
 
   // Drop every per-namespace bit of session state after its connection has
-  // been closed. Called by all three teardown sites -- explicit deactivate,
-  // the idle reaper, and reconcileConfig's unload of a server a bundles.json
-  // reload changed or removed. The first two used to carry identical copies
+  // been closed. Called by all four teardown sites -- explicit deactivate,
+  // the idle reaper, reconcileConfig's unload of a server a bundles.json
+  // reload changed or removed, and the prewarm teardown. The first two used to carry identical copies
   // of this list, so a new piece of per-namespace state had to be remembered
   // in each place to avoid leaking into the next load of the same server.
   //
@@ -5886,7 +6011,25 @@ export class ConnectServer {
   // server offers survives an unload -- that is what makes it deferred
   // rather than invisible), activationFailures (a health signal with its own
   // TTL), and learning counters (cross-session by design).
-  private forgetNamespace(namespace: string): void {
+  //
+  // Takes the connection being forgotten and forgets ONLY if the map still
+  // holds that one. Every caller has just awaited disconnectFromUpstream,
+  // which flips the connection's status to "disconnected" synchronously and
+  // then spends up to ~4 s in the SDK's close. runActivateOne early-returns
+  // only on status "connected", and evaluateCapFor grants a "disconnected"
+  // entry no slot, so an activate landing in that window is a fresh
+  // activation: it spawns a child and connections.set()s it under the same
+  // key. An unconditional delete here then dropped THAT entry -- and its
+  // sessionActivated / toolFilters -- leaving a live child nothing
+  // referenced and shutdown() never closed. Returns whether it forgot, so a
+  // caller can tell "unloaded" from "superseded" in its reply.
+  private forgetNamespace(namespace: string, connection: UpstreamConnection): boolean {
+    if (this.connections.get(namespace) !== connection) {
+      log("info", "Teardown skipped the map delete -- namespace was re-activated during the close", {
+        namespace,
+      });
+      return false;
+    }
     this.connections.delete(namespace);
     this.idleCallCounts.delete(namespace);
     this.adaptiveSkipLogged.delete(namespace);
@@ -5896,6 +6039,7 @@ export class ConnectServer {
     // LATER dispatch-driven activation would re-advertise the whole
     // namespace without the client ever asking for it.
     this.sessionActivated.delete(namespace);
+    return true;
   }
 
   private async handleDeactivate(
@@ -5934,9 +6078,15 @@ export class ConnectServer {
       }
 
       await disconnectFromUpstream(connection);
-      this.forgetNamespace(namespace);
       anyChanged = true;
-      results.push(`Unloaded "${namespace}". Tools removed from context.`);
+      // A re-activation that landed during the close keeps its connection
+      // (and its advertised / filter state); say so rather than claiming the
+      // tools left the context when they are about to be re-listed.
+      if (this.forgetNamespace(namespace, connection)) {
+        results.push(`Unloaded "${namespace}". Tools removed from context.`);
+      } else {
+        results.push(`"${namespace}" was re-loaded while it was being unloaded -- still loaded.`);
+      }
     }
 
     if (anyChanged) {
@@ -5952,7 +6102,13 @@ export class ConnectServer {
     await this.trackUsageForNamespaces([calledNamespace]);
   }
 
-  /** Age every loaded server by one and run the reaper, crediting none.
+  /** Run `result`, then charge the session one idle tick: every connected
+   *  namespace not in `credited` ages by one, and those in it are treated as
+   *  freshly used. Awaits the handler FIRST -- read_tool can connect a server
+   *  for the length of the call, and ticking before it returns would age a
+   *  set the handler is still changing. Only discover's auto-warm credits
+   *  anything (the namespace it just picked); every other observation
+   *  meta-tool passes nothing and ages everything.
    *
    *  The idle clock used to advance only on PROXIED calls, so a session that
    *  spoke exclusively to the broker -- discover, find_tool, health, secrets --
@@ -5970,18 +6126,12 @@ export class ConnectServer {
    *  stays advertised as a deferred route, and re-activates lazily on the
    *  first call to one of its tools. The cost of being wrong here is one
    *  re-spawn, which is the trade the reaper already makes everywhere else. */
-  private async trackObservation(): Promise<void> {
-    // The empty array is the whole point: `called` is empty, so no namespace
-    // is credited and every connected one ages by one.
-    await this.trackUsageForNamespaces([]);
-  }
-
-  /** Run `result`, then charge the session one idle tick. Awaits the handler
-   *  FIRST -- read_tool can connect a server for the length of the call, and
-   *  ticking before it returns would age a set the handler is still changing. */
-  private async observed<T>(result: T | Promise<T>): Promise<T> {
+  private async observed<T>(result: T | Promise<T>, credited: string[] = []): Promise<T> {
     const resolved = await result;
-    await this.trackObservation();
+    // The default empty array is the whole point for every caller but
+    // discover: `called` is empty, so no namespace is credited and every
+    // connected one ages by one.
+    await this.trackUsageForNamespaces(credited);
     return resolved;
   }
 
@@ -6092,9 +6242,10 @@ export class ConnectServer {
       }
       log("info", "Auto-deactivating idle server", { namespace: ns, idleCalls: this.idleCallCounts.get(ns) });
       await disconnectFromUpstream(connection);
-      // Same teardown as an explicit deactivate -- one copy, so the three
-      // teardown sites can never drift over what survives an unload.
-      this.forgetNamespace(ns);
+      // Same teardown as an explicit deactivate -- one copy, so the four
+      // teardown sites can never drift over what survives an unload, nor
+      // over the identity check that keeps a re-activation's child alive.
+      this.forgetNamespace(ns, connection);
       deactivated++;
     }
 
@@ -6538,8 +6689,11 @@ export class ConnectServer {
     );
     // "No match" is only a real answer once the startup pre-warm has learned
     // the tool lists it is about to learn. Re-read the servers after the
-    // wait: the pre-warm fills the cache rankableFor merges.
-    if (ranked.length === 0 && this.startupPrewarm) {
+    // wait: the pre-warm fills the cache rankableFor merges. Skipped when
+    // every active server's list is already known and fresh -- the sweep
+    // then has nothing left to learn that could change the answer, and the
+    // query simply matches nothing installed.
+    if (ranked.length === 0 && this.startupPrewarm && this.prewarmStillLearning()) {
       await this.settleStartupPrewarm();
       ranked = rankTools(
         query,
@@ -6896,12 +7050,25 @@ export class ConnectServer {
     // rebuilds routes only when its whole sweep ends, so if the bound lapses
     // first, rebuild from what it has learned so far: each server it finished
     // is already in the tool cache the deferred routes derive from.
+    //
+    // Two things keep this from being a flat 20 s wait on every miss. The
+    // routes are rebuilt FIRST, so a tool on a server the sweep has already
+    // learned routes now instead of waiting on the servers it has not. And
+    // the wait is taken only when the sweep could still produce the missing
+    // route -- the name is prefixed by a namespace the pre-warm has yet to
+    // learn (prewarmCouldRoute). A typo'd namespace, or a tool on a server
+    // whose list is already known, has no route coming and used to block
+    // for the full bound before failing with the same "Unknown tool".
     if (this.startupPrewarm && steps.some((s) => !this.toolRoutes.has(s.tool))) {
-      await this.settleStartupPrewarm(signal);
-      if (signal?.aborted) {
-        return { content: [{ type: "text", text: "exec: cancelled before step 0 ran." }], isError: true };
+      this.rebuildRoutes();
+      const unrouted = steps.filter((s) => !this.toolRoutes.has(s.tool)).map((s) => s.tool);
+      if (unrouted.length > 0 && this.prewarmCouldRoute(unrouted)) {
+        await this.settleStartupPrewarm(signal);
+        if (signal?.aborted) {
+          return { content: [{ type: "text", text: "exec: cancelled before step 0 ran." }], isError: true };
+        }
+        if (steps.some((s) => !this.toolRoutes.has(s.tool))) this.rebuildRoutes();
       }
-      if (steps.some((s) => !this.toolRoutes.has(s.tool))) this.rebuildRoutes();
     }
     for (let i = 0; i < steps.length; i++) {
       const step = steps[i];
@@ -6934,7 +7101,15 @@ export class ConnectServer {
       };
     }
 
+    // Two views of every step's output. `bindings` is what later steps' $refs
+    // resolve against: the body as the upstream sent it (stepContent), so a
+    // ref to a field the pruner drops (an empty array, a null) or a tail the
+    // size cap cuts still reads the real value. `echoed` is the pruned and
+    // capped body, and is what the reply carries as `result`, `steps` and
+    // `partial` -- the prune and the cap exist to spend fewer of the reader's
+    // tokens, and a $ref target is read by the next step, not by the reader.
     const bindings: Record<string, unknown> = {};
+    const echoed: Record<string, unknown> = {};
     const stepKeys: string[] = [];
     // stepKey -> namespace, built as steps run, so a failing step can
     // attribute cascading blame to the upstream steps it consumed via $ref.
@@ -7011,7 +7186,7 @@ export class ConnectServer {
                     ok: false,
                     failedStep: key,
                     error: `step "${key}": resolved args are not an object (${typeof resolved})`,
-                    partial: bindings,
+                    partial: echoed,
                   },
                   null,
                   2,
@@ -7034,7 +7209,7 @@ export class ConnectServer {
                   ok: false,
                   failedStep: key,
                   error: `step "${key}": ${msg}`,
-                  partial: bindings,
+                  partial: echoed,
                 },
                 null,
                 2,
@@ -7077,7 +7252,7 @@ export class ConnectServer {
         // could not see it. No-op when it is already pinned.
         pinNamespace(stepNs);
       }
-      let stepResult: { content: Array<{ type: string; text?: string }>; isError?: boolean };
+      let stepResult: Awaited<ReturnType<ConnectServer["handleToolCall"]>>;
       try {
         stepResult = await this.handleToolCall(
           step.tool,
@@ -7154,7 +7329,7 @@ export class ConnectServer {
                   ok: false,
                   failedStep: key,
                   error: errText,
-                  partial: bindings,
+                  partial: echoed,
                 },
                 null,
                 2,
@@ -7175,11 +7350,12 @@ export class ConnectServer {
         // failure branch above and the proxy path's own invalidation).
         this.invalidateDiscoverCache();
       }
-      bindings[key] = ConnectServer.parseStepPayload(stepResult);
+      bindings[key] = ConnectServer.parseStepPayload({ content: stepResult.stepContent ?? stepResult.content });
+      echoed[key] = ConnectServer.parseStepPayload(stepResult);
     }
 
     const returnKey = explicitReturn ?? stepKeys[stepKeys.length - 1];
-    const finalResult = bindings[returnKey];
+    const finalResult = echoed[returnKey];
 
     // One idle tick for the whole pipeline, after the last step, and the
     // point at which the namespace pins taken above are released. The
@@ -7219,12 +7395,12 @@ export class ConnectServer {
     // -- 5,067 bytes measured to discard 51 bytes of issue number, while `b`
     // was transmitted regardless. The cost being avoided is the EXTRA payload
     // of echoing what the caller skipped, so that is what gets weighed.
-    const skipped = Object.fromEntries(Object.entries(bindings).filter(([k]) => k !== returnKey));
+    const skipped = Object.fromEntries(Object.entries(echoed).filter(([k]) => k !== returnKey));
     const body = !explicitReturn
-      ? { ok: true, result: finalResult, steps: bindings }
+      ? { ok: true, result: finalResult, steps: echoed }
       : JSON.stringify(skipped).length > EXEC_ECHO_BUDGET_BYTES
         ? { ok: true, result: finalResult, stepKeys }
-        : { ok: true, result: finalResult, stepKeys, steps: bindings };
+        : { ok: true, result: finalResult, stepKeys, steps: echoed };
 
     return {
       content: [

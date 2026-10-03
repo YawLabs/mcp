@@ -619,8 +619,22 @@ export function acquireSidecarsLock(dir: string): (() => void) | null {
   // switches the heartbeat off.)
   if (release === null) return null;
   const lockPath = join(dir, SIDECARS_LOCK_NAME);
+  // What acquireUpgradeLock wrote into the file it took: its ownership-checked
+  // release reads this back before unlinking, and the heartbeat has to apply
+  // the same test. The PATH is not the lock -- the inode is. If this lock is
+  // stolen as stale after all (a paused VM that outlived the window) and
+  // another process takes the path, a heartbeat that touched the path blindly
+  // would keep the THIEF's lock fresh for as long as this process lived,
+  // making it unstealable in turn, while telling nobody. Touch only a file
+  // that still carries our pid; anything else means the lock is no longer
+  // ours and the heartbeat has nothing to keep alive.
+  const mine = String(process.pid);
   const beat = setInterval(() => {
     try {
+      if (readFileSync(lockPath, "utf8").trim() !== mine) {
+        clearInterval(beat);
+        return;
+      }
       const now = new Date();
       utimesSync(lockPath, now, now);
     } catch {
@@ -665,6 +679,13 @@ export function parseSidecarsArgs(
     } else if (a === "--help" || a === "-h") {
       return { ok: false, error: SIDECARS_USAGE, help: true };
     } else if (a === "install") {
+      // A second `install` is not a second request, it is a typo or a
+      // mis-pasted command line, and the verb-less surface below has no
+      // meaning for it. Refuse it like any other unexpected positional
+      // rather than let `sidecars install install` parse as a plain install.
+      if (sawInstall) {
+        return { ok: false, error: `yaw-mcp sidecars: "install" given twice\n\n${SIDECARS_USAGE}` };
+      }
       sawInstall = true;
     } else if (a.startsWith("-")) {
       return { ok: false, error: `yaw-mcp sidecars: unknown argument "${a}"\n\n${SIDECARS_USAGE}` };

@@ -13,8 +13,9 @@
 //     costs tokens without informing the model.
 //   * KEEP false, 0, empty strings — those can be load-bearing
 //     ("error": "" meaning success, "deleted": false, etc.).
-//   * Text-mode: strip trailing whitespace per line and collapse runs
-//     of 3+ blank lines into 2 -- but only after CLASSIFYING THE BLOCK.
+//   * Text-mode: strip trailing whitespace per line and collapse a run of
+//     2+ blank lines into 1 (three or more consecutive newlines become
+//     two, see collapseBlankRuns) -- but only after CLASSIFYING THE BLOCK.
 //     Trailing whitespace and blank runs are formatting in prose and
 //     CONTENT in a unified diff, inside a fenced code block, and at a
 //     Markdown hard line break, and none of the three can be recognized
@@ -32,8 +33,15 @@
 //     marginal win. The ratio is measured over the whole array
 //     (JSON.stringify(content)), not per individual content item.
 //
-// Opt-out: set YAW_MCP_PRUNE_RESPONSES=0 to disable entirely and keep
-// the original bytes. In that mode responseBytesPruned == responseBytesRaw.
+// Opt-out: set YAW_MCP_PRUNE_RESPONSES=0 (or =false, whitespace ignored --
+// see opt-out-env.ts) to disable entirely and keep the original bytes. In
+// that mode responseBytesPruned == responseBytesRaw.
+//
+// Size ceiling: a text block of MAX_PRUNE_CHARS or more is returned
+// unchanged on BOTH paths. The JSON path skips it because even a failed
+// parse of a multi-megabyte blob chews CPU; the text path skips it because
+// pruneWhitespace splits, classifies and re-joins every line, and this all
+// runs synchronously on the proxy path in front of the model's reply.
 //
 // NOT a security control. Nothing here inspects, redacts or truncates a
 // VALUE -- a large file blob, a base64 payload, an instruction-shaped string
@@ -43,8 +51,14 @@
 // feature this module does not have.
 
 import { setJsonKey } from "./json-key.js";
+import { isFeatureDisabled } from "./opt-out-env.js";
 
 const MIN_SAVINGS_RATIO = 0.02;
+
+/** Blocks at or above this many chars are passed through untouched -- see
+ *  the size-ceiling note in the header. Exported for the test that pins the
+ *  text path to the same ceiling as the JSON path. */
+export const MAX_PRUNE_CHARS = 2_000_000;
 
 export interface Content {
   type: string;
@@ -58,10 +72,12 @@ export interface PruneResult {
   bytesPruned: number;
 }
 
+/** On unless YAW_MCP_PRUNE_RESPONSES is an off spelling. The shared parser
+ *  trims, so cmd.exe's `set VAR=0 && yaw-mcp serve` (which delivers "0 ")
+ *  turns pruning off like every other YAW_MCP_* opt-out, instead of reading
+ *  as "not an opt-out" and pruning anyway. */
 export function isPruneEnabled(): boolean {
-  const raw = process.env.YAW_MCP_PRUNE_RESPONSES;
-  if (raw === undefined || raw === "") return true;
-  return raw !== "0" && raw.toLowerCase() !== "false";
+  return !isFeatureDisabled("YAW_MCP_PRUNE_RESPONSES");
 }
 
 export function pruneContent(content: Content[]): PruneResult {
@@ -85,10 +101,12 @@ export function pruneContent(content: Content[]): PruneResult {
 }
 
 function pruneText(text: string): string {
-  // Guard: don't try to parse multi-megabyte blobs as JSON — even a
-  // failed parse chews CPU. We still apply text-mode cleanup below.
+  // One ceiling for both paths. The guard used to sit on the JSON branch
+  // only, so a multi-megabyte NON-JSON block (a log tail, a file dump) still
+  // went through the per-line split/classify/join below, synchronously.
+  if (text.length >= MAX_PRUNE_CHARS) return text;
   const trimmed = text.trimStart();
-  if ((trimmed.startsWith("{") || trimmed.startsWith("[")) && text.length < 2_000_000) {
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
     try {
       const parsed = JSON.parse(text);
       // Only re-serialize when every number survives the round-trip. A
@@ -102,6 +120,15 @@ function pruneText(text: string): string {
       // Not JSON — fall through to text-mode cleanup.
     }
   }
+  // Reached by non-JSON text AND by valid JSON that was skipped above (an
+  // unfaithful number, or a document that pruned to nothing). Running the
+  // whitespace rules over raw JSON text is safe only because a JSON string
+  // literal cannot contain a raw newline (or any raw control character): every
+  // line boundary therefore lies OUTSIDE every string, the trailing-whitespace
+  // strip stops at the closing quote, and the blank-run collapse only ever
+  // removes inter-token whitespace -- so the value the parser sees is
+  // unchanged. Pretty-printed JSON with trailing spaces is exactly where this
+  // still earns its savings.
   return pruneWhitespace(text);
 }
 

@@ -235,8 +235,10 @@ export interface InstallTargetBase {
 
 /** The six rows that keep their inline `pathFor` branches. `resolvePath` is
  *  ABSENT here, which is what lets `pathFor` narrow: `if (t.resolvePath) return
- *  t.resolvePath(base)` leaves an InlineTarget, and the switch over the inline
- *  ids can end in a `never` check. */
+ *  t.resolvePath(base)` leaves an InlineTarget, `pathFor` takes this id union
+ *  and nothing wider, and its chain of `if (client === ...)` branches ends in
+ *  a `const unhandled: never = client` check (install-targets.ts), so a new
+ *  inline id fails to compile until it has a branch. */
 export type InlineClientId = "claude-code" | "claude-desktop" | "cursor" | "vscode" | "windsurf" | "gemini-cli";
 
 export interface InlineTarget extends InstallTargetBase {

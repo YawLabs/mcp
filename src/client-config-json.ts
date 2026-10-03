@@ -39,20 +39,20 @@
 //     targets' output bytes relative to that module.
 
 import { parseTree } from "jsonc-parser";
-import {
-  type ConfigAdapter,
-  type ConfigPosition,
-  type ConfigRead,
-  canonicalJson,
-  describeValueShape,
-  type EntryAddress,
-  type EntryTransform,
-  type EntryView,
-  launchOf,
-  normalizeEntry,
-  positionAt,
-  type StrictViolation,
+// TYPES ONLY from the core, by design. client-config.ts imports this module
+// at runtime to build the JSON family in, so a runtime import back from here
+// would be a cycle -- the one this file and client-config-values.ts were
+// split to remove. Every helper this adapter CALLS comes from that leaf.
+import type {
+  ConfigAdapter,
+  ConfigPosition,
+  ConfigRead,
+  EntryAddress,
+  EntryTransform,
+  EntryView,
+  StrictViolation,
 } from "./client-config.js";
+import { canonicalJson, describeValueShape, launchOf, normalizeEntry, positionAt } from "./client-config-values.js";
 import { editJsoncEntry, parseJsonc, removeJsoncEntry } from "./jsonc.js";
 
 /** U+FEFF, built from its code point rather than written as an escape: a

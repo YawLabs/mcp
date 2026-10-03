@@ -61,6 +61,14 @@ const isWindows = process.platform === "win32";
 const exe = isWindows ? ".exe" : "";
 
 /**
+ * @biomejs/biome's `bin` entry (its package.json: "bin": { "biome": "bin/biome" }):
+ * a node script that picks the platform binary and execs it. It is what npm's
+ * `.bin/biome` shim runs; nativeBinary falls back to it, and the spawn at the
+ * bottom runs it through `process.execPath` with no shell.
+ */
+const BIOME_JS_ENTRY = join(repoRoot, "node_modules", "@biomejs", "biome", "bin", "biome");
+
+/**
  * Every spawn below is bounded, because `npm run lint` runs UNATTENDED as
  * release.sh step 1 -- an unbounded child there turns a WEDGED release rather
  * than a failed one, with no output to say why.
@@ -120,10 +128,14 @@ function nativeBinary() {
   const direct = join(repoRoot, "node_modules", ...pkg.split("/"), `biome${exe}`);
   if (existsSync(direct)) return direct;
   // musl and other suffixed variants (cli-linux-x64-musl) don't match the plain
-  // name above; fall back to the shim npm links, which is correct everywhere the
-  // native binary is not itself broken.
-  const shim = join(repoRoot, "node_modules", ".bin", isWindows ? "biome.cmd" : "biome");
-  return existsSync(shim) ? shim : null;
+  // name above; fall back to the package's own JS entry point -- the file the
+  // `.bin/biome` shim execs -- which resolves the right platform binary itself
+  // and is correct everywhere the native binary is not itself broken. The
+  // entry rather than the shim: `.bin/biome.cmd` can only be spawned through
+  // cmd.exe, which re-splits the argv on whitespace, so a repo path with a
+  // space in it arrived as two arguments. The entry is spawned through node
+  // with no shell (see the spawn below).
+  return existsSync(BIOME_JS_ENTRY) ? BIOME_JS_ENTRY : null;
 }
 
 /**
@@ -196,7 +208,9 @@ function emulatedX64Binary(version) {
     );
   }
 
-  console.error(`[lint] routing biome through the x64 build under emulation on Windows ARM64; provisioning x64 ${version}`);
+  console.error(
+    `[lint] routing biome through the x64 build under emulation on Windows ARM64; provisioning x64 ${version}`,
+  );
   const install = spawnSync(
     process.execPath,
     [npmCli, "i", "--no-save", "--force", "--prefix", prefix, `@biomejs/cli-win32-x64@${version}`],
@@ -246,12 +260,19 @@ try {
 // Exit with biome's own status so `npm run lint` stays a usable gate, and so a
 // non-zero result is a real finding rather than this wrapper's opinion.
 //
-// `shell` is enabled ONLY for a .cmd/.bat target: spawning one with shell:false
-// throws EINVAL on Node 22 (the `.bin/biome.cmd` shim fallback, and any
-// YAWLABS_BIOME_BIN pointing at a batch file). Everything else -- including
-// every normal .exe path -- stays shell-free so arguments are passed verbatim.
-const needsShell = /\.(cmd|bat)$/i.test(binary);
-const run = spawnSync(binary, process.argv.slice(2), { stdio: "inherit", shell: needsShell, timeout: LINT_TIMEOUT_MS });
+// The package's JS entry (the shim-less fallback in nativeBinary) runs under
+// this node with no shell, so its arguments arrive verbatim. `shell` is
+// enabled ONLY for a YAWLABS_BIOME_BIN that names a .cmd/.bat: spawning one
+// with shell:false throws EINVAL on Node 22, and cmd.exe then re-splits the
+// argv on whitespace -- an operator-supplied batch file is the one case left
+// where that trade is theirs to make. Everything else -- including every
+// normal .exe path -- stays shell-free.
+const lintArgs = process.argv.slice(2);
+const needsShell = binary !== BIOME_JS_ENTRY && /\.(cmd|bat)$/i.test(binary);
+const run =
+  binary === BIOME_JS_ENTRY
+    ? spawnSync(process.execPath, [binary, ...lintArgs], { stdio: "inherit", shell: false, timeout: LINT_TIMEOUT_MS })
+    : spawnSync(binary, lintArgs, { stdio: "inherit", shell: needsShell, timeout: LINT_TIMEOUT_MS });
 // Checked BEFORE the generic error and crash branches: a timeout kill sets
 // `signal` to SIGTERM, which the crash check below would otherwise report as
 // the known native-binary crash -- the wrong diagnosis entirely.

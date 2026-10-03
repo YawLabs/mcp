@@ -54,6 +54,7 @@ import {
   carriedFieldsOf,
   carryableEnvOf,
   composeEntry,
+  containerKeysAt,
   launchOf,
   readClientConfigFile,
   readClientEnv,
@@ -66,9 +67,11 @@ import { ENTRY_NAME, resolveAppDataDir } from "./install-target-model.js";
 import {
   buildLaunchEntry,
   CURRENT_OS,
+  claudeCodeProjectSites,
   INSTALL_TARGETS,
   type InstallOS,
   type InstallTarget,
+  isProjectLocalEntry,
   resolveInstallSites,
 } from "./install-targets.js";
 import { log } from "./logger.js";
@@ -87,6 +90,14 @@ export interface HealedEntry {
   /** What the entry launches now -- a path, or `"npx"` when no durable entry
    *  could be resolved and the self-refetching form is the honest answer. */
   to: string;
+  /** Set when `to` is a PROJECT-LOCAL install -- a node_modules under the
+   *  tree the sweep ran in -- which install warns about when it writes the
+   *  same path (install-cmd.ts, the "project-local install" Note): this
+   *  config is machine-global, and an `rm -rf node_modules` weeks from now
+   *  kills the entry with nothing pointing back at the cause. The one
+   *  sentence, for `yaw-mcp heal` to print under the entry and the serve
+   *  wrapper to log; absent for a global or npx `to`. */
+  note?: string;
 }
 
 /** A config this pass could not even look inside, so it can make no claim
@@ -219,9 +230,16 @@ function isForeignEntry(command: string, entryPath: string, platform: NodeJS.Pla
 /** Gate 1. Is this entry file one WE would have written -- i.e. does it live
  *  inside an `@yawlabs/mcp` package tree? Anchored on the package directory
  *  rather than on the exact `dist/index.js` tail, which is the package's `bin`
- *  and may legitimately move between versions. */
-function isOwnBrokerEntry(entryPath: string): boolean {
-  return norm(entryPath).includes("/node_modules/@yawlabs/mcp/");
+ *  and may legitimately move between versions.
+ *
+ *  `platform` is the inspecting machine's, threaded like every other `norm`
+ *  call in the sweep: left to default it would fold case by the RUNNER's
+ *  platform while gates 2 and 4 judged by the option's, so a WSL session
+ *  reading a Windows profile could recognise `@YawLabs\MCP` on one gate and
+ *  not the next. (The segment is lower-case in every tree npm lays out, so
+ *  today the two policies agree; the seam is passed for the day they do not.) */
+function isOwnBrokerEntry(entryPath: string, platform: NodeJS.Platform): boolean {
+  return norm(entryPath, platform).includes("/node_modules/@yawlabs/mcp/");
 }
 
 /** Gate 2's real question: can `oam run` actually start this path? Only a
@@ -238,7 +256,13 @@ function isLaunchableFile(entryPath: string): boolean {
 }
 
 /**
- * Re-point every stale broker entry this machine can see.
+ * Re-point every stale broker entry this machine can see: every row, every
+ * scope, every copy of a fanned-out file (Cline's editor copies), and -- for
+ * Claude Code's local scope -- every project's container in `~/.claude.json`,
+ * not only the one for the directory the process is in (see
+ * claudeCodeProjectSites). A project scope that resolves against the cwd
+ * (`<cwd>/.mcp.json` and its peers) is the one slot that is still cwd-bound:
+ * there is no file to enumerate those from.
  *
  * Never rejects for a per-file problem: a machine with one unreadable config
  * must still heal the others, and every caller is a fire-and-forget startup
@@ -341,7 +365,7 @@ export async function healStaleBrokerEntries(opts: HealOptions = {}): Promise<He
 
       // Gate 1: an oam launch, pointing into our own package tree.
       const entryPath = oamRunEntryPath(launch.command, launch.args);
-      if (entryPath === null || !isOwnBrokerEntry(entryPath)) return;
+      if (entryPath === null || !isOwnBrokerEntry(entryPath, platform)) return;
 
       // Written for another OS than the one inspecting: unverifiable here,
       // never broken. See isForeignEntry -- this is the WSL case, and it is
@@ -386,13 +410,24 @@ export async function healStaleBrokerEntries(opts: HealOptions = {}): Promise<He
       // decided to rewrite it. A failure past this point is not a file to skip
       // quietly: the client still names a launch file that is gone, so it is
       // reported under `failed`, never left to the catch below.
-      const outcome = {
+      const outcome: HealedEntry = {
         clientId: target.clientId,
         scope,
         path: site.resolved.absolute,
         from: entryPath,
         to: nextEntry ?? "npx",
       };
+      // install's own caveat over the same path (install-cmd.ts, the
+      // "project-local install" Note), carried on the entry so each caller
+      // prints it on its own surface. Same helper, same cwd rule, same
+      // platform seam, so heal and install agree about which paths are
+      // project-local.
+      if (nextEntry !== null && isProjectLocalEntry(nextEntry, opts.cwd ?? process.cwd(), platform)) {
+        outcome.note =
+          `that path is a project-local install (${nextEntry}). Removing this checkout's node_modules ` +
+          `(\`rm -rf node_modules\`, \`npm prune\`, a rename) breaks the entry in ${site.resolved.absolute}. ` +
+          "`npm i -g @yawlabs/mcp` and re-run `yaw-mcp install` for a machine-durable path.";
+      }
 
       // Rendered BEFORE the dry-run branch, the way install renders its
       // editor copies: applyClientConfigEdits is where a refusal lives (a file
@@ -436,16 +471,39 @@ export async function healStaleBrokerEntries(opts: HealOptions = {}): Promise<He
         }
       }
 
+      // Under --dry-run this is the entry that WOULD be re-pointed: the
+      // result's `healed` carries the plan, and every caller says which it
+      // is printing (heal-cmd's "Would re-point", the JSON's `dryRun: true`).
       healed.push(outcome);
     } catch (err) {
       // Anything else that throws for this site -- none is expected: the read
       // classifies its own IO errors, and the rewrite reports its own
       // failures under `failed` above. One bad config must not stop the sweep.
-      log("warn", "Could not heal a stale yaw-mcp entry", {
+      // Worded apart from the serve wrapper's "Could not re-point" line: that
+      // one is a rewrite the sweep decided on and could not land; this is the
+      // sweep giving up on a file before deciding anything about it.
+      log("warn", "Stale-entry heal pass threw while inspecting a client config and skipped it", {
         path: site.resolved.absolute,
         error: err instanceof Error ? err.message : String(err),
       });
     }
+  };
+
+  /** The sites to sweep for ONE resolved site: itself, plus -- for a Claude
+   *  Code local-scope site -- one per OTHER project container in the same
+   *  file. The keys are listed off ONE read of the file's bytes through the
+   *  core (`containerKeysAt`), never by parsing here; the sweep over each
+   *  container then re-reads the file itself, which is what it has to do
+   *  anyway, since an earlier container's heal rewrites the bytes a later
+   *  one reads. Any other site comes back alone. */
+  const sitesToSweep = async (site: ConfigSite): Promise<ConfigSite[]> => {
+    let raw: string | null;
+    try {
+      raw = (await readClientConfigFile(site)).raw;
+    } catch {
+      return [site];
+    }
+    return claudeCodeProjectSites(site, (prefix) => containerKeysAt(raw, site, prefix));
   };
 
   for (const target of INSTALL_TARGETS) {
@@ -478,20 +536,36 @@ export async function healStaleBrokerEntries(opts: HealOptions = {}): Promise<He
         continue;
       }
 
-      for (const site of sites) {
-        const key = `${norm(site.resolved.absolute, platform)}::${addressOf(site).containerPath.join(".")}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        await healSite(target, scope.scope, site);
+      for (const resolvedSite of sites) {
+        // Every project's container, not only the cwd's, for a local-scope
+        // site (claudeCodeProjectSites); `[resolvedSite]` for every other.
+        // Listed only for the scope that fans out, so no other row pays a
+        // read for a list it cannot use.
+        const swept = scope.scope === "local" ? await sitesToSweep(resolvedSite) : [resolvedSite];
+        for (const site of swept) {
+          const key = `${norm(site.resolved.absolute, platform)}::${addressOf(site).containerPath.join(".")}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          await healSite(target, scope.scope, site);
+        }
       }
     }
   }
 
   if (healed.length > 0) {
-    log("info", "Re-pointed stale yaw-mcp entries whose launch file no longer existed", {
-      count: healed.length,
-      clients: healed.map((h) => `${h.clientId} (${h.scope})`),
-    });
+    // Tense follows the run: a dry run re-pointed nothing, and a past-tense
+    // "Re-pointed" in the log over a --dry-run was a claim about a write that
+    // never happened.
+    log(
+      "info",
+      opts.dryRun === true
+        ? "Would re-point stale yaw-mcp entries whose launch file no longer exists (dry run; nothing written)"
+        : "Re-pointed stale yaw-mcp entries whose launch file no longer existed",
+      {
+        count: healed.length,
+        clients: healed.map((h) => `${h.clientId} (${h.scope})`),
+      },
+    );
   }
   return { healed, unhealable, failed };
 }
@@ -525,11 +599,16 @@ export async function maybeHealStaleBrokerEntries(opts: HealOptions = {}): Promi
   }
   // `log` swallows its own write errors, so reporting cannot reject either.
   for (const f of result.failed) {
-    log("warn", "Could not heal a stale yaw-mcp entry", {
+    log("warn", "Could not re-point a stale yaw-mcp entry", {
       client: `${f.clientId} (${f.scope})`,
       path: f.path,
       error: f.error,
     });
+  }
+  // install's project-local caveat, on the one surface serve has.
+  for (const h of result.healed) {
+    if (h.note !== undefined)
+      log("warn", `Re-pointed yaw-mcp entry: ${h.note}`, { client: `${h.clientId} (${h.scope})` });
   }
   return result;
 }

@@ -92,6 +92,11 @@ export function capForPrompt(s: string, max: number): string {
 export interface GraderContext {
   // The dispatch intent the server was routed for, if known. Best-effort:
   // the proxy path doesn't always have it, so the prompt degrades gracefully.
+  // Staleness is PER NAMESPACE, not per call: server.ts feeds this from
+  // lastIntentByNamespace, i.e. the intent of whichever dispatch most
+  // recently loaded the namespace -- so a tool call that follows an earlier,
+  // unrelated dispatch to the same server is graded against that earlier
+  // intent, not against anything said for this call.
   intent?: string;
   toolName: string;
   resultText: string;
@@ -156,9 +161,11 @@ export function buildGraderPrompt(ctx: GraderContext): string {
     // Ask for a LABELLED verdict, not a bare word: parseGrade prefers the
     // `GRADE:` token precisely because it survives a model that narrates
     // first ("No results were returned, but the call succeeded. GRADE: YES").
-    // The bare-word instruction stays as the fallback contract for a model
-    // that ignores the label.
-    "Reply with ONLY one word: YES, PARTIAL, or NO, on a final line of the form `GRADE: <word>`.",
+    // The instruction is one sentence that cannot contradict itself -- it
+    // used to open with "Reply with ONLY one word" and then ask for a
+    // labelled line, which is two words. parseGrade still accepts a bare
+    // verdict word as its fallback for a model that drops the label.
+    "End your reply with a final line of the form `GRADE: <word>`, where <word> is exactly one of YES, PARTIAL, or NO.",
   );
   return lines.join("\n");
 }
@@ -190,12 +197,34 @@ export function parseGrade(text: string): number | null {
   }
 }
 
+/** Logged once per process, not per graded call: with the grader opted in
+ *  and a client that does not advertise sampling, every uncertain outcome
+ *  returns null here, and nothing else tells the user the opt-in is inert. */
+let noSamplingNoticeLogged = false;
+
+/** Test hook: let the one-time notice fire again. */
+export function resetNoSamplingNotice(): void {
+  noSamplingNoticeLogged = false;
+}
+
+function noteNoSamplingCapability(): void {
+  if (noSamplingNoticeLogged) return;
+  noSamplingNoticeLogged = true;
+  log(
+    "info",
+    "Client does not advertise the sampling capability; YAW_MCP_REWARD_GRADER has no effect and the heuristic reward stands",
+  );
+}
+
 // Ask the client LLM to grade the outcome. Returns the graded reward in
 // {0.0, 0.5, 1.0}, or null when sampling is unavailable / declined / timed
 // out / unparseable. Never throws.
 export async function gradeOutcomeViaSampling(server: Server, ctx: GraderContext): Promise<number | null> {
   const caps = server.getClientCapabilities();
-  if (!caps?.sampling) return null;
+  if (!caps?.sampling) {
+    noteNoSamplingCapability();
+    return null;
+  }
 
   const prompt = buildGraderPrompt(ctx);
   try {

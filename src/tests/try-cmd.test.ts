@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import type { MockInstance } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { atomicWriteFile } from "../atomic-write.js";
@@ -988,7 +988,6 @@ describe("marker trust guards", () => {
     const marker: TrialMarker = {
       schemaVersion: 1,
       slug,
-      name: "Demo MCP",
       expiresAt: Date.now() - 1,
       clientPath: join(synthHome, ".claude.json"),
       clientName: "claude-code",
@@ -1091,6 +1090,45 @@ describe("marker trust guards", () => {
     expect(result.cleared).toBe(0);
     expect(existsSync(path)).toBe(true);
   });
+
+  it("scanTrials refuses a marker whose schemaVersion is a STRING instead of reading it as v1", async () => {
+    // Every other marker field is type-checked; schemaVersion was compared
+    // with `>` behind a typeof guard, so a hand-edited "99" skipped the
+    // newer-writer refusal and was swept as if it were v1 -- the exact marker
+    // the version guard exists to leave alone. The same string spelled as our
+    // own version is refused too: the field is a number or it is absent.
+    writeMarker("stringy", { schemaVersion: "99" as unknown as number });
+    writeMarker("stringy-own", { schemaVersion: "1" as unknown as number });
+    writeMarker("legacy", { schemaVersion: undefined as unknown as number });
+    const scan = await scanTrials({ home: synthHome });
+    expect(scan.malformed.map((p) => basename(p)).sort()).toEqual(["stringy-own.json", "stringy.json"]);
+    expect(scan.expired.map((e) => e.marker.slug)).toEqual(["legacy"]);
+    // And the GC leaves them where they are, like a newer-schema marker.
+    await gcExpiredTrials({ home: synthHome });
+    expect(existsSync(trialMarkerPath("stringy", synthHome))).toBe(true);
+    expect(existsSync(trialMarkerPath("stringy-own", synthHome))).toBe(true);
+  });
+
+  it("try-cleanup refuses a marker whose schemaVersion is a STRING", async () => {
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { "yaw-mcp-try-stringy": { command: "npx" } } }),
+    );
+    const markerPath = writeMarker("stringy", { schemaVersion: "1" as unknown as number });
+    const cap = captureIO();
+    const r = await runTryCleanup({
+      slug: "stringy",
+      home: synthHome,
+      force: true,
+      out: cap.pushOut,
+      err: cap.pushErr,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(cap.errText()).toMatch(/schemaVersion that is not a number \("1"\)/);
+    expect(existsSync(markerPath)).toBe(true);
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(client.mcpServers["yaw-mcp-try-stringy"]).toBeDefined();
+  });
 });
 
 describe("runTryCleanup", () => {
@@ -1105,7 +1143,6 @@ describe("runTryCleanup", () => {
     const marker: TrialMarker = {
       schemaVersion: 1,
       slug: "demo",
-      name: "Demo MCP",
       expiresAt: Date.now() + 3_600_000,
       clientPath,
       clientName: "claude-code",
@@ -1170,7 +1207,6 @@ describe("runTryCleanup", () => {
     const marker: TrialMarker = {
       schemaVersion: 1,
       slug: "demo",
-      name: "Demo MCP",
       expiresAt: Date.now() + 3_600_000,
       clientPath: join(synthHome, ".claude.json"),
       clientName: "claude-code",
@@ -1219,7 +1255,6 @@ describe("runTryCleanup", () => {
     const marker: TrialMarker = {
       schemaVersion: 1,
       slug: "demo",
-      name: "Demo MCP",
       expiresAt: Date.now() + 3_600_000,
       clientPath,
       clientName: "claude-code",
@@ -1260,7 +1295,6 @@ describe("scanTrials + gcExpiredTrials", () => {
     const expiredMarker: TrialMarker = {
       schemaVersion: 1,
       slug: "old",
-      name: "Old MCP",
       expiresAt: baseNow - 1,
       clientPath: join(synthHome, ".claude.json"),
       clientName: "claude-code",
@@ -1271,7 +1305,6 @@ describe("scanTrials + gcExpiredTrials", () => {
     const liveMarker: TrialMarker = {
       ...expiredMarker,
       slug: "new",
-      name: "New MCP",
       expiresAt: baseNow + 1_800_000,
       entryName: "yaw-mcp-try-new",
     };
@@ -1306,7 +1339,6 @@ describe("scanTrials + gcExpiredTrials", () => {
     const expiredMarker: TrialMarker = {
       schemaVersion: 1,
       slug: "old",
-      name: "Old MCP",
       expiresAt: baseNow - 1,
       clientPath: join(synthHome, ".claude.json"),
       clientName: "claude-code",
@@ -1345,7 +1377,6 @@ describe("scanTrials + gcExpiredTrials", () => {
     const expiredMarker: TrialMarker = {
       schemaVersion: 1,
       slug: "old",
-      name: "Old MCP",
       expiresAt: baseNow - 1,
       clientPath: join(synthHome, ".claude.json"),
       clientName: "claude-code",
@@ -1379,7 +1410,6 @@ describe("scanTrials + gcExpiredTrials", () => {
     const expiredMarker: TrialMarker = {
       schemaVersion: 1,
       slug: "old",
-      name: "Old MCP",
       expiresAt: baseNow - 1,
       clientPath,
       clientName: "claude-code",
@@ -1420,7 +1450,6 @@ describe("scanTrials + gcExpiredTrials", () => {
     const expiredMarker: TrialMarker = {
       schemaVersion: 1,
       slug: "old",
-      name: "Old MCP",
       expiresAt: baseNow - 1,
       clientPath,
       clientName: "claude-code",
@@ -1466,7 +1495,6 @@ describe("gcExpiredTrials -- the container itself was deleted by hand", () => {
     const marker: TrialMarker = {
       schemaVersion: 1,
       slug: "old",
-      name: "Old MCP",
       expiresAt: baseNow - 1,
       clientPath,
       clientName: "claude-code",
@@ -1599,7 +1627,6 @@ describe("gcExpiredTrials -- the container itself was deleted by hand", () => {
     const marker: TrialMarker = {
       schemaVersion: 1,
       slug: "demo",
-      name: "Demo MCP",
       expiresAt: baseNow + 3_600_000,
       clientPath,
       clientName: "claude-code",

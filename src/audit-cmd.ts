@@ -16,8 +16,11 @@
 // Exit codes:
 //   0  audited successfully, grade written
 //   1  no server with that namespace in bundles.json
-//   2  the server isn't a stdio/command server (nothing to spawn), or the
-//      suite failed to run
+//   2  nothing was graded: the server isn't a stdio/command server (nothing
+//      to spawn); on Windows its command/args carry a cmd.exe metacharacter
+//      the shell-spawned suite would split on (findCmdMetacharToken); its
+//      env references a ${secret:NAME} the vault could not resolve (locked,
+//      missing name); or the suite ran and failed
 //   3  the suite RAN and produced a grade, but grades.json could not be
 //      written (read-only $HOME, no space, permissions). The grade is still
 //      printed on stdout -- only the cache is missing. Deliberately distinct
@@ -27,11 +30,12 @@ import { homedir } from "node:os";
 import { locateComplianceSuite } from "./compliance-cmd.js";
 import { gradesCachePath, writeGrade } from "./grades-cache.js";
 import { scrubForWarning } from "./health-score.js";
+import { scrubInternalSecretsFromProcessEnv } from "./internal-secret-env.js";
 import { loadLocalBundles } from "./local-bundles.js";
 import { createStreamWriter, log } from "./logger.js";
 import { hasSecretRefs } from "./secrets-vault.js";
 import type { UpstreamServerConfig } from "./types.js";
-import { resolveServerEnv, scrubInternalSecretsFromProcessEnv } from "./upstream.js";
+import { resolveServerEnv } from "./upstream.js";
 
 export interface AuditCommandOptions {
   /** Positional: the namespace to audit. Required. */
@@ -339,8 +343,11 @@ export async function runAudit(opts: AuditCommandOptions = {}): Promise<AuditCom
   // `yaw-mcp compliance <url>` instead.
   if (!server.command) {
     if (server.url) {
+      // Scrubbed: a remote URL can carry a credential in its query string
+      // (`?api_key=...`), and this line is the one place audit echoes it.
+      const url = scrubForWarning(server.url);
       printErr(
-        `yaw-mcp audit: "${namespace}" is a remote server (${server.url}). Audit grades stdio servers; run \`yaw-mcp compliance ${server.url}\` to grade a remote target.`,
+        `yaw-mcp audit: "${namespace}" is a remote server (${url}). Audit grades stdio servers; run \`yaw-mcp compliance ${url}\` to grade a remote target.`,
       );
     } else {
       printErr(`yaw-mcp audit: "${namespace}" has no command to spawn -- it can't be audited as a stdio server.`);
@@ -440,7 +447,12 @@ export async function runAudit(opts: AuditCommandOptions = {}): Promise<AuditCom
   try {
     report = await runner(target);
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
+    // Scrubbed BEFORE either sink sees it: by this point `target.env` holds
+    // the resolved vault secrets and `target.args` the raw argv, and a runner
+    // failure (a spawn error quoting the command line, the suite echoing the
+    // child's env in its abort message) can carry either. The log line is
+    // debug-only but still a sink, so it gets the scrubbed text too.
+    const msg = scrubForWarning(err instanceof Error ? err.message : String(err));
     // DEBUG, not error: the prose line below carries the same facts and goes to
     // the same stderr, so logging at error too put a raw JSON envelope directly
     // in front of the human version of itself. Same double-report shape
@@ -472,7 +484,10 @@ export async function runAudit(opts: AuditCommandOptions = {}): Promise<AuditCom
       home,
     );
   } catch (err) {
-    cacheError = err instanceof Error ? err.message : String(err);
+    // Scrubbed for the same reason as the runner error above: this text
+    // reaches stderr, the debug log and the --json payload, and the process
+    // env still carries the resolved secrets when it is composed.
+    cacheError = scrubForWarning(err instanceof Error ? err.message : String(err));
     // DEBUG for the same reason as the runner failure above: `cacheError` is
     // reported in prose on stderr at the end of this function (and in the
     // --json payload), so an error-level envelope here only doubles it.

@@ -100,8 +100,14 @@ import { dirname, join, sep } from "node:path";
 import { isWin32TransientFsError } from "./atomic-write.js";
 import { stripInternalSecretsFromEnv } from "./internal-secret-env.js";
 import { log } from "./logger.js";
-import { isFeatureDisabled } from "./opt-out-env.js";
+import { isFeatureDisabled, isTestSandbox } from "./opt-out-env.js";
+// No cycle: upgrade-cmd reaches back into this module only through dynamic
+// imports (defaultRunningPrefix, the prefix quoters and the --run lock), so
+// this static import is the one direction the two modules are allowed to
+// depend in. BINARY_RETIRED_HINT rides along so the retired-binary advice is
+// one string in upgrade-cmd rather than a second spelling here.
 import {
+  BINARY_RETIRED_HINT,
   buildUpgradePlan,
   comparablePath,
   detectInstallMethod,
@@ -206,6 +212,37 @@ export function detectRunningInstallPrefix(argvPath: string | undefined): string
   return candidate;
 }
 
+/** Is the running copy a global install under the prefix npm itself has
+ *  been told about -- `npm_config_prefix` in the environment -- even though
+ *  no path marker recognised it?
+ *
+ *  The path markers in detectInstallMethod know the default prefixes and the
+ *  version managers' fixed layouts, and `~/.npm-global` (the name npm's own
+ *  docs suggest). Anything else -- `npm config set prefix ~/tools` -- is
+ *  classified local-node-modules, and the CLI recovers that with a ~3s
+ *  `npm prefix -g` probe that the serve hot path cannot afford. This is the
+ *  cheap half of that probe: when npm exported its prefix into our
+ *  environment (every `npm run` / `npx` child, and a user who set the
+ *  variable by hand), compare it with the resolved entrypoint instead of
+ *  spawning npm to ask. Both global layouts are accepted (`<prefix>/lib/
+ *  node_modules` on POSIX, `<prefix>/node_modules` on Windows), anchored on
+ *  the `@yawlabs/mcp` segment like every marker. Lowercase `npm_config_prefix`
+ *  is what npm exports; on win32 process.env is case-insensitive, so the
+ *  uppercase spelling resolves through the same read.
+ *
+ *  Read-only and filesystem-only (one realpath), so the hot-path objection to
+ *  `npm prefix -g` does not apply. Unset, absent or non-matching all answer
+ *  false, which leaves the literal classification standing. */
+export function runsUnderNpmConfigPrefix(argvPath: string | undefined, env: NodeJS.ProcessEnv = process.env): boolean {
+  const prefix = env.npm_config_prefix;
+  if (!argvPath || prefix === undefined || prefix.trim() === "") return false;
+  const root = comparablePath(prefix.trim()).replace(/\/+$/, "");
+  const entry = comparablePath(argvPath);
+  return (
+    entry.startsWith(`${root}/lib/node_modules/@yawlabs/mcp/`) || entry.startsWith(`${root}/node_modules/@yawlabs/mcp/`)
+  );
+}
+
 /** Log a warning when npm's configured global prefix differs from the
  *  detected running-install prefix. `detected` must be the RAW (unquoted)
  *  prefix -- comparing the shell-quoted form against npm's unquoted answer
@@ -252,8 +289,13 @@ async function compareWithNpmPrefix(
  *  a shared POSIX box, every user) on one file. sidecars-cmd.ts passes its own
  *  SIDECARS_LOCK_NAME explicitly rather than leaning on this default; that
  *  constant deliberately EQUALS this value for the one mixed-version upgrade
- *  window (see its doc), so change the two together or not at all. */
-const UPGRADE_LOCK_NAME = ".yaw-mcp-upgrade.lock";
+ *  window (see its doc), so change the two together or not at all.
+ *
+ *  Exported for `yaw-mcp upgrade --run` (upgrade-cmd.ts), which takes the
+ *  SAME lock in the same prefix before its foreground `npm install -g`: the
+ *  background self-upgrade and the manual command write the same tree, so
+ *  they have to serialize on one file. */
+export const UPGRADE_LOCK_NAME = ".yaw-mcp-upgrade.lock";
 
 /** How long a lock is honoured before it is treated as abandoned. An install
  *  is seconds; ten minutes is far past that. The holder is NOT guaranteed to
@@ -498,14 +540,32 @@ export function acquireUpgradeLock(
   return second === undefined ? null : second;
 }
 
-/** The lock the serve path actually uses. Short-circuits under vitest --
- *  mirroring npmGlobalPrefix's probe guard -- so no unit test writes a
- *  lockfile into a real global prefix, or leaves one behind for the next test
- *  in the run to trip over. Tests that mean to exercise locking either call
- *  acquireUpgradeLock directly against a temp dir, or inject acquireLockImpl. */
+/** The lock the serve path actually uses. Short-circuits under a test harness
+ *  (isTestSandbox) -- mirroring npmGlobalPrefix's probe guard -- so no unit
+ *  test writes a lockfile into a real global prefix, or leaves one behind for
+ *  the next test in the run to trip over. Tests that mean to exercise locking
+ *  either call acquireUpgradeLock directly against a temp dir, or inject
+ *  acquireLockImpl. */
 function defaultAcquireLock(dir: string, lockName: string): (() => void) | null {
-  if (process.env.VITEST) return () => {};
+  if (isTestSandbox()) return () => {};
   return acquireUpgradeLock(dir, lockName);
+}
+
+/** The registry probe the serve path actually uses. Short-circuits to null
+ *  (= "registry unreachable", which maybeAutoUpgrade treats as nothing to do)
+ *  under a test harness, and that gate is what makes the WHOLE feature a
+ *  no-op there: every later step -- the plan, the lock, the memos, the spawn
+ *  -- is reached only through a non-null `latest`. Before this gate the memos
+ *  and the lock were already no-ops under VITEST while the fetch was not, so a
+ *  stale global copy spawned by some downstream package's test suite (which
+ *  inherits VITEST) ran a real `npm install -g` with no lock and no attempt
+ *  memo, on every start of that suite. defaultSpawn is deliberately NOT gated
+ *  on its own: it is unreachable under the harness without an injected
+ *  fetchLatestImpl / checkedRecentlyImpl, and the tests that exercise the real
+ *  child reach it through exactly that injection. */
+function defaultFetchLatest(): Promise<string | null> {
+  if (isTestSandbox()) return Promise.resolve(null);
+  return fetchLatestVersion();
 }
 
 /** How long a completed registry check (and the answer it fetched) is reused
@@ -572,7 +632,12 @@ export interface CachedCheck {
 /** Machine-wide memo of the last completed registry check. It has to live in
  *  tmpdir because the check runs before any install prefix is known, and it
  *  carries the uid so one user's check cannot silence another's on a shared
- *  POSIX box. */
+ *  POSIX box. Machine-wide cuts both ways: the memo records the ANSWER, and a
+ *  `latest: null` cached by one offline start (a laptop waking without a
+ *  network) suppresses the registry check for EVERY yaw-mcp copy this user
+ *  starts, on the whole machine, for the next UPGRADE_CHECK_INTERVAL_MS --
+ *  a stale global install that starts ten minutes later, online, still reads
+ *  the cached null and skips its own evaluation until the hour is up. */
 function checkMemoPath(): string {
   return join(tmpdir(), `.yaw-mcp-upgrade-check-${process.getuid?.() ?? "win"}.json`);
 }
@@ -620,27 +685,28 @@ function attemptMemoFallbackPath(dir: string, lockName: string, fallbackDir: str
   return join(fallbackDir, `.yaw-mcp-upgrade-attempt-${process.getuid?.() ?? "win"}-${scope}.json`);
 }
 
-// The four defaults below short-circuit under vitest for the same reason
-// defaultAcquireLock does: no unit test may write a memo into a real tmpdir or
-// global prefix, and none may inherit one left by an earlier test in the run.
-// Tests that mean to exercise the wiring inject the hooks instead.
+// The four defaults below short-circuit under a test harness (isTestSandbox)
+// for the same reason defaultAcquireLock does: no unit test may write a memo
+// into a real tmpdir or global prefix, and none may inherit one left by an
+// earlier test in the run. Tests that mean to exercise the wiring inject the
+// hooks instead.
 function defaultCheckedRecently(): CachedCheck | null {
-  if (process.env.VITEST) return null;
+  if (isTestSandbox()) return null;
   return readCheckMemo(checkMemoPath());
 }
 
 function defaultRecordCheck(latest: string | null): void {
-  if (process.env.VITEST) return;
+  if (isTestSandbox()) return;
   writeCheckMemo(checkMemoPath(), latest);
 }
 
 function defaultAttemptedRecently(dir: string, lockName: string, version: string): boolean {
-  if (process.env.VITEST) return false;
+  if (isTestSandbox()) return false;
   return attemptedRecentlyAt(dir, lockName, version);
 }
 
 function defaultRecordAttempt(dir: string, lockName: string, version: string): void {
-  if (process.env.VITEST) return;
+  if (isTestSandbox()) return;
   recordAttemptAt(dir, lockName, version);
 }
 
@@ -688,14 +754,18 @@ export interface AutoUpgradeDeps {
   acquireLockImpl?: (dir: string, lockName: string) => (() => void) | null;
   /** Test hook: replace the `npm prefix -g` probe behind the multi-prefix
    *  warning. Needed in tests because the shared probe short-circuits to null
-   *  under VITEST so no unit test ever spawns a real npm. */
+   *  under the test harness so no unit test ever spawns a real npm. */
   npmPrefixImpl?: () => Promise<string | null>;
+  /** Test hook: the environment the custom-prefix second chance reads
+   *  `npm_config_prefix` from (see runsUnderNpmConfigPrefix). Defaults to
+   *  process.env. */
+  env?: NodeJS.ProcessEnv;
   /** Test hook: force single-executable (SEA binary) detection. */
   isSeaImpl?: () => boolean | Promise<boolean>;
   /** Test hook: replace the "a registry check already ran recently" memo. A
    *  non-null answer is the CACHED registry result and skips the fetch; null
    *  means "no fresh check, go ask". Needed in tests because the default
-   *  short-circuits to null under VITEST. */
+   *  short-circuits to null under the test harness. */
   checkedRecentlyImpl?: () => CachedCheck | null;
   /** Test hook: replace the recorder for a completed registry check. Receives
    *  the answer the fetch produced (null for an unreachable registry). */
@@ -794,10 +864,14 @@ export async function maybeAutoUpgrade(deps: AutoUpgradeDeps = {}): Promise<void
   // hot path must not block on a 3s probe at startup. Consequence: a
   // custom-prefix global install whose argv[1] pattern doesn't match
   // the default npm prefix heuristic -- and whose realpath doesn't either --
-  // is classified as "local-node-modules" (or "unknown") and silently skipped;
-  // no background upgrade fires for it even when stale. Users in that setup
-  // should run `yaw-mcp upgrade --run` manually, or set the standard npm
-  // global prefix.
+  // is classified as "local-node-modules" (or "unknown") and skipped; no
+  // background upgrade fires for it even when stale. Two cheap recoveries
+  // narrow that: `~/.npm-global` is a path marker now (classifyEntrypoint),
+  // and runsUnderNpmConfigPrefix below reclassifies a copy that lives under
+  // the prefix npm exported as `npm_config_prefix`. Users in any other custom
+  // setup are told so by the local-node-modules log line at the bottom and
+  // can run `yaw-mcp upgrade --run`, whose `npm prefix -g` probe DOES
+  // recognise their prefix.
   //
   // `local-node-modules` joins `unknown` in the realpath second chance (the
   // CLI resolves `unknown` only -- see detectInstallMethod's docblock for why
@@ -809,9 +883,17 @@ export async function maybeAutoUpgrade(deps: AutoUpgradeDeps = {}): Promise<void
   // the ~3s objection above does not apply, and it degrades safely in both
   // directions: an `npm link`ed checkout resolves to `dev-checkout` and a
   // project-local shim back to `local-node-modules`, and neither spawns.
-  const method = (deps.isSeaImpl ? await deps.isSeaImpl() : await detectSea())
+  let method = (deps.isSeaImpl ? await deps.isSeaImpl() : await detectSea())
     ? "binary"
     : detectInstallMethod(argvPath, realpathSync, ["unknown", "local-node-modules"]);
+  // Second chance for a custom global prefix the markers do not know: npm's
+  // own `npm_config_prefix`, when it is in our environment. Only the
+  // local-node-modules verdict is revisited -- that is the one a global copy
+  // under an unrecognised prefix lands on (a bare `/node_modules/@yawlabs/
+  // mcp/` match), and it is the one verdict that is wrong in the costly
+  // direction (never upgrades). The confirmed global shapes above are not
+  // second-guessed by an env var.
+  if (method === "local-node-modules" && runsUnderNpmConfigPrefix(argvPath, deps.env)) method = "global-npm";
 
   // Throttle the registry probe itself. The lock below is acquired well AFTER
   // the fetch, so it never covered it: without this, every serve start hits
@@ -824,7 +906,7 @@ export async function maybeAutoUpgrade(deps: AutoUpgradeDeps = {}): Promise<void
   if (cached !== null) {
     latest = cached.latest;
   } else {
-    latest = await (deps.fetchLatestImpl ?? fetchLatestVersion)();
+    latest = await (deps.fetchLatestImpl ?? defaultFetchLatest)();
     // Record the check whichever way it went. An offline machine answers null
     // on every attempt, and re-probing an unreachable registry on each start
     // is the same waste this memo exists to stop.
@@ -879,6 +961,15 @@ export async function maybeAutoUpgrade(deps: AutoUpgradeDeps = {}): Promise<void
     // single `${tmpdir()}/.yaw-mcp-upgrade.lock`, and on a shared POSIX box
     // another user's lock could be neither taken nor stolen. Tool + uid in the
     // filename restores "one lock per tool family per user".
+    //
+    // When rawPrefix was detected but quotedPrefix is null (an unquotable
+    // win32 path), the lock dir is where we WOULD install, not where npm
+    // will: `--prefix` was dropped from the argv, so npm writes into its own
+    // configured prefix while the lock and the attempt memo sit in the
+    // running copy's. The lock still serializes every yaw-mcp that detected
+    // this same prefix -- which is every copy a client spawns from this tree
+    // -- so two of them cannot run npm at once; it just cannot contend with a
+    // writer that locked npm's prefix directly.
     const lockDir = rawPrefix ?? tmpdir();
     const lockName =
       rawPrefix === null ? `.yaw-mcp-upgrade-${globalSpec.cmd}-${process.getuid?.() ?? "win"}.lock` : UPGRADE_LOCK_NAME;
@@ -959,11 +1050,7 @@ export async function maybeAutoUpgrade(deps: AutoUpgradeDeps = {}): Promise<void
     // A standalone binary has no package manager to self-upgrade -- and the
     // binary track was retired in 0.70.3, so the only way forward is the
     // npm install. Nothing safe to spawn; log it and move on.
-    log(
-      "info",
-      "yaw-mcp (standalone binary) is behind npm; the binary track was retired -- npm install -g @yawlabs/mcp@latest, then delete the old executable",
-      { current, latest },
-    );
+    log("info", `yaw-mcp (standalone binary) is behind npm; ${BINARY_RETIRED_HINT}`, { current, latest });
     return;
   }
 
@@ -982,9 +1069,17 @@ export async function maybeAutoUpgrade(deps: AutoUpgradeDeps = {}): Promise<void
     // it won't pick up the new one. `upgrade --run` DOES work here: it runs
     // `npm install @yawlabs/mcp@latest` in the tree root (upgrade-cmd's
     // local-node-modules runSpec), so advertise it.
+    //
+    // This verdict is also where a GLOBAL install under a prefix the markers
+    // do not recognise lands (`npm config set prefix ~/tools`; see the NOTE
+    // on detectInstallMethod above), and for that user the pinned-project
+    // half of the sentence is false. Say so: `upgrade --run` is still the
+    // right command for them -- its `npm prefix -g` probe reclassifies the
+    // copy as global-npm -- but the reason this process did not upgrade in
+    // the background is "unrecognised prefix", not "your project pins it".
     log(
       "info",
-      "yaw-mcp is out of date; run `yaw-mcp upgrade --run` to update this install (a restart re-runs the version pinned in your project's node_modules)",
+      "yaw-mcp is out of date; run `yaw-mcp upgrade --run` to update this install (a restart re-runs the version pinned in your project's node_modules; if this copy was installed with `npm install -g` under a custom npm prefix, the background self-upgrade did not recognise that prefix -- `upgrade --run` asks npm for it and does)",
       {
         current,
         latest,

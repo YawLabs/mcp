@@ -437,6 +437,16 @@ const EXPECTED_WALKS: Record<string, Walk[]> = {
       why: "claudeCodeContainerPaths building one variant path per case-variant key it found",
     },
     {
+      shape: "INDEX for (const key of keysAt([PROJECTS_KEY])) {",
+      why:
+        "claudeCodeProjectSites asking the key lister for EVERY projects key, so heal can sweep each " +
+        "project's local scope rather than the working directory's alone -- same read as above, one more caller",
+    },
+    {
+      shape: "INDEX out.push(siteAt(site, [PROJECTS_KEY, key, ...tail]));",
+      why: "claudeCodeProjectSites building one sibling site per other project key, under the canonical tail",
+    },
+    {
       shape: 'INDEX containerPath: ["projects", projectKey, "mcpServers"]',
       why: "resolveInstallPath: the local-scope container path, from claudeCodeProjectKey -- the canonical spelling",
     },

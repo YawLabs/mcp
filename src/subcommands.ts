@@ -30,9 +30,11 @@ export const FLAG_ALIASES = ["--help", "-h", "--version", "-V"] as const;
 //
 // That last sentence is enforced now, not merely requested: the test
 // "lists exactly the subcommands index.ts dispatches" (index-dispatch.
-// test.ts) scrapes every `subcommand === "..."` literal out of index.ts
-// and requires the two sets to be equal, in both directions. A branch
-// added without an entry here, or an entry outliving its branch, goes red.
+// test.ts) scrapes every `subcommand === "..."` literal out of the
+// `if (` / `} else if (` dispatch lines of index.ts -- comments and other
+// code are not scanned -- and requires the two sets to be equal, in both
+// directions. A branch added without an entry here, or an entry outliving
+// its branch, goes red.
 export const KNOWN_SUBCOMMANDS = [
   "compliance",
   "audit",
@@ -65,12 +67,6 @@ export const KNOWN_SUBCOMMANDS = [
 ] as const;
 
 /**
- * Suggest the closest real subcommands for a bare (non-dash) typo.
- * `help` stays in the pool so `halp` -> `help`; only the leading-dash
- * flag aliases are stripped (those are handled by `suggestFlag`).
- * Returns up to `limit` names, best first; [] when nothing is close.
- */
-/**
  * Verbs that USED to exist, mapped to what replaced them.
  *
  * Deleting a command is not the same as it never having existed. `servers`
@@ -95,6 +91,12 @@ export function retiredSubcommandReplacement(input: string): string | null {
   return RETIRED_SUBCOMMANDS.get(input.toLowerCase()) ?? null;
 }
 
+/**
+ * Suggest the closest real subcommands for a bare (non-dash) typo.
+ * `help` stays in the pool so `halp` -> `help`; only the leading-dash
+ * flag aliases are stripped (those are handled by `suggestFlag`).
+ * Returns up to `limit` names, best first; [] when nothing is close.
+ */
 export function suggestSubcommand(input: string, limit = 3): string[] {
   const visible = KNOWN_SUBCOMMANDS.filter((s) => !s.startsWith("-"));
   return closestNames(input, visible, limit);

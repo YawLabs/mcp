@@ -45,15 +45,16 @@ describe("stripJsoncComments", () => {
     expect(parseJsonc(src)).toEqual({ msg: 'he said "hi //"' });
   });
 
-  it("honors // and /* inside single-quoted strings too (defensive, even though JSON disallows)", () => {
-    // parseJsonc will fail on single-quoted strings at JSON.parse time, but
-    // the stripper runs BEFORE that and is exported in its own right: its
-    // contract is "removes comments, touches nothing else", so a // inside any
-    // quoted run has to survive. It also keeps the text JSON.parse raises its
-    // SyntaxError against a faithful copy of the user's source, so the position
-    // it reports points at the real problem and not at a span the stripper ate.
-    const src = "{'s': 'a // b'}";
-    expect(stripJsoncComments(src)).toBe(src);
+  it("does not treat an apostrophe as a string delimiter: JSON has none", () => {
+    // `'` used to open a "string" in both strippers, so a stray apostrophe
+    // put the rest of the file inside one and let a real `//` comment through
+    // to JSON.parse. Outside a `"` string it is just a byte, and the `//`
+    // after it is a comment.
+    expect(stripJsoncComments("{'s': 'a // b'}")).toBe("{'s': 'a ");
+    expect(stripTrailingCommas("{'s': 1,}")).toBe("{'s': 1 }");
+    // Inside a real string it is content, and so is the `//` beside it.
+    const src = '{"s": "it\'s // not a comment"} // but this is\n';
+    expect(parseJsonc(src)).toEqual({ s: "it's // not a comment" });
   });
 
   it("handles token on same line as // comment", () => {

@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { dirname, join, posix as posixPath, win32 as winPath } from "node:path";
 import { fileURLToPath } from "node:url";
+import { scrubForWarning } from "./health-score.js";
 import { stripInternalSecretsFromEnv } from "./internal-secret-env.js";
 import { createStreamWriter } from "./logger.js";
 
@@ -569,7 +570,11 @@ export function createInterruptHandler(
       // A repeat interrupt must not stack a second fallback timer; the first
       // one is already counting down against the same child. The FIRST signal
       // also fixes the status -- a SIGTERM arriving after a Ctrl-C does not
-      // relabel a cancellation as a termination.
+      // relabel a cancellation as a termination. Reachable by a second Ctrl-C
+      // as well as by SIGTERM-after-SIGINT: the listeners are installed with
+      // `process.on`, not `process.once`, so a repeat lands HERE (and
+      // re-kills a child the first kill may have missed) instead of falling
+      // to node's default die-on-signal, which would skip the teardown.
       if (timer !== undefined) return;
       timer = setTimeout(() => {
         try {
@@ -627,6 +632,13 @@ function runTest(launch: SuiteLaunch, err: (s: string) => void): Promise<Complia
     let child: ChildProcess;
     try {
       child = spawn(launch.command, launch.args, {
+        // stderr is INHERITED, deliberately unscrubbed: it is the suite's own
+        // progress output, streamed live to the operator who typed the target
+        // on this command line and already holds whatever it could echo. The
+        // report on stdout is the channel yaw-mcp parses and re-renders
+        // (printSummary scrubs the url it echoes); stderr is passed through
+        // as-is so a hung or failing run shows the suite's own diagnostics
+        // in real time rather than after a buffered scrub.
         stdio: ["ignore", "pipe", "inherit"],
         shell: launch.shell,
         // Own process group on POSIX so the timeout can take the whole tree
@@ -660,14 +672,22 @@ function runTest(launch: SuiteLaunch, err: (s: string) => void): Promise<Complia
     // which reads as a tool malfunction and exits 1 -- indistinguishable from
     // a genuine parse failure or a --min-grade gate failure. First signal
     // wins, so a follow-up SIGTERM cannot relabel a cancellation.
+    //
+    // `process.on`, NOT `process.once`: with `once` the listener was gone
+    // after the first Ctrl-C, so a SECOND Ctrl-C (the reflex when the first
+    // seems to do nothing) took node's default and killed the CLI outright --
+    // skipping the fallback timer and leaving the child tree orphaned, the
+    // exact outcome the handler exists to prevent. The handler is idempotent
+    // (interruptedBy is set once, the timer is armed once), so repeats are
+    // safe, and releaseSignals removes it as soon as the run settles.
     const interrupt = createInterruptHandler(child);
     let interruptedBy: NodeJS.Signals | undefined;
     const onInterrupt = (signal: NodeJS.Signals): void => {
       interruptedBy ??= signal;
       interrupt.onInterrupt(signal);
     };
-    process.once("SIGINT", onInterrupt);
-    process.once("SIGTERM", onInterrupt);
+    process.on("SIGINT", onInterrupt);
+    process.on("SIGTERM", onInterrupt);
     const releaseSignals = (): void => {
       process.off("SIGINT", onInterrupt);
       process.off("SIGTERM", onInterrupt);
@@ -758,9 +778,13 @@ function runTest(launch: SuiteLaunch, err: (s: string) => void): Promise<Complia
 
 function printSummary(report: ComplianceReport, out: (s: string) => void): void {
   const { grade, score, summary, url } = report;
+  // `url` is the suite's echo of the target the operator typed, and a remote
+  // target can carry a credential in its query string (`?api_key=...`). The
+  // operator typed it, but this line is the one that lands in a pasted
+  // ticket, so it goes through the same scrubber every other echo does.
   out(
     `\nCompliance: ${grade} (${score.toFixed(1)}%) -- ${summary.passed}/${summary.total} passed, ` +
       `${summary.requiredPassed}/${summary.required} required\n` +
-      `Target: ${url}\n`,
+      `Target: ${scrubForWarning(url)}\n`,
   );
 }

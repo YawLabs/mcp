@@ -1,3 +1,5 @@
+import { MAX_EXEC_STEPS } from "./exec-engine.js";
+import { PENALTY_RATE_THRESHOLD } from "./learning.js";
 // Single source of truth for the `${secret:NAME}` reference shape AND for the
 // scan over it is secrets-vault's collectSecretRefNames. This file used to keep
 // a byte-identical private copy of that loop, re-deriving the fresh-RegExp rule
@@ -6,8 +8,6 @@
 // matching the old shape. (secrets-vault does touch the filesystem elsewhere in
 // the module, but nothing runs at import time -- computeSecretsReport below
 // stays pure.)
-import { MAX_EXEC_STEPS } from "./exec-engine.js";
-import { PENALTY_RATE_THRESHOLD } from "./learning.js";
 import { collectMalformedSecretRefs, collectSecretRefNames } from "./secrets-vault.js";
 import { isRemoteEntry } from "./types.js";
 
@@ -213,7 +213,7 @@ export const META_TOOLS = {
   findTool: {
     name: "mcp_connect_find_tool",
     description:
-      'Search every installed server\'s tools by what they DO ("resize an image", "list pull requests") when you do not know which server has it. Ranks tool names and descriptions across loaded and unloaded servers from cache; nothing is loaded and no server is contacted. A match on a loaded server carries its full input schema; one on a never-loaded server carries name and description only -- `mcp_connect_read_tool` returns its arguments.',
+      'Search every installed server\'s tools by what they DO ("resize an image", "list pull requests") when you do not know which server has it. Ranks tool names and descriptions across loaded and unloaded servers from cache; nothing is loaded and no server is contacted. On a fresh install a no-match first waits (up to 20 s) for the startup scan still learning a server\'s tools. A match on a loaded server carries its full input schema; one on a never-loaded server carries name and description only -- `mcp_connect_read_tool` returns its arguments.',
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -302,9 +302,9 @@ export const META_TOOLS = {
     // Joined rather than one literal so the step cap can be interpolated from
     // MAX_EXEC_STEPS -- the constant validateExecRequest actually enforces.
     description: [
-      "Run a short DECLARATIVE pipeline of upstream tool calls in one round-trip, when you already know the 2-4 calls and one step's output feeds another's args -- e.g. `a = gh_list_prs(); b = gh_get_pr(a[0].number); return b`. NOT a code sandbox: no expressions, loops, branching or arithmetic. Steps run in order; the only data flow is `{\"$ref\": \"<stepId>[.path.to.value]\"}` (dot keys, `[N]` / `.N` array indexing), which substitutes a prior step's output into a later step's args. Each `tool` is a namespaced upstream name: a loaded server is called directly; a not-yet-loaded server whose tools are cached is loaded on first use, as a direct tools/call would (its tools join this session; it can still be refused). A POLICY refusal (server disabled, project profile, compliance floor) is decided before step 0 runs and refuses the whole pipeline with nothing done, so fixing it and re-running costs no repeated side effect; a server-cap refusal is only knowable when the step is reached and fails it there, with `partial` holding what already ran. A name neither loaded nor cached fails its step.",
+      "Run a short DECLARATIVE pipeline of upstream tool calls in one round-trip, when you already know the 2-4 calls and one step's output feeds another's args -- e.g. `a = gh_list_prs(); b = gh_get_pr(a[0].number); return b`. Not a sandbox: no expressions, loops, branches or arithmetic. Steps run in order; the only data flow is `{\"$ref\": \"<stepId>[.path.to.value]\"}` (dot keys, `[N]`/`.N` indexing), which substitutes a prior step's output into a later step's args. A `$ref` reads the output as the server sent it, before the pruning and size cap applied to the echoed copy. Each `tool` is a namespaced upstream name: a loaded server is called directly; an unloaded server whose tools are cached is loaded on first use (its tools join this session; it can still be refused). A POLICY refusal (server disabled, project profile, compliance floor) is decided before step 0 runs and refuses the whole pipeline with nothing done, so a re-run repeats no side effect; a server-cap refusal is only knowable when the step is reached and fails it there, with `partial` holding what already ran. A name neither loaded nor cached fails its step.",
       `Max ${MAX_EXEC_STEPS} steps per exec.`,
-      "Any failure returns `{ ok: false, failedStep, error, partial }`. Success returns `{ ok: true, result, steps }`; with a named `return`, `result` is that step's output, `stepKeys` is added, and `steps` is dropped once the intermediate outputs exceed about 4 KB. Name a `return` whenever one value is enough: it stops a large intermediate output being replayed into your context.",
+      "Any failure returns `{ ok: false, failedStep, error, partial }`. Success returns `{ ok: true, result, steps }`; with a named `return`, `result` is that step's output, `stepKeys` is added, and `steps` is dropped once the intermediates exceed about 4 KB. Name a `return` when one value is enough: it keeps a large intermediate out of your context.",
     ].join(" "),
     inputSchema: {
       type: "object" as const,
@@ -324,7 +324,7 @@ export const META_TOOLS = {
               tool: {
                 type: "string",
                 description:
-                  'Namespaced tool name (e.g. "gh_list_prs"); a cached-but-unloaded server is loaded on first use. Meta-tools (mcp_connect_*) are not callable from exec.',
+                  'Namespaced tool name (e.g. "gh_list_prs"); a cached-but-unloaded server is loaded on first use. Meta-tools (mcp_connect_*) are not callable from exec. On a fresh install a name with no route waits up to 20 s for the startup scan.',
               },
               args: {
                 type: "object",

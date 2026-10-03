@@ -138,7 +138,7 @@ import { atomicWriteFile } from "./atomic-write.js";
 import { loadLocalBundles } from "./local-bundles.js";
 import { log } from "./logger.js";
 import { compareVersions } from "./oam-spawn.js";
-import { isFeatureDisabled } from "./opt-out-env.js";
+import { isFeatureDisabled, isTestSandbox } from "./opt-out-env.js";
 import { CONFIG_DIRNAME, sidecarsRoot } from "./paths.js";
 import {
   acquireSidecarsLock,
@@ -275,11 +275,14 @@ export interface SidecarRefreshPlan {
  *  must never touch: the network, the user's real ~/.yaw-mcp, a lockfile in a
  *  real sidecars root, or a real `npm install`. Tests inject their own impls
  *  and never see these paths; a test that forgets to inject one gets a
- *  deterministic no-op instead of a machine-dependent side effect. Mirrors the
- *  VITEST short-circuits in upgrade-cmd (npmGlobalPrefix), auto-upgrade
- *  (defaultAcquireLock) and doctor (registrySkipCheck). */
+ *  deterministic no-op instead of a machine-dependent side effect. The
+ *  predicate is opt-out-env's isTestSandbox -- the same one upgrade-cmd
+ *  (npmGlobalPrefix), auto-upgrade (defaultAcquireLock, defaultFetchLatest)
+ *  and doctor (registrySkipCheck) gate on, so "the background features are
+ *  off under a test harness" is one rule rather than four readers of one
+ *  variable. Kept as a local name so every default below reads the same. */
 function inUnitTest(): boolean {
-  return Boolean(process.env.VITEST);
+  return isTestSandbox();
 }
 
 /**
@@ -470,6 +473,14 @@ function defaultSpawnRefresh(stale: SidecarSpec[], onDone: () => void, home: str
   }
   void (async () => {
     try {
+      // The whole `sidecars install` command, run INSIDE the serve process.
+      // backgroundInstallOptions mutes the command's own writers (`out` /
+      // `err`), so its report never reaches the stdio transport -- but the
+      // helpers it calls log through logger.ts (`log(...)`) directly, and
+      // those lines DO reach serve's stderr as ordinary broker records. That
+      // is intended (stderr is the broker's log, not the JSON-RPC stream),
+      // just not obvious from "muted": a line about the sidecars tree that
+      // appears mid-session comes from here.
       const result = await runSidecarsInstall(backgroundInstallOptions(home));
       if (result.exitCode === 0) {
         // NOT "restart your MCP client": this writes into the very tree this

@@ -85,10 +85,11 @@
 
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
-import { type ConfigSite, effectiveConfigFormat, type SyntaxName } from "./client-config.js";
+import { type ConfigSite, effectiveConfigFormat, type SyntaxName, siteAt } from "./client-config.js";
 import {
   type ClientEnvValues,
   defineTarget,
+  type InlineClientId,
   type InlineTarget,
   type InstallOS,
   type InstallScope,
@@ -306,9 +307,10 @@ export interface ResolvePathOptions {
   home?: string;
   /** Windows `%APPDATA%`. Defaults to `<home>/AppData/Roaming` -- the resolver
    *  never reads `process.env.APPDATA` itself, so a caller on a box where
-   *  %APPDATA% is redirected must pass it (see `resolveAppDataDir` below, the
-   *  one helper that reads the env, shared by install's write path, `--list`,
-   *  `doctor` and `try` so none of them can disagree).
+   *  %APPDATA% is redirected must pass it (see `resolveAppDataDir` in
+   *  install-target-model.ts, the one helper that reads the env, shared by
+   *  install's write path, `--list`, `doctor` and `try` so none of them can
+   *  disagree).
    *
    *  An EMPTY string counts as unset and takes the same `<home>/AppData/Roaming`
    *  default: an empty-but-set %APPDATA% is ordinary on Windows and in CI, and
@@ -436,9 +438,10 @@ function resolveTargetBase(opts: ResolvePathOptions): {
   // On a box where %APPDATA% is redirected away from `<home>\AppData\Roaming`,
   // install wrote the claude_desktop_config.json Claude Desktop actually reads
   // while doctor and --list reported a different path. Choosing %APPDATA% is a
-  // CALLER's job -- see `resolveAppDataDir` below, the single helper that reads
-  // the env, used by install's write path, `--list`, `doctor` and `try` alike
-  // so they cannot disagree. Keeping the env out of here is also what keeps a hermetic run
+  // CALLER's job -- see `resolveAppDataDir` in install-target-model.ts, the
+  // single helper that reads the env, used by install's write path, `--list`,
+  // `doctor` and `try` alike so they cannot disagree. Keeping the env out of
+  // here is also what keeps a hermetic run
   // hermetic: claude-desktop is the one client living under %APPDATA%, so a
   // test that overrode `home` but not `appData` would otherwise resolve to (and
   // install would have written) the DEVELOPER's own config file.
@@ -705,8 +708,52 @@ export function claudeCodeContainerPathVariants(
   return out;
 }
 
+/** The six inline rows' paths. `client` is the INLINE id union, not the whole
+ *  `InstallClientId`: `resolveInstallPath` narrows a row to InlineTarget by
+ *  testing `resolvePath` first, so every id that reaches here has a branch
+ *  below, and the function ends in a real exhaustiveness check rather than a
+ *  cast-and-throw -- a seventh inline id (or a modular row that forgot its
+ *  `resolvePath`) fails to compile instead of throwing at the first resolve. */
+/** Every per-project container in the file a Claude Code LOCAL-scope site
+ *  names, one site each -- for a sweep that has to look at every project this
+ *  machine has opened rather than at the one the process happens to be in.
+ *
+ *  A local-scope resolve answers for ONE project (`projects[<cwd>].mcpServers`),
+ *  because that is where install writes. But `~/.claude.json` holds one such
+ *  container per project Claude Code has ever been run in, every one of them
+ *  can carry an entry install wrote, and the heal pass (heal-entries.ts) must
+ *  reach them all: a stale entry in a project the user is not sitting in is
+ *  exactly as dead as one in the project they are. `keysAt` is the key lister
+ *  the caller has -- `containerKeysAt` over the bytes it already read -- so
+ *  this never parses a client config itself. A site whose container path is
+ *  not a `projects[<key>]...` one (every other row and scope) comes back as
+ *  itself, alone; so does a file with no projects, or one that did not parse
+ *  (the lister answers `[]` for it). The site's OWN container comes first,
+ *  so a caller that already dedupes by (file, container) keeps the canonical
+ *  key ahead of the file's spelling of it. */
+export function claudeCodeProjectSites(
+  site: ConfigSite,
+  keysAt: (prefix: readonly string[]) => readonly string[],
+): ConfigSite[] {
+  const containerPath = site.resolved.containerPath;
+  if (containerPath.length < 2 || containerPath[0] !== PROJECTS_KEY) return [site];
+  const tail = containerPath.slice(2);
+  const out: ConfigSite[] = [site];
+  for (const key of keysAt([PROJECTS_KEY])) {
+    if (key === containerPath[1]) continue;
+    out.push(siteAt(site, [PROJECTS_KEY, key, ...tail]));
+  }
+  return out;
+}
+
+/** The six inline rows' paths. `client` is the INLINE id union, not the whole
+ *  `InstallClientId`: `resolveInstallPath` narrows a row to InlineTarget by
+ *  testing `resolvePath` first, so every id that reaches here has a branch
+ *  below, and the function ends in a real exhaustiveness check rather than a
+ *  cast-and-throw -- a seventh inline id (or a modular row that forgot its
+ *  `resolvePath`) fails to compile instead of throwing at the first resolve. */
 function pathFor(
-  client: InstallClientId,
+  client: InlineClientId,
   scope: InstallScope,
   os: InstallOS,
   base: { home: string; appData: string; projectDir: string; claudeConfigDir: string | undefined },
@@ -846,7 +893,11 @@ function pathFor(
     };
   }
 
-  throw new Error(`Unhandled client: ${client as string}`);
+  // Exhaustiveness: every InlineClientId above returned, so `client` is `never`
+  // here and a new inline id does not compile until it has a branch. The throw
+  // stays for a caller that defeated the types at runtime.
+  const unhandled: never = client;
+  throw new Error(`Unhandled client: ${String(unhandled)}`);
 }
 
 export interface BuildLaunchEntryOptions {
@@ -1164,13 +1215,25 @@ export function buildLaunchEntry(opts: BuildLaunchEntryOptions): LaunchEntry {
  * yaw-mcp was launched from that project's node_modules, which is where the
  * user is.
  *
- * Pure string work on both separators, and case-insensitive: Windows paths
- * compare case-insensitively (including drive-letter case, which differs
- * between `process.cwd()` and a resolved module path), and a POSIX tree whose
- * only difference is case would at worst earn one extra note.
+ * Pure string work on both separators. Case is folded ONLY where the
+ * filesystem folds it -- `platform` is win32 (drive-letter case differs
+ * between `process.cwd()` and a resolved module path, so an exact compare
+ * missed the common case there). The same policy as heal's `norm` and
+ * uninstall's `samePathKey`, and for the same reason: Linux and a
+ * case-sensitive APFS volume keep `/opt/Yaw` and `/opt/yaw` apart, so folding
+ * there would call two trees one. `platform` is the path SEMANTICS of the
+ * machine answering, never the `--os` preview knob; it defaults to this
+ * process's and is a parameter so a test can ask about the other one.
  */
-export function isProjectLocalEntry(entryPath: string, cwd: string): boolean {
-  const norm = (p: string): string => p.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+export function isProjectLocalEntry(
+  entryPath: string,
+  cwd: string,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  const norm = (p: string): string => {
+    const slashed = p.replace(/\\/g, "/").replace(/\/+$/, "");
+    return platform === "win32" ? slashed.toLowerCase() : slashed;
+  };
   const entry = norm(entryPath);
   const here = norm(cwd);
   // OUTERMOST node_modules, so a transitively-nested copy is still attributed

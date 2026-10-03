@@ -44,3 +44,27 @@ export function isFeatureDisabled(name: string, env: NodeJS.ProcessEnv = process
   if (trimmed === "") return false;
   return trimmed === "0" || trimmed.toLowerCase() === "false";
 }
+
+/**
+ * Is a test harness driving this process? True whenever `VITEST` is set to
+ * anything non-empty -- vitest exports it as `"true"` into every worker, and
+ * a downstream suite that spawns `yaw-mcp` as a child INHERITS it.
+ *
+ * The ONE reader of that variable. It used to be spelled ten times across
+ * auto-upgrade, upgrade-cmd and sidecar-refresh, each copy gating a different
+ * default (a lock, a memo, a probe), and the set of gated defaults was not
+ * closed: under an inherited VITEST the memos and the lock were no-ops while
+ * the registry fetch was not, so a stale global copy spawned under some other
+ * package's test run performed a real, UNSERIALIZED `npm install -g`. One
+ * predicate makes "the background features are off under a test harness" one
+ * fact, and gives every default the same seam: a test that wants the real
+ * path injects an impl; one that forgets gets a deterministic no-op.
+ *
+ * Only the DEFAULT impls consult it. An injected hook (`fetchLatestImpl`,
+ * `spawnImpl`, `acquireLock`, ...) always runs, which is how the unit tests
+ * reach the real code paths from inside the harness.
+ */
+export function isTestSandbox(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = env.VITEST;
+  return raw !== undefined && raw !== "";
+}

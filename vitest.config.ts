@@ -8,12 +8,21 @@ import { defaultExclude, defineConfig } from "vitest/config";
 // 500 ms budget measured at 26-250 ms standalone came back at 822 ms and
 // failed a release run.
 //
-// They get their own project with fileParallelism disabled. That forces the
-// project's maxWorkers to 1, which puts its files in vitest's sequential
-// group: the group runs after every parallel group, one file at a time, so the
-// budgets are measured on an idle box instead of a contended one. The
-// alternative -- widening each budget until it cannot flake -- widens it past
-// the regression it exists to catch.
+// They get their own project with fileParallelism disabled. What that does,
+// read from the installed vitest 4.1.10 (checked 2026-10-03; it is not in the
+// documentation): resolveConfig sets the project's maxWorkers to 1 whenever
+// fileParallelism is false ("parallelism cannot be implemented without
+// limiting workers", dist/chunks/coverage.*.js), and groupSpecs
+// (dist/chunks/cli-api.*.js) puts every file whose project has isolate true
+// (the default), sequence.groupOrder 0 (the default) and maxWorkers 1 into a
+// `sequential` group that is appended after every other group and run with
+// one worker -- so these files run after the parallel groups, one at a time,
+// and the budgets are measured on an idle box instead of a contended one.
+// Two things would undo it: setting isolate false or a groupOrder on this
+// project, and VITEST_MAX_WORKERS in the environment, which resolveConfig
+// applies after the maxWorkers=1 line and so overrides it. The alternative --
+// widening each budget until it cannot flake -- widens it past the regression
+// it exists to catch.
 const TIMING_SENSITIVE = [
   "src/tests/error-category.test.ts",
   "src/tests/install-targets.test.ts",

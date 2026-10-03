@@ -4,7 +4,7 @@
 // only have to prove their feature CALLS it, not re-prove the spellings.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { isFeatureDisabled } from "../opt-out-env.js";
+import { isFeatureDisabled, isTestSandbox } from "../opt-out-env.js";
 
 const NAME = "YAW_MCP_TEST_OPT_OUT";
 
@@ -58,5 +58,27 @@ describe("isFeatureDisabled", () => {
 
   it("looks at the named variable and no other", () => {
     expect(isFeatureDisabled(NAME, { YAW_MCP_OTHER: "0" })).toBe(false);
+  });
+});
+
+describe("isTestSandbox", () => {
+  // The ONE reader of VITEST. Every default that would touch the machine
+  // (registry, lock, memos, npm) gates on it; the per-feature suites prove
+  // their defaults call it, this proves what it says.
+  it("is true for any non-empty value -- vitest exports `true`, but the spelling is not the contract", () => {
+    expect(isTestSandbox({ VITEST: "true" })).toBe(true);
+    expect(isTestSandbox({ VITEST: "1" })).toBe(true);
+    expect(isTestSandbox({ VITEST: "anything" })).toBe(true);
+  });
+
+  it("is false when unset or empty", () => {
+    expect(isTestSandbox({})).toBe(false);
+    expect(isTestSandbox({ VITEST: "" })).toBe(false);
+  });
+
+  it("reads process.env when no environment is injected -- and this suite IS one", () => {
+    expect(isTestSandbox()).toBe(true);
+    vi.stubEnv("VITEST", "");
+    expect(isTestSandbox()).toBe(false);
   });
 });

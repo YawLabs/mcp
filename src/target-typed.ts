@@ -124,18 +124,28 @@ const WINDOWS_SEP = String.fromCharCode(92);
 /** The bundle segments under the home, as typed's installer lays them out. */
 const DEFAULT_BUNDLE_SEGMENTS = [".config", "typed", "typed-cli", "cli.mjs"];
 
-/** The typed CLI bundle typed's launcher runs: `TYPED_CLI_BUNDLE` when set
- *  (empty already counts as unset, the launcher's `${TYPED_CLI_BUNDLE:-...}`
- *  rule), resolved against the current directory when relative, else the
- *  installed default under the home. */
+/** `TYPED_CLI_BUNDLE` as an override, or undefined when it is not one: unset,
+ *  empty (the launcher's own `${TYPED_CLI_BUNDLE:-...}` rule, which
+ *  `readClientEnv` already applies) or whitespace-only, which the Cline row
+ *  treats as unset for the same reason -- a path made of spaces is not one
+ *  the user can have meant. ONE reader, so the probe's path and its warning's
+ *  wording cannot disagree about whether the variable is in play. */
+function typedCliBundleOverride(base: PathBase): string | undefined {
+  const trimmed = base.env.typedCliBundle?.trim();
+  return trimmed !== undefined && trimmed.length > 0 ? trimmed : undefined;
+}
+
+/** The typed CLI bundle typed's launcher runs: `TYPED_CLI_BUNDLE` when it is
+ *  an override (see typedCliBundleOverride), resolved against the current
+ *  directory when relative, else the installed default under the home. */
 function typedCliBundle(base: PathBase): string {
-  const override = base.env.typedCliBundle;
+  const override = typedCliBundleOverride(base);
   if (override !== undefined) return isAbsolute(override) ? override : resolve(override);
   return join(base.home, ...DEFAULT_BUNDLE_SEGMENTS);
 }
 
 function staleTypedCliWarning(bundle: string, base: PathBase): string {
-  return base.env.typedCliBundle !== undefined
+  return typedCliBundleOverride(base) !== undefined
     ? `the typed CLI bundle at ${bundle} (TYPED_CLI_BUNDLE) predates ~/.config/typed/mcp.json, so that typed will not load this entry until the bundle is rebuilt or replaced -- \`typed update\` updates only the default ~/.config/typed/typed-cli/cli.mjs.`
     : `the typed CLI at ${bundle} predates ~/.config/typed/mcp.json, so it will not load this entry until it updates -- run \`typed update\`.`;
 }

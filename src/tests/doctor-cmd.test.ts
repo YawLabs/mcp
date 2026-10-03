@@ -77,6 +77,22 @@ import {
 // implementation.
 const { readFileErrors } = vi.hoisted(() => ({ readFileErrors: new Map<string, string>() }));
 
+// A loader that THROWS (as opposed to one that reads a file and reports on
+// it) has no on-disk shape at all: every read failure the loader can meet is
+// caught inside it and reported in `warnings`. The throw is injected at the
+// module boundary instead, and only while `loaderFault.error` is set; every
+// other call passes straight through to the real loader.
+const { loaderFault } = vi.hoisted(() => ({ loaderFault: { error: null as Error | null } }));
+
+vi.mock("../local-bundles.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../local-bundles.js")>();
+  const loadLocalBundles: typeof actual.loadLocalBundles = (...args) => {
+    if (loaderFault.error !== null) return Promise.reject(loaderFault.error);
+    return actual.loadLocalBundles(...args);
+  };
+  return { ...actual, loadLocalBundles };
+});
+
 vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
   const readFile = ((target: unknown, ...rest: unknown[]) => {
@@ -1035,7 +1051,9 @@ describe("runDoctor — RELIABILITY section", () => {
       skipRegistryCheck: true,
     });
     const txt = cap.text();
-    expect(txt).toMatch(/RELIABILITY \(dormant, <80% success\)/);
+    // "(top 5)" is in the header because the cap is doctor's, not the
+    // definition's: `yaw-mcp status` lists every flaky namespace.
+    expect(txt).toMatch(/RELIABILITY \(top 5 dormant, <80% success\)/);
     // Healthy entries must not appear.
     expect(txt).not.toMatch(/ {2}solid /);
     // Ordering: dead (0%) < severe (20%) < worse (30%) < bad (40%) < zzz (50%).
@@ -6033,5 +6051,263 @@ describe("oamRunEntryPath -- fish and PowerShell wrappers", () => {
 
   it("declines a PowerShell launch with no -Command", () => {
     expect(oamRunEntryPath("pwsh", ["-File", "run.ps1"])).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Full-pass follow-ups (2026-10-03).
+// ---------------------------------------------------------------------------
+
+describe("runDoctor -- a THROWING bundles loader is a degraded report, not a fresh install", () => {
+  afterEach(() => {
+    loaderFault.error = null;
+  });
+
+  it("text: warns, names the (scrubbed) error, exits 2, and the OAM RUNTIME line says unknown", async () => {
+    // A loader THROW (not a malformed file) used to collapse to null, which
+    // the collector could not tell from "no bundles.json yet": the report read
+    // "All good" with a fresh-install hint, exit 0, on a machine whose server
+    // list doctor never saw.
+    loaderFault.error = new Error("ENOTDIR: not a directory, scandir; api_key=sekret123 leaked");
+    const cap = captureOut();
+    const errs: string[] = [];
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      err: (s) => errs.push(s),
+      skipRegistryCheck: true,
+    });
+    const txt = cap.text();
+    expect(r.exitCode).toBe(2);
+    expect(r.snapshot.config.warnings.some((w) => w.startsWith("could not read bundles.json: ENOTDIR"))).toBe(true);
+    expect(txt).toContain("servers (local bundles.json): unknown -- could not read bundles.json: ENOTDIR");
+    expect(txt).not.toContain("no bundles.json on this machine yet");
+    expect(txt).not.toContain("All good");
+    // The loader's text goes through scrubForWarning on the way in.
+    expect(txt + errs.join("")).not.toContain("sekret123");
+  });
+
+  it("--json: the same warning reaches .warnings and the exit code", async () => {
+    loaderFault.error = new Error("EIO: i/o error");
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      err: () => {},
+      json: true,
+      skipRegistryCheck: true,
+    });
+    expect(r.exitCode).toBe(2);
+    const parsed = JSON.parse(r.lines[0]);
+    expect(parsed.warnings).toContain("could not read bundles.json: EIO: i/o error");
+  });
+});
+
+describe("probeUsable -- a blocked container is not a trial target", () => {
+  it("excludes a row whose container install refuses to overwrite, with every other gate passing", async () => {
+    // try-cmd's auto-detect picked this file as the trial target and the
+    // write then aborted on the very refusal doctor had just reported.
+    writeFileSync(join(synthCwd, ".mcp.json"), JSON.stringify({ mcpServers: [{ command: "npx" }] }));
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, err: () => {} });
+    const probe = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "project");
+    expect(probe?.containerBlocked).toBe('"mcpServers" is an array of 1');
+    expect(probe?.exists).toBe(true);
+    expect(probe?.malformed).toBe(false);
+    expect(probe?.unreadable).toBeNull();
+    expect(probe?.unloadable).toBeNull();
+    expect(probe?.entryUnspliceable).toBeNull();
+    expect(probe?.containerUnspliceable).toBeNull();
+    expect(probeUsable(probe!)).toBe(false);
+  });
+});
+
+describe("collectVaultStatus -- locks only what doctor itself unlocked", () => {
+  it("leaves a key a caller unlocked BEFORE doctor ran in place", async () => {
+    // lock() zeroes secrets-vault's MODULE-GLOBAL key. A host that unlocked
+    // the vault and then ran doctor in the same process must not find its key
+    // gone; doctor's check hits the cache and leaves it.
+    const pass = "the-real-passphrase-xyz";
+    const vault = await createEmptyVault(pass);
+    await saveVault(join(synthHome, ".yaw-mcp", "secrets.json"), vault);
+    try {
+      (await unlock(vault, pass)).fill(0);
+      expect(isUnlocked()).toBe(true);
+      const cap = captureOut();
+      const r = await runDoctor({
+        cwd: synthCwd,
+        home: synthHome,
+        env: { YAW_MCP_VAULT_PASSPHRASE: pass },
+        os: "linux",
+        out: cap.out,
+        skipRegistryCheck: true,
+      });
+      expect(r.exitCode).toBe(0);
+      expect(cap.text()).toContain("passphrase: set in this environment, and it unlocks the vault");
+      expect(isUnlocked()).toBe(true);
+    } finally {
+      lock();
+    }
+    // And the existing contract still holds once nobody else holds the key:
+    // a derivation doctor made for itself is dropped.
+    const cap = captureOut();
+    await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_VAULT_PASSPHRASE: pass },
+      os: "linux",
+      out: cap.out,
+      skipRegistryCheck: true,
+    });
+    expect(isUnlocked()).toBe(false);
+  });
+});
+
+describe("SECRET VAULT -- Windows permissions line", () => {
+  it("names the files that rely on the inherited DACL on --os windows, and only there", async () => {
+    await saveVault(join(synthHome, ".yaw-mcp", "secrets.json"), await createEmptyVault("p"));
+    const win = captureOut();
+    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "windows", out: win.out, skipRegistryCheck: true });
+    expect(win.text()).toContain(
+      "perms:      no POSIX mode on Windows -- secrets.json, secrets-audit.log and trusted.json",
+    );
+    expect(win.text()).toContain(`rely on the DACL inherited from ${synthHome}`);
+    const lin = captureOut();
+    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: lin.out, skipRegistryCheck: true });
+    expect(lin.text()).toContain("SECRET VAULT");
+    expect(lin.text()).not.toContain("DACL");
+  });
+});
+
+describe("oamRuntime.managed.platformMismatch -- judged against doctor's platform override", () => {
+  it("a tree installed for the overridden platform is not a mismatch", async () => {
+    writeYawMcpConfig(synthHome, "bundles.json", {
+      version: 1,
+      servers: [{ namespace: "fetch", name: "Fetch", command: "npx", args: ["-y", "@yawlabs/fetch-mcp@latest"] }],
+    });
+    const root = join(synthHome, ".yaw-mcp", "sidecars");
+    const pkgDir = join(root, "node_modules", "@yawlabs", "fetch-mcp");
+    mkdirSync(pkgDir, { recursive: true });
+    writeFileSync(join(pkgDir, "package.json"), JSON.stringify({ name: "@yawlabs/fetch-mcp", version: "0.3.6" }));
+    writeFileSync(join(root, "platform.json"), JSON.stringify({ platform: "beos", arch: process.arch }));
+    const managed = async (platform?: NodeJS.Platform) => {
+      const cap = captureOut();
+      const r = await runDoctor({
+        cwd: synthCwd,
+        home: synthHome,
+        env: {},
+        os: "linux",
+        out: cap.out,
+        json: true,
+        skipRegistryCheck: true,
+        platform,
+      });
+      return JSON.parse(r.lines[0]).oamRuntime.managed;
+    };
+    expect((await managed()).platformMismatch).toBe(true);
+    expect((await managed("beos" as NodeJS.Platform)).platformMismatch).toBe(false);
+  });
+});
+
+describe("STATE -- 'last saved' age", () => {
+  it("is measured by doctor's `now` hook, not the wall clock", async () => {
+    const savedAt = 1_700_000_000_000;
+    writeYawMcpConfig(synthHome, STATE_FILENAME, {
+      version: STATE_SCHEMA_VERSION,
+      savedAt,
+      learning: {},
+      packHistory: [],
+    });
+    const cap = captureOut();
+    await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      skipRegistryCheck: true,
+      now: () => savedAt + 7 * 60 * 1000,
+    });
+    expect(cap.text()).toMatch(/last saved: +7m ago/);
+  });
+});
+
+describe("scanShellHistoryForShadows -- HISTFILE spelling", () => {
+  it("expands a leading ~/ against home", () => {
+    // A single-quoted `HISTFILE='~/.cache/bash_history'` reaches the process
+    // with the tilde intact; used as-is it names nothing and read as "no
+    // history" for exactly the relocated case HISTFILE support exists for.
+    mkdirSync(join(synthHome, ".cache"), { recursive: true });
+    writeFileSync(join(synthHome, ".cache", "bash_history"), "npm audit\nnpm search lodash\n");
+    const hits = scanShellHistoryForShadows({ home: synthHome, env: { HISTFILE: "~/.cache/bash_history" } });
+    expect(hits.find((h) => h.cli === "npm")?.count).toBe(2);
+  });
+});
+
+describe("declared twins stay twins", () => {
+  const src = (name: string): string => readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", name), "utf8");
+  /** The text of `function <fn>(` up to its closing brace at column 0. */
+  const body = (source: string, fn: string): string => {
+    const m = source.match(new RegExp(`\\n(?:export )?(?:async )?function ${fn}\\([\\s\\S]*?\\n}\\n`));
+    if (!m) throw new Error(`${fn} not found`);
+    return m[0];
+  };
+
+  it("spellRootValue and rootLinePlacement are byte-identical in doctor-cmd.ts and install-cmd.ts", () => {
+    // Declared twins (doctor cannot import install-cmd, which imports it).
+    // The runtime pin -- install over the same file -- covers one value and
+    // one syntax; this holds every branch to one spelling.
+    const d = src("doctor-cmd.ts");
+    const i = src("install-cmd.ts");
+    expect(body(d, "spellRootValue")).toBe(body(i, "spellRootValue"));
+    expect(body(d, "rootLinePlacement")).toBe(body(i, "rootLinePlacement"));
+  });
+
+  it("fetchSidecarLatest validates the registry answer exactly as upgrade-cmd's fetchLatestVersion does", () => {
+    const d = body(src("doctor-cmd.ts"), "fetchSidecarLatest");
+    const u = body(src("upgrade-cmd.ts"), "fetchLatestVersion");
+    for (const line of [
+      'headers: { accept: "application/json" }',
+      "if (!res.ok) return null;",
+      "const body = (await res.json()) as { version?: unknown };",
+      'return typeof body.version === "string" ? body.version : null;',
+    ]) {
+      expect(d).toContain(line);
+      expect(u).toContain(line);
+    }
+  });
+
+  it("oamArgvTokens unwraps every wrapper shape isOamLaunch accepts, and no other", () => {
+    // isOamLaunch decides `launchRuntime === "oam"`; oamArgvTokens (through
+    // oamRunEntryPath) is what the entry scan then reads. A wrapper one
+    // accepts and the other does not reads the wrapper's own switches as an
+    // oam path.
+    const shapes: ReadonlyArray<readonly [string, readonly string[]]> = [
+      ["oam", ["run", "--no-check", "/p/index.js"]],
+      ["/usr/local/bin/oam", ["run", "/p/index.js"]],
+      ["cmd", ["/d", "/s", "/c", "oam", "run", "--no-check", "/p/index.js"]],
+      ["cmd.exe", ["/c", "oam", "run", "/p/index.js"]],
+      ["C:\\Windows\\System32\\cmd.exe", ["/c", "oam", "run", "/p/index.js"]],
+      ["sh", ["-c", "oam run --no-check /p/index.js"]],
+      ["bash", ["-c", "oam run /p/index.js"]],
+      ["/bin/zsh", ["-c", "oam run /p/index.js"]],
+      ["fish", ["-c", "oam run /p/index.js"]],
+      ["dash", ["oam run /p/index.js"]],
+      ["pwsh", ["-NoProfile", "-Command", "oam", "run", "/p/index.js"]],
+      ["node", ["/p/index.js"]],
+      ["cmd", ["/c", "node", "/p/index.js"]],
+      ["sh", ["-c", "node /p/index.js"]],
+      ["cmd", ["/c"]],
+      ["sh", []],
+    ];
+    for (const [cmd, args] of shapes) {
+      expect(oamRunEntryPath(cmd, args) !== null, `${cmd} ${args.join(" ")}`).toBe(isOamLaunch(cmd, args));
+    }
   });
 });

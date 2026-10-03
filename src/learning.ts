@@ -34,6 +34,15 @@
 //   - Snapshots persist to ~/.yaw-mcp/state.json across restarts
 //     (see persistence.ts); ConnectServer handles the load/save
 //     lifecycle via exportSnapshot/loadSnapshot.
+//
+// NO TIME DECAY. `lastUsedAt` is stamped on every observation and persisted,
+// but nothing reads it back: a namespace's dispatched/succeeded counters are
+// cumulative for the life of the state file, so a server that was flaky a
+// month ago and has been fine since carries that month forever, and the
+// penalty branch does not age out on its own. The only way out is
+// `yaw-mcp reset-learning` (reset-learning-cmd.ts), which drops the whole
+// learning map. If decay is ever wanted, lastUsedAt is the field to build it
+// on -- it is already there.
 
 import { setJsonKey } from "./json-key.js";
 
@@ -128,11 +137,11 @@ export class LearningStore {
     });
   }
 
-  // Synthetic failed observation with NO success credit. Used by the
-  // re-dispatch routing-miss signal (redispatch.ts): when the model
-  // abandons server A and re-routes a similar intent to B, A's earlier
-  // "clean" reply was useless in hindsight, so we depress A's success rate
-  // by one failed observation. Denominator-only — same shape as a
+  // Synthetic failed observation with NO success credit. Sole caller is the
+  // re-dispatch routing-miss detector in server.ts (handleDispatch): when
+  // the model abandons server A and re-routes a similar intent to B, A's
+  // earlier "clean" reply was useless in hindsight, so we depress A's success
+  // rate by one failed observation. Denominator-only — same shape as a
   // recordDispatch that never sees a matching success.
   recordMiss(namespace: string): void {
     const prev = this.usage.get(namespace);

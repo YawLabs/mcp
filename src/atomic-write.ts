@@ -2,7 +2,16 @@
 // onto the target -- fs.rename is atomic on the same filesystem on POSIX
 // and on modern Windows Node, so a process killed mid-write (SIGINT,
 // OOM, antivirus) leaves the original target intact instead of a half-
-// written file. (Atomic on Windows does not mean reliable first try there:
+// written file.
+//
+// THE GUARANTEE IS KILL-MID-WRITE, NOT POWER LOSS. Nothing here fsyncs the
+// tmp file before the rename or the directory after it, so on a crash of the
+// OS or a loss of power the rename can be on disk while the tmp file's bytes
+// are not, and the target comes back empty or short. That is a deliberate
+// trade: the files this writes are small configs and caches the user can
+// regenerate, and an fsync per write is a measurable cost on every save.
+//
+// (Atomic on Windows does not mean reliable first try there:
 // see renameWithRetry below for the transient EPERM/EBUSY dance with AV and
 // indexer handles.) The pid+timestamp+counter suffix makes the tmp name unique
 // across concurrent processes AND within this one; in-process serialization
@@ -26,9 +35,19 @@
 // resolve the link first, so both the tmp sibling and the rename land on the
 // real file. See resolveSymlinkTarget.
 
-import { chmod, lstat, mkdir, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readdir, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+
+// A hard kill (SIGKILL, a crashed host) between the tmp write and the rename
+// orphans `<file>.tmp-<pid>-<ms>-<n>`, and the error-path unlink below never
+// runs. Nothing else sweeps them, so every successful write to the same
+// target sweeps its own stale siblings: same basename prefix, tmp suffix
+// shape, and older than this. The age guard is what keeps a sibling that a
+// CONCURRENT process wrote a moment ago out of the sweep -- a live tmp is
+// seconds old, never minutes.
+const STALE_TMP_AGE_MS = 10 * 60 * 1000;
+const TMP_SUFFIX = /\.tmp-\d+-\d+-\d+$/;
 
 // Windows-only transient-error retry for the publish rename. On Windows a
 // freshly written file is routinely held open for a beat by antivirus
@@ -161,6 +180,10 @@ export async function atomicWriteFile(
   const birthMode = mode ?? preserved;
   try {
     await writeFile(tmp, contents, birthMode === undefined ? { encoding } : { encoding, mode: birthMode });
+    // Only once the tmp write has landed: a directory that refused the write
+    // is not one to go deleting in, and the sweep's own errors never reach
+    // the caller (see sweepStaleTmpSiblings).
+    await sweepStaleTmpSiblings(dir, path.basename(target), tmp);
     if (preserved !== undefined) {
       try {
         // writeFile's mode is masked by the process umask, so a preserved
@@ -180,6 +203,41 @@ export async function atomicWriteFile(
     // failure is what the caller cares about.
     await unlink(tmp).catch(() => undefined);
     throw err;
+  }
+}
+
+/**
+ * Best-effort removal of orphaned tmp files of the SAME target: siblings in
+ * `dir` named `<base>.tmp-<pid>-<ms>-<n>` whose mtime is older than
+ * STALE_TMP_AGE_MS. `own` (this call's tmp) is never touched, whatever its
+ * age. Every error -- an unreadable directory, a sibling that vanished
+ * between readdir and stat, an unlink the OS refuses -- is swallowed: the
+ * sweep is housekeeping on the side of a write that has already succeeded,
+ * and must not turn that write into a failure.
+ *
+ * Exported for the test; nothing else calls it directly.
+ */
+export async function sweepStaleTmpSiblings(dir: string, base: string, own: string): Promise<void> {
+  const prefix = `${base}.tmp-`;
+  let names: string[];
+  try {
+    names = await readdir(dir);
+  } catch {
+    return;
+  }
+  const cutoff = Date.now() - STALE_TMP_AGE_MS;
+  const ownResolved = path.resolve(own);
+  for (const name of names) {
+    if (!name.startsWith(prefix) || !TMP_SUFFIX.test(name)) continue;
+    const candidate = path.join(dir, name);
+    if (path.resolve(candidate) === ownResolved) continue;
+    try {
+      const st = await stat(candidate);
+      if (!st.isFile() || st.mtimeMs > cutoff) continue;
+      await unlink(candidate);
+    } catch {
+      // Ignored: gone already, or not ours to remove.
+    }
   }
 }
 

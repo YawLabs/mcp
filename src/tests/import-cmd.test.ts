@@ -1579,3 +1579,79 @@ describe("runImport -- the wired-in SEARCH folds the drive-letter case too", () 
     expect(Object.keys(after.mcpServers)).toEqual([]);
   });
 });
+
+describe("runImport -- an entry with BOTH command and url is imported as local, and says what it dropped", () => {
+  it("warns naming the url, and the entry lands with the command", async () => {
+    writeClaudeCode({
+      mcpServers: {
+        mcp: { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] },
+        both: { command: "npx", args: ["-y", "both-mcp"], url: "https://both.test/mcp" },
+      },
+    });
+    const cap = capture();
+    const r = await runImport({ clientId: "claude-code", home: synthHome, cwd: synthCwd, keepOriginals: true, ...cap });
+    expect(r.exitCode).toBe(0);
+    expect(cap.errText()).toMatch(
+      /warning: .*ignoring 'url' on "both" \(the entry also has a command, so it is imported as a local stdio server\) -- https:\/\/both\.test\/mcp was not carried over/,
+    );
+    const row = bundles().find((s) => s.namespace === "both");
+    expect(row?.command).toBe("npx");
+    expect(row?.url).toBeUndefined();
+    expect(row?.type).toBe("local");
+  });
+});
+
+describe("runImport -- promptAnswer answers the bundles.json overwrite question too", () => {
+  it("'o' overwrites every entry asked about without opening stdin", async () => {
+    seedCollision();
+    const cap = capture();
+    const r = await runImport({
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      promptAnswer: "o",
+      keepOriginals: true,
+      ...cap,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.text()).toContain('Overwriting the "fs" entry in bundles.json.\n');
+    expect(bundles().find((s) => s.namespace === "fs")?.args).toEqual([
+      "-y",
+      "@modelcontextprotocol/server-filesystem",
+      "C:/tmp",
+    ]);
+  });
+
+  it("'s' (or anything else) skips it, and 'a' aborts with nothing written", async () => {
+    const seed = seedCollision();
+    const skip = capture();
+    const r1 = await runImport({
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      promptAnswer: "s",
+      keepOriginals: true,
+      ...skip,
+    });
+    expect(r1.exitCode).toBe(0);
+    expect(skip.text()).toContain('Left the "fs" entry in bundles.json as it is -- fs is not imported.\n');
+    expect(bundles().find((s) => s.namespace === "fs")?.args).toEqual([
+      "-y",
+      "@modelcontextprotocol/server-filesystem",
+      "D:/mydata",
+    ]);
+    // Reset and abort.
+    writeFileSync(seed.bundlesPath, seed.bundlesBefore);
+    const abort = capture();
+    const r2 = await runImport({
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      promptAnswer: "a",
+      keepOriginals: true,
+      ...abort,
+    });
+    expect(r2.written).toEqual([]);
+    expect(readFileSync(seed.bundlesPath, "utf8")).toBe(seed.bundlesBefore);
+  });
+});

@@ -88,7 +88,14 @@ export const LEGACY_KDF: Readonly<KdfParams> = Object.freeze({ N: 1 << 15, r: 8,
  *  do NOT imply the memory ceiling: scrypt allocates roughly 128 * N * r
  *  bytes, and MAX_KDF_N * MAX_KDF_R multiplies out to 1 GiB -- four times the
  *  documented cap. MAX_KDF_MEMORY_BYTES below is what actually enforces it;
- *  these keep any single field from being absurd. */
+ *  these keep any single field from being absurd.
+ *
+ *  MAX_KDF_P is the CPU bound the memory product never sees: p runs that
+ *  many independent mixes of the same N*r working set, so a vault recording
+ *  p=16 unlocks ~16x slower than the default at the same memory. 16 is the
+ *  ceiling (a hostile file cannot ask for p=1000 and pin a core for minutes
+ *  per unlock); kdfExceedsDefault below is what gets a slow-but-legal vault a
+ *  diagnostic. */
 const MAX_KDF_N = 1 << 18;
 const MAX_KDF_R = 32;
 const MAX_KDF_P = 16;
@@ -106,20 +113,28 @@ function kdfMemoryBytes(N: number, r: number): number {
   return 128 * N * r;
 }
 
-/** Validate KDF parameters read off disk. Rejects non-integers, zero/negative
+/** Why `v` is not an acceptable KdfParams -- naming the field and the bound
+ *  it broke -- or null when it is. Rejects non-integers, zero/negative
  *  values, a non-power-of-two N, anything past a per-field bound, any N/r
  *  PAIR whose combined working set exceeds MAX_KDF_MEMORY_BYTES, and any N/r
- *  pair node's scrypt refuses outright (see below). */
-export function isValidKdfParams(v: unknown): v is KdfParams {
-  if (!v || typeof v !== "object") return false;
+ *  pair node's scrypt refuses outright (see below). isValidKdfParams is this
+ *  with the reason dropped; loadVault quotes the reason in its "invalid kdf
+ *  parameters" error so a hand-edited or hostile vault says WHICH field is
+ *  off (p=17 and N=3 are both "corrupt", but the fix differs). */
+export function invalidKdfParamsReason(v: unknown): string | null {
+  if (!v || typeof v !== "object") return "not an object";
   const o = v as Record<string, unknown>;
   const { N, r, p } = o;
-  if (typeof N !== "number" || typeof r !== "number" || typeof p !== "number") return false;
-  if (!Number.isInteger(N) || !Number.isInteger(r) || !Number.isInteger(p)) return false;
-  if (N < 2 || N > MAX_KDF_N || (N & (N - 1)) !== 0) return false; // must be a power of two
-  if (r < 1 || r > MAX_KDF_R) return false;
-  if (p < 1 || p > MAX_KDF_P) return false;
-  if (kdfMemoryBytes(N, r) > MAX_KDF_MEMORY_BYTES) return false;
+  if (typeof N !== "number" || typeof r !== "number" || typeof p !== "number") return "N, r and p must be numbers";
+  if (!Number.isInteger(N) || !Number.isInteger(r) || !Number.isInteger(p)) return "N, r and p must be integers";
+  if (N < 2 || N > MAX_KDF_N || (N & (N - 1)) !== 0) {
+    return `N=${N} must be a power of two between 2 and ${MAX_KDF_N}`;
+  }
+  if (r < 1 || r > MAX_KDF_R) return `r=${r} must be between 1 and ${MAX_KDF_R}`;
+  if (p < 1 || p > MAX_KDF_P) return `p=${p} must be between 1 and ${MAX_KDF_P}`;
+  if (kdfMemoryBytes(N, r) > MAX_KDF_MEMORY_BYTES) {
+    return `N=${N} r=${r} needs ${kdfMemoryBytes(N, r)} bytes, over the ${MAX_KDF_MEMORY_BYTES} bound`;
+  }
   // OpenSSL's scrypt requires N < 2^(16 * r) and rejects anything else with
   // ERR_CRYPTO_INVALID_SCRYPT_PARAMS, whatever maxmem says. Under MAX_KDF_N
   // (2^18) that only bites r=1 with N >= 2^16, but a vault carrying such a
@@ -127,8 +142,23 @@ export function isValidKdfParams(v: unknown): v is KdfParams {
   // RangeError -- which the broker reported as a wrong passphrase -- instead
   // of the "invalid kdf parameters" error loadVault gives every other bad
   // pair. For r >= 4 the bound is 2^64 or more and OpenSSL skips the check.
-  if (r < 4 && N >= 2 ** (16 * r)) return false;
-  return true;
+  if (r < 4 && N >= 2 ** (16 * r)) return `N=${N} must be below 2^(16*r) for r=${r}`;
+  return null;
+}
+
+/** Validate KDF parameters read off disk: invalidKdfParamsReason as a type
+ *  guard, for callers that only need the verdict. */
+export function isValidKdfParams(v: unknown): v is KdfParams {
+  return invalidKdfParamsReason(v) === null;
+}
+
+/** True when `params` cost more than DEFAULT_KDF on ANY axis -- N and r
+ *  (memory and time) or p (time alone). Legal, and bounded above by
+ *  isValidKdfParams, but the one reason a correct passphrase takes seconds
+ *  instead of ~100ms, so unlock() logs the parameters at debug when this is
+ *  true: a slow unlock gets a diagnostic instead of looking like a hang. */
+export function kdfExceedsDefault(params: KdfParams): boolean {
+  return params.N > DEFAULT_KDF.N || params.r > DEFAULT_KDF.r || params.p > DEFAULT_KDF.p;
 }
 
 export interface EncryptedEntry {

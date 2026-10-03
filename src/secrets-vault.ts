@@ -55,8 +55,10 @@ import {
   type EncryptedEntry,
   encryptEntry,
   generateSalt,
+  invalidKdfParamsReason,
   isValidKdfParams,
   type KdfParams,
+  kdfExceedsDefault,
   LEGACY_KDF,
   normalizePassphrase,
   SALT_LEN,
@@ -221,8 +223,9 @@ export async function loadVault(path: string, opts?: LoadVaultOptions): Promise<
   // which key comes out, so a present-but-nonsense `kdf` is a corrupt vault,
   // not something to silently fall back from: falling back to the default
   // would derive the wrong key and report a wrong passphrase.
-  if (obj.kdf !== undefined && !isValidKdfParams(obj.kdf)) {
-    throw new Error(`vault at ${path} is corrupt: invalid kdf parameters`);
+  const kdfProblem = obj.kdf === undefined ? null : invalidKdfParamsReason(obj.kdf);
+  if (kdfProblem !== null) {
+    throw new Error(`vault at ${path} is corrupt: invalid kdf parameters (${kdfProblem})`);
   }
   // Validate each entry's shape up front rather than deferring to decrypt
   // time -- a malformed entry (missing/non-string iv/ciphertext/authTag) is
@@ -390,6 +393,21 @@ export async function unlock(vault: VaultFile, passphrase: string): Promise<Buff
   // passphrase" for a correct one, which is precisely the lockout recording
   // the parameters was meant to prevent.
   const params = vault.kdf ?? LEGACY_KDF;
+  // Costlier-than-default parameters are legal (a future build may write
+  // them; isValidKdfParams bounds them) but they are also the one reason a
+  // correct passphrase takes seconds instead of ~100ms, and p in particular
+  // is pure CPU the memory bound never sees. Say so at debug, so a slow
+  // unlock has a diagnostic instead of looking like a hang.
+  if (kdfExceedsDefault(params)) {
+    log("debug", "Vault KDF parameters exceed this build's default; key derivation will be slower", {
+      N: params.N,
+      r: params.r,
+      p: params.p,
+      defaultN: DEFAULT_KDF.N,
+      defaultR: DEFAULT_KDF.r,
+      defaultP: DEFAULT_KDF.p,
+    });
+  }
   let key = await deriveKey(passphrase, salt, params);
   try {
     verifyKey(vault, key);
@@ -646,6 +664,16 @@ export async function createEmptyVault(passphrase: string): Promise<VaultFile> {
 export async function rotateVault(vault: VaultFile, oldKey: Buffer, newPassphrase: string): Promise<VaultFile> {
   // Step 1: verify the old key against the check marker first, so a wrong
   // old passphrase aborts loudly before we attempt any entry decrypt.
+  //
+  // Defensive, not a CLI-reachable path: the only caller (secrets-cmd's
+  // rotate) obtains `oldKey` from unlock(), which has already verified it
+  // against this same marker and thrown VAULT_WRONG_PASSPHRASE_ERROR on a
+  // mismatch -- so from the CLI this throw cannot fire. It stays because
+  // rotateVault is an exported building block: an embedder handing it a key
+  // from anywhere else must get the loud abort, not a vault re-encrypted
+  // from garbage plaintext (step 2 would fail on the first entry anyway, but
+  // on a vault with NO entries it would not, and the marker would be
+  // re-stamped under a key nobody holds).
   if (vault.check && !checkMarkerMatches(vault, oldKey)) {
     throw new Error("rotate aborted: current passphrase is wrong (vault check failed to decrypt)");
   }
@@ -880,11 +908,14 @@ export function resolveSecretRefs(
   const decrypted = new Map<string, string>();
   const resolved: Record<string, string> = {};
   for (const [k, v] of Object.entries(env)) {
+    // setJsonKey, not `resolved[k] = ...`: `k` comes out of a parsed
+    // bundles.json, and an env key literally named "__proto__" would go
+    // through Object.prototype's setter and vanish from the child's env.
     if (typeof v !== "string" || !v.includes(SECRET_REF_OPENER)) {
-      resolved[k] = v;
+      setJsonKey(resolved, k, v);
       continue;
     }
-    resolved[k] = v.replace(SECRET_REF_RE, (full, name: string) => {
+    const replaced = v.replace(SECRET_REF_RE, (full, name: string) => {
       if (decrypted.has(name)) return decrypted.get(name) as string;
       // Own-property lookup: SECRET_REF_RE happily captures `toString`,
       // which `entries[name]` would otherwise resolve off Object.prototype.
@@ -902,6 +933,7 @@ export function resolveSecretRefs(
         return full;
       }
     });
+    setJsonKey(resolved, k, replaced);
     // Scanned on the ORIGINAL value, not the resolved one: a decrypted
     // secret could itself contain "${secret:" and must not be mistaken for
     // an unparsed reference. Deduped on the bounded `display` form, which is
@@ -923,9 +955,13 @@ const SECRET_REF_OPENER = "${secret:";
  *  in the vault" without inspecting the rest of the string. */
 export const MALFORMED_REF_MARKER = "<malformed ref>";
 
-/** Cap on how much of a malformed span `display` quotes. An unterminated
- *  reference runs to the end of the env value, which is unbounded; 40
- *  characters is enough to show the opener and the typo next to it. */
+/** Upper bound on how much of a malformed span `display` can quote, pinned
+ *  by the tests (meta-tools.test.ts relies on it too). An unterminated
+ *  reference runs to the end of the env value, which is unbounded. The
+ *  actual cut (describeMalformedSecretRef) is the opener plus
+ *  MALFORMED_REF_NAME_CHARS + 1 code points -- 26 characters at most, well
+ *  inside this -- so this is the contract a consumer may rely on, not the
+ *  mechanism; nothing slices to it. */
 export const MALFORMED_REF_MAX_CHARS = 40;
 
 /** A `${secret:...}` span SECRET_REF_RE could not parse, reduced to the two
@@ -934,9 +970,13 @@ export const MALFORMED_REF_MAX_CHARS = 40;
  *  the opener -- a URL, a password, a newline. */
 export interface MalformedSecretRef {
   /** For an error message or a diagnostic: MALFORMED_REF_MARKER, then the
-   *  span as written with control characters stripped, cut at
-   *  MALFORMED_REF_MAX_CHARS (with a `...` when it was). Quotes the typo so
-   *  the user can find it in their config. */
+   *  opener, the name-shaped prefix of the span (at most
+   *  MALFORMED_REF_NAME_CHARS code points) and the ONE character after it --
+   *  the typo itself -- with control characters stripped and a `...`
+   *  appended whenever anything followed that character. Quotes the typo so
+   *  the user can find it in their config, and never more: past that point
+   *  is env-value text that may be a credential. Always shorter than
+   *  MALFORMED_REF_MAX_CHARS of span text. */
   display: string;
   /** For the audit trail, whose `secret` field is a names-only contract:
    *  MALFORMED_REF_MARKER plus the longest prefix of the span's body that IS
@@ -986,7 +1026,7 @@ function describeMalformedSecretRef(span: string): MalformedSecretRef {
     .slice(0, namePrefix.length + 1)
     .join("");
   const truncated = Array.from(printableBody).length > namePrefix.length + 1;
-  const clipped = `${SECRET_REF_OPENER}${shown}${truncated ? "..." : ""}`.slice(0, MALFORMED_REF_MAX_CHARS + 3);
+  const clipped = `${SECRET_REF_OPENER}${shown}${truncated ? "..." : ""}`;
   return {
     display: `${MALFORMED_REF_MARKER} ${clipped}`,
     auditName: namePrefix.length > 0 ? `${MALFORMED_REF_MARKER} ${namePrefix}` : MALFORMED_REF_MARKER,

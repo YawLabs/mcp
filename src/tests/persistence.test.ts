@@ -9,8 +9,10 @@ import {
   emptyState,
   isPersistenceDisabled,
   isReadableStateVersion,
+  LEARNING_MAX_NAMESPACES,
   loadState,
   loadStateClassified,
+  PACK_HISTORY_MAX_ENTRIES,
   STATE_SCHEMA_VERSION,
   saveState,
   TOOLCACHE_MAX_DESCRIPTION_CHARS,
@@ -619,6 +621,57 @@ describe("persistence.saveState", () => {
     expect(loaded.packHistory).toEqual(stateB.packHistory);
     expect(loaded.learning.gh).toBeUndefined();
   });
+
+  it("caps packHistory on WRITE to the newest PACK_HISTORY_MAX_ENTRIES", async () => {
+    // The bound used to be the PackDetector's alone (its in-memory ring); a
+    // caller handing saveState a longer array wrote it all. The cap is this
+    // module's now, so the bytes on disk never exceed it whoever the writer is.
+    const history = Array.from({ length: PACK_HISTORY_MAX_ENTRIES + 50 }, (_, i) => ({
+      namespace: "gh",
+      toolName: `t${i}`,
+      at: i,
+    }));
+    await saveState({ learning: {}, packHistory: history }, file);
+    const parsed = JSON.parse(readFileSync(file, "utf8"));
+    expect(parsed.packHistory).toHaveLength(PACK_HISTORY_MAX_ENTRIES);
+    // Newest kept: the tail of an append-ordered history.
+    expect(parsed.packHistory[0].toolName).toBe("t50");
+    expect(parsed.packHistory[PACK_HISTORY_MAX_ENTRIES - 1].toolName).toBe(`t${PACK_HISTORY_MAX_ENTRIES + 49}`);
+  });
+
+  it("caps learning on WRITE to the LEARNING_MAX_NAMESPACES most recently used", async () => {
+    const learning: Record<string, { dispatched: number; succeeded: number; lastUsedAt: number }> = {};
+    for (let i = 0; i < LEARNING_MAX_NAMESPACES + 20; i++) {
+      learning[`ns${i}`] = { dispatched: 1, succeeded: 1, lastUsedAt: i };
+    }
+    await saveState({ learning, packHistory: [] }, file);
+    const parsed = JSON.parse(readFileSync(file, "utf8"));
+    const kept = Object.keys(parsed.learning);
+    expect(kept).toHaveLength(LEARNING_MAX_NAMESPACES);
+    // The 20 oldest by lastUsedAt are the ones dropped.
+    expect(kept).not.toContain("ns0");
+    expect(kept).not.toContain("ns19");
+    expect(kept).toContain("ns20");
+    expect(kept).toContain(`ns${LEARNING_MAX_NAMESPACES + 19}`);
+  });
+
+  it("sanitizes learning and packHistory on WRITE, not only on read", async () => {
+    // succeeded > dispatched is clamped, and a malformed pack call is dropped,
+    // before the bytes hit disk -- the same rules loadState applies.
+    await saveState(
+      {
+        learning: { gh: { dispatched: 2, succeeded: 5, lastUsedAt: 1 } },
+        packHistory: [
+          { namespace: "gh", toolName: "ok", at: 1 },
+          { namespace: "", toolName: "blank-ns", at: 2 },
+        ],
+      },
+      file,
+    );
+    const parsed = JSON.parse(readFileSync(file, "utf8"));
+    expect(parsed.learning.gh).toEqual({ dispatched: 2, succeeded: 2, lastUsedAt: 1 });
+    expect(parsed.packHistory).toEqual([{ namespace: "gh", toolName: "ok", at: 1 }]);
+  });
 });
 
 describe("LearningStore snapshot round-trip", () => {
@@ -735,6 +788,12 @@ describe("persistence.isPersistenceDisabled", () => {
     ["true", true],
     ["TRUE", true],
     ["True", true],
+    // cmd.exe's `set VAR=1 && ...` keeps the space before `&&`, so the value
+    // arrives as "1 ". The sibling predicates (isReadOnlyDiagnostics,
+    // isAutoLoadEnabled) trimmed; this one was the odd one out.
+    ["1 ", true],
+    [" true", true],
+    ["  ", false],
     ["", false],
     [undefined, false],
     ["0", false],

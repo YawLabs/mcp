@@ -27,6 +27,9 @@ import { defineTarget, type PathBase, type ResolvedPath } from "./install-target
  *  unset), so this function is where the policy lives and the reader stays
  *  policy-free -- the two other clients that read a directory variable resolve
  *  a relative one, and one rule in the reader would be wrong for somebody.
+ *  Surrounding whitespace is stripped first, as the Cline row strips it from
+ *  its three variables: a value of spaces is not absolute either way, but a
+ *  padded absolute one (`" /xdg"`) should still be the redirect it names.
  *
  *  Not modelled, and named in `notes`: the Flatpak build, which reads
  *  `$FLATPAK_XDG_CONFIG_HOME/zed` instead, and `zed --user-data-dir <dir>`. */
@@ -34,7 +37,7 @@ function zedConfigDir(base: PathBase): { dir: string; display: string } | null {
   if (base.os === "windows") {
     return { dir: join(base.appData, "Zed"), display: "%APPDATA%\\Zed" };
   }
-  const xdg = base.env.xdgConfigHome;
+  const xdg = base.env.xdgConfigHome?.trim();
   if (base.os === "linux" && xdg && isAbsolute(xdg)) {
     return { dir: join(xdg, "zed"), display: `$XDG_CONFIG_HOME/zed` };
   }

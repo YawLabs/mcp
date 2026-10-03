@@ -346,16 +346,38 @@ export function shouldSample(ranked: Array<{ namespace: string; score: number }>
 
 // Map an effort level to the number of best-of-N samples. "auto" stays at a
 // single sample so default latency matches today's tiebreak; "aggressive"
-// fans out to 3. "off" never reaches here, but maps to 0 for completeness.
+// fans out to 3. "off" never reaches here in production (shouldSample gates
+// it to false first); it maps to 1 because that is what bestOfNViaSampling
+// would actually do with it -- N is clamped into [1, MAX_SAMPLES] -- so the
+// number this function reports is the number of samples that would run. It
+// used to return 0, which read as "no samples" and was silently clamped up.
 export function sampleCountForEffort(effort: RouteEffort): number {
   switch (effort) {
-    case "off":
-      return 0;
     case "aggressive":
       return 3;
     default:
       return 1;
   }
+}
+
+/** Logged once per process, not per dispatch: a client that does not
+ *  advertise sampling returns null here on EVERY ambiguous dispatch, and a
+ *  user who set YAW_MCP_ROUTE_EFFORT=aggressive has no other way to learn the
+ *  dial is inert. */
+let noSamplingNoticeLogged = false;
+
+/** Test hook: let the one-time notice fire again. */
+export function resetNoSamplingNotice(): void {
+  noSamplingNoticeLogged = false;
+}
+
+function noteNoSamplingCapability(): void {
+  if (noSamplingNoticeLogged) return;
+  noSamplingNoticeLogged = true;
+  log(
+    "info",
+    "Client does not advertise the sampling capability; the LLM routing tiebreak is off and YAW_MCP_ROUTE_EFFORT=aggressive has no effect",
+  );
 }
 
 // Best-of-N tiebreak: call the client LLM N times, majority-vote the parsed
@@ -374,7 +396,10 @@ export async function bestOfNViaSampling(
   n: number,
 ): Promise<string | null> {
   const caps = server.getClientCapabilities();
-  if (!caps?.sampling) return null;
+  if (!caps?.sampling) {
+    noteNoSamplingCapability();
+    return null;
+  }
   if (candidates.length < 2) return null;
 
   const samples = Math.min(MAX_SAMPLES, Math.max(1, Math.floor(n)));

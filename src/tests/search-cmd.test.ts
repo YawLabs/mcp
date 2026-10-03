@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { CatalogServer } from "../catalog.js";
 import { parseSearchArgs, runSearch } from "../search-cmd.js";
 
@@ -380,5 +380,30 @@ describe("runSearch with optional env", () => {
     expect(parsed.results[0].slug).toBe("consul");
     expect(parsed.results[0].requiredEnvKeys).toEqual(["CONSUL_HTTP_ADDR"]);
     expect(parsed.results[0].optionalEnvKeys).toEqual(["CONSUL_HTTP_TOKEN"]);
+  });
+});
+
+describe("runSearch -- the default fetcher's staleness note goes to the injected err writer", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("lands in `err`, not on process.stderr", async () => {
+    // The one-argument `fetchCatalog(url)` call dropped the deps, so the note
+    // always hit the real process.stderr, past the writer this command was
+    // handed.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ servers: CATALOG, generated_at: "2020-01-01T00:00:00.000Z" }),
+      })),
+    );
+    const cap = capture();
+    const r = await runSearch({ query: "sql", env: {}, ...cap });
+    expect(r.exitCode).toBe(0);
+    expect(cap.errText()).toContain("the Yaw MCP catalog was generated 2020-01-01");
+    expect(cap.text()).not.toContain("was generated");
   });
 });

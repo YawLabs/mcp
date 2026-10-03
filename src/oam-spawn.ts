@@ -712,6 +712,20 @@ export function resolveBinAbsolute(
   return null;
 }
 
+/** Is this spawn rejection "a Windows batch shim (.cmd/.bat) spawned without
+ *  a shell"? Node refuses that with EINVAL before the file is read (the
+ *  CVE-2024-27980 fix), so the check is on the NAME and the code, and only on
+ *  win32 -- off Windows a .cmd is just a file, and an EINVAL on one is an
+ *  ordinary spawn failure. `platform` is injectable so the classification is
+ *  testable on every host. */
+export function isShellShimSpawnRefusal(
+  code: unknown,
+  bin: string,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  return code === "EINVAL" && platform === "win32" && /\.(cmd|bat)$/i.test(bin);
+}
+
 /** Classify a probe rejection so callers can distinguish a BROKEN oam from an
  *  absent one. An injected `run` that rejects without a recognizable code is
  *  reported as "spawn" -- the conservative answer, since the one thing it
@@ -762,9 +776,18 @@ export const OAM_PROBE_KILL_SIGNAL = "SIGKILL";
  *  that execFileSync applied for free before the async rewrite. */
 export const OAM_PROBE_MAX_OUTPUT = 8 * 1024;
 
-/** Bytes of the previous chunk kept so a version split across a chunk
- *  boundary ("0.6" | ".0") still matches. A dotted triple is ~20 chars. */
-const VERSION_CARRY = 32;
+/** Characters of the previous chunk kept so a version split across a chunk
+ *  boundary ("0.6" | ".0") still matches. A dotted triple is ~20 chars, but
+ *  the carry has to cover the LONGEST token the parser can match, prerelease
+ *  and build suffix included: push() holds a match that runs flush to the end
+ *  of what it has seen rather than latching it (see there), and that hold
+ *  only helps if the next chunk is scanned together with the WHOLE held
+ *  token. A suffix longer than the carry leaves only its tail in the re-scan,
+ *  and a tail like `.1.2.3` parses as a version of its own -- a truncated,
+ *  wrong one, latched because it no longer ends flush. 128 covers any
+ *  prerelease/build string a release tool actually emits; the cost is one
+ *  128-char slice per chunk, on a stream that is normally one chunk long. */
+const VERSION_CARRY = 128;
 
 /**
  * Accumulator for probe stdout.
@@ -874,6 +897,11 @@ function spawnVersionProbe(bin: string): Promise<string> {
     try {
       child = spawn(bin, ["--version"], {
         stdio: ["ignore", "pipe", "ignore"],
+        // No shell, unlike uv-bootstrap's PATH probe: oam ships as a real
+        // executable, and shell:true would wrap an .exe in cmd.exe for
+        // nothing. The cost is that a .cmd/.bat OAM_BIN EINVALs here (Node
+        // refuses batch shims without a shell since the CVE-2024-27980 fix);
+        // probeOamUncached classifies and logs that rather than hiding it.
         windowsHide: process.platform === "win32",
         // oam is a binary yaw-mcp did not write; README promises the vault
         // passphrase is stripped from every child yaw-mcp starts, and this
@@ -1092,11 +1120,25 @@ async function probeOamUncached(run: (bin: string) => Promise<string>, generatio
     const code = (err as { code?: unknown } | null)?.code;
     /** ENOENT is absence ONLY when the name was ours to guess. */
     const absent = code === "ENOENT" && !explicit;
+    /** A .cmd/.bat OAM_BIN on Windows. spawnVersionProbe runs shell:false
+     *  (deliberately -- see the spawn options there), and Node refuses to
+     *  spawn a batch shim without a shell: EINVAL, before the file is ever
+     *  read. That is not a broken oam, it is a shim that needs a shell -- say
+     *  so, or the generic warn below reports a working install as
+     *  "--version failed". Only the shim case is classified; an .exe that
+     *  EINVALs is still a real failure and takes the generic branch. */
+    const shellShim = isShellShimSpawnRefusal(code, bin);
     if (code === "ETIMEDOUT") {
       log("warn", "oam did not respond to --version twice; falling back to node for this process", {
         timeoutMs: OAM_PROBE_TIMEOUT_MS,
         bin,
       });
+    } else if (shellShim) {
+      log(
+        "warn",
+        "OAM_BIN names a .cmd/.bat shim, which needs a shell the version probe does not use; falling back to node for this process",
+        { bin, hint: "point OAM_BIN at the oam .exe the shim wraps" },
+      );
     } else if (code !== "ENOENT") {
       // A non-zero exit, a signal death, an EACCES on a non-executable file,
       // or a spawn that threw outright. All of them mean a present-but-broken
@@ -1124,7 +1166,13 @@ async function probeOamUncached(run: (bin: string) => Promise<string>, generatio
       version: null,
       belowMin: false,
       failure: absent ? null : classifyProbeFailure(err),
-      failureDetail: absent ? null : err instanceof Error ? err.message : String(err),
+      failureDetail: absent
+        ? null
+        : shellShim
+          ? `${bin} is a .cmd/.bat shim and the version probe spawns without a shell; point OAM_BIN at the .exe it wraps`
+          : err instanceof Error
+            ? err.message
+            : String(err),
     });
   }
 }

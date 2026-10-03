@@ -1,5 +1,9 @@
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { describe, expect, it, vi } from "vitest";
+
+vi.mock("../logger.js", () => ({ log: vi.fn() }));
+
+import { log } from "../logger.js";
 import { INTENT_MAX } from "../reward-grader.js";
 import {
   AGGRESSIVE_AMBIGUITY_THRESHOLD,
@@ -12,12 +16,15 @@ import {
   MAX_SAMPLES,
   parseRouteEffort,
   parseTiebreakResponse,
+  resetNoSamplingNotice,
   SAMPLING_TIEBREAK_RATIO,
   SAMPLING_TIMEOUT_MS,
   sampleCountForEffort,
   shouldSample,
   shouldTiebreak,
 } from "../sampling-rank.js";
+
+const mockLog = vi.mocked(log);
 
 const candidates = [
   { namespace: "github", score: 1.0, tools: [{ name: "create_issue" }] },
@@ -545,10 +552,11 @@ describe("sampleCountForEffort", () => {
     // aggressive -> 1 voids the best-of-3 the tool schema advertises.
     expect(sampleCountForEffort("auto")).toBe(1);
     expect(sampleCountForEffort("aggressive")).toBe(3);
-    // "off" documents intent rather than guarding behavior: shouldSample
-    // returns false for "off" so this branch is never reached in production,
-    // and bestOfNViaSampling clamps a 0 back up to 1 anyway.
-    expect(sampleCountForEffort("off")).toBe(0);
+    // "off" never reaches bestOfNViaSampling in production (shouldSample
+    // gates it), and if it did, N is clamped into [1, MAX_SAMPLES]: 1 is the
+    // number of samples that would actually run, so that is what it reports.
+    // It used to say 0, which the clamp silently turned into 1.
+    expect(sampleCountForEffort("off")).toBe(1);
   });
 });
 
@@ -569,6 +577,25 @@ describe("bestOfNViaSampling", () => {
     const out = await bestOfNViaSampling(server, "intent", candidates, 3);
     expect(out).toBeNull();
     expect(createMessage).not.toHaveBeenCalled();
+  });
+
+  it("logs ONCE per process that the client has no sampling, so an inert ROUTE_EFFORT is visible", async () => {
+    // Every ambiguous dispatch lands here on a client without sampling, and
+    // nothing else tells the user YAW_MCP_ROUTE_EFFORT=aggressive does
+    // nothing. One info line, not one per dispatch.
+    resetNoSamplingNotice();
+    mockLog.mockClear();
+    const server = mockServer(undefined, vi.fn());
+    await bestOfNViaSampling(server, "intent", candidates, 3);
+    await bestOfNViaSampling(server, "intent", candidates, 1);
+    const notices = mockLog.mock.calls.filter(([level, msg]) => level === "info" && /sampling/.test(msg));
+    expect(notices).toHaveLength(1);
+    expect(notices[0][1]).toMatch(/YAW_MCP_ROUTE_EFFORT=aggressive/);
+    // A client WITH sampling never triggers it.
+    resetNoSamplingNotice();
+    mockLog.mockClear();
+    await bestOfNViaSampling(mockServer({ sampling: {} }, vi.fn().mockResolvedValue({})), "intent", candidates, 1);
+    expect(mockLog.mock.calls.filter(([level]) => level === "info")).toHaveLength(0);
   });
 
   it("returns null with fewer than 2 candidates", async () => {

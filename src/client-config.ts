@@ -17,9 +17,15 @@
 //     sites, reload), the adapter REGISTRY, the single reader of the env vars
 //     that relocate a client config, and the write facade that verifies its
 //     own output before any caller can persist it.
+//   * client-config-values.ts -- the LEAF the core and every adapter share:
+//     canonicalJson, describeValueShape, positionAt, launchOf, normalizeEntry.
+//     Re-exported from here, so a consumer still imports them from this file.
+//     It is a separate module so that this file and client-config-json.ts do
+//     not import each other (see the note on `builtInAdapter`).
 //   * client-config-json.ts -- the JSON-family adapter (JSONC-tolerant and
 //     strict JSON), which delegates every splice to jsonc.ts so it inherits
-//     that module's byte-preservation contract.
+//     that module's byte-preservation contract. Imported HERE, at runtime, to
+//     build it in; it imports nothing from this file at runtime.
 //   * a sibling module -- one more adapter per syntax, registered through
 //     `registerConfigAdapter`. The `"toml"` format is read by the adapter
 //     target-codex-cli.ts registers at module scope, which any importer of
@@ -46,6 +52,7 @@
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { JSON_ADAPTER, JSONC_ADAPTER } from "./client-config-json.js";
+import { canonicalJson, isRecord, normalizeEntry, positionAt, stringMap } from "./client-config-values.js";
 import {
   ENTRY_NAME,
   type InstallOS,
@@ -53,6 +60,10 @@ import {
   LEGACY_ENTRY_NAMES,
   type ResolvedPath,
 } from "./install-target-model.js";
+
+// The shared value helpers live in the leaf module (see the header) and are
+// re-exported here so every consumer keeps one import path for the model.
+export { canonicalJson, describeValueShape, launchOf, normalizeEntry, positionAt } from "./client-config-values.js";
 
 // ---------------------------------------------------------------------------
 // Formats
@@ -277,21 +288,6 @@ export interface ConfigPosition {
   column: number;
 }
 
-/** `offset` as a 1-based line/column pair against `raw`. Counts LF, so a CRLF
- *  file reports the line numbers an editor shows. */
-export function positionAt(raw: string, offset: number): ConfigPosition {
-  const clamped = Math.max(0, Math.min(offset, raw.length));
-  let line = 1;
-  let lineStart = 0;
-  for (let i = 0; i < clamped; i++) {
-    if (raw[i] === "\n") {
-      line++;
-      lineStart = i + 1;
-    }
-  }
-  return { offset: clamped, line, column: clamped - lineStart + 1 };
-}
-
 /** The file parses for yaw-mcp but NOT for the client that owns it: strict
  *  JSON carrying a comment or a trailing comma. Every server in such a file
  *  is silently not loading, so splicing one more in would print Done over a
@@ -504,44 +500,6 @@ export interface EntryTransform {
   forImport?: (stored: Record<string, unknown>) => ImportView;
 }
 
-/** True for a plain object -- neither null nor an array. The test every read
- *  here makes before treating a parsed value as an entry or a container. */
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-/** `stored` as the transform says every consumer should see it. */
-export function normalizeEntry(stored: unknown, transform?: EntryTransform): unknown {
-  return transform?.normalize === undefined ? stored : transform.normalize(stored);
-}
-
-/** The launch view of a stored entry, or null when there is nothing to launch.
- *
- *  `args` is FILTERED to strings rather than cast: a hand-edited config whose
- *  args carry a number parses fine, and every consumer downstream calls string
- *  methods on each token. `env` keeps only string-valued keys, per key, for
- *  the same reason -- a numeric `DEBUG: 1` must not take the valid keys beside
- *  it down with it. */
-export function launchOf(value: unknown): LaunchEntry | null {
-  if (!isRecord(value)) return null;
-  const record = value;
-  if (typeof record.command !== "string") return null;
-  const args = Array.isArray(record.args) ? record.args.filter((a): a is string => typeof a === "string") : [];
-  const env = stringMap(record.env);
-  return env === undefined ? { command: record.command, args } : { command: record.command, args, env };
-}
-
-/** The string-valued keys of an `env` object, or undefined when there are none
- *  (or when `env` is not an object). */
-function stringMap(value: unknown): Record<string, string> | undefined {
-  if (!isRecord(value)) return undefined;
-  const kept: Record<string, string> = {};
-  for (const [key, v] of Object.entries(value)) {
-    if (typeof v === "string") kept[key] = v;
-  }
-  return Object.keys(kept).length > 0 ? kept : undefined;
-}
-
 /** The env a rewrite carries forward from a stored entry: string values only,
  *  undefined when there is nothing to carry. */
 export function carryableEnvOf(stored: unknown): Record<string, string> | undefined {
@@ -735,12 +693,16 @@ export interface ConfigAdapter {
    *  result like every other edit; `previewRootDefaults` also calls it, with
    *  `null`, to render the line alone for --dry-run, and writes nothing. */
   insertRootKey?(raw: string | null, key: string, value: RootDefaultValue): string;
+  /** OPTIONAL: `entry` as it will READ BACK once this syntax has written it --
+   *  the adapter's own omissions applied. The TOML renderer writes no
+   *  `[...env]` sub-table for an empty `env: {}` (Codex's own
+   *  `!env.is_empty()`), so the stored table has no `env` key; without this
+   *  hook the write facade compared the entry it was handed, saw the missing
+   *  key, and refused a write that was correct. An adapter that writes every
+   *  key it is given (the JSON family) leaves it out, and the facade compares
+   *  the entry as handed. */
+  entryAsWritten?(entry: Record<string, unknown>): Record<string, unknown>;
 }
-
-/** The DESIGN.md spelling of `ConfigAdapter`, kept as an alias so a sibling
- *  adapter written against that document compiles unchanged. One interface,
- *  two names for it -- never two interfaces. */
-export type FormatAdapter = ConfigAdapter;
 
 export class MissingConfigAdapterError extends Error {
   readonly format: ConfigFormat;
@@ -762,12 +724,16 @@ const REGISTERED = new Map<ConfigFormat, ConfigAdapter>();
 
 /** The adapters this module ships.
  *
- *  Read inside a FUNCTION rather than at module scope on purpose:
- *  client-config-json.ts imports helpers from this file, so a top-level
- *  `const ADAPTERS = { json: JSON_ADAPTER }` here would throw a TDZ
- *  ReferenceError whenever the json module happened to be loaded first.
- *  Deferring the read to first call makes the import order irrelevant, which
- *  client-config-json.test.ts pins by importing that module first. */
+ *  Read inside a FUNCTION rather than at module scope. It USED to be
+ *  load-bearing: client-config-json.ts imported its helpers from this file,
+ *  so a top-level `const ADAPTERS = { json: JSON_ADAPTER }` here threw a TDZ
+ *  ReferenceError whenever the json module happened to be loaded first. Those
+ *  helpers now live in client-config-values.ts and the json adapter imports
+ *  nothing from this file at runtime (its imports from here are `import
+ *  type`, erased), so there is no cycle and no order to get wrong --
+ *  client-config-json.test.ts still imports that module first, which pins the
+ *  cycle as gone rather than as survived. The function stays because a
+ *  lookup by format is the shape the registry below has too. */
 function builtInAdapter(format: ConfigFormat): ConfigAdapter | undefined {
   if (format === "json") return JSON_ADAPTER;
   if (format === "jsonc") return JSONC_ADAPTER;
@@ -811,51 +777,8 @@ export function resetConfigAdapterRegistry(): void {
 // Shared value helpers (every adapter uses these)
 // ---------------------------------------------------------------------------
 
-/** A JSON value rendered canonically: object keys sorted, `undefined`-valued
- *  keys dropped, no whitespace.
- *
- *  Two canonical strings are equal exactly when the two values are equal AS
- *  JSON -- the question install's idempotence check asks ("would writing this
- *  CHANGE what the client reads") and the question the post-write check asks
- *  of every untouched neighbour. Key order is deliberately not part of it: a
- *  hand-edited entry spelling its args before its command means what install's
- *  own spelling means, and rewriting the file to reorder two keys is churn
- *  with no behaviour behind it.
- *
- *  A BIGINT renders as its digits. `JSON.stringify` THROWS on one, and a
- *  throw here would surface as a raw TypeError out of a post-write check whose
- *  whole job is to refuse cleanly -- which is reachable the moment a syntax
- *  whose parser yields bigints for large integers is registered (the declared
- *  `"toml"` slot: smol-toml's `integersAsBigInt: "asNeeded"` returns one for an
- *  integer outside the double-safe range). Digits are also the right answer
- *  for the comparison this function serves: under `asNeeded` a value is a
- *  bigint only when it does NOT fit a number, so a bigint and a number that
- *  render alike differ in spelling and not in value.
- *
- *  A value JSON cannot represent at all (a function, a symbol, `undefined`)
- *  renders as `null`, the way JSON.stringify treats one inside an array. Those
- *  come from a caller, never from a parser; the fallback is there so this can
- *  never return `undefined` and make two unequal values compare equal. */
-export function canonicalJson(value: unknown): string {
-  if (typeof value === "bigint") return value.toString();
-  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-  const record = value as Record<string, unknown>;
-  const keys = Object.keys(record)
-    .filter((key) => record[key] !== undefined)
-    .sort();
-  return `{${keys.map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(",")}}`;
-}
-
-/** How to name a value's SHAPE in a message -- what is there instead of a
- *  container. Shape, never contents: such a value can be arbitrarily large,
- *  and the user needs to know which key is wrong rather than have it echoed
- *  back. */
-export function describeValueShape(value: unknown): string {
-  if (value === null) return "null";
-  if (Array.isArray(value)) return value.length === 0 ? "an empty array" : `an array of ${value.length}`;
-  return `a ${typeof value}`;
-}
+// `canonicalJson` and `describeValueShape` live in client-config-values.ts
+// (re-exported above).
 
 /** A text's own line ending, read from its first line break: CRLF, LF or a
  *  lone CR, and LF when it has none.
@@ -891,10 +814,17 @@ export function detectLineEnding(text: string): "\r\n" | "\n" | "\r" {
  *  file it is no line break the file uses, so the file still needs its LF;
  *  the CR stays where the user put it, in front of that LF.
  *
+ *  EMPTY text stays empty. A removal that takes the only table out of a
+ *  config.toml leaves zero bytes (see `verifyEdits`), and a file of one line
+ *  break is not "nothing": it would be one byte that is neither the empty
+ *  file Codex reads as an empty table nor anything the user wrote. There is
+ *  no line to terminate.
+ *
  *  Apply this to text you are about to write, never to a value you are
  *  comparing by identity: a no-op removal returns its input string itself, and
  *  terminating that would turn "nothing changed" into a phantom write. */
 export function terminateWithNewline(text: string): string {
+  if (text === "") return text;
   if (text.endsWith("\n")) return text;
   const eol = detectLineEnding(text);
   if (text.endsWith("\r")) return eol === "\r" ? text : `${text}\n`;
@@ -1455,7 +1385,11 @@ function refusalFor(read: ConfigRead, where: string, edits: readonly ClientConfi
       : `${where} is not valid ${read.syntax}${at} (${read.detail})`;
   }
   if (read.kind === "unspliceable") {
-    return `the "${read.key}" entry in ${where} is ${read.reason}, so yaw-mcp will not edit it`;
+    // The by-hand step rides along when the adapter gave one, the way the
+    // unloadable refusal above carries its fix: a caller that prints this
+    // verbatim (`try`) then tells the user what to do, not only what is wrong.
+    const fix = read.fix === undefined ? "" : `; ${read.fix}, then re-run`;
+    return `the "${read.key}" entry in ${where} is ${read.reason}, so yaw-mcp will not edit it${fix}`;
   }
   if (read.kind === "blocked") {
     const key = read.path.join(".");
@@ -1499,7 +1433,9 @@ function verifyEdits(
   // -- so an emptied file is read back exactly, not unreadable. It cannot
   // happen in the JSON family, which leaves a residue (`{"mcpServers": {}}`);
   // a TOML file whose only table was ours comes back as zero bytes, which
-  // Codex reads as an empty table. Treating it as an empty container keeps
+  // Codex reads as an empty table, and `terminateWithNewline` leaves those
+  // zero bytes alone, so that is what reaches the disk. Treating it as an
+  // empty container keeps
   // every check below meaningful (no entries, so a removed key is gone and no
   // neighbour moved) instead of refusing the one uninstall that empties a
   // file. An UPSERT that produced an empty file is still a refusal: the entry
@@ -1521,7 +1457,10 @@ function verifyEdits(
 
   const keptBefore = view.entries().filter((e) => !touched.has(e.key));
   const keptAfter = reread.entries.filter((e) => !touched.has(e.key));
-  if (keptAfter.map((e) => e.key).join(" ") !== keptBefore.map((e) => e.key).join(" ")) {
+  // Joined on NUL, as the TOML adapter's own order check is: a server name can
+  // hold a space (`"my server"` is a legal JSON key and a legal quoted TOML
+  // key), so a space-joined list could read two different orders as one.
+  if (keptAfter.map((e) => e.key).join("\u0000") !== keptBefore.map((e) => e.key).join("\u0000")) {
     throw new ClientConfigWriteError(
       `writing to ${where} would have changed which other servers it holds, or their order -- nothing was written`,
     );
@@ -1537,7 +1476,11 @@ function verifyEdits(
   for (const edit of edits) {
     if (edit.op === "upsert") {
       const written = reread.entries.find((e) => e.key === edit.key);
-      if (written === undefined || canonicalJson(written.value) !== canonicalJson(edit.entry)) {
+      // Compared against the entry as THIS syntax writes it back (see
+      // `ConfigAdapter.entryAsWritten`): an adapter that omits a key on
+      // purpose is held to its own rule, not to a key it never writes.
+      const expected = adapter.entryAsWritten === undefined ? edit.entry : adapter.entryAsWritten(edit.entry);
+      if (written === undefined || canonicalJson(written.value) !== canonicalJson(expected)) {
         throw new ClientConfigWriteError(
           `the "${edit.key}" entry did not read back from ${where} as it was written -- nothing was written`,
         );

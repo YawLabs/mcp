@@ -108,13 +108,16 @@ Exit codes:
   project profile blocks, one below YAW_MCP_MIN_COMPLIANCE, and any tool on the
   \`blockedTools\` deny list are all refused -- before the server is spawned.`;
 
-/** Bound on the single tools/call this command makes, under the same operator
- *  knob the proxy's calls use (MCP_CALL_TIMEOUT, default the SDK's 60s). Read
- *  through the shared resolver so a bad value falls back with one warn rather
- *  than becoming a 3ms or a 24-day ceiling. A shell caller that needs longer
- *  raises the same env var it would raise for the broker -- one knob, not a
- *  second one that only this door reads. */
-const CALL_TIMEOUT = resolveTimeoutEnv("MCP_CALL_TIMEOUT", 60_000);
+/** Default bound on the single tools/call this command makes, under the same
+ *  operator knob the proxy's calls use (MCP_CALL_TIMEOUT, the SDK's 60s). The
+ *  env is read inside runCall, through the shared resolver, from `opts.env`:
+ *  a bad value falls back with one warn rather than becoming a 3ms or a
+ *  24-day ceiling, and an injected env decides the way CallCommandOptions.env
+ *  promises it does -- a module-load read of process.env ignored it. A shell
+ *  caller that needs longer raises the same env var it would raise for the
+ *  broker -- one knob, not a second one that only this door reads. */
+const DEFAULT_CALL_TIMEOUT_MS = 60_000;
+const CALL_TIMEOUT_ENV = "MCP_CALL_TIMEOUT";
 
 /** The connect-run-teardown seam. Defaults to the real transient helper;
  *  tests inject a fake so the suite never spawns a child. Typed as the helper's
@@ -285,6 +288,10 @@ export async function runCall(opts: CallCommandOptions): Promise<CallCommandResu
   const err = opts.err ?? createStreamWriter(process.stderr);
   const print = (s = ""): void => out(`${s}\n`);
   const printErr = (s: string): void => err(`${s}\n`);
+  // Resolved per call, from the env this call was handed (see the constant's
+  // note above). `opts.env` undefined means the resolver's own process.env
+  // default, which is what the CLI path gets.
+  const callTimeoutMs = resolveTimeoutEnv(CALL_TIMEOUT_ENV, DEFAULT_CALL_TIMEOUT_MS, opts.env);
 
   const namespace = opts.namespace ?? "";
   const toolArg = opts.tool ?? "";
@@ -462,7 +469,7 @@ export async function runCall(opts: CallCommandOptions): Promise<CallCommandResu
         return { exitCode: 2 };
       }
 
-      let result: { content?: unknown; isError?: unknown };
+      let result: { content?: unknown; isError?: unknown; structuredContent?: unknown };
       try {
         result = (await connection.client.callTool(
           { name: tool.name, arguments: parsedArgs.value },
@@ -471,8 +478,8 @@ export async function runCall(opts: CallCommandOptions): Promise<CallCommandResu
           // SDK's structured-output validation with it. Same shape as the
           // proxy's own call (proxy.ts routeToolCall).
           undefined,
-          { timeout: CALL_TIMEOUT },
-        )) as { content?: unknown; isError?: unknown };
+          { timeout: callTimeoutMs },
+        )) as { content?: unknown; isError?: unknown; structuredContent?: unknown };
       } catch (e) {
         // A transport-level failure: a timeout, a JSON-RPC error, a child that
         // died mid-call. Distinct from an `isError` RESULT, which is the
@@ -489,6 +496,14 @@ export async function runCall(opts: CallCommandOptions): Promise<CallCommandResu
         const blocks = Array.isArray(result.content) ? result.content : [];
         for (const block of blocks) {
           print(renderContentBlock((block ?? {}) as { type?: unknown; text?: unknown }));
+        }
+        // A server that answers ONLY in `structuredContent` (an output schema
+        // and no text mirror) printed nothing here and exited 0, which reads as
+        // "the tool returned nothing". The answer DID arrive; say where it is.
+        // Stderr, so a script's stdout stays what the tool said -- which is
+        // nothing -- and the hint never lands in a pipe.
+        if (blocks.length === 0 && result.structuredContent !== undefined) {
+          printErr("[structured result only -- re-run with --json to see it]");
         }
       }
       // An `isError` result is a real answer -- the body is printed either way,

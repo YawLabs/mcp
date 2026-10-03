@@ -145,8 +145,9 @@ describe("resolveUv fetch order", () => {
     // A Promise.all over both let the tiny sidecar 404 (the shape of a
     // UV_VERSION bump that outruns Astral's upload) while the 18-23 MB archive
     // download carried on into memory with nothing to abort it -- each fetch
-    // arms its own AbortSignal.timeout and nothing cancelled the survivor.
-    // Sequential sidecar-first turns that into one small failed request.
+    // armed its own AbortSignal.timeout at the time and nothing cancelled the
+    // survivor. Sequential sidecar-first turns that into one small failed
+    // request.
     const seen: string[] = [];
     mockRequest.mockImplementation((url: unknown) => {
       seen.push(String(url));
@@ -159,6 +160,29 @@ describe("resolveUv fetch order", () => {
     // Exactly one request, and it was the sidecar: the archive never started.
     expect(seen).toHaveLength(1);
     expect(seen[0]).toMatch(/\.sha256$/);
+  });
+
+  it("arms ONE total deadline shared by the sidecar and the archive fetch", async () => {
+    // UV_FETCH_TOTAL_MS is documented as the bound on the WHOLE download. A
+    // per-call AbortSignal.timeout gave each fetch its own budget, so the pair
+    // could run to twice the number the comment promised. A checksum mismatch
+    // is the cheapest way to get both requests made and nothing extracted.
+    const archiveBody = Buffer.from("fake-archive-bytes");
+    const wrongHash = createHash("sha256").update(Buffer.from("different-content")).digest("hex");
+    mockRequest.mockImplementation((url: unknown) =>
+      Promise.resolve(
+        fakeResponse(
+          200,
+          String(url).endsWith(".sha256") ? Buffer.from(`${wrongHash}  x.zip\n`) : archiveBody,
+        ) as never,
+      ),
+    );
+
+    await expect(ensureUv()).rejects.toThrow("checksum mismatch");
+    expect(mockRequest).toHaveBeenCalledTimes(2);
+    const signals = mockRequest.mock.calls.map((c) => (c[1] as { signal?: AbortSignal }).signal);
+    expect(signals[0]).toBeInstanceOf(AbortSignal);
+    expect(signals[1]).toBe(signals[0]);
   });
 });
 

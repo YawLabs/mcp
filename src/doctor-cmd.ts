@@ -91,6 +91,7 @@ import {
   type ServerRuntimeInfo,
 } from "./default-runtime.js";
 import { type GuideFile, loadProjectGuide, projectGuideNotice } from "./guide.js";
+import { scrubForWarning } from "./health-score.js";
 import {
   blockedContainerFix,
   type ClientEnvValues,
@@ -145,6 +146,7 @@ import {
   checkVaultPassphrase,
   collectMalformedSecretRefs,
   collectSecretRefNames,
+  isUnlocked,
   listKeys,
   loadVault,
   lock,
@@ -254,11 +256,12 @@ export interface DoctorOptions {
   home?: string;
   os?: InstallOS;
   env?: NodeJS.ProcessEnv;
-  /** Override for tests; defaults to process.stdout.write. */
+  /** Override for tests; defaults to createStreamWriter(process.stdout) --
+   *  the EPIPE-safe wrapper from logger.ts, not the bare stream method. */
   out?: (s: string) => void;
-  /** Override for tests; defaults to process.stderr.write. Used for the
-   *  always-on warning stream so pipelines that capture stdout still see
-   *  config warnings. */
+  /** Override for tests; defaults to createStreamWriter(process.stderr) (the
+   *  same wrapper as `out`). Used for the always-on warning stream so
+   *  pipelines that capture stdout still see config warnings. */
   err?: (s: string) => void;
   /** Disable the npm registry freshness check (tests, offline use). */
   skipRegistryCheck?: boolean;
@@ -272,7 +275,8 @@ export interface DoctorOptions {
   sidecarRegistryFetch?: (pkg: string) => Promise<string | null>;
   /** Emit a single JSON blob instead of the human-readable text report. */
   json?: boolean;
-  /** Test hook: override Date.now() used by the trial GC pass. */
+  /** Test hook: override Date.now() used by the trial GC pass and by the
+   *  STATE section's "last saved ... ago" age. */
   now?: () => number;
   /** Test hook: override the current version used for the staleness comparison
    *  and UPGRADE AVAILABLE hint. Defaults to VERSION (the build-time constant).
@@ -986,6 +990,12 @@ export function probeUsable(c: ClientProbeResult): boolean {
   // install will not edit, so auto-detect must not pick that file either.
   // `containerUnspliceable` the same: the write of a trial entry into an
   // inline container is the very write upsert refuses.
+  // `containerBlocked` the same again: it is set only for a container shape
+  // install REFUSES to overwrite (a non-reparable `"mcpServers": [1, 2]`, any
+  // non-table TOML container), and try's write goes through the same refusal.
+  // Without this clause try-cmd's auto-detect picked such a file as the
+  // trial target and the write aborted on the refusal doctor had just
+  // reported, with a usable config one slot along.
   return (
     !c.unavailable &&
     c.exists &&
@@ -993,7 +1003,8 @@ export function probeUsable(c: ClientProbeResult): boolean {
     c.unreadable === null &&
     c.unloadable === null &&
     c.entryUnspliceable === null &&
-    c.containerUnspliceable === null
+    c.containerUnspliceable === null &&
+    c.containerBlocked === null
   );
 }
 
@@ -1228,6 +1239,7 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
     home,
     probeFn: opts.oamProbe ?? probeOam,
     sidecarLatest: sidecarLatestFetcher(opts),
+    platform: opts.platform,
   });
   // bundles.json diagnostics (unparseable file, bad schema version, invalid
   // defaultRuntime, skipped server entries) come back from the loader the
@@ -1243,7 +1255,7 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   // work -- without it, "my server won't start" has no visible cause short of
   // reading the spawn error. Informational; see renderVaultSection for why it
   // never becomes a warning.
-  renderVaultSection({ status: await collectVaultStatus({ home, env, servers: oamStatus.servers }), print });
+  renderVaultSection({ status: await collectVaultStatus({ home, env, servers: oamStatus.servers }), print, os, home });
 
   // state.json, peeked and loaded ONCE for both the STATE and RELIABILITY
   // sections -- by the same helper the --json path uses, so the two surfaces
@@ -1264,6 +1276,7 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
     persisted: persistedState,
     peek: statePeek,
     print,
+    now: opts.now,
   });
 
   // Reliability roll-up — pulls flaky namespaces from the same
@@ -1395,12 +1408,11 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   // this gate must stay unconditional. The old form ran the warning branch
   // only when a token was resolved, so once account mode went away a
   // malformed config would have exited 0 with the warnings buried.
+  print("DIAGNOSIS");
   if (config.warnings.length > 0) {
     exitCode = 2;
-    print("DIAGNOSIS");
     print("  Warnings above need attention.");
   } else {
-    print("DIAGNOSIS");
     print(
       staleHint ? "  Healthy, but an upgrade is available (see above)." : "  All good. yaw-mcp should start cleanly.",
     );
@@ -1421,9 +1433,14 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   return { exitCode, lines, snapshot: { version: VERSION, config, clients } };
 }
 
-// JSON counterpart to runDoctor. Same data-collection sequence, no
-// print calls — emits a single JSON blob so pipelines and dashboards
-// can consume the diagnostic without parsing the text layout.
+// JSON counterpart to runDoctor. Same collectors as the text path (so the
+// two surfaces cannot drift on a fact), but NOT the same order of
+// collection: the text path interleaves its reads with printing, and this
+// one gathers each block where its JSON field is built. The one ordering
+// constraint both paths share is that the trial GC pass runs BEFORE the
+// client probe (see the collectTrialStatus note below). No print calls --
+// emits a single JSON blob so pipelines and dashboards can consume the
+// diagnostic without parsing the text layout.
 async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
   const lines: string[] = [];
   const write = opts.out ?? createStreamWriter(process.stdout);
@@ -1610,6 +1627,7 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
     home,
     probeFn: opts.oamProbe ?? probeOam,
     sidecarLatest: sidecarLatestFetcher(opts),
+    platform: opts.platform,
   });
   // Identical fold to the text path -- a malformed bundles.json must reach
   // `.warnings` and exit 2 on both surfaces.
@@ -1821,8 +1839,10 @@ function renderEnvSection(opts: { env: NodeJS.ProcessEnv; print: (s?: string) =>
  *  until one decrypts, as a canary for the key -- so one value can exist in
  *  memory, inside secrets-vault's canDecrypt, for the length of that call.
  *  It is discarded there (a JS string, released, not zeroized), never
- *  surfaces in this status or its rendering, and the derived key is zeroed
- *  by lock() before the status is returned. `passphraseSet` is a boolean for the same reason
+ *  surfaces in this status or its rendering, and a derived key doctor itself
+ *  produced is zeroed by lock() before the status is returned (a key some
+ *  caller unlocked BEFORE doctor ran is left in place -- see the HAZARD note
+ *  in collectVaultStatus). `passphraseSet` is a boolean for the same reason
  *  YAW_MCP_VAULT_PASSPHRASE is deliberately absent from DOCTOR_ENV_VARS,
  *  which prints raw values: doctor output is the paste-into-a-ticket surface,
  *  and the one env var here that is itself a credential must never be in it.
@@ -1903,16 +1923,35 @@ async function collectVaultStatus(opts: {
   // Does the passphrase in THIS env open the vault? Only asked when there is
   // one, the vault was read, and the vault can actually verify a passphrase
   // (an empty check-less vault accepts every one -- see
-  // vaultVerifiesPassphrases). The one scrypt derivation this costs leaves a
-  // key in the module cache that doctor has no use for, so it is dropped at
-  // once. The value itself is never rendered anywhere: see passphraseSet.
-  // checkVaultPassphrase THROWS when the check itself fails (a key-derivation
-  // error) rather than calling the passphrase wrong; that says nothing either
-  // way, so the verdict stays null and the line reads as unverifiable.
+  // vaultVerifiesPassphrases). The value itself is never rendered anywhere:
+  // see passphraseSet. checkVaultPassphrase THROWS when the check itself
+  // fails (a key-derivation error) rather than calling the passphrase wrong;
+  // that says nothing either way, so the verdict stays null and the line
+  // reads as unverifiable.
+  //
+  // COST: the check is one scrypt derivation, ~100 ms of CPU, and it runs on
+  // EVERY doctor run that has YAW_MCP_VAULT_PASSPHRASE in its env -- the
+  // --json path included, so a panel that polls `doctor --json` (Yaw
+  // Terminal's MCP panel, on every refresh) pays it per poll whenever its own
+  // env carries the passphrase. secrets-vault's unlock cache does not help
+  // across runs: each poll is a fresh process. Accepted for now because the
+  // line it buys ("set, but does NOT unlock") is the only surface that tells
+  // a stale passphrase from a forgotten one.
+  //
+  // HAZARD: lock() zeroes secrets-vault's MODULE-GLOBAL cached key, not a
+  // doctor-local one. A caller that unlocked the vault before running doctor
+  // in the same process (an embedding host, a future `secrets` subcommand
+  // that calls runDoctor) would find its key gone. So doctor locks ONLY what
+  // it unlocked itself: if the cache was already populated on entry, the
+  // check hits that cache (same passphrase and salt -- no scrypt either) and
+  // the key is left in place for its owner. Today runDoctor's sole caller is
+  // index.ts's dispatch, which never unlocks first, so the guard is for the
+  // next caller rather than a live bug.
   const passphrase = opts.env.YAW_MCP_VAULT_PASSPHRASE ?? "";
   let passphraseUnlocks: boolean | null = null;
   let checkMarkerCorrupt = false;
   if (passphrase !== "" && vault !== null && vaultVerifiesPassphrases(vault)) {
+    const unlockedBeforeDoctor = isUnlocked();
     try {
       const verdict = await checkVaultPassphrase(vault, passphrase);
       passphraseUnlocks = verdict === "opens";
@@ -1920,7 +1959,7 @@ async function collectVaultStatus(opts: {
     } catch {
       // Could not check: leave passphraseUnlocks null.
     } finally {
-      lock();
+      if (!unlockedBeforeDoctor) lock();
     }
   }
 
@@ -1982,11 +2021,29 @@ async function collectVaultStatus(opts: {
  *  warning would take a perfectly healthy machine to exit 2.
  *
  *  Omitted entirely when there is no vault and nothing references one. */
-function renderVaultSection(opts: { status: VaultStatus; print: (s?: string) => void }): void {
+function renderVaultSection(opts: {
+  status: VaultStatus;
+  print: (s?: string) => void;
+  /** Doctor's --os (defaults to the host). Picks the Windows permissions
+   *  line below. */
+  os: InstallOS;
+  /** The home directory the vault files live under; named in that line. */
+  home: string;
+}): void {
   const { status, print } = opts;
   if (!status.exists && status.refs.length === 0 && status.malformed.length === 0) return;
   print("SECRET VAULT");
   print(`  file:       ${status.path}${status.exists ? "" : " (does not exist yet)"}`);
+  // On Windows every writer of the vault's files (saveVault, the secrets
+  // audit log, the project trust store, the `secrets reset` backup) skips
+  // its chmod -- there is no POSIX mode to set -- so the only thing keeping
+  // another local account out of them is the ACL they inherit from the home
+  // directory. Said once, names only, so a user whose profile is shared or
+  // whose home ACL was loosened knows which files that reaches.
+  if (opts.os === "windows") {
+    print(`  perms:      no POSIX mode on Windows -- secrets.json, secrets-audit.log and trusted.json`);
+    print(`              rely on the DACL inherited from ${opts.home}`);
+  }
   if (status.unreadable !== null) {
     print(`  entries:    unreadable -- ${status.unreadable}`);
   } else {
@@ -2147,6 +2204,13 @@ interface OamRuntimeStatus {
    *  file that exists and defines nothing is either an empty edit or a broken
    *  one -- different sentences, and the section printed neither. */
   bundlesPath: string | null;
+  /** The loader THREW (as opposed to reading a file and reporting on it):
+   *  the scrubbed error message, or null. When set, `bundlesPath` is null and
+   *  `servers` is empty, but neither means "fresh install" -- doctor never saw
+   *  the config at all. The same text is already in `bundleWarnings`, so
+   *  WARNINGS and the exit code carry it; this field is what lets the OAM
+   *  RUNTIME servers line say "could not read" instead of "none yet". */
+  bundlesUnreadable: string | null;
 }
 
 // Latest-version probe for a managed sidecar package. Same contract and
@@ -2186,10 +2250,13 @@ async function fetchSidecarLatest(pkg: string): Promise<string | null> {
  *  the stale-version branches that the auto-skip would otherwise hide.
  *
  *  NOTE: `process.env.VITEST` here is THE deliberate process.env read in
- *  doctor (everything else routes through opts.env). Tests pass a stripped
- *  `env: {}`, so VITEST is never visible via opts.env; reading process.env
- *  directly is exactly what lets the auto-skip fire under vitest. Kept
- *  intentional -- do not "fix" it to opts.env. */
+ *  doctor (everything else routes through opts.env). It is a TEST-HARNESS
+ *  GUARD, not a production switch: VITEST is the marker vitest itself sets
+ *  in every worker it runs, so this read means "a test is running me, do
+ *  not hit the real registry", and nothing in production sets or reads it.
+ *  Tests pass a stripped `env: {}`, so VITEST is never visible via opts.env;
+ *  reading process.env directly is exactly what lets the auto-skip fire
+ *  under vitest. Kept intentional -- do not "fix" it to opts.env. */
 export function registrySkipCheck(opts: DoctorOptions, override: unknown): boolean {
   return (opts.skipRegistryCheck === true || Boolean(process.env.VITEST)) && !override;
 }
@@ -2211,6 +2278,12 @@ async function collectOamRuntimeStatus(opts: {
   /** Latest-version probe for a managed sidecar package, or null when the
    *  registry check is skipped. See sidecarLatestFetcher. */
   sidecarLatest: ((pkg: string) => Promise<string | null>) | null;
+  /** The platform the managed tree's install marker is judged against
+   *  (platformMismatch). Doctor's own `platform` override, so a report
+   *  generated for another machine judges the tree by THAT machine; defaults
+   *  to process.platform. The arch half has no override and stays
+   *  process.arch. */
+  platform?: NodeJS.Platform;
 }): Promise<OamRuntimeStatus> {
   const probe = await opts.probeFn();
   // `env` is threaded through so the loader's trust gate sees the SAME
@@ -2218,7 +2291,25 @@ async function collectOamRuntimeStatus(opts: {
   // process.env while doctor read opts.env, and the two could disagree about
   // whether the project file is honoured -- which would print a bypass warning
   // and an "IGNORED" warning about the same file in the same report.
-  const bundles = await loadLocalBundles({ cwd: opts.cwd, home: opts.home, env: opts.env }).catch(() => null);
+  //
+  // A loader THROW (not a malformed file -- the loader reports that in its
+  // own `warnings` -- but a failure inside the loader itself: the trust
+  // probe, a config-dir migration, an unexpected errno) used to be swallowed
+  // into `null`, which the rest of this collector cannot tell from "no
+  // bundles.json on this machine yet". The report then read "All good" with a
+  // fresh-install hint, exit 0, on a machine whose real server list it never
+  // saw. The error is carried as a warning instead: it reaches WARNINGS and
+  // exit 2 through the same fold as a malformed file, and the OAM RUNTIME
+  // servers line names it (see bundlesUnreadable). Scrubbed, because an
+  // errno message can carry the path it failed on and the loader's own text
+  // can quote a value from the file.
+  let bundles: Awaited<ReturnType<typeof loadLocalBundles>> | null = null;
+  let bundlesUnreadable: string | null = null;
+  try {
+    bundles = await loadLocalBundles({ cwd: opts.cwd, home: opts.home, env: opts.env });
+  } catch (err) {
+    bundlesUnreadable = scrubForWarning(err instanceof Error ? err.message : String(err));
+  }
   // Hand describeDefaultRuntime the load we just did instead of letting it do
   // its own -- it reads the SAME file. Two reads was not merely wasteful: the
   // loader warns on a bundles.json it cannot parse, so a malformed file logged
@@ -2307,12 +2398,16 @@ async function collectOamRuntimeStatus(opts: {
   // node that RUNS the install, so a marker from another platform/arch means
   // the versions above can be present, current, and still fail at spawn here.
   const installedFor = anyManaged ? installedPlatform(opts.home) : null;
+  // opts.platform, not process.platform: the same override the CLIENTS
+  // launch checks judge paths by, so one `--platform` report cannot say
+  // "foreign path" about an entry and "matches this host" about the tree.
+  const hostPlatform = opts.platform ?? process.platform;
   const managed = {
     root: sidecarsRoot(opts.home),
     packages,
     installedFor,
     platformMismatch:
-      installedFor !== null && (installedFor.platform !== process.platform || installedFor.arch !== process.arch),
+      installedFor !== null && (installedFor.platform !== hostPlatform || installedFor.arch !== process.arch),
   };
   return {
     probe,
@@ -2321,8 +2416,14 @@ async function collectOamRuntimeStatus(opts: {
     managed,
     refreshSkips,
     refreshDisabled,
-    bundleWarnings: bundles?.warnings ?? [],
+    // The loader-throw warning rides in the same list a malformed file's
+    // diagnostics do, so foldBundleWarnings carries it to config.warnings
+    // (and so to exit 2) without a second fold. Its text does not start with
+    // the project file's path, so the untrusted-project filter leaves it in.
+    bundleWarnings:
+      bundlesUnreadable !== null ? [`could not read bundles.json: ${bundlesUnreadable}`] : (bundles?.warnings ?? []),
     bundlesPath: bundles?.path ?? null,
+    bundlesUnreadable,
   };
 }
 
@@ -2410,7 +2511,13 @@ function renderOamRuntimeSection(opts: {
     // legitimate, and the WARNINGS fold drives exit 2 (see the exit-code note
     // at the top of this file). This is the informational line the section was
     // missing, in the same place the server table would have been.
-    if (status.bundlesPath === null) {
+    if (status.bundlesUnreadable !== null) {
+      // Checked FIRST: bundlesPath is null here too, and the fresh-install
+      // branch below would read as "All good, add a server" on a machine
+      // whose server list doctor never saw. WARNINGS carries the same text
+      // and moves the exit code (see collectOamRuntimeStatus).
+      print(`  servers (local bundles.json): unknown -- could not read bundles.json: ${status.bundlesUnreadable}`);
+    } else if (status.bundlesPath === null) {
       print("  servers (local bundles.json): none -- no bundles.json on this machine yet.");
       print("           add one: `yaw-mcp add <slug>` (find a slug with `yaw-mcp search <text>`)");
     } else if (status.bundleWarnings.length > 0) {
@@ -2535,14 +2642,19 @@ function renderStateSection(opts: {
    *  only an "ok" peek is loaded. Read `disabled` / `peek` for which of those
    *  it is. */
   persisted: Awaited<ReturnType<typeof loadState>> | null;
-  /** Peek result from collectStateStatus, so state.json is not re-read. */
+  /** Peek result from collectStateStatus, so state.json is not re-read. Null
+   *  EXACTLY when `disabled` (collectStateStatus skips the peek then), which
+   *  is why the disabled branch below is the only null branch. */
   peek: StatePeek | null;
   print: (s?: string) => void;
+  /** Clock for the "last saved ... ago" age; doctor's `now` hook, so a test
+   *  can pin the age. Defaults to Date.now. */
+  now?: () => number;
 }): void {
   const { filePath, disabled, persisted, peek, print } = opts;
   print("STATE");
-  if (disabled || !peek) {
-    if (disabled) print("  status: disabled via YAW_MCP_DISABLE_PERSISTENCE");
+  if (disabled || peek === null) {
+    print("  status: disabled via YAW_MCP_DISABLE_PERSISTENCE");
     print("");
     return;
   }
@@ -2573,7 +2685,7 @@ function renderStateSection(opts: {
   if (!persisted || persisted.savedAt === 0) {
     print("  (no persisted state yet -- will be created on the first tool call)");
   } else {
-    print(`  last saved:           ${formatRelativeAge(Date.now() - persisted.savedAt)} ago`);
+    print(`  last saved:           ${formatRelativeAge((opts.now ?? Date.now)() - persisted.savedAt)} ago`);
     print(`  learning entries:     ${Object.keys(persisted.learning).length}`);
     print(`  pack history entries: ${persisted.packHistory.length}`);
   }
@@ -2658,7 +2770,10 @@ function renderReliabilitySection(opts: {
   const flaky = selectFlakyNamespaces(entries, 5);
   if (flaky.length === 0) return;
 
-  print("RELIABILITY (dormant, <80% success)");
+  // "(top 5)" because selectFlakyNamespaces is capped here and in the --json
+  // block, while `yaw-mcp status` lists every flaky namespace under the same
+  // definition -- a reader comparing the two must be able to see the cap.
+  print("RELIABILITY (top 5 dormant, <80% success)");
   const now = Date.now();
   for (const { namespace, usage } of flaky) {
     const rate = Math.round((usage.succeeded / usage.dispatched) * 100);
@@ -4027,7 +4142,20 @@ function shellHistorySources(opts: { home: string; env: NodeJS.ProcessEnv }): Sh
   // hardcoding the default path silently reported zero shadowed commands for
   // exactly the users who customise their shell the most. opts.env is already
   // threaded in for APPDATA below; this just uses it.
-  sources.push({ path: opts.env.HISTFILE || join(opts.home, ".bash_history"), extractCommand: plain });
+  //
+  // A leading `~/` is expanded against doctor's `home`: the shell expands it
+  // at assignment, so a LITERAL tilde only reaches us from a `.bashrc` that
+  // single-quoted the value -- but that is the common dotfiles spelling, and
+  // used as-is it names a path that does not exist, which read as "no
+  // history" for exactly the relocated case this lookup exists for.
+  const histfile = opts.env.HISTFILE;
+  const bashHistory =
+    histfile === undefined || histfile === ""
+      ? join(opts.home, ".bash_history")
+      : histfile.startsWith("~/")
+        ? join(opts.home, histfile.slice(2))
+        : histfile;
+  sources.push({ path: bashHistory, extractCommand: plain });
   sources.push({
     path: join(opts.home, ".zsh_history"),
     // Zsh extended-history lines look like `: 1700000000:0;npm audit`.

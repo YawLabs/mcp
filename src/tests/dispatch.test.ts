@@ -275,9 +275,10 @@ describe("handleDispatch", () => {
     // The old `budget === 1` test on the RAW value silently skipped the
     // tiebreak that exists precisely for the single-primary case. Two
     // servers with identical matched terms tie the BM25 scores, so
-    // shouldSample("auto") fires; the mock server has no sampling
-    // capability, so bestOfNViaSampling returns null and the ranker order
-    // stands -- the observable is the progress line emitted at the gate.
+    // shouldSample("auto") fires. The client advertises sampling (the gate
+    // now checks that first -- see the sibling below) but its createMessage
+    // fails, so bestOfNViaSampling returns null and the ranker order stands
+    // -- the observable is the progress line emitted at the gate.
     const priv = getPrivate(server);
     priv.config = {
       configVersion: "v1",
@@ -289,6 +290,10 @@ describe("handleDispatch", () => {
     vi.mocked(connectToUpstream).mockImplementation(async (cfg: UpstreamServerConfig) =>
       makeConnection(cfg.namespace, [{ name: "tool_one", description: "Example" }]),
     );
+    priv.server.getClientCapabilities = () => ({ sampling: {} });
+    priv.server.createMessage = async () => {
+      throw new Error("no transport in this test");
+    };
     const progress = vi.fn();
     const result = await priv.handleDispatch("manage github issues", 1.5, progress);
     expect(result.isError).toBeUndefined();
@@ -296,6 +301,30 @@ describe("handleDispatch", () => {
     expect(vi.mocked(connectToUpstream)).toHaveBeenCalledTimes(1);
     // The tiebreak gate fired for the single-winner dispatch.
     expect(progress.mock.calls.some((c) => String(c[0]).includes("Top candidates close"))).toBe(true);
+  });
+
+  it("does not announce an LLM tiebreak to a client that cannot sample", async () => {
+    // Same tie as above, but the client advertises no sampling capability.
+    // bestOfNViaSampling would return null anyway; the point is the progress
+    // line: "asking LLM to pick" promised a round-trip that was never going
+    // to happen, and the silence after it read as the LLM picking nothing.
+    const priv = getPrivate(server);
+    priv.config = {
+      configVersion: "v1",
+      servers: [
+        makeServerConfig({ id: "a", namespace: "alpha", name: "Alpha", description: "manage github issues" }),
+        makeServerConfig({ id: "b", namespace: "beta", name: "Beta", description: "manage github issues" }),
+      ],
+    };
+    vi.mocked(connectToUpstream).mockImplementation(async (cfg: UpstreamServerConfig) =>
+      makeConnection(cfg.namespace, [{ name: "tool_one", description: "Example" }]),
+    );
+    priv.server.getClientCapabilities = () => ({});
+    const progress = vi.fn();
+    const result = await priv.handleDispatch("manage github issues", 1, progress);
+    expect(result.isError).toBeUndefined();
+    expect(vi.mocked(connectToUpstream)).toHaveBeenCalledTimes(1);
+    expect(progress.mock.calls.some((c) => String(c[0]).includes("Top candidates close"))).toBe(false);
   });
 
   it("respects a budget larger than 1", async () => {
@@ -490,7 +519,7 @@ describe("handleDiscoverWithAutoWarm", () => {
     // gh was auto-loaded. That is correct rather than confusing: the banner
     // announces a session state change the model has to know about, and
     // suppressing it would hide an activation. Without this test, the focus
-    // parameter passes within arm's reach of twoStageRank uncovered.
+    // parameter passes within arm's reach of rankIntentCandidates uncovered.
     const priv = getPrivate(server);
     priv.config = {
       configVersion: "v1",
@@ -699,7 +728,7 @@ describe("handleDiscoverWithAutoWarm", () => {
   it("names the namespace it actually warmed, not the head of the BM25 list", async () => {
     // The banner used to print sorted[0] from the ranking the list
     // rendering uses, while the server that got activated came from
-    // twoStageRank. When the two disagree the banner named a server that
+    // rankIntentCandidates. When the two disagree the banner named a server that
     // was never loaded.
     const priv = getPrivate(server);
     priv.config = {
@@ -715,7 +744,7 @@ describe("handleDiscoverWithAutoWarm", () => {
     // Force the auto-warm winner to be "bravo" regardless of BM25 order.
     // Scores are on the BM25 scale (unbounded positive) so they clear
     // AUTO_ACTIVATE_MIN_SCORE_BM25 / _MARGIN_BM25.
-    priv.twoStageRank = async () => [
+    priv.rankIntentCandidates = async () => [
       { namespace: "bravo", score: 9.0 },
       { namespace: "alpha", score: 1.0 },
     ];

@@ -379,3 +379,27 @@ describe("PackDetector", () => {
     expect(chains[0].lastSeenAt).toBe(t0 + 5_000);
   });
 });
+
+describe("PackDetector -- recordCall validates `at` like loadSnapshot does", () => {
+  it("ignores a call whose timestamp is not a finite number", () => {
+    const d = new PackDetector();
+    d.recordCall("gh", "a", Number.NaN);
+    d.recordCall("gh", "b", Number.POSITIVE_INFINITY);
+    d.recordCall("gh", "c", "1000" as unknown as number);
+    d.recordCall("gh", "d", undefined as unknown as number);
+    d.recordCall("gh", "e", 1_000);
+    expect(d.getHistory()).toEqual([{ namespace: "gh", toolName: "e", at: 1_000 }]);
+  });
+
+  it("a 4-namespace rotation surfaces its first 3-subset at the 15th call (pins the segmentBursts comment)", () => {
+    // [a,b,c] [d,a,b] [c,d,a] [b,c,d] [a,b,c]: the overflow cut walks the
+    // rotation, so {a,b,c} recurs only once per full pass over it.
+    const d = new PackDetector();
+    const rotation = ["a", "b", "c", "d"];
+    const t0 = 1_000_000;
+    for (let i = 0; i < 14; i++) d.recordCall(rotation[i % 4], "t", t0 + i * 1_000);
+    expect(d.detectChains()).toEqual([]);
+    d.recordCall(rotation[14 % 4], "t", t0 + 14 * 1_000);
+    expect(d.detectChains().map((p) => p.namespaces.slice().sort())).toEqual([["a", "b", "c"]]);
+  });
+});

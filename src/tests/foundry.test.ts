@@ -222,6 +222,24 @@ describe("redactIntent", () => {
     expect(r.tokens).toEqual(expect.arrayContaining(["192", "168", "100", "10"]));
   });
 
+  it("keeps TWO whitespace-adjacent dates, which the IPv4 pair fix did not cover", () => {
+    // Same mechanism as the IP pair: one date is 8 digits (under the phone
+    // floor), but "2024-01-15 2024-01-16" arrives as ONE 16-digit match, and
+    // the per-group exclusion knew dotted literals only. A date range is
+    // ordinary intent vocabulary ("logs between X and Y").
+    const r = redactIntent("fetch logs between 2024-01-15 2024-01-16 please");
+    expect(r.redactedCount).toBe(0);
+    expect(r.tokens).toEqual(expect.arrayContaining(["2024", "01", "15", "16", "logs"]));
+    // Dotted day.month.year pairs are the same shape with the other separator.
+    const dotted = redactIntent("between 15.01.2024 16.01.2024");
+    expect(dotted.redactedCount).toBe(0);
+    // A date NEXT TO a real phone number is still a phone number: the excluded
+    // group is set aside and the remaining digits clear the floor on their own.
+    const mixed = redactIntent("on 2024-01-15 call 555 123 4567");
+    expect(mixed.redactedCount).toBe(1);
+    expect(mixed.tokens).not.toContain("4567");
+  });
+
   it("applies the same 2-digit floor to #N that the ticket rule applies to PROJ-N", () => {
     // "#1" is a priority marker or a list index, not an issue ref, and the
     // sibling rule already keeps "PROJ-1" for exactly that reason. The two

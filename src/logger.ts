@@ -1,3 +1,19 @@
+// Process-wide stderr logger: one record per call, as a JSON line on the
+// server surface and as a plain `yaw-mcp: warning: ...` sentence on the CLI.
+//
+// NO REDACTION HAPPENS HERE. `msg` and every field of `data` are written
+// VERBATIM -- renderData prints each value as-is for the CLI line, and the
+// server line is JSON.stringify over the whole `data` object. The scrubber
+// that exists (health-score.ts scrubForWarning) is shape-specific and is
+// applied by the CALLER, at the point where it knows what the text can
+// contain. So callers must not pass a secret-bearing field: no resolved env,
+// no raw argv, no upstream error text that has not been through
+// scrubForWarning, no URL with a query string. A field name like `token` is
+// not treated specially either. If a future call site cannot know what its
+// value holds, scrub it first; do not add a blanket key filter here, because
+// the module cannot tell a diagnostic "token: missing" from a credential and
+// a half-redaction inverts the diagnostic (see the health-score.ts header).
+
 const LOG_LEVELS = { debug: 0, info: 1, warn: 2, error: 3 } as const;
 type LogLevel = keyof typeof LOG_LEVELS;
 

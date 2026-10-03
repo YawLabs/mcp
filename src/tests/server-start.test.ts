@@ -734,8 +734,8 @@ describe("ConnectServer.start() — persisted state hydration", () => {
       (conn.client as { callTool: unknown }).callTool = callTool;
       return conn;
     }) as unknown as typeof connectToUpstream);
-    const saved = (ConnectServer as any).STARTUP_PREWARM_WAIT_MS;
-    (ConnectServer as any).STARTUP_PREWARM_WAIT_MS = 100;
+    const saved = ConnectServer.STARTUP_PREWARM_WAIT_MS;
+    ConnectServer.STARTUP_PREWARM_WAIT_MS = 100;
     try {
       const { priv, prewarmed } = await startServer();
       // Let the fast server's pre-warm land while the slow one hangs.
@@ -746,7 +746,7 @@ describe("ConnectServer.start() — persisted state hydration", () => {
       releaseSlow();
       await prewarmed;
     } finally {
-      (ConnectServer as any).STARTUP_PREWARM_WAIT_MS = saved;
+      ConnectServer.STARTUP_PREWARM_WAIT_MS = saved;
       releaseSlow();
     }
   });
@@ -777,6 +777,23 @@ describe("ConnectServer.start() — persisted state hydration", () => {
     await prewarmed;
     expect(res.content[0]?.text).not.toContain("No configured server has a tool matching");
     expect(res.content[0]?.text).toContain("fresh_live");
+  });
+
+  it("exec does not wait on the pre-warm for a name no server it is learning could route", async () => {
+    // "nope_live" is prefixed by no configured namespace, so no sweep will
+    // ever add its route. It used to sit behind the full wait bound (20 s)
+    // before failing with the same "Unknown tool" it fails with now.
+    writeBundles(synthHome, [serverEntry("fresh")]);
+    const { release } = gatedUpstream();
+    const { priv, prewarmed } = await startServer();
+
+    const t0 = Date.now();
+    const res = await priv.handleToolCall("mcp_connect_exec", { steps: [{ tool: "nope_live" }] });
+    const elapsed = Date.now() - t0;
+    release();
+    await prewarmed;
+    expect(res.isError).toBe(true);
+    expect(elapsed).toBeLessThan(2_000);
   });
 
   it("pre-warms EVERY server when there is no persisted tool cache", async () => {
@@ -1481,6 +1498,31 @@ describe("ConnectServer -- live bundles.json reload", () => {
     // model is told the file on disk is broken while the session keeps serving
     // what it loaded.
     expect(priv.configWarnings.join(" ")).toContain("invalid JSON");
+  });
+
+  it("keeps the running config when the bundles.json it loaded vanishes, and adopts a replacement", async () => {
+    // A deleted file -- or an editor's atomic save in the instant between
+    // unlink and rename -- makes the loader report "no bundles.json
+    // anywhere". That is an empty config for a fresh process, but for THIS
+    // session it is a degraded re-read: adopting it tore every connection
+    // down as "removed" and told the model nothing was installed.
+    writeBundles(synthHome, [serverEntry("gh"), serverEntry("linear")]);
+    const { priv, prewarmed } = await startServer();
+    await prewarmed;
+    await priv.handleToolCall("mcp_connect_activate", { server: "gh" });
+
+    rmSync(bundlesPathIn(synthHome));
+    await priv.handleToolCall("mcp_connect_health", {});
+
+    expect(namespacesOf(priv).sort()).toEqual(["gh", "linear"]);
+    expect(priv.connections.has("gh")).toBe(true);
+    expect(priv.configWarnings.join(" ")).toContain("no longer readable");
+
+    // Not latched: a file that comes back is adopted like any other change.
+    rewriteBundles(synthHome, [serverEntry("gh")]);
+    await priv.handleToolCall("mcp_connect_health", {});
+    expect(namespacesOf(priv)).toEqual(["gh"]);
+    expect(priv.configWarnings).toEqual([]);
   });
 
   it("does not re-parse an unchanged broken file on every meta-tool call", async () => {
