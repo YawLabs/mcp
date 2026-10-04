@@ -1412,7 +1412,11 @@ export interface LaunchShape {
 }
 
 /** A launch swap an upsert performed (or, from previewUpsertUserBundle,
- *  would perform) on a slug-less stored entry. See the upsertUserBundle doc. */
+ *  would perform): set for ANY matched stored entry -- by namespace or by the
+ *  name fallback, slug or no slug -- when the incoming entry carries a launch
+ *  (`command` or `url`) that differs from the stored one, in either direction
+ *  (stdio -> remote included). See resolveUpsertTarget and the
+ *  upsertUserBundle doc. */
 export interface LaunchChange {
   from: LaunchShape;
   to: LaunchShape;

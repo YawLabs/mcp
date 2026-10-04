@@ -873,11 +873,17 @@ async function promptPassphraseTwice(
   opts: SecretsCommandOptions,
   io: SecretsIo,
   labels: PassphrasePromptLabels,
+  note?: string,
 ): Promise<string | null | Cancelled | NoEcho> {
   const stdin = opts.io?.stdin ?? process.stdin;
   const stdout = opts.io?.stdout ?? process.stdout;
   for (let attempt = 0; attempt < MAX_PASSPHRASE_PROMPTS; attempt++) {
-    const first = await readLineFromTTY(stdin as NodeJS.ReadStream, stdout, labels.first);
+    // `note` rides at the head of the FIRST prompt, so it is written exactly
+    // when that prompt is: readLineFromTTY writes nothing when it cannot turn
+    // echo off (NO_ECHO), and a note above a prompt that never appears would
+    // only precede the refusal.
+    const prompt = attempt === 0 && note !== undefined ? `${note}${labels.first}` : labels.first;
+    const first = await readLineFromTTY(stdin as NodeJS.ReadStream, stdout, prompt);
     if (first === CANCELLED || first === NO_ECHO) return first;
     if (first.length === 0) {
       stdout.write("Passphrase cannot be empty.\n");
@@ -925,12 +931,13 @@ async function resolvePassphrase(
   // (unrecoverable) passphrase. Confirm it twice, like rotate's
   // resolveNewPassphrase, so the two entries must agree before we commit.
   if (confirm) {
-    // `note` is written only here, on the prompt stream and right before the
-    // first entry: it exists to say WHY a confirm-twice prompt is appearing
-    // (see the emptied-vault case in runSecrets), and the env/opts paths above
-    // never show a prompt that could surprise anyone.
-    if (note !== undefined) stdout.write(note);
-    return promptPassphraseTwice(opts, io, labels);
+    // `note` is written only with the first prompt, on the prompt stream: it
+    // exists to say WHY a confirm-twice prompt is appearing (see the
+    // emptied-vault case in runSecrets). The env/opts paths above never show
+    // a prompt that could surprise anyone, and a terminal that will not turn
+    // echo off shows none either -- promptPassphraseTwice writes the note as
+    // part of that prompt, so it is never printed above a NO_ECHO refusal.
+    return promptPassphraseTwice(opts, io, labels, note);
   }
   // Reject an empty passphrase (bare Enter / EOF with nothing typed):
   // deriving a key from "" would otherwise unlock any vault. Re-prompt up

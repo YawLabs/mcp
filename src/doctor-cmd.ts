@@ -134,6 +134,7 @@ import {
   powershellPayload,
   probeOam,
 } from "./oam-spawn.js";
+import { isTestSandbox } from "./opt-out-env.js";
 import { normalizeForCompare, userConfigDir } from "./paths.js";
 import {
   isPersistenceDisabled,
@@ -446,6 +447,11 @@ export interface DoctorJsonSnapshot {
     defaultRuntimeSource: "env" | "bundles" | null;
     defaultRuntimePath: string | null;
     servers: Array<{ namespace: string; runtime: "oam" | "node" | null; reason: string }>;
+    /** Why the bundles loader THREW (scrubbed), or null. Set, `servers` is
+     *  `[]` because the list is UNKNOWN, not because none is configured --
+     *  the text path's "servers: unknown -- could not read bundles.json"
+     *  line. Without it an empty array read as a fresh install. Additive. */
+    bundlesUnreadable: string | null;
     /** The managed install (`yaw-mcp sidecars install`): where it lives, and
      *  the version of each configured package in it. A null version means the
      *  package is not in the managed tree, so that server resolves from the
@@ -629,6 +635,15 @@ export interface ClientProbeResult {
    *  Same division of labour as the field above: the clause names an install
    *  run where one is the remedy, and install is what removes the key. */
   legacyEntryName: string | null;
+  /** Set when that legacy entry is spelled in a way install will not REMOVE
+   *  -- for TOML an inline table or dotted keys (`yaw-mcp = { ... }` under
+   *  [mcp_servers]) -- with the adapter's clause and by-hand step, as on
+   *  `entryUnspliceable`. Install trims a legacy entry in the same write as
+   *  ours, so a plain install refuses that file (install --keep-legacy, which
+   *  leaves the entry alone, still runs); the status line names the step
+   *  instead of promising a migration. Null otherwise, and on every
+   *  JSON-family row. Additive JSON field. */
+  legacyUnspliceable: { reason: string; fix: string } | null;
   /** The file exists but its content did not parse in its own syntax (see
    *  `syntax`): invalid JSON or a non-object JSON root, TOML that does not
    *  parse, or a TOML file whose bytes are not UTF-8 (see `malformedDetail`).
@@ -1664,6 +1679,9 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
       runtime: s.info.runtime,
       reason: s.info.reason,
     })),
+    // The marker that `servers: []` above is unknown, not empty -- the text
+    // path's "unknown -- could not read bundles.json" line, scrubbed the same.
+    bundlesUnreadable: oamStatus.bundlesUnreadable,
     // Mirrored, not dropped. collectOamRuntimeStatus already pays for these
     // reads on both paths, and the text renderer has always printed them --
     // emitting only on the text path made the shared-collector claim above
@@ -1941,12 +1959,20 @@ async function collectVaultStatus(opts: {
   // HAZARD: lock() zeroes secrets-vault's MODULE-GLOBAL cached key, not a
   // doctor-local one. A caller that unlocked the vault before running doctor
   // in the same process (an embedding host, a future `secrets` subcommand
-  // that calls runDoctor) would find its key gone. So doctor locks ONLY what
-  // it unlocked itself: if the cache was already populated on entry, the
-  // check hits that cache (same passphrase and salt -- no scrypt either) and
-  // the key is left in place for its owner. Today runDoctor's sole caller is
-  // index.ts's dispatch, which never unlocks first, so the guard is for the
-  // next caller rather than a live bug.
+  // that calls runDoctor) would find its key gone. So doctor locks only when
+  // the cache was EMPTY on entry -- then any key in it afterwards is the one
+  // this check derived. A cache populated on entry is left alone, and that
+  // is right in two of its three cases: the check hits it (same passphrase
+  // and salt, no scrypt), or the check fails and unlock() leaves it as it
+  // was. The third is NOT covered: when this passphrase opens the vault but
+  // the cached key came from a different passphrase or salt (another
+  // vault), unlock() REPLACES the cached key with doctor's, so the owner's
+  // key is gone anyway and doctor's own is left behind unlocked. Telling a
+  // hit from a replacement needs to see which (salt, passphrase) the cache
+  // holds -- the fingerprint secrets-vault.ts keeps private -- and that
+  // module offers no accessor for it, so this guard cannot. Today
+  // runDoctor's sole caller is index.ts's dispatch, which never unlocks
+  // first, so all of this is for the next caller rather than a live bug.
   const passphrase = opts.env.YAW_MCP_VAULT_PASSPHRASE ?? "";
   let passphraseUnlocks: boolean | null = null;
   let checkMarkerCorrupt = false;
@@ -2249,16 +2275,18 @@ async function fetchSidecarLatest(pkg: string): Promise<string | null> {
  *  explicitly-supplied `override` hook wins over both, so a test can reach
  *  the stale-version branches that the auto-skip would otherwise hide.
  *
- *  NOTE: `process.env.VITEST` here is THE deliberate process.env read in
- *  doctor (everything else routes through opts.env). It is a TEST-HARNESS
- *  GUARD, not a production switch: VITEST is the marker vitest itself sets
- *  in every worker it runs, so this read means "a test is running me, do
- *  not hit the real registry", and nothing in production sets or reads it.
+ *  NOTE: the VITEST read here -- isTestSandbox(), opt-out-env.ts's ONE
+ *  reader of that variable -- is THE deliberate process.env read in doctor
+ *  (everything else routes through opts.env). It is a TEST-HARNESS GUARD,
+ *  not a production switch: VITEST is the marker vitest itself sets in
+ *  every worker it runs, so this read means "a test is running me, do not
+ *  hit the real registry", and nothing in production sets or reads it.
  *  Tests pass a stripped `env: {}`, so VITEST is never visible via opts.env;
- *  reading process.env directly is exactly what lets the auto-skip fire
- *  under vitest. Kept intentional -- do not "fix" it to opts.env. */
+ *  reading the process environment (isTestSandbox's default) is exactly
+ *  what lets the auto-skip fire under vitest. Kept intentional -- do not
+ *  "fix" it to isTestSandbox(opts.env). */
 export function registrySkipCheck(opts: DoctorOptions, override: unknown): boolean {
-  return (opts.skipRegistryCheck === true || Boolean(process.env.VITEST)) && !override;
+  return (opts.skipRegistryCheck === true || isTestSandbox()) && !override;
 }
 
 // The gate for the per-sidecar freshness probe, shared by the text and --json
@@ -3064,9 +3092,13 @@ function renderClientStatus(c: ClientProbeResult, installCmd: string, client: st
   // (install-cmd.ts, the two "Set OAM_BIN to oam's full path and re-run install"
   // runtime lines), so this one names it as a precondition of the rerun rather
   // than as an alternative to it.
-  const legacy = c.hasLegacyEntry
-    ? `; legacy "${c.legacyEntryName}" entry also present -- install removes it as it writes the working entry`
-    : "";
+  // A legacy entry install cannot remove (legacyUnspliceable) gets its
+  // by-hand step instead of the promise: that rerun refuses the file.
+  const legacy = !c.hasLegacyEntry
+    ? ""
+    : c.legacyUnspliceable !== null
+      ? `; legacy "${c.legacyEntryName}" entry also present, but it is ${c.legacyUnspliceable.reason} -- install will not remove it, so ${c.legacyUnspliceable.fix} first`
+      : `; legacy "${c.legacyEntryName}" entry also present -- install removes it as it writes the working entry`;
   // The entry is real but lives under the OTHER drive-letter spelling of this
   // directory's projects[] key. Appended to every branch that reports an
   // entry, because each of them otherwise reads as a statement about the key
@@ -3133,6 +3165,12 @@ function renderClientStatus(c: ClientProbeResult, installCmd: string, client: st
   }
   if (c.hasMcpEntry) {
     return `${ok}has "${ENTRY_NAME}" entry${c.launchRuntime === "oam" ? " (runs on oam)" : ""}${rootClause("run")}${keyNote}`;
+  }
+  if (c.hasLegacyEntry && c.legacyUnspliceable !== null) {
+    // The migration install would make refuses this file: its trim of the
+    // legacy entry is an edit the splice will not make. Said here, before the
+    // run, with the adapter's own step.
+    return `legacy "${c.legacyEntryName}" entry present, but it is ${c.legacyUnspliceable.reason} -- install will not remove it, so the migration is refused; ${c.legacyUnspliceable.fix}, then run \`${installCmd}\`${keyNote}`;
   }
   if (c.hasLegacyEntry) {
     // No "then remove it by hand": install trims the legacy entry in the same
@@ -3283,6 +3321,7 @@ const EMPTY_PROBE: Readonly<ProbeClassification> = {
   containerEntries: 0,
   hasLegacyEntry: false,
   legacyEntryName: null,
+  legacyUnspliceable: null,
   malformed: false,
   malformedDetail: null,
   unloadable: null,
@@ -3689,12 +3728,20 @@ function classifyAdapterView(
       if (!read.containerPresent) return { ...EMPTY_PROBE, unloadable };
       const entry = view.entry();
       const legacy = view.legacyKey();
+      const stuckLegacy = legacy === null ? undefined : read.unspliceableEntries?.find((e) => e.key === legacy);
       const base: ProbeClassification = {
         ...EMPTY_PROBE,
         hasMcpEntry: entry !== undefined,
         containerEntries: view.count(),
         hasLegacyEntry: legacy !== null,
         legacyEntryName: legacy,
+        legacyUnspliceable:
+          stuckLegacy === undefined
+            ? null
+            : {
+                reason: stuckLegacy.reason,
+                fix: stuckLegacy.fix ?? "rewrite it by hand as a table of its own (or delete it)",
+              },
         unloadable,
         // Only meaningful with no entry: the adapter reports an entry INSIDE
         // such a container as unspliceable, so this and hasMcpEntry are never
@@ -4002,6 +4049,7 @@ function classifyProbeContent(
       containerEntries: Object.keys(container).length,
       hasLegacyEntry: legacyEntryName !== null,
       legacyEntryName,
+      legacyUnspliceable: null,
       malformed: false,
       malformedDetail: null,
       unloadable,

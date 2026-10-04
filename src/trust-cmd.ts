@@ -238,7 +238,9 @@ async function runTrustGrant(opts: TrustCommandOptions): Promise<TrustCommandRes
   // three into "store-unreadable", so the kind has to come from the store.
   if (probe.status === "store-unreadable") {
     // The store's second read on this grant (the probe read it to classify;
-    // grantTrust reads it twice more, before and after the prompt). Re-read
+    // grantTrust, which runs only after the prompt is answered, reads it twice
+    // more -- once to refuse an unusable store, once more just before it
+    // merges and writes). Re-read
     // rather than carried from the probe because the probe hands back only
     // the collapsed status, not the kind -- and the kind is what decides
     // between refusing here and letting a "parse" store be rebuilt.

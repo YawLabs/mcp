@@ -641,6 +641,87 @@ describe("release.sh version-ordering guard", () => {
     const r = run({ LATEST_NPM: "0.80.0", RESUMING: "false" });
     expect(r.out.trim()).toBe("CONTINUED");
   });
+
+  // npm_latest_version exits 3, printing what npm returned, when `latest` is
+  // there but is not a version. The registry answered, so "unreadable, retry"
+  // is the wrong message: say what it is.
+  const capture = extractBlock("LATEST_NPM_RC=0", "fi");
+
+  function runFrom(fnBody: string, env: Record<string, string> = {}): RunResult {
+    const body = [STUB_HELPERS, `npm_latest_version() { ${fnBody}; }`, capture, block, 'echo "CONTINUED"'].join("\n");
+    return runBash(body, dir, { RESUMING: "false", ALLOW_UNVERIFIED_VERSION: "", ...env });
+  }
+
+  it("names a 'latest' that is not a version instead of calling the registry unreadable", () => {
+    const r = runFrom(`printf '%s' '"banana"'; return 3`);
+    expect(r.out).toContain(`FAIL npm's 'latest' dist-tag for @yawlabs/mcp is "banana", which is not a semver version`);
+    expect(r.out).toContain("a retry will not change this");
+    expect(r.out).toContain("ALLOW_UNVERIFIED_VERSION=1");
+    expect(r.out).not.toContain("unreadable");
+    expect(r.out).not.toContain("registry read failure");
+    expect(r.out).not.toContain("CONTINUED");
+  });
+
+  it("warns on that shape and continues on a resume or under ALLOW_UNVERIFIED_VERSION=1", () => {
+    const envs: Record<string, string>[] = [{ RESUMING: "true" }, { ALLOW_UNVERIFIED_VERSION: "1" }];
+    for (const env of envs) {
+      const r = runFrom(`printf '%s' 'null'; return 3`, env);
+      expect(r.out).toContain("WARN npm's 'latest' dist-tag for @yawlabs/mcp is null, which is not a semver version");
+      expect(r.out).not.toContain("unreadable");
+      expect(r.out).toContain("CONTINUED");
+    }
+  });
+
+  it("still calls an empty answer a read failure, and lets a readable latest through untouched", () => {
+    const failed = runFrom("return 1");
+    expect(failed.out).toContain("FAIL npm's packument returned no 'latest'");
+    expect(failed.out).not.toContain("CONTINUED");
+    const ok = runFrom(`printf '%s' '1.1.0-rc.1'`);
+    expect(ok.out.trim()).toBe("CONTINUED");
+  });
+});
+
+describe("release.sh npm_latest_version", () => {
+  const fn = extractBlock("npm_latest_version() {", "}");
+  const dir = newTmp("release-latest-");
+
+  /** Run npm_latest_version with curl stubbed to return `body`, or to fail
+   *  like `curl -f` when body is null. */
+  function run(body: string | null): { rc: string; out: string } {
+    const curlStub = body === null ? "curl() { return 22; }" : `curl() { printf '%s' "$FAKE_BODY"; }`;
+    const script = [curlStub, fn, 'v=$(npm_latest_version); rc=$?; printf "RC=%s V=[%s]" "$rc" "$v"'].join("\n");
+    const out = runBash(script, dir, { FAKE_BODY: body ?? "" }).out;
+    const m = /RC=(\d+) V=\[([\s\S]*)\]/.exec(out);
+    return { rc: m?.[1] ?? "?", out: m?.[2] ?? out };
+  }
+
+  const packument = (latest: unknown) => JSON.stringify({ name: "@yawlabs/mcp", "dist-tags": { latest } });
+
+  it("prints a release and a prerelease alike: both are versions to order against", () => {
+    expect(run(packument("1.0.18"))).toEqual({ rc: "0", out: "1.0.18" });
+    expect(run(packument("1.1.0-rc.1"))).toEqual({ rc: "0", out: "1.1.0-rc.1" });
+    expect(run(packument("1.1.0-beta.2+build.5"))).toEqual({ rc: "0", out: "1.1.0-beta.2+build.5" });
+  });
+
+  it("returns 1 with nothing printed when the read fails or carries no latest", () => {
+    for (const body of [null, "", "<html>502 Bad Gateway</html>", JSON.stringify({ "dist-tags": {} })]) {
+      expect(run(body)).toEqual({ rc: "1", out: "" });
+    }
+  });
+
+  it("returns 3 and prints what npm returned when latest is there but is not a version", () => {
+    expect(run(packument("banana"))).toEqual({ rc: "3", out: '"banana"' });
+    expect(run(packument(null))).toEqual({ rc: "3", out: "null" });
+    expect(run(packument("1.0"))).toEqual({ rc: "3", out: '"1.0"' });
+  });
+
+  it("never hands echo -e a backslash or a control byte to interpret", () => {
+    // JSON spells the ESC as the six chars \u001b and the backslash as \\;
+    // every backslash then becomes `?`.
+    const r = run(packument("x\u001b[31my\\n"));
+    expect(r.rc).toBe("3");
+    expect(r.out).toBe('"x?u001b[31my??n"');
+  });
 });
 
 describe("release.sh version comparator", () => {
@@ -673,6 +754,15 @@ describe("release.sh version comparator", () => {
     ["0.80.0", "0.80.0", false],
     ["0.79.3", "0.80.0", false],
     ["0.8.0", "0.80.0", false],
+    // A prerelease `latest` (published without --tag): the cores decide, and a
+    // release outranks a prerelease of the same core.
+    ["1.0.19", "1.1.0-rc.1", false],
+    ["1.1.0", "1.1.0-rc.1", true],
+    ["1.1.1", "1.1.0-rc.1", true],
+    ["1.0.20", "1.0.20-beta.2+build.5", true],
+    ["1.0.19", "1.0.20-beta", false],
+    ["1.0.19", "1.0.19+build.1", false],
+    ["1.0.19", "banana", false],
   ])("%s > %s === %s", (version, latest, expected) => {
     expect(greaterThan(version as string, latest as string)).toBe(expected);
   });
@@ -2402,6 +2492,18 @@ describe("release.sh stale-tag guard", () => {
     expect(r.out).not.toContain("CONTINUED");
   });
 
+  it("stops the push on a stale tag that shares its name with a local branch", () => {
+    // %(refname:short) renders such a tag as `tags/v0.1.0`, which matched no
+    // ref and no commit, so the guard used to skip it silently.
+    const { work } = repo();
+    git(work, ["tag", "-a", "v0.1.0", "-m", "v0.1.0", "HEAD~1"]);
+    git(work, ["branch", "v0.1.0", "HEAD~1"]);
+    const r = run(work);
+    expect(r.out).toContain("FAIL Local annotated tag(s) v0.1.0 are absent from origin");
+    expect(r.out).not.toContain("tags/v0.1.0");
+    expect(r.out).not.toContain("CONTINUED");
+  });
+
   it("fails closed when origin's tags cannot be read", () => {
     const { work } = repo();
     git(work, ["remote", "set-url", "origin", shPath(join(work, "no-such-origin.git"))]);
@@ -2506,8 +2608,10 @@ describe("release.sh oam floor gate (stubbed full run)", () => {
     // npm's packument -- the abbreviated form, which carries dist-tags -- the
     // read behind the backward-version guard's `latest` (npm_latest_version).
     // Its URL has no path segment after the package name, which is what keeps
-    // it apart from the per-version document below.
-    "  *registry.npmjs.org/@yawlabs%2Fmcp?*)",
+    // it apart from the per-version document below -- so the `?` is escaped:
+    // a bare one is a glob wildcard that matches the `/` of every per-version
+    // URL too, and this arm would answer them all with the packument.
+    "  *registry.npmjs.org/@yawlabs%2Fmcp\\?*)",
     `    printf '{"name":"@yawlabs/mcp","dist-tags":{"latest":"1.0.1"},"versions":{},"modified":"2026-10-03T00:00:00.000Z"}' ;;`,
     // npm's per-version document, the read behind every "is it on npm?"
     // question (npm_version_manifest). An unpublished version is a 404, which
@@ -2690,6 +2794,34 @@ describe("release.sh oam floor gate (stubbed full run)", () => {
     }
   };
 
+  it("serves a per-version read the per-version document, and only the bare read the packument", () => {
+    // The curl stub's packument arm once ended in a bare `?` -- a glob
+    // wildcard that matched the `/` of every per-version URL -- so every
+    // npm_version_manifest read in these runs got the packument, which has no
+    // `version` and reads as "not on npm". Drive the stub with the URLs
+    // release.sh builds and check which document answers each.
+    const root = newTmp("release-curl-stub-");
+    const state = join(root, "state");
+    mkdirSync(state);
+    writeFileSync(join(root, "curl"), CURL_SCRIPT);
+    writeFileSync(join(state, "published-1.0.2"), "");
+    const read = (url: string) => {
+      const r = spawnSync("bash", [join(root, "curl"), "-fsSL", "-H", "Accept: application/json", url], {
+        encoding: "utf8",
+        env: { ...baseEnv(), FAKE_STATE: shPath(state) },
+      });
+      return { status: r.status, out: r.stdout ?? "" };
+    };
+    const perVersion = read("https://registry.npmjs.org/@yawlabs%2Fmcp/1.0.2?_=1234");
+    expect(perVersion.status).toBe(0);
+    expect(JSON.parse(perVersion.out).version).toBe("1.0.2");
+    expect(JSON.parse(perVersion.out)["dist-tags"]).toBeUndefined();
+    expect(read("https://registry.npmjs.org/@yawlabs%2Fmcp/1.0.3?_=1234").status).toBe(22);
+    const packument = read("https://registry.npmjs.org/@yawlabs%2Fmcp?_=1234");
+    expect(packument.status).toBe(0);
+    expect(JSON.parse(packument.out)["dist-tags"].latest).toBe("1.0.1");
+  });
+
   it.skipIf(!hasCoreutilsTimeout)("stops a login the MCP registry never answers, and fails the step saying so", () => {
     const f = setup();
     writeFileSync(join(f.state, "login-hangs"), "");
@@ -2757,6 +2889,9 @@ describe("release.sh oam floor gate (stubbed full run)", () => {
     // Step 5's whole publish path ran: npm answered on the first read, the
     // pinned mcp-publisher came down and passed its sha256 check, logged in
     // with the GitHub token, published once, and the read-back confirmed it.
+    // "npm serves" on the FIRST read is the per-version document answering a
+    // per-version read in this run -- the packument has no `version`, so a
+    // stub arm that served it there would read as "not on npm" every time.
     expect(r.out).toContain("npm serves @yawlabs/mcp@1.0.2\n");
     expect(r.out).toContain(`mcp-publisher ${PUBLISHER_VERSION} ready (sha256 verified)`);
     expect(r.out).toContain("Published server.json to MCP registry");

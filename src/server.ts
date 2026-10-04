@@ -90,6 +90,7 @@ import {
 import {
   bestOfNViaSampling,
   buildCandidates,
+  noteNoSamplingCapability,
   parseRouteEffort,
   sampleCountForEffort,
   shouldSample,
@@ -3060,7 +3061,21 @@ export class ConnectServer {
       if (!opts?.deferIdleTracking) {
         await this.trackUsageAndAutoDeactivate(route.namespace);
       }
-      if (stepContent) return { ...result, stepContent };
+      // Attach to the SAME object, never a spread copy: a spread copies only
+      // own enumerable keys, and the routing-fault / cancelled brands
+      // (proxy.ts brandRoutingFault / brandCancelled) are defined
+      // enumerable:false. A copy reached handleExec unbranded and its
+      // recordOutcome(ns, 0) blamed a healthy server for yaw-mcp's own fault
+      // or the user's cancel. Non-enumerable itself, so it can never ride a
+      // serialize of this result onto the wire.
+      if (stepContent) {
+        Object.defineProperty(result, "stepContent", {
+          value: stepContent,
+          enumerable: false,
+          configurable: true,
+          writable: true,
+        });
+      }
     }
 
     return result;
@@ -5893,7 +5908,14 @@ export class ConnectServer {
     // round-trip that was never going to happen, and the silent null that
     // followed read as the LLM having picked nothing.
     const clientCanSample = this.server.getClientCapabilities()?.sampling !== undefined;
-    if (safeBudget === 1 && clientCanSample && shouldSample(ranked, effort)) {
+    const wantsTiebreak = safeBudget === 1 && shouldSample(ranked, effort);
+    // The one-time "client has no sampling" notice is emitted HERE, at the
+    // gate that skips the round-trip: bestOfNViaSampling is never reached on
+    // such a client, so its own copy of the notice could not fire in
+    // production, and an operator who set YAW_MCP_ROUTE_EFFORT=aggressive had
+    // no way to learn the dial was inert. Same per-process flag either way.
+    if (wantsTiebreak && !clientCanSample) noteNoSamplingCapability();
+    if (wantsTiebreak && clientCanSample) {
       progress?.("Top candidates close — asking LLM to pick…");
       const serversByNamespace = new Map(activeServers.map((s) => [s.namespace, s]));
       // activeServers came through getProfiledActiveServers, so each one's

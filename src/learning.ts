@@ -36,9 +36,14 @@
 //     lifecycle via exportSnapshot/loadSnapshot.
 //
 // NO TIME DECAY. `lastUsedAt` is stamped on every observation and persisted,
-// but nothing reads it back: a namespace's dispatched/succeeded counters are
-// cumulative for the life of the state file, so a server that was flaky a
-// month ago and has been fine since carries that month forever, and the
+// and it IS read back -- but never by the boost/penalty math. Its readers are
+// display (the "last used <age> ago" lines in `yaw-mcp doctor` and its
+// --json, mcp_connect_health's reliability block in server.ts, and
+// `yaw-mcp status`) plus persistence.ts's capLearning, which keeps the most
+// recently used namespaces when the map outgrows its cap. A namespace's
+// dispatched/succeeded counters are cumulative for the life of the state
+// file, so a server that was flaky a month ago and has been fine since
+// carries that month forever, and the
 // penalty branch does not age out on its own. The only way out is
 // `yaw-mcp reset-learning` (reset-learning-cmd.ts), which drops the whole
 // learning map. If decay is ever wanted, lastUsedAt is the field to build it

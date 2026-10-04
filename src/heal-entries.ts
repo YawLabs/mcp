@@ -46,6 +46,7 @@
  * returned result.
  */
 import { statSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { atomicWriteFile } from "./atomic-write.js";
 import {
   addressOf,
@@ -54,11 +55,11 @@ import {
   carriedFieldsOf,
   carryableEnvOf,
   composeEntry,
-  containerKeysAt,
   launchOf,
   readClientConfigFile,
   readClientEnv,
   selectSites,
+  siteAt,
   terminateWithNewline,
 } from "./client-config.js";
 import { isReadOnlyDiagnostics } from "./config-loader.js";
@@ -85,6 +86,11 @@ export interface HealedEntry {
   scope: string;
   /** The config file that was rewritten. */
   path: string;
+  /** The Claude Code project whose container holds the entry -- the
+   *  `projects[<key>]` key in ~/.claude.json -- set only for a local-scope
+   *  entry. One file holds a container per project, so without it N entries
+   *  in one file print as N identical lines. Additive JSON field. */
+  project?: string;
   /** The dead entry-file path that was replaced. */
   from: string;
   /** What the entry launches now -- a path, or `"npx"` when no durable entry
@@ -108,6 +114,11 @@ export interface UnhealableConfig {
   clientId: string;
   scope: string;
   path: string;
+  /** The Claude Code project whose container was not looked inside -- the
+   *  `projects[<key>]` key in ~/.claude.json -- set only for a local-scope
+   *  entry. One file holds a container per project, so without it N entries
+   *  in one file print as N identical lines. Additive JSON field. */
+  project?: string;
   /** The `ConfigRead` kind that stopped us: `unspliceable`, `blocked`,
    *  `malformed` or `unreadable`. */
   reason: string;
@@ -129,6 +140,12 @@ export interface FailedHeal {
   scope: string;
   /** The config file that still holds the dead entry. */
   path: string;
+  /** The Claude Code project whose container holds the entry -- the
+   *  `projects[<key>]` key in ~/.claude.json -- set only for a local-scope
+   *  entry. One file holds a container per project, so without it N entries
+   *  in one file print as N identical lines. Additive JSON field. */
+  project?: string;
+
   /** The dead entry-file path the entry still names. */
   from: string;
   /** What the rewrite would have launched -- same meaning as HealedEntry.to. */
@@ -183,6 +200,10 @@ export interface HealOptions {
    *  file it replaces -- so a test that has to fail the write on every runner
    *  throws from here instead. */
   writeConfig?: (path: string, text: string) => Promise<void>;
+  /** Test seam for the reads: node's readFile unless a test says otherwise.
+   *  The sweep reads each FILE once (see readOnce in healStaleBrokerEntries),
+   *  and a test counts that through here. */
+  readFile?: (path: string) => Promise<string | Uint8Array>;
 }
 
 /**
@@ -225,6 +246,34 @@ function isForeignEntry(command: string, entryPath: string, platform: NodeJS.Pla
   if (isForeignAbsoluteLaunch(command, platform)) return true;
   if (platform === "win32" && (entryPath.startsWith("/") || command.startsWith("/"))) return true;
   return false;
+}
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+/** False only when `value` (one project's object) provably holds no entry of
+ *  ours under `tail` (its container path inside the project): a segment along
+ *  it is missing, or the container is an object without an "mcp" key -- the
+ *  two shapes the read classifies `ok` with nothing to heal. Anything else,
+ *  including a non-object the read would call `blocked`, is true, so the
+ *  sweep still reads it and reports it. */
+function mayHoldEntry(value: unknown, tail: readonly string[]): boolean {
+  let cursor: unknown = value;
+  for (const segment of tail) {
+    if (!isPlainObject(cursor)) return true;
+    if (!Object.hasOwn(cursor, segment)) return false;
+    cursor = cursor[segment];
+  }
+  return !isPlainObject(cursor) || Object.hasOwn(cursor, ENTRY_NAME);
+}
+
+/** `{ project }` for a site whose container is one Claude Code project's
+ *  (`projects[<key>]...`), else nothing -- the field every heal record
+ *  carries so a fanned-out file's entries stay distinguishable. */
+function projectOf(site: ConfigSite): { project?: string } {
+  const path = site.resolved.containerPath;
+  return path.length >= 2 && path[0] === "projects" ? { project: path[1] } : {};
 }
 
 /** Gate 1. Is this entry file one WE would have written -- i.e. does it live
@@ -286,6 +335,25 @@ export async function healStaleBrokerEntries(opts: HealOptions = {}): Promise<He
   const failed: FailedHeal[] = [];
   const writeConfig = opts.writeConfig ?? atomicWriteFile;
 
+  // Each FILE is read once per sweep, whatever number of sites name it:
+  // ~/.claude.json is Claude Code's user slot AND one local-scope container
+  // per project the machine has opened, and this pass runs on every serve
+  // start. The bytes are cached by path; a write this sweep makes replaces
+  // them with the bytes it wrote -- encoded, so the next site decodes them
+  // exactly as it would have decoded a re-read of the file -- so a later
+  // container still sees an earlier container's repair.
+  const readBytes = opts.readFile ?? ((path: string) => readFile(path));
+  const fileBytes = new Map<string, Promise<string | Uint8Array>>();
+  const readOnce = (path: string): Promise<string | Uint8Array> => {
+    const key = norm(path, platform);
+    let bytes = fileBytes.get(key);
+    if (bytes === undefined) {
+      bytes = readBytes(path);
+      fileBytes.set(key, bytes);
+    }
+    return bytes;
+  };
+
   // Resolved ONCE for the whole sweep, and LAZILY: probing oam spawns a
   // process, and this pass runs on every broker start. The steady state is
   // "nothing is stale", so paying a process spawn to discover that would be a
@@ -337,7 +405,7 @@ export async function healStaleBrokerEntries(opts: HealOptions = {}): Promise<He
     try {
       // Same transform install reads with, so carried fields and the
       // normalised view match what install would compute for this row.
-      const view = await readClientConfigFile(site, { transform: target.entry });
+      const view = await readClientConfigFile(site, { transform: target.entry, readFile: readOnce });
       if (view.read.kind !== "ok") {
         // A file this pass DECLINED to look inside is not the same as a file
         // with nothing wrong, and reporting "no stale entries found" for one
@@ -352,6 +420,7 @@ export async function healStaleBrokerEntries(opts: HealOptions = {}): Promise<He
             clientId: target.clientId,
             scope,
             path: site.resolved.absolute,
+            ...projectOf(site),
             reason: view.read.kind,
           });
         }
@@ -414,14 +483,18 @@ export async function healStaleBrokerEntries(opts: HealOptions = {}): Promise<He
         clientId: target.clientId,
         scope,
         path: site.resolved.absolute,
+        ...projectOf(site),
         from: entryPath,
         to: nextEntry ?? "npx",
       };
       // install's own caveat over the same path (install-cmd.ts, the
       // "project-local install" Note), carried on the entry so each caller
-      // prints it on its own surface. Same helper, same cwd rule, same
-      // platform seam, so heal and install agree about which paths are
-      // project-local.
+      // prints it on its own surface. Same helper and same cwd rule
+      // (`opts.cwd`, else process.cwd()) as install's call. The platform
+      // differs only as a seam: heal passes its own `platform` option, which
+      // defaults to process.platform -- the value install's call takes by
+      // default -- so on every real run the two agree about which paths are
+      // project-local, and only a test that sets the option diverges.
       if (nextEntry !== null && isProjectLocalEntry(nextEntry, opts.cwd ?? process.cwd(), platform)) {
         outcome.note =
           `that path is a project-local install (${nextEntry}). Removing this checkout's node_modules ` +
@@ -458,7 +531,9 @@ export async function healStaleBrokerEntries(opts: HealOptions = {}): Promise<He
           // ends in one as it is. Nothing compares this text by identity
           // afterwards -- gate 2 and the check above have already decided the
           // entry changes -- so it cannot turn a no-op into a phantom write.
-          await writeConfig(site.resolved.absolute, terminateWithNewline(text));
+          const written = terminateWithNewline(text);
+          await writeConfig(site.resolved.absolute, written);
+          fileBytes.set(norm(site.resolved.absolute, platform), Promise.resolve(Buffer.from(written, "utf8")));
         } catch (err) {
           // Worded by describeWriteFailure, as install and uninstall word the
           // same failure: node's errno named the temp sibling atomicWriteFile
@@ -491,19 +566,35 @@ export async function healStaleBrokerEntries(opts: HealOptions = {}): Promise<He
 
   /** The sites to sweep for ONE resolved site: itself, plus -- for a Claude
    *  Code local-scope site -- one per OTHER project container in the same
-   *  file. The keys are listed off ONE read of the file's bytes through the
-   *  core (`containerKeysAt`), never by parsing here; the sweep over each
-   *  container then re-reads the file itself, which is what it has to do
-   *  anyway, since an earlier container's heal rewrites the bytes a later
-   *  one reads. Any other site comes back alone. */
+   *  file. The projects are listed off ONE classification of the file's
+   *  bytes through the core (never by parsing here), and that same read
+   *  drops every project whose container provably holds no entry of ours --
+   *  no container at all, or an object without an "mcp" key -- since healSite
+   *  would read, parse and return without a word for each of them. Only the
+   *  rest are swept, so a file with many projects and one wired entry is
+   *  parsed once for the list and once for that entry, not once per project.
+   *  A project whose path holds anything else (a non-object the read would
+   *  call blocked) is still swept, so it is still reported; a file that does
+   *  not list (absent, malformed, a non-object `projects`) comes back as the
+   *  site alone, which healSite then reports as it always did. Any other
+   *  site comes back alone too. */
   const sitesToSweep = async (site: ConfigSite): Promise<ConfigSite[]> => {
-    let raw: string | null;
+    if (projectOf(site).project === undefined) return [site];
+    const [projectsKey, , ...tail] = site.resolved.containerPath;
+    let listed: Awaited<ReturnType<typeof readClientConfigFile>>["read"];
     try {
-      raw = (await readClientConfigFile(site)).raw;
+      listed = (await readClientConfigFile(siteAt(site, [projectsKey]), { readFile: readOnce })).read;
     } catch {
       return [site];
     }
-    return claudeCodeProjectSites(site, (prefix) => containerKeysAt(raw, site, prefix));
+    if (listed.kind !== "ok") return [site];
+    const projectValues = new Map(listed.entries.map((e) => [e.key, e.value] as const));
+    const sites = claudeCodeProjectSites(site, () => [...projectValues.keys()]);
+    return sites.filter((s) => {
+      const key = s.resolved.containerPath[1];
+      if (!projectValues.has(key)) return false;
+      return mayHoldEntry(projectValues.get(key), tail);
+    });
   };
 
   for (const target of INSTALL_TARGETS) {

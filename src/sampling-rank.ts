@@ -360,10 +360,10 @@ export function sampleCountForEffort(effort: RouteEffort): number {
   }
 }
 
-/** Logged once per process, not per dispatch: a client that does not
- *  advertise sampling returns null here on EVERY ambiguous dispatch, and a
- *  user who set YAW_MCP_ROUTE_EFFORT=aggressive has no other way to learn the
- *  dial is inert. */
+/** Logged once per process, not per dispatch: on a client that does not
+ *  advertise sampling EVERY ambiguous dispatch skips the tiebreak, and a user
+ *  who set YAW_MCP_ROUTE_EFFORT=aggressive has no other way to learn the dial
+ *  is inert. */
 let noSamplingNoticeLogged = false;
 
 /** Test hook: let the one-time notice fire again. */
@@ -371,7 +371,11 @@ export function resetNoSamplingNotice(): void {
   noSamplingNoticeLogged = false;
 }
 
-function noteNoSamplingCapability(): void {
+/** Emit the one-time notice. Exported because the PRODUCTION caller is
+ *  server.ts's dispatch gate, which checks the capability itself before it
+ *  would call bestOfNViaSampling (so a client without sampling never sees the
+ *  "asking LLM to pick" progress line) and emits the notice when it skips. */
+export function noteNoSamplingCapability(): void {
   if (noSamplingNoticeLogged) return;
   noSamplingNoticeLogged = true;
   log(
@@ -397,6 +401,9 @@ export async function bestOfNViaSampling(
 ): Promise<string | null> {
   const caps = server.getClientCapabilities();
   if (!caps?.sampling) {
+    // Defensive: server.ts's gate already checks the capability (and emits
+    // this notice) before calling, so production never lands here. Kept for
+    // any other caller, behind the same once-per-process flag.
     noteNoSamplingCapability();
     return null;
   }

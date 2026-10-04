@@ -6,7 +6,7 @@ import { FOUNDRY_FILENAME } from "../foundry.js";
 import { DEFAULT_OUT, defaultLoadServers, FOUNDRY_USAGE, parseFoundryArgs, runFoundryExport } from "../foundry-cmd.js";
 import { DEFAULT_CORPUS_CAP } from "../foundry-corpus.js";
 import { localBundlesPath } from "../local-bundles.js";
-import { userConfigDir } from "../paths.js";
+import { CONFIG_DIRNAME, userConfigDir } from "../paths.js";
 import { STATE_SCHEMA_VERSION, statePath } from "../persistence.js";
 import type { RankableServer } from "../relevance.js";
 
@@ -314,6 +314,47 @@ describe("defaultLoadServers", () => {
     const servers = await defaultLoadServers(cwd, home);
     expect(servers).toHaveLength(1);
     expect(servers[0].tools).toEqual([]);
+  });
+
+  it("names an UNTRUSTED project bundles.json and points at `yaw-mcp trust` instead of saying none was found", async () => {
+    // A project file that exists but is not approved is skipped by the loader
+    // (no servers, no shadowing of the user-global file). With no user-global
+    // file either, the diagnostic said "no bundles.json found -- looked for
+    // <project> and <global>" -- false for the project file, which sits right
+    // there, and silent on the one command that would make it count.
+    rmSync(localBundlesPath(userConfigDir(home)));
+    const projectDir = join(cwd, CONFIG_DIRNAME);
+    mkdirSync(projectDir, { recursive: true });
+    const projectFile = localBundlesPath(projectDir);
+    writeFileSync(
+      projectFile,
+      JSON.stringify({ version: 1, servers: [{ namespace: "github", name: "GitHub", command: "npx" }] }),
+      "utf8",
+    );
+    const dir = mkdtempSync(join(tmpdir(), "yaw-foundry-untrusted-"));
+    const errs: string[] = [];
+    try {
+      const r = await runFoundryExport({
+        out: join(dir, "c.json"),
+        cap: 500,
+        json: false,
+        home,
+        cwd,
+        readTraces: () => JSON.stringify({ tokens: ["a"], chosen: "github" }),
+        write: () => {},
+        writeErr: (s) => {
+          errs.push(s);
+        },
+      });
+      expect(r.exitCode).toBe(1);
+      const msg = errs.join("");
+      expect(msg).not.toContain("no bundles.json found");
+      expect(msg).toContain(projectFile);
+      expect(msg).toContain("not approved");
+      expect(msg).toContain("yaw-mcp trust");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("names the missing bundles.json in the empty-corpus diagnostic instead of saying 0 servers", async () => {

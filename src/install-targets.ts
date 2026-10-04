@@ -708,12 +708,6 @@ export function claudeCodeContainerPathVariants(
   return out;
 }
 
-/** The six inline rows' paths. `client` is the INLINE id union, not the whole
- *  `InstallClientId`: `resolveInstallPath` narrows a row to InlineTarget by
- *  testing `resolvePath` first, so every id that reaches here has a branch
- *  below, and the function ends in a real exhaustiveness check rather than a
- *  cast-and-throw -- a seventh inline id (or a modular row that forgot its
- *  `resolvePath`) fails to compile instead of throwing at the first resolve. */
 /** Every per-project container in the file a Claude Code LOCAL-scope site
  *  names, one site each -- for a sweep that has to look at every project this
  *  machine has opened rather than at the one the process happens to be in.

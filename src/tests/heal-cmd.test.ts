@@ -183,6 +183,24 @@ describe("runHeal -- the outcomes that were already right keep their output and 
     expect(io.stderr()).toBe("");
   });
 
+  it("names the project for each local-scope entry, so one file's entries are not N identical lines", async () => {
+    // ~/.claude.json holds one container per project, and the sweep reaches
+    // them all; every line used to read `claude-code (local): <file>`.
+    const a: HealedEntry = { ...HEALED, scope: "local", project: "/work/a" };
+    const b: HealedEntry = { ...HEALED, scope: "local", project: "/work/b" };
+    const io = captureStreams();
+    const { exitCode } = await runHeal({}, sweepOf({ healed: [a, b] }));
+    expect(exitCode).toBe(0);
+    expect(io.stdout()).toContain(`  claude-code (local): ${CLAUDE} (project /work/a)\n`);
+    expect(io.stdout()).toContain(`  claude-code (local): ${CLAUDE} (project /work/b)\n`);
+    const json = captureStreams();
+    await runHeal({ json: true }, sweepOf({ healed: [a, b] }));
+    expect((JSON.parse(json.stdout()) as { healed: HealedEntry[] }).healed.map((h) => h.project)).toEqual([
+      "/work/a",
+      "/work/b",
+    ]);
+  });
+
   it("--dry-run --json is told apart from a live --json by `dryRun`, with the same `healed` and `count`", async () => {
     // The sweep's `healed` under a dry run is the entries it WOULD re-point,
     // and `count` is its length either way; `dryRun: true` is what says

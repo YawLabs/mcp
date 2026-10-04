@@ -58,9 +58,19 @@ vi.mock("../secret-entry-page.js", async (importOriginal) => {
   };
 });
 
+// routeToolCall passes straight through to the real one. Wrapped only so a test
+// can hand handleToolCall a result carrying one of proxy.ts's in-process brands
+// (routing fault, client cancel) without contriving the race that produces it
+// for real -- the exec brand-survival tests below need exactly that.
+vi.mock("../proxy.js", async (importOriginal) => {
+  const actual = (await importOriginal()) as any;
+  return { ...actual, routeToolCall: vi.fn(actual.routeToolCall) };
+});
+
 import { CONFIG_DIRNAME } from "../paths.js";
-import { isRoutingFaultResult } from "../proxy.js";
+import { brandCancelled, brandRoutingFault, isRoutingFaultResult, routeToolCall } from "../proxy.js";
 import { capContent } from "../result-cap.js";
+import { resetNoSamplingNotice } from "../sampling-rank.js";
 import type { SecretEntryPage, SecretEntryPageOptions } from "../secret-entry-page.js";
 import {
   ConnectServer,
@@ -3343,6 +3353,35 @@ describe("ConnectServer", () => {
       expect(isRoutingFaultResult(result)).toBe(true);
       expect(priv.learning.get("gh")).toBeUndefined();
     });
+
+    // handleToolCall's exec-step return used to spread the result
+    // ({ ...result, stepContent }) to attach the pre-prune snapshot. A spread
+    // copies only own ENUMERABLE string/symbol keys, and the brands are
+    // defined enumerable:false, so a branded step reached handleExec bare and
+    // recordOutcome(ns, 0) blamed a healthy server for yaw-mcp's own fault or
+    // the user's cancel.
+    for (const [label, brand] of [
+      ["routing fault", brandRoutingFault],
+      ["client cancel", brandCancelled],
+    ] as const) {
+      it(`exec step keeps the ${label} brand through the stepContent attach (no learning booked)`, async () => {
+        const priv = getPrivate(server);
+        priv.connections.set("gh", makeConnection("gh", ["get_resource"]));
+        priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+        priv.rebuildRoutes();
+        vi.mocked(routeToolCall).mockImplementationOnce(async () =>
+          brand({ content: [{ type: "text", text: "Error: withdrawn" }], isError: true }),
+        );
+        const recordOutcome = vi.spyOn(priv.learning, "recordOutcome");
+        const result = await priv.handleToolCall("mcp_connect_exec", {
+          steps: [{ id: "a", tool: "gh_get_resource", args: {} }],
+        });
+        expect(result.isError).toBe(true);
+        expect(vi.mocked(routeToolCall)).toHaveBeenCalled();
+        expect(recordOutcome).not.toHaveBeenCalledWith("gh", expect.anything());
+        expect(priv.learning.get("gh")).toBeUndefined();
+      });
+    }
 
     it("exec step attribution still books an upstream error that merely CONTAINS a marker phrase", async () => {
       // The exec counterpart of the direct-path brand test: a genuine
@@ -10643,6 +10682,35 @@ describe("cold tool-list readers share mergeToolCache's precedence", () => {
     expect(prompt).toContain("tools: zz_alpha_tool");
     expect(prompt).toContain("tools: zz_beta_tool");
     expect(prompt).not.toContain("no tool metadata yet");
+  });
+
+  it("tells the operator ONCE that the client has no sampling when dispatch skips an ambiguous tiebreak", async () => {
+    // The one-time notice used to live only inside bestOfNViaSampling, whose
+    // sole production caller (this gate) already checks the capability first
+    // -- so a client without sampling never reached it and an inert
+    // YAW_MCP_ROUTE_EFFORT stayed invisible. The gate now emits it itself.
+    resetNoSamplingNotice();
+    const priv = getPrivate(server);
+    priv.config = makeConfig([
+      makeServerConfig({ id: "a", namespace: "alpha", name: "Alpha", description: "manage github issues" }),
+      makeServerConfig({ id: "b", namespace: "beta", name: "Beta", description: "manage github issues" }),
+    ]);
+    priv.server.getClientCapabilities = () => ({});
+    const createMessage = vi.fn();
+    priv.server.createMessage = createMessage;
+    const write = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    try {
+      await priv.handleDispatch("manage github issues", 1);
+      await priv.handleDispatch("manage github issues", 1);
+      const notices = write.mock.calls.filter(([chunk]) =>
+        String(chunk).includes("does not advertise the sampling capability"),
+      );
+      expect(notices).toHaveLength(1);
+      expect(createMessage).not.toHaveBeenCalled();
+    } finally {
+      write.mockRestore();
+      resetNoSamplingNotice();
+    }
   });
 
   it("checks an activate filter against the curated list of a server with no learned one", () => {

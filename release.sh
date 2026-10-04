@@ -650,8 +650,16 @@ npm_has_version() {
 }
 
 # The version npm's `latest` dist-tag names for @yawlabs/mcp, for the
-# backward-version guard. Prints it and returns 0; prints nothing and returns
-# 1 when the registry cannot be read or the body carries no such tag.
+# backward-version guard. Prints it and returns 0 when it is a semver version
+# -- a prerelease included: `npm publish` of a 1.1.0-rc.1 without --tag moves
+# `latest` onto it, and that is a registry state to order against, not a read
+# failure. Prints nothing and returns 1 when the registry cannot be read or
+# the body carries no such tag. Returns 3 when the tag IS there but names
+# something that is not a version, printing what npm returned so the guard
+# can say exactly that instead of calling the registry unreadable: as JSON (so
+# a null or a number reads as one), cut at 200 chars, with every backslash and
+# non-printable-ASCII char turned into `?` -- warn and fail print through
+# `echo -e`, which would turn a JSON `\u001b` back into a raw ESC.
 #
 # This is the packument read -- GET /@yawlabs%2Fmcp, the document
 # npm_version_manifest explains `npm view` fetches from Cloudflare's edge
@@ -677,7 +685,11 @@ npm_latest_version() {
     process.stdin.on("end", () => {
       let v;
       try { v = JSON.parse(s)["dist-tags"].latest; } catch { v = undefined; }
-      if (typeof v !== "string" || !/^[0-9]+\.[0-9]+\.[0-9]+$/.test(v)) process.exit(1);
+      if (v === undefined) process.exit(1);
+      if (typeof v !== "string" || !/^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$/.test(v)) {
+        process.stdout.write(String(JSON.stringify(v)).replace(/[^ -~]|\\/g, "?").slice(0, 200));
+        process.exit(3);
+      }
       process.stdout.write(v);
     });
   '
@@ -877,7 +889,18 @@ fi
 # message. A version that is ALREADY published is a legitimate resume (later
 # steps skip it), so only a not-yet-published version at or below the current
 # npm latest is blocked.
-LATEST_NPM=$(npm_latest_version || echo "")
+LATEST_NPM_RC=0
+LATEST_NPM=$(npm_latest_version) || LATEST_NPM_RC=$?
+# Exit 3 is a `latest` that IS there but is not a version: keep what npm
+# returned for the message below, and leave LATEST_NPM empty so nothing tries
+# to order against it.
+LATEST_NPM_BAD=""
+if [ "$LATEST_NPM_RC" -eq 3 ]; then
+  LATEST_NPM_BAD="$LATEST_NPM"
+  LATEST_NPM=""
+elif [ "$LATEST_NPM_RC" -ne 0 ]; then
+  LATEST_NPM=""
+fi
 # npm_latest_version cannot distinguish "the registry read failed" from "the
 # package is unpublished" -- both yield an empty string -- and the ordering
 # guard below is gated on LATEST_NPM being non-empty, so a transient 5xx, proxy
@@ -900,7 +923,16 @@ LATEST_NPM=$(npm_latest_version || echo "")
 # an unrelated probe would block the recovery re-run -- the same carve-out the
 # npm-auth guard below makes on ALREADY_PUBLISHED.
 if [ -z "$LATEST_NPM" ]; then
-  if [ "$RESUMING" = true ] || [ "${ALLOW_UNVERIFIED_VERSION:-}" = "1" ]; then
+  if [ -n "${LATEST_NPM_BAD:-}" ]; then
+    # The registry answered; its `latest` is just not something to order
+    # against. Say what it is -- "unreadable, retry" would send the operator
+    # round a loop no retry ends.
+    if [ "$RESUMING" = true ] || [ "${ALLOW_UNVERIFIED_VERSION:-}" = "1" ]; then
+      warn "npm's 'latest' dist-tag for @yawlabs/mcp is ${LATEST_NPM_BAD}, which is not a semver version, so the backward-version ordering guard is SKIPPED for this run"
+    else
+      fail "npm's 'latest' dist-tag for @yawlabs/mcp is ${LATEST_NPM_BAD}, which is not a semver version -- cannot verify version ordering. The registry answered, so a retry will not change this: check 'npm dist-tag ls @yawlabs/mcp' and point latest at a release (npm dist-tag add @yawlabs/mcp@<x.y.z> latest), or set ALLOW_UNVERIFIED_VERSION=1 to proceed deliberately."
+    fi
+  elif [ "$RESUMING" = true ] || [ "${ALLOW_UNVERIFIED_VERSION:-}" = "1" ]; then
     warn "npm's packument returned no 'latest' for @yawlabs/mcp -- the registry is unreadable, so the backward-version ordering guard is SKIPPED for this run"
   else
     fail "npm's packument returned no 'latest' for @yawlabs/mcp -- cannot verify version ordering. The package IS published, so this is a registry read failure, not a first publish; continuing would silently disable the backward-version guard. Retry, or set ALLOW_UNVERIFIED_VERSION=1 to proceed deliberately."
@@ -909,7 +941,13 @@ fi
 ALREADY_PUBLISHED=""
 if npm_has_version "$VERSION"; then ALREADY_PUBLISHED="$VERSION"; fi
 if [ -n "$LATEST_NPM" ] && [ "$ALREADY_PUBLISHED" != "$VERSION" ]; then
-  if node -e 'const a=process.argv[1].split(".").map(Number),b=process.argv[2].split(".").map(Number);for(let i=0;i<3;i++){if((a[i]||0)>(b[i]||0))process.exit(0);if((a[i]||0)<(b[i]||0))process.exit(1);}process.exit(1);' "$VERSION" "$LATEST_NPM"; then
+  # Semver precedence over x.y.z, with LATEST_NPM possibly a prerelease (and
+  # build metadata, which semver ignores). The cores decide first, so a latest
+  # of 1.1.0-rc.1 keeps 1.0.19 out; on equal cores a release outranks a
+  # prerelease, so 1.1.0 passes over 1.1.0-rc.1 -- npm moves latest onto it.
+  # VERSION is strict x.y.z (the usage check above), so two prereleases never
+  # meet here; anything unparsed is "not greater", the side that stops.
+  if node -e 'const p=(s)=>{const m=/^([0-9]+)\.([0-9]+)\.([0-9]+)(-[^+]+)?(\+.*)?$/.exec(s);return m?{c:[Number(m[1]),Number(m[2]),Number(m[3])],pre:m[4]!==undefined}:null;};const a=p(process.argv[1]),b=p(process.argv[2]);if(!a||!b||a.pre)process.exit(1);for(let i=0;i<3;i++){if(a.c[i]>b.c[i])process.exit(0);if(a.c[i]<b.c[i])process.exit(1);}process.exit(b.pre?0:1);' "$VERSION" "$LATEST_NPM"; then
     info "Version ${VERSION} > published latest ${LATEST_NPM}"
   else
     fail "Version ${VERSION} is not greater than the published latest ${LATEST_NPM} -- npm will not move the 'latest' tag backward. This is almost always a fat-finger; pick a version > ${LATEST_NPM}."
@@ -1328,6 +1366,9 @@ if [ "$REMOTE_TAG_RC" -ne 0 ]; then
   fail "Could not list origin's tags (git ls-remote exited ${REMOTE_TAG_RC}; output above) -- refusing to push without knowing which local tags --follow-tags would add. Fix connectivity or auth and re-run ./release.sh ${VERSION}: the bump commit and v${VERSION} are local, and the re-run resumes from them."
 fi
 # One ref per line, matched whole (-x) so v1.0.1 cannot pass as v1.0.10.
+# The local names come from %(refname:strip=2), not :short -- :short renders a
+# tag as `tags/<name>` when a local branch shares its name, and that spelling
+# matched nothing below, so such a stale tag was silently skipped.
 REMOTE_TAG_REFS=$(awk '{ print $2 }' <<<"$REMOTE_TAG_LIST")
 STALE_TAGS=""
 while read -r LOCAL_TAG_TYPE LOCAL_TAG; do
@@ -1341,7 +1382,7 @@ while read -r LOCAL_TAG_TYPE LOCAL_TAG; do
   [ "$LOCAL_TAG_TYPE" = "tag" ] || continue
   git merge-base --is-ancestor "refs/tags/${LOCAL_TAG}^{commit}" HEAD 2>/dev/null || continue
   STALE_TAGS="${STALE_TAGS} ${LOCAL_TAG}"
-done <<<"$(git for-each-ref --format='%(objecttype) %(refname:short)' refs/tags)"
+done <<<"$(git for-each-ref --format='%(objecttype) %(refname:strip=2)' refs/tags)"
 if [ -n "$STALE_TAGS" ]; then
   fail "Local annotated tag(s)${STALE_TAGS} are absent from origin, and 'git push --follow-tags' would push them alongside v${VERSION}. A release tag deleted on origin on purpose must not come back: delete each here too (git tag -d <tag>) and re-run ./release.sh ${VERSION} -- the bump commit and v${VERSION} are local, and the re-run resumes from them. If one is meant to exist on origin, push it deliberately first (git push origin <tag>)."
 fi

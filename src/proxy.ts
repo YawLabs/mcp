@@ -497,10 +497,14 @@ export async function routeResourceRead(
       // KNOWN PROTOCOL DEVIATION, left as is. This arm -- and every other
       // failure arm in routeResourceRead and routePromptGet below (unknown
       // resource/prompt, namespace not connected, upstream threw) -- answers
-      // with a SUCCESSFUL resources/read or prompts/get result whose text
-      // starts "Error:", not with a JSON-RPC error. A client therefore cannot
-      // tell a failed read from a resource whose content is the string
-      // "Error: ...", and its retry/backoff logic never sees a failure. The
+      // with a SUCCESSFUL resources/read or prompts/get result carrying the
+      // failure as plain text, not with a JSON-RPC error. Only the two
+      // "threw" arms (this builtin one and the upstream catch) prefix the text
+      // "Error:"; unknown-resource/prompt says "Unknown resource: <uri>" /
+      // "Unknown prompt: <name>" and not-connected says 'Server "<ns>" is not
+      // connected.', so there is not even a common prefix to sniff. A client
+      // therefore cannot tell a failed read from a resource whose content is
+      // that text, and its retry/backoff logic never sees a failure. The
       // tools/call path is different on purpose (isError + the routing-fault
       // brand); these two have no such convention. Switching them to McpError
       // is client-visible -- a client that today renders the text would

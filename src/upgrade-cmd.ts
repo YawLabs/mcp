@@ -948,7 +948,13 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
     writeErr(`${s}\n`);
   };
 
-  const fetcher = opts.fetchLatest ?? fetchLatestVersion;
+  // The DEFAULT registry probe is off under a test harness (isTestSandbox),
+  // like every other default this command runs (`npm prefix -g`, `oam
+  // --version`) and as `yaw-mcp --help` says of VITEST: a stale global copy
+  // spawned by some other package's test run must not reach the network. An
+  // injected `fetchLatest` always runs, which is how the tests reach the
+  // real paths. Null reads as "registry unreachable", the offline answer.
+  const fetcher = opts.fetchLatest ?? (isTestSandbox() ? async () => null : fetchLatestVersion);
   const current = opts.currentVersion ?? readCurrentVersion();
   const argvPath = opts.argvPath ?? process.argv[1];
   // A standalone SEA binary has no package manager and no script path in

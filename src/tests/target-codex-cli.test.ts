@@ -766,32 +766,60 @@ describe("install refuses rather than corrupt a file", () => {
     });
   }
 
-  it("classifies a LEGACY entry in a refused spelling as unspliceable, so doctor warns before install writes", () => {
+  it("a LEGACY entry in a refused spelling refuses only the edit that removes it, not the file", () => {
     // Install trims a legacy entry with a `remove` edit in the same write
     // that adds ours, and the splice refuses to delete an inline or dotted
-    // spelling. Read as `ok`, that file sent the user to an install that
-    // failed at the write; read as `unspliceable`, doctor prints the by-hand
-    // step and install refuses before it writes.
+    // spelling. The read names it (`ok.unspliceableEntries`) so doctor can
+    // warn and the facade refuses that removal with the by-hand step -- but
+    // it must not refuse the WHOLE file: a --keep-legacy run, which never
+    // touches the legacy entry, still writes.
     const site = siteFor();
     for (const legacy of LEGACY_ENTRY_NAMES) {
       const key = legacy.includes(".") ? `"${legacy}"` : legacy;
       const raw = `[mcp_servers]\n${key} = { command = "npx" }\n`;
       const view = classifyClientConfig(raw, site, { transform: CODEX.entry });
-      expect(view.read).toMatchObject({ kind: "unspliceable", key: legacy });
-      expect(view.read.kind === "unspliceable" ? view.read.reason : "").toMatch(/an inline table under/);
-      expect(refusalOf(() => installThrough(raw, site))).toContain(`the "${legacy}" entry`);
+      if (view.read.kind !== "ok") throw new Error(`${legacy}: not ok: ${view.read.kind}`);
+      expect(view.read.unspliceableEntries).toEqual([
+        { key: legacy, reason: expect.stringMatching(/an inline table under/), fix: expect.any(String) },
+      ]);
+      const refusal = refusalOf(() => installThrough(raw, site));
+      expect(refusal).toContain(`the "${legacy}" entry`);
+      expect(refusal).toContain("then re-run");
+      // --keep-legacy: ours is added, the legacy line is left byte-for-byte.
+      const kept = installThrough(raw, site, { keepLegacy: true });
+      expect(kept.next).toContain(`${key} = { command = "npx" }`);
+      expect(classifyClientConfig(kept.next, site, { transform: CODEX.entry }).entry()).toBeDefined();
     }
-    // Our own entry's problem is the one reported when both are refused.
+    // The audited file: a CORRECT [mcp_servers.mcp] table beside an inline
+    // legacy entry. It read `unspliceable` (key "yaw-mcp"), so even a
+    // --keep-legacy install or uninstall refused it.
+    const correct = fixture("f01-missing", "expected");
+    const withLegacy = `[mcp_servers]\nyaw-mcp = { command = "npx" }\n\n${correct}`;
+    const view = classifyClientConfig(withLegacy, site, { transform: CODEX.entry });
+    expect(view.read.kind).toBe("ok");
+    expect(view.entry()).toBeDefined();
+    const removedOurs = applyClientConfigEdits(view, [{ op: "remove", key: ENTRY_NAME }], site);
+    expect(removedOurs).toContain('yaw-mcp = { command = "npx" }');
+    expect(classifyClientConfig(removedOurs, site, { transform: CODEX.entry }).entry()).toBeUndefined();
+    expect(refusalOf(() => applyClientConfigEdits(view, [{ op: "remove", key: "yaw-mcp" }], site))).toContain(
+      'the "yaw-mcp" entry',
+    );
+    // Our own entry's problem still refuses the whole file, and is the one
+    // reported when both are refused.
     const both = `[mcp_servers]\nmcp = { command = "npx" }\nyaw-mcp = { command = "npx" }\n`;
     expect(classifyClientConfig(both, site, { transform: CODEX.entry }).read).toMatchObject({
       kind: "unspliceable",
       key: ENTRY_NAME,
     });
-    // A legacy entry in a TABLE still reads ok and migrates (f08 above); a
-    // third-party sibling in an inline spelling is nobody's to rewrite and
-    // does not take the file hostage.
+    // A legacy entry in a TABLE still reads ok with nothing flagged and
+    // migrates (f08 above); a third-party sibling in an inline spelling is
+    // nobody's to rewrite and is not flagged either.
+    const f08 = classifyClientConfig(fixture("f08-legacy"), site, { transform: CODEX.entry }).read;
+    expect(f08.kind === "ok" ? f08.unspliceableEntries : "not ok").toBeUndefined();
     const sibling = `[mcp_servers]\nother = { command = "node" }\n\n[mcp_servers.mcp]\ncommand = "npx"\n`;
-    expect(classifyClientConfig(sibling, site, { transform: CODEX.entry }).read.kind).toBe("ok");
+    const siblingRead = classifyClientConfig(sibling, site, { transform: CODEX.entry }).read;
+    expect(siblingRead.kind).toBe("ok");
+    expect(siblingRead.kind === "ok" ? siblingRead.unspliceableEntries : "not ok").toBeUndefined();
   });
 
   it("writes an entry with an empty env through the facade: the read-back check uses the adapter's own omissions", () => {
@@ -1374,6 +1402,99 @@ describe("install and uninstall over an entry the splice will not edit", () => {
       }
     });
   }
+});
+
+describe("install and uninstall beside a legacy entry the splice will not remove", () => {
+  let home: string;
+  let projectDir: string;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "yaw-mcp-codex-stuck-legacy-home-"));
+    projectDir = mkdtempSync(join(tmpdir(), "yaw-mcp-codex-stuck-legacy-proj-"));
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(projectDir, { recursive: true, force: true });
+  });
+
+  const userFile = (): string => join(home, ".codex", "config.toml");
+  const LEGACY_LINE = 'yaw-mcp = { command = "npx" }';
+
+  /** Install's own file, with an inline legacy entry left above it. */
+  async function seedInstalledWithLegacy(): Promise<string> {
+    const first = await runInstall({
+      clientId: "codex-cli",
+      scope: "user",
+      os: "linux",
+      home,
+      cwd: projectDir,
+      io: captureIo().io,
+      oamProbe: OAM_ABSENT,
+      bundlesSummary: BUNDLES_EMPTY,
+    });
+    expect(first.exitCode).toBe(0);
+    const installed = readFileSync(userFile(), "utf8");
+    expect(installed).toContain("[mcp_servers.mcp]");
+    const raw = installed.replace("[mcp_servers.mcp]", `[mcp_servers]\n${LEGACY_LINE}\n\n[mcp_servers.mcp]`);
+    writeFileSync(userFile(), raw, "utf8");
+    return raw;
+  }
+
+  it("install --keep-legacy re-runs clean over a correct entry; a plain install refuses the trim with the step", async () => {
+    const raw = await seedInstalledWithLegacy();
+    const cap = captureIo();
+    const kept = await runInstall({
+      clientId: "codex-cli",
+      scope: "user",
+      os: "linux",
+      home,
+      cwd: projectDir,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+      bundlesSummary: BUNDLES_EMPTY,
+      keepLegacy: true,
+    });
+    expect(cap.stderr()).toBe("");
+    expect(kept.exitCode).toBe(0);
+    expect(readFileSync(userFile(), "utf8")).toBe(raw);
+
+    const plain = captureIo();
+    const refused = await runInstall({
+      clientId: "codex-cli",
+      scope: "user",
+      os: "linux",
+      home,
+      cwd: projectDir,
+      io: plain.io,
+      oamProbe: OAM_ABSENT,
+      bundlesSummary: BUNDLES_EMPTY,
+      force: true,
+    });
+    expect(refused.exitCode).toBe(1);
+    expect(plain.stderr()).toContain('the "yaw-mcp" entry');
+    expect(readFileSync(userFile(), "utf8")).toBe(raw);
+  });
+
+  it("uninstall --keep-legacy removes our entry and leaves the legacy line", async () => {
+    await seedInstalledWithLegacy();
+    const cap = captureIo();
+    const result = await runUninstall({
+      clientId: "codex-cli",
+      scope: "user",
+      os: "linux",
+      home,
+      cwd: projectDir,
+      io: cap.io,
+      force: true,
+      keepLegacy: true,
+    });
+    expect(cap.stderr()).toBe("");
+    expect(result.exitCode).toBe(0);
+    const after = readFileSync(userFile(), "utf8");
+    expect(after).toContain(LEGACY_LINE);
+    expect(after).not.toContain("[mcp_servers.mcp]");
+  });
 });
 
 // ---------------------------------------------------------------------------
