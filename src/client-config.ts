@@ -418,6 +418,15 @@ export type ConfigRead =
       entries: readonly EntryView[];
       unloadable: StrictViolation | null;
       containerUnspliceable?: { reason: string; fix: string };
+      /** Entries OTHER than ours that the file holds in a spelling the splicer
+       *  will not edit -- today a Codex legacy entry (`yaw-mcp = { ... }`
+       *  inline) that install would trim. Unlike an `unspliceable` read, which
+       *  refuses every edit, these refuse only an edit that names one of them
+       *  (applyClientConfigEdits), so a run that leaves them alone -- install
+       *  or uninstall with --keep-legacy -- still writes. Doctor reads it to
+       *  print the by-hand step before install refuses. Optional for the same
+       *  reason as above; absent when there are none. */
+      unspliceableEntries?: readonly { key: string; reason: string; fix?: string }[];
     };
 
 // ---------------------------------------------------------------------------
@@ -730,10 +739,14 @@ const REGISTERED = new Map<ConfigFormat, ConfigAdapter>();
  *  ReferenceError whenever the json module happened to be loaded first. Those
  *  helpers now live in client-config-values.ts and the json adapter imports
  *  nothing from this file at runtime (its imports from here are `import
- *  type`, erased), so there is no cycle and no order to get wrong --
- *  client-config-json.test.ts still imports that module first, which pins the
- *  cycle as gone rather than as survived. The function stays because a
- *  lookup by format is the shape the registry below has too. */
+ *  type`, erased), so there is no cycle and no order to get wrong.
+ *  client-config-json.test.ts still imports that module first, but that only
+ *  shows the json-first order loads today: with this read function-scoped it
+ *  would load just as well if the cycle came back, so the test cannot tell a
+ *  removed cycle from a survived one. What keeps it removed is the
+ *  types-only import at the top of client-config-json.ts, which nothing but
+ *  review enforces. The function stays because a lookup by format is the
+ *  shape the registry below has too. */
 function builtInAdapter(format: ConfigFormat): ConfigAdapter | undefined {
   if (format === "json") return JSON_ADAPTER;
   if (format === "jsonc") return JSONC_ADAPTER;
@@ -1245,6 +1258,8 @@ export class ClientConfigWriteError extends Error {
  *  What it refuses before touching anything:
  *    * any read that is not `ok` -- malformed, unreadable, unspliceable, or
  *      blocked without a `repair` edit for the blocked key;
+ *    * an upsert or remove naming an entry an `ok` read lists in
+ *      `unspliceableEntries` (a Codex legacy entry spelled inline);
  *    * an upsert or a repair into a file the CLIENT cannot load (strict JSON
  *      carrying a comment or a trailing comma). A remove is still allowed
  *      there: taking our entry out of a file the client skips is correct, and
@@ -1338,6 +1353,17 @@ export function applyClientConfigEdits(
     }
   } else if (read.kind !== "ok") {
     throw new ClientConfigWriteError(refusalFor(read, where, edits));
+  } else {
+    // An entry the read flagged as one the splicer will not edit refuses only
+    // the edit that names it -- with the same words, and the same by-hand
+    // step, as an `unspliceable` read -- so the edits that leave it alone run.
+    for (const edit of edits) {
+      if (edit.op !== "upsert" && edit.op !== "remove") continue;
+      const stuck = read.unspliceableEntries?.find((e) => e.key === edit.key);
+      if (stuck !== undefined) {
+        throw new ClientConfigWriteError(refusalFor({ kind: "unspliceable", ...stuck }, where, edits));
+      }
+    }
   }
   const unloadable = view.unloadable();
   if (unloadable !== null && writes) {

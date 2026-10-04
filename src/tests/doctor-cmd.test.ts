@@ -5484,6 +5484,30 @@ describe("runDoctor -- a TOML client config (Codex CLI) is classified by its ada
     expect(status).not.toContain("or delete it");
   });
 
+  it("a lone legacy entry install cannot remove names the by-hand step, not a migration or an mcp entry", async () => {
+    // The trim install makes in the migrating write is a removal the splice
+    // refuses for an inline spelling. The row used to say either "run install
+    // to migrate" (a run that exits 1) or, once the legacy name was folded
+    // into the refusing names, `has "mcp" entry` -- for a file with none.
+    const raw = '[mcp_servers]\nyaw-mcp = { command = "npx" }\n';
+    writeCodexToml(raw);
+    const read = classifyClientConfig(raw, codexSite()).read;
+    if (read.kind !== "ok" || read.unspliceableEntries?.[0]?.fix === undefined) {
+      throw new Error(`should read ok with a flagged legacy entry: ${read.kind}`);
+    }
+    const { reason, fix } = read.unspliceableEntries[0];
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const row = codexRow(r.snapshot.clients);
+    expect(row?.hasMcpEntry).toBe(false);
+    expect(row?.legacyEntryName).toBe("yaw-mcp");
+    expect(row?.legacyUnspliceable).toEqual({ reason, fix });
+    expect(row?.entryUnspliceable).toBeNull();
+    expect(clientsRow(cap.text(), CODEX_LABEL).status).toBe(
+      `legacy "yaw-mcp" entry present, but it is ${reason} -- install will not remove it, so the migration is refused; ${fix}, then run \`${CODEX_INSTALL}\``,
+    );
+  });
+
   it("an inline root container with no mcp entry (g09-inline-root) is not sent to a refused install run", async () => {
     // The read is fine -- Codex loads the file, --list says other-entries --
     // but the `[mcp_servers.mcp]` header install writes would redefine the
@@ -6106,6 +6130,26 @@ describe("runDoctor -- a THROWING bundles loader is a degraded report, not a fre
     expect(r.exitCode).toBe(2);
     const parsed = JSON.parse(r.lines[0]);
     expect(parsed.warnings).toContain("could not read bundles.json: EIO: i/o error");
+    // The servers list is UNKNOWN, and the block says so -- an empty array
+    // alone read as "no servers configured".
+    expect(parsed.oamRuntime.servers).toEqual([]);
+    expect(parsed.oamRuntime.bundlesUnreadable).toBe("EIO: i/o error");
+  });
+
+  it("--json: a healthy loader carries bundlesUnreadable: null", async () => {
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      err: () => {},
+      json: true,
+      skipRegistryCheck: true,
+    });
+    const parsed = JSON.parse(r.lines[0]);
+    expect(parsed.oamRuntime.bundlesUnreadable).toBeNull();
   });
 });
 

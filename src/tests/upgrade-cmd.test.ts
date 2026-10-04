@@ -909,6 +909,28 @@ describe("runUpgrade", () => {
     expect(out).toContain("OK:");
   });
 
+  it("under VITEST, the DEFAULT registry probe never touches the network (help says VITEST disables it)", async () => {
+    // `yaw-mcp --help` documents VITEST as disabling the registry probe
+    // `upgrade` would run, but the default fetcher was not gated: a copy
+    // spawned under another package's test run still hit the registry.
+    expect(process.env.VITEST).toBeTruthy();
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ version: "9.9.9" })));
+    vi.stubGlobal("fetch", fetchMock);
+    const io = captureIO();
+    await runUpgrade({
+      currentVersion: "0.45.0",
+      argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
+      isSea: () => false,
+      npmPrefix: async () => null,
+      out: io.push,
+      err: io.pushErr,
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+    // The offline answer, not the stubbed registry's.
+    expect(io.out.join("\n")).toContain("couldn't reach the npm registry");
+    expect(io.out.join("\n")).not.toContain("9.9.9");
+  });
+
   it("exits 1 and prints the command when stale and --run not passed (global-npm)", async () => {
     const io = captureIO();
     const r = await runUpgrade({

@@ -541,14 +541,19 @@ export interface RankedTool {
   score: number;
 }
 
-/** Did the query name this namespace? True when the query carries the
- *  namespace whole ("aws_s3" survives tokenizeQuery only when the caller
- *  wrote it without the underscore, so that form is checked verbatim) OR
- *  every identifier token of it ("aws" and "s3" for `aws_s3`). A whole-string
- *  test alone could never award the bonus to a multi-segment namespace,
- *  because the query is tokenized on the same separators the namespace is
- *  built from. A namespace that tokenizes to nothing never matches: an
- *  `every` over an empty list would be vacuously true. */
+/** Did the query name this namespace? True when every identifier token of
+ *  it is a query term ("aws" and "s3" for `aws_s3`). The query is tokenized
+ *  on the same non-alphanumeric separators the namespace is split on here, so
+ *  `aws_s3`, `aws-s3` and "aws s3" in the query all qualify -- while "awss3"
+ *  does not: it is one token, and neither branch below joins segments.
+ *
+ *  The verbatim check is only a fast path. A query term never contains a
+ *  separator, so it can equal the whole lowercased namespace only when the
+ *  namespace has none either -- and then tokenizeIdent yields that same
+ *  single token and the `every` branch answers identically. A whole-string
+ *  test alone could never award the bonus to a multi-segment namespace. A
+ *  namespace that tokenizes to nothing never matches: an `every` over an
+ *  empty list would be vacuously true. */
 function queryNamesNamespace(queryTerms: Set<string>, namespace: string): boolean {
   if (queryTerms.has(namespace.toLowerCase())) return true;
   const parts = tokenizeIdent(namespace);

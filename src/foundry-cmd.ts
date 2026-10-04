@@ -29,7 +29,7 @@ import {
   scoreCorpus,
   traceDropReason,
 } from "./foundry-corpus.js";
-import { loadLocalBundles } from "./local-bundles.js";
+import { loadLocalBundles, probeProjectTrust, projectFileIsHonoured } from "./local-bundles.js";
 import { createStreamWriter } from "./logger.js";
 import { userConfigDir } from "./paths.js";
 import { loadState, statePath } from "./persistence.js";
@@ -131,12 +131,30 @@ export async function defaultLoadServers(cwd: string | undefined, home: string):
  *  reads as "your catalog is empty" when the truth is "no catalog was found
  *  at any of the paths the loader consults". `bundlesPath` is null when no
  *  file was found (a present-but-malformed file still names its path, and
- *  its own warnings explain the empty server list). */
+ *  its own warnings explain the empty server list).
+ *
+ *  `untrustedProjectPath` is set when bundlesPath is null BECAUSE the only
+ *  file present is a project bundles.json the user has not approved: the
+ *  loader skips it, so "no bundles.json found" would be false for a file that
+ *  sits right there. Probed separately because loadLocalBundles reports the
+ *  verdict only as warning prose. */
 export async function loadServerCatalog(
   cwd: string | undefined,
   home: string,
-): Promise<{ servers: RankableServer[]; bundlesPath: string | null; consultedPaths: string[] }> {
+): Promise<{
+  servers: RankableServer[];
+  bundlesPath: string | null;
+  consultedPaths: string[];
+  untrustedProjectPath: string | null;
+}> {
   const { config, path: bundlesPath, consultedPaths } = await loadLocalBundles({ cwd, home });
+  let untrustedProjectPath: string | null = null;
+  if (bundlesPath === null && consultedPaths.length > 1) {
+    const probe = await probeProjectTrust({ cwd, home });
+    if (probe.path !== null && probe.status !== "none" && !projectFileIsHonoured(probe)) {
+      untrustedProjectPath = probe.path;
+    }
+  }
   // Hydrate the PERSISTED tool cache, mirroring ConnectServer.rankableFor.
   // bundles.json's loader does not carry `toolCache` through its field
   // whitelist, so a snapshot built from the config alone gives every server
@@ -158,7 +176,7 @@ export async function loadServerCatalog(
     description: s.description,
     tools: state.toolCache[s.namespace]?.tools ?? s.toolCache ?? [],
   }));
-  return { servers, bundlesPath, consultedPaths };
+  return { servers, bundlesPath, consultedPaths, untrustedProjectPath };
 }
 
 export async function runFoundryExport(opts: FoundryExportOptions): Promise<{ exitCode: number; lines: string[] }> {
@@ -209,10 +227,18 @@ export async function runFoundryExport(opts: FoundryExportOptions): Promise<{ ex
   } else {
     const catalog = await loadServerCatalog(opts.cwd, home);
     servers = catalog.servers;
-    catalogNote =
-      catalog.bundlesPath === null
-        ? `no bundles.json found -- looked for ${catalog.consultedPaths.join(" and ")}`
-        : `${servers.length} ${servers.length === 1 ? "server" : "servers"} in ${catalog.bundlesPath}`;
+    if (catalog.untrustedProjectPath !== null) {
+      // bundlesPath null with an untrusted project file means the user-global
+      // file is absent too (it would have loaded otherwise), so the project
+      // file is the whole story -- and `yaw-mcp trust` the fix.
+      const others = catalog.consultedPaths.filter((p) => p !== catalog.untrustedProjectPath);
+      catalogNote = `${catalog.untrustedProjectPath} is not approved, so it was skipped -- run \`yaw-mcp trust\` to approve it${others.length > 0 ? `; no bundles.json at ${others.join(" or ")}` : ""}`;
+    } else {
+      catalogNote =
+        catalog.bundlesPath === null
+          ? `no bundles.json found -- looked for ${catalog.consultedPaths.join(" and ")}`
+          : `${servers.length} ${servers.length === 1 ? "server" : "servers"} in ${catalog.bundlesPath}`;
+    }
   }
   const corpus = buildCorpusFromTraces(traces, servers, { cap: opts.cap });
 

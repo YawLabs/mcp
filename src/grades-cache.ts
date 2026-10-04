@@ -16,7 +16,7 @@
 // run repopulates it. We never fail a list/read on a malformed cache -- a
 // garbage grades.json is treated as "no cached grades" and ignored.
 
-import { type FileHandle, mkdir, open, readdir, readFile, rename, rm, stat, utimes } from "node:fs/promises";
+import { type FileHandle, mkdir, open, readdir, readFile, rename, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -245,8 +245,14 @@ export interface WriteGradeOptions {
  *  a lock this process cannot create sits in the directory grades.json itself
  *  could not have been written into. The one exception is withGradesLock's to
  *  make, not this function's: on Windows it retries a transient errno for up
- *  to GRADES_LOCK_TRANSIENT_MS before letting it through. */
-async function takeLock(lockPath: string, token: string): Promise<boolean> {
+ *  to GRADES_LOCK_TRANSIENT_MS before letting it through.
+ *
+ *  `times`, when given, is applied through the HANDLE this call created, after
+ *  the token write and before the close -- so it can only ever reach the file
+ *  this take made. A path-based utimes after the take could land on a
+ *  different holder's lock (see stealStaleLock's restore). Best-effort: a
+ *  failed utimes leaves the lock held, merely younger. */
+async function takeLock(lockPath: string, token: string, times?: { atime: Date; mtime: Date }): Promise<boolean> {
   let fh: FileHandle;
   try {
     fh = await open(lockPath, "wx");
@@ -256,6 +262,7 @@ async function takeLock(lockPath: string, token: string): Promise<boolean> {
   }
   try {
     await fh.writeFile(token);
+    if (times) await fh.utimes(times.atime, times.mtime).catch(() => undefined);
     await fh.close();
   } catch (err) {
     // The O_EXCL open succeeded, so a lock now sits at lockPath and NOBODY
@@ -310,14 +317,17 @@ export async function stealStaleLock(lockPath: string, isLive: (ageMs: number) =
     // EEXIST here means a THIRD process took the path meanwhile. The live
     // holder's lock is then simply gone, and the cost is bounded to one
     // possible lost grade in that three-way race -- the pre-lock behavior.
-    if (await takeLock(lockPath, holder.token).catch(() => false)) {
-      // The restored file is a NEW file, so without this it carries a fresh
-      // mtime and the holder's lease is silently extended by up to the whole
-      // stale age -- a crashed holder's lock would then survive one extra
-      // round of waiting for every stealer that caught it live. Best-effort:
-      // if the utimes fails the lock still holds, merely younger.
-      await utimes(lockPath, holder.atime, holder.mtime).catch(() => undefined);
-    }
+    //
+    // The holder's ORIGINAL times ride into the take: the restored file is a
+    // NEW file, so without them it carries a fresh mtime and the holder's
+    // lease is silently extended by up to the whole stale age -- a crashed
+    // holder's lock would then survive one extra round of waiting for every
+    // stealer that caught it live. They are applied through the take's own
+    // handle, never by path afterwards: once takeLock has closed, the
+    // restored holder may already have released and a third process taken
+    // the path fresh, and a path-based backdate would age THAT live lock
+    // toward stale.
+    await takeLock(lockPath, holder.token, { atime: holder.atime, mtime: holder.mtime }).catch(() => false);
   }
   // A failed rm here (an AV or indexer handle on Windows, the same transient
   // hold the rename above can meet) leaves `<lock>.stale-<pid>-<n>` behind.

@@ -235,9 +235,17 @@ describe("redactIntent", () => {
     expect(dotted.redactedCount).toBe(0);
     // A date NEXT TO a real phone number is still a phone number: the excluded
     // group is set aside and the remaining digits clear the floor on their own.
-    const mixed = redactIntent("on 2024-01-15 call 555 123 4567");
+    // Truly adjacent -- one whitespace-joined run, so the matcher nominates
+    // date and phone TOGETHER and the set-aside-then-count path is what has to
+    // decide. (A word between them, as this case used to have, splits them
+    // into two matches -- the date judged alone, the phone judged alone -- and
+    // never reaches that path.) The verdict is per MATCH, so the whole run is
+    // scrubbed, date included; only the phone side is pinned here.
+    const mixed = redactIntent("deploy 2024-01-15 555 123 4567");
     expect(mixed.redactedCount).toBe(1);
+    expect(mixed.tokens).not.toContain("555");
     expect(mixed.tokens).not.toContain("4567");
+    expect(mixed.tokens).toContain("deploy");
   });
 
   it("applies the same 2-digit floor to #N that the ticket rule applies to PROJ-N", () => {

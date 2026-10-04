@@ -736,10 +736,12 @@ function secretMatchVariants(value: string): string[] {
  *  that was written as a `${secret:NAME}` ref (resolved form, keyed by the env
  *  name) plus the bare decrypted values keyed by secret name -- and a LITERAL
  *  entry goes in only when its NAME reads as a credential under the same
- *  classifier credentialShapedParentEnv applies to the inherited env. A
- *  literal under a non-credential name (DATA_DIR, BASE_URL, PROJECT_PATH) is
- *  configuration the reader needs to see, and redacting it hid the path an
- *  error was about while protecting nothing.
+ *  classifier credentialShapedParentEnv applies to the inherited env, or when
+ *  its VALUE is a URL carrying a userinfo password (hasUrlPassword: a literal
+ *  DSN under DATABASE_URL). Any other literal under a non-credential name
+ *  (DATA_DIR, BASE_URL, PROJECT_PATH) is configuration the reader needs to
+ *  see, and redacting it hid the path an error was about while protecting
+ *  nothing.
  *
  *  The ref test is a plain substring check on the CONFIG value, the same one
  *  resolveServerEnv's refKeys uses, so a ref that resolution left alone still
@@ -754,9 +756,22 @@ function localRedactionMap(
   for (const [k, v] of Object.entries(serverEnv)) {
     if (typeof v !== "string") continue;
     const raw = configEnv[k];
-    if ((typeof raw === "string" && raw.includes("${secret:")) || isCredentialEnvName(k)) out[k] = v;
+    if ((typeof raw === "string" && raw.includes("${secret:")) || isCredentialEnvName(k) || hasUrlPassword(v)) {
+      out[k] = v;
+    }
   }
   return { ...out, ...secretValues };
+}
+
+/** True when `value` is a URL whose userinfo carries a password --
+ *  `postgres://user:pass@host`, or Redis's empty-user `redis://:pass@host`.
+ *  The name classifier cannot see this case: DATABASE_URL / REDIS_URL /
+ *  MONGODB_URI are not credential-shaped NAMES, yet a literal DSN under one
+ *  holds the password inline, and a driver that echoes its DSN on a failed
+ *  connect would put it in the stderr tail. A URL with no userinfo, or a user
+ *  without a password, stays readable like any other configuration. */
+function hasUrlPassword(value: string): boolean {
+  return /^[a-z][a-z0-9+.-]*:\/\/[^/@\s:]*:[^/@\s]+@/i.test(value.trim());
 }
 
 /** The credential-shaped slice of the PARENT env -- the half of the child's

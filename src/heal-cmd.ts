@@ -67,8 +67,15 @@ export function parseHealArgs(
   return { ok: true, options };
 }
 
+/** The file, plus the project container inside it for a local-scope entry:
+ *  ~/.claude.json holds one container per project, and without the key every
+ *  project's line read the same. */
+function where(r: { path: string; project?: string }): string {
+  return r.project === undefined ? r.path : `${r.path} (project ${r.project})`;
+}
+
 function describe(h: HealedEntry): string {
-  const lines = [`  ${h.clientId} (${h.scope}): ${h.path}`, `    was -> ${h.from}`, `    now -> ${h.to}`];
+  const lines = [`  ${h.clientId} (${h.scope}): ${where(h)}`, `    was -> ${h.from}`, `    now -> ${h.to}`];
   // install's own caveat when it writes the same path (see HealedEntry.note).
   if (h.note !== undefined) lines.push(`    Note: ${h.note}`);
   return lines.join("\n");
@@ -79,7 +86,7 @@ function describe(h: HealedEntry): string {
  *  file and, where there is one, the step past it), and the re-run. */
 function describeFailures(failed: readonly FailedHeal[], dryRun: boolean): string {
   const one = failed.length === 1;
-  const rows = failed.map((f) => `  ${f.clientId} (${f.scope}): ${f.path}\n    still -> ${f.from}\n    ${f.error}`);
+  const rows = failed.map((f) => `  ${f.clientId} (${f.scope}): ${where(f)}\n    still -> ${f.from}\n    ${f.error}`);
   return (
     `yaw-mcp heal: ${dryRun ? "cannot" : "could not"} re-point ${failed.length} stale ${one ? "entry" : "entries"}:\n` +
     `${rows.join("\n")}\n` +
@@ -129,9 +136,11 @@ export async function runHeal(
     // the two fields together are what makes `--dry-run --json` and a live
     // `--json` distinguishable, since the entry lists are otherwise identical
     // for the same files. A `healed` entry carries `note` only when its new
-    // path is a project-local install (see HealedEntry.note). `failed` is the
-    // newest field; the others keep their meaning, so a reader that knows
-    // only those reads what it always did.
+    // path is a project-local install (see HealedEntry.note), and every
+    // record in the three lists carries `project` only when it is one Claude
+    // Code project's container in ~/.claude.json (see HealedEntry.project).
+    // `failed` and `project` are the newest fields; the others keep their
+    // meaning, so a reader that knows only those reads what it always did.
     process.stdout.write(
       `${JSON.stringify({ healed, unhealable, failed, count: healed.length, dryRun: options.dryRun === true }, null, 2)}\n`,
     );
@@ -167,7 +176,7 @@ export async function runHeal(
     if (unhealable.length > 0) {
       process.stdout.write(
         `${printed ? "\n" : ""}${unhealable.length} config${unhealable.length === 1 ? "" : "s"} could not be checked:\n` +
-          `${unhealable.map((u) => `  ${u.clientId} (${u.scope}): ${u.path} -- ${u.reason}`).join("\n")}\n` +
+          `${unhealable.map((u) => `  ${u.clientId} (${u.scope}): ${where(u)} -- ${u.reason}`).join("\n")}\n` +
           "Run `yaw-mcp doctor` for what each one needs.\n",
       );
       printed = true;

@@ -4878,6 +4878,32 @@ describe("runSecrets set on a legacy vault -- the two things it has to say", () 
     ).toBe(0);
   });
 
+  it("the emptied-vault note is not printed when the prompt cannot be shown (no echo-off)", async () => {
+    // The note used to be written BEFORE the prompt, so a terminal that would
+    // not enter raw mode -- no prompt, a NO_ECHO refusal -- still got a line
+    // about "the one you enter now" on stdout with nothing to enter.
+    await writeV1Vault(["GH"]);
+    expect(
+      (await runSecrets({ action: "remove", name: "GH", passphrase: V1_PASS, force: true, home }, io)).exitCode,
+    ).toBe(0);
+    lock();
+    const stdin = new RawRefusingTTYStdin(["typed\r"]);
+    const r = await runSecrets(
+      {
+        action: "set",
+        name: "NEW",
+        value: "v",
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(1);
+    expect(errText()).toContain("would not turn echo off");
+    expect(promptText()).not.toContain("is empty");
+    expect(promptText()).not.toContain("Vault passphrase: ");
+  });
+
   it("a genuinely fresh vault gets the confirm-twice prompt with no such note", async () => {
     const stdin = new FakeTTYStdin(["brand-new-passphrase\r", "brand-new-passphrase\r"]);
     const r = await runSecrets(

@@ -1,11 +1,13 @@
 // The JSON-family adapter, exercised through the PUBLIC contract: classify,
 // then applyClientConfigEdits, then the bytes.
 //
-// This module is imported FIRST on purpose. client-config.ts and
-// client-config-json.ts import each other (the model owns the shared helpers;
-// the registry reaches the adapters), so a top-level read of an adapter
-// binding in the model would throw a TDZ ReferenceError in exactly this import
-// order. The first `adapterFor` call below is what proves it does not.
+// This module is imported FIRST on purpose. client-config-json.ts imports only
+// TYPES from client-config.ts (the shared value helpers moved to the leaf
+// client-config-values.ts), so there is no runtime cycle left; this import
+// order is the one a reintroduced cycle would break with a TDZ ReferenceError.
+// It cannot tell "no cycle" from "a cycle that happens to be harmless" -- the
+// types-only import is what keeps it removed. The first `adapterFor` call below
+// is what proves this order loads.
 
 import { describe, expect, it } from "vitest";
 import {

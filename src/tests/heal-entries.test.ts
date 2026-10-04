@@ -725,6 +725,8 @@ describe("healStaleBrokerEntries -- every project's local-scope container, not o
     const healed = await heal({ env: {}, cwd: home });
     const local = healed.filter((h) => h.clientId === "claude-code" && h.scope === "local");
     expect(local.map((h) => [h.path, h.from, h.to])).toEqual([[p, DEAD, liveEntry]]);
+    // The project key rides on the entry: one file, many containers.
+    expect(local.map((h) => h.project)).toEqual([other]);
     const after = JSON.parse(readFileSync(p, "utf8")) as {
       projects: Record<string, { mcpServers: { mcp: { args: string[] } } }>;
     };
@@ -746,7 +748,59 @@ describe("healStaleBrokerEntries -- every project's local-scope container, not o
     const healed = await heal({ env: {}, cwd: home });
     const local = healed.filter((h) => h.clientId === "claude-code" && h.scope === "local");
     expect(local).toHaveLength(2);
+    expect(local.map((h) => h.project)).toEqual([mine, other]);
     expect(readFileSync(p, "utf8")).toBe(claudeJsonWithProjects({ [mine]: liveEntry, [other]: liveEntry }));
+  });
+});
+
+describe("healStaleBrokerEntries -- ~/.claude.json is read once per sweep, however many projects it holds", () => {
+  const key = (name: string): string => (process.platform === "win32" ? `C:\\work\\${name}` : `/work/${name}`);
+
+  it("reads a many-project file once, and still heals the one dead entry and reports the blocked one", async () => {
+    // The local-scope fan-out used to re-read and re-parse ~/.claude.json once
+    // per project inside healSite, on every serve start -- and the user slot
+    // read it once more. Each project without our entry is now dropped off the
+    // one listing read, and every read of the file shares one set of bytes.
+    const p = join(home, ".claude.json");
+    const projects: Record<string, unknown> = {
+      [key("dead")]: { mcpServers: { mcp: { command: OAM_BIN, args: ["run", "--no-check", DEAD] } } },
+      [key("live")]: { mcpServers: { mcp: { command: OAM_BIN, args: ["run", "--no-check", liveEntry] } } },
+      [key("none")]: { mcpServers: { other: { command: "node" } } },
+      [key("bare")]: { allowedTools: [] },
+      [key("blocked")]: { mcpServers: [] },
+    };
+    writeFileSync(p, `${JSON.stringify({ projects }, null, 2)}\n`);
+    const reads: string[] = [];
+    const result = await healResult({
+      env: {},
+      readFile: async (path: string) => {
+        reads.push(path);
+        return readFileSync(path);
+      },
+    });
+    expect(reads.filter((r) => r === p)).toHaveLength(1);
+    const local = result.healed.filter((h) => h.clientId === "claude-code" && h.scope === "local");
+    expect(local.map((h) => [h.project, h.from, h.to])).toEqual([[key("dead"), DEAD, liveEntry]]);
+    // A non-object container is still read and still reported, by project.
+    expect(
+      result.unhealable.filter((u) => u.clientId === "claude-code").map((u) => [u.scope, u.project, u.reason]),
+    ).toEqual([["local", key("blocked"), "blocked"]]);
+  });
+
+  it("a later container sees an earlier container's repair (the cached bytes follow the write)", async () => {
+    const p = join(home, ".claude.json");
+    const projects: Record<string, unknown> = {
+      [key("one")]: { mcpServers: { mcp: { command: OAM_BIN, args: ["run", "--no-check", DEAD] } } },
+      [key("two")]: { mcpServers: { mcp: { command: OAM_BIN, args: ["run", "--no-check", DEAD] } } },
+    };
+    writeFileSync(p, `${JSON.stringify({ projects }, null, 2)}\n`);
+    const healed = await heal({ env: {} });
+    expect(healed.filter((h) => h.scope === "local").map((h) => h.project)).toEqual([key("one"), key("two")]);
+    const after = JSON.parse(readFileSync(p, "utf8")) as {
+      projects: Record<string, { mcpServers: { mcp: { args: string[] } } }>;
+    };
+    expect(after.projects[key("one")].mcpServers.mcp.args[2]).toBe(liveEntry);
+    expect(after.projects[key("two")].mcpServers.mcp.args[2]).toBe(liveEntry);
   });
 });
 
@@ -779,5 +833,7 @@ describe("healStaleBrokerEntries -- a repair onto a project-local path says so",
     expect(codex).toHaveLength(1);
     expect(codex[0].note).toBeUndefined();
     expect("note" in codex[0]).toBe(false);
+    // Not a Claude Code project container, so no project key either.
+    expect("project" in codex[0]).toBe(false);
   });
 });

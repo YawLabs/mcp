@@ -188,21 +188,41 @@ function tomlPosition(raw: string, line: number, column: number): ConfigPosition
   return { offset: Math.min(offset + column - 1, raw.length), line, column };
 }
 
-/** The names `classify` asks about SPLICEABILITY: ours, and the legacy
- *  spellings install migrates.
+/** The names `classify` asks about SPLICEABILITY in a way that refuses the
+ *  whole file: ours alone.
  *
- *  Ours first, so a problem with our own entry is the one reported when both
- *  are in a refused spelling. The legacy names are in the list because install
- *  EDITS a legacy entry: it trims one with a `remove` edit in the same write
- *  that adds ours, and the splice refuses to delete an inline or dotted
- *  spelling. With the legacy names left out, such a file read `ok`, doctor
- *  called it healthy, and install failed at the write with the splicer's own
- *  message; now the read says `unspliceable` with the by-hand step, doctor
- *  prints that step ahead of install, and install refuses before it writes.
- *  A SIBLING server (a third-party entry) in such a spelling is still not
- *  asked about: nothing rewrites it, so refusing the whole file over it would
- *  only take yaw-mcp's own entry hostage. */
-const SPLICEABLE_NAMES = [ENTRY_NAME, ...LEGACY_ENTRY_NAMES];
+ *  An `unspliceable` read refuses EVERY edit through the write facade, so it
+ *  is kept for the one entry every write touches. A legacy spelling install
+ *  migrates is asked about separately (legacyUnspliceable, below): install
+ *  EDITS a legacy entry -- it trims one with a `remove` edit in the same write
+ *  that adds ours -- and the splice refuses to delete an inline or dotted
+ *  spelling, so the read names it on `ok.unspliceableEntries`. The facade then
+ *  refuses only an edit that would touch that entry (a legacy removal), doctor
+ *  prints the by-hand step ahead of install, and an install or uninstall with
+ *  --keep-legacy, which never touches it, still runs. Folding the legacy names
+ *  in here instead made a file with a correct [mcp_servers.mcp] table read
+ *  `unspliceable` over a neighbour that run would never edit.
+ *  A SIBLING server (a third-party entry) in such a spelling is not asked
+ *  about at all: nothing rewrites it. */
+const SPLICEABLE_NAMES = [ENTRY_NAME];
+
+/** The legacy entries present in an `ok` read whose spelling the splice will
+ *  not remove, each with the adapter's reason and by-hand step. Re-reads only
+ *  when a legacy key is actually in the container, so the common file (no
+ *  legacy entry) costs nothing extra. */
+function legacyUnspliceable(
+  raw: string,
+  containerPath: readonly string[],
+  read: Extract<TomlConfigRead, { kind: "ok" }>,
+): { key: string; reason: string; fix: string }[] {
+  const out: { key: string; reason: string; fix: string }[] = [];
+  for (const legacy of LEGACY_ENTRY_NAMES) {
+    if (!read.entries.some((e) => e.key === legacy)) continue;
+    const probe = readTomlConfig(raw, containerPath, [legacy]);
+    if (probe.kind === "unspliceable") out.push({ key: probe.key, reason: probe.shape, fix: probe.fix });
+  }
+  return out;
+}
 
 function entryViewsOf(read: TomlConfigRead, transform?: EntryTransform): EntryView[] {
   if (read.kind !== "ok") return [];
@@ -247,7 +267,7 @@ function classifyToml(raw: string, addr: EntryAddress, transform?: EntryTransfor
       // by-hand step for that shape. The splice's own `remedy` stays behind:
       // it is worded for the refusal beside install's preview.
       return { kind: "unspliceable", key: read.key, reason: read.shape, fix: read.fix };
-    default:
+    default: {
       // `unloadable` is a strict-JSON concept: a comment makes a .mcp.json
       // unreadable to its client. TOML has no such gap -- what smol-toml
       // accepts here, Codex's `toml` crate accepts (parseTomlConfig refuses
@@ -256,6 +276,8 @@ function classifyToml(raw: string, addr: EntryAddress, transform?: EntryTransfor
       // An inline root container rides along the same way, so the one surface
       // that would send the user to install (doctor) can say the run is
       // refused; every other consumer reads a healthy file, which it is.
+      // A legacy entry in a refused spelling rides along the same way.
+      const unspliceableEntries = legacyUnspliceable(raw, addr.containerPath, read);
       return {
         kind: "ok",
         containerPresent: read.containerPresent,
@@ -266,7 +288,9 @@ function classifyToml(raw: string, addr: EntryAddress, transform?: EntryTransfor
           : {
               containerUnspliceable: { reason: read.containerUnspliceable.shape, fix: read.containerUnspliceable.fix },
             }),
+        ...(unspliceableEntries.length === 0 ? {} : { unspliceableEntries }),
       };
+    }
   }
 }
 

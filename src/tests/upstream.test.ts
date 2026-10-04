@@ -1245,6 +1245,40 @@ describe("redactSecretsInOutput", () => {
     expect(err!.stderrTail).toContain("***MY_TOKEN***");
   });
 
+  it("maps a LITERAL DSN carrying a URL password whatever its env NAME", async () => {
+    // The name-only rule above dropped a case the old map-everything rule
+    // covered: DATABASE_URL / REDIS_URL are not credential-shaped NAMES, but a
+    // literal `scheme://user:pass@host` value carries the password inline, and
+    // a driver that echoes its DSN on a failed connect put it in the stderr
+    // tail, the log and the model's context. The VALUE's shape maps it too --
+    // including Redis's empty-user `redis://:pass@host` form. A URL with no
+    // userinfo password stays readable (BASE_URL below).
+    const dsn = "postgres://app_user:s3cr3t-pa55word@db.internal:5432/app";
+    const redis = "redis://:r3dis-pa55word@cache.internal:6379/0";
+    const baseUrl = "https://gateway.internal.example/api/v2/projects";
+    const config = makeLocalConfig({ env: { DATABASE_URL: dsn, REDIS_URL: redis, BASE_URL: baseUrl } });
+
+    _sdkBehavior.clientConnect = () => {
+      _sdkBehavior.stderrEmitter?.emit("data", Buffer.from(`connect ${dsn} failed; cache ${redis}; api ${baseUrl}`));
+      return Promise.reject(new Error("handshake failed"));
+    };
+
+    let err: ActivationError | undefined;
+    try {
+      await connectToUpstream(config);
+    } catch (e) {
+      err = e as ActivationError;
+    }
+
+    expect(err).toBeInstanceOf(ActivationError);
+    expect(err!.stderrTail).not.toContain("s3cr3t-pa55word");
+    expect(err!.stderrTail).not.toContain("r3dis-pa55word");
+    expect(err!.stderrTail).toContain("***DATABASE_URL***");
+    expect(err!.stderrTail).toContain("***REDIS_URL***");
+    expect(err!.stderrTail).toContain(baseUrl);
+    expect(err!.stderrTail).not.toContain("***BASE_URL***");
+  });
+
   it("maps a resolved ${secret:} value whatever its env NAME", async () => {
     // The other half of the rule: a vault-sourced value under a bland name
     // (ENDPOINT holding a connection string with the password inline) is a

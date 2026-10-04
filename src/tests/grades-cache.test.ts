@@ -12,7 +12,17 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// Path-based utimes passes straight through. Wrapped only so the restore-race
+// test below can land a THIRD process's lock at the path in the window between
+// the restore's take and a path-based backdate.
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = (await importOriginal()) as typeof import("node:fs/promises");
+  return { ...actual, utimes: vi.fn(actual.utimes) };
+});
+
+import { utimes as utimesMock } from "node:fs/promises";
 import type { CachedGrade } from "../grades-cache.js";
 import { gradesCachePath, readGradesCache, stealStaleLock, writeGrade } from "../grades-cache.js";
 import { CONFIG_DIRNAME } from "../paths.js";
@@ -348,6 +358,42 @@ describe("writeGrade -- cross-process lock", () => {
     expect(Math.abs(statSync(lock).mtimeMs - taken.getTime())).toBeLessThan(1_000);
     // The stolen copy is gone.
     expect(readdirSync(join(synthHome, CONFIG_DIRNAME)).filter((f) => f.includes(".lock.stale-"))).toEqual([]);
+  });
+
+  it("never backdates a THIRD process's lock that took the path after the restore", async () => {
+    // The restore used to backdate by PATH (utimes(lockPath)) after takeLock
+    // had closed its handle. Anyone can hold the path by then -- the restored
+    // holder released and a third process took it fresh -- and the backdate
+    // then aged THAT live lock toward stale, inviting the next writer to steal
+    // it. The mock lands the third process's lock in exactly that window; the
+    // backdate must reach only the file the restore itself created.
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    const lock = lockPath(synthHome);
+    writeFileSync(lock, "live-holder\n");
+    const taken = new Date(Date.now() - 8_000);
+    utimesSync(lock, taken, taken);
+    vi.mocked(utimesMock).mockImplementationOnce(async (p, a, m) => {
+      rmSync(String(p), { force: true });
+      writeFileSync(String(p), "third-process\n");
+      const real = (await vi.importActual("node:fs/promises")) as typeof import("node:fs/promises");
+      return real.utimes(p, a, m);
+    });
+    try {
+      const isLive = (ageMs: number): boolean => ageMs > -5_000 && ageMs < 10_000;
+      expect(await stealStaleLock(lock, isLive)).toBe(true);
+      const token = readFileSync(lock, "utf8");
+      const ageMs = Date.now() - statSync(lock).mtimeMs;
+      if (token === "third-process\n") {
+        // The third holder's lock must keep its own fresh mtime.
+        expect(ageMs).toBeLessThan(2_000);
+      } else {
+        // Or the window never opened: the restored lock under its original mtime.
+        expect(token).toBe("live-holder\n");
+        expect(Math.abs(statSync(lock).mtimeMs - taken.getTime())).toBeLessThan(1_000);
+      }
+    } finally {
+      vi.mocked(utimesMock).mockReset();
+    }
   });
 
   it("sweeps stale-file litter older than the stale age at lock take, and leaves young litter alone", async () => {

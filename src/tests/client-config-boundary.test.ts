@@ -120,6 +120,9 @@ const RULES: Rule[] = [
     allowed: {
       "src/client-config.ts": "findLegacyKey and the view's default key -- the core's own answer",
       "src/install-targets.ts": "findLegacyEntry's body, over an object rather than a key list",
+      "src/target-codex-cli.ts":
+        "the one-element list of names its adapter asks the TOML reader about whole-file spliceability -- " +
+        "an array literal, not a membership test on a container (the legacy names are asked separately)",
       "src/doctor-cmd.ts": NOT_YET_MIGRATED,
     },
     positive: ["if (ENTRY_NAME in container) {", "const e = c[ENTRY_NAME];", "LEGACY_ENTRY_NAMES.some((n) => n === k)"],
