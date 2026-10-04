@@ -2576,7 +2576,23 @@ describe("release.sh oam floor gate (stubbed full run)", () => {
     '        echo "[verify:oam-floor] oam 0.16.3 at oam; the floor is 0.16.3"',
     '        echo "[verify:oam-floor] OK -- oam 0.16.3 hosts a stdio @modelcontextprotocol/sdk server (initialize + tools/list + tools/call); the floor 0.16.3 stands" ;;',
     "      test)",
-    '        echo " Test Files  3 passed (3)" ;;',
+    // tests-colored / tests-colored-failed: the summary as vitest 4.1.10
+    // prints it outside an AI-agent environment (tinyrainbow colours into a
+    // pipe on every platform unless NO_COLOR is set or TERM is dumb; vitest
+    // disables it only when std-env's isAgent fires) -- the passing bytes
+    // measured on 2026-10-03, the failed variant built from vitest's
+    // getStateString shape (bold red `N failed`, dim ` | `, bold green
+    // `N passed`, gray count), not measured. The terminal renders both as
+    // plain text; run_npm_check must see through the escapes or a green run
+    // fails on "printed no verdict".
+    '        if [ -f "$FAKE_STATE/tests-colored" ]; then',
+    '          printf "\\033[2m Test Files \\033[22m \\033[1m\\033[32m3 passed\\033[39m\\033[22m\\033[90m (3)\\033[39m\\n"',
+    '        elif [ -f "$FAKE_STATE/tests-colored-failed" ]; then',
+    '          printf "\\033[2m Test Files \\033[22m \\033[1m\\033[31m1 failed\\033[39m\\033[22m\\033[2m | \\033[22m\\033[1m\\033[32m2 passed\\033[39m\\033[22m\\033[90m (3)\\033[39m\\n"',
+    "          exit 1",
+    "        else",
+    '          echo " Test Files  3 passed (3)"',
+    "        fi ;;",
     '      build) mkdir -p dist; echo "built" > dist/index.js ;;',
     "    esac ;;",
     "  version)",
@@ -2982,6 +2998,42 @@ describe("release.sh oam floor gate (stubbed full run)", () => {
     expect(r.status).toBe(1);
     expect(npmLog(f)).toContain("npm run lint");
     expect(npmLog(f)).not.toContain("npm run typecheck");
+    expect(subjects(f.bare, "main")).toEqual(["fixture"]);
+    expect(git(f.bare, ["tag", "-l"]).trim()).toBe("");
+    expect(JSON.parse(readFileSync(join(f.work, "package.json"), "utf8")).version).toBe("1.0.1");
+  });
+
+  it("passes the Tests gate when vitest colours its summary, as it does from a plain terminal", () => {
+    // The 2026-10-03 release run failed here on a green suite: run_npm_check grepped
+    // the raw capture, and `Test Files +[0-9]+ passed` cannot match
+    // `ESC[2m Test Files ESC[22m ESC[1mESC[32m133 passed`. The verdict greps
+    // now read an escape-stripped copy.
+    const f = setup();
+    writeFileSync(join(f.state, "tests-colored"), "");
+    const r = release(f);
+    expect(r.out).not.toContain("printed no verdict");
+    expect(r.out).toContain("Lint + typecheck + tests + oam floor passed");
+    expect(r.out).toContain("v1.0.2 released to npm + MCP registry.");
+    expect(r.status).toBe(0);
+    // The coloured line itself is still what the human sees -- the strip
+    // feeds the greps, not the terminal.
+    expect(r.out).toContain("\x1b[32m3 passed\x1b[39m");
+  });
+
+  it("fails the Tests gate on a coloured failure summary by its summary line, not just its exit code", () => {
+    // The same escapes blind fail_re: a coloured `1 failed` would otherwise
+    // fall through to the generic "failed (exit 1)" -- still a failure, but
+    // one that no longer names the summary line it is about. (On the ARM64
+    // segfault path the colour blinds done_re too, so that run also fails,
+    // generically, as "failed (exit 139)" -- colour never let a red suite
+    // through; what it cost was the verdict.)
+    const f = setup();
+    writeFileSync(join(f.state, "tests-colored-failed"), "");
+    const r = release(f);
+    expect(r.out).toContain("[x] Tests failed");
+    expect(r.out).not.toContain("Tests failed (exit");
+    expect(r.status).toBe(1);
+    expect(npmLog(f)).not.toContain("npm publish");
     expect(subjects(f.bare, "main")).toEqual(["fixture"]);
     expect(git(f.bare, ["tag", "-l"]).trim()).toBe("");
     expect(JSON.parse(readFileSync(join(f.work, "package.json"), "utf8")).version).toBe("1.0.1");

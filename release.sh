@@ -233,7 +233,7 @@ esac
 # $3 ERE for real failures, $4 (opt) ERE proving the tool ran, $5 (opt) direct
 # verify command (no npm-run wrapper) for tools that print no completion marker.
 run_npm_check() {
-  local label="$1" script="$2" fail_re="$3" done_re="${4:-}" verify_cmd="${5:-}" out rc=0
+  local label="$1" script="$2" fail_re="$3" done_re="${4:-}" verify_cmd="${5:-}" out plain rc=0
   # SKIP_LINT=1 escape hatch -- an explicit LAST RESORT, not a routine skip. It
   # takes lint out of the release entirely and nothing else re-checks
   # formatting: this repo has no CI (no .github/workflows, and GitHub Actions is
@@ -261,11 +261,32 @@ run_npm_check() {
   # analysis below runs.
   out=$(npm run "$script" 2>&1) || rc=$?
   printf '%s\n' "$out"
-  # Every grep over $out below reads it from a here-string, never from a
+  # Every verdict grep below reads $plain -- $out with its CSI escape
+  # sequences (ESC [ ... final byte: colours, cursor moves, erases) removed --
+  # never $out itself. vitest colours its summary even into a pipe: its colour
+  # library, tinyrainbow 3.1.0, never consults isatty -- it colours whenever
+  # NO_COLOR is unset and TERM is not "dumb", on every platform -- and vitest
+  # itself turns colour off only when std-env's isAgent sees an AI-agent
+  # environment (AI_AGENT, CLAUDECODE, CLAUDE_CODE, CURSOR_AGENT and the other
+  # agent CLIs it knows). So the same `npm test` prints
+  # ` Test Files  133 passed (133)` from
+  # inside a Claude Code session and `ESC[2m Test Files ESC[22m
+  # ESC[1mESC[32m133 passedESC[39mESC[22mESC[90m (133)ESC[39m` from a plain
+  # terminal (vitest 4.1.10, measured 2026-10-03). The terminal renders both
+  # identically; `Test Files +[0-9]+ passed` matches only the first, and that
+  # failed a green 133-file run on 2026-10-03 with "printed no verdict". The
+  # strip takes ECMA-48 CSI as a whole -- parameter bytes 0x30-0x3F,
+  # intermediates 0x20-0x2F, one final byte 0x40-0x7E -- not only the SGR
+  # `m` form vitest emits today. It runs in the C locale so those ranges mean
+  # bytes and the suite's non-ASCII console output cannot make sed stumble.
+  # Non-CSI escapes (OSC hyperlinks, 8-bit C1) are not stripped; nothing in
+  # this toolchain emits them. The human still sees the coloured output above.
+  plain=$(LC_ALL=C sed -E $'s/\033\\[[0-?]*[ -/]*[@-~]//g' <<<"$out")
+  # Every grep over $plain below reads it from a here-string, never from a
   # pipe: under `set -o pipefail`, `producer | grep -q` reports a MISS when
   # grep quits on its first match and the producer dies of SIGPIPE (141) on a
-  # large $out -- the test suite's output is exactly that large.
-  if grep -qE "$fail_re" <<<"$out"; then
+  # large $plain -- the test suite's output is exactly that large.
+  if grep -qE "$fail_re" <<<"$plain"; then
     fail "$label failed"
   fi
   if [ "$rc" -eq 0 ]; then
@@ -275,7 +296,7 @@ run_npm_check() {
     # a vitest that found no test files, a verifier that printed neither of
     # its lines. Passing a release on that silence is the one shape of pass
     # no later step can catch, since there is no CI behind this script.
-    if [ -n "$done_re" ] && ! grep -qE "$done_re" <<<"$out"; then
+    if [ -n "$done_re" ] && ! grep -qE "$done_re" <<<"$plain"; then
       fail "$label exited 0 but printed no verdict -- refusing to pass a gate on silence (expected output matching '${done_re}')"
     fi
     return 0
@@ -287,11 +308,11 @@ run_npm_check() {
   # the done_re passed at the Lint call site no longer tolerates anything.
   # scripts/lint.mjs turns a biome crash into exit 1 with its own "[lint] biome
   # crashed with / killed by" line, so that shape is matched here as well.
-  if [[ "$script" == lint* ]] && { [ "$rc" -eq 139 ] || [ "$rc" -eq 134 ] || grep -qE '^\[lint\] biome (killed by|crashed with)' <<<"$out"; }; then
+  if [[ "$script" == lint* ]] && { [ "$rc" -eq 139 ] || [ "$rc" -eq 134 ] || grep -qE '^\[lint\] biome (killed by|crashed with)' <<<"$plain"; }; then
     fail "$label crashed (exit $rc) -- no lint verdict was produced, so the release stops here. Fix the crash (scripts/lint.mjs honours YAWLABS_BIOME_BIN / YAWLABS_BIOME_NATIVE), or as an explicit last resort re-run with SKIP_LINT=1 ./release.sh ${VERSION} -- that publishes unlinted, and there is no CI to catch it."
   fi
   if [ "$IS_MINGW_ARM64" = true ] && { [ "$rc" -eq 139 ] || [ "$rc" -eq 134 ]; }; then
-    if [ -n "$done_re" ] && grep -qE "$done_re" <<<"$out"; then
+    if [ -n "$done_re" ] && grep -qE "$done_re" <<<"$plain"; then
       warn "$label: npm exited $rc (ARM64 npm-run cleanup segfault) but the tool completed with no findings -- tolerating"
       return 0
     fi
@@ -319,7 +340,7 @@ run_npm_check() {
   # fail_re comment documents. A false match here can only reword an
   # already-failing gate, never fail a passing one. The step-2 build gate is a
   # separate code path and is NOT covered here.
-  if grep -qE ': not found$|: command not found|is not recognized as an internal|Cannot find (module|package)|installed .* for another platform' <<<"$out"; then
+  if grep -qE ': not found$|: command not found|is not recognized as an internal|Cannot find (module|package)|installed .* for another platform' <<<"$plain"; then
     fail "$label failed (exit $rc) -- the toolchain could not resolve its own executable (see the error above). node_modules is missing or only partially installed. Run \`npm ci\`, then re-run ./release.sh ${VERSION}."
   fi
   fail "$label failed (exit $rc)"
