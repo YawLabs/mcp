@@ -57,16 +57,21 @@
 // booted and then sat mute forever while the launcher reported success.
 // MIN_OAM_VERSION gates that fix in, so a machine below the floor gets node.
 //
-// One browser mode is still NOT hostable: @playwright/mcp with --isolated boots
-// and lists its tools on oam, but every browser tool errors (measured on
-// Windows). In that mode it connects to a local pipe path, and oam has no
-// client for a named pipe or a Unix-domain socket -- net.connect({path}) fails
-// with ERR_FEATURE_UNAVAILABLE_ON_PLATFORM. oam never had such a client: up to
-// 0.16.2 it dialled host:port instead, and a844903 (first in 0.16.3) only
-// replaced that silent misconnect with the refusal. Neither the 0.11.0 run nor
-// oam's matrix covers this mode (its playwright row runs with a persistent
-// profile). The boot is healthy, so the boot-scoped node downgrade below never
-// fires; `"runtime": "node"` for that server is the escape.
+// @playwright/mcp with --isolated is hostable from oam 0.18.0. In that mode
+// every browser tool dials playwright-core's BrowserServer over a local pipe
+// (a Windows named pipe, a Unix-domain socket elsewhere), and until 0.18.0 oam
+// had no client for one: up to 0.16.2 it dialled host:port instead, a844903
+// (first in 0.16.3) replaced that silent misconnect with
+// ERR_FEATURE_UNAVAILABLE_ON_PLATFORM, and either way the server booted,
+// listed its tools and failed every browser call (measured here on Windows).
+// oam #219 (first in 0.18.0) added net.connect({path}) and the
+// http.request({socketPath}) that rides on it, and MIN_OAM_VERSION gates that
+// in, so a machine below the floor gets node. The 0.11.0 run here never
+// covered this mode and this repo has not re-measured it; the coverage is
+// oam's gate's, whose matrix has a `pw-isolated` row from v0.18.0 that runs
+// browser_navigate with --isolated on oam and on a node control. oam 0.18.0
+// still refuses TLS over a pipe and tls/http/https/http2 servers on one; the
+// --isolated dial uses neither.
 //
 // Native addons: oam refuses to dlopen a .node addon by default, throwing a
 // CATCHABLE error with code OAM-NATIVE0001 (OAM_ENABLE_NATIVE_ADDONS=1 opts
@@ -280,7 +285,7 @@ export function npxSpec(args: readonly string[]): string | null {
  * floor that is too high costs a fallback, while one that is too low hosts
  * production sidecars on a build the check never ran on.
  */
-export const MIN_OAM_VERSION = "0.17.0";
+export const MIN_OAM_VERSION = "0.18.0";
 
 /** The oam installer one-liners, as oamjs.org publishes them. Both install the
  *  current release, which always satisfies MIN_OAM_VERSION. */
@@ -380,11 +385,15 @@ export function oamInstallAdvice(os: InstallOS): string {
  * lands inside a 500-char stderr tail under a generic "failed to start", and
  * the one lever that fixes it is never mentioned to the person who needs it.
  *
- * OAM_MAX_HEAP_MB=0, or any non-numeric value (an empty one reads as unset),
- * REMOVES oam's cap rather than raising it: V8's own limit applies (about
- * 1.4 GiB), oam registers no near-heap-limit callback, and the child dies with
- * a raw V8 crash (exit 127 measured on Windows) and no OAM-RT-OOM -- so this
- * hint never fires for it.
+ * There is always a cap. OAM_MAX_HEAP_MB=0, a negative number, or any
+ * non-numeric value does NOT remove it: from oam 0.18.0 (#223, inside the
+ * MIN_OAM_VERSION floor) such a value is ignored with one stderr warning per
+ * process (`oam: warning: OAM_MAX_HEAP_MB="0" is not a positive whole number
+ * of megabytes; ignoring it and keeping the 4096 MB heap cap`, measured), and
+ * a cap hit still exits 134 with `error[OAM-RT-OOM]`, so this hint fires for
+ * it too. An empty or whitespace-only value reads as unset, with no warning.
+ * (Below 0.18.0 such a value removed the cap and the child died of a raw V8
+ * abort with no banner; the floor gates that oam out.)
  *
  * Matches the stable error CODE, not the prose: the banner carries the
  * resolved cap and where it came from (the env, the cgroup, or the default),
