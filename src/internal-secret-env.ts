@@ -71,6 +71,16 @@ export function scrubInternalSecretsFromProcessEnv(): void {
  *  yaw-internal enough that stripping a differently-cased twin there costs
  *  nothing and keeps one code path on every platform.
  *
+ *  The strip is only as good as the HOST runtime's `env` contract: the object
+ *  passed as a spawn's `env` must become the child's whole environment, not
+ *  pairs laid over the host's own start-up environment. node has always done
+ *  that. oam has only from 0.18.0: before it, a broker itself launched as
+ *  `oam run ... dist/index.js` with the passphrase in its client env block
+ *  handed that passphrase to every child, strip or no strip. MIN_OAM_VERSION
+ *  governs only the sidecars the broker hosts on oam, not the oam the broker
+ *  runs on, and heal rewrites only a broken broker entry, so an install whose
+ *  broker entry names an older oam keeps that gap until `oam self-update`.
+ *
  *  Exported for tests. */
 export function stripInternalSecretsFromEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const out: NodeJS.ProcessEnv = {};

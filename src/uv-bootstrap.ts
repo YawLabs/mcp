@@ -216,10 +216,13 @@ export async function onPath(cmd: string): Promise<boolean> {
 // directly to disk would leave a partially-written, unverified file
 // if the process is killed mid-download. The one-shot memory cost is
 // acceptable given that this path runs at most once per uv version.
-// undici's request() has no default headersTimeout/bodyTimeout, so a
-// stalled GitHub CDN connection would hang ensureUv() (and thus first
-// Python-server activation) indefinitely. Cap both at 30s and surface
-// a clear "uv download timed out" error rather than blocking forever.
+// undici's request() defaults headersTimeout/bodyTimeout to 300 s, so a
+// stalled GitHub CDN connection would hold ensureUv() (and thus first
+// Python-server activation) for five minutes per stall. Cap both at 30s and
+// surface a clear "uv download timed out" error instead. When the broker
+// runs on oam, `undici` is oam's shim, which ignored both timers (and
+// rejected with an uncoded `TypeError: fetch failed`, so the UND_ERR_*
+// matching below could not fire) until oam 0.18.0 (#218 for the timers).
 //
 // Those two are IDLE timers (bodyTimeout resets on every chunk), so they
 // do not bound a connection that trickles: a CDN delivering one byte per
