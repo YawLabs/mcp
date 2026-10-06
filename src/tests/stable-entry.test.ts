@@ -14,7 +14,7 @@ function fakeDeps(over: Record<string, unknown> = {}): StableSpellingDeps {
         r === "C:\\app\\1.0.0\\node_modules\\@y\\m\\dist\\index.js" ||
         r === VER ||
         r === "C:\\app" ||
-        r === "C:" + String.fromCharCode(92)
+        r === `C:${String.fromCharCode(92)}`
       )
         return r;
       if (r.startsWith(VER)) return r;
@@ -58,7 +58,7 @@ describe("stableSpellingOf", () => {
 
   it("ignores argv[1] when it names a DIFFERENT file", () => {
     const deps = fakeDeps({
-      argv1: "C:" + String.fromCharCode(92) + "somewhere" + String.fromCharCode(92) + "else.js",
+      argv1: `C:${String.fromCharCode(92)}somewhere${String.fromCharCode(92)}else.js`,
     });
     // Falls through to the alias walk, which still finds the junction.
     expect(stableSpellingOf("C:\\app\\1.0.0\\node_modules\\@y\\m\\dist\\index.js", deps)).toBe(
@@ -85,7 +85,7 @@ describe("stableSpellingOf", () => {
     // realpath-identity gate must reject it rather than redirect the entry.
     const deps = fakeDeps({
       realpath: (p: string): string =>
-        p.includes("current") ? "C:" + String.fromCharCode(92) + "totally" + String.fromCharCode(92) + "other.js" : p,
+        p.includes("current") ? `C:${String.fromCharCode(92)}totally${String.fromCharCode(92)}other.js` : p,
     });
     expect(stableSpellingOf("C:\\app\\1.0.0\\node_modules\\@y\\m\\dist\\index.js", deps)).toBe(
       "C:\\app\\1.0.0\\node_modules\\@y\\m\\dist\\index.js",
@@ -122,8 +122,8 @@ describe("stableSpellingOf -- regressions found on a real filesystem", () => {
     // It resolves to the same file, so realpath identity ACCEPTS it -- but its
     // ACL denies traversal to most processes, so persisting it hands the
     // client a path it cannot open. Only version-shaped segments may alias.
-    const USERS = "C:" + String.fromCharCode(92) + "Users";
-    const LEGACY = "C:" + String.fromCharCode(92) + "Documents and Settings";
+    const USERS = `C:${String.fromCharCode(92)}Users`;
+    const LEGACY = `C:${String.fromCharCode(92)}Documents and Settings`;
     const entry =
       USERS +
       String.fromCharCode(92) +
@@ -138,7 +138,7 @@ describe("stableSpellingOf -- regressions found on a real filesystem", () => {
       argv1: undefined,
       realpath: (p: string): string => (p.startsWith(LEGACY) ? USERS + p.slice(LEGACY.length) : p),
       readdir: (p: string): string[] =>
-        p === "C:" + String.fromCharCode(92) ? ["Users", "Documents and Settings"] : [],
+        p === `C:${String.fromCharCode(92)}` ? ["Users", "Documents and Settings"] : [],
       isSymlink: (p: string): boolean => p === LEGACY,
     };
     expect(stableSpellingOf(entry, deps)).toBe(entry);
@@ -155,14 +155,14 @@ describe("stableSpellingOf -- regressions found on a real filesystem", () => {
     // the result is string-compared later by the heal recogniser.
     const VER = "C:/app/1.0.0";
     const CUR = "C:/app/current";
-    const entry = VER + "/dist/index.js";
+    const entry = `${VER}/dist/index.js`;
     const deps: StableSpellingDeps = {
       argv1: undefined,
       realpath: (p: string): string => (p.startsWith(CUR) ? VER + p.slice(CUR.length) : p),
       readdir: (p: string): string[] => (p === "C:/app" ? ["1.0.0", "current"] : []),
       isSymlink: (p: string): boolean => p === CUR,
     };
-    expect(stableSpellingOf(entry, deps)).toBe(CUR + "/dist/index.js");
+    expect(stableSpellingOf(entry, deps)).toBe(`${CUR}/dist/index.js`);
   });
 });
 
@@ -175,7 +175,7 @@ describe("stableSpellingOf -- version directory at a filesystem root", () => {
   // sitting at a root was silently never aliased.
   const deps: StableSpellingDeps = {
     argv1: undefined,
-    realpath: (p: string): string => (p.startsWith("C:\\current") ? "C:\\1.0.0" + p.slice("C:\\current".length) : p),
+    realpath: (p: string): string => (p.startsWith("C:\\current") ? `C:\\1.0.0${p.slice("C:\\current".length)}` : p),
     readdir: (p: string): string[] => (p === "C:\\" ? ["1.0.0", "current"] : []),
     isSymlink: (p: string): boolean => p === "C:\\current",
   };
@@ -187,7 +187,7 @@ describe("stableSpellingOf -- version directory at a filesystem root", () => {
   it("does the same on a POSIX root", () => {
     const posix: StableSpellingDeps = {
       argv1: undefined,
-      realpath: (p: string): string => (p.startsWith("/current") ? "/1.0.0" + p.slice("/current".length) : p),
+      realpath: (p: string): string => (p.startsWith("/current") ? `/1.0.0${p.slice("/current".length)}` : p),
       readdir: (p: string): string[] => (p === "/" ? ["1.0.0", "current"] : []),
       isSymlink: (p: string): boolean => p === "/current",
     };
