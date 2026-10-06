@@ -6065,10 +6065,7 @@ describe("oamRunEntryPath -- fish and PowerShell wrappers", () => {
     // isOamLaunch says yes (it only reads the first token); this one must
     // still decline, because a half-path would fail the exists check and
     // read as a broken entry -- which the heal pass rewrites.
-    const args = [
-      "-Command",
-      "oam run --no-check " + String.fromCharCode(39) + "/p/a b/index.js" + String.fromCharCode(39),
-    ];
+    const args = ["-Command", `oam run --no-check ${String.fromCharCode(39)}/p/a b/index.js${String.fromCharCode(39)}`];
     expect(isOamLaunch("pwsh", args)).toBe(true);
     expect(oamRunEntryPath("pwsh", args)).toBeNull();
   });
