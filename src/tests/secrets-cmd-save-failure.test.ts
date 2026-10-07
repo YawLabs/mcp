@@ -104,9 +104,13 @@ describe("runSecrets -- a failed vault write stays inside the command's error en
     lock();
     delete process.env.YAW_MCP_VAULT_PASSPHRASE;
     home = mkdtempSync(join(tmpdir(), "yaw-mcp-savefail-"));
+    // A successful `set` walks up from cwd for a project bundles.json (see
+    // secretConsumers); from the checkout that reaches the REAL ~/.yaw-mcp.
+    vi.spyOn(process, "cwd").mockReturnValue(home);
   });
 
   afterEach(() => {
+    vi.mocked(process.cwd).mockRestore();
     injected.code = null;
     injected.message = null;
     rmSync(home, { recursive: true, force: true });
@@ -247,9 +251,11 @@ describe("runSecrets -- a failed vault read names the vault file", () => {
     lock();
     delete process.env.YAW_MCP_VAULT_PASSPHRASE;
     home = mkdtempSync(join(tmpdir(), "yaw-mcp-readfail-"));
+    vi.spyOn(process, "cwd").mockReturnValue(home);
   });
 
   afterEach(() => {
+    vi.mocked(process.cwd).mockRestore();
     injected.loadCode = null;
     rmSync(home, { recursive: true, force: true });
     lock();

@@ -28,7 +28,7 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseJsonc } from "./jsonc.js";
-import { NAMESPACE_RE } from "./local-bundles.js";
+import { jsonErrorLocation, NAMESPACE_RE } from "./local-bundles.js";
 import { log } from "./logger.js";
 import { migrateLegacyConfigPaths, type PendingLegacyMigration, planLegacyConfigMigration } from "./migrate.js";
 import { findProjectConfigDir, userConfigDir } from "./paths.js";
@@ -352,9 +352,12 @@ async function readConfigAt(path: string, scope: ConfigScope, warnings: string[]
   try {
     parsed = parseJsonc(raw);
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    warnings.push(`${path}: invalid JSON (${msg}) -- file ignored`);
-    log("warn", "Config file is not valid JSON; ignoring", { path, error: msg });
+    // A position, never err.message: V8 quotes a slice of the source around
+    // the bad token, which can be a pasted secret. Same rule as bundles.json
+    // (parseBundlesContent).
+    const where = jsonErrorLocation(raw, err);
+    warnings.push(`${path}: invalid JSON ${where} -- file ignored`);
+    log("warn", "Config file is not valid JSON; ignoring", { path, location: where });
     return null;
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {

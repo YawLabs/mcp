@@ -195,7 +195,7 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
     name: "set",
     description: "Change a per-server field in bundles.json",
     positional: [["<slug-or-namespace>"], ["<key=value>"]],
-    flags: ["--json", "--force", "--yes", "--help"],
+    flags: ["--json", "--force", "--yes", "--secret", "--secret-name", "--stdin", "--help"],
   },
   {
     name: "enable",

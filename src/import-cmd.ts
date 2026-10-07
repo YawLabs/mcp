@@ -1561,10 +1561,20 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
       `Not imported (another key that derives the same namespace overwrote it): ${lost}. Left in ${displaySafe(resolved.absolute)} so nothing is lost: rename one of them there and re-run, or add it by hand with \`yaw-mcp add\`.`,
     );
   }
-  if (imported.some((r) => r.candidate.credentialKeys.length > 0)) {
-    const names = [...new Set(imported.flatMap((r) => r.candidate.credentialKeys))];
+  // A local server's credentials are env keys, which `set --secret` moves into
+  // the vault in one step. A remote server's are headers, and `set` has no
+  // header path, so those keep the two-step form and a hand edit.
+  const isRemote = (r: (typeof imported)[number]): boolean => r.candidate.entry.type === "remote";
+  const envKeys = [...new Set(imported.filter((r) => !isRemote(r)).flatMap((r) => r.candidate.credentialKeys))];
+  const headerKeys = [...new Set(imported.filter(isRemote).flatMap((r) => r.candidate.credentialKeys))];
+  if (envKeys.length > 0) {
     print(
-      `Credentials came across as plain values: ${names.map(displayArg).join(", ")}. Move each one into the vault with \`yaw-mcp secrets set NAME\`, then \`yaw-mcp set <server> env.KEY='\${secret:NAME}'\`.`,
+      `Credentials came across as plain values: ${envKeys.map(displayArg).join(", ")}. Move each one into the vault with \`yaw-mcp set <server> env.KEY --secret\`, which stores the value and writes the \${secret:NAME} reference in one step.`,
+    );
+  }
+  if (headerKeys.length > 0) {
+    print(
+      `Header credentials came across as plain values: ${headerKeys.map(displayArg).join(", ")}. Store each one with \`yaw-mcp secrets set NAME\`, then replace the credential in that server's "headers" in bundles.json with \${secret:NAME}, keeping any scheme in front of it (Authorization: "Bearer \${secret:NAME}"; X-Api-Key and its kind take the bare \${secret:NAME}).`,
     );
   }
 

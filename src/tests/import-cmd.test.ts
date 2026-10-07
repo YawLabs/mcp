@@ -239,7 +239,14 @@ describe("runImport -- reading a client config", () => {
     expect(all).toContain("GITHUB_TOKEN");
     expect(all).not.toContain("ghp_x");
     expect(all).not.toContain("lin_x");
-    expect(all).toContain("yaw-mcp secrets set");
+    // env keys get the one-step `set --secret`; a remote server's header
+    // cannot take that path, so it keeps the two-step form.
+    expect(all).toContain(
+      "plain values: GITHUB_TOKEN. Move each one into the vault with `yaw-mcp set <server> env.KEY --secret`",
+    );
+    expect(all).toContain(
+      "Header credentials came across as plain values: Authorization. Store each one with `yaw-mcp secrets set NAME`",
+    );
   });
 
   it("derives a namespace and reports a collision rather than silently keeping one", async () => {

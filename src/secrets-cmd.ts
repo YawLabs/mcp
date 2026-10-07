@@ -22,10 +22,12 @@
 import { createHash } from "node:crypto";
 import { chmod, copyFile, constants as fsConstants, readFile, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
+import { loadLocalBundles } from "./local-bundles.js";
 import { createStreamWriter } from "./logger.js";
 import { type AuditEvent, readAuditLog } from "./secrets-audit.js";
 import {
   checkVaultPassphrase,
+  collectSecretRefNames,
   createEmptyVault,
   getSecret,
   listKeys,
@@ -50,6 +52,7 @@ import {
   vaultVerifiesPassphrases,
 } from "./secrets-vault.js";
 import { CANCELLED, type Cancelled, NO_ECHO, type NoEcho, readLineFromTTY } from "./tty-reader.js";
+import { isRemoteEntry } from "./types.js";
 
 export const SECRETS_USAGE = `Usage: yaw-mcp secrets <action> [args]
 
@@ -63,6 +66,12 @@ Actions:
                           Setting a name that already exists REPLACES it
                           (confirmed first on a TTY; scripted runs proceed
                           and say "Replaced" instead of "Stored").
+                          Then names the servers in bundles.json that
+                          reference it. After a replace, a running
+                          yaw-mcp keeps the OLD value in those it already
+                          started until they restart: unload them
+                          (mcp_connect_deactivate <ns>) or reconnect
+                          yaw-mcp in your client.
   get <name>              Decrypt and print one secret value to stdout.
                           NOTE: this prints the secret in CLEARTEXT (with
                           or without --json). Redirect to a file or pipe
@@ -190,6 +199,20 @@ export interface SecretsCommandOptions {
   serverFilter?: string;
   /** Test hooks. */
   home?: string;
+  /** Where `set` looks for a project bundles.json when it reports which
+   *  servers reference the name (see secretConsumers). Defaults to
+   *  process.cwd(), the same root every other CLI command loads from. */
+  cwd?: string;
+  /** For `set`: the caller writes `${secret:NAME}` into bundles.json right
+   *  after this store (`yaw-mcp set <server> env.KEY --secret`), so the
+   *  "no server references it yet -- point an env value at it" hint would
+   *  tell the user to run the step already under way. Suppresses only that
+   *  hint; the referenced-by and restart notes still print. */
+  referenceFollows?: boolean;
+  /** For `set`: the remedy appended when the value prompt cannot be shown
+   *  (stdin a TTY, stdout not). The default offers --value, which an embedder
+   *  that keeps the value out of argv (`set --secret`) does not accept. */
+  valueRemedy?: string;
   /** The passphrase (for `reset`: the NEW vault's). It takes the env var's
    *  place in the precedence -- ahead of it, and for `reset` checked against
    *  the old vault the same way -- but it is not reported as the env var:
@@ -793,6 +816,128 @@ function freshVaultNudge(io: SecretsIo, path: string, json: boolean | undefined)
   io.err(`yaw-mcp secrets: created the vault at ${path}.\n${lines.join("\n")}\n`);
 }
 
+/** Which configured servers reference `${secret:NAME}`, from the bundles.json
+ *  every other CLI command loads (an approved project file, else the
+ *  user-global one). `namespaces` is sorted and empty when nothing references
+ *  the name, or when there is no bundles.json at all (`path` null).
+ *
+ *  null means UNKNOWN, not "none": the loader threw, or a bundles.json exists
+ *  but did not parse. Reporting "no server uses this" off a file we could not
+ *  read would talk the user out of the restart they actually need.
+ *
+ *  The map scanned per server is the one doctor's vault section scans, for
+ *  the same reason: a local server's refs ride in `env`, a remote one's in
+ *  `headers` (its `env` is never sent). The scan itself is secrets-vault's
+ *  shared collectSecretRefNames, never a local matchAll over SECRET_REF_RE.
+ *
+ *  This is the bundles.json THIS process resolves from ITS cwd. A running
+ *  yaw-mcp resolved its own from the cwd its client launched it in, so the
+ *  two can differ (a project file here, the user-global one there); the
+ *  notice below words its restart advice with that in mind. */
+async function secretConsumers(
+  name: string,
+  home: string,
+  cwd: string | undefined,
+): Promise<{ path: string | null; namespaces: string[] } | null> {
+  const loaded = await loadLocalBundles({ cwd: cwd ?? process.cwd(), home, env: process.env }).catch(() => null);
+  if (loaded === null) return null;
+  if (loaded.config === null) return loaded.path === null ? { path: null, namespaces: [] } : null;
+  const namespaces = loaded.config.servers
+    .filter((s) => collectSecretRefNames(isRemoteEntry(s) ? s.headers : s.env).has(name))
+    .map((s) => s.namespace)
+    .sort();
+  return { path: loaded.path, namespaces };
+}
+
+/** The `err` lines after a successful `set` that connect the vault write to
+ *  the servers that consume it. Prose mode only: under --json the same facts
+ *  ride in the result envelope (referenced_by, running_servers_stale).
+ *
+ *  The REPLACE case is the one that bites. A running yaw-mcp re-reads the
+ *  vault at every spawn, but a server it has ALREADY spawned got the old
+ *  value in its child env and keeps it until that child restarts -- and this
+ *  CLI process cannot reach the running server to restart it. Nothing used to
+ *  say so: the upstream just kept failing auth (seen with Lemon Squeezy until
+ *  the server was unloaded by hand). So a replace always says something --
+ *  who references the name and how to restart them, or that nothing does.
+ *  "Nothing does" is only true of the file this process read (see
+ *  secretConsumers), so that line still carries the restart advice for a
+ *  yaw-mcp a client launched against a different bundles.json.
+ *
+ *  A first-time store is NOT proof that nothing running is stale. Resolution
+ *  is fail-closed, so a server spawned while the name was missing was
+ *  refused -- but `secrets remove NAME` then `secrets set NAME` (the usual
+ *  rotate-by-hand) is a first store too, and a child spawned before the
+ *  remove still holds the value it started with. So a referenced name always
+ *  gets the restart advice; a first store only words it as the remove case.
+ *  With no reference it stays SILENT in an existing vault -- a hint on every
+ *  `set` is noise a scripted caller cannot turn off, the rule freshVaultNudge
+ *  follows -- and gives the wiring hint only alongside that once-per-vault
+ *  nudge. `referenceFollows` drops that hint entirely: the caller is writing
+ *  the reference itself.
+ *
+ *  Names and namespaces only; the value is never in scope here. */
+function secretConsumersNotice(
+  io: SecretsIo,
+  name: string,
+  consumers: { path: string | null; namespaces: string[] } | null,
+  replacing: boolean,
+  isFresh: boolean,
+  referenceFollows: boolean,
+): void {
+  // The one literal "${secret:" is escaped here, once; every line below
+  // interpolates `ref` rather than spelling the marker again.
+  const ref = `\${secret:${name}}`;
+  if (consumers === null) {
+    if (replacing) {
+      io.err(
+        `yaw-mcp secrets: could not read bundles.json to check which servers reference ${ref}.\n` +
+          "  A running yaw-mcp keeps the OLD value in any server it already started with it, until that\n" +
+          "  server restarts: unload it (mcp_connect_deactivate <namespace>) or reconnect yaw-mcp in your client.\n",
+      );
+    }
+    return;
+  }
+  const where = consumers.path ?? "bundles.json";
+  if (consumers.namespaces.length > 0) {
+    const list = consumers.namespaces.join(", ");
+    if (replacing) {
+      io.err(
+        `yaw-mcp secrets: ${ref} is referenced by: ${list} (${where}).\n` +
+          "  A running yaw-mcp keeps the OLD value in any of these it has already started, until it\n" +
+          "  restarts. Unload each one (mcp_connect_deactivate <namespace>; the next call starts it\n" +
+          "  with the new value), or reconnect yaw-mcp in your MCP client.\n",
+      );
+    } else {
+      io.err(
+        `yaw-mcp secrets: ${ref} is referenced by: ${list} (${where}).\n` +
+          "  yaw-mcp reads the vault at each server start, so they pick it up the next time they start.\n" +
+          "  One a running yaw-mcp started before an earlier `secrets remove` of this name still holds\n" +
+          "  the value it started with: unload it (mcp_connect_deactivate <namespace>) or reconnect yaw-mcp.\n",
+      );
+    }
+    return;
+  }
+  const otherProject = replacing
+    ? "  If your MCP client launches yaw-mcp from another project, its bundles.json can differ from\n" +
+      "  this one: a server there that already started with the OLD value keeps it until it restarts\n" +
+      "  (mcp_connect_deactivate <namespace>, or reconnect yaw-mcp in your client).\n"
+    : "";
+  // referenceFollows drops ONLY the point-an-env-value hint: a replace still
+  // owes the other-project restart lines, since a yaw-mcp launched against a
+  // different bundles.json may hold a child started with the OLD value.
+  if (referenceFollows) {
+    if (replacing) io.err(`yaw-mcp secrets: no server in ${where} references ${ref} yet.\n${otherProject}`);
+    return;
+  }
+  if (!replacing && !isFresh) return;
+  io.err(
+    `yaw-mcp secrets: no server in ${where} references ${ref} yet. To use it, point an env value at it:\n` +
+      `  yaw-mcp set <server> env.KEY='${ref}'\n` +
+      otherProject,
+  );
+}
+
 /** One `err` line when a loaded vault is behind this build's schema.
  *
  *  The v2 name binding (secrets-vault.ts's AAD) only engages for a file
@@ -1302,7 +1447,7 @@ export async function runSecrets(
             io,
             opts.json,
             "set",
-            "cannot prompt for the value: stdin is a TTY but stdout is not, so the prompt would be written into the redirect instead of shown. Pass --value <v>, or pipe the value in with --stdin.",
+            `cannot prompt for the value: stdin is a TTY but stdout is not, so the prompt would be written into the redirect instead of shown. ${opts.valueRemedy ?? "Pass --value <v>, or pipe the value in with --stdin."}`,
           );
         }
         value = entered;
@@ -1325,13 +1470,37 @@ export async function runSecrets(
       // "Replaced" vs "Stored" is the only signal a scripted run gets that it
       // just destroyed a previous value (the non-TTY path proceeds without a
       // confirmation), so the two cases must never print the same line.
-      if (opts.json) io.out(`${JSON.stringify({ ok: true, name, fresh_vault: isFresh, replaced: replacing })}\n`);
-      else if (replacing) io.out(`Replaced secret "${name}".\n`);
+      // Read AFTER the save: the vault write is the command, and a
+      // bundles.json that will not load must never turn a stored secret into
+      // a failed run. See secretConsumers for what null means.
+      const consumers = await secretConsumers(name, home, opts.cwd);
+      if (opts.json) {
+        io.out(
+          `${JSON.stringify({
+            ok: true,
+            name,
+            fresh_vault: isFresh,
+            replaced: replacing,
+            referenced_by: consumers?.namespaces ?? null,
+            bundles_path: consumers?.path ?? null,
+            // A running yaw-mcp's already-started children of these servers
+            // MAY hold an old value -- the field a wrapper keys a reconnect
+            // on. True whenever the name is referenced, replace or not: a
+            // first store after `secrets remove` leaves a pre-remove child
+            // stale, and this process cannot see the running one to tell.
+            // null (like referenced_by) when bundles.json could not be read:
+            // unknown, never "not stale". false is relative to bundles_path,
+            // which may not be the file a client's yaw-mcp loaded.
+            running_servers_stale: consumers === null ? null : consumers.namespaces.length > 0,
+          })}\n`,
+        );
+      } else if (replacing) io.out(`Replaced secret "${name}".\n`);
       else io.out(`${isFresh ? "Created vault and " : ""}Stored secret "${name}".\n`);
       // Creating the vault is the one moment the CLI can tell the user that
       // the passphrase has to reach the yaw-mcp their CLIENT spawns, not just
       // the shell they typed this in. See freshVaultNudge.
       if (isFresh) freshVaultNudge(io, path, opts.json);
+      if (!opts.json) secretConsumersNotice(io, name, consumers, replacing, isFresh, opts.referenceFollows === true);
       return { exitCode: 0 };
     }
 

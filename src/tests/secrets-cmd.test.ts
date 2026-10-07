@@ -445,8 +445,23 @@ describe("parseSecretsArgs", () => {
  *  not leave a pile of yaw-test-* directories behind in os.tmpdir(). */
 function makeHome(): string {
   const dir = mkdtempSync(nodePath.join(os.tmpdir(), "yaw-mcp-cmd-"));
+  lastHome = dir;
   return dir;
 }
+
+/** `set` reads bundles.json after a save to name the servers that reference
+ *  the secret (secretConsumers), walking up for a project file from
+ *  process.cwd(). Left alone, that walk starts in the repo checkout and climbs
+ *  to the REAL ~/.yaw-mcp. Pinning cwd to the current test's throwaway HOME
+ *  keeps every lookup inside it. */
+let lastHome: string | undefined;
+beforeEach(() => {
+  vi.spyOn(process, "cwd").mockImplementation(() => lastHome ?? os.tmpdir());
+});
+afterEach(() => {
+  vi.mocked(process.cwd).mockRestore();
+  lastHome = undefined;
+});
 
 /** Every line written to `io.err`, each parsed as JSON. A line that is not
  *  JSON fails NAMING that line -- JSON.parse over the joined stream fails
