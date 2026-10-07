@@ -60,6 +60,11 @@ export const META_TOOLS = {
           description:
             "Optional: one namespace to report on in full -- just that server's card, with its complete tool list.",
         },
+        listOnly: {
+          type: "boolean",
+          description:
+            "For client UIs, not models: same listing with no side effects (no auto-load, idle tick or install hints).",
+        },
       },
     },
     annotations: {
