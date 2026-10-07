@@ -83,6 +83,7 @@ import {
   READONLY_DIAGNOSTICS_ENV,
   type ResolvedConfig,
 } from "./config-loader.js";
+import { isCredentialEnvName } from "./credentials.js";
 import {
   type DefaultRuntimeInfo,
   describeDefaultRuntime,
@@ -151,6 +152,7 @@ import {
   listKeys,
   loadVault,
   lock,
+  SECRET_NAME_RE,
   SECRETS_SCHEMA_VERSION,
   type VaultFile,
   vaultCheckCorruptHint,
@@ -346,7 +348,8 @@ export interface DoctorJsonSnapshot {
    *  whether a passphrase is available. `passphraseSet` is a boolean and
    *  `entries` holds names only -- no secret value, and no passphrase, ever
    *  appears in this snapshot. Mirrors the text path's SECRET VAULT section
-   *  (which is omitted when there is no vault and no refs; the JSON block is
+   *  (which is omitted when there is no vault, no refs and no plaintext
+   *  credential; the JSON block is
    *  always present so consumers can read it unconditionally).
    *
    *  Declared as the collector's own type, not re-spelled here: the emitted
@@ -1649,7 +1652,7 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
   config.warnings = [...config.warnings, ...foldBundleWarnings(oamStatus.bundleWarnings, trustProbe)];
   // Same collector as the text path's SECRET VAULT section. Emitted
   // unconditionally here (the text section hides itself when there is no
-  // vault and no refs) so a consumer can read `.vault` without a presence
+  // vault, no refs and no plaintext credential) so a consumer can read `.vault` without a presence
   // check. Names and booleans only -- never a value, never the passphrase.
   const vault = await collectVaultStatus({ home, env, servers: oamStatus.servers });
   // Trial-GC failures (or, on a read-only run, the unswept expired trials)
@@ -1912,6 +1915,79 @@ export interface VaultStatus {
   /** Referenced names that are NOT in the vault. Empty when the vault is
    *  unreadable -- we cannot tell, and guessing would invent a false alarm. */
   missing: string[];
+  /** Credentials still sitting IN THE CLEAR in bundles.json: per server, the
+   *  credential-shaped KEY NAMES on the channel it uses (env for a local
+   *  server, headers for a remote one -- the same choice `refs` makes) whose
+   *  value is non-empty and carries no `${secret:` span. Names only; the
+   *  values are never read past that test, never copied here.
+   *
+   *  `vaultEntries` is the half-migration signal: vault entry names that look
+   *  like THIS server's (equal, ignoring case, to its namespace, to
+   *  `<namespace>_<key>`, or to a bare plaintext key name no other server
+   *  references or also carries -- see plaintextVaultEntries). Non-empty means `secrets set` was run but the
+   *  bundles.json side of the move never happened -- the server still sends
+   *  the plaintext and does not read the stored entry. Empty when the
+   *  vault is unreadable, for the same reason `missing` is.
+   *
+   *  Without this, a half-done migration read as complete: refs listed, vault
+   *  populated, and the credential the server actually used still a literal.
+   *  Additive JSON field. */
+  plaintext: Array<{ namespace: string; channel: "env" | "headers"; keys: string[]; vaultEntries: string[] }>;
+}
+
+/** Header names that carry a credential whatever the name heuristic says.
+ *  isCredentialEnvName refuses AUTH as a segment on purpose (SSH_AUTH_SOCK),
+ *  which makes AUTHORIZATION -- the most common credential header there is --
+ *  read as ordinary. Lowercase; header names are case-insensitive. */
+const CREDENTIAL_HEADER_NAMES = new Set(["authorization", "proxy-authorization"]);
+
+/** Is this env key (local) or header name (remote) a credential BY NAME?
+ *  credentials.ts's classifier for both, so doctor cannot call a key a
+ *  credential that the elicitation path and the stderr redactor do not. A
+ *  header name is folded `-` -> `_` first so X-Api-Key splits into the same
+ *  segments X_API_KEY does. No value sniffing: a credential parked in a key
+ *  that does not read as one is a limit here, as it is in the redactor. */
+function isPlaintextCredentialName(name: string, channel: "env" | "headers"): boolean {
+  if (channel === "env") return isCredentialEnvName(name);
+  return CREDENTIAL_HEADER_NAMES.has(name.toLowerCase()) || isCredentialEnvName(name.replace(/-/g, "_"));
+}
+
+/** The entry `yaw-mcp set --secret` derives for a key when no --secret-name
+ *  is given (local-set-cmd.ts's secretNameFor), so a key moved that way is
+ *  recognised here and a name suggested here is the one set would pick.
+ *  Lowercase, like that derivation. */
+function derivedSecretName(namespace: string, key: string): string {
+  return `${namespace}_${key}`.toLowerCase();
+}
+
+/** Vault entries that look like THIS plaintext server's, for the
+ *  half-migration line. A namespace-qualified name (the namespace itself, or
+ *  `<namespace>_<key>`) always counts: it names this server and no other.
+ *
+ *  A BARE key name counts only when nothing else could own it. Key names are
+ *  generic across servers -- Authorization, X-Api-Key, API_KEY, TOKEN -- so
+ *  an `Authorization` entry that another server already references is that
+ *  server's credential, and telling this one to reference it would send
+ *  another service's token. The same goes when another server ALSO carries
+ *  that key in plaintext: the entry could be either one's, and doctor cannot
+ *  tell which without reading values. */
+function plaintextVaultEntries(
+  p: VaultStatus["plaintext"][number],
+  entries: string[],
+  refs: VaultStatus["refs"],
+  plaintext: VaultStatus["plaintext"],
+): string[] {
+  const qualified = new Set(
+    [p.namespace, ...p.keys.map((k) => derivedSecretName(p.namespace, k))].map((n) => n.toLowerCase()),
+  );
+  const claimedElsewhere = new Set(
+    [
+      ...refs.filter((r) => r.namespace !== p.namespace).flatMap((r) => r.secretNames),
+      ...plaintext.filter((o) => o.namespace !== p.namespace).flatMap((o) => o.keys),
+    ].map((n) => n.toLowerCase()),
+  );
+  const bareKeys = new Set(p.keys.map((k) => k.toLowerCase()).filter((k) => !claimedElsewhere.has(k)));
+  return entries.filter((e) => qualified.has(e.toLowerCase()) || bareKeys.has(e.toLowerCase()));
 }
 
 async function collectVaultStatus(opts: {
@@ -1991,6 +2067,7 @@ async function collectVaultStatus(opts: {
 
   const refs: VaultStatus["refs"] = [];
   const malformed: VaultStatus["malformed"] = [];
+  const plaintext: VaultStatus["plaintext"] = [];
   for (const s of opts.servers) {
     // Which map carries the refs depends on the server's shape, and getting
     // this wrong in either direction invents a cause or hides a real one.
@@ -2017,7 +2094,26 @@ async function collectVaultStatus(opts: {
     if (names.size > 0) refs.push({ namespace: s.namespace, secretNames: [...names].sort() });
     const malformedRefs = collectMalformedSecretRefs(refSource);
     if (malformedRefs.length > 0) malformed.push({ namespace: s.namespace, refs: malformedRefs });
+    // Plaintext credentials on the SAME channel, for the same reason the refs
+    // scan picks one: a literal in a map the server never sends is not a
+    // credential in use. Any `${secret:` span exempts the value -- a
+    // well-formed ref is the migrated state, and a malformed one is already
+    // reported above with its own remedy. A blank value is not a credential
+    // either: it means the server reads the variable from the ambient env.
+    const channel = isRemoteEntry(s) ? "headers" : "env";
+    const keys = Object.entries(refSource ?? {})
+      .filter(
+        ([k, v]) =>
+          typeof v === "string" && v.trim() !== "" && !v.includes("${secret:") && isPlaintextCredentialName(k, channel),
+      )
+      .map(([k]) => k)
+      .sort();
+    if (keys.length > 0) plaintext.push({ namespace: s.namespace, channel, keys, vaultEntries: [] });
   }
+  // The half-migration match runs after the loop: it needs EVERY server's refs
+  // and plaintext keys, and a server later in the list is not scanned yet
+  // inside it. See plaintextVaultEntries for why those matter.
+  for (const p of plaintext) p.vaultEntries = plaintextVaultEntries(p, entries ?? [], refs, plaintext);
 
   const known = entries;
   const referenced = new Set(refs.flatMap((r) => r.secretNames));
@@ -2035,6 +2131,7 @@ async function collectVaultStatus(opts: {
     refs,
     malformed,
     missing,
+    plaintext,
   };
 }
 
@@ -2046,7 +2143,8 @@ async function collectVaultStatus(opts: {
  *  which doctor -- running as its own process from a shell -- cannot see. A
  *  warning would take a perfectly healthy machine to exit 2.
  *
- *  Omitted entirely when there is no vault and nothing references one. */
+ *  Omitted entirely when there is no vault, nothing references one, and no
+ *  server carries a plaintext credential that could move into one. */
 function renderVaultSection(opts: {
   status: VaultStatus;
   print: (s?: string) => void;
@@ -2057,7 +2155,11 @@ function renderVaultSection(opts: {
   home: string;
 }): void {
   const { status, print } = opts;
-  if (!status.exists && status.refs.length === 0 && status.malformed.length === 0) return;
+  // Plaintext credentials alone are enough to show the section: a machine
+  // with no vault at all is exactly where "these could live in one" applies.
+  if (!status.exists && status.refs.length === 0 && status.malformed.length === 0 && status.plaintext.length === 0) {
+    return;
+  }
   print("SECRET VAULT");
   print(`  file:       ${status.path}${status.exists ? "" : " (does not exist yet)"}`);
   // On Windows every writer of the vault's files (saveVault, the secrets
@@ -2154,7 +2256,86 @@ function renderVaultSection(opts: {
     print(`  missing:    referenced but not stored -- ${status.missing.join(", ")}`);
     print("              store each with `yaw-mcp secrets set <name>`");
   }
+  if (status.plaintext.length > 0) renderPlaintextCredentials(status.plaintext, print);
   print("");
+}
+
+/** The vault entry name the fix lines suggest for one plaintext key. An entry
+ *  the vault ALREADY holds wins -- that is the half-migration, and the fix is
+ *  to reference it, not to store a second copy under a new name: one named
+ *  like the key (bare, or `<namespace>_<key>`), else one named like the
+ *  namespace when this is the server's only plaintext key (with two, a
+ *  namespace-named entry cannot be both). vaultEntries already dropped a bare
+ *  key name another server owns, so a match here is this server's.
+ *
+ *  A fresh name is the namespace for a lone key -- the `${secret:gh}` shape
+ *  the help text and the catalog already use -- else `<namespace>_<key>`, the
+ *  name `set --secret` derives. Never the bare key: two servers that each
+ *  send Authorization would both be told `secrets set Authorization`, and the
+ *  second run would overwrite the first one's credential. */
+function suggestSecretName(p: VaultStatus["plaintext"][number], key: string): { name: string; stored: boolean } {
+  const keyNames = new Set([key.toLowerCase(), derivedSecretName(p.namespace, key)]);
+  const byKey = p.vaultEntries.find((e) => keyNames.has(e.toLowerCase()));
+  if (byKey !== undefined) return { name: byKey, stored: true };
+  if (p.keys.length === 1) {
+    const byNs = p.vaultEntries.find((e) => e.toLowerCase() === p.namespace.toLowerCase());
+    if (byNs !== undefined) return { name: byNs, stored: true };
+    return { name: p.namespace, stored: false };
+  }
+  const derived = derivedSecretName(p.namespace, key);
+  return { name: SECRET_NAME_RE.test(derived) ? derived : `${p.namespace}-${p.keys.indexOf(key) + 1}`, stored: false };
+}
+
+/** The `plaintext:` block of SECRET VAULT. Names only -- the namespace, the
+ *  channel and the key -- plus the commands that move each one into the
+ *  vault. Informational like the rest of the section (see renderVaultSection):
+ *  a literal credential in bundles.json WORKS, so it is a hygiene finding, not
+ *  a failure, and moving the exit code over it would turn every machine that
+ *  predates the vault to exit 2. */
+function renderPlaintextCredentials(plaintext: VaultStatus["plaintext"], print: (s?: string) => void): void {
+  print("  plaintext:  credentials stored IN THE CLEAR in bundles.json (names only, never values):");
+  for (const p of plaintext) {
+    print(`    ${p.namespace}: ${p.keys.map((k) => `${p.channel}.${k}`).join(", ")}`);
+    if (p.vaultEntries.length > 0) {
+      // The exact case this block exists for: `secrets set` ran, the
+      // bundles.json edit did not, and nothing said so.
+      const held = p.vaultEntries.map((e) => `"${e}"`).join(", ");
+      print(`      the vault already holds ${held}, but this server still sends the plaintext --`);
+      print("      the move into the vault is half done.");
+    }
+    for (const key of p.keys) {
+      const { name, stored } = suggestSecretName(p, key);
+      const ref = `\${secret:${name}}`;
+      if (p.channel === "env") {
+        if (stored) {
+          print(`      yaw-mcp set ${p.namespace} env.${key}='${ref}'`);
+          print(`        (first \`yaw-mcp secrets set ${name}\` if the stored value is not this one)`);
+        } else {
+          print(`      yaw-mcp secrets set ${name}`);
+          print(`      yaw-mcp set ${p.namespace} env.${key}='${ref}'`);
+          // The one-step form, offered only here: on the stored branch above
+          // `--secret` would REPLACE an entry that only needs referencing.
+          // --secret-name pinned so it stores under the name this block named,
+          // not set's own <namespace>_<key> default.
+          print(`        (or in one step: yaw-mcp set ${p.namespace} env.${key} --secret --secret-name ${name})`);
+        }
+      } else {
+        // `set` refuses env on a remote and never edits headers (see
+        // local-set-cmd.ts), so the second step is the file or a re-add.
+        if (!stored) print(`      yaw-mcp secrets set ${name}`);
+        print(`      ${stored ? "make" : "then make"} "headers"."${key}" in bundles.json reference ${ref}`);
+        // The Bearer scheme only on the headers that take one: X-Api-Key and
+        // its kind want the bare key, and "Bearer <key>" there is rejected.
+        const example = CREDENTIAL_HEADER_NAMES.has(key.toLowerCase()) ? `Bearer ${ref}` : ref;
+        print(
+          `        (e.g. "${example}"), or re-add with \`yaw-mcp add ${p.namespace} --url <url> --header '${key}: ...'\``,
+        );
+        // Same caveat as the env branch: a matched entry is a name match, not
+        // a value match.
+        if (stored) print(`        (first \`yaw-mcp secrets set ${name}\` if the stored value is not this one)`);
+      }
+    }
+  }
 }
 
 // Everything the OAM RUNTIME section (text) / oamRuntime block (json) needs,
