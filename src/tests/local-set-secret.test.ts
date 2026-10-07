@@ -508,3 +508,197 @@ describe("runSet --secret", () => {
     expect(await readBack("pg_pgpassword")).toBe(VALUE);
   });
 });
+
+describe("runSet --secret -- the referenced-by notice", () => {
+  // The rotate scenario `referenceFollows` targets: `rot` already references
+  // ${secret:mytok}, so a second run replaces a value a running yaw-mcp may
+  // hold in an already-started child. The restart notice must reach the
+  // user through set's own stderr, not just the vault's.
+  it("a rotate on a referenced name tells the user to restart the referencing server", async () => {
+    writeBundles(SAMPLE);
+    expect((await secretSet("rot", "env.TOKEN", {}, "v1\n")).exitCode).toBe(0);
+    const second = await secretSet("rot", "env.TOKEN", {}, "v2\n");
+    expect(second.exitCode).toBe(0);
+    expect(second.err).toContain("${secret:mytok} is referenced by: rot");
+    expect(second.err).toContain("OLD value");
+    expect(second.err).toContain("mcp_connect_deactivate");
+    expect(second.err).not.toContain("v1");
+    expect(second.err).not.toContain("v2");
+  });
+});
+
+describe("runSet --secret -- interactive, --json and reference edges", () => {
+  /** Every non-blank stderr line parsed as JSON -- a prose line throws. */
+  function errLines(err: string): Array<Record<string, unknown>> {
+    return err
+      .split("\n")
+      .filter((l) => l.trim() !== "")
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+  }
+
+  /** A terminal on both ends: stdin a TTY that takes raw mode, stdout a TTY.
+   *  Each answer is typed only once its prompt has been written -- the way a
+   *  person at the terminal answers. */
+  function ttyIo(answers: Array<[prompt: string, typed: string]>): {
+    io: SetCommandOptions["io"];
+    shown: () => string;
+  } {
+    const stdin = Object.assign(new PassThrough(), {
+      isTTY: true,
+      isRaw: false,
+      setRawMode(v: boolean) {
+        stdin.isRaw = v;
+        return stdin;
+      },
+    });
+    const stdout = Object.assign(new PassThrough(), { isTTY: true, columns: 80 });
+    let shown = "";
+    let next = 0;
+    stdout.on("data", (b: Buffer) => {
+      shown += b.toString("utf8");
+      while (next < answers.length && shown.includes(answers[next][0])) {
+        const typed = answers[next][1];
+        // Consume the prompt so a later answer waits for a fresh one.
+        shown = shown.replace(answers[next][0], "");
+        next++;
+        setImmediate(() => stdin.write(typed));
+      }
+    });
+    let all = "";
+    stdout.on("data", (b: Buffer) => {
+      all += b.toString("utf8");
+    });
+    return { io: { stdin, stdout }, shown: () => all };
+  }
+
+  it("an accepted overwrite on a TTY goes on to read the value from the same stdin", { timeout: 20_000 }, async () => {
+    writeBundles(SAMPLE);
+    const t = ttyIo([
+      ["[y/N]", "y\r"],
+      ["Secret value: ", `${VALUE}\r`],
+    ]);
+    const r = await secretSet("pg", "env.PGPASSWORD", { isTTY: true, io: t.io });
+    expect(t.shown()).toContain("Overwrite PGPASSWORD");
+    expect(r.out).not.toContain("Aborted");
+    expect(r.exitCode).toBe(0);
+    expect(envOf("pg")).toEqual({ PGPASSWORD: "${secret:pg_pgpassword}" });
+    expect(await readBack("pg_pgpassword")).toBe(VALUE);
+    // No-echo: the typed value never reaches the terminal.
+    expect(t.shown()).not.toContain(VALUE);
+  });
+
+  it("--json: a vault-step failure is runSecrets's one envelope, with no prose and an empty stdout", async () => {
+    writeBundles(SAMPLE);
+    const empty = await secretSet("gh", "env.GITHUB_TOKEN", { json: true }, "\n");
+    // Seed a vault so a wrong passphrase has something to fail against.
+    expect((await secretSet("gh", "env.SEED", {}, "seed\n")).exitCode).toBe(0);
+    lock();
+    const seeded = readFileSync(bundlesPath(), "utf8");
+    const wrong = await secretSet("pg", "env.NEWKEY", { json: true, passphrase: "not-the-passphrase" });
+    const ttyIn = Object.assign(new PassThrough(), { isTTY: true });
+    const noPrompt = await secretSet("gh", "env.GITHUB_TOKEN", {
+      json: true,
+      io: { stdin: ttyIn, stdout: new PassThrough() },
+    });
+    for (const [label, r] of [
+      ["empty", empty],
+      ["wrong passphrase", wrong],
+      ["no prompt", noPrompt],
+    ] as const) {
+      expect(r.exitCode, label).toBe(1);
+      expect(r.out, label).toBe("");
+      expect(r.err, label).not.toContain("Nothing was written");
+      const fails = errLines(r.err).filter((p) => p.ok === false);
+      expect(fails, label).toHaveLength(1);
+      expect(typeof fails[0].error, label).toBe("string");
+    }
+    expect(errLines(empty.err).find((p) => p.ok === false)?.error).toContain("cannot be empty");
+    expect(readFileSync(bundlesPath(), "utf8")).toBe(seeded);
+    expect(envOf("gh")).toEqual({ OTHER: "o", SEED: "${secret:gh_seed}" });
+  });
+
+  it("--json: a rotation reports replaced: true and fresh_vault: false", async () => {
+    writeBundles(SAMPLE);
+    expect((await secretSet("rot", "env.TOKEN", {}, "v1\n")).exitCode).toBe(0);
+    lock();
+    const r = await secretSet("rot", "env.TOKEN", { json: true }, "v2\n");
+    expect(r.exitCode).toBe(0);
+    const env = JSON.parse(r.out.trim());
+    expect(env.secret).toEqual({ name: "mytok", ref: "${secret:mytok}", replaced: true, fresh_vault: false });
+    expect(await readBack("mytok")).toBe("v2");
+  });
+
+  it("refuses a derived name a remote server's header already embeds", async () => {
+    writeBundles(`{ "version": 1, "servers": [
+      { "namespace": "gh", "name": "GitHub", "command": "npx", "args": ["x"] },
+      { "namespace": "ghr", "name": "GitHub remote", "url": "https://example.test/mcp", "headers": { "Authorization": "Bearer \${secret:gh_github_token}" } }
+    ] }`);
+    const before = readFileSync(bundlesPath(), "utf8");
+    const r = await secretSet("gh", "env.GITHUB_TOKEN");
+    expect(r.exitCode).toBe(2);
+    expect(r.err).toContain("referenced by ghr header Authorization");
+    expect(readFileSync(bundlesPath(), "utf8")).toBe(before);
+    expect(existsSync(vaultFile())).toBe(false);
+  });
+
+  it("rotating env.KEY's own reference proceeds even when another key shares it", async () => {
+    writeBundles(`{ "version": 1, "servers": [
+      { "namespace": "rot", "name": "R", "command": "npx", "args": ["x"], "env": { "TOKEN": "\${secret:mytok}" } },
+      { "namespace": "other", "name": "O", "command": "npx", "args": ["x"], "env": { "T": "\${secret:mytok}" } }
+    ] }`);
+    const r = await secretSet("rot", "env.TOKEN");
+    expect(r.err).not.toContain("already referenced by");
+    expect(r.exitCode).toBe(0);
+    expect(await readBack("mytok")).toBe(VALUE);
+  });
+
+  it("--secret-name over an existing reference is an overwrite: refused off a TTY, re-pointed with --force", async () => {
+    writeBundles(SAMPLE);
+    expect((await secretSet("rot", "env.TOKEN", {}, "old\n")).exitCode).toBe(0);
+    lock();
+    const before = readFileSync(bundlesPath(), "utf8");
+    const refused = await secretSet("rot", "env.TOKEN", { secretName: "newtok" });
+    expect(refused.exitCode).toBe(2);
+    expect(refused.err).toContain("refusing to overwrite TOKEN");
+    expect(readFileSync(bundlesPath(), "utf8")).toBe(before);
+    expect(await readBack("newtok")).toBeUndefined();
+    const forced = await secretSet("rot", "env.TOKEN", { secretName: "newtok", force: true });
+    expect(forced.exitCode).toBe(0);
+    expect(envOf("rot")).toEqual({ TOKEN: "${secret:newtok}" });
+    expect(await readBack("newtok")).toBe(VALUE);
+    // The old entry is left alone, not deleted.
+    expect(await readBack("mytok")).toBe("old");
+  });
+
+  it("--json: every refusal before the vault write is one stderr envelope", async () => {
+    writeBundles(`{ "version": 1, "servers": [
+      { "namespace": "my server", "name": "Odd", "command": "npx", "args": ["x"] },
+      { "namespace": "gh", "name": "GitHub", "command": "npx", "args": ["x"], "env": { "GITHUB_TOKEN": "\${secret:gh_github_token}" } },
+      { "namespace": "pg", "name": "Postgres", "command": "npx", "args": ["x"], "env": { "PGPASSWORD": "plain" } }
+    ] }`);
+    const underivable = await secretSet("my server", "env.TOKEN", { json: true });
+    const collision = await secretSet("gh", "env.github_token", { json: true });
+    const overwrite = await secretSet("pg", "env.PGPASSWORD", { json: true });
+    for (const [label, r] of [
+      ["underivable", underivable],
+      ["collision", collision],
+      ["overwrite", overwrite],
+    ] as const) {
+      expect(r.exitCode, label).toBe(2);
+      expect(r.out, label).toBe("");
+      const lines = errLines(r.err);
+      expect(lines, label).toHaveLength(1);
+      expect(lines[0].ok, label).toBe(false);
+      expect(lines[0].path, label).toBe(bundlesPath());
+    }
+    const [u] = errLines(underivable.err);
+    expect(u).toMatchObject({ namespace: "my server", hint: "Name it yourself with --secret-name NAME." });
+    expect(u.error).toContain('cannot derive a vault name from "my server" and TOKEN');
+    const [c] = errLines(collision.err);
+    expect(c).toMatchObject({ namespace: "gh", referenced_by: ["gh env.GITHUB_TOKEN"] });
+    expect(c.error).toContain('"gh_github_token" is already referenced by gh env.GITHUB_TOKEN');
+    expect(c.hint).toContain("--secret-name NAME");
+    expect(errLines(overwrite.err)[0]).toMatchObject({ namespace: "pg", destructive: ["PGPASSWORD"] });
+    expect(existsSync(vaultFile())).toBe(false);
+  });
+});

@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   CONFIG_FILENAME,
   CURRENT_SCHEMA_VERSION,
@@ -314,6 +314,26 @@ describe("loadYawMcpConfig — fail-open on bad files", () => {
     const warning = r.warnings.find((w) => w.includes("invalid JSON")) ?? "";
     expect(warning).toContain("at line 2, column 15");
     for (let i = 0; i + 4 <= token.length; i++) expect(warning).not.toContain(token.slice(i, i + 4));
+  });
+
+  // The log("warn") line on stderr carries the path and the position only:
+  // the JSON.parse message (with its slice of source) must not ride along.
+  it("an unquoted value in a malformed config file never reaches stderr", async () => {
+    const token = "zq9Xv7Kp2Lm4Rt8Wn3Yb6Hc1Jd5Fg0";
+    writeConfigRaw(synthCwd, LOCAL_CONFIG_FILENAME, `{\n  "servers": [${token}]\n}\n`);
+    const written: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => {
+      written.push(String(chunk));
+      return true;
+    });
+    try {
+      await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    } finally {
+      spy.mockRestore();
+    }
+    const stderr = written.join("");
+    expect(stderr).toContain("at line 2, column 15");
+    for (let i = 0; i + 4 <= token.length; i++) expect(stderr).not.toContain(token.slice(i, i + 4));
   });
 
   it("warns when a config file exists but cannot be READ (not just when it won't parse)", async () => {

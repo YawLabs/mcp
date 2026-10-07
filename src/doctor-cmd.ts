@@ -2358,6 +2358,17 @@ function renderPlaintextCredentials(
       const held = p.vaultEntries.map((e) => `"${e}"`).join(", ");
       print(`      the vault already holds ${held}, but this server still sends the plaintext --`);
       print("      the move into the vault is half done.");
+      // An entry named for the NAMESPACE is matched above but, with two or
+      // more keys, suggestSecretName cannot hand it to any one of them --
+      // doctor reads names, not values, so it cannot tell which key it holds.
+      // Without this the block said "half done with <ns>" and then suggested
+      // only fresh entries, leaving <ns> referenced by nothing.
+      const nsEntry =
+        p.keys.length > 1 ? p.vaultEntries.find((e) => e.toLowerCase() === p.namespace.toLowerCase()) : undefined;
+      if (nsEntry !== undefined) {
+        print(`      "${nsEntry}" is named for the server, not a key, so it can serve only ONE of these:`);
+        print(`      point the key it holds at \${secret:${nsEntry}} in place of that key's lines below.`);
+      }
     }
     for (const key of p.keys) {
       const { name, stored } = suggestSecretName(p, key);

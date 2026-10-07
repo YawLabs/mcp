@@ -859,6 +859,29 @@ describe("loadLocalBundles", () => {
     expect(jsonErrorLocation("{}", new Error("no offset anywhere"))).toBe("(position unknown)");
   });
 
+  const locate = (src: string): string => {
+    let err: unknown;
+    try {
+      JSON.parse(src);
+    } catch (e) {
+      err = e;
+    }
+    return jsonErrorLocation(src, err);
+  };
+
+  it("jsonErrorLocation counts the column in the original text, comments included", () => {
+    // The bad token `x` sits at column 19 of what the user sees; the
+    // comment-stripped text would put it 10 columns earlier.
+    expect(locate('{ /* note */ "a": x }')).toBe("at line 1, column 19");
+  });
+
+  it("jsonErrorLocation treats LF, CRLF and a bare CR each as one line break", () => {
+    expect(locate('{\n"a": x}')).toBe("at line 2, column 6");
+    expect(locate('{\r\n"a": x}')).toBe("at line 2, column 6");
+    expect(locate('{\r"a": x}')).toBe("at line 2, column 6");
+    expect(locate('{\r\r\n\n"a": x}')).toBe("at line 4, column 6");
+  });
+
   it("returns null when root is an array, not an object", async () => {
     mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
     writeFileSync(localBundlesPath(join(synthHome, CONFIG_DIRNAME)), JSON.stringify([{ namespace: "x" }]));

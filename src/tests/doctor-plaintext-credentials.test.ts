@@ -363,3 +363,147 @@ describe("SECRET VAULT -- plaintext credentials", () => {
     expect(raw).not.toContain(BEARER);
   });
 });
+
+describe("SECRET VAULT -- plaintext credentials: fix-line shapes", () => {
+  const remote = (ns: string, headers: Record<string, string>) => ({
+    id: `${ns}-id`,
+    name: ns,
+    namespace: ns,
+    type: "remote",
+    url: `https://${ns}.example.com/mcp`,
+    headers,
+  });
+
+  async function writeTrustedProject(servers: unknown[]): Promise<string> {
+    const projectPath = join(cwd, ".yaw-mcp", "bundles.json");
+    mkdirSync(join(cwd, ".yaw-mcp"), { recursive: true });
+    writeFileSync(projectPath, JSON.stringify({ version: 1, servers }));
+    const { grantTrust } = await import("../trust.js");
+    await grantTrust(projectPath, readFileSync(projectPath), { home });
+    return projectPath;
+  }
+
+  it("offers the pasteable re-add on a user-global remote, and drops it for a project file", async () => {
+    writeBundles([remote("linear", { Authorization: BEARER })]);
+    const { txt } = await text();
+    expect(txt).toContain(
+      "        (e.g. \"Bearer ${secret:linear}\"), or re-add with `yaw-mcp add linear --url <url> --header 'Authorization: ...'`\n",
+    );
+    expect(txt).not.toContain(BEARER);
+
+    rmSync(join(home, ".yaw-mcp", "bundles.json"));
+    const projectPath = await writeTrustedProject([remote("linear", { Authorization: BEARER })]);
+    const project = await text();
+    expect(project.txt).toContain(`in ${projectPath} reference \${secret:linear}\n`);
+    expect(project.txt).toContain('        (e.g. "Bearer ${secret:linear}")\n');
+    expect(project.txt).not.toContain("or re-add");
+  });
+
+  it("gives each of a local server's plaintext env keys its own derived <ns>_<key> entry", async () => {
+    writeBundles([tailscale({ TAILSCALE_API_KEY: TS_KEY, TAILSCALE_CLIENT_SECRET: "cs-PLAINTEXT-0009" })]);
+    const { txt } = await text();
+    expect(txt).toContain("    tailscale: env.TAILSCALE_API_KEY, env.TAILSCALE_CLIENT_SECRET\n");
+    for (const [key, name] of [
+      ["TAILSCALE_API_KEY", "tailscale_tailscale_api_key"],
+      ["TAILSCALE_CLIENT_SECRET", "tailscale_tailscale_client_secret"],
+    ]) {
+      expect(txt).toContain(`      yaw-mcp secrets set ${name}\n`);
+      expect(txt).toContain(`      yaw-mcp set tailscale env.${key}='\${secret:${name}}'\n`);
+      expect(txt).toContain(`(or in one step: yaw-mcp set tailscale env.${key} --secret --secret-name ${name})`);
+    }
+    // Two keys never share the namespace entry.
+    expect(txt).not.toContain("      yaw-mcp secrets set tailscale\n");
+    expect(txt).not.toContain("${secret:tailscale}");
+    expect(txt).not.toContain(TS_KEY);
+    expect(txt).not.toContain("cs-PLAINTEXT-0009");
+  });
+
+  it("says a namespace-named entry can serve only one of a multi-key server's keys", async () => {
+    writeVault(["tailscale"]);
+    writeBundles([tailscale({ TAILSCALE_API_KEY: TS_KEY, TAILSCALE_CLIENT_SECRET: "cs-PLAINTEXT-0010" })]);
+    const { txt } = await text();
+    expect(txt).toContain('the vault already holds "tailscale", but this server still sends the plaintext');
+    expect(txt).toContain('      "tailscale" is named for the server, not a key, so it can serve only ONE of these:\n');
+    expect(txt).toContain("      point the key it holds at ${secret:tailscale} in place of that key's lines below.\n");
+    // Doctor cannot tell which key the entry holds, so each key keeps its fresh line.
+    expect(txt).toContain("      yaw-mcp secrets set tailscale_tailscale_api_key\n");
+    expect(txt).toContain("      yaw-mcp secrets set tailscale_tailscale_client_secret\n");
+    expect(txt).not.toContain("cs-PLAINTEXT-0010");
+
+    // A lone key takes the namespace entry outright: no "only ONE" line.
+    writeBundles([tailscale({ TAILSCALE_API_KEY: TS_KEY })]);
+    const lone = await text();
+    expect(lone.txt).toContain("yaw-mcp set tailscale env.TAILSCALE_API_KEY='${secret:tailscale}'");
+    expect(lone.txt).not.toContain("named for the server");
+  });
+
+  it("on a project file with a matching entry, says make (not then make) with the not-this-value caveat", async () => {
+    writeVault(["tailscale"]);
+    const projectPath = await writeTrustedProject([tailscale({ TAILSCALE_API_KEY: TS_KEY })]);
+    const { txt } = await text();
+    expect(txt).toContain('the vault already holds "tailscale"');
+    expect(txt).toContain(`      make "env"."TAILSCALE_API_KEY" in ${projectPath} reference \${secret:tailscale}\n`);
+    expect(txt).toContain("        (first `yaw-mcp secrets set tailscale` if the stored value is not this one)\n");
+    expect(txt).not.toContain("then make");
+    expect(txt).not.toContain("      yaw-mcp secrets set tailscale\n");
+    expect(txt).not.toContain("yaw-mcp set ");
+    expect(txt).not.toContain(TS_KEY);
+  });
+
+  it("still lists plaintext when the vault cannot be read, claiming nothing about its entries", async () => {
+    mkdirSync(join(home, ".yaw-mcp"), { recursive: true });
+    // Truncated JSON that names the namespace, so a fallback that scraped it would show.
+    writeFileSync(join(home, ".yaw-mcp", "secrets.json"), '{"entries": {"tailscale": ');
+    writeBundles([tailscale({ TAILSCALE_API_KEY: TS_KEY })]);
+    const { txt, exitCode } = await text();
+    expect(txt).toContain("  entries:    unreadable -- ");
+    expect(txt).toContain("    tailscale: env.TAILSCALE_API_KEY\n");
+    expect(txt).not.toContain("already holds");
+    expect(txt).toContain("      yaw-mcp secrets set tailscale\n");
+    expect(txt).toContain("      yaw-mcp set tailscale env.TAILSCALE_API_KEY='${secret:tailscale}'\n");
+    expect(txt).not.toContain(TS_KEY);
+    expect(exitCode).toBe(0);
+
+    const { parsed } = await json();
+    expect(parsed.vault.plaintext).toEqual([
+      { namespace: "tailscale", channel: "env", keys: ["TAILSCALE_API_KEY"], vaultEntries: [] },
+    ]);
+  });
+
+  it("flags lowercase authorization and Proxy-Authorization in any case, with the Bearer example", async () => {
+    writeBundles([
+      remote("alpha", { authorization: BEARER }),
+      remote("beta", { "PROXY-AUTHORIZATION": "Bearer prx-PLAINTEXT-0011" }),
+    ]);
+    const { txt } = await text();
+    expect(txt).toContain("    alpha: headers.authorization\n");
+    expect(txt).toContain("    beta: headers.PROXY-AUTHORIZATION\n");
+    expect(txt).toContain('        (e.g. "Bearer ${secret:alpha}"), or re-add');
+    expect(txt).toContain('        (e.g. "Bearer ${secret:beta}"), or re-add');
+    expect(txt).not.toContain(BEARER);
+    expect(txt).not.toContain("prx-PLAINTEXT-0011");
+    const { parsed } = await json();
+    expect(parsed.vault.plaintext).toEqual([
+      { namespace: "alpha", channel: "headers", keys: ["authorization"], vaultEntries: [] },
+      { namespace: "beta", channel: "headers", keys: ["PROXY-AUTHORIZATION"], vaultEntries: [] },
+    ]);
+  });
+
+  it("falls back to <ns>-<n> when the derived name is not a valid secret name, distinct per key", async () => {
+    // `#` and `!` are legal in a header name (RFC 9110 tchar) but not in a
+    // secret name, so acme_my#secret could be neither stored nor referenced.
+    writeBundles([
+      remote("acme", { "My#Secret": "s-PLAINTEXT-0012", "Proxy-Authorization": BEARER, "X!Token": "t-PLAINTEXT-0013" }),
+    ]);
+    const { txt } = await text();
+    expect(txt).toContain("    acme: headers.My#Secret, headers.Proxy-Authorization, headers.X!Token\n");
+    expect(txt).toContain("      yaw-mcp secrets set acme-1\n");
+    expect(txt).toContain('then make "headers"."My#Secret" in bundles.json reference ${secret:acme-1}');
+    expect(txt).toContain("      yaw-mcp secrets set acme_proxy-authorization\n");
+    expect(txt).toContain("      yaw-mcp secrets set acme-3\n");
+    expect(txt).toContain('then make "headers"."X!Token" in bundles.json reference ${secret:acme-3}');
+    expect(txt).not.toContain("acme_my#secret");
+    expect(txt).not.toContain("acme_x!token");
+    for (const leak of ["s-PLAINTEXT-0012", "t-PLAINTEXT-0013", BEARER]) expect(txt).not.toContain(leak);
+  });
+});

@@ -553,8 +553,12 @@ export function jsonErrorLocation(raw: string, err: unknown): string {
   }
   if (offset === undefined || !Number.isFinite(offset)) return "(position unknown)";
   const before = source.slice(0, Math.min(offset, source.length));
-  const line = before.split("\n").length;
-  const column = before.length - (before.lastIndexOf("\n") + 1) + 1;
+  // \r\n, a bare \r and \n each end a line: counting \n alone put every error
+  // in a bare-CR (classic-Mac) file on line 1 and undercounted lines in a
+  // mixed-ending one.
+  const lines = before.split(/\r\n|\r|\n/);
+  const line = lines.length;
+  const column = (lines[lines.length - 1] ?? "").length + 1;
   return `at line ${line}, column ${column}`;
 }
 

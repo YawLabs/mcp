@@ -918,15 +918,23 @@ function secretConsumersNotice(
     }
     return;
   }
-  if (referenceFollows || (!replacing && !isFresh)) return;
+  const otherProject = replacing
+    ? "  If your MCP client launches yaw-mcp from another project, its bundles.json can differ from\n" +
+      "  this one: a server there that already started with the OLD value keeps it until it restarts\n" +
+      "  (mcp_connect_deactivate <namespace>, or reconnect yaw-mcp in your client).\n"
+    : "";
+  // referenceFollows drops ONLY the point-an-env-value hint: a replace still
+  // owes the other-project restart lines, since a yaw-mcp launched against a
+  // different bundles.json may hold a child started with the OLD value.
+  if (referenceFollows) {
+    if (replacing) io.err(`yaw-mcp secrets: no server in ${where} references ${ref} yet.\n${otherProject}`);
+    return;
+  }
+  if (!replacing && !isFresh) return;
   io.err(
     `yaw-mcp secrets: no server in ${where} references ${ref} yet. To use it, point an env value at it:\n` +
       `  yaw-mcp set <server> env.KEY='${ref}'\n` +
-      (replacing
-        ? "  If your MCP client launches yaw-mcp from another project, its bundles.json can differ from\n" +
-          "  this one: a server there that already started with the OLD value keeps it until it restarts\n" +
-          "  (mcp_connect_deactivate <namespace>, or reconnect yaw-mcp in your client).\n"
-        : ""),
+      otherProject,
   );
 }
 

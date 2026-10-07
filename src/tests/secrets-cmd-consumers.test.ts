@@ -7,12 +7,13 @@
 // so `set` now reads bundles.json after the save and names who references the
 // name, and what to do about the ones a running yaw-mcp already started.
 
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import nodePath from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runSecrets } from "../secrets-cmd.js";
 import { lock } from "../secrets-vault.js";
+import { grantTrust, TRUST_BYPASS_ENV } from "../trust.js";
 
 const PASS = "a-long-enough-passphrase";
 const VALUE = "ls_live_value_123";
@@ -67,15 +68,26 @@ describe("runSecrets set -- servers that reference the name", () => {
     io.err.mockReset();
   }
 
-  async function set(name: string, json = false): Promise<number> {
+  async function set(name: string, json = false, referenceFollows = false): Promise<number> {
     const r = await runSecrets(
-      { action: "set", name, value: NEW_VALUE, passphrase: PASS, force: true, home, cwd, json },
+      { action: "set", name, value: NEW_VALUE, passphrase: PASS, force: true, home, cwd, json, referenceFollows },
       io,
     );
     return r.exitCode;
   }
 
+  /** A project bundles.json at <cwd>/.yaw-mcp/bundles.json; returns its path. */
+  function writeProjectBundles(content: unknown): string {
+    const p = nodePath.join(cwd, ".yaw-mcp", "bundles.json");
+    mkdirSync(nodePath.dirname(p), { recursive: true });
+    writeFileSync(p, JSON.stringify(content));
+    return p;
+  }
+
   beforeEach(() => {
+    // The env bypass would honour an unapproved project file; the trust
+    // tests below need the real gate.
+    vi.stubEnv(TRUST_BYPASS_ENV, "");
     io.out.mockReset();
     io.err.mockReset();
     home = mkdtempSync(nodePath.join(os.tmpdir(), "yaw-mcp-consumers-"));
@@ -87,6 +99,7 @@ describe("runSecrets set -- servers that reference the name", () => {
   });
 
   afterEach(() => {
+    vi.unstubAllEnvs();
     lock();
     rmSync(home, { recursive: true, force: true });
   });
@@ -252,5 +265,88 @@ describe("runSecrets set -- servers that reference the name", () => {
     for (let i = 0; i + 4 <= token.length; i++) {
       expect(everything).not.toContain(token.slice(i, i + 4));
     }
+  });
+  // `yaw-mcp set <server> env.NEW --secret --secret-name EXISTING --force`:
+  // the caller writes the reference next, so the wiring hint is dropped --
+  // but a replace still owes the other-project restart lines.
+  it("referenceFollows on a replace nothing references keeps the other-project restart lines", async () => {
+    await seed();
+    writeBundles({ version: 1, servers: [{ namespace: "github", name: "GH", command: "npx", args: ["y"] }] });
+    expect(await set("LS", false, true)).toBe(0);
+    expect(outText()).toBe('Replaced secret "LS".\n');
+    const err = errText();
+    expect(err).toContain("launches yaw-mcp from another project");
+    expect(err).toContain("OLD value");
+    expect(err).toContain("mcp_connect_deactivate");
+    expect(err).not.toContain("yaw-mcp set <server>");
+    expect(err).not.toContain("point an env value");
+  });
+
+  it("referenceFollows on a first store nothing references prints no wiring hint, even in a fresh vault", async () => {
+    expect(await set("LS", false, true)).toBe(0);
+    const err = errText();
+    expect(err).toContain("created the vault");
+    expect(err).not.toContain("no server in");
+    expect(err).not.toContain("yaw-mcp set <server>");
+  });
+
+  it("an APPROVED project bundles.json under cwd is the one reported", async () => {
+    await seed();
+    writeMixedBundles();
+    const projectPath = writeProjectBundles({
+      version: 1,
+      servers: [{ namespace: "projls", name: "P", command: "npx", args: ["p"], env: { K: "${secret:LS}" } }],
+    });
+    await grantTrust(projectPath, readFileSync(projectPath), { home });
+    expect(await set("LS", true)).toBe(0);
+    expect(JSON.parse(outText())).toMatchObject({
+      referenced_by: ["projls"],
+      bundles_path: projectPath,
+      running_servers_stale: true,
+    });
+  });
+
+  it("an UNAPPROVED project bundles.json is ignored; the user-global file is reported", async () => {
+    await seed();
+    writeMixedBundles();
+    writeProjectBundles({
+      version: 1,
+      servers: [{ namespace: "projls", name: "P", command: "npx", args: ["p"], env: { K: "${secret:LS}" } }],
+    });
+    expect(await set("LS", true)).toBe(0);
+    expect(JSON.parse(outText())).toMatchObject({
+      referenced_by: ["billing", "lemonsqueezy"],
+      bundles_path: bundlesPath(),
+    });
+  });
+
+  it("an unreadable bundles.json on a FIRST store prints nothing and reports unknown under --json", async () => {
+    writeBundles("{ not json");
+    // Fresh vault: only the creation nudge.
+    expect(await set("LS")).toBe(0);
+    let err = errText();
+    expect(err).toContain("created the vault");
+    expect(err).not.toContain("could not read bundles.json");
+    expect(err).not.toContain("no server in");
+    expect(err).not.toContain("yaw-mcp set <server>");
+
+    // Existing vault, a new name: silent.
+    io.out.mockReset();
+    io.err.mockReset();
+    lock();
+    expect(await set("OTHER")).toBe(0);
+    expect(outText()).toBe('Stored secret "OTHER".\n');
+    err = errText();
+    expect(err).toBe("");
+
+    io.out.mockReset();
+    lock();
+    expect(await set("THIRD", true)).toBe(0);
+    expect(JSON.parse(outText())).toMatchObject({
+      replaced: false,
+      referenced_by: null,
+      bundles_path: null,
+      running_servers_stale: null,
+    });
   });
 });

@@ -1118,13 +1118,25 @@ async function runSetSecret(opts: SetCommandOptions, ctx: SetContext): Promise<S
   const pre = await locateEntry(ctx, [{ field: "env", key, value: "", raw }]);
   if (!pre.ok) return pre.result;
 
+  // A refusal before the vault write: prose, or under --json ONE stderr
+  // envelope in the shape confirmDestructive's refusal takes, so a script
+  // that asked for machine output never has to scrape a prose line.
+  const refuseEarly = (error: string, hint: string, fields: Record<string, unknown> = {}): SetCommandResult => {
+    if (opts.json) {
+      printErr(JSON.stringify({ ok: false, error, hint, path, namespace: pre.namespace, ...fields }));
+    } else {
+      printErr(`yaw-mcp ${verb}: ${error}`);
+      printErr(`  ${hint}`);
+    }
+    return { exitCode: 2, written: [] };
+  };
+
   const name = secretNameFor(opts.secretName, pre.originalEnv[key], pre.namespace, key);
   if (name === null) {
-    printErr(
-      `yaw-mcp ${verb}: cannot derive a vault name from "${pre.namespace}" and ${key} (letters, digits, "_", "." or "-" only).`,
+    return refuseEarly(
+      `cannot derive a vault name from "${pre.namespace}" and ${key} (letters, digits, "_", "." or "-" only).`,
+      "Name it yourself with --secret-name NAME.",
     );
-    printErr("  Name it yourself with --secret-name NAME.");
-    return { exitCode: 2, written: [] };
   }
   const ref = `\${secret:${name}}`;
   // Only a DERIVED name is checked: an explicit --secret-name that another
@@ -1135,11 +1147,11 @@ async function runSetSecret(opts: SetCommandOptions, ctx: SetContext): Promise<S
   if (opts.secretName === undefined && name !== storedRef) {
     const others = otherReferences(pre.rawText, ref, pre.namespace, key);
     if (others.length > 0) {
-      printErr(
-        `yaw-mcp ${verb}: the derived vault name "${name}" is already referenced by ${others.join(", ")} in ${path} -- storing env.${key} under it would replace that credential too.`,
+      return refuseEarly(
+        `the derived vault name "${name}" is already referenced by ${others.join(", ")} in ${path} -- storing env.${key} under it would replace that credential too.`,
+        "Name this one yourself with --secret-name NAME.",
+        { referenced_by: others },
       );
-      printErr("  Name this one yourself with --secret-name NAME.");
-      return { exitCode: 2, written: [] };
     }
   }
   const assignment: Assignment = { field: "env", key, value: ref, raw };
