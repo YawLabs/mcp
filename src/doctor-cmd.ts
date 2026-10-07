@@ -115,6 +115,7 @@ import { parseJsonc } from "./jsonc.js";
 import {
   isRemoteEntry,
   loadLocalBundles,
+  localBundlesPath,
   type ProjectTrustProbe,
   probeProjectTrust,
   projectFileIsHonoured,
@@ -1273,7 +1274,12 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   // work -- without it, "my server won't start" has no visible cause short of
   // reading the spawn error. Informational; see renderVaultSection for why it
   // never becomes a warning.
-  renderVaultSection({ status: await collectVaultStatus({ home, env, servers: oamStatus.servers }), print, os, home });
+  renderVaultSection({
+    status: await collectVaultStatus({ home, env, servers: oamStatus.servers, bundlesPath: oamStatus.bundlesPath }),
+    print,
+    os,
+    home,
+  });
 
   // state.json, peeked and loaded ONCE for both the STATE and RELIABILITY
   // sections -- by the same helper the --json path uses, so the two surfaces
@@ -1654,7 +1660,7 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
   // unconditionally here (the text section hides itself when there is no
   // vault, no refs and no plaintext credential) so a consumer can read `.vault` without a presence
   // check. Names and booleans only -- never a value, never the passphrase.
-  const vault = await collectVaultStatus({ home, env, servers: oamStatus.servers });
+  const vault = await collectVaultStatus({ home, env, servers: oamStatus.servers, bundlesPath: oamStatus.bundlesPath });
   // Trial-GC failures (or, on a read-only run, the unswept expired trials)
   // fold AFTER the bundle warnings, matching the text path's order (trust ->
   // bundle -> trials) so the two surfaces emit the same warning list in the
@@ -1933,6 +1939,18 @@ export interface VaultStatus {
    *  populated, and the credential the server actually used still a literal.
    *  Additive JSON field. */
   plaintext: Array<{ namespace: string; channel: "env" | "headers"; keys: string[]; vaultEntries: string[] }>;
+  /** The bundles.json the scanned servers (and so `refs`, `malformed` and
+   *  `plaintext`) came from -- the file the loader settled on, which can be an
+   *  approved PROJECT `.yaw-mcp/bundles.json` rather than the user-global one.
+   *  Null when no file was loaded. Additive JSON field. */
+  bundlesPath: string | null;
+  /** True when `bundlesPath` is the user-global `~/.yaw-mcp/bundles.json` --
+   *  the ONLY file `yaw-mcp set` edits (local-set-cmd.ts). False for a project
+   *  file, where a `set` command would write the wrong file and leave the
+   *  plaintext the server actually loads untouched, so the fix lines name a
+   *  hand edit of `bundlesPath` instead. True when `bundlesPath` is null.
+   *  Additive JSON field. */
+  bundlesUserGlobal: boolean;
 }
 
 /** Header names that carry a credential whatever the name heuristic says.
@@ -1942,11 +1960,17 @@ export interface VaultStatus {
 const CREDENTIAL_HEADER_NAMES = new Set(["authorization", "proxy-authorization"]);
 
 /** Is this env key (local) or header name (remote) a credential BY NAME?
- *  credentials.ts's classifier for both, so doctor cannot call a key a
- *  credential that the elicitation path and the stderr redactor do not. A
- *  header name is folded `-` -> `_` first so X-Api-Key splits into the same
- *  segments X_API_KEY does. No value sniffing: a credential parked in a key
- *  that does not read as one is a limit here, as it is in the redactor. */
+ *  An env key goes through credentials.ts's isCredentialEnvName alone, the
+ *  classifier the elicitation path and the stderr redactor use, so on that
+ *  channel doctor flags exactly the keys they treat as credentials. A header
+ *  name goes through the same classifier after folding `-` -> `_` (so
+ *  X-Api-Key splits into the segments X_API_KEY does), PLUS
+ *  CREDENTIAL_HEADER_NAMES: Authorization and Proxy-Authorization are flagged
+ *  even though that classifier refuses AUTH as a segment (see the set above),
+ *  because a header by that name carries a credential by definition. So on
+ *  the headers channel doctor flags a superset of what the classifier alone
+ *  would. No value sniffing: a credential parked in a key that does not read
+ *  as one is a limit here, as it is in the redactor. */
 function isPlaintextCredentialName(name: string, channel: "env" | "headers"): boolean {
   if (channel === "env") return isCredentialEnvName(name);
   return CREDENTIAL_HEADER_NAMES.has(name.toLowerCase()) || isCredentialEnvName(name.replace(/-/g, "_"));
@@ -1994,6 +2018,8 @@ async function collectVaultStatus(opts: {
   home: string;
   env: NodeJS.ProcessEnv;
   servers: OamRuntimeStatus["servers"];
+  /** OamRuntimeStatus.bundlesPath: the file `servers` were loaded from. */
+  bundlesPath: string | null;
 }): Promise<VaultStatus> {
   const path = vaultPath(opts.home);
   const exists = existsSync(path);
@@ -2132,6 +2158,13 @@ async function collectVaultStatus(opts: {
     malformed,
     missing,
     plaintext,
+    bundlesPath: opts.bundlesPath,
+    // Same path `yaw-mcp set` builds (local-set-cmd.ts), compared the way
+    // paths.ts folds case on case-insensitive filesystems.
+    bundlesUserGlobal:
+      opts.bundlesPath === null ||
+      normalizeForCompare(resolve(opts.bundlesPath)) ===
+        normalizeForCompare(resolve(localBundlesPath(userConfigDir(opts.home)))),
   };
 }
 
@@ -2256,7 +2289,7 @@ function renderVaultSection(opts: {
     print(`  missing:    referenced but not stored -- ${status.missing.join(", ")}`);
     print("              store each with `yaw-mcp secrets set <name>`");
   }
-  if (status.plaintext.length > 0) renderPlaintextCredentials(status.plaintext, print);
+  if (status.plaintext.length > 0) renderPlaintextCredentials(status, print);
   print("");
 }
 
@@ -2291,10 +2324,33 @@ function suggestSecretName(p: VaultStatus["plaintext"][number], key: string): { 
  *  vault. Informational like the rest of the section (see renderVaultSection):
  *  a literal credential in bundles.json WORKS, so it is a hygiene finding, not
  *  a failure, and moving the exit code over it would turn every machine that
- *  predates the vault to exit 2. */
-function renderPlaintextCredentials(plaintext: VaultStatus["plaintext"], print: (s?: string) => void): void {
-  print("  plaintext:  credentials stored IN THE CLEAR in bundles.json (names only, never values):");
-  for (const p of plaintext) {
+ *  predates the vault to exit 2.
+ *
+ *  The header names the file the servers were loaded from, because it is not
+ *  always the one `yaw-mcp set` / `yaw-mcp add` edit: those write only the
+ *  user-global ~/.yaw-mcp/bundles.json, while an approved PROJECT bundles.json
+ *  wins the load. `set` never creates an entry, so suggesting it there either
+ *  failed ("no server named ...") or edited a same-namespace entry in the
+ *  global file, and in both cases the plaintext the project file sends stayed
+ *  put. So for a project file every move is `secrets set` plus a hand edit of THAT
+ *  file. */
+function renderPlaintextCredentials(
+  status: Pick<VaultStatus, "plaintext" | "bundlesPath" | "bundlesUserGlobal">,
+  print: (s?: string) => void,
+): void {
+  const userGlobal = status.bundlesUserGlobal;
+  // Per-line label: the full path once in the header, then "bundles.json" for
+  // the user-global file and the full path again for a project file, so a
+  // hand-edit line can never be read as pointing at the global file.
+  const fileLabel = userGlobal ? "bundles.json" : (status.bundlesPath ?? "bundles.json");
+  print(
+    `  plaintext:  credentials stored IN THE CLEAR in ${status.bundlesPath ?? "bundles.json"} (names only, never values):`,
+  );
+  if (!userGlobal) {
+    print("              a PROJECT bundles.json: `yaw-mcp set` and `yaw-mcp add` edit only the");
+    print("              user-global ~/.yaw-mcp/bundles.json, so edit the file above by hand.");
+  }
+  for (const p of status.plaintext) {
     print(`    ${p.namespace}: ${p.keys.map((k) => `${p.channel}.${k}`).join(", ")}`);
     if (p.vaultEntries.length > 0) {
       // The exact case this block exists for: `secrets set` ran, the
@@ -2306,7 +2362,7 @@ function renderPlaintextCredentials(plaintext: VaultStatus["plaintext"], print: 
     for (const key of p.keys) {
       const { name, stored } = suggestSecretName(p, key);
       const ref = `\${secret:${name}}`;
-      if (p.channel === "env") {
+      if (p.channel === "env" && userGlobal) {
         if (stored) {
           print(`      yaw-mcp set ${p.namespace} env.${key}='${ref}'`);
           print(`        (first \`yaw-mcp secrets set ${name}\` if the stored value is not this one)`);
@@ -2320,16 +2376,22 @@ function renderPlaintextCredentials(plaintext: VaultStatus["plaintext"], print: 
           print(`        (or in one step: yaw-mcp set ${p.namespace} env.${key} --secret --secret-name ${name})`);
         }
       } else {
-        // `set` refuses env on a remote and never edits headers (see
-        // local-set-cmd.ts), so the second step is the file or a re-add.
+        // A remote: `set` refuses env there and never edits headers (see
+        // local-set-cmd.ts). A project file: `set` edits the wrong file. Either
+        // way the second step is a hand edit of the file the server loads from.
         if (!stored) print(`      yaw-mcp secrets set ${name}`);
-        print(`      ${stored ? "make" : "then make"} "headers"."${key}" in bundles.json reference ${ref}`);
-        // The Bearer scheme only on the headers that take one: X-Api-Key and
-        // its kind want the bare key, and "Bearer <key>" there is rejected.
-        const example = CREDENTIAL_HEADER_NAMES.has(key.toLowerCase()) ? `Bearer ${ref}` : ref;
-        print(
-          `        (e.g. "${example}"), or re-add with \`yaw-mcp add ${p.namespace} --url <url> --header '${key}: ...'\``,
-        );
+        print(`      ${stored ? "make" : "then make"} "${p.channel}"."${key}" in ${fileLabel} reference ${ref}`);
+        if (p.channel === "headers") {
+          // The Bearer scheme only on the headers that take one: X-Api-Key and
+          // its kind want the bare key, and "Bearer <key>" there is rejected.
+          const example = CREDENTIAL_HEADER_NAMES.has(key.toLowerCase()) ? `Bearer ${ref}` : ref;
+          // The re-add only for the user-global file: `add` writes there too.
+          print(
+            userGlobal
+              ? `        (e.g. "${example}"), or re-add with \`yaw-mcp add ${p.namespace} --url <url> --header '${key}: ...'\``
+              : `        (e.g. "${example}")`,
+          );
+        }
         // Same caveat as the env branch: a matched entry is a name match, not
         // a value match.
         if (stored) print(`        (first \`yaw-mcp secrets set ${name}\` if the stored value is not this one)`);

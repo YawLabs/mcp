@@ -5,7 +5,7 @@
 // `tailscale` entry) read as complete. Names only, never values; informational,
 // like the rest of the section.
 
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -82,7 +82,9 @@ describe("SECRET VAULT -- plaintext credentials", () => {
     writeVault(["tailscale"]);
     writeBundles([tailscale({ TAILSCALE_API_KEY: TS_KEY, TAILSCALE_TAILNET: "example.com" })]);
     const { txt, exitCode } = await text();
-    expect(txt).toContain("plaintext:  credentials stored IN THE CLEAR in bundles.json (names only, never values):");
+    expect(txt).toContain(
+      `plaintext:  credentials stored IN THE CLEAR in ${join(home, ".yaw-mcp", "bundles.json")} (names only, never values):`,
+    );
     expect(txt).toContain("    tailscale: env.TAILSCALE_API_KEY\n");
     expect(txt).toContain('the vault already holds "tailscale", but this server still sends the plaintext');
     // The entry exists, so the fix is the reference -- not a second copy.
@@ -296,5 +298,68 @@ describe("SECRET VAULT -- plaintext credentials", () => {
     expect(txt).toContain("    tailscale: env.TAILSCALE_API_KEY\n");
     expect(txt).not.toContain("already holds");
     expect(txt).toContain("      yaw-mcp secrets set tailscale\n");
+  });
+
+  // `yaw-mcp set` / `yaw-mcp add` edit only the user-global bundles.json
+  // (local-set-cmd.ts), but an approved PROJECT bundles.json wins the load.
+  // `set` never creates an entry, so suggesting it for a project server either
+  // failed ("no server named ...") or edited a same-namespace entry in the
+  // global file; either way the plaintext the project file sends stayed put.
+  it("names the user-global file and offers set commands when that is the file loaded", async () => {
+    writeBundles([tailscale({ TAILSCALE_API_KEY: TS_KEY })]);
+    const { txt } = await text();
+    expect(txt).not.toContain("a PROJECT bundles.json");
+    expect(txt).toContain("      yaw-mcp set tailscale env.TAILSCALE_API_KEY='${secret:tailscale}'\n");
+
+    const { parsed } = await json();
+    expect(parsed.vault.bundlesPath).toBe(join(home, ".yaw-mcp", "bundles.json"));
+    expect(parsed.vault.bundlesUserGlobal).toBe(true);
+  });
+
+  it("names an approved PROJECT file and suggests a hand edit of it, never `set` or `add`", async () => {
+    const projectPath = join(cwd, ".yaw-mcp", "bundles.json");
+    mkdirSync(join(cwd, ".yaw-mcp"), { recursive: true });
+    writeFileSync(
+      projectPath,
+      JSON.stringify({
+        version: 1,
+        servers: [
+          tailscale({ TAILSCALE_API_KEY: TS_KEY }),
+          {
+            id: "lin-id",
+            name: "Linear",
+            namespace: "linear",
+            type: "remote",
+            url: "https://mcp.linear.app/mcp",
+            headers: { Authorization: BEARER },
+          },
+        ],
+      }),
+    );
+    const { grantTrust } = await import("../trust.js");
+    await grantTrust(projectPath, readFileSync(projectPath), { home });
+
+    const { txt, exitCode } = await text();
+    expect(txt).toContain(`plaintext:  credentials stored IN THE CLEAR in ${projectPath} (names only, never values):`);
+    expect(txt).toContain("a PROJECT bundles.json: `yaw-mcp set` and `yaw-mcp add` edit only the");
+    expect(txt).toContain("      yaw-mcp secrets set tailscale\n");
+    expect(txt).toContain(
+      `      then make "env"."TAILSCALE_API_KEY" in ${projectPath} reference \${secret:tailscale}\n`,
+    );
+    expect(txt).toContain("      yaw-mcp secrets set linear\n");
+    expect(txt).toContain(`      then make "headers"."Authorization" in ${projectPath} reference \${secret:linear}\n`);
+    expect(txt).toContain('        (e.g. "Bearer ${secret:linear}")\n');
+    // Neither verb edits the project file, so neither is offered.
+    expect(txt).not.toContain("yaw-mcp set ");
+    expect(txt).not.toContain("yaw-mcp add ");
+    expect(txt).not.toContain(TS_KEY);
+    expect(txt).not.toContain(BEARER);
+    expect(exitCode).toBe(0);
+
+    const { parsed, raw } = await json();
+    expect(parsed.vault.bundlesPath).toBe(projectPath);
+    expect(parsed.vault.bundlesUserGlobal).toBe(false);
+    expect(raw).not.toContain(TS_KEY);
+    expect(raw).not.toContain(BEARER);
   });
 });

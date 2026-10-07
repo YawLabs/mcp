@@ -223,4 +223,34 @@ describe("runSecrets set -- servers that reference the name", () => {
     // would skip the one prose mode advises.
     expect(JSON.parse(outText())).toMatchObject({ referenced_by: null, running_servers_stale: null });
   });
+
+  // `set` re-reads bundles.json after every save. A file that fails to parse
+  // because a credential sits in it unquoted must not echo any of that
+  // credential: V8's JSON.parse message quotes the source around the bad
+  // token, and the loader's log() line goes straight to process.stderr.
+  it("an unquoted credential in a broken bundles.json reaches no output of set", async () => {
+    const token = "zq9Xv7Kp2Lm4Rt8Wn3Yb6Hc1Jd5Fg0";
+    await seed();
+    writeBundles(`{ "servers": [ { "namespace": "gh", "command": "npx", "env": { "T": ${token} } } ] }`);
+    const written: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => {
+      written.push(String(chunk));
+      return true;
+    });
+    try {
+      expect(await set("LS")).toBe(0);
+      io.out.mockReset();
+      lock();
+      expect(await set("LS", true)).toBe(0);
+    } finally {
+      spy.mockRestore();
+    }
+    const stderr = written.join("");
+    // The loader DID warn (so the scan below covers a real line), with a position.
+    expect(stderr).toContain("at line 1, column");
+    const everything = `${stderr}\n${errText()}\n${outText()}`;
+    for (let i = 0; i + 4 <= token.length; i++) {
+      expect(everything).not.toContain(token.slice(i, i + 4));
+    }
+  });
 });

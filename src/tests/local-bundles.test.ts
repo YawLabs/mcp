@@ -19,6 +19,7 @@ import {
   BUNDLES_LOCK_NAME,
   BUNDLES_LOCK_WAIT_MS,
   bundlesSignature,
+  jsonErrorLocation,
   loadLocalBundles,
   localBundlesPath,
   NAMESPACE_RE,
@@ -810,6 +811,52 @@ describe("loadLocalBundles", () => {
     const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
     expect(r.config).toBeNull();
     expect(r.warnings.some((w) => w.includes("invalid JSON"))).toBe(true);
+  });
+
+  // V8's JSON.parse message quotes ~10 characters of source around the bad
+  // token. A credential pasted in unquoted is exactly such a token, so the
+  // warning and the log line carry a line:column and nothing of the source.
+  it("an unquoted credential in bundles.json reaches neither the warnings nor stderr", async () => {
+    const token = "zq9Xv7Kp2Lm4Rt8Wn3Yb6Hc1Jd5Fg0";
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(
+      localBundlesPath(join(synthHome, CONFIG_DIRNAME)),
+      `{\n  "servers": [\n    { "namespace": "gh", "command": "npx", "env": { "T": ${token} } }\n  ]\n}\n`,
+    );
+    const written: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => {
+      written.push(String(chunk));
+      return true;
+    });
+    let r: Awaited<ReturnType<typeof loadLocalBundles>>;
+    try {
+      r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    } finally {
+      spy.mockRestore();
+    }
+    expect(r.config).toBeNull();
+    const warning = r.warnings.find((w) => w.includes("invalid JSON"));
+    expect(warning).toContain("at line 3, column 58");
+    const stderr = written.join("");
+    expect(stderr).toContain("at line 3, column 58");
+    const everything = `${r.warnings.join("\n")}\n${stderr}`;
+    for (let i = 0; i + 4 <= token.length; i++) {
+      expect(everything).not.toContain(token.slice(i, i + 4));
+    }
+  });
+
+  it("jsonErrorLocation reports a position and never the source text", () => {
+    const src = '{\r\n  "a": secretvalue\r\n}';
+    let err: unknown;
+    try {
+      JSON.parse(src);
+    } catch (e) {
+      err = e;
+    }
+    expect(jsonErrorLocation(src, err)).toBe("at line 2, column 8");
+    // BOM stripped before counting.
+    expect(jsonErrorLocation(String.fromCharCode(0xfeff) + src, err)).toBe("at line 2, column 8");
+    expect(jsonErrorLocation("{}", new Error("no offset anywhere"))).toBe("(position unknown)");
   });
 
   it("returns null when root is an array, not an object", async () => {

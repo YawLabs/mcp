@@ -31,6 +31,7 @@ import {
   deriveNamespace,
   findShadowingProjectBundles,
   isRemoteEntry,
+  jsonErrorLocation,
   localBundlesPath,
   namespacesForStoredIdentity,
   STORED_TARGET_RE,
@@ -106,8 +107,9 @@ Settable keys:
                              "gh_github_token". Two keys can derive one name
                              (GITHUB_TOKEN and github_token; namespace "a_b"
                              with KEY C and "a" with B_C), so a derived name
-                             another env value in bundles.json already
-                             references is refused: pass --secret-name.
+                             another env value or header in bundles.json
+                             already references is refused: pass
+                             --secret-name.
                         Then env.KEY='\${secret:NAME}' is written to the entry.
                         A vault name that already exists is REPLACED
                         (confirmed on a TTY; scripted runs proceed and say
@@ -610,8 +612,11 @@ async function locateEntry(ctx: SetContext, assignments: Assignment[]): Promise<
   try {
     parsed = parseJsonc(rawText);
   } catch (e) {
+    // A position, never the parser's message: V8 quotes a slice of the source
+    // around the bad token, and the usual bad token is a credential pasted in
+    // unquoted. See jsonErrorLocation.
     printErr(
-      `yaw-mcp ${verb}: ${path} could not be parsed -- fix the JSON before setting fields (${(e as Error).message}).`,
+      `yaw-mcp ${verb}: ${path} could not be parsed -- fix the JSON before setting fields (invalid JSON ${jsonErrorLocation(rawText, e)}).`,
     );
     return refuse(1);
   }
@@ -1194,15 +1199,43 @@ async function runSetSecret(opts: SetCommandOptions, ctx: SetContext): Promise<S
   }
   const secret: SecretWrite = { key, name, ref, replaced, freshVault };
 
-  const finishHint = `  The secret "${name}" IS in the vault; finish with \`yaw-mcp set ${pre.namespace} env.${key}='${ref}'\`.`;
+  const finishCmd = `yaw-mcp set ${pre.namespace} env.${key}='${ref}'`;
+  const finishHint = `  The secret "${name}" IS in the vault; finish with \`${finishCmd}\`.`;
+  // Every failure past this point leaves the secret stored and the reference
+  // unwritten. In prose that is the finish hint; under --json it is ONE stderr
+  // envelope carrying `stored: true` and the secret's facts, so a script does
+  // not read the non-zero exit as "nothing changed". `lines` are the prose
+  // diagnostics, joined into the envelope's `error`.
+  const failAfterVault = (exitCode: number, lines: string[]): SetCommandResult => {
+    if (opts.json) {
+      printErr(
+        JSON.stringify({
+          ok: false,
+          error: lines
+            .map((l) => l.trim())
+            .filter((l) => l !== "")
+            .join(" "),
+          hint: `The secret "${name}" IS in the vault; finish with \`${finishCmd}\`.`,
+          path,
+          namespace: pre.namespace,
+          stored: true,
+          secret: { name, ref, replaced, fresh_vault: freshVault },
+        }),
+      );
+    } else {
+      for (const l of lines) printErr(l);
+      printErr(finishHint);
+    }
+    return { exitCode, written: [] };
+  };
   try {
     return await serializeBundleWrite(() =>
       withBundlesLock(home, async () => {
-        const loc = await locateEntry(ctx, [assignment]);
-        if (!loc.ok) {
-          if (!opts.json) printErr(finishHint);
-          return loc.result;
-        }
+        // locateEntry's refusals are captured rather than printed, so --json
+        // can carry them in the one envelope instead of a prose line before it.
+        const locErr: string[] = [];
+        const loc = await locateEntry({ ...ctx, printErr: (s) => locErr.push(s) }, [assignment]);
+        if (!loc.ok) return failAfterVault(loc.result.exitCode, locErr);
         // The overwrite was confirmed against the value read before the
         // prompts. If another writer changed it since, that confirmation was
         // for a different value -- refuse rather than destroy one the user
@@ -1214,11 +1247,9 @@ async function runSetSecret(opts: SetCommandOptions, ctx: SetContext): Promise<S
           loc.namespace !== pre.namespace ||
           JSON.stringify(loc.originalEnv[key]) !== JSON.stringify(pre.originalEnv[key])
         ) {
-          printErr(
+          return failAfterVault(1, [
             `yaw-mcp ${verb}: env.${key} on "${pre.namespace}" changed in ${path} while you were entering the secret.`,
-          );
-          printErr(finishHint);
-          return { exitCode: 1, written: [] };
+          ]);
         }
         return applyAssignments(opts, ctx, loc, [assignment], secret);
       }),
@@ -1226,9 +1257,7 @@ async function runSetSecret(opts: SetCommandOptions, ctx: SetContext): Promise<S
   } catch (e) {
     // The lock wait timing out (or the write failing) after the vault write
     // must not read as "nothing happened": the secret is stored.
-    printErr(`yaw-mcp ${verb}: ${(e as Error).message}`);
-    printErr(finishHint);
-    return { exitCode: 1, written: [] };
+    return failAfterVault(1, [`yaw-mcp ${verb}: ${(e as Error).message}`]);
   }
 }
 

@@ -43,12 +43,13 @@ import { existsSync, statSync } from "node:fs";
 import { chmod, mkdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { type ParseError, parse as parseJsoncTolerant } from "jsonc-parser";
 import { atomicWriteFile } from "./atomic-write.js";
 // The cross-process write lock reuses the auto-upgrade lock primitive (O_EXCL
 // sidecar, ownership-checked release, stale steal by rename) instead of
 // growing a second copy here. See the write-path header for what it buys.
 import { acquireUpgradeLock } from "./auto-upgrade.js";
-import { parseJsonc } from "./jsonc.js";
+import { parseJsonc, stripJsoncComments, stripTrailingCommas } from "./jsonc.js";
 import { log } from "./logger.js";
 import { findProjectConfigDir, userConfigDir } from "./paths.js";
 import {
@@ -528,6 +529,35 @@ async function readBundlesAt(path: string, warnings: string[]): Promise<ReadResu
   return { exists: true, file: parseBundlesContent(path, r.raw, warnings) };
 }
 
+/** Where a bundles.json parse failed, as "at line L, column C" (1-based, in
+ *  the user's ORIGINAL text), or "(position unknown)". Built from offsets
+ *  alone, never from the JSON.parse message, which embeds a slice of the
+ *  source (see parseBundlesContent). jsonc-parser locates the first error
+ *  against the original text, comments included. When it accepts what
+ *  JSON.parse rejected, the number from V8's "position N" -- digits only --
+ *  is mapped onto the comment-stripped text instead: the strippers keep every
+ *  newline, so the line is still the user's, though the column can be short
+ *  by an earlier block comment on that line. */
+export function jsonErrorLocation(raw: string, err: unknown): string {
+  const text = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
+  const errors: ParseError[] = [];
+  parseJsoncTolerant(text, errors, { allowTrailingComma: true });
+  let source = text;
+  let offset: number | undefined = errors[0]?.offset;
+  if (offset === undefined) {
+    const m = /position (\d+)/.exec(err instanceof Error ? err.message : "");
+    if (m) {
+      offset = Number(m[1]);
+      source = stripTrailingCommas(stripJsoncComments(text));
+    }
+  }
+  if (offset === undefined || !Number.isFinite(offset)) return "(position unknown)";
+  const before = source.slice(0, Math.min(offset, source.length));
+  const line = before.split("\n").length;
+  const column = before.length - (before.lastIndexOf("\n") + 1) + 1;
+  return `at line ${line}, column ${column}`;
+}
+
 /** Parse already-read bundles.json bytes. Returns null (with warnings
  *  populated) when the content is unusable. Separate from the read so the
  *  trust gate can decide whether to parse at all -- an untrusted file must
@@ -539,9 +569,15 @@ function parseBundlesContent(path: string, rawBytes: Buffer, warnings: string[])
   try {
     parsed = parseJsonc(raw);
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    warnings.push(`${path}: invalid JSON (${msg}) -- file ignored`);
-    log("warn", "bundles.json is not valid JSON; ignoring", { path, error: msg });
+    // NEVER err.message: V8 quotes about ten characters of source around the
+    // bad token, and a bundles.json that fails to parse is often one with a
+    // credential pasted in unquoted. The fragment would land in this warning,
+    // which the commands that load bundles.json print (call, bundles, doctor,
+    // ...), and on stderr via log() -- which is how `secrets set` reaches it
+    // after every save. A position is all either gets.
+    const where = jsonErrorLocation(raw, err);
+    warnings.push(`${path}: invalid JSON ${where} -- file ignored`);
+    log("warn", "bundles.json is not valid JSON; ignoring", { path, location: where });
     return null;
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {

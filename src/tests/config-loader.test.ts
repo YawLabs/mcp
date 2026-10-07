@@ -304,6 +304,18 @@ describe("loadYawMcpConfig — fail-open on bad files", () => {
     expect(r.warnings.some((w) => w.includes("invalid JSON"))).toBe(true);
   });
 
+  // V8's JSON.parse message quotes ~10 characters of source around the bad
+  // token, and an unquoted pasted secret is such a token: the warning gets a
+  // line:column and nothing of the source.
+  it("an unquoted value in a malformed config file never reaches the warning", async () => {
+    const token = "zq9Xv7Kp2Lm4Rt8Wn3Yb6Hc1Jd5Fg0";
+    writeConfigRaw(synthCwd, LOCAL_CONFIG_FILENAME, `{\n  "servers": [${token}]\n}\n`);
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    const warning = r.warnings.find((w) => w.includes("invalid JSON")) ?? "";
+    expect(warning).toContain("at line 2, column 15");
+    for (let i = 0; i + 4 <= token.length; i++) expect(warning).not.toContain(token.slice(i, i + 4));
+  });
+
   it("warns when a config file exists but cannot be READ (not just when it won't parse)", async () => {
     // A config.json that is really a DIRECTORY reads as EISDIR on every
     // platform -- the portable stand-in for the field case (a root-owned

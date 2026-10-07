@@ -301,7 +301,7 @@ describe("runSet --secret", () => {
     const r = await secretSet("gh", "env.GITHUB_TOKEN", { json: true });
     expect(r.exitCode).toBe(0);
     const lines = r.out.trim().split("\n");
-    expect(lines).toHaveLength(1);
+    expect(lines, lines.map((l) => l.slice(0, 160)).join(" // ")).toHaveLength(1);
     const env = JSON.parse(lines[0]);
     expect(env).toMatchObject({
       ok: true,
@@ -421,6 +421,76 @@ describe("runSet --secret", () => {
     });
     expect(r.exitCode).toBe(1);
     expect(r.err).toContain(PG_HINT);
+    expect(await readBack("pg_pgpassword")).toBe(VALUE);
+  });
+
+  /** The failure envelope under --json, parsed. Every stderr line must be
+   *  JSON (no prose leaks); the vault's own `vault-created` warning line may
+   *  precede it, but exactly one line is an `ok: false` envelope. */
+  function jsonErr(err: string): Record<string, unknown> {
+    const parsed = err
+      .split("\n")
+      .filter((l) => l.trim() !== "")
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+    const fails = parsed.filter((p) => p.ok === false);
+    expect(fails).toHaveLength(1);
+    return fails[0];
+  }
+
+  it("--json: a change while entering emits one envelope saying the secret is stored", async () => {
+    writeBundles(SAMPLE);
+    const r = await secretSet("pg", "env.PGPASSWORD", {
+      force: true,
+      json: true,
+      io: hookedIo(() => writeBundles(SAMPLE.replace('"plain"', '"plain2"'))),
+    });
+    expect(r.exitCode).toBe(1);
+    expect(r.out).toBe("");
+    const env = jsonErr(r.err);
+    expect(env.ok).toBe(false);
+    expect(env.stored).toBe(true);
+    expect(env.error).toContain("while you were entering the secret");
+    expect(env.hint).toContain("yaw-mcp set pg env.PGPASSWORD='${secret:pg_pgpassword}'");
+    expect(env.secret).toEqual({
+      name: "pg_pgpassword",
+      ref: "${secret:pg_pgpassword}",
+      replaced: false,
+      fresh_vault: true,
+    });
+    expect(r.err).not.toContain(VALUE);
+    expect(envOf("pg")).toEqual({ PGPASSWORD: "plain2" });
+    expect(await readBack("pg_pgpassword")).toBe(VALUE);
+  });
+
+  it("--json: an entry gone after the vault write emits one envelope carrying the refusal", async () => {
+    writeBundles(SAMPLE);
+    const r = await secretSet("pg", "env.PGPASSWORD", {
+      force: true,
+      json: true,
+      io: hookedIo(() => writeBundles(SAMPLE.replace('"namespace": "pg"', '"namespace": "pg2"'))),
+    });
+    expect(r.exitCode).not.toBe(0);
+    const env = jsonErr(r.err);
+    expect(env.ok).toBe(false);
+    expect(env.stored).toBe(true);
+    expect(typeof env.error).toBe("string");
+    expect(env.error).not.toBe("");
+    expect((env.secret as Record<string, unknown>).name).toBe("pg_pgpassword");
+    expect(r.err).not.toContain(VALUE);
+    expect(await readBack("pg_pgpassword")).toBe(VALUE);
+  });
+
+  it("--json: a held bundles lock after the vault write emits one envelope", { timeout: 20_000 }, async () => {
+    writeBundles(SAMPLE);
+    const r = await secretSet("pg", "env.PGPASSWORD", {
+      force: true,
+      json: true,
+      io: hookedIo(() => writeFileSync(join(synthHome, ".yaw-mcp", BUNDLES_LOCK_NAME), `${process.pid}\n`)),
+    });
+    expect(r.exitCode).toBe(1);
+    const env = jsonErr(r.err);
+    expect(env.stored).toBe(true);
+    expect(env.error).toContain("is locked by another yaw-mcp process");
     expect(await readBack("pg_pgpassword")).toBe(VALUE);
   });
 

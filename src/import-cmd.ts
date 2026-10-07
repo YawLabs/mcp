@@ -1574,7 +1574,7 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
   }
   if (headerKeys.length > 0) {
     print(
-      `Header credentials came across as plain values: ${headerKeys.map(displayArg).join(", ")}. Store each one with \`yaw-mcp secrets set NAME\`, then replace the value in that server's "headers" in bundles.json with \${secret:NAME} (e.g. "Bearer \${secret:NAME}").`,
+      `Header credentials came across as plain values: ${headerKeys.map(displayArg).join(", ")}. Store each one with \`yaw-mcp secrets set NAME\`, then replace the credential in that server's "headers" in bundles.json with \${secret:NAME}, keeping any scheme in front of it (Authorization: "Bearer \${secret:NAME}"; X-Api-Key and its kind take the bare \${secret:NAME}).`,
     );
   }
 

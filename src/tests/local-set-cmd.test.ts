@@ -75,6 +75,22 @@ describe("parseSetArgs", () => {
   });
 });
 
+describe("runSet -- a bundles.json that will not parse", () => {
+  // V8's JSON.parse message quotes ~10 characters of source around the bad
+  // token; an unquoted pasted credential is such a token. The refusal names a
+  // line:column and nothing of the source.
+  it("reports a position, never a fragment of an unquoted credential", async () => {
+    const token = "zq9Xv7Kp2Lm4Rt8Wn3Yb6Hc1Jd5Fg0";
+    writeBundles(`{\n  "servers": [\n    { "namespace": "gh", "command": "npx", "env": { "T": ${token} } }\n  ]\n}\n`);
+    const cap = capture();
+    const r = await runSet({ target: "gh", assignments: ["isActive=false"], home: synthHome, ...cap });
+    expect(r.exitCode).toBe(1);
+    const all = cap.text() + cap.errText();
+    expect(all).toContain("invalid JSON at line 3, column 58");
+    for (let i = 0; i + 4 <= token.length; i++) expect(all).not.toContain(token.slice(i, i + 4));
+  });
+});
+
 describe("runSet -- comment preservation", () => {
   it("keeps comments and every untouched entry byte-identical", async () => {
     // The reason this command exists rather than reusing add/remove's writer:
