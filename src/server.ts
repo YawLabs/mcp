@@ -2469,6 +2469,24 @@ export class ConnectServer {
     // string. Widening `.has()` keeps the runtime check intact.
     if ((META_TOOL_NAMES as Set<string>).has(name)) await this.maybeReloadBundles();
     if (name === META_TOOLS.discover.name) {
+      // listOnly: a client UI (a /mcp panel, a status line) listing what is
+      // installed, not a model browsing. Every side effect of the model-facing
+      // path is skipped: no auto-warm (an activation), no observation tick
+      // (which ages idle servers toward eviction), no once-per-session guide
+      // nudge (which would be spent on a UI the model never reads), and no
+      // install-candidates block (the shell-history scan + recordNudges, which
+      // spends the per-CLI cooldown). The server listing itself is the same
+      // text a plain call renders. Strict `=== true`, like the other
+      // typeof-guarded args: the low-level Server does not validate input
+      // against inputSchema, and a stray truthy string must not silently
+      // switch a model's discover onto the side-effect-free path.
+      if (args.listOnly === true) {
+        return this.handleDiscover(
+          typeof args.context === "string" ? args.context : undefined,
+          typeof args.server === "string" ? args.server : undefined,
+          /* listOnly */ true,
+        );
+      }
       // When the LLM supplies task context, automatically warm the top
       // confident candidate so a one-shot discover() is enough to start
       // calling tools. Ambiguous queries fall through to the manual list.
@@ -3239,8 +3257,9 @@ export class ConnectServer {
   private handleDiscover(
     context?: string,
     focusNamespace?: string,
+    listOnly = false,
   ): { content: Array<{ type: string; text: string }> } {
-    return this.buildDiscoverOutput(context, /* warmedNamespace */ null, focusNamespace);
+    return this.buildDiscoverOutput(context, /* warmedNamespace */ null, focusNamespace, listOnly);
   }
 
   private async handleDiscoverWithAutoWarm(
@@ -3377,6 +3396,7 @@ export class ConnectServer {
     context: string | undefined,
     warmedNamespace: string | null,
     focusNamespace: string | undefined,
+    listOnly = false,
   ): string {
     const activeNamespaces = [...this.connections.entries()]
       .filter(([, c]) => c.status === "connected")
@@ -3425,7 +3445,13 @@ export class ConnectServer {
     // and a discover inside the TTL replayed the old one.
     const floorSignature = resolveMinCompliance() ?? "";
     const exposureSignature = this.currentExposure();
-    return `${this.configVersion ?? ""}|${context ?? ""}|${warmedNamespace ?? ""}|${activeNamespaces}|${filterSignature}|${advertisedSignature}|${focusNamespace ?? ""}|${warningSignature}|${floorSignature}|${exposureSignature}`;
+    // listOnly drops the install-candidates block, so it renders a different
+    // body. Keyed in BOTH directions: a UI's listOnly call must not memoize a
+    // nudge-free body that a model's plain `{}` inside the TTL then replays
+    // (the model would never see the candidates, and the block would not
+    // even run), and a plain call's body must not be replayed to listOnly.
+    const listOnlySignature = listOnly ? "list" : "";
+    return `${this.configVersion ?? ""}|${context ?? ""}|${warmedNamespace ?? ""}|${activeNamespaces}|${filterSignature}|${advertisedSignature}|${focusNamespace ?? ""}|${warningSignature}|${floorSignature}|${exposureSignature}|${listOnlySignature}`;
   }
 
   /** The "there is nothing to route to" text, for discover / dispatch /
@@ -3509,14 +3535,15 @@ export class ConnectServer {
     context: string | undefined,
     warmedNamespace: string | null,
     focusNamespace?: string,
+    listOnly = false,
   ): { content: Array<{ type: string; text: string }> } {
-    const key = this.discoverCacheKey(context, warmedNamespace, focusNamespace);
+    const key = this.discoverCacheKey(context, warmedNamespace, focusNamespace, listOnly);
     const now = Date.now();
     const cached = this.discoverCache;
     if (cached && cached.key === key && cached.expires > now) {
       return cached.result;
     }
-    const result = this.buildDiscoverOutputImpl(context, warmedNamespace, focusNamespace);
+    const result = this.buildDiscoverOutputImpl(context, warmedNamespace, focusNamespace, listOnly);
     this.discoverCache = { key, result, expires: now + ConnectServer.DISCOVER_CACHE_TTL_MS };
     return result;
   }
@@ -3525,6 +3552,7 @@ export class ConnectServer {
     context: string | undefined,
     warmedNamespace: string | null,
     focusNamespace?: string,
+    listOnly = false,
   ): { content: Array<{ type: string; text: string }> } {
     if (!this.config || this.config.servers.length === 0) {
       return { content: [{ type: "text", text: this.emptyStateText() }] };
@@ -3969,7 +3997,10 @@ export class ConnectServer {
     // Gated on the CALL rather than on its output: this runs the offline
     // shell-history scan and then records a per-CLI nudge cooldown, so
     // suppressing only the lines would burn a nudge the user never saw.
-    if (!focused) lines.push(...this.buildInstallCandidatesLines(allProfiled));
+    // listOnly skips the CALL for the same reason: a client UI listing
+    // servers must not scan history or spend a cooldown on a nudge the model
+    // never sees.
+    if (!focused && !listOnly) lines.push(...this.buildInstallCandidatesLines(allProfiled));
 
     // Count CONNECTED connections only, the same slot definition the
     // concurrent-load cap uses (evaluateCapFor). An error-state entry is an

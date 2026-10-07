@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -67,6 +67,8 @@ vi.mock("../proxy.js", async (importOriginal) => {
   return { ...actual, routeToolCall: vi.fn(actual.routeToolCall) };
 });
 
+import { installNudgeStatePath } from "../install-nudge.js";
+import { META_TOOLS } from "../meta-tools.js";
 import { CONFIG_DIRNAME } from "../paths.js";
 import { brandCancelled, brandRoutingFault, isRoutingFaultResult, routeToolCall } from "../proxy.js";
 import { capContent } from "../result-cap.js";
@@ -1787,6 +1789,132 @@ describe("ConnectServer", () => {
       // Second call within the cooldown is suppressed.
       const second = priv.buildInstallCandidatesLines(priv.getProfiledActiveServers()).join("\n");
       expect(second).toBe("");
+    });
+
+    describe("discover listOnly (client UI listing, no side effects)", () => {
+      const nudgeStatePath = (): string => installNudgeStatePath(nudgeHome);
+
+      it("skips the install-candidates block entirely: no history read, no cooldown recorded", async () => {
+        const priv = getPrivate(server);
+        priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+        priv.installNudge = true;
+        primeHistory(server, HEAVY("tailscale"));
+        // Same instrumentation as the OFF-by-default test: a read count of 0
+        // proves the scan never opened the history, not merely that nothing
+        // was rendered.
+        let homeReads = 0;
+        let home: string = priv.nudgeHome;
+        Object.defineProperty(priv, "nudgeHome", {
+          configurable: true,
+          get: () => {
+            homeReads++;
+            return home;
+          },
+          set: (v: string) => {
+            home = v;
+          },
+        });
+
+        const result = await priv.handleToolCall("mcp_connect_discover", { listOnly: true });
+        const text = result.content[0].text;
+        expect(homeReads).toBe(0);
+        expect(text).not.toContain("Install candidates");
+        expect(text).toContain("gh");
+        // recordNudges never ran, so the per-CLI cooldown is unspent.
+        expect(existsSync(nudgeStatePath())).toBe(false);
+      });
+
+      it("is part of the memo key: a plain {} right after a listOnly call still gets the nudge", async () => {
+        const priv = getPrivate(server);
+        priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+        priv.installNudge = true;
+        primeHistory(server, HEAVY("tailscale"));
+
+        const listed = await priv.handleToolCall("mcp_connect_discover", { listOnly: true });
+        expect(listed.content[0].text).not.toContain("Install candidates");
+        // Inside the 3s TTL: without listOnly in the key this replayed the
+        // nudge-free body and the model never saw the candidate.
+        const plain = await priv.handleToolCall("mcp_connect_discover", {});
+        expect(plain.content[0].text).toContain("Install candidates");
+        expect(plain.content[0].text).toContain("run: yaw-mcp add tailscale");
+        expect(existsSync(nudgeStatePath())).toBe(true);
+      });
+
+      it("is part of the memo key the other way too: listOnly after a plain call does not replay the nudge", async () => {
+        const priv = getPrivate(server);
+        priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+        priv.installNudge = true;
+        primeHistory(server, HEAVY("tailscale"));
+
+        const plain = await priv.handleToolCall("mcp_connect_discover", {});
+        expect(plain.content[0].text).toContain("Install candidates");
+        const listed = await priv.handleToolCall("mcp_connect_discover", { listOnly: true });
+        expect(listed.content[0].text).not.toContain("Install candidates");
+      });
+
+      it("returns exactly the plain listing text when there is nothing to nudge", async () => {
+        const priv = getPrivate(server);
+        priv.config = makeConfig([
+          makeServerConfig({ id: "1", namespace: "gh", name: "GitHub" }),
+          makeServerConfig({ id: "2", namespace: "slack", name: "Slack" }),
+        ]);
+        priv.connections.set("slack", makeConnection("slack", ["post"]));
+        // Gate off (the default): the two bodies must be byte-identical, so a
+        // client parsing the listing lines sees no format change.
+        primeHistory(server, []);
+        const listed = (await priv.handleToolCall("mcp_connect_discover", { listOnly: true })).content[0].text;
+        priv.discoverCache = null;
+        const plain = (await priv.handleToolCall("mcp_connect_discover", {})).content[0].text;
+        expect(listed).toBe(plain);
+        expect(listed).toMatch(/loaded in this session/);
+      });
+
+      it("skips the observation tick: a connected server does not age", async () => {
+        const priv = getPrivate(server);
+        priv.config = makeConfig([makeServerConfig({ namespace: "slack", name: "Slack" })]);
+        priv.connections.set("slack", makeConnection("slack", ["post"]));
+        priv.idleCallCounts.set("slack", 0);
+
+        await priv.handleToolCall("mcp_connect_discover", { listOnly: true });
+        expect(priv.idleCallCounts.get("slack")).toBe(0);
+
+        // Control: the plain call still ticks, so the assertion above is not
+        // vacuous.
+        await priv.handleToolCall("mcp_connect_discover", {});
+        expect(priv.idleCallCounts.get("slack")).toBe(1);
+      });
+
+      it("does not auto-warm from context and does not spend the once-per-session guide hint", async () => {
+        const priv = getPrivate(server);
+        priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+        priv.guides = { user: { scope: "user", path: "/h/.yaw-mcp/YAW-MCP.md", content: "u" }, project: null };
+        const rank = vi.spyOn(priv, "rankIntentCandidates").mockResolvedValue([{ namespace: "gh", score: 5 }]);
+
+        const result = await priv.handleToolCall("mcp_connect_discover", { listOnly: true, context: "github issue" });
+        expect(rank).not.toHaveBeenCalled();
+        expect(vi.mocked(connectToUpstream)).not.toHaveBeenCalled();
+        expect(priv.connections.has("gh")).toBe(false);
+        expect(result.content).toHaveLength(1);
+        expect(priv.guideNudgeFired).toBe(false);
+      });
+
+      it("only a boolean true selects it: a truthy string keeps the model path", async () => {
+        const priv = getPrivate(server);
+        priv.config = makeConfig([makeServerConfig({ namespace: "slack", name: "Slack" })]);
+        priv.connections.set("slack", makeConnection("slack", ["post"]));
+        priv.idleCallCounts.set("slack", 0);
+
+        await priv.handleToolCall("mcp_connect_discover", { listOnly: "true" });
+        expect(priv.idleCallCounts.get("slack")).toBe(1);
+      });
+
+      it("is declared in the tool's inputSchema as a described boolean", () => {
+        const prop = (
+          META_TOOLS.discover.inputSchema.properties as Record<string, { type: string; description: string }>
+        ).listOnly;
+        expect(prop.type).toBe("boolean");
+        expect(prop.description).toMatch(/no side effects/);
+      });
     });
   });
 
