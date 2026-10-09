@@ -20,7 +20,7 @@
 //   - NEVER-THROWING: any failure (no sampling capability, timeout, declined,
 //     unparseable) returns null and the heuristic stands.
 
-import type { Server } from "@modelcontextprotocol/server";
+import type { ClientCapabilities, Server } from "@modelcontextprotocol/server";
 import { log } from "./logger.js";
 import { REWARD_EMPTY_BODY, REWARD_ERROR_SHAPED, type ToolCallResultShape } from "./reward.js";
 
@@ -216,10 +216,19 @@ function noteNoSamplingCapability(): void {
   );
 }
 
+/** The slice of the downstream client a sampling helper uses. server.ts
+ *  hands in its session view, whose capabilities are empty on a protocol
+ *  revision that cannot carry sampling/createMessage (2026-07-28), so the
+ *  capability gate here doubles as the push gate. */
+export interface SamplingPeer {
+  getClientCapabilities(): ClientCapabilities | undefined;
+  createMessage: Server["createMessage"];
+}
+
 // Ask the client LLM to grade the outcome. Returns the graded reward in
 // {0.0, 0.5, 1.0}, or null when sampling is unavailable / declined / timed
 // out / unparseable. Never throws.
-export async function gradeOutcomeViaSampling(server: Server, ctx: GraderContext): Promise<number | null> {
+export async function gradeOutcomeViaSampling(server: SamplingPeer, ctx: GraderContext): Promise<number | null> {
   const caps = server.getClientCapabilities();
   if (!caps?.sampling) {
     noteNoSamplingCapability();

@@ -2,13 +2,22 @@ import { homedir } from "node:os";
 import { getSupportedElicitationModes } from "@modelcontextprotocol/sdk/client/index.js";
 import {
   type CallToolResult,
+  CLIENT_CAPABILITIES_META_KEY,
+  CLIENT_INFO_META_KEY,
+  type ClientCapabilities,
   type GetPromptResult,
+  type HandlerResultTypeMap,
+  type Implementation,
   type ListPromptsResult,
   type ListResourcesResult,
   type ListToolsResult,
   type ProtocolEra,
   type ReadResourceResult,
+  type RequestMethod,
+  type RequestTypeMap,
   Server,
+  type ServerContext,
+  type ServerOptions,
   SUPPORTED_PROTOCOL_VERSIONS,
   type Transport,
 } from "@modelcontextprotocol/server";
@@ -93,6 +102,7 @@ import {
   gradeOutcomeViaSampling,
   isRewardGraderEnabled,
   isUncertainReward,
+  type SamplingPeer,
 } from "./reward-grader.js";
 import {
   bestOfNViaSampling,
@@ -276,13 +286,47 @@ export function clientRelistsTools(clientInfo?: { name?: string }): boolean {
   return !(clientInfo?.name !== undefined && NO_RELIST_CLIENTS.has(clientInfo.name));
 }
 
+/** Who is on the other end of the downstream connection, as every reader of
+ *  client identity sees it (see ConnectServer.clientSession).
+ *
+ *  `canPush` is whether yaw-mcp may send the client a request of its own
+ *  (elicitation/create, sampling/createMessage, roots/list). True on the 2025
+ *  protocol. False on 2026-07-28, which has no server-to-client request
+ *  channel: the SDK throws on those calls there, so every push path checks
+ *  this first and takes its "client cannot be asked" branch instead. */
+export interface ClientSession {
+  era: ProtocolEra;
+  clientInfo?: Implementation;
+  capabilities?: ClientCapabilities;
+  canPush: boolean;
+}
+
+/** ttlMs 0 / private on every cacheable result: activation, idle reaping,
+ *  config reload and tool filters all change the lists mid-session, and a
+ *  list-change notification only reaches a 2026-07-28 client that opened
+ *  subscriptions/listen, so a positive TTL would serve a stale list right
+ *  after an activate reply told the model the new tools are callable. Private
+ *  because the content comes from this user's bundles and vault state. These
+ *  equal the SDK's defaults today; set explicitly so an SDK default change
+ *  cannot loosen them. */
+const NO_CACHE = { ttlMs: 0, cacheScope: "private" } as const;
+const CACHE_HINTS: ServerOptions["cacheHints"] = {
+  "tools/list": NO_CACHE,
+  "prompts/list": NO_CACHE,
+  "resources/list": NO_CACHE,
+  "resources/templates/list": NO_CACHE,
+  "resources/read": NO_CACHE,
+  "server/discover": NO_CACHE,
+};
+
 // How much of the catalog tools/list advertises. Gateway by default -- see
 // ToolExposure in proxy.ts for the measurement that made it the default --
 // and lite by default for the clients in LITE_BY_DEFAULT_CLIENTS, which is
 // why the connected client's `clientInfo` is a parameter: the handlers pass
-// `this.server.getClientVersion()`, populated by the SDK from the initialize
-// request (undefined before it, and in a unit test that never handshakes,
-// which lands on gateway). An explicit YAW_MCP_TOOL_EXPOSURE always wins over
+// the session's clientInfo (ConnectServer.clientSession: the initialize
+// request's on the 2025 protocol, each request's envelope on 2026-07-28;
+// undefined before either, and in a unit test that never handshakes, which
+// lands on gateway). An explicit YAW_MCP_TOOL_EXPOSURE always wins over
 // that default: `full` restores the previous behavior for a client that
 // genuinely wants the whole catalog inlined, `lite` opts any client into the
 // three-tool surface, `gateway` pins a typed-cli session to the full
@@ -748,6 +792,14 @@ export class ConnectServer {
    *  state awaits this first. Resolved from the outset for a host that never
    *  calls start() (tests, embedders), whose state is whatever it set. */
   private ready: Promise<void> = Promise.resolve();
+  /** The era of the newest served instance; undefined until a connection is
+   *  served (tests and embedders drive the constructor's instance, which
+   *  reads like a 2025 session). See clientSession. */
+  private servedEra: ProtocolEra | undefined;
+  /** The identity the latest 2026-07-28 request carried in its envelope. */
+  private modernClient: { clientInfo?: Implementation; capabilities?: ClientCapabilities } = {};
+  /** beginSession's once-per-process latch. */
+  private sessionBegun = false;
   private clientBridge: DownstreamClientBridge;
   private connections = new Map<string, UpstreamConnection>();
   private config: ConnectConfig | null = null;
@@ -1066,7 +1118,7 @@ export class ConnectServer {
     // yaw-mcp itself does not handle elicitation or sampling requests; it
     // originates them. The capability declaration for originated features
     // is implicit -- the client advertises whether IT supports receiving
-    // them, which we check via getClientCapabilities() before prompting.
+    // them, which we check via pushCapabilities() before prompting.
     //
     // Upstream-originated requests are a different story: this bridge is
     // handed to every connectToUpstream call so proxied servers keep
@@ -1074,9 +1126,11 @@ export class ConnectServer {
     // them. upstream.ts mirrors the declared set onto each upstream Client
     // and forwards those requests through these methods; capabilities are
     // read lazily because upstream connects happen after the downstream
-    // initialize.
+    // initialize. On 2026-07-28 the mirrored set is empty (pushCapabilities):
+    // nothing could forward those requests, so upstreams are told the client
+    // cannot answer them and degrade on their own.
     this.clientBridge = {
-      getClientCapabilities: () => this.server.getClientCapabilities(),
+      getClientCapabilities: () => this.pushCapabilities(),
       elicitInput: (params, options) => this.server.elicitInput(params, options),
       // The bridge is typed with the v1 client's shapes (upstream.ts stays on
       // the v1 SDK); v2 narrows `metadata` from `object` to a JSON object.
@@ -1114,13 +1168,72 @@ export class ConnectServer {
         // -- a description is paid on every tools/list, this is paid once per
         // connection. See SERVER_INSTRUCTIONS.
         instructions: SERVER_INSTRUCTIONS,
+        cacheHints: CACHE_HINTS,
         ...(supportedProtocolVersions ? { supportedProtocolVersions } : {}),
       },
     );
-    this.installHandlers(s);
+    this.installHandlers(s, era);
     if (era === "legacy") s.oninitialized = () => this.beginSession();
     this.server = s;
+    if (era !== undefined) this.servedEra = era;
     return s;
+  }
+
+  /** The downstream client as every identity reader sees it: exposure, the
+   *  no-relist hint, the push gates, sampling, upstream capability mirroring.
+   *
+   *  2025 protocol: the SDK's copy of the initialize request, which is fixed
+   *  for the connection once the handshake is done (read through the
+   *  accessors rather than copied in oninitialized, so the values are the
+   *  SDK's own normalization of the declared capabilities).
+   *
+   *  2026-07-28: the latest request's envelope. Never the accessors there --
+   *  on stdio the SDK does not backfill them in this era (measured null with
+   *  2.3.1: only its HTTP entry seeds them from the envelope), so a reader
+   *  that used them would treat Claude Code as an anonymous client. */
+  private clientSession(): ClientSession {
+    if (this.servedEra === "modern") {
+      return { era: "modern", ...this.modernClient, canPush: false };
+    }
+    return {
+      era: "legacy",
+      clientInfo: this.server.getClientVersion(),
+      capabilities: this.server.getClientCapabilities(),
+      canPush: true,
+    };
+  }
+
+  /** What the sampling helpers (sampling-rank.ts, reward-grader.ts) need of
+   *  the client: its push-usable capabilities, and the live instance to ask. */
+  private samplingPeer(): SamplingPeer {
+    return {
+      getClientCapabilities: () => this.pushCapabilities(),
+      createMessage: (params, options) => this.server.createMessage(params, options),
+    };
+  }
+
+  /** The client's capabilities as far as a push may rely on them: undefined
+   *  when the session cannot carry a server-to-client request at all, so a
+   *  `caps?.elicitation` / `caps?.sampling` gate takes its "not supported"
+   *  branch on 2026-07-28. */
+  private pushCapabilities(): ClientCapabilities | undefined {
+    const session = this.clientSession();
+    return session.canPush ? session.capabilities : undefined;
+  }
+
+  /** Runs ahead of every handler a 2026-07-28 instance serves. Each request
+   *  there is self-describing, so the identity is refreshed from its envelope
+   *  every time. Any request that reaches a handler also starts the session:
+   *  server/discover is answered inside the SDK and never gets here, so a
+   *  probe the client then abandons for initialize starts nothing. */
+  private observeRequest(era: ProtocolEra | undefined, ctx: ServerContext): void {
+    if (era !== "modern") return;
+    const envelope = (ctx.mcpReq.envelope ?? {}) as Record<string, unknown>;
+    this.modernClient = {
+      clientInfo: envelope[CLIENT_INFO_META_KEY] as Implementation | undefined,
+      capabilities: envelope[CLIENT_CAPABILITIES_META_KEY] as ClientCapabilities | undefined,
+    };
+    this.beginSession();
   }
 
   // Builtin resources served directly by yaw-mcp (not proxied from an
@@ -1163,10 +1276,10 @@ export class ConnectServer {
    *  otherwise -- see resolveToolExposure). The one place the client's
    *  identity is read, so the three list handlers and discover's "in
    *  context" summary cannot disagree about which surface they describe.
-   *  getClientVersion() is the SDK's copy of the initialize request's
-   *  clientInfo and is undefined before the handshake. */
+   *  The clientInfo comes from clientSession and is undefined before the
+   *  client has identified itself. */
   private currentExposure(): ToolExposure {
-    return resolveToolExposure(this.server.getClientVersion());
+    return resolveToolExposure(this.clientSession().clientInfo);
   }
 
   /** The routes every instance serves. Each handler first waits for start()
@@ -1174,9 +1287,20 @@ export class ConnectServer {
    *  the SDK from static data the moment the connection opens, but everything
    *  below reads the config, the tool cache and the routes. Results are typed
    *  loosely where they carry proxied upstream data (the v1 client's types);
-   *  the casts mark that boundary. */
-  private installHandlers(s: Server): void {
-    s.setRequestHandler("tools/list", async () => {
+   *  the casts mark that boundary. Every route goes through `handle`, so a
+   *  2026-07-28 request's identity is read before its handler runs. */
+  private installHandlers(s: Server, era: ProtocolEra | undefined): void {
+    const handle = <M extends RequestMethod>(
+      method: M,
+      fn: (request: RequestTypeMap[M], ctx: ServerContext) => Promise<HandlerResultTypeMap[M]>,
+    ): void => {
+      s.setRequestHandler(method, (request, ctx) => {
+        this.observeRequest(era, ctx);
+        return fn(request, ctx);
+      });
+    };
+
+    handle("tools/list", async () => {
       await this.ready;
       return {
         tools: buildToolList(
@@ -1194,7 +1318,7 @@ export class ConnectServer {
       };
     });
 
-    s.setRequestHandler("tools/call", async (request, ctx) => {
+    handle("tools/call", async (request, ctx) => {
       await this.ready;
       const { name, arguments: args } = request.params;
       const result = await this.handleToolCall(name, args ?? {}, ctx);
@@ -1205,7 +1329,7 @@ export class ConnectServer {
       return s.projectCallToolResult(result as CallToolResult, this.advertisedOutputSchema(name));
     });
 
-    s.setRequestHandler("resources/list", async () => {
+    handle("resources/list", async () => {
       await this.ready;
       return {
         resources: buildResourceList(
@@ -1225,11 +1349,11 @@ export class ConnectServer {
     // conn.resources, so routeResourceRead could not resolve a templated
     // URI anyway. If template proxying lands, this handler is where the
     // aggregated upstream templates get returned.
-    s.setRequestHandler("resources/templates/list", async () => ({
+    handle("resources/templates/list", async () => ({
       resourceTemplates: [],
     }));
 
-    s.setRequestHandler("resources/read", async (request) => {
+    handle("resources/read", async (request) => {
       await this.ready;
       return (await routeResourceRead(
         request.params.uri,
@@ -1239,7 +1363,7 @@ export class ConnectServer {
       )) as ReadResourceResult;
     });
 
-    s.setRequestHandler("prompts/list", async () => {
+    handle("prompts/list", async () => {
       await this.ready;
       return {
         prompts: buildPromptList(
@@ -1250,7 +1374,7 @@ export class ConnectServer {
       };
     });
 
-    s.setRequestHandler("prompts/get", async (request) => {
+    handle("prompts/get", async (request) => {
       await this.ready;
       return (await routePromptGet(
         request.params.name,
@@ -1373,7 +1497,7 @@ export class ConnectServer {
    *  first), so `args: {}` runs as written. When every tool needs arguments
    *  the line says to fill them in rather than show a call that would fail. */
   private execHintForNonRelistingClient(loaded: readonly string[]): string | null {
-    if (clientRelistsTools(this.server.getClientVersion())) return null;
+    if (clientRelistsTools(this.clientSession().clientInfo)) return null;
     const needsNoArgs = (t: { inputSchema: Record<string, unknown> }): boolean => {
       const required = t.inputSchema?.required;
       return !Array.isArray(required) || required.length === 0;
@@ -2249,8 +2373,12 @@ export class ConnectServer {
   }
 
   /** Starts the session's background work: pre-warm and the opt-in auto-load.
-   *  A legacy instance calls this from `oninitialized`. */
+   *  Once per process. A legacy instance calls this from `oninitialized`; on
+   *  2026-07-28, which has no handshake, the first request that reaches a
+   *  handler does (observeRequest). */
   private beginSession(): void {
+    if (this.sessionBegun) return;
+    this.sessionBegun = true;
     // Both startup activation paths -- pre-warm and the opt-in auto-load --
     // wait for the downstream client's initialize handshake to complete.
     // Serving only starts the transport; the SDK records the client's
@@ -2262,6 +2390,8 @@ export class ConnectServer {
     // capabilities -- and when an explicit activate later joins a prewarm
     // inflight and keeps that connection alive, elicitation/sampling/roots
     // forwarding is silently dead for the connection's whole lifetime.
+    // On 2026-07-28 that snapshot is deliberately empty (pushCapabilities),
+    // so the ordering only matters on the 2025 protocol.
     // A client that never initializes never triggers either path: with no
     // downstream there is nothing to serve. buildServer attaches the callback
     // at construction, so a fast client can't complete the handshake into a
@@ -2301,7 +2431,7 @@ export class ConnectServer {
             // recurring pack will never load -- and without this line nothing
             // says why. persistenceReady is false for exactly two reasons (see
             // the state hydration at the top of start()), so name the one that
-            // applies. Once per session: oninitialized fires once.
+            // applies. Once per session: beginSession is latched.
             log("info", "YAW_MCP_AUTO_LOAD is set but persisted history is unavailable; skipping auto-load", {
               reason: isPersistenceDisabled() ? "YAW_MCP_DISABLE_PERSISTENCE is set" : "state.json could not be read",
             });
@@ -4556,10 +4686,11 @@ export class ConnectServer {
    *  `${namespace}_${tool}` is not injective: (ns=`gh`, tool=`actions_list`)
    *  and (ns=`gh_actions`, tool=`list`) both flatten to `gh_actions_list`, so
    *  two loaded servers can claim one wire name. buildToolRoutes resolves that
-   *  to exactly one owner (first writer wins, and buildToolList agrees), which
-   *  leaves the loser's tool with no name any caller can reach: a direct
-   *  tools/call and an mcp_connect_exec step both resolve the wire name
-   *  through that one table, and tools/list advertises it once.
+   *  to exactly one owner (the lexically first namespace, and buildToolList
+   *  agrees -- see compareNamespaces), which leaves the loser's tool with no
+   *  name any caller can reach: a direct tools/call and an mcp_connect_exec
+   *  step both resolve the wire name through that one table, and tools/list
+   *  advertises it once.
    *
    *  Both activate messages used to render straight from visibleTools, which
    *  is the server's OWN inventory and knows nothing about the rest of the
@@ -5110,11 +5241,12 @@ export class ConnectServer {
       return null;
     }
 
-    const caps = this.server.getClientCapabilities();
+    const caps = this.pushCapabilities();
     if (!caps?.elicitation) {
       log("info", "Detected missing credentials but client does not support elicitation", {
         namespace,
         missing,
+        era: this.clientSession().era,
       });
       return null;
     }
@@ -5332,12 +5464,13 @@ export class ConnectServer {
 
     if (this.vaultPassphraseElicited) return null;
 
-    const caps = this.server.getClientCapabilities();
+    const caps = this.pushCapabilities();
     if (!caps?.elicitation) {
       log("info", "Vault is locked but client does not support elicitation", {
         namespace,
         refKeys: lastError.refKeys,
         reason: lastError.reason,
+        era: this.clientSession().era,
       });
       return null;
     }
@@ -5521,7 +5654,7 @@ export class ConnectServer {
     // stored (ElicitationCapabilitySchema in the SDK's types), which is what
     // elicitInput's own per-mode guard then checks; this helper reads a bare
     // `{}` the same way, so the two cannot disagree.
-    const modes = getSupportedElicitationModes(this.server.getClientCapabilities()?.elicitation);
+    const modes = getSupportedElicitationModes(this.pushCapabilities()?.elicitation);
     if (!modes.supportsUrlMode && !modes.supportsFormMode) return { kind: "failed" };
     const mode = modes.supportsUrlMode ? "url" : "form";
 
@@ -5621,6 +5754,8 @@ export class ConnectServer {
         error: err instanceof Error ? err.message : String(err),
       });
     };
+    // Only a URL elicitation this session pushed has anything to complete.
+    if (!this.clientSession().canPush) return;
     try {
       this.server.createElicitationCompletionNotifier(elicitationId)().catch(onError);
     } catch (err) {
@@ -5992,7 +6127,7 @@ export class ConnectServer {
   // the delta (recordOutcome already counted the dispatch). Never throws.
   private async refineRewardInBackground(namespace: string, heuristic: number, ctx: GraderContext): Promise<void> {
     try {
-      const graded = await gradeOutcomeViaSampling(this.server, ctx);
+      const graded = await gradeOutcomeViaSampling(this.samplingPeer(), ctx);
       if (graded === null || graded === heuristic) return;
       this.learning.adjustSucceeded(namespace, graded - heuristic);
       this.scheduleStateSave();
@@ -6109,7 +6244,7 @@ export class ConnectServer {
     // sees the "asking LLM to pick" progress line: that line promised a
     // round-trip that was never going to happen, and the silent null that
     // followed read as the LLM having picked nothing.
-    const clientCanSample = this.server.getClientCapabilities()?.sampling !== undefined;
+    const clientCanSample = this.pushCapabilities()?.sampling !== undefined;
     const wantsTiebreak = safeBudget === 1 && shouldSample(ranked, effort);
     // The one-time "client has no sampling" notice is emitted HERE, at the
     // gate that skips the round-trip: bestOfNViaSampling is never reached on
@@ -6127,7 +6262,7 @@ export class ConnectServer {
       const mergedTools = new Map(activeServers.map((s) => [s.namespace, s.toolCache ?? []]));
       const candidates = buildCandidates(ranked.slice(0, 3), serversByNamespace, mergedTools);
       const samples = sampleCountForEffort(effort);
-      const picked = await bestOfNViaSampling(this.server, trimmed, candidates, samples);
+      const picked = await bestOfNViaSampling(this.samplingPeer(), trimmed, candidates, samples);
       if (picked) {
         const winner = ranked.find((r) => r.namespace === picked);
         if (winner) {

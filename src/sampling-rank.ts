@@ -1,6 +1,6 @@
-import type { CreateMessageRequestParamsBase, Server } from "@modelcontextprotocol/server";
+import type { CreateMessageRequestParamsBase } from "@modelcontextprotocol/server";
 import { log } from "./logger.js";
-import { capForPrompt, INTENT_MAX } from "./reward-grader.js";
+import { capForPrompt, INTENT_MAX, type SamplingPeer } from "./reward-grader.js";
 import type { UpstreamServerConfig } from "./types.js";
 
 // Top-2 scores within this ratio of each other trigger a sampling
@@ -393,7 +393,7 @@ export function noteNoSamplingCapability(): void {
 // fewer than 2 candidates, or total failure it returns null and the caller
 // falls back to the ranker's order — it never throws.
 export async function bestOfNViaSampling(
-  server: Server,
+  server: SamplingPeer,
   intent: string,
   candidates: TiebreakCandidate[],
   n: number,

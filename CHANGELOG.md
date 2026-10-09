@@ -4,6 +4,10 @@ All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented 
 
 ## Unreleased
 
+**Changed -- servers are listed in namespace order, and a tool-name collision goes to the lexically first namespace**
+
+`tools/list`, `resources/list` and `prompts/list` listed loaded servers in the order they were loaded, and idle servers' cached tools in `bundles.json` order, so the same set of servers gave a different list depending on what the model loaded first. Every list and route table now walks namespaces in code-unit order (meta-tools still first, each server's own tool order kept), so the same loaded set gives a byte-identical list. This changes who wins a name collision: when two namespaces flatten onto one wire name (`gh` + `actions_list` and `gh_actions` + `list` are both `gh_actions_list`), the owner was the first one loaded and is now the lexically first namespace (`gh`), for loaded and idle servers alike. The list and the routes still agree on the owner, so a call always reaches the tool whose schema was listed; the activate reply still names a tool that lost its name, and renaming one namespace still resolves it.
+
 **Added -- `mcp_connect_discover` takes `listOnly: true` for a side-effect-free listing**
 
 A client UI that shows the installed servers (a `/mcp` panel, a status line) had only the model's discover to call, and an unfocused discover is not read-only: it runs the shell-history install-candidates scan and records a per-CLI nudge cooldown, so the suggestion was spent on a panel the model never reads; it ticks every connected server one call closer to idle eviction; it fires the once-per-session `yaw-mcp://guide` hint; and with a `context` it can auto-load a server. `listOnly: true` skips all four and returns the same server listing text. It is part of the discover memo key in both directions, so a model's plain `{}` inside the 3 s TTL still runs the install-candidates block instead of replaying the UI's body. Only a boolean `true` selects it; the low-level server does not validate input against the schema, so a stray string does not move a model's discover onto the quiet path.
