@@ -1830,6 +1830,7 @@ export const DOCTOR_ENV_VARS: ReadonlyArray<{ name: string; defaultHint: string 
   { name: "YAW_MCP_SIDECAR_REFRESH", defaultHint: "default on" },
   { name: "YAW_MCP_CONFIG_RELOAD", defaultHint: "default on" },
   { name: "YAW_MCP_PREWARM", defaultHint: "default on" },
+  { name: "YAW_MCP_PROTOCOL", defaultHint: "auto: 2026-07-28 and 2025 eras" },
   { name: "YAW_MCP_IDLE_THRESHOLD", defaultHint: "adaptive, base 10" },
   { name: "YAW_MCP_ROUTE_EFFORT", defaultHint: "auto" },
   { name: "YAW_MCP_REWARD_GRADER", defaultHint: "off" },

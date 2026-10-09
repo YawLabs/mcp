@@ -10,21 +10,22 @@
 // day of opening and closing a client, that is orphaned MCP servers piling
 // up on the machine this project is developed on.
 //
-// The SDK does not cover this for us. StdioServerTransport.start() attaches
-// exactly two stdin listeners, 'data' and 'error' (see
-// @modelcontextprotocol/sdk/dist/esm/server/stdio.js); it has no 'end' or
-// 'close' listener, so its own `onclose` fires only when something calls
-// transport.close() explicitly. On EOF nothing does. Hooking stdin here is
-// therefore the fix, not a belt-and-braces addition to an SDK path that
-// already works.
+// The SDK does not cover this for us. The v2 StdioServerTransport does close
+// itself on stdin 'end'/'close', but that only closes the MCP connection:
+// serveStdio closes the pinned instance and nothing more, and yaw-mcp never
+// ties an instance's onclose to shutdown (serveStdio also closes a discarded
+// server/discover probe instance, which must not end the process). So the
+// upstream teardown still hangs off stdin here. (The v1 transport had no
+// 'end' listener at all, which is why this module exists.)
 //
 // TIMING CONSTRAINT the callback runs under. index.ts arms a 10s force-exit
 // (`setTimeout(() => process.exit(1), 10_000)`, ref'd on purpose) the moment
 // shutdown starts, and the teardown it bounds is the SDK's STAGED stdio close
 // per upstream: end stdin, wait up to 2s, SIGTERM, wait up to 2s, SIGKILL
 // (StdioClientTransport.close) -- up to 4s per child that ignores EOF, run
-// in parallel across the connections, then server.close(). server.ts sizes
-// its SHUTDOWN_DRAIN_MS (2s) against that same 10s cap, so the budget is:
+// in parallel across the connections, after the downstream face has
+// closed. server.ts sizes its SHUTDOWN_DRAIN_MS (2s) against that same 10s
+// cap, so the budget is:
 // drain 2s + staged close 4s + headroom. Anything new that a shutdown
 // trigger makes the callback wait on comes out of that headroom, and past it
 // the process exits 1 instead of 0 -- which a desktop client then reports

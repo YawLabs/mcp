@@ -20,7 +20,7 @@
 //   - NEVER-THROWING: any failure (no sampling capability, timeout, declined,
 //     unparseable) returns null and the heuristic stands.
 
-import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import type { Server } from "@modelcontextprotocol/server";
 import { log } from "./logger.js";
 import { REWARD_EMPTY_BODY, REWARD_ERROR_SHAPED, type ToolCallResultShape } from "./reward.js";
 

@@ -1,16 +1,18 @@
 import { homedir } from "node:os";
 import { getSupportedElicitationModes } from "@modelcontextprotocol/sdk/client/index.js";
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
-  CallToolRequestSchema,
-  GetPromptRequestSchema,
-  ListPromptsRequestSchema,
-  ListResourcesRequestSchema,
-  ListResourceTemplatesRequestSchema,
-  ListToolsRequestSchema,
-  ReadResourceRequestSchema,
-} from "@modelcontextprotocol/sdk/types.js";
+  type CallToolResult,
+  type GetPromptResult,
+  type ListPromptsResult,
+  type ListResourcesResult,
+  type ListToolsResult,
+  type ProtocolEra,
+  type ReadResourceResult,
+  Server,
+  SUPPORTED_PROTOCOL_VERSIONS,
+  type Transport,
+} from "@modelcontextprotocol/server";
+import { type StdioServerHandle, StdioServerTransport, serveStdio } from "@modelcontextprotocol/server/stdio";
 import { maybeAutoUpgrade } from "./auto-upgrade.js";
 import { bundleActivateHint, CURATED_BUNDLES, matchBundles, topPartialBundles } from "./bundles.js";
 import { bundlesFileHint } from "./bundles-hint.js";
@@ -54,7 +56,12 @@ import { computeSecretsReport, META_TOOL_NAMES, META_TOOLS, SERVER_INSTRUCTIONS 
 import { isFeatureDisabled } from "./opt-out-env.js";
 import { PackDetector } from "./pack-detect.js";
 import { isPersistenceDisabled, loadState, type PersistedToolCacheEntry, saveState } from "./persistence.js";
-import { createProgressReporter, isProgressRequested, type ProgressExtra, type ProgressReporter } from "./progress.js";
+import {
+  createProgressReporter,
+  isProgressRequested,
+  type ProgressContext,
+  type ProgressReporter,
+} from "./progress.js";
 import {
   type BuiltinResource,
   brandRoutingFault,
@@ -163,6 +170,34 @@ export function isAutoLoadEnabled(): boolean {
   if (raw === undefined || raw === "") return false;
   return raw === "1" || raw.toLowerCase() === "true";
 }
+
+/** Which protocol eras the downstream face serves. */
+export type ProtocolMode = "auto" | "legacy";
+
+// The escape hatch for the dual-era serving entry. Unset or "auto" serves
+// both eras: a 2026-07-28 client that opens with server/discover gets the
+// modern protocol, a 2025 client that opens with initialize gets that. Set
+// YAW_MCP_PROTOCOL=legacy to serve exactly what 1.0.x served -- initialize
+// only, with server/discover answered -32601, which is the legacy signal a
+// probing client falls back on. The server-side twin of Claude Code's own
+// MCP_PROTOCOL_NEGOTIATION=legacy. Read once, at start(): the era is fixed
+// for the connection, so a mid-session change could not apply anyway.
+export function resolveProtocolMode(env: NodeJS.ProcessEnv = process.env): ProtocolMode {
+  // Trimmed for the cmd.exe reason isAutoLoadEnabled documents.
+  const raw = env.YAW_MCP_PROTOCOL?.trim().toLowerCase();
+  if (raw === undefined || raw === "" || raw === "auto") return "auto";
+  if (raw === "legacy") return "legacy";
+  // Unknown value: "auto" is what an unset value gets, and it is the mode
+  // that still serves every client, so a typo costs nothing but this line.
+  log("warn", `unrecognized YAW_MCP_PROTOCOL "${raw}"; using "auto"`, { raw });
+  return "auto";
+}
+
+/** The 2025-era revisions the legacy hatch negotiates over initialize. The
+ *  SDK's own list is legacy-only today (modern revisions are kept apart from
+ *  it); filtered anyway so the hatch cannot start answering server/discover
+ *  if a later SDK merges the lists. */
+const LEGACY_PROTOCOL_VERSIONS = SUPPORTED_PROTOCOL_VERSIONS.filter((v) => v < "2026-07-28");
 
 // Startup pre-warm of dormant servers. Default ON; set YAW_MCP_PREWARM=0
 // (or "false") to suppress it. The one reason to: pre-warm LEARNS a
@@ -704,6 +739,15 @@ function explicitLoadIsError(tally: ExplicitLoadTally): true | undefined {
 
 export class ConnectServer {
   private server: Server;
+  /** The serving entry's handle (serveStdio, or the legacy hatch's plain
+   *  transport); null until start() serves. shutdown() closes through it. */
+  private stdioHandle: StdioServerHandle | null = null;
+  /** Settles when start() has loaded the config, the tool cache and the
+   *  routes. start() serves before it loads anything, so server/discover is
+   *  answered inside a client's probe bound; every handler that reads that
+   *  state awaits this first. Resolved from the outset for a host that never
+   *  calls start() (tests, embedders), whose state is whatever it set. */
+  private ready: Promise<void> = Promise.resolve();
   private clientBridge: DownstreamClientBridge;
   private connections = new Map<string, UpstreamConnection>();
   private config: ConnectConfig | null = null;
@@ -1016,22 +1060,9 @@ export class ConnectServer {
   private static readonly SHUTDOWN_DRAIN_MS = 2000;
 
   constructor() {
-    this.server = new Server(
-      { name: "yaw-mcp", version: typeof __VERSION__ !== "undefined" ? __VERSION__ : "dev" },
-      {
-        capabilities: {
-          tools: { listChanged: true },
-          resources: { listChanged: true },
-          prompts: { listChanged: true },
-        },
-        // Returned once, in the initialize result, and injected by Claude
-        // Code into the system prompt as a "# MCP Server Instructions"
-        // block. This is where the routing prose the meta-tool descriptions
-        // used to repeat now lives -- a description is paid on every
-        // tools/list, this is paid once. See SERVER_INSTRUCTIONS.
-        instructions: SERVER_INSTRUCTIONS,
-      },
-    );
+    // The instance a test or embedded host reaches before start() serves a
+    // connection; serving replaces it with the instance it pins.
+    this.server = this.buildServer();
     // yaw-mcp itself does not handle elicitation or sampling requests; it
     // originates them. The capability declaration for originated features
     // is implicit -- the client advertises whether IT supports receiving
@@ -1047,10 +1078,49 @@ export class ConnectServer {
     this.clientBridge = {
       getClientCapabilities: () => this.server.getClientCapabilities(),
       elicitInput: (params, options) => this.server.elicitInput(params, options),
-      createMessage: (params, options) => this.server.createMessage(params, options),
+      // The bridge is typed with the v1 client's shapes (upstream.ts stays on
+      // the v1 SDK); v2 narrows `metadata` from `object` to a JSON object.
+      // Sidecar params are JSON off the wire, so the narrowing holds.
+      createMessage: (params, options) =>
+        this.server.createMessage(params as Parameters<Server["createMessage"]>[0], options),
       listRoots: (params, options) => this.server.listRoots(params, options),
     };
-    this.setupHandlers();
+  }
+
+  /** One protocol face over this ConnectServer's state. serveStdio calls it
+   *  up to twice per connection -- a server/discover probe instance, then a
+   *  legacy one when the client falls back to initialize -- so it does no I/O
+   *  and keeps no state of its own: everything a session accumulates lives on
+   *  ConnectServer, and the handlers reach it through `this`. The newest
+   *  instance is the live one (serveStdio discards the probe before it builds
+   *  the legacy instance), which is what clientBridge and the push paths read.
+   *
+   *  `era` is undefined for the constructor's unserved instance. A legacy
+   *  instance starts the session's background work once the client's
+   *  initialize handshake completes; see beginSession for why it waits. */
+  private buildServer(era?: ProtocolEra, supportedProtocolVersions?: string[]): Server {
+    const s = new Server(
+      { name: "yaw-mcp", version: typeof __VERSION__ !== "undefined" ? __VERSION__ : "dev" },
+      {
+        capabilities: {
+          tools: { listChanged: true },
+          resources: { listChanged: true },
+          prompts: { listChanged: true },
+        },
+        // Sent in the server/discover result (2026-07-28) or the initialize
+        // result (2025-era), and injected by Claude Code into the system
+        // prompt as a "# MCP Server Instructions" block. This is where the
+        // routing prose the meta-tool descriptions used to repeat now lives
+        // -- a description is paid on every tools/list, this is paid once per
+        // connection. See SERVER_INSTRUCTIONS.
+        instructions: SERVER_INSTRUCTIONS,
+        ...(supportedProtocolVersions ? { supportedProtocolVersions } : {}),
+      },
+    );
+    this.installHandlers(s);
+    if (era === "legacy") s.oninitialized = () => this.beginSession();
+    this.server = s;
+    return s;
   }
 
   // Builtin resources served directly by yaw-mcp (not proxied from an
@@ -1099,35 +1169,53 @@ export class ConnectServer {
     return resolveToolExposure(this.server.getClientVersion());
   }
 
-  private setupHandlers(): void {
-    this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
-      tools: buildToolList(
-        this.connections,
-        this.getDeferredServers(),
-        this.toolFilters,
-        this.currentExposure(),
-        this.sessionActivated,
-        // Hidden here, refused at the gate, but still ROUTED: dropping the
-        // route instead would make a call by name return `Unknown tool`,
-        // which reads as a typo and sends the model hunting for a name that
-        // is right there.
-        (wireName) => this.isToolDenied(wireName),
-      ),
-    }));
-
-    this.server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
-      const { name, arguments: args } = request.params;
-      return this.handleToolCall(name, args ?? {}, extra);
+  /** The routes every instance serves. Each handler first waits for start()
+   *  to finish loading config: server/discover and initialize are answered by
+   *  the SDK from static data the moment the connection opens, but everything
+   *  below reads the config, the tool cache and the routes. Results are typed
+   *  loosely where they carry proxied upstream data (the v1 client's types);
+   *  the casts mark that boundary. */
+  private installHandlers(s: Server): void {
+    s.setRequestHandler("tools/list", async () => {
+      await this.ready;
+      return {
+        tools: buildToolList(
+          this.connections,
+          this.getDeferredServers(),
+          this.toolFilters,
+          this.currentExposure(),
+          this.sessionActivated,
+          // Hidden here, refused at the gate, but still ROUTED: dropping the
+          // route instead would make a call by name return `Unknown tool`,
+          // which reads as a typo and sends the model hunting for a name that
+          // is right there.
+          (wireName) => this.isToolDenied(wireName),
+        ) as ListToolsResult["tools"],
+      };
     });
 
-    this.server.setRequestHandler(ListResourcesRequestSchema, async () => ({
-      resources: buildResourceList(
-        this.connections,
-        this.getBuiltinResources(),
-        this.currentExposure(),
-        this.sessionActivated,
-      ),
-    }));
+    s.setRequestHandler("tools/call", async (request, ctx) => {
+      await this.ready;
+      const { name, arguments: args } = request.params;
+      const result = await this.handleToolCall(name, args ?? {}, ctx);
+      // A low-level handler owns the projection McpServer would apply: the
+      // SEP-2106 TextContent append, and on the 2025 era the `{result: ...}`
+      // wrap of a non-object structuredContent. Only proxied results can carry
+      // structuredContent; for the rest it is the identity.
+      return s.projectCallToolResult(result as CallToolResult, this.advertisedOutputSchema(name));
+    });
+
+    s.setRequestHandler("resources/list", async () => {
+      await this.ready;
+      return {
+        resources: buildResourceList(
+          this.connections,
+          this.getBuiltinResources(),
+          this.currentExposure(),
+          this.sessionActivated,
+        ) as ListResourcesResult["resources"],
+      };
+    });
 
     // Registered so a client probing resources/templates/list gets a valid
     // empty result instead of -32601 — the constructor declares the
@@ -1137,26 +1225,49 @@ export class ConnectServer {
     // conn.resources, so routeResourceRead could not resolve a templated
     // URI anyway. If template proxying lands, this handler is where the
     // aggregated upstream templates get returned.
-    this.server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => ({
+    s.setRequestHandler("resources/templates/list", async () => ({
       resourceTemplates: [],
     }));
 
-    this.server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
-      return routeResourceRead(request.params.uri, this.resourceRoutes, this.connections, this.getBuiltinResourceMap());
+    s.setRequestHandler("resources/read", async (request) => {
+      await this.ready;
+      return (await routeResourceRead(
+        request.params.uri,
+        this.resourceRoutes,
+        this.connections,
+        this.getBuiltinResourceMap(),
+      )) as ReadResourceResult;
     });
 
-    this.server.setRequestHandler(ListPromptsRequestSchema, async () => ({
-      prompts: buildPromptList(this.connections, this.currentExposure(), this.sessionActivated),
-    }));
+    s.setRequestHandler("prompts/list", async () => {
+      await this.ready;
+      return {
+        prompts: buildPromptList(
+          this.connections,
+          this.currentExposure(),
+          this.sessionActivated,
+        ) as ListPromptsResult["prompts"],
+      };
+    });
 
-    this.server.setRequestHandler(GetPromptRequestSchema, async (request) => {
-      return routePromptGet(
+    s.setRequestHandler("prompts/get", async (request) => {
+      await this.ready;
+      return (await routePromptGet(
         request.params.name,
         request.params.arguments as Record<string, string> | undefined,
         this.promptRoutes,
         this.connections,
-      );
+      )) as GetPromptResult;
     });
+  }
+
+  /** The outputSchema tools/list advertised for `wireName`, which
+   *  projectCallToolResult needs to decide the 2025-era wrap. Read after the
+   *  call, so a deferred server the call just activated is found too. */
+  private advertisedOutputSchema(wireName: string): Record<string, unknown> | undefined {
+    const route = this.toolRoutes.get(wireName);
+    if (!route) return undefined;
+    return this.connections.get(route.namespace)?.tools.find((t) => t.namespacedName === wireName)?.outputSchema;
   }
 
   private readonly onUpstreamDisconnect = (ns: string) => {
@@ -1891,7 +2002,91 @@ export class ConnectServer {
   // warnings, so a typo'd key that fails open to allow-all is reported on
   // every path rather than only on the one whose caller happened to log
   // first.
-  async start(opts: { config?: ResolvedConfig } = {}): Promise<void> {
+  //
+  // `transport`: serve over this instead of the process's stdio. For tests,
+  // which drive the real serving entry through an in-memory pair.
+  async start(opts: { config?: ResolvedConfig; transport?: Transport } = {}): Promise<void> {
+    // Serve FIRST, before any file is read. Claude Code probes with
+    // server/discover and waits min(3 s, connectTimeout/3) for the answer; a
+    // server that misses the bound is connected on the 2025 protocol and
+    // remembered as a legacy peer for seven days. The SDK answers discover
+    // and initialize from static data (capabilities, SERVER_INSTRUCTIONS), so
+    // the config load below is kept off that path, and the handlers that do
+    // need it wait on `ready` instead.
+    let markReady!: () => void;
+    let failReady!: (err: unknown) => void;
+    this.ready = new Promise<void>((resolve, reject) => {
+      markReady = resolve;
+      failReady = reject;
+    });
+    // Handlers observe a startup failure through their own await; this only
+    // keeps the rejection from also surfacing as an unhandled one.
+    this.ready.catch(() => {});
+    this.stdioHandle = await this.serve(opts.transport);
+    try {
+      await this.loadStartupState(opts);
+    } catch (err) {
+      failReady(err);
+      throw err;
+    }
+    markReady();
+
+    // Self-upgrade check: if this install is stale, upgrade it in the
+    // background so the next client restart runs the latest version.
+    // Fire-and-forget -- never awaited, never gates transport readiness.
+    // Not handshake-gated: it spawns no upstream, so the capability
+    // snapshot is irrelevant to it.
+    maybeAutoUpgrade().catch((err: Error) => log("warn", "Auto-upgrade check failed", { error: err?.message }));
+
+    // The same check one level down: maybeAutoUpgrade above refreshes yaw-mcp
+    // itself, this refreshes the managed SIDECAR tree it spawns servers from.
+    // Needed because `sidecars install` trades npx's per-spawn re-resolution
+    // for a copy on disk -- an oam-hosted server runs that copy and cannot
+    // re-resolve "@latest", so without this the tree sits at whatever version
+    // the last manual `yaw-mcp sidecars install` happened to fetch, forever.
+    // No-op for npx users (nothing managed to refresh) and for explicitly
+    // pinned specs, which are the user's stated version and never auto-moved.
+    //
+    // Fire-and-forget for its sibling's reasons, and emphatically not awaited:
+    // the work it can trigger is an `npm install` that runs for tens of
+    // seconds. Ordering against maybeAutoUpgrade does not matter -- they touch
+    // different trees (the global prefix vs ~/.yaw-mcp/sidecars) and each
+    // serializes itself with its own lockfile.
+    maybeRefreshSidecars().catch((err: Error) => log("warn", "Sidecar refresh check failed", { error: err?.message }));
+
+    // There is deliberately NO npx-cache pre-warm here. 1.0.7 added a
+    // fire-and-forget `npx -y <pkg>@latest --version` pass at this point
+    // (auto-prewarm.ts, since deleted) to spare the first activation the
+    // cold-cache tax. It never ran: the call passed no server list, so the
+    // pass saw zero npx packages and returned on every start. Wiring it up
+    // for real would have spawned up to twenty parallel npx children -- a
+    // registry hit and a package boot each -- on EVERY broker start, and Yaw
+    // Terminal starts one broker per pane. Its stated goal was unreachable
+    // from here anyway: serving started at the top of start(), so the
+    // handshake this was meant to protect is over before the pass fires. A
+    // once-a-day warm belongs in an explicit verb the app runs at launch, not
+    // on the serve hot path.
+
+    // Re-point any client entry whose baked launch file an app upgrade
+    // deleted. CROSS-CLIENT on purpose, and that is the whole point: the
+    // client with the dead entry cannot start this process, so the repair
+    // has to ride in on a client whose entry still works. On a Yaw box the
+    // Claude Code entry is kept live by the app, so a pane spawn is what
+    // heals Codex. Writes nothing when READONLY_DIAGNOSTICS is set, when
+    // YAW_MCP_AUTO_HEAL=0, or -- the steady state -- when every entry
+    // resolves. Never awaited: serve must not block on filesystem work.
+    maybeHealStaleBrokerEntries().catch((err: Error) =>
+      log("warn", "Stale-entry heal failed", { error: err?.message }),
+    );
+
+    log("info", "yaw-mcp started", {
+      servers: this.config?.servers.length ?? 0,
+    });
+  }
+
+  /** Everything start() reads before the handlers may run: persisted state,
+   *  the profile, guides, bundles, grades and the routing table. */
+  private async loadStartupState(opts: { config?: ResolvedConfig }): Promise<void> {
     // Hydrate learning + pack-history state from ~/.yaw-mcp/state.json
     // before anything else so subsequent record* writes land on top of
     // the restored signal rather than replacing it. loadState() never
@@ -2030,8 +2225,8 @@ export class ConnectServer {
     // cached-but-unloaded server is loaded on first use" answered "Unknown
     // tool" instead. That is the ONLY way a client that never re-lists tools
     // (Codex) reaches an upstream tool, and typed's lite find_tool -> exec
-    // flow hits the same wall. No list_changed notification: the transport is
-    // not connected yet, so the client's first tools/list already sees this.
+    // flow hits the same wall. No list_changed notification: every handler
+    // waits on `ready`, so the client's first tools/list already sees this.
     this.rebuildRoutes();
 
     // Prewarm the uv bootstrap if any configured server needs it. Fire
@@ -2051,14 +2246,16 @@ export class ConnectServer {
     if (this.getProfiledActiveServers().some((s) => s.command !== undefined && uvLaunchKind(s.command) !== null)) {
       ensureUv().catch((err: Error) => log("warn", "uv prewarm failed", { error: err?.message }));
     }
+  }
 
-    const transport = new StdioServerTransport();
-
+  /** Starts the session's background work: pre-warm and the opt-in auto-load.
+   *  A legacy instance calls this from `oninitialized`. */
+  private beginSession(): void {
     // Both startup activation paths -- pre-warm and the opt-in auto-load --
     // wait for the downstream client's initialize handshake to complete.
-    // Protocol.connect() below only starts the transport; the SDK records
-    // the client's declared capabilities in _oninitialize and fires
-    // `oninitialized` on the client's notifications/initialized. Upstream
+    // Serving only starts the transport; the SDK records the client's
+    // declared capabilities in _oninitialize and fires `oninitialized` on
+    // the client's notifications/initialized. Upstream
     // connects mirror that capability snapshot at Client construction
     // (upstream.ts reads bridge.getClientCapabilities() once), so an
     // upstream spawned before initialize deterministically mirrors EMPTY
@@ -2066,98 +2263,72 @@ export class ConnectServer {
     // inflight and keeps that connection alive, elicitation/sampling/roots
     // forwarding is silently dead for the connection's whole lifetime.
     // A client that never initializes never triggers either path: with no
-    // downstream there is nothing to serve. Registered BEFORE connect so
-    // a fast client can't complete the handshake into a missing callback.
-    this.server.oninitialized = () => {
-      // Dormant servers (isActive but no persisted toolCache yet) are
-      // invisible in tools/list because getDeferredServers() filters on
-      // toolCache presence. That breaks the "I toggled it on in the
-      // bundles.json and it disappeared" user experience. Pre-warm each one
-      // in the background: activate → populate the in-memory toolCache
-      // → disconnect so we're not holding 9 upstream processes idle.
-      // Fire-and-forget so this doesn't gate the handshake response. Kept in
-      // startupPrewarm while it runs, so a find_tool or exec that lands first
-      // can wait for what it is about to learn instead of answering "none".
-      const prewarm = this.prewarmDormantServers()
-        .catch((err: Error) => log("warn", "Pre-warm failed", { error: err?.message }))
-        .finally(() => {
-          if (this.startupPrewarm === prewarm) this.startupPrewarm = null;
-        });
-      this.startupPrewarm = prewarm;
-
-      // Opt-in auto-load of the top recurring pack. Requires persistence
-      // (so there IS a history to learn from) AND YAW_MCP_AUTO_LOAD=1. Runs
-      // alongside prewarm so both paths see the same config snapshot;
-      // they're independent (prewarm populates toolCache for newly-enabled
-      // servers, this one spins up the recurring workflow's servers for
-      // real). Fire-and-forget — the handshake shouldn't block on it.
-      if (isAutoLoadEnabled()) {
-        if (this.persistenceReady) {
-          this.autoLoadRecurringPack().catch((err: Error) => log("warn", "Auto-load failed", { error: err?.message }));
-        } else {
-          // The flag is set but there is no history to replay from, so the
-          // recurring pack will never load -- and without this line nothing
-          // says why. persistenceReady is false for exactly two reasons (see
-          // the state hydration at the top of start()), so name the one that
-          // applies. Once per session: oninitialized fires once.
-          log("info", "YAW_MCP_AUTO_LOAD is set but persisted history is unavailable; skipping auto-load", {
-            reason: isPersistenceDisabled() ? "YAW_MCP_DISABLE_PERSISTENCE is set" : "state.json could not be read",
+    // downstream there is nothing to serve. buildServer attaches the callback
+    // at construction, so a fast client can't complete the handshake into a
+    // missing one. The handshake can complete before start() has loaded the
+    // config (serving comes first), so the work also waits for `ready`.
+    this.ready.then(
+      () => {
+        // Dormant servers (isActive but no persisted toolCache yet) are
+        // invisible in tools/list because getDeferredServers() filters on
+        // toolCache presence. That breaks the "I toggled it on in the
+        // bundles.json and it disappeared" user experience. Pre-warm each one
+        // in the background: activate → populate the in-memory toolCache
+        // → disconnect so we're not holding 9 upstream processes idle.
+        // Fire-and-forget so this doesn't gate the handshake response. Kept in
+        // startupPrewarm while it runs, so a find_tool or exec that lands first
+        // can wait for what it is about to learn instead of answering "none".
+        const prewarm = this.prewarmDormantServers()
+          .catch((err: Error) => log("warn", "Pre-warm failed", { error: err?.message }))
+          .finally(() => {
+            if (this.startupPrewarm === prewarm) this.startupPrewarm = null;
           });
+        this.startupPrewarm = prewarm;
+
+        // Opt-in auto-load of the top recurring pack. Requires persistence
+        // (so there IS a history to learn from) AND YAW_MCP_AUTO_LOAD=1. Runs
+        // alongside prewarm so both paths see the same config snapshot;
+        // they're independent (prewarm populates toolCache for newly-enabled
+        // servers, this one spins up the recurring workflow's servers for
+        // real). Fire-and-forget — the handshake shouldn't block on it.
+        if (isAutoLoadEnabled()) {
+          if (this.persistenceReady) {
+            this.autoLoadRecurringPack().catch((err: Error) =>
+              log("warn", "Auto-load failed", { error: err?.message }),
+            );
+          } else {
+            // The flag is set but there is no history to replay from, so the
+            // recurring pack will never load -- and without this line nothing
+            // says why. persistenceReady is false for exactly two reasons (see
+            // the state hydration at the top of start()), so name the one that
+            // applies. Once per session: oninitialized fires once.
+            log("info", "YAW_MCP_AUTO_LOAD is set but persisted history is unavailable; skipping auto-load", {
+              reason: isPersistenceDisabled() ? "YAW_MCP_DISABLE_PERSISTENCE is set" : "state.json could not be read",
+            });
+          }
         }
-      }
-    };
-    await this.server.connect(transport);
-
-    // Self-upgrade check: if this install is stale, upgrade it in the
-    // background so the next client restart runs the latest version.
-    // Fire-and-forget -- never awaited, never gates transport readiness.
-    // Not handshake-gated: it spawns no upstream, so the capability
-    // snapshot is irrelevant to it.
-    maybeAutoUpgrade().catch((err: Error) => log("warn", "Auto-upgrade check failed", { error: err?.message }));
-
-    // The same check one level down: maybeAutoUpgrade above refreshes yaw-mcp
-    // itself, this refreshes the managed SIDECAR tree it spawns servers from.
-    // Needed because `sidecars install` trades npx's per-spawn re-resolution
-    // for a copy on disk -- an oam-hosted server runs that copy and cannot
-    // re-resolve "@latest", so without this the tree sits at whatever version
-    // the last manual `yaw-mcp sidecars install` happened to fetch, forever.
-    // No-op for npx users (nothing managed to refresh) and for explicitly
-    // pinned specs, which are the user's stated version and never auto-moved.
-    //
-    // Fire-and-forget for its sibling's reasons, and emphatically not awaited:
-    // the work it can trigger is an `npm install` that runs for tens of
-    // seconds. Ordering against maybeAutoUpgrade does not matter -- they touch
-    // different trees (the global prefix vs ~/.yaw-mcp/sidecars) and each
-    // serializes itself with its own lockfile.
-    maybeRefreshSidecars().catch((err: Error) => log("warn", "Sidecar refresh check failed", { error: err?.message }));
-
-    // There is deliberately NO npx-cache pre-warm here. 1.0.7 added a
-    // fire-and-forget `npx -y <pkg>@latest --version` pass at this point
-    // (auto-prewarm.ts, since deleted) to spare the first activation the
-    // cold-cache tax. It never ran: the call passed no server list, so the
-    // pass saw zero npx packages and returned on every start. Wiring it up
-    // for real would have spawned up to twenty parallel npx children -- a
-    // registry hit and a package boot each -- on EVERY broker start, and Yaw
-    // Terminal starts one broker per pane. Its stated goal was unreachable
-    // from here anyway: `server.connect` above has already completed, so the
-    // handshake this was meant to protect is over before the pass fires. A
-    // once-a-day warm belongs in an explicit verb the app runs at launch, not
-    // on the serve hot path.
-
-    // Re-point any client entry whose baked launch file an app upgrade
-    // deleted. CROSS-CLIENT on purpose, and that is the whole point: the
-    // client with the dead entry cannot start this process, so the repair
-    // has to ride in on a client whose entry still works. On a Yaw box the
-    // Claude Code entry is kept live by the app, so a pane spawn is what
-    // heals Codex. Writes nothing when READONLY_DIAGNOSTICS is set, when
-    // YAW_MCP_AUTO_HEAL=0, or -- the steady state -- when every entry
-    // resolves. Never awaited: serve must not block on filesystem work.
-    maybeHealStaleBrokerEntries().catch((err: Error) =>
-      log("warn", "Stale-entry heal failed", { error: err?.message }),
+      },
+      () => {},
     );
+  }
 
-    log("info", "yaw-mcp started", {
-      servers: this.config?.servers.length ?? 0,
+  /** Opens the downstream face on `transport` (the process's stdio when
+   *  absent). Never wire an instance's onclose to shutdown: serveStdio closes
+   *  the discover probe instance when a client falls back to initialize, and
+   *  the end of the session is what shutdown-triggers.ts hears on stdin. */
+  private async serve(transport: Transport | undefined): Promise<StdioServerHandle> {
+    if (resolveProtocolMode() === "legacy") {
+      // A plain transport and no serving entry: nothing marks the instance
+      // modern, and with only 2025 revisions supported the SDK registers no
+      // server/discover handler, so a probe gets -32601.
+      const s = this.buildServer("legacy", LEGACY_PROTOCOL_VERSIONS);
+      await s.connect(transport ?? new StdioServerTransport());
+      log("info", "Serving the 2025 protocol only (YAW_MCP_PROTOCOL=legacy)");
+      return { close: () => s.close() };
+    }
+    return serveStdio(({ era }) => this.buildServer(era), {
+      transport,
+      onerror: (err) => log("warn", "stdio serving error", { error: err.message }),
     });
   }
 
@@ -2421,15 +2592,15 @@ export class ConnectServer {
   private async handleToolCall(
     name: string,
     args: Record<string, unknown>,
-    // `signal` rides along with the two progress fields because the SDK's
-    // RequestHandlerExtra has always carried it -- it was simply never read,
-    // so a downstream cancel aborted this handler and left the upstream call
-    // running. The proxy path below forwards it. Typed as the progress
-    // module's own narrowing of RequestHandlerExtra (ProgressExtra) plus the
-    // signal, rather than `any`: the SDK's full type carries request-scoped
-    // fields this handler never reads, and the narrow shape is what both
-    // callers (the CallTool handler and handleExec's per-step call) satisfy.
-    extra?: NonNullable<ProgressExtra> & { signal?: AbortSignal },
+    // `ctx.mcpReq.signal` rides along with the two progress fields because a
+    // downstream cancel must abort the upstream call too, not just this
+    // handler. The proxy path below forwards it. Typed as the progress
+    // module's own narrowing of the handler context (ProgressContext) plus
+    // the signal, rather than `any`: the SDK's full ServerContext carries
+    // request-scoped fields this handler never reads, and the narrow shape is
+    // what both callers (the tools/call handler and handleExec's per-step
+    // call) satisfy.
+    ctx?: { mcpReq?: NonNullable<NonNullable<ProgressContext>["mcpReq"]> & { signal?: AbortSignal } },
     // When deferLearning is set (exec steps), the proxy path does NOT record
     // the cross-session learning signal — handleExec records step-level,
     // cascading-blame credit instead so a failing consumer doesn't wrongly
@@ -2458,7 +2629,7 @@ export class ConnectServer {
     isError?: boolean;
     stepContent?: Array<{ type: string; text?: string }>;
   }> {
-    const progress = createProgressReporter(extra);
+    const progress = createProgressReporter(ctx);
     // THE meta-tool boundary. Everything about why it is here and not
     // anywhere else is on maybeReloadBundles; the two load-bearing facts at
     // this call site are that it runs BEFORE any branch below reads
@@ -2579,7 +2750,7 @@ export class ConnectServer {
       return this.observed(this.attachGuideNudge(await this.handleFindTool(q, limit)));
     }
     if (name === META_TOOLS.exec.name) {
-      const result = await this.handleExec(args, extra?.signal);
+      const result = await this.handleExec(args, ctx?.mcpReq?.signal);
       return this.attachGuideNudge(result);
     }
     if (name === META_TOOLS.bundles.name) {
@@ -2828,13 +2999,13 @@ export class ConnectServer {
         // Cancellation crosses the hop: the SDK sends notifications/cancelled
         // upstream and rejects the pending call, instead of leaving it to run
         // to CALL_TIMEOUT after the client that wanted it has gone.
-        signal: extra?.signal,
+        signal: ctx?.mcpReq?.signal,
         // Relay upstream progress under the DOWNSTREAM token, and only when
         // the client asked -- see isProgressRequested. `progress` is the same
         // reporter the meta-tool branches use, so its monotonic clamp keeps
         // the sequence legal even if activation already emitted under this
         // token earlier in the call.
-        onprogress: isProgressRequested(extra)
+        onprogress: isProgressRequested(ctx)
           ? (p) => progress(p.message ?? `${route?.namespace ?? "upstream"} working`, p.progress, p.total)
           : undefined,
       });
@@ -6949,7 +7120,7 @@ export class ConnectServer {
   private async handleExec(
     args: Record<string, unknown>,
     // The downstream request's abort signal, forwarded to each step so a
-    // cancelled pipeline actually stops. Deliberately NOT the whole `extra`:
+    // cancelled pipeline actually stops. Deliberately NOT the whole `ctx`:
     // see the step dispatch below for why exec withholds the progress half.
     signal?: AbortSignal,
   ): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
@@ -7278,13 +7449,13 @@ export class ConnectServer {
       // and pack-detector logic so exec steps behave identically to
       // direct calls — the caller pays no per-step cost in surprises.
       //
-      // The progress half of `extra` is still withheld so exec steps don't
+      // The progress half of `ctx` is still withheld so exec steps don't
       // fight for the top-level progress token; the exec itself emits no
       // progress. The SIGNAL is forwarded, though: that reasoning was only
       // ever about the token, and without it a cancelled pipeline kept
       // dispatching its remaining steps. Passing an object carrying nothing
       // but `signal` keeps the old behaviour exactly -- createProgressReporter
-      // returns its no-op when there is no token and no sendNotification.
+      // returns its no-op when there is no token and no notify.
       // Step-level (process) reward: defer the proxy path's learning signal
       // and attribute credit per step here, using the $ref dependency graph
       // so a step that fails on bad INPUT it consumed from an upstream step
@@ -7310,7 +7481,7 @@ export class ConnectServer {
         stepResult = await this.handleToolCall(
           step.tool,
           resolvedArgs,
-          { signal },
+          { mcpReq: { signal } },
           {
             deferLearning: true,
             deferIdleTracking: true,
@@ -7506,9 +7677,9 @@ export class ConnectServer {
     // — an unbounded await here outlives index.ts's 10s force-exit timer, so
     // a SIGTERM landing on a cold npx handshake would sit for 10s and then
     // exit(1) instead of exiting 0 promptly. 2s is what we can spend and
-    // still finish: the disconnects below race the SDK's stdio close timers
-    // (2s, twice) and then server.close() has to run, which leaves ~4s of
-    // headroom under the 10s cap. Anything an activation needs beyond 2s was
+    // still finish: the downstream close is quick, and the disconnects
+    // below race the SDK's stdio close timers (2s, twice), which leaves ~4s
+    // of headroom under the 10s cap. Anything an activation needs beyond 2s was
     // never going to fit under that cap anyway, so waiting for it only buys
     // a forced exit(1).
     if (this.activationInflight.size > 0) {
@@ -7543,6 +7714,14 @@ export class ConnectServer {
     // process exit masks that; in an embedded or test host nothing does.
     this.persistenceReady = false;
 
+    // Close the downstream face BEFORE the upstream teardown below: closing
+    // it answers any open 2026-07-28 subscriptions/listen with its graceful
+    // close result, and the staged upstream closes can take most of
+    // index.ts's 10s force-exit budget. A host that never served (tests, an
+    // embedder that skipped start()) closes the instance it holds.
+    if (this.stdioHandle) await this.stdioHandle.close();
+    else await this.server.close();
+
     // Disconnect all upstreams
     const disconnects = Array.from(this.connections.values()).map((conn) => disconnectFromUpstream(conn));
     await Promise.allSettled(disconnects);
@@ -7553,8 +7732,8 @@ export class ConnectServer {
     //
     // This is hygiene, NOT a reset for reuse -- a ConnectServer is
     // single-use. `shuttingDown` is latched above and nothing ever clears it
-    // (activateOne refuses from here on, permanently), and `this.server` is
-    // closed below. The other session-lifecycle fields (sessionActivated,
+    // (activateOne refuses from here on, permanently), and the downstream face
+    // was closed above. The other session-lifecycle fields (sessionActivated,
     // toolFilters, idleCallCounts, toolCache, and the ask counters and
     // latches credentialPrompts, vaultPassphrasePrompts and
     // vaultPassphraseElicited -- counts and booleans, no plaintext) are
@@ -7575,8 +7754,6 @@ export class ConnectServer {
     // that collected it ("for this session") told the user.
     clearSessionVaultPassphrase();
     this.inflightCalls.clear();
-
-    await this.server.close();
 
     log("info", "yaw-mcp shutdown complete");
   }

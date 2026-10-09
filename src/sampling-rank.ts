@@ -1,5 +1,4 @@
-import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import type { CreateMessageRequestParamsBase } from "@modelcontextprotocol/sdk/types.js";
+import type { CreateMessageRequestParamsBase, Server } from "@modelcontextprotocol/server";
 import { log } from "./logger.js";
 import { capForPrompt, INTENT_MAX } from "./reward-grader.js";
 import type { UpstreamServerConfig } from "./types.js";

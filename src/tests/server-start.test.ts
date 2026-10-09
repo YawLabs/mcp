@@ -43,10 +43,11 @@ const hoisted = vi.hoisted(() => ({
   bundlesError: null as Error | null,
 }));
 
-vi.mock("@modelcontextprotocol/sdk/server/stdio.js", () => {
-  // Minimal Transport: Protocol.connect() only assigns onclose/onerror/
-  // onmessage and awaits start(); send() is used by the list-changed
-  // notifications, close() by shutdown().
+vi.mock("@modelcontextprotocol/server/stdio", async (importOriginal) => {
+  // Minimal Transport: the serving entry (or, under YAW_MCP_PROTOCOL=legacy,
+  // Protocol.connect()) only assigns onclose/onerror/onmessage and awaits
+  // start(); send() carries every reply and notification, close() is
+  // shutdown()'s.
   class FakeStdioServerTransport {
     onclose?: () => void;
     onerror?: (err: Error) => void;
@@ -68,7 +69,20 @@ vi.mock("@modelcontextprotocol/sdk/server/stdio.js", () => {
       this.onclose?.();
     }
   }
-  return { StdioServerTransport: FakeStdioServerTransport };
+  // The REAL serveStdio, so the era routing, the probe discard and the
+  // factory wiring under test are the SDK's own; only its default transport
+  // (the process's stdio) is swapped, through the ServeStdioOptions.transport
+  // hook the SDK offers for exactly this.
+  const actual = (await importOriginal()) as typeof import("@modelcontextprotocol/server/stdio");
+  return {
+    ...actual,
+    StdioServerTransport: FakeStdioServerTransport,
+    serveStdio: (factory: Parameters<typeof actual.serveStdio>[0], options: Parameters<typeof actual.serveStdio>[1]) =>
+      actual.serveStdio(factory, {
+        ...options,
+        transport: options?.transport ?? (new FakeStdioServerTransport() as never),
+      }),
+  };
 });
 
 vi.mock("../upstream.js", async (importOriginal) => {
@@ -142,6 +156,9 @@ const ENV_KEYS = [
   // them for a reason no test here is about; the one test that turns it off
   // sets it itself.
   "YAW_MCP_PREWARM",
+  // The protocol escape hatch. An exported YAW_MCP_PROTOCOL=legacy would take
+  // server/discover away from the serving test below.
+  "YAW_MCP_PROTOCOL",
 ] as const;
 
 let synthHome: string;
@@ -175,6 +192,7 @@ beforeEach(() => {
   delete process.env.YAW_MCP_TOOL_EXPOSURE;
   delete process.env.YAW_MCP_CONFIG_RELOAD;
   delete process.env.YAW_MCP_PREWARM;
+  delete process.env.YAW_MCP_PROTOCOL;
 
   cwdSpy = vi.spyOn(process, "cwd").mockReturnValue(synthCwd);
 
@@ -547,6 +565,67 @@ describe("ConnectServer.start() — transport + config load", () => {
   });
 });
 
+describe("ConnectServer.start() — serves before it loads", () => {
+  // Claude Code probes with server/discover and waits min(3 s,
+  // connectTimeout/3) for the answer; a server that misses the bound is
+  // connected on the 2025 protocol and remembered as a legacy peer for seven
+  // days. start() used to load guides, bundles and grades before it connected
+  // (~2.9 s on a loaded box), so the answer has to come from static data
+  // while that load is still running. Here the load is held open on a gate,
+  // so the bound below is about the serving order, not about the box.
+  const MODERN_META = {
+    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+    "io.modelcontextprotocol/clientInfo": { name: "claude-code", version: "2.1.292" },
+    "io.modelcontextprotocol/clientCapabilities": {},
+  };
+
+  function replyTo(transport: { sent: unknown[] }, id: unknown): Record<string, unknown> | undefined {
+    return transport.sent.find((m) => (m as { id?: unknown }).id === id) as Record<string, unknown> | undefined;
+  }
+
+  it("answers server/discover while start() is still loading, and holds tools/list until it is done", async () => {
+    writeBundles(synthHome, [serverEntry("gh")]);
+    const server = new ConnectServer();
+    servers.push(server);
+    const priv = server as any;
+    let releaseLoad: () => void = () => {};
+    const loadGate = new Promise<void>((resolve) => {
+      releaseLoad = resolve;
+    });
+    const loadStartupState = priv.loadStartupState.bind(priv);
+    priv.loadStartupState = async (opts: unknown) => {
+      await loadGate;
+      return loadStartupState(opts);
+    };
+
+    const started = server.start();
+    await vi.waitFor(() => expect(hoisted.transports).toHaveLength(1));
+    const transport = hoisted.transports[0] as (typeof hoisted.transports)[number] & {
+      onmessage?: (msg: unknown) => void;
+    };
+
+    const sentAt = performance.now();
+    transport.onmessage?.({ jsonrpc: "2.0", id: "d1", method: "server/discover", params: { _meta: MODERN_META } });
+    transport.onmessage?.({ jsonrpc: "2.0", id: 1, method: "tools/list", params: { _meta: MODERN_META } });
+    await vi.waitFor(() => expect(replyTo(transport, "d1")).toBeDefined(), { timeout: 1000, interval: 5 });
+    expect(performance.now() - sentAt).toBeLessThan(1000);
+    const discover = replyTo(transport, "d1")?.result as Record<string, unknown>;
+    expect(discover.supportedVersions).toEqual(["2026-07-28"]);
+    expect(discover.instructions).toBe(SERVER_INSTRUCTIONS);
+
+    // tools/list reads the config the gated load has not produced yet, so it
+    // waits on `ready` rather than answering from an empty state.
+    await new Promise((r) => setTimeout(r, 50));
+    expect(replyTo(transport, 1)).toBeUndefined();
+
+    releaseLoad();
+    await started;
+    await vi.waitFor(() => expect(replyTo(transport, 1)).toBeDefined());
+    const tools = (replyTo(transport, 1)?.result as { tools: Array<{ name: string }> }).tools.map((t) => t.name);
+    expect(tools).toEqual(expect.arrayContaining([...META_TOOL_NAMES]));
+  });
+});
+
 describe("ConnectServer.start() — project-bundle trust gate", () => {
   it("ignores an UNTRUSTED project bundles.json and still loads user-global", async () => {
     writeBundles(synthHome, [serverEntry("userglobal")]);
@@ -881,7 +960,10 @@ describe("ConnectServer.start() — persisted state hydration", () => {
     // And the first tools/call, through the real handler, lazily loads the
     // server and returns the upstream's answer rather than `Unknown tool`.
     const call = priv.server._requestHandlers.get("tools/call");
-    const res = await call({ method: "tools/call", params: { name: "known_cached_tool", arguments: {} } }, {} as never);
+    // The minimal handler context the SDK's tools/call wrapper reads: no
+    // requestState, so the call takes the plain (non-retry) path.
+    const ctx = { mcpReq: { requestState: () => undefined } };
+    const res = await call({ method: "tools/call", params: { name: "known_cached_tool", arguments: {} } }, ctx);
     expect(res.isError).toBeFalsy();
     expect(res.content[0].text).toBe("from the upstream");
     expect(spawnedNamespaces()).toEqual(["known"]);
