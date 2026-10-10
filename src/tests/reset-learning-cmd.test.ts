@@ -329,10 +329,10 @@ describe("runResetLearning", () => {
   });
 
   // The delete is a pure filesystem operation with no channel to a live
-  // `yaw-mcp serve`, and serve re-saves its in-memory snapshot without ever
-  // re-reading the file. Deleting state.json while a client is attached
-  // therefore gets silently undone on the next proxied tool call, so the
-  // success report has to say that out loud.
+  // `yaw-mcp serve`. A current serve adopts the reset on its next save but
+  // keeps routing on its in-memory learning until then, and an older release
+  // re-saves its whole snapshot over the deleted file -- so the success
+  // report has to say that out loud.
   describe("running-serve warning", () => {
     function writeState(): void {
       writeFileSync(
@@ -347,7 +347,7 @@ describe("runResetLearning", () => {
       );
     }
 
-    it("warns that a running serve process will re-save its in-memory state", async () => {
+    it("warns that a running serve process still holds its in-memory state", async () => {
       writeState();
       const io = captureIO();
       await runResetLearning({ home, env: {}, force: true, out: io.push, err: io.pushErr });

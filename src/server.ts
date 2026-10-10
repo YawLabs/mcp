@@ -1,21 +1,40 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { getSupportedElicitationModes } from "@modelcontextprotocol/sdk/client/index.js";
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
-  CallToolRequestSchema,
-  GetPromptRequestSchema,
-  ListPromptsRequestSchema,
-  ListResourcesRequestSchema,
-  ListResourceTemplatesRequestSchema,
-  ListToolsRequestSchema,
-  ReadResourceRequestSchema,
-} from "@modelcontextprotocol/sdk/types.js";
+  type CallToolResult,
+  CLIENT_CAPABILITIES_META_KEY,
+  CLIENT_INFO_META_KEY,
+  type ClientCapabilities,
+  createRequestStateCodec,
+  type GetPromptResult,
+  type HandlerResultTypeMap,
+  type Implementation,
+  type InputRequest,
+  type InputRequiredResult,
+  inputRequired,
+  inputResponse,
+  type ListPromptsResult,
+  type ListResourcesResult,
+  type ListToolsResult,
+  type ProtocolEra,
+  ProtocolError,
+  ProtocolErrorCode,
+  type ReadResourceResult,
+  type RequestMethod,
+  type RequestTypeMap,
+  Server,
+  type ServerContext,
+  type ServerOptions,
+  SUPPORTED_PROTOCOL_VERSIONS,
+  type Transport,
+} from "@modelcontextprotocol/server";
+import { type StdioServerHandle, StdioServerTransport, serveStdio } from "@modelcontextprotocol/server/stdio";
 import { maybeAutoUpgrade } from "./auto-upgrade.js";
 import { bundleActivateHint, CURATED_BUNDLES, matchBundles, topPartialBundles } from "./bundles.js";
 import { bundlesFileHint } from "./bundles-hint.js";
 import { formatShadowLine, installTargetForCli } from "./cli-shadows.js";
+import { canonicalJson } from "./client-config-values.js";
 import { classifyGrade, passesMinCompliance } from "./compliance.js";
 import { loadYawMcpConfig, type Profile, profileAllows, type ResolvedConfig, toProfile } from "./config-loader.js";
 import { estimateFromConnectedTools, estimateFromToolCache, formatCostLabel } from "./cost-estimate.js";
@@ -60,9 +79,15 @@ import {
   type PersistedPrewarmFailure,
   type PersistedToolCacheEntry,
   PREWARM_FAILURE_BACKOFF_MS,
-  saveState,
+  type StateSections,
+  StateSync,
 } from "./persistence.js";
-import { createProgressReporter, isProgressRequested, type ProgressExtra, type ProgressReporter } from "./progress.js";
+import {
+  createProgressReporter,
+  isProgressRequested,
+  type ProgressContext,
+  type ProgressReporter,
+} from "./progress.js";
 import {
   type BuiltinResource,
   brandRoutingFault,
@@ -94,6 +119,7 @@ import {
   gradeOutcomeViaSampling,
   isRewardGraderEnabled,
   isUncertainReward,
+  type SamplingPeer,
 } from "./reward-grader.js";
 import {
   bestOfNViaSampling,
@@ -107,6 +133,7 @@ import {
   openInSystemBrowser,
   openSecretEntryPage,
   SECRET_ENTRY_PAGE_TTL_MS,
+  type SecretEntryOutcome,
   type SecretEntryPage,
   type SecretEntryPageOptions,
 } from "./secret-entry-page.js";
@@ -171,6 +198,34 @@ export function isAutoLoadEnabled(): boolean {
   if (raw === undefined || raw === "") return false;
   return raw === "1" || raw.toLowerCase() === "true";
 }
+
+/** Which protocol eras the downstream face serves. */
+export type ProtocolMode = "auto" | "legacy";
+
+// The escape hatch for the dual-era serving entry. Unset or "auto" serves
+// both eras: a 2026-07-28 client that opens with server/discover gets the
+// modern protocol, a 2025 client that opens with initialize gets that. Set
+// YAW_MCP_PROTOCOL=legacy to serve exactly what 1.0.x served -- initialize
+// only, with server/discover answered -32601, which is the legacy signal a
+// probing client falls back on. The server-side twin of Claude Code's own
+// MCP_PROTOCOL_NEGOTIATION=legacy. Read once, at start(): the era is fixed
+// for the connection, so a mid-session change could not apply anyway.
+export function resolveProtocolMode(env: NodeJS.ProcessEnv = process.env): ProtocolMode {
+  // Trimmed for the cmd.exe reason isAutoLoadEnabled documents.
+  const raw = env.YAW_MCP_PROTOCOL?.trim().toLowerCase();
+  if (raw === undefined || raw === "" || raw === "auto") return "auto";
+  if (raw === "legacy") return "legacy";
+  // Unknown value: "auto" is what an unset value gets, and it is the mode
+  // that still serves every client, so a typo costs nothing but this line.
+  log("warn", `unrecognized YAW_MCP_PROTOCOL "${raw}"; using "auto"`, { raw });
+  return "auto";
+}
+
+/** The 2025-era revisions the legacy hatch negotiates over initialize. The
+ *  SDK's own list is legacy-only today (modern revisions are kept apart from
+ *  it); filtered anyway so the hatch cannot start answering server/discover
+ *  if a later SDK merges the lists. */
+const LEGACY_PROTOCOL_VERSIONS = SUPPORTED_PROTOCOL_VERSIONS.filter((v) => v < "2026-07-28");
 
 // Startup pre-warm of dormant servers. Default ON; set YAW_MCP_PREWARM=0
 // (or "false") to suppress it. The one reason to: pre-warm LEARNS a
@@ -249,13 +304,47 @@ export function clientRelistsTools(clientInfo?: { name?: string }): boolean {
   return !(clientInfo?.name !== undefined && NO_RELIST_CLIENTS.has(clientInfo.name));
 }
 
+/** Who is on the other end of the downstream connection, as every reader of
+ *  client identity sees it (see ConnectServer.clientSession).
+ *
+ *  `canPush` is whether yaw-mcp may send the client a request of its own
+ *  (elicitation/create, sampling/createMessage, roots/list). True on the 2025
+ *  protocol. False on 2026-07-28, which has no server-to-client request
+ *  channel: the SDK throws on those calls there, so every push path checks
+ *  this first and takes its "client cannot be asked" branch instead. */
+export interface ClientSession {
+  era: ProtocolEra;
+  clientInfo?: Implementation;
+  capabilities?: ClientCapabilities;
+  canPush: boolean;
+}
+
+/** ttlMs 0 / private on every cacheable result: activation, idle reaping,
+ *  config reload and tool filters all change the lists mid-session, and a
+ *  list-change notification only reaches a 2026-07-28 client that opened
+ *  subscriptions/listen, so a positive TTL would serve a stale list right
+ *  after an activate reply told the model the new tools are callable. Private
+ *  because the content comes from this user's bundles and vault state. These
+ *  equal the SDK's defaults today; set explicitly so an SDK default change
+ *  cannot loosen them. */
+const NO_CACHE = { ttlMs: 0, cacheScope: "private" } as const;
+const CACHE_HINTS: ServerOptions["cacheHints"] = {
+  "tools/list": NO_CACHE,
+  "prompts/list": NO_CACHE,
+  "resources/list": NO_CACHE,
+  "resources/templates/list": NO_CACHE,
+  "resources/read": NO_CACHE,
+  "server/discover": NO_CACHE,
+};
+
 // How much of the catalog tools/list advertises. Gateway by default -- see
 // ToolExposure in proxy.ts for the measurement that made it the default --
 // and lite by default for the clients in LITE_BY_DEFAULT_CLIENTS, which is
 // why the connected client's `clientInfo` is a parameter: the handlers pass
-// `this.server.getClientVersion()`, populated by the SDK from the initialize
-// request (undefined before it, and in a unit test that never handshakes,
-// which lands on gateway). An explicit YAW_MCP_TOOL_EXPOSURE always wins over
+// the session's clientInfo (ConnectServer.clientSession: the initialize
+// request's on the 2025 protocol, each request's envelope on 2026-07-28;
+// undefined before either, and in a unit test that never handshakes, which
+// lands on gateway). An explicit YAW_MCP_TOOL_EXPOSURE always wins over
 // that default: `full` restores the previous behavior for a client that
 // genuinely wants the whole catalog inlined, `lite` opts any client into the
 // three-tool surface, `gateway` pins a typed-cli session to the full
@@ -357,8 +446,31 @@ export function toolCacheConfigKey(entry: UpstreamServerConfig): string {
  *  different question. Each such ask spends one of that namespace's prompts,
  *  and a decline latches it for the session exactly as an explicit activate's
  *  decline would. A value typed there that the child accepts stays in
- *  elicitedEnv after prewarm tears the child down, so the next launch uses it. */
+ *  elicitedEnv after prewarm tears the child down, so the next launch uses it.
+ *  That is the 2025 protocol. On 2026-07-28 a prompt rides on a client
+ *  request (InputLeg), and prewarm has none, so it asks nothing and the next
+ *  explicit activate of that server does the asking. */
 const MAX_CREDENTIAL_PROMPTS = 2;
+
+/** The inputRequests key of a 2026-07-28 masked-entry prompt. One key is
+ *  enough: a round carries at most one prompt (see InputLeg). */
+const SECRET_ASK_KEY = "yaw-mcp.secret";
+
+/** How long a posted prompt, and the requestState naming it, can be redeemed
+ *  by a retry. The page itself lives SECRET_ENTRY_PAGE_TTL_MS (3 min); the
+ *  rest is room for a retry that arrives after the page expired to get the
+ *  expiry refusal rather than the codec's bare "invalid or expired" -32602.
+ *  Ten minutes is the codec's own default and the SDK's legacy-shim round
+ *  timeout. */
+const SECRET_ASK_TTL_SECONDS = 600;
+
+/** The activation a prompt was asked for, as the re-run of its call looks it
+ *  up: each missing-credential prompt is its namespace's, the vault prompt is
+ *  the one vault's. */
+const VAULT_ASK_SUBJECT = "vault";
+function credentialAskSubject(namespace: string): string {
+  return `credential:${namespace}`;
+}
 
 /** How many bytes of intermediate step output an exec echoes back when the
  *  caller named an explicit `return`.
@@ -706,6 +818,69 @@ type LoopbackEntryResult =
   | { kind: "unreachable"; reason: SecretPageFailure }
   | { kind: "failed" };
 
+/** The requestState a 2026-07-28 masked-entry prompt round-trips through the
+ *  client. Signed by the codec, not encrypted -- the client can read it -- so
+ *  it names the prompt by an id of its own and binds it to the call by a
+ *  digest; the page's address (its token) is never in it. */
+interface SecretAskState {
+  pageId: string;
+  argsDigest: string;
+}
+
+/** A prompt's result as the re-run of its call receives it: what
+ *  collectSecretOnLoopbackPage produced for a missing-credential prompt, or
+ *  what the vault prompt made of it (verified, rejected, ...). `subject` is
+ *  the activation it answers (credentialAskSubject / VAULT_ASK_SUBJECT). */
+type SecretAnswer =
+  | { subject: string; kind: "credential"; entry: LoopbackEntryResult }
+  | { subject: string; kind: "vault"; outcome: VaultPromptOutcome };
+
+type ElicitAction = "accept" | "decline" | "cancel";
+
+/** One masked-entry prompt handed to a 2026-07-28 client inside an
+ *  input_required result. Lives from the leg that posted it until a retry
+ *  consumes it, or SECRET_ASK_TTL_SECONDS. */
+interface SecretAsk {
+  pageId: string;
+  subject: string;
+  request: InputRequest;
+  /** The client's answer to the prompt, delivered by the retry. */
+  decision: Promise<ElicitAction>;
+  decide: (action: ElicitAction) => void;
+  /** The retry's reporter, set before decide(): the wait on the page then
+   *  heartbeats on the request that is open, not on the answered first leg. */
+  progress?: ProgressReporter;
+  /** The prompt's processed result (credential values stored, the vault
+   *  passphrase verified), set by the path that asked. Never rejects. */
+  settled?: Promise<SecretAnswer>;
+  dropTimer?: ReturnType<typeof setTimeout>;
+}
+
+/** One 2026-07-28 tools/call round, as the secret-entry paths see it. The
+ *  activation code reaches it through the call's progress reporter, which is
+ *  already threaded to every activation the call makes (see inputLegs);
+ *  background activations (prewarm, auto-load, exec steps) have none, and
+ *  so have no request to carry a prompt. */
+interface InputLeg {
+  progress: ProgressReporter;
+  /** This request's envelope capabilities: the ones its prompt must fit. */
+  capabilities: ClientCapabilities | undefined;
+  /** What the retry that started this round brought back, if it was one. */
+  answer: SecretAnswer | null;
+  /** The prompt this round posted. At most one: a later prompt in the same
+   *  call waits for the next round (awaitingInputResult). */
+  ask: SecretAsk | null;
+  /** Set, synchronously, by the path that is about to post `ask`. A call
+   *  activates several namespaces at once, and opening a page takes a while:
+   *  a second path checking `ask` alone in that window would post a second
+   *  prompt, or wait on a vault prompt its own call has yet to hand out. */
+  askClaimed: boolean;
+  /** Settles when `ask` is posted, so the path that asked can stop waiting
+   *  on the prompt and let the call return. */
+  posted: Promise<void>;
+  markPosted: () => void;
+}
+
 /** What one namespace's activation came back with -- activateOne,
  *  runActivateOne, the shared in-flight promise, and the two elicit-and-retry
  *  paths that stand in for runActivateOne's result. One declaration so a new
@@ -714,7 +889,19 @@ type LoopbackEntryResult =
  *  every refusal). `capped`: the refusal was the concurrent-server cap, which
  *  handleActivate and handleDispatch treat as informational beside a new
  *  connection and as an error without one (explicitLoadIsError). */
-type ActivationResult = { ok: boolean; message: string; isChanged: boolean; serverId?: string; capped?: boolean };
+type ActivationResult = {
+  ok: boolean;
+  message: string;
+  isChanged: boolean;
+  serverId?: string;
+  capped?: boolean;
+  /** Set when the activation was REFUSED by this broker -- shutting down, the
+   *  entry changed under the launch, a spawn gate -- rather than attempted
+   *  and failed. Pre-warm reads it: a refusal says nothing about whether the
+   *  server can start, so it must not be banked as a pre-warm failure that
+   *  every other pane then backs off from. */
+  refused?: true;
+};
 
 /** What a batch of explicit loads added up to -- see recordExplicitLoad. */
 interface ExplicitLoadTally {
@@ -742,6 +929,23 @@ function explicitLoadIsError(tally: ExplicitLoadTally): true | undefined {
 
 export class ConnectServer {
   private server: Server;
+  /** The serving entry's handle (serveStdio, or the legacy hatch's plain
+   *  transport); null until start() serves. shutdown() closes through it. */
+  private stdioHandle: StdioServerHandle | null = null;
+  /** Settles when start() has loaded the config, the tool cache and the
+   *  routes. start() serves before it loads anything, so server/discover is
+   *  answered inside a client's probe bound; every handler that reads that
+   *  state awaits this first. Resolved from the outset for a host that never
+   *  calls start() (tests, embedders), whose state is whatever it set. */
+  private ready: Promise<void> = Promise.resolve();
+  /** The era of the newest served instance; undefined until a connection is
+   *  served (tests and embedders drive the constructor's instance, which
+   *  reads like a 2025 session). See clientSession. */
+  private servedEra: ProtocolEra | undefined;
+  /** The identity the latest 2026-07-28 request carried in its envelope. */
+  private modernClient: { clientInfo?: Implementation; capabilities?: ClientCapabilities } = {};
+  /** beginSession's once-per-process latch. */
+  private sessionBegun = false;
   private clientBridge: DownstreamClientBridge;
   private connections = new Map<string, UpstreamConnection>();
   private config: ConnectConfig | null = null;
@@ -912,6 +1116,25 @@ export class ConnectServer {
   // Tracked so shutdown() can close them: a listener keeps the process alive
   // under oam, whose http.Server has no unref().
   private secretEntryPages = new Set<SecretEntryPage>();
+  // 2026-07-28 prompts posted in an input_required result and not yet
+  // redeemed by a retry, by SecretAsk.pageId.
+  private secretAsks = new Map<string, SecretAsk>();
+  // The round each 2026-07-28 tools/call's progress reporter belongs to.
+  // Keyed by the reporter because it is the one per-call value every
+  // activation path is already handed (activateOne, runActivateOne and the
+  // elicitation paths all take it); threading a second parameter through
+  // each of them and their callers would say the same thing at a dozen call
+  // sites. A reporter is made per call and never shared, so the key is exact.
+  private inputLegs = new WeakMap<ProgressReporter, InputLeg>();
+  // Signs the requestState of a 2026-07-28 prompt. A random key per process
+  // is enough: one stdio process serves every round of a flow, and a retry
+  // that outlives it has no page to come back to anyway. Bound to the method
+  // so a state minted for tools/call is refused anywhere else.
+  private readonly requestStateCodec = createRequestStateCodec<SecretAskState>({
+    key: randomBytes(32),
+    ttlSeconds: SECRET_ASK_TTL_SECONDS,
+    bind: (ctx) => ctx.mcpReq.method,
+  });
   // The page opener, the browser launcher and the page TTL. Instance fields
   // (not direct calls) purely so tests can substitute a fake page and a fake
   // browser, the same reason activationRetryDelayMs is one; production never
@@ -1058,6 +1281,19 @@ export class ConnectServer {
   // single write; flushed synchronously on shutdown.
   private persistenceReady = false;
   private stateSaveTimer: ReturnType<typeof setTimeout> | null = null;
+  // Merging saver: every flush takes the cross-process state.json lock,
+  // re-reads the file and lands only this process's delta, so concurrent
+  // yaw-mcp panes stop overwriting each other (see persistence.ts StateSync).
+  // Its baseline is set in start() once the stores are hydrated.
+  private readonly stateSync = new StateSync({
+    exportCurrent: () => ({
+      learning: this.learning.exportSnapshot(),
+      packHistory: this.packDetector.exportSnapshot(),
+      toolCache: this.exportToolCache(),
+      prewarmFailures: this.exportPrewarmFailures(),
+    }),
+    applyMerged: (merged) => this.applyMergedState(merged),
+  });
   private static readonly STATE_SAVE_DEBOUNCE_MS = 1000;
 
   // How long shutdown() will wait for in-flight activations before it
@@ -1067,26 +1303,13 @@ export class ConnectServer {
   private static readonly SHUTDOWN_DRAIN_MS = 2000;
 
   constructor() {
-    this.server = new Server(
-      { name: "yaw-mcp", version: typeof __VERSION__ !== "undefined" ? __VERSION__ : "dev" },
-      {
-        capabilities: {
-          tools: { listChanged: true },
-          resources: { listChanged: true },
-          prompts: { listChanged: true },
-        },
-        // Returned once, in the initialize result, and injected by Claude
-        // Code into the system prompt as a "# MCP Server Instructions"
-        // block. This is where the routing prose the meta-tool descriptions
-        // used to repeat now lives -- a description is paid on every
-        // tools/list, this is paid once. See SERVER_INSTRUCTIONS.
-        instructions: SERVER_INSTRUCTIONS,
-      },
-    );
+    // The instance a test or embedded host reaches before start() serves a
+    // connection; serving replaces it with the instance it pins.
+    this.server = this.buildServer();
     // yaw-mcp itself does not handle elicitation or sampling requests; it
     // originates them. The capability declaration for originated features
     // is implicit -- the client advertises whether IT supports receiving
-    // them, which we check via getClientCapabilities() before prompting.
+    // them, which we check via pushCapabilities() before prompting.
     //
     // Upstream-originated requests are a different story: this bridge is
     // handed to every connectToUpstream call so proxied servers keep
@@ -1094,14 +1317,264 @@ export class ConnectServer {
     // them. upstream.ts mirrors the declared set onto each upstream Client
     // and forwards those requests through these methods; capabilities are
     // read lazily because upstream connects happen after the downstream
-    // initialize.
+    // initialize. On 2026-07-28 the mirrored set is empty (pushCapabilities):
+    // nothing could forward those requests, so upstreams are told the client
+    // cannot answer them and degrade on their own.
     this.clientBridge = {
-      getClientCapabilities: () => this.server.getClientCapabilities(),
+      getClientCapabilities: () => this.pushCapabilities(),
       elicitInput: (params, options) => this.server.elicitInput(params, options),
-      createMessage: (params, options) => this.server.createMessage(params, options),
+      // The bridge is typed with the v1 client's shapes (upstream.ts stays on
+      // the v1 SDK); v2 narrows `metadata` from `object` to a JSON object.
+      // Sidecar params are JSON off the wire, so the narrowing holds.
+      createMessage: (params, options) =>
+        this.server.createMessage(params as Parameters<Server["createMessage"]>[0], options),
       listRoots: (params, options) => this.server.listRoots(params, options),
     };
-    this.setupHandlers();
+  }
+
+  /** One protocol face over this ConnectServer's state. serveStdio calls it
+   *  up to twice per connection -- a server/discover probe instance, then a
+   *  legacy one when the client falls back to initialize -- so it does no I/O
+   *  and keeps no state of its own: everything a session accumulates lives on
+   *  ConnectServer, and the handlers reach it through `this`. The newest
+   *  instance is the live one (serveStdio discards the probe before it builds
+   *  the legacy instance), which is what clientBridge and the push paths read.
+   *
+   *  `era` is undefined for the constructor's unserved instance. A legacy
+   *  instance starts the session's background work once the client's
+   *  initialize handshake completes; see beginSession for why it waits. */
+  private buildServer(era?: ProtocolEra, supportedProtocolVersions?: string[]): Server {
+    const s = new Server(
+      { name: "yaw-mcp", version: typeof __VERSION__ !== "undefined" ? __VERSION__ : "dev" },
+      {
+        capabilities: {
+          tools: { listChanged: true },
+          resources: { listChanged: true },
+          prompts: { listChanged: true },
+        },
+        // Sent in the server/discover result (2026-07-28) or the initialize
+        // result (2025-era), and injected by Claude Code into the system
+        // prompt as a "# MCP Server Instructions" block. This is where the
+        // routing prose the meta-tool descriptions used to repeat now lives
+        // -- a description is paid on every tools/list, this is paid once per
+        // connection. See SERVER_INSTRUCTIONS.
+        instructions: SERVER_INSTRUCTIONS,
+        cacheHints: CACHE_HINTS,
+        // Verifies an echoed requestState before the handler runs; a forged,
+        // expired or foreign one is answered -32602 by the SDK. Only the
+        // 2026-07-28 tools/call path mints one (callToolCarryingInput).
+        requestState: { verify: (state, ctx) => this.requestStateCodec.verify(state, ctx) },
+        ...(supportedProtocolVersions ? { supportedProtocolVersions } : {}),
+      },
+    );
+    this.installHandlers(s, era);
+    if (era === "legacy") s.oninitialized = () => this.beginSession();
+    this.server = s;
+    if (era !== undefined) this.servedEra = era;
+    return s;
+  }
+
+  /** The downstream client as every identity reader sees it: exposure, the
+   *  no-relist hint, the push gates, sampling, upstream capability mirroring.
+   *
+   *  2025 protocol: the SDK's copy of the initialize request, which is fixed
+   *  for the connection once the handshake is done (read through the
+   *  accessors rather than copied in oninitialized, so the values are the
+   *  SDK's own normalization of the declared capabilities).
+   *
+   *  2026-07-28: the latest request's envelope. Never the accessors there --
+   *  on stdio the SDK does not backfill them in this era (measured null with
+   *  2.3.1: only its HTTP entry seeds them from the envelope), so a reader
+   *  that used them would treat Claude Code as an anonymous client. */
+  private clientSession(): ClientSession {
+    if (this.servedEra === "modern") {
+      return { era: "modern", ...this.modernClient, canPush: false };
+    }
+    return {
+      era: "legacy",
+      clientInfo: this.server.getClientVersion(),
+      capabilities: this.server.getClientCapabilities(),
+      canPush: true,
+    };
+  }
+
+  /** What the sampling helpers (sampling-rank.ts, reward-grader.ts) need of
+   *  the client: the era (sampling runs on the 2025 protocol only), its
+   *  push-usable capabilities, and the live instance to ask. */
+  private samplingPeer(): SamplingPeer {
+    return {
+      era: this.clientSession().era,
+      getClientCapabilities: () => this.pushCapabilities(),
+      createMessage: (params, options) => this.server.createMessage(params, options),
+    };
+  }
+
+  /** The client's capabilities as far as a push may rely on them: undefined
+   *  when the session cannot carry a server-to-client request at all, so a
+   *  `caps?.elicitation` / `caps?.sampling` gate takes its "not supported"
+   *  branch on 2026-07-28. */
+  private pushCapabilities(): ClientCapabilities | undefined {
+    const session = this.clientSession();
+    return session.canPush ? session.capabilities : undefined;
+  }
+
+  /** The 2026-07-28 round an activation is running for, found through the
+   *  reporter its call was handed (see inputLegs). Undefined on the 2025
+   *  protocol, which asks by push, and for a background activation. */
+  private inputLegFor(progress: ProgressReporter | undefined): InputLeg | undefined {
+    return progress ? this.inputLegs.get(progress) : undefined;
+  }
+
+  /** The elicitation modes a masked-entry prompt may use: the initialize
+   *  declaration on the 2025 protocol, the carrying request's envelope on
+   *  2026-07-28 (the SDK checks an input request against that envelope and
+   *  refuses one it does not cover). */
+  private elicitationCapability(leg: InputLeg | undefined): ClientCapabilities["elicitation"] {
+    return leg ? leg.capabilities?.elicitation : this.pushCapabilities()?.elicitation;
+  }
+
+  /** True when this activation cannot ask because the session is on
+   *  2026-07-28 and nothing carries a prompt for it -- prewarm, auto-load, an
+   *  exec step. Logged as a credential the next explicit activate will ask
+   *  for, rather than as a client that cannot be asked at all. */
+  private noRequestToAskOn(leg: InputLeg | undefined): boolean {
+    return leg === undefined && this.clientSession().era === "modern";
+  }
+
+  /** Post a masked-entry prompt on `leg`: the call returns it as an
+   *  input_required result once its activations have unwound. */
+  private postSecretAsk(leg: InputLeg, subject: string, request: InputRequest): SecretAsk {
+    let decide: (action: ElicitAction) => void = () => {};
+    const decision = new Promise<ElicitAction>((resolve) => {
+      decide = resolve;
+    });
+    const ask: SecretAsk = { pageId: randomUUID(), subject, request, decision, decide };
+    // Past the codec's TTL a retry is refused before it reaches the handler,
+    // so the record has no reader left. unref: a pending drop must not keep
+    // the process up.
+    ask.dropTimer = setTimeout(() => this.dropSecretAsk(ask), SECRET_ASK_TTL_SECONDS * 1000);
+    ask.dropTimer.unref?.();
+    this.secretAsks.set(ask.pageId, ask);
+    leg.ask = ask;
+    leg.markPosted();
+    return ask;
+  }
+
+  private dropSecretAsk(ask: SecretAsk): void {
+    if (ask.dropTimer) clearTimeout(ask.dropTimer);
+    this.secretAsks.delete(ask.pageId);
+  }
+
+  /** The stand-in result of an activation whose prompt waits for the next
+   *  round: this call already posted one (a round carries one), or the vault
+   *  prompt it would join is this call's own. The call answers input_required,
+   *  so its own client never reads this; a call that joined the activation
+   *  from another request does. */
+  private awaitingInputResult(namespace: string): ActivationResult {
+    return {
+      ok: false,
+      isChanged: false,
+      message: `"${namespace}" is waiting on a secret-entry prompt that is still open. Activate it again once that prompt is answered.`,
+    };
+  }
+
+  /** tools/call on a 2026-07-28 connection. There is no server-to-client
+   *  request there, so a masked-entry prompt is returned as an input_required
+   *  result instead of pushed, in the SDK's re-run model (nothing is parked
+   *  between rounds):
+   *
+   *  First round: the call runs as usual. A secret-entry path that would have
+   *  pushed opens its page, posts the prompt on this round and returns early;
+   *  the call then answers with the prompt and a signed requestState naming it
+   *  (SecretAskState). Spawn attempts made before the prompt run again on the
+   *  retry; nothing else in an activation has a side effect worth guarding.
+   *
+   *  Retry: the codec has verified the state before this runs; the digest
+   *  binds it to this call's name and arguments. The client's answer goes to
+   *  the prompt, which waits out the page with its heartbeat on THIS request,
+   *  and the call re-runs with the result -- the credential is in place by
+   *  then, so the activation simply succeeds, and the refusals (declined,
+   *  expired, rejected) come from the same code that words them on the 2025
+   *  protocol. A retry that brings no answer for the prompt is asked again;
+   *  the spec says re-request rather than error. */
+  private async callToolCarryingInput(
+    s: Server,
+    name: string,
+    args: Record<string, unknown>,
+    ctx: ServerContext,
+  ): Promise<CallToolResult | InputRequiredResult> {
+    const argsDigest = createHash("sha256").update(canonicalJson({ name, args })).digest("base64url");
+    const progress = createProgressReporter(ctx);
+    let answer: SecretAnswer | null = null;
+    const state = ctx.mcpReq.requestState<SecretAskState>();
+    if (state !== undefined) {
+      if (state.argsDigest !== argsDigest) {
+        throw new ProtocolError(ProtocolErrorCode.InvalidParams, "requestState was issued for a different tool call");
+      }
+      const ask = this.secretAsks.get(state.pageId);
+      if (!ask) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "That secret-entry prompt is no longer open: a retry already answered it. Call the tool again.",
+            },
+          ],
+          isError: true,
+        };
+      }
+      const response = inputResponse(ctx.mcpReq.inputResponses, SECRET_ASK_KEY);
+      if (response.kind !== "elicit") {
+        return inputRequired({
+          inputRequests: { [SECRET_ASK_KEY]: ask.request },
+          requestState: await this.requestStateCodec.mint(state, ctx),
+        });
+      }
+      // Consumed here, so a replay of the same state cannot answer twice.
+      this.dropSecretAsk(ask);
+      ask.progress = progress;
+      ask.decide(response.action);
+      answer = (await ask.settled) ?? null;
+    }
+
+    let markPosted: () => void = () => {};
+    const posted = new Promise<void>((resolve) => {
+      markPosted = resolve;
+    });
+    const envelope = (ctx.mcpReq.envelope ?? {}) as Record<string, unknown>;
+    const leg: InputLeg = {
+      progress,
+      capabilities: envelope[CLIENT_CAPABILITIES_META_KEY] as ClientCapabilities | undefined,
+      answer,
+      ask: null,
+      askClaimed: false,
+      posted,
+      markPosted,
+    };
+    this.inputLegs.set(progress, leg);
+    const result = await this.handleToolCall(name, args, ctx, { inputLeg: leg });
+    if (leg.ask) {
+      return inputRequired({
+        inputRequests: { [SECRET_ASK_KEY]: leg.ask.request },
+        requestState: await this.requestStateCodec.mint({ pageId: leg.ask.pageId, argsDigest }, ctx),
+      });
+    }
+    return s.projectCallToolResult(result as CallToolResult, this.advertisedOutputSchema(name));
+  }
+
+  /** Runs ahead of every handler a 2026-07-28 instance serves. Each request
+   *  there is self-describing, so the identity is refreshed from its envelope
+   *  every time. Any request that reaches a handler also starts the session:
+   *  server/discover is answered inside the SDK and never gets here, so a
+   *  probe the client then abandons for initialize starts nothing. */
+  private observeRequest(era: ProtocolEra | undefined, ctx: ServerContext): void {
+    if (era !== "modern") return;
+    const envelope = (ctx.mcpReq.envelope ?? {}) as Record<string, unknown>;
+    this.modernClient = {
+      clientInfo: envelope[CLIENT_INFO_META_KEY] as Implementation | undefined,
+      capabilities: envelope[CLIENT_CAPABILITIES_META_KEY] as ClientCapabilities | undefined,
+    };
+    this.beginSession();
   }
 
   // Builtin resources served directly by yaw-mcp (not proxied from an
@@ -1144,41 +1617,71 @@ export class ConnectServer {
    *  otherwise -- see resolveToolExposure). The one place the client's
    *  identity is read, so the three list handlers and discover's "in
    *  context" summary cannot disagree about which surface they describe.
-   *  getClientVersion() is the SDK's copy of the initialize request's
-   *  clientInfo and is undefined before the handshake. */
+   *  The clientInfo comes from clientSession and is undefined before the
+   *  client has identified itself. */
   private currentExposure(): ToolExposure {
-    return resolveToolExposure(this.server.getClientVersion());
+    return resolveToolExposure(this.clientSession().clientInfo);
   }
 
-  private setupHandlers(): void {
-    this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
-      tools: buildToolList(
-        this.connections,
-        this.getDeferredServers(),
-        this.toolFilters,
-        this.currentExposure(),
-        this.sessionActivated,
-        // Hidden here, refused at the gate, but still ROUTED: dropping the
-        // route instead would make a call by name return `Unknown tool`,
-        // which reads as a typo and sends the model hunting for a name that
-        // is right there.
-        (wireName) => this.isToolDenied(wireName),
-      ),
-    }));
+  /** The routes every instance serves. Each handler first waits for start()
+   *  to finish loading config: server/discover and initialize are answered by
+   *  the SDK from static data the moment the connection opens, but everything
+   *  below reads the config, the tool cache and the routes. Results are typed
+   *  loosely where they carry proxied upstream data (the v1 client's types);
+   *  the casts mark that boundary. Every route goes through `handle`, so a
+   *  2026-07-28 request's identity is read before its handler runs. */
+  private installHandlers(s: Server, era: ProtocolEra | undefined): void {
+    const handle = <M extends RequestMethod>(
+      method: M,
+      fn: (request: RequestTypeMap[M], ctx: ServerContext) => Promise<HandlerResultTypeMap[M]>,
+    ): void => {
+      s.setRequestHandler(method, (request, ctx) => {
+        this.observeRequest(era, ctx);
+        return fn(request, ctx);
+      });
+    };
 
-    this.server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
-      const { name, arguments: args } = request.params;
-      return this.handleToolCall(name, args ?? {}, extra);
+    handle("tools/list", async () => {
+      await this.ready;
+      return {
+        tools: buildToolList(
+          this.connections,
+          this.getDeferredServers(),
+          this.toolFilters,
+          this.currentExposure(),
+          this.sessionActivated,
+          // Hidden here, refused at the gate, but still ROUTED: dropping the
+          // route instead would make a call by name return `Unknown tool`,
+          // which reads as a typo and sends the model hunting for a name that
+          // is right there.
+          (wireName) => this.isToolDenied(wireName),
+        ) as ListToolsResult["tools"],
+      };
     });
 
-    this.server.setRequestHandler(ListResourcesRequestSchema, async () => ({
-      resources: buildResourceList(
-        this.connections,
-        this.getBuiltinResources(),
-        this.currentExposure(),
-        this.sessionActivated,
-      ),
-    }));
+    handle("tools/call", async (request, ctx) => {
+      await this.ready;
+      const { name, arguments: args } = request.params;
+      if (era === "modern") return this.callToolCarryingInput(s, name, args ?? {}, ctx);
+      const result = await this.handleToolCall(name, args ?? {}, ctx);
+      // A low-level handler owns the projection McpServer would apply: the
+      // SEP-2106 TextContent append, and on the 2025 era the `{result: ...}`
+      // wrap of a non-object structuredContent. Only proxied results can carry
+      // structuredContent; for the rest it is the identity.
+      return s.projectCallToolResult(result as CallToolResult, this.advertisedOutputSchema(name));
+    });
+
+    handle("resources/list", async () => {
+      await this.ready;
+      return {
+        resources: buildResourceList(
+          this.connections,
+          this.getBuiltinResources(),
+          this.currentExposure(),
+          this.sessionActivated,
+        ) as ListResourcesResult["resources"],
+      };
+    });
 
     // Registered so a client probing resources/templates/list gets a valid
     // empty result instead of -32601 — the constructor declares the
@@ -1188,26 +1691,49 @@ export class ConnectServer {
     // conn.resources, so routeResourceRead could not resolve a templated
     // URI anyway. If template proxying lands, this handler is where the
     // aggregated upstream templates get returned.
-    this.server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => ({
+    handle("resources/templates/list", async () => ({
       resourceTemplates: [],
     }));
 
-    this.server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
-      return routeResourceRead(request.params.uri, this.resourceRoutes, this.connections, this.getBuiltinResourceMap());
+    handle("resources/read", async (request) => {
+      await this.ready;
+      return (await routeResourceRead(
+        request.params.uri,
+        this.resourceRoutes,
+        this.connections,
+        this.getBuiltinResourceMap(),
+      )) as ReadResourceResult;
     });
 
-    this.server.setRequestHandler(ListPromptsRequestSchema, async () => ({
-      prompts: buildPromptList(this.connections, this.currentExposure(), this.sessionActivated),
-    }));
+    handle("prompts/list", async () => {
+      await this.ready;
+      return {
+        prompts: buildPromptList(
+          this.connections,
+          this.currentExposure(),
+          this.sessionActivated,
+        ) as ListPromptsResult["prompts"],
+      };
+    });
 
-    this.server.setRequestHandler(GetPromptRequestSchema, async (request) => {
-      return routePromptGet(
+    handle("prompts/get", async (request) => {
+      await this.ready;
+      return (await routePromptGet(
         request.params.name,
         request.params.arguments as Record<string, string> | undefined,
         this.promptRoutes,
         this.connections,
-      );
+      )) as GetPromptResult;
     });
+  }
+
+  /** The outputSchema tools/list advertised for `wireName`, which
+   *  projectCallToolResult needs to decide the 2025-era wrap. Read after the
+   *  call, so a deferred server the call just activated is found too. */
+  private advertisedOutputSchema(wireName: string): Record<string, unknown> | undefined {
+    const route = this.toolRoutes.get(wireName);
+    if (!route) return undefined;
+    return this.connections.get(route.namespace)?.tools.find((t) => t.namespacedName === wireName)?.outputSchema;
   }
 
   private readonly onUpstreamDisconnect = (ns: string) => {
@@ -1246,19 +1772,28 @@ export class ConnectServer {
     });
   };
 
-  /** The active servers the startup pre-warm still has to spawn to learn:
-   *  no trusted tool list yet, or a learned one past its refresh window.
-   *  The same predicate prewarmDormantServers selects by, read NOW rather
-   *  than at its snapshot, so a server the sweep has already finished drops
-   *  out as soon as its list lands in the cache. */
+  /** The active servers the startup pre-warm still has to SPAWN to learn:
+   *  no trusted tool list yet (prewarmMustLearn). A learned-but-aged list is
+   *  deliberately not in here: the cache it came from is served straight away
+   *  and revalidated in the background (prewarmDormantServers), so a caller
+   *  waiting on the sweep must not wait for that refresh before answering
+   *  from a list it already has. Nor is a server the sweep is backing off
+   *  from after a recent failure (prewarmBackoffFor): it will not be spawned,
+   *  so a waiter must not wait on it. Read NOW rather than at the sweep's
+   *  snapshot, so a server the sweep has already finished drops out as soon
+   *  as its list lands. */
   private serversPrewarmIsLearning(): UpstreamServerConfig[] {
-    return this.getProfiledActiveServers().filter((s) => this.wantsPrewarm(s) && !this.prewarmBackoffFor(s));
+    return this.getProfiledActiveServers().filter((s) => this.prewarmMustLearn(s) && !this.prewarmBackoffFor(s));
   }
 
-  /** Does pre-warm want to learn this server -- no trusted list, or a learned
-   *  one that is stale (by age or by a changed launch config)? */
-  private wantsPrewarm(server: UpstreamServerConfig): boolean {
-    return !this.hasKnownTools(server) || this.learnedCacheStaleReason(server) !== null;
+  /** Must pre-warm learn this server before its tools can be trusted -- no
+   *  list at all, or a list learned under a launch config that no longer
+   *  matches (a pinned version, an image tag, a flag or an env key moved, so
+   *  the cached list describes a different server)? A list that is merely
+   *  past its refresh window is NOT this: it keeps being served while a
+   *  background revalidation refreshes it (prewarmDormantServers). */
+  private prewarmMustLearn(server: UpstreamServerConfig): boolean {
+    return !this.hasKnownTools(server) || this.learnedCacheStaleReason(server) === "config-changed";
   }
 
   /** The recorded pre-warm failure that still suppresses pre-warm of this
@@ -1349,6 +1884,12 @@ export class ConnectServer {
    *  shrink it without a cast; nothing outside the tests writes it. */
   static STARTUP_PREWARM_WAIT_MS = 20_000;
 
+  /** How many servers the startup pre-warm activates at once (formerly an
+   *  inline `CONCURRENCY = 3` in prewarmDormantServers). handleActivate stays
+   *  sequential and instead joins any namespace the pre-warm is already
+   *  connecting, so a multi-server activate never starts the same child twice. */
+  private static readonly ACTIVATION_CONCURRENCY = 3;
+
   /** The line a load reply needs for a client that never re-lists tools
    *  (NO_RELIST_CLIENTS), or null for every other client.
    *
@@ -1361,7 +1902,7 @@ export class ConnectServer {
    *  first), so `args: {}` runs as written. When every tool needs arguments
    *  the line says to fill them in rather than show a call that would fail. */
   private execHintForNonRelistingClient(loaded: readonly string[]): string | null {
-    if (clientRelistsTools(this.server.getClientVersion())) return null;
+    if (clientRelistsTools(this.clientSession().clientInfo)) return null;
     const needsNoArgs = (t: { inputSchema: Record<string, unknown> }): boolean => {
       const required = t.inputSchema?.required;
       return !Array.isArray(required) || required.length === 0;
@@ -1501,8 +2042,10 @@ export class ConnectServer {
   // spawn per server per week.
   private static readonly TOOLCACHE_REFRESH_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
-  // True when the list hasKnownTools trusts came from a PREVIOUS session's
-  // learning and is old enough to re-verify. Scoped to learned entries on
+  // Why the list hasKnownTools trusts, which came from a PREVIOUS session's
+  // learning, should be re-learned -- "age" when it is old enough to
+  // re-verify, "config-changed" when the entry it was learned under moved
+  // (below), null when it is current. Scoped to learned entries on
   // purpose: a toolCache shipped in bundles.json is curated, carries no
   // learnedAt, and is never refreshed here -- refreshing it every session
   // is exactly the per-session `npx -y <pkg>@latest` resolve pre-warm
@@ -2020,7 +2563,91 @@ export class ConnectServer {
   // warnings, so a typo'd key that fails open to allow-all is reported on
   // every path rather than only on the one whose caller happened to log
   // first.
-  async start(opts: { config?: ResolvedConfig } = {}): Promise<void> {
+  //
+  // `transport`: serve over this instead of the process's stdio. For tests,
+  // which drive the real serving entry through an in-memory pair.
+  async start(opts: { config?: ResolvedConfig; transport?: Transport } = {}): Promise<void> {
+    // Serve FIRST, before any file is read. Claude Code probes with
+    // server/discover and waits min(3 s, connectTimeout/3) for the answer; a
+    // server that misses the bound is connected on the 2025 protocol and
+    // remembered as a legacy peer for seven days. The SDK answers discover
+    // and initialize from static data (capabilities, SERVER_INSTRUCTIONS), so
+    // the config load below is kept off that path, and the handlers that do
+    // need it wait on `ready` instead.
+    let markReady!: () => void;
+    let failReady!: (err: unknown) => void;
+    this.ready = new Promise<void>((resolve, reject) => {
+      markReady = resolve;
+      failReady = reject;
+    });
+    // Handlers observe a startup failure through their own await; this only
+    // keeps the rejection from also surfacing as an unhandled one.
+    this.ready.catch(() => {});
+    this.stdioHandle = await this.serve(opts.transport);
+    try {
+      await this.loadStartupState(opts);
+    } catch (err) {
+      failReady(err);
+      throw err;
+    }
+    markReady();
+
+    // Self-upgrade check: if this install is stale, upgrade it in the
+    // background so the next client restart runs the latest version.
+    // Fire-and-forget -- never awaited, never gates transport readiness.
+    // Not handshake-gated: it spawns no upstream, so the capability
+    // snapshot is irrelevant to it.
+    maybeAutoUpgrade().catch((err: Error) => log("warn", "Auto-upgrade check failed", { error: err?.message }));
+
+    // The same check one level down: maybeAutoUpgrade above refreshes yaw-mcp
+    // itself, this refreshes the managed SIDECAR tree it spawns servers from.
+    // Needed because `sidecars install` trades npx's per-spawn re-resolution
+    // for a copy on disk -- an oam-hosted server runs that copy and cannot
+    // re-resolve "@latest", so without this the tree sits at whatever version
+    // the last manual `yaw-mcp sidecars install` happened to fetch, forever.
+    // No-op for npx users (nothing managed to refresh) and for explicitly
+    // pinned specs, which are the user's stated version and never auto-moved.
+    //
+    // Fire-and-forget for its sibling's reasons, and emphatically not awaited:
+    // the work it can trigger is an `npm install` that runs for tens of
+    // seconds. Ordering against maybeAutoUpgrade does not matter -- they touch
+    // different trees (the global prefix vs ~/.yaw-mcp/sidecars) and each
+    // serializes itself with its own lockfile.
+    maybeRefreshSidecars().catch((err: Error) => log("warn", "Sidecar refresh check failed", { error: err?.message }));
+
+    // There is deliberately NO npx-cache pre-warm here. 1.0.7 added a
+    // fire-and-forget `npx -y <pkg>@latest --version` pass at this point
+    // (auto-prewarm.ts, since deleted) to spare the first activation the
+    // cold-cache tax. It never ran: the call passed no server list, so the
+    // pass saw zero npx packages and returned on every start. Wiring it up
+    // for real would have spawned up to twenty parallel npx children -- a
+    // registry hit and a package boot each -- on EVERY broker start, and Yaw
+    // Terminal starts one broker per pane. Its stated goal was unreachable
+    // from here anyway: serving started at the top of start(), so the
+    // handshake this was meant to protect is over before the pass fires. A
+    // once-a-day warm belongs in an explicit verb the app runs at launch, not
+    // on the serve hot path.
+
+    // Re-point any client entry whose baked launch file an app upgrade
+    // deleted. CROSS-CLIENT on purpose, and that is the whole point: the
+    // client with the dead entry cannot start this process, so the repair
+    // has to ride in on a client whose entry still works. On a Yaw box the
+    // Claude Code entry is kept live by the app, so a pane spawn is what
+    // heals Codex. Writes nothing when READONLY_DIAGNOSTICS is set, when
+    // YAW_MCP_AUTO_HEAL=0, or -- the steady state -- when every entry
+    // resolves. Never awaited: serve must not block on filesystem work.
+    maybeHealStaleBrokerEntries().catch((err: Error) =>
+      log("warn", "Stale-entry heal failed", { error: err?.message }),
+    );
+
+    log("info", "yaw-mcp started", {
+      servers: this.config?.servers.length ?? 0,
+    });
+  }
+
+  /** Everything start() reads before the handlers may run: persisted state,
+   *  the profile, guides, bundles, grades and the routing table. */
+  private async loadStartupState(opts: { config?: ResolvedConfig }): Promise<void> {
     // Hydrate learning + pack-history state from ~/.yaw-mcp/state.json
     // before anything else so subsequent record* writes land on top of
     // the restored signal rather than replacing it. loadState() never
@@ -2043,6 +2670,15 @@ export class ConnectServer {
       }
       this.hydrateToolCache(persisted.toolCache);
       this.hydratePrewarmFailures(persisted.prewarmFailures);
+      // The baseline is the HYDRATED view, not the raw file: the stores cap
+      // and sort what they load, and the first save's delta must be measured
+      // against what memory actually started from.
+      this.stateSync.setBaseline({
+        learning: this.learning.exportSnapshot(),
+        packHistory: this.packDetector.exportSnapshot(),
+        toolCache: this.exportToolCache(),
+        prewarmFailures: this.exportPrewarmFailures(),
+      });
       // loadFailed means the state file exists but could not be READ (a
       // transient handle error, not a missing or corrupt file). The empty
       // snapshot we just hydrated is a stand-in, not the truth -- leaving
@@ -2160,8 +2796,8 @@ export class ConnectServer {
     // cached-but-unloaded server is loaded on first use" answered "Unknown
     // tool" instead. That is the ONLY way a client that never re-lists tools
     // (Codex) reaches an upstream tool, and typed's lite find_tool -> exec
-    // flow hits the same wall. No list_changed notification: the transport is
-    // not connected yet, so the client's first tools/list already sees this.
+    // flow hits the same wall. No list_changed notification: every handler
+    // waits on `ready`, so the client's first tools/list already sees this.
     this.rebuildRoutes();
 
     // Prewarm the uv bootstrap if any configured server needs it. Fire
@@ -2181,113 +2817,95 @@ export class ConnectServer {
     if (this.getProfiledActiveServers().some((s) => s.command !== undefined && uvLaunchKind(s.command) !== null)) {
       ensureUv().catch((err: Error) => log("warn", "uv prewarm failed", { error: err?.message }));
     }
+  }
 
-    const transport = new StdioServerTransport();
-
+  /** Starts the session's background work: pre-warm and the opt-in auto-load.
+   *  Once per process. A legacy instance calls this from `oninitialized`; on
+   *  2026-07-28, which has no handshake, the first request that reaches a
+   *  handler does (observeRequest). */
+  private beginSession(): void {
+    if (this.sessionBegun) return;
+    this.sessionBegun = true;
     // Both startup activation paths -- pre-warm and the opt-in auto-load --
     // wait for the downstream client's initialize handshake to complete.
-    // Protocol.connect() below only starts the transport; the SDK records
-    // the client's declared capabilities in _oninitialize and fires
-    // `oninitialized` on the client's notifications/initialized. Upstream
+    // Serving only starts the transport; the SDK records the client's
+    // declared capabilities in _oninitialize and fires `oninitialized` on
+    // the client's notifications/initialized. Upstream
     // connects mirror that capability snapshot at Client construction
     // (upstream.ts reads bridge.getClientCapabilities() once), so an
     // upstream spawned before initialize deterministically mirrors EMPTY
     // capabilities -- and when an explicit activate later joins a prewarm
     // inflight and keeps that connection alive, elicitation/sampling/roots
     // forwarding is silently dead for the connection's whole lifetime.
+    // On 2026-07-28 that snapshot is deliberately empty (pushCapabilities),
+    // so the ordering only matters on the 2025 protocol.
     // A client that never initializes never triggers either path: with no
-    // downstream there is nothing to serve. Registered BEFORE connect so
-    // a fast client can't complete the handshake into a missing callback.
-    this.server.oninitialized = () => {
-      // Dormant servers (isActive but no persisted toolCache yet) are
-      // invisible in tools/list because getDeferredServers() filters on
-      // toolCache presence. That breaks the "I toggled it on in the
-      // bundles.json and it disappeared" user experience. Pre-warm each one
-      // in the background: activate → populate the in-memory toolCache
-      // → disconnect so we're not holding 9 upstream processes idle.
-      // Fire-and-forget so this doesn't gate the handshake response. Kept in
-      // startupPrewarm while it runs, so a find_tool or exec that lands first
-      // can wait for what it is about to learn instead of answering "none".
-      const prewarm = this.prewarmDormantServers()
-        .catch((err: Error) => log("warn", "Pre-warm failed", { error: err?.message }))
-        .finally(() => {
-          if (this.startupPrewarm === prewarm) this.startupPrewarm = null;
-        });
-      this.startupPrewarm = prewarm;
-
-      // Opt-in auto-load of the top recurring pack. Requires persistence
-      // (so there IS a history to learn from) AND YAW_MCP_AUTO_LOAD=1. Runs
-      // alongside prewarm so both paths see the same config snapshot;
-      // they're independent (prewarm populates toolCache for newly-enabled
-      // servers, this one spins up the recurring workflow's servers for
-      // real). Fire-and-forget — the handshake shouldn't block on it.
-      if (isAutoLoadEnabled()) {
-        if (this.persistenceReady) {
-          this.autoLoadRecurringPack().catch((err: Error) => log("warn", "Auto-load failed", { error: err?.message }));
-        } else {
-          // The flag is set but there is no history to replay from, so the
-          // recurring pack will never load -- and without this line nothing
-          // says why. persistenceReady is false for exactly two reasons (see
-          // the state hydration at the top of start()), so name the one that
-          // applies. Once per session: oninitialized fires once.
-          log("info", "YAW_MCP_AUTO_LOAD is set but persisted history is unavailable; skipping auto-load", {
-            reason: isPersistenceDisabled() ? "YAW_MCP_DISABLE_PERSISTENCE is set" : "state.json could not be read",
+    // downstream there is nothing to serve. buildServer attaches the callback
+    // at construction, so a fast client can't complete the handshake into a
+    // missing one. The handshake can complete before start() has loaded the
+    // config (serving comes first), so the work also waits for `ready`.
+    this.ready.then(
+      () => {
+        // Dormant servers (isActive but no persisted toolCache yet) are
+        // invisible in tools/list because getDeferredServers() filters on
+        // toolCache presence. That breaks the "I toggled it on in the
+        // bundles.json and it disappeared" user experience. Pre-warm each one
+        // in the background: activate → populate the in-memory toolCache
+        // → disconnect so we're not holding 9 upstream processes idle.
+        // Fire-and-forget so this doesn't gate the handshake response. Kept in
+        // startupPrewarm while it runs, so a find_tool or exec that lands first
+        // can wait for what it is about to learn instead of answering "none".
+        const prewarm = this.prewarmDormantServers()
+          .catch((err: Error) => log("warn", "Pre-warm failed", { error: err?.message }))
+          .finally(() => {
+            if (this.startupPrewarm === prewarm) this.startupPrewarm = null;
           });
+        this.startupPrewarm = prewarm;
+
+        // Opt-in auto-load of the top recurring pack. Requires persistence
+        // (so there IS a history to learn from) AND YAW_MCP_AUTO_LOAD=1. Runs
+        // alongside prewarm so both paths see the same config snapshot;
+        // they're independent (prewarm populates toolCache for newly-enabled
+        // servers, this one spins up the recurring workflow's servers for
+        // real). Fire-and-forget — the handshake shouldn't block on it.
+        if (isAutoLoadEnabled()) {
+          if (this.persistenceReady) {
+            this.autoLoadRecurringPack().catch((err: Error) =>
+              log("warn", "Auto-load failed", { error: err?.message }),
+            );
+          } else {
+            // The flag is set but there is no history to replay from, so the
+            // recurring pack will never load -- and without this line nothing
+            // says why. persistenceReady is false for exactly two reasons (see
+            // the state hydration at the top of start()), so name the one that
+            // applies. Once per session: beginSession is latched.
+            log("info", "YAW_MCP_AUTO_LOAD is set but persisted history is unavailable; skipping auto-load", {
+              reason: isPersistenceDisabled() ? "YAW_MCP_DISABLE_PERSISTENCE is set" : "state.json could not be read",
+            });
+          }
         }
-      }
-    };
-    await this.server.connect(transport);
-
-    // Self-upgrade check: if this install is stale, upgrade it in the
-    // background so the next client restart runs the latest version.
-    // Fire-and-forget -- never awaited, never gates transport readiness.
-    // Not handshake-gated: it spawns no upstream, so the capability
-    // snapshot is irrelevant to it.
-    maybeAutoUpgrade().catch((err: Error) => log("warn", "Auto-upgrade check failed", { error: err?.message }));
-
-    // The same check one level down: maybeAutoUpgrade above refreshes yaw-mcp
-    // itself, this refreshes the managed SIDECAR tree it spawns servers from.
-    // Needed because `sidecars install` trades npx's per-spawn re-resolution
-    // for a copy on disk -- an oam-hosted server runs that copy and cannot
-    // re-resolve "@latest", so without this the tree sits at whatever version
-    // the last manual `yaw-mcp sidecars install` happened to fetch, forever.
-    // No-op for npx users (nothing managed to refresh) and for explicitly
-    // pinned specs, which are the user's stated version and never auto-moved.
-    //
-    // Fire-and-forget for its sibling's reasons, and emphatically not awaited:
-    // the work it can trigger is an `npm install` that runs for tens of
-    // seconds. Ordering against maybeAutoUpgrade does not matter -- they touch
-    // different trees (the global prefix vs ~/.yaw-mcp/sidecars) and each
-    // serializes itself with its own lockfile.
-    maybeRefreshSidecars().catch((err: Error) => log("warn", "Sidecar refresh check failed", { error: err?.message }));
-
-    // There is deliberately NO npx-cache pre-warm here. 1.0.7 added a
-    // fire-and-forget `npx -y <pkg>@latest --version` pass at this point
-    // (auto-prewarm.ts, since deleted) to spare the first activation the
-    // cold-cache tax. It never ran: the call passed no server list, so the
-    // pass saw zero npx packages and returned on every start. Wiring it up
-    // for real would have spawned up to twenty parallel npx children -- a
-    // registry hit and a package boot each -- on EVERY broker start, and Yaw
-    // Terminal starts one broker per pane. Its stated goal was unreachable
-    // from here anyway: `server.connect` above has already completed, so the
-    // handshake this was meant to protect is over before the pass fires. A
-    // once-a-day warm belongs in an explicit verb the app runs at launch, not
-    // on the serve hot path.
-
-    // Re-point any client entry whose baked launch file an app upgrade
-    // deleted. CROSS-CLIENT on purpose, and that is the whole point: the
-    // client with the dead entry cannot start this process, so the repair
-    // has to ride in on a client whose entry still works. On a Yaw box the
-    // Claude Code entry is kept live by the app, so a pane spawn is what
-    // heals Codex. Writes nothing when READONLY_DIAGNOSTICS is set, when
-    // YAW_MCP_AUTO_HEAL=0, or -- the steady state -- when every entry
-    // resolves. Never awaited: serve must not block on filesystem work.
-    maybeHealStaleBrokerEntries().catch((err: Error) =>
-      log("warn", "Stale-entry heal failed", { error: err?.message }),
+      },
+      () => {},
     );
+  }
 
-    log("info", "yaw-mcp started", {
-      servers: this.config?.servers.length ?? 0,
+  /** Opens the downstream face on `transport` (the process's stdio when
+   *  absent). Never wire an instance's onclose to shutdown: serveStdio closes
+   *  the discover probe instance when a client falls back to initialize, and
+   *  the end of the session is what shutdown-triggers.ts hears on stdin. */
+  private async serve(transport: Transport | undefined): Promise<StdioServerHandle> {
+    if (resolveProtocolMode() === "legacy") {
+      // A plain transport and no serving entry: nothing marks the instance
+      // modern, and with only 2025 revisions supported the SDK registers no
+      // server/discover handler, so a probe gets -32601.
+      const s = this.buildServer("legacy", LEGACY_PROTOCOL_VERSIONS);
+      await s.connect(transport ?? new StdioServerTransport());
+      log("info", "Serving the 2025 protocol only (YAW_MCP_PROTOCOL=legacy)");
+      return { close: () => s.close() };
+    }
+    return serveStdio(({ era }) => this.buildServer(era), {
+      transport,
+      onerror: (err) => log("warn", "stdio serving error", { error: err.message }),
     });
   }
 
@@ -2379,8 +2997,9 @@ export class ConnectServer {
   // server rather than a per-session `npx -y <pkg>@latest` resolve for
   // every active server (which is what it degenerated into while the
   // learned cache had nowhere to persist). A learned list past
-  // TOOLCACHE_REFRESH_MS counts as dormant again so @latest drift gets
-  // re-learned weekly instead of only at the 30-day persistence expiry.
+  // TOOLCACHE_REFRESH_MS is refreshed by this same pass, but as a separate
+  // REVALIDATION population (below): the cached list keeps serving until
+  // the refresh lands, so a weekly drift check is no longer a cold start.
   //
   // The child it spawns is DISCARDED: the tool list is what this wants, and
   // holding the upstream open would mean N idle processes for the session.
@@ -2391,7 +3010,8 @@ export class ConnectServer {
   // that takes a lock, binds a port, opens a DB session or writes a login
   // audit event does that side effect twice. YAW_MCP_PREWARM=0 is the escape
   // hatch for the second kind (isPrewarmEnabled says what turning it off
-  // costs).
+  // costs). A WARM cache costs no spawn at all -- nothing here runs for a
+  // server whose list is known and inside its refresh window.
   //
   // Cap-exempt in both directions, deliberately -- the reasoning is at the
   // cap check in runActivateOne. The consequence to know is that the
@@ -2427,8 +3047,8 @@ export class ConnectServer {
     // prewarm didn't create and must not tear down. The isChanged gate
     // in the batch below covers the race where a namespace connects
     // between this snapshot and its activation turn.
-    const candidates = this.getProfiledActiveServers().filter(
-      (s) => this.connections.get(s.namespace)?.status !== "connected" && this.wantsPrewarm(s),
+    const available = this.getProfiledActiveServers().filter(
+      (s) => this.connections.get(s.namespace)?.status !== "connected",
     );
     // A server whose pre-warm failed recently -- in THIS broker or in any
     // other pane's (state.json) -- under the same launch config is skipped:
@@ -2437,7 +3057,7 @@ export class ConnectServer {
     // possibly a prompt in every new pane, and the answer will be the same.
     // Said once per startup, with when it retries, so the missing tools are
     // never a mystery; discover() carries the same note on the server.
-    const backedOff = candidates.flatMap((s) => {
+    const backedOff = available.flatMap((s) => {
       const failure = this.prewarmBackoffFor(s);
       return failure === null ? [] : [{ namespace: s.namespace, failure }];
     });
@@ -2452,25 +3072,59 @@ export class ConnectServer {
       });
     }
     const skipped = new Set(backedOff.map((b) => b.namespace));
-    const dormant = candidates.filter((s) => !skipped.has(s.namespace));
-    if (dormant.length === 0) return;
+    const candidates = available.filter((s) => !skipped.has(s.namespace));
+    // Two populations, one sweep. `dormant` has no list pre-warm can trust
+    // (prewarmMustLearn): none at all, or one learned under a launch config
+    // that has since changed, so spawning it is the only way to learn what it
+    // offers -- that is the spawn the header describes. `revalidate` already
+    // has one and is merely past TOOLCACHE_REFRESH_MS; its cached list is
+    // being served right now (tools/list, discover, the deferred routes), so
+    // this pass refreshes it in the BACKGROUND beside that answer rather than
+    // as a precondition of anything. Before the split the two went through
+    // the same branch and the weekly re-learn was indistinguishable from a
+    // cold start -- which is what left readers (prewarmStillLearning /
+    // prewarmCouldRoute) treating a warm cache as "still being learned" and
+    // holding a call behind a wait whose only purpose is servers nothing is
+    // known about yet.
+    const dormant = candidates.filter((s) => this.prewarmMustLearn(s));
+    const revalidate = candidates.filter((s) => !this.prewarmMustLearn(s) && this.learnedCacheStaleReason(s) === "age");
+    if (dormant.length === 0 && revalidate.length === 0) return;
 
-    log("info", "Pre-warming dormant servers", {
-      count: dormant.length,
-      namespaces: dormant.map((s) => s.namespace),
-      // Why each one is being spawned, so a re-learn after a config edit
-      // reads as intended rather than as a cache that failed to persist.
-      reasons: Object.fromEntries(
-        dormant.map((s) => [s.namespace, this.hasKnownTools(s) ? this.learnedCacheStaleReason(s) : "unknown"]),
-      ),
-    });
+    if (dormant.length > 0) {
+      log("info", "Pre-warming dormant servers", {
+        count: dormant.length,
+        namespaces: dormant.map((s) => s.namespace),
+        // Why each one is being spawned, so a re-learn after a config edit
+        // reads as intended rather than as a cache that failed to persist.
+        reasons: Object.fromEntries(
+          dormant.map((s) => [s.namespace, this.hasKnownTools(s) ? this.learnedCacheStaleReason(s) : "unknown"]),
+        ),
+      });
+    }
+    if (revalidate.length > 0) {
+      log("info", "Revalidating learned tool lists past their refresh window", {
+        count: revalidate.length,
+        namespaces: revalidate.map((s) => s.namespace),
+      });
+    }
 
-    const CONCURRENCY = 3;
+    // Learning first: a server that offers nothing yet is the one a client
+    // cannot see at all, so it takes the earlier batches.
+    const sweep = [
+      ...dormant.map((server) => ({ server, revalidate: false })),
+      ...revalidate.map((server) => ({ server, revalidate: true })),
+    ];
+
+    const CONCURRENCY = ConnectServer.ACTIVATION_CONCURRENCY;
     let anyPopulated = false;
-    for (let i = 0; i < dormant.length; i += CONCURRENCY) {
-      const batch = dormant.slice(i, i + CONCURRENCY);
+    for (let i = 0; i < sweep.length; i += CONCURRENCY) {
+      const batch = sweep.slice(i, i + CONCURRENCY);
       await Promise.all(
-        batch.map(async (server) => {
+        batch.map(async ({ server, revalidate: isRefresh }) => {
+          // What the cache held before this attempt: a list stamped after it
+          // means the attempt LEARNED (and only then hit an error), so a
+          // failure must not be recorded over a success. See the catch.
+          const learnedAtBefore = this.toolCacheLearnedAt.get(server.namespace);
           try {
             const result = await this.activateOne(server.namespace, undefined, /* fromPrewarm */ true);
             if (!result.ok) {
@@ -2483,14 +3137,32 @@ export class ConnectServer {
               // the session. Cheap now, and it stops the stale entry becoming
               // load-bearing later.
               this.prewarmNamespaces.delete(server.namespace);
-              // A failed prewarm means the namespace gets no toolCache
-              // entry and stays invisible in tools/list for the session --
-              // the exact UX prewarm exists to prevent. Never silent.
+              if (isRefresh) {
+                // A failed REVALIDATION is not a lost answer: the list the
+                // cache already holds stays served, so this is a background
+                // nicety that did not run, not a server that is invisible.
+                // Debug rather than warn -- the same server being down is a
+                // warn on its next real activation, where it actually blocks
+                // someone.
+                log("debug", "Background revalidation of a learned tool list did not run", {
+                  namespace: server.namespace,
+                  message: result.message,
+                });
+                return;
+              }
+              // A failed prewarm of a server with no list leaves it invisible
+              // in tools/list for the session -- the exact UX prewarm exists
+              // to prevent. One re-learning after a config change keeps
+              // serving its old list instead (discover says so). Never silent.
               log("warn", "Pre-warm could not learn a dormant server's tools", {
                 namespace: server.namespace,
                 message: result.message,
               });
-              this.recordPrewarmFailure(server.namespace, result.message);
+              // A REFUSAL (shutting down, the entry changed under the launch,
+              // a spawn gate) is not evidence the server cannot start; banked
+              // as a failure it would back every other pane off for an hour
+              // from a server nothing ever tried.
+              if (!result.refused) this.recordPrewarmFailure(server.namespace, result.message);
               return;
             }
             // isChanged:false means runActivateOne's already-connected
@@ -2539,7 +3211,12 @@ export class ConnectServer {
               namespace: server.namespace,
               error,
             });
-            this.recordPrewarmFailure(server.namespace, error);
+            // Recorded only for a cold learn that did not learn: a failed
+            // background revalidation keeps its served list (as above), a
+            // throw AFTER the list landed (teardown) is not a failed spawn,
+            // and a shutdown mid-sweep is not the server's fault.
+            const learned = this.toolCacheLearnedAt.get(server.namespace) !== learnedAtBefore;
+            if (!isRefresh && !learned && !this.shuttingDown) this.recordPrewarmFailure(server.namespace, error);
           }
         }),
       );
@@ -2580,15 +3257,15 @@ export class ConnectServer {
   private async handleToolCall(
     name: string,
     args: Record<string, unknown>,
-    // `signal` rides along with the two progress fields because the SDK's
-    // RequestHandlerExtra has always carried it -- it was simply never read,
-    // so a downstream cancel aborted this handler and left the upstream call
-    // running. The proxy path below forwards it. Typed as the progress
-    // module's own narrowing of RequestHandlerExtra (ProgressExtra) plus the
-    // signal, rather than `any`: the SDK's full type carries request-scoped
-    // fields this handler never reads, and the narrow shape is what both
-    // callers (the CallTool handler and handleExec's per-step call) satisfy.
-    extra?: NonNullable<ProgressExtra> & { signal?: AbortSignal },
+    // `ctx.mcpReq.signal` rides along with the two progress fields because a
+    // downstream cancel must abort the upstream call too, not just this
+    // handler. The proxy path below forwards it. Typed as the progress
+    // module's own narrowing of the handler context (ProgressContext) plus
+    // the signal, rather than `any`: the SDK's full ServerContext carries
+    // request-scoped fields this handler never reads, and the narrow shape is
+    // what both callers (the tools/call handler and handleExec's per-step
+    // call) satisfy.
+    ctx?: { mcpReq?: NonNullable<NonNullable<ProgressContext>["mcpReq"]> & { signal?: AbortSignal } },
     // When deferLearning is set (exec steps), the proxy path does NOT record
     // the cross-session learning signal — handleExec records step-level,
     // cascading-blame credit instead so a failing consumer doesn't wrongly
@@ -2599,7 +3276,11 @@ export class ConnectServer {
     // pipeline on A ages B by 10 calls and can evict B mid-pipeline (the
     // step after next may be routed to it). handleExec ticks ONCE for the
     // whole pipeline instead — see the trackUsageForNamespaces call there.
-    opts?: { deferLearning?: boolean; deferIdleTracking?: boolean },
+    //
+    // inputLeg is the 2026-07-28 round this call runs as (callToolCarryingInput).
+    // Its reporter replaces the one made here: a second reporter on the same
+    // progress token would restart the count, and progress must only rise.
+    opts?: { deferLearning?: boolean; deferIdleTracking?: boolean; inputLeg?: InputLeg },
     // `text` optional, matching routeToolCall (proxy.ts): the proxy path
     // returns the UPSTREAM's body, and an image / audio / resource content
     // block carries no text. The meta-tool branches below all produce text and
@@ -2617,7 +3298,7 @@ export class ConnectServer {
     isError?: boolean;
     stepContent?: Array<{ type: string; text?: string }>;
   }> {
-    const progress = createProgressReporter(extra);
+    const progress = opts?.inputLeg?.progress ?? createProgressReporter(ctx);
     // THE meta-tool boundary. Everything about why it is here and not
     // anywhere else is on maybeReloadBundles; the two load-bearing facts at
     // this call site are that it runs BEFORE any branch below reads
@@ -2738,7 +3419,7 @@ export class ConnectServer {
       return this.observed(this.attachGuideNudge(await this.handleFindTool(q, limit)));
     }
     if (name === META_TOOLS.exec.name) {
-      const result = await this.handleExec(args, extra?.signal);
+      const result = await this.handleExec(args, ctx?.mcpReq?.signal);
       return this.attachGuideNudge(result);
     }
     if (name === META_TOOLS.bundles.name) {
@@ -2987,13 +3668,13 @@ export class ConnectServer {
         // Cancellation crosses the hop: the SDK sends notifications/cancelled
         // upstream and rejects the pending call, instead of leaving it to run
         // to CALL_TIMEOUT after the client that wanted it has gone.
-        signal: extra?.signal,
+        signal: ctx?.mcpReq?.signal,
         // Relay upstream progress under the DOWNSTREAM token, and only when
         // the client asked -- see isProgressRequested. `progress` is the same
         // reporter the meta-tool branches use, so its monotonic clamp keeps
         // the sequence legal even if activation already emitted under this
         // token earlier in the call.
-        onprogress: isProgressRequested(extra)
+        onprogress: isProgressRequested(ctx)
           ? (p) => progress(p.message ?? `${route?.namespace ?? "upstream"} working`, p.progress, p.total)
           : undefined,
       });
@@ -4030,14 +4711,21 @@ export class ConnectServer {
       // this the server just has no tool names, and nothing says why or
       // that activating it retries. Skipped when the session-local warning
       // above already reports a failure.
-      if (!connection && !warning && !this.hasKnownTools(server)) {
+      // prewarmMustLearn, not !hasKnownTools: a server re-learning after a
+      // config change still serves the list learned under the OLD config
+      // while it is backed off, and that list is wrong by construction --
+      // the one case the user most needs told about.
+      if (!connection && !warning && this.prewarmMustLearn(server)) {
         const failure = this.prewarmBackoffFor(server);
         if (failure) {
           const ageMin = Math.max(1, Math.round((Date.now() - failure.failedAt) / 60_000));
           const msg = failure.message
             ? `: ${failure.message.length > 120 ? `${failure.message.slice(0, 117)}...` : failure.message}`
             : "";
-          lines.push(`    warn: tools unknown, startup pre-warm failed ${ageMin}m ago${msg}; activate it to retry`);
+          const what = this.hasKnownTools(server)
+            ? "tools listed may be stale (learned under a previous config); re-learn failed"
+            : "tools unknown, startup pre-warm failed";
+          lines.push(`    warn: ${what} ${ageMin}m ago${msg}; activate it to retry`);
         }
       }
 
@@ -4377,8 +5065,13 @@ export class ConnectServer {
   // The one refusal every shutdown gate returns -- the pre-spawn check in
   // activateOne, the per-attempt check at the top of runActivateOne's loop,
   // and its post-handshake check -- so they cannot drift apart in wording.
-  private shuttingDownRefusal(namespace: string): { ok: false; message: string; isChanged: false } {
-    return { ok: false, isChanged: false, message: `"${namespace}" was not loaded — yaw-mcp is shutting down.` };
+  private shuttingDownRefusal(namespace: string): { ok: false; message: string; isChanged: false; refused: true } {
+    return {
+      ok: false,
+      isChanged: false,
+      refused: true,
+      message: `"${namespace}" was not loaded — yaw-mcp is shutting down.`,
+    };
   }
 
   /** The refusal for a connection that came up against config the user had
@@ -4387,7 +5080,7 @@ export class ConnectServer {
   private staleLaunchRefusal(
     namespace: string,
     reason: "removed" | "disabled" | "launch-config-changed",
-  ): { ok: false; message: string; isChanged: false } {
+  ): { ok: false; message: string; isChanged: false; refused: true } {
     const what =
       reason === "removed"
         ? "was removed from bundles.json while it was loading"
@@ -4398,6 +5091,7 @@ export class ConnectServer {
     return {
       ok: false,
       isChanged: false,
+      refused: true,
       message: `"${namespace}" ${what}, so the connection that just came up was already stale and has been closed.${next}`,
     };
   }
@@ -4559,10 +5253,11 @@ export class ConnectServer {
    *  `${namespace}_${tool}` is not injective: (ns=`gh`, tool=`actions_list`)
    *  and (ns=`gh_actions`, tool=`list`) both flatten to `gh_actions_list`, so
    *  two loaded servers can claim one wire name. buildToolRoutes resolves that
-   *  to exactly one owner (first writer wins, and buildToolList agrees), which
-   *  leaves the loser's tool with no name any caller can reach: a direct
-   *  tools/call and an mcp_connect_exec step both resolve the wire name
-   *  through that one table, and tools/list advertises it once.
+   *  to exactly one owner (the lexically first namespace, and buildToolList
+   *  agrees -- see compareNamespaces), which leaves the loser's tool with no
+   *  name any caller can reach: a direct tools/call and an mcp_connect_exec
+   *  step both resolve the wire name through that one table, and tools/list
+   *  advertises it once.
    *
    *  Both activate messages used to render straight from visibleTools, which
    *  is the server's OWN inventory and knows nothing about the rest of the
@@ -4728,7 +5423,7 @@ export class ConnectServer {
     // floor (see passesMinCompliance).
     const gateRefusal = this.spawnGateRefusal(serverConfig, "activate");
     if (gateRefusal) {
-      return { ok: false, isChanged: false, message: gateRefusal };
+      return { ok: false, isChanged: false, refused: true, message: gateRefusal };
     }
 
     // Concurrent-load cap. Connected servers count; error-state
@@ -5025,6 +5720,20 @@ export class ConnectServer {
     // that tells the user their values were rejected.
     const supplied = this.elicitedEnv.get(namespace) ?? {};
 
+    // A 2026-07-28 retry re-runs its call carrying the answer to the prompt
+    // the first round posted (callToolCarryingInput). Submitted values were
+    // stored before this run, so this activation already launched with them
+    // and is exactly the retry the 2025 path makes with isElicitRetry. Any
+    // other answer gets the words the 2025 path gives right after its prompt,
+    // without re-checking the latch and the budget that prompt already went
+    // through.
+    const leg = this.inputLegFor(progress);
+    const answer = this.takeSecretAnswer(leg, credentialAskSubject(namespace));
+    if (answer?.kind === "credential") {
+      if (answer.entry.kind !== "submitted") return this.credentialEntryRefusal(namespace, missing, answer.entry);
+      isElicitRetry = true;
+    }
+
     // We are already inside the retry a prompt bought, and the child still
     // reports missing exactly the keys we just supplied. Asking again HERE
     // opens a second modal in the same breath as the first, worded
@@ -5114,14 +5823,27 @@ export class ConnectServer {
       return null;
     }
 
-    const caps = this.server.getClientCapabilities();
-    if (!caps?.elicitation) {
-      log("info", "Detected missing credentials but client does not support elicitation", {
+    if (this.noRequestToAskOn(leg)) {
+      log("info", "Missing credentials and no client request to ask on; the next explicit activate will ask", {
         namespace,
         missing,
+        era: "modern",
       });
       return null;
     }
+    if (!this.elicitationCapability(leg)) {
+      log("info", "Detected missing credentials but client does not support elicitation", {
+        namespace,
+        missing,
+        era: this.clientSession().era,
+      });
+      return null;
+    }
+    // This call already has a prompt, and a round carries one: this one is
+    // asked on the next round, when the call runs again. Before the budget,
+    // which it has not spent.
+    if (leg?.askClaimed) return this.awaitingInputResult(namespace);
+    if (leg) leg.askClaimed = true;
 
     // The values are typed on a masked page served on 127.0.0.1, not into the
     // client's own dialog: a form-mode string field is an ordinary visible
@@ -5150,8 +5872,10 @@ export class ConnectServer {
     // the env path by reading the source.
     const fixHint = `Set ${what} in this server's "env" in ${bundlesFileHint("defines-it")} to skip this prompt in future sessions.`;
     const why = `"${namespace}" cannot start: it reports ${missing.join(", ")} missing. ${fixHint}`;
-    const entry = await this.collectSecretOnLoopbackPage({
+    const subject = credentialAskSubject(namespace);
+    const entryPromise = this.collectSecretOnLoopbackPage({
       namespace,
+      subject,
       why,
       secretNoun: isPlural ? `the values of ${missing.join(", ")}` : `the value of ${missing[0]}`,
       page: {
@@ -5165,81 +5889,29 @@ export class ConnectServer {
       progress,
     });
 
-    if (entry.kind === "failed") {
-      log("info", "Credential elicitation did not complete", { namespace, missing });
-      // shutdown() latched while the prompt was up. Refuse the way every
-      // other shutdown gate does, with the same words: the give-up path's
-      // "spawn failed" invites a retry in a session that is ending.
-      if (this.shuttingDown) return this.shuttingDownRefusal(namespace);
-      return null;
-    }
-    if (entry.kind === "declined") {
-      log("info", "User declined credential elicitation", { namespace });
-      if (this.shuttingDown) return this.shuttingDownRefusal(namespace);
-      // A decline is a decision, not a slip. Latch for the session the
-      // way the vault does: a re-ask would put up the same modal and
-      // hit the same answer. The early check above renders the raw
-      // spawn error on follow-up -- a user who said no wants the
-      // original "could not load" message, not a workaround hint.
-      this.credentialElicited.set(namespace, "declined");
-      return null;
-    }
-    if (entry.kind === "unreachable") {
-      // Same latch rules as the vault path: no-page and no-browser are a
-      // wall a second prompt would hit identically, so asking again wastes
-      // a round-trip. Expired is a user-away state and does not latch --
-      // the user may simply have been away -- so the next activate asks
-      // again while the budget lasts. All three return the refusal rather
-      // than null, as the vault does: it says what happened to the page,
-      // which the give-up path's raw "spawn failed" would not, and it skips
-      // that path's dispatch penalty against a server whose only problem
-      // is a value nobody got to type.
-      log("info", "Credential masked-entry page was unreachable", {
-        namespace,
-        missing,
-        reason: entry.reason,
-      });
-      if (this.shuttingDown) return this.shuttingDownRefusal(namespace);
-      if (entry.reason !== "expired") {
-        // Explicit latch: the early check at the top of this function
-        // already accounts for the no-page / no-browser wall. Without an
-        // add here, the next activate would burn a budget slot on the
-        // SAME wall, not a new reason to ask. The latch carries the
-        // reason so the early check can re-render the same refusal on a
-        // follow-up activate.
-        this.credentialElicited.set(namespace, entry.reason);
+    const entry = leg ? await this.untilPosted(leg, entryPromise) : await entryPromise;
+    if (entry === "posted") {
+      // 2026-07-28: the prompt is posted on this call's round, and the call
+      // has to return for the client to show it. The rest of the prompt runs
+      // on: values the user submits are stored the moment they arrive, so the
+      // retry's re-run launches with them (and so does any later activate, if
+      // the client never retries).
+      const asked = leg?.ask;
+      if (asked) {
+        asked.settled = entryPromise.then(
+          (e): SecretAnswer => {
+            if (e.kind === "submitted") this.storeCredentialValues(namespace, missing, e.values);
+            return { subject, kind: "credential", entry: e };
+          },
+          (): SecretAnswer => ({ subject, kind: "credential", entry: { kind: "failed" } }),
+        );
       }
-      return this.credentialUnreachableRefusal(namespace, missing, entry.reason);
+      return this.awaitingInputResult(namespace);
     }
-
-    // entry.kind === "submitted". Pick the keys we actually asked for, and
-    // only non-empty strings. With the shipped page both filters are
-    // no-ops: its fields are exactly `missing`, every input is `required`,
-    // and its POST handler answers 400 "Every field is required." to a
-    // missing or empty field, so a submitted result carries every asked key
-    // non-empty (secret-entry-page.ts). They are defense in depth against a
-    // page implementation that drifts: an extra field would otherwise leak
-    // into this server's env, and a blank one would override a supplied
-    // value through the merge below.
-    const values: Record<string, string> = {};
-    for (const key of missing) {
-      const v = entry.values[key];
-      if (typeof v === "string" && v.length > 0) values[key] = v;
-    }
-    if (Object.keys(values).length === 0) {
-      // Defensive, like the filter above: the shipped page cannot return a
-      // submission with no non-empty value. Should a drifted page do so,
-      // treat it like a decline -- latch so a follow-up activate hits the
-      // early check at the top of this function instead of re-opening the
-      // page, and let the "empty" reason fall through there to the raw
-      // spawn error, the same as a decline. This return-null is for THIS
-      // activate only; the latch owns the next ask.
-      log("info", "Credential masked-entry page returned no values", { namespace, missing });
-      this.credentialElicited.set(namespace, "empty");
-      return null;
-    }
-
-    this.elicitedEnv.set(namespace, { ...supplied, ...values });
+    // Ended before it was posted (no page, shutdown): the round's slot is free.
+    if (leg) leg.askClaimed = false;
+    if (entry.kind !== "submitted") return this.credentialEntryRefusal(namespace, missing, entry);
+    if (!this.storeCredentialValues(namespace, missing, entry.values)) return null;
     progress?.("Got credentials — retrying load");
     // Recurse — runActivateOne fills the env from elicitedEnv on this
     // attempt (through effectiveEntry).
@@ -5259,6 +5931,109 @@ export class ConnectServer {
     // If the child STILL reports the same key missing, the branch above turns
     // that into a message rather than a second identical modal.
     return this.runActivateOne(namespace, progress, fromPrewarm, /* skipCap */ true, /* isElicitRetry */ true);
+  }
+
+  // The words for a missing-credential prompt that ended without values:
+  // what maybeElicitAndRetry returns right after its prompt, and what a
+  // 2026-07-28 re-run returns for the answer its retry brought back.
+  private credentialEntryRefusal(
+    namespace: string,
+    missing: string[],
+    entry: Exclude<LoopbackEntryResult, { kind: "submitted" }>,
+  ): ActivationResult | null {
+    if (entry.kind === "failed") {
+      log("info", "Credential elicitation did not complete", { namespace, missing });
+      // shutdown() latched while the prompt was up. Refuse the way every
+      // other shutdown gate does, with the same words: the give-up path's
+      // "spawn failed" invites a retry in a session that is ending.
+      if (this.shuttingDown) return this.shuttingDownRefusal(namespace);
+      return null;
+    }
+    if (entry.kind === "declined") {
+      log("info", "User declined credential elicitation", { namespace });
+      if (this.shuttingDown) return this.shuttingDownRefusal(namespace);
+      // A decline is a decision, not a slip. Latch for the session the
+      // way the vault does: a re-ask would put up the same modal and
+      // hit the same answer. The early check above renders the raw
+      // spawn error on follow-up -- a user who said no wants the
+      // original "could not load" message, not a workaround hint.
+      this.credentialElicited.set(namespace, "declined");
+      return null;
+    }
+    // entry.kind === "unreachable". Same latch rules as the vault path:
+    // no-page and no-browser are a wall a second prompt would hit
+    // identically, so asking again wastes a round-trip. Expired is a
+    // user-away state and does not latch -- the user may simply have been
+    // away -- so the next activate asks again while the budget lasts. All
+    // three return the refusal rather than null, as the vault does: it says
+    // what happened to the page, which the give-up path's raw "spawn failed"
+    // would not, and it skips that path's dispatch penalty against a server
+    // whose only problem is a value nobody got to type.
+    log("info", "Credential masked-entry page was unreachable", {
+      namespace,
+      missing,
+      reason: entry.reason,
+    });
+    if (this.shuttingDown) return this.shuttingDownRefusal(namespace);
+    if (entry.reason !== "expired") {
+      // Explicit latch: the early check in maybeElicitAndRetry already
+      // accounts for the no-page / no-browser wall. Without an add here, the
+      // next activate would burn a budget slot on the SAME wall, not a new
+      // reason to ask. The latch carries the reason so the early check can
+      // re-render the same refusal on a follow-up activate.
+      this.credentialElicited.set(namespace, entry.reason);
+    }
+    return this.credentialUnreachableRefusal(namespace, missing, entry.reason);
+  }
+
+  // Store the values a missing-credential page took, for effectiveEntry to
+  // fill into the child's env on the next launch. False when nothing usable
+  // was submitted, which latches the namespace.
+  private storeCredentialValues(namespace: string, missing: string[], submitted: Record<string, string>): boolean {
+    // Pick the keys we actually asked for, and only non-empty strings. With
+    // the shipped page both filters are no-ops: its fields are exactly
+    // `missing`, every input is `required`, and its POST handler answers 400
+    // "Every field is required." to a missing or empty field, so a submitted
+    // result carries every asked key non-empty (secret-entry-page.ts). They
+    // are defense in depth against a page implementation that drifts: an
+    // extra field would otherwise leak into this server's env, and a blank
+    // one would override a supplied value through the merge below.
+    const values: Record<string, string> = {};
+    for (const key of missing) {
+      const v = submitted[key];
+      if (typeof v === "string" && v.length > 0) values[key] = v;
+    }
+    if (Object.keys(values).length === 0) {
+      // Defensive, like the filter above: the shipped page cannot return a
+      // submission with no non-empty value. Should a drifted page do so,
+      // treat it like a decline -- latch so a follow-up activate hits the
+      // early check in maybeElicitAndRetry instead of re-opening the page,
+      // and let the "empty" reason fall through there to the raw spawn
+      // error, the same as a decline. The caller's return-null is for THIS
+      // activate only; the latch owns the next ask.
+      log("info", "Credential masked-entry page returned no values", { namespace, missing });
+      this.credentialElicited.set(namespace, "empty");
+      return false;
+    }
+    this.elicitedEnv.set(namespace, { ...(this.elicitedEnv.get(namespace) ?? {}), ...values });
+    return true;
+  }
+
+  // Wait for a prompt's result, or for it to be posted on a 2026-07-28 round,
+  // whichever comes first. A prompt that fails before it is posted (no page,
+  // shutdown) resolves with its result, exactly as on the 2025 protocol.
+  private untilPosted<T>(leg: InputLeg, result: Promise<T>): Promise<T | "posted"> {
+    return Promise.race([result, leg.posted.then(() => "posted" as const)]);
+  }
+
+  // The answer a 2026-07-28 retry brought back for `subject`, once: the
+  // re-run's first activation of that subject consumes it, so a second pass
+  // through the same activation in the same call asks afresh.
+  private takeSecretAnswer(leg: InputLeg | undefined, subject: string): SecretAnswer | null {
+    if (!leg?.answer || leg.answer.subject !== subject) return null;
+    const answer = leg.answer;
+    leg.answer = null;
+    return answer;
   }
 
   // The vault-passphrase counterpart to maybeElicitAndRetry. Split out
@@ -5294,6 +6069,22 @@ export class ConnectServer {
     progress?: ProgressReporter,
     fromPrewarm = false,
   ): Promise<ActivationResult | null> {
+    // A 2026-07-28 retry re-runs its call with the vault prompt's result
+    // (callToolCarryingInput). A verified passphrase is already the session's
+    // by then, so the re-run resolves its env and never gets here; what does
+    // is a prompt that ended without one, which gets the words the 2025 path
+    // gives the winner right after its prompt.
+    const leg = this.inputLegFor(progress);
+    const answer = this.takeSecretAnswer(leg, VAULT_ASK_SUBJECT);
+    if (answer?.kind === "vault") {
+      if (this.shuttingDown) return this.shuttingDownRefusal(namespace);
+      if (answer.outcome.kind === "rejected") return this.vaultPassphraseRejected(namespace, lastError);
+      if (answer.outcome.kind === "unreachable") {
+        return this.vaultPassphraseUnreachable(namespace, lastError, answer.outcome.reason);
+      }
+      return null;
+    }
+
     // Someone else is already asking. Join their prompt: on success retry
     // straight away (the vault is now unlocked for every namespace, which is
     // the whole point); on a rejected entry report it exactly as the winner
@@ -5308,6 +6099,13 @@ export class ConnectServer {
     // prompt that is about to unlock the vault for it.
     const joined = this.vaultElicitInflight;
     if (joined) {
+      // On 2026-07-28 a follower whose own call holds a prompt -- the vault
+      // prompt it would join, when the leader is another namespace of the
+      // same call -- must not wait on it: that call has to return before the
+      // prompt can reach the client at all. Its re-run finds the vault
+      // unlocked. A follower on any other request waits, as on the 2025
+      // protocol; the prompt settles without it.
+      if (leg?.askClaimed) return this.awaitingInputResult(namespace);
       progress?.("Waiting for the vault passphrase prompt already in flight");
       // The winner's wait on the page is heartbeated (collectSecretOnLoopbackPage)
       // and can run the page's whole TTL; a follower parked on it for that
@@ -5336,25 +6134,61 @@ export class ConnectServer {
 
     if (this.vaultPassphraseElicited) return null;
 
-    const caps = this.server.getClientCapabilities();
-    if (!caps?.elicitation) {
+    if (this.noRequestToAskOn(leg)) {
+      log("info", "Vault is locked and no client request to ask on; the next explicit activate will ask", {
+        namespace,
+        refKeys: lastError.refKeys,
+        reason: lastError.reason,
+        era: "modern",
+      });
+      return null;
+    }
+    if (!this.elicitationCapability(leg)) {
       log("info", "Vault is locked but client does not support elicitation", {
         namespace,
         refKeys: lastError.refKeys,
         reason: lastError.reason,
+        era: this.clientSession().era,
       });
       return null;
     }
+    // This call already has a prompt; the vault's is asked next round.
+    if (leg?.askClaimed) return this.awaitingInputResult(namespace);
+    if (leg) leg.askClaimed = true;
 
     const prompt = this.promptForVaultPassphrase(namespace, lastError, progress);
     this.vaultElicitInflight = prompt;
-    let outcome: VaultPromptOutcome;
-    try {
-      outcome = await prompt;
-    } finally {
-      // Only clear OUR entry: a later prompt (the re-ask after a typo)
-      // registers its own, and this one must not delete it.
+    // Only clear OUR entry: a later prompt (the re-ask after a typo)
+    // registers its own, and this one must not delete it.
+    const release = (): void => {
       if (this.vaultElicitInflight === prompt) this.vaultElicitInflight = null;
+    };
+    let outcome: VaultPromptOutcome;
+    if (leg) {
+      const settled = prompt.finally(release);
+      const first = await this.untilPosted(leg, settled);
+      if (first === "posted") {
+        // 2026-07-28: posted on this call's round; the call returns so the
+        // client can show it. The prompt runs on and stays the one followers
+        // join: a passphrase submitted on the page is verified and becomes
+        // the session's as soon as it arrives, whether or not a retry comes.
+        const asked = leg.ask;
+        if (asked) {
+          asked.settled = settled.then(
+            (o): SecretAnswer => ({ subject: VAULT_ASK_SUBJECT, kind: "vault", outcome: o }),
+            (): SecretAnswer => ({ subject: VAULT_ASK_SUBJECT, kind: "vault", outcome: { kind: "unavailable" } }),
+          );
+        }
+        return this.awaitingInputResult(namespace);
+      }
+      leg.askClaimed = false;
+      outcome = first;
+    } else {
+      try {
+        outcome = await prompt;
+      } finally {
+        release();
+      }
     }
 
     // shutdown() latched while the prompt was up. Refuse the way every other
@@ -5509,8 +6343,18 @@ export class ConnectServer {
   // Nothing here is vault-specific. The missing-credential prompt
   // (maybeElicitAndRetry) supplies its own words and fields and goes through
   // the same page.
+  //
+  // On 2026-07-28 nothing is pushed: the same request is posted on the
+  // calling round (InputLeg) and the client answers it on its retry, with no
+  // elicitationId (that revision's URL mode has none) and no completion
+  // notification afterwards. The wait below then heartbeats on the retry,
+  // which is the request still open by the time anyone waits.
   private async collectSecretOnLoopbackPage(request: {
     namespace: string;
+    /** The activation this prompt is for; on 2026-07-28 it names the answer
+     *  the re-run of the call picks up (credentialAskSubject,
+     *  VAULT_ASK_SUBJECT). */
+    subject: string;
     /** Lead of the client dialog: what needs the secret, and why. */
     why: string;
     /** The secret as the dialog's instruction names it, e.g. "your vault
@@ -5519,13 +6363,17 @@ export class ConnectServer {
     page: Omit<SecretEntryPageOptions, "ttlMs">;
     progress?: ProgressReporter;
   }): Promise<LoopbackEntryResult> {
-    const { namespace, why, secretNoun, progress } = request;
+    const { namespace, why, secretNoun } = request;
+    let progress = request.progress;
+    const leg = this.inputLegFor(progress);
     // The SDK's own reading of the capability. Its initialize schema rewrites
     // an empty `elicitation: {}` on the wire into `{ form: {} }` before it is
     // stored (ElicitationCapabilitySchema in the SDK's types), which is what
     // elicitInput's own per-mode guard then checks; this helper reads a bare
-    // `{}` the same way, so the two cannot disagree.
-    const modes = getSupportedElicitationModes(this.server.getClientCapabilities()?.elicitation);
+    // `{}` the same way, so the two cannot disagree. A 2026-07-28 envelope is
+    // not normalized by anyone, and a bare `{}` means form there too, which
+    // this helper supplies.
+    const modes = getSupportedElicitationModes(this.elicitationCapability(leg));
     if (!modes.supportsUrlMode && !modes.supportsFormMode) return { kind: "failed" };
     const mode = modes.supportsUrlMode ? "url" : "form";
 
@@ -5545,33 +6393,62 @@ export class ConnectServer {
     // however long that took.
     const openedAt = Date.now();
     this.secretEntryPages.add(page);
+    const pageResult = (outcome: SecretEntryOutcome): LoopbackEntryResult => {
+      if (outcome.kind === "submitted") return { kind: "submitted", values: outcome.values };
+      if (outcome.kind === "expired") return { kind: "unreachable", reason: "expired" };
+      return { kind: "failed" };
+    };
     try {
       // shutdown() sweeps secretEntryPages synchronously, and this page was
       // still being opened when it did: nothing else will ever close it, so
       // the finally below has to, now, rather than after a prompt nobody is
       // going to answer in a session that is ending.
       if (this.shuttingDown) return { kind: "failed" };
-      let result: Awaited<ReturnType<Server["elicitInput"]>>;
-      try {
-        result =
+      const urlMessage = `${why} Open the link to type ${secretNoun} into a masked field on a page yaw-mcp serves on this computer -- it never passes through this client. Decline to cancel.`;
+      const formMessage = `${why} Accept to open a page yaw-mcp serves on this computer (127.0.0.1) in your browser, and type ${secretNoun} into its masked field there -- it is never typed into this dialog. Decline to cancel.`;
+      let result: { action: ElicitAction };
+      let asked: SecretAsk | undefined;
+      if (leg) {
+        asked = this.postSecretAsk(
+          leg,
+          request.subject,
           mode === "url"
-            ? await this.server.elicitInput({
-                mode: "url",
-                message: `${why} Open the link to type ${secretNoun} into a masked field on a page yaw-mcp serves on this computer -- it never passes through this client. Decline to cancel.`,
-                elicitationId: page.elicitationId,
-                url: page.url,
-              })
-            : await this.server.elicitInput({
-                message: `${why} Accept to open a page yaw-mcp serves on this computer (127.0.0.1) in your browser, and type ${secretNoun} into its masked field there -- it is never typed into this dialog. Decline to cancel.`,
-                requestedSchema: { type: "object", properties: {} },
-              });
-      } catch (err) {
-        log("warn", "Secret entry elicitation failed", {
-          namespace,
-          mode,
-          error: err instanceof Error ? err.message : String(err),
-        });
-        return { kind: "failed" };
+            ? inputRequired.elicitUrl({ message: urlMessage, url: page.url })
+            : inputRequired.elicit({ message: formMessage, requestedSchema: { type: "object", properties: {} } }),
+        );
+        // The page can settle before the retry brings the client's answer:
+        // in URL mode the user may have typed and submitted already, which is
+        // consent enough; an expiry or a close ends the prompt the same way it
+        // would have ended the wait below.
+        const first = await Promise.race([
+          asked.decision.then((action) => ({ action })),
+          page.result.then((outcome) => ({ outcome })),
+        ]);
+        if ("outcome" in first) return pageResult(first.outcome);
+        result = first;
+        progress = asked.progress;
+      } else {
+        try {
+          result =
+            mode === "url"
+              ? await this.server.elicitInput({
+                  mode: "url",
+                  message: urlMessage,
+                  elicitationId: page.elicitationId,
+                  url: page.url,
+                })
+              : await this.server.elicitInput({
+                  message: formMessage,
+                  requestedSchema: { type: "object", properties: {} },
+                });
+        } catch (err) {
+          log("warn", "Secret entry elicitation failed", {
+            namespace,
+            mode,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          return { kind: "failed" };
+        }
       }
       if (result.action !== "accept") {
         log("info", "User declined the secret entry prompt", { namespace, mode, action: result.action });
@@ -5604,11 +6481,11 @@ export class ConnectServer {
       // page included: the page module also ends with "closed" when its
       // listener fails after listen, and that client is still there waiting.
       // Not sent once shutdown() has latched, which is also what closes a
-      // page under the wait: the transport is going with it.
+      // page under the wait: the transport is going with it. Never on
+      // 2026-07-28, which has no such notification: the notifier's own
+      // canPush gate drops it there.
       if (mode === "url" && !this.shuttingDown) this.notifyElicitationComplete(page.elicitationId, namespace);
-      if (outcome.kind === "submitted") return { kind: "submitted", values: outcome.values };
-      if (outcome.kind === "expired") return { kind: "unreachable", reason: "expired" };
-      return { kind: "failed" };
+      return pageResult(outcome);
     } finally {
       page.close();
       this.secretEntryPages.delete(page);
@@ -5625,6 +6502,8 @@ export class ConnectServer {
         error: err instanceof Error ? err.message : String(err),
       });
     };
+    // Only a URL elicitation this session pushed has anything to complete.
+    if (!this.clientSession().canPush) return;
     try {
       this.server.createElicitationCompletionNotifier(elicitationId)().catch(onError);
     } catch (err) {
@@ -5667,6 +6546,7 @@ export class ConnectServer {
 
     const entry = await this.collectSecretOnLoopbackPage({
       namespace,
+      subject: VAULT_ASK_SUBJECT,
       why,
       secretNoun: invalid ? "the correct vault passphrase" : "your vault passphrase",
       page: {
@@ -5862,11 +6742,40 @@ export class ConnectServer {
     const total = namespaces.length;
     // Namespaces this call left loaded, for the exec hint below.
     const loadedOk: string[] = [];
+    // Claim, UP FRONT, every namespace the startup prewarm is already
+    // connecting. The loop below is sequential, so without this a claim only
+    // lands when the loop reaches that namespace -- and a prewarm that
+    // finishes in the meantime sees no claim, disconnects the child it just
+    // booted, and the loop then spawns the same server again. Measured on
+    // 2026-10-09 (m3, `activate {servers:[fetch,npmjs]}` on a cold home): the
+    // loop sat awaiting fetch's prewarm while npmjs's prewarm completed and
+    // was torn down, so every aggregator started npmjs twice. Joining here
+    // goes through activateOne exactly as the loop would (the claim and its
+    // cap check), just earlier; namespaces with no prewarm in flight still
+    // spawn one at a time, in order. The one ordering consequence: under a
+    // nearly full cap, an already-booting prewarmed server is preferred over
+    // a later-listed one that would need a fresh spawn -- the cheaper of the
+    // two to admit.
+    const preClaimed = new Map<string, Promise<ActivationResult>>();
+    for (const namespace of namespaces) {
+      if (preClaimed.has(namespace)) continue;
+      if (!this.prewarmNamespaces.has(namespace) || !this.activationInflight.has(namespace)) continue;
+      const claim = this.activateOne(namespace, progress);
+      // Awaited in the loop below; this only keeps a rejection that lands
+      // while the loop is still awaiting an earlier namespace from surfacing
+      // as unhandled.
+      claim.catch(() => {});
+      preClaimed.set(namespace, claim);
+    }
     let i = 0;
     for (const namespace of namespaces) {
       i += 1;
       progress?.(`Loading ${namespace} (${i}/${total})`, i - 1, total);
-      const r = await this.activateOne(namespace, progress);
+      const claimed = preClaimed.get(namespace);
+      // Consumed once: a namespace listed twice takes the ordinary path the
+      // second time, as it always has.
+      preClaimed.delete(namespace);
+      const r = await (claimed ?? this.activateOne(namespace, progress));
       results.push(r.message);
       // Flags plus the sessionActivated add, shared with handleDispatch.
       this.recordExplicitLoad(tally, namespace, r);
@@ -5996,7 +6905,7 @@ export class ConnectServer {
   // the delta (recordOutcome already counted the dispatch). Never throws.
   private async refineRewardInBackground(namespace: string, heuristic: number, ctx: GraderContext): Promise<void> {
     try {
-      const graded = await gradeOutcomeViaSampling(this.server, ctx);
+      const graded = await gradeOutcomeViaSampling(this.samplingPeer(), ctx);
       if (graded === null || graded === heuristic) return;
       this.learning.adjustSucceeded(namespace, graded - heuristic);
       this.scheduleStateSave();
@@ -6112,15 +7021,17 @@ export class ConnectServer {
     // makes it, and returns null) so that a client WITHOUT sampling never
     // sees the "asking LLM to pick" progress line: that line promised a
     // round-trip that was never going to happen, and the silent null that
-    // followed read as the LLM having picked nothing.
-    const clientCanSample = this.server.getClientCapabilities()?.sampling !== undefined;
+    // followed read as the LLM having picked nothing. The era comes first:
+    // sampling runs on the 2025 protocol only (see SamplingPeer).
+    const era = this.clientSession().era;
+    const clientCanSample = era === "legacy" && this.pushCapabilities()?.sampling !== undefined;
     const wantsTiebreak = safeBudget === 1 && shouldSample(ranked, effort);
     // The one-time "client has no sampling" notice is emitted HERE, at the
     // gate that skips the round-trip: bestOfNViaSampling is never reached on
     // such a client, so its own copy of the notice could not fire in
     // production, and an operator who set YAW_MCP_ROUTE_EFFORT=aggressive had
     // no way to learn the dial was inert. Same per-process flag either way.
-    if (wantsTiebreak && !clientCanSample) noteNoSamplingCapability();
+    if (wantsTiebreak && !clientCanSample) noteNoSamplingCapability(era);
     if (wantsTiebreak && clientCanSample) {
       progress?.("Top candidates close — asking LLM to pick…");
       const serversByNamespace = new Map(activeServers.map((s) => [s.namespace, s]));
@@ -6131,7 +7042,7 @@ export class ConnectServer {
       const mergedTools = new Map(activeServers.map((s) => [s.namespace, s.toolCache ?? []]));
       const candidates = buildCandidates(ranked.slice(0, 3), serversByNamespace, mergedTools);
       const samples = sampleCountForEffort(effort);
-      const picked = await bestOfNViaSampling(this.server, trimmed, candidates, samples);
+      const picked = await bestOfNViaSampling(this.samplingPeer(), trimmed, candidates, samples);
       if (picked) {
         const winner = ranked.find((r) => r.namespace === picked);
         if (winner) {
@@ -7124,7 +8035,7 @@ export class ConnectServer {
   private async handleExec(
     args: Record<string, unknown>,
     // The downstream request's abort signal, forwarded to each step so a
-    // cancelled pipeline actually stops. Deliberately NOT the whole `extra`:
+    // cancelled pipeline actually stops. Deliberately NOT the whole `ctx`:
     // see the step dispatch below for why exec withholds the progress half.
     signal?: AbortSignal,
   ): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
@@ -7453,13 +8364,13 @@ export class ConnectServer {
       // and pack-detector logic so exec steps behave identically to
       // direct calls — the caller pays no per-step cost in surprises.
       //
-      // The progress half of `extra` is still withheld so exec steps don't
+      // The progress half of `ctx` is still withheld so exec steps don't
       // fight for the top-level progress token; the exec itself emits no
       // progress. The SIGNAL is forwarded, though: that reasoning was only
       // ever about the token, and without it a cancelled pipeline kept
       // dispatching its remaining steps. Passing an object carrying nothing
       // but `signal` keeps the old behaviour exactly -- createProgressReporter
-      // returns its no-op when there is no token and no sendNotification.
+      // returns its no-op when there is no token and no notify.
       // Step-level (process) reward: defer the proxy path's learning signal
       // and attribute credit per step here, using the $ref dependency graph
       // so a step that fails on bad INPUT it consumed from an upstream step
@@ -7485,7 +8396,7 @@ export class ConnectServer {
         stepResult = await this.handleToolCall(
           step.tool,
           resolvedArgs,
-          { signal },
+          { mcpReq: { signal } },
           {
             deferLearning: true,
             deferIdleTracking: true,
@@ -7656,6 +8567,9 @@ export class ConnectServer {
     // under oam, whose http.Server has no unref(), a listener left open would
     // keep the process alive.
     for (const page of this.secretEntryPages) page.close();
+    // And the 2026-07-28 prompts no retry has redeemed: their pages just
+    // closed, and their drop timers are the last thing referring to them.
+    for (const ask of [...this.secretAsks.values()]) this.dropSecretAsk(ask);
 
     // Flush any pending state save before we stop accepting writes.
     // Cancels the debounce timer so no stale snapshot writes after.
@@ -7681,9 +8595,9 @@ export class ConnectServer {
     // — an unbounded await here outlives index.ts's 10s force-exit timer, so
     // a SIGTERM landing on a cold npx handshake would sit for 10s and then
     // exit(1) instead of exiting 0 promptly. 2s is what we can spend and
-    // still finish: the disconnects below race the SDK's stdio close timers
-    // (2s, twice) and then server.close() has to run, which leaves ~4s of
-    // headroom under the 10s cap. Anything an activation needs beyond 2s was
+    // still finish: the downstream close is quick, and the disconnects
+    // below race the SDK's stdio close timers (2s, twice), which leaves ~4s
+    // of headroom under the 10s cap. Anything an activation needs beyond 2s was
     // never going to fit under that cap anyway, so waiting for it only buys
     // a forced exit(1).
     if (this.activationInflight.size > 0) {
@@ -7718,6 +8632,14 @@ export class ConnectServer {
     // process exit masks that; in an embedded or test host nothing does.
     this.persistenceReady = false;
 
+    // Close the downstream face BEFORE the upstream teardown below: closing
+    // it answers any open 2026-07-28 subscriptions/listen with its graceful
+    // close result, and the staged upstream closes can take most of
+    // index.ts's 10s force-exit budget. A host that never served (tests, an
+    // embedder that skipped start()) closes the instance it holds.
+    if (this.stdioHandle) await this.stdioHandle.close();
+    else await this.server.close();
+
     // Disconnect all upstreams
     const disconnects = Array.from(this.connections.values()).map((conn) => disconnectFromUpstream(conn));
     await Promise.allSettled(disconnects);
@@ -7728,8 +8650,8 @@ export class ConnectServer {
     //
     // This is hygiene, NOT a reset for reuse -- a ConnectServer is
     // single-use. `shuttingDown` is latched above and nothing ever clears it
-    // (activateOne refuses from here on, permanently), and `this.server` is
-    // closed below. The other session-lifecycle fields (sessionActivated,
+    // (activateOne refuses from here on, permanently), and the downstream face
+    // was closed above. The other session-lifecycle fields (sessionActivated,
     // toolFilters, idleCallCounts, toolCache, and the ask counters and
     // latches credentialPrompts, vaultPassphrasePrompts and
     // vaultPassphraseElicited -- counts and booleans, no plaintext) are
@@ -7751,8 +8673,6 @@ export class ConnectServer {
     clearSessionVaultPassphrase();
     this.inflightCalls.clear();
 
-    await this.server.close();
-
     log("info", "yaw-mcp shutdown complete");
   }
 
@@ -7771,19 +8691,32 @@ export class ConnectServer {
     if (this.stateSaveTimer.unref) this.stateSaveTimer.unref();
   }
 
+  // One merging save (see stateSync). A save that could not land -- another
+  // pane held the lock past the wait budget, or state.json was momentarily
+  // unreadable -- has already logged its one line and kept the pending
+  // delta; re-arm the debounce so it lands on the next attempt instead of
+  // waiting for the next recorded call. Never during shutdown: the shutdown
+  // path flushes explicitly and then closes the save path, and a timer armed
+  // here would fire after it.
   private async flushStateSave(): Promise<void> {
-    // mergeWithDisk: every pane runs its own broker, and a plain replace let
-    // an older broker's snapshot erase a list another one had just learned
-    // (see SaveStateOptions in persistence.ts).
-    await saveState(
-      {
-        learning: this.learning.exportSnapshot(),
-        packHistory: this.packDetector.exportSnapshot(),
-        toolCache: this.exportToolCache(),
-        prewarmFailures: this.exportPrewarmFailures(),
-      },
-      undefined,
-      { mergeWithDisk: true },
-    );
+    const saved = await this.stateSync.save();
+    if (!saved && !this.shuttingDown) this.scheduleStateSave();
+  }
+
+  // Adopt the merged state a save just wrote: this pane now routes on the
+  // learning and pack history other panes saved. Both are replaced wholesale
+  // -- the merge already folded in everything this process recorded,
+  // including calls that landed while the save was in flight.
+  //
+  // The tool cache is deliberately NOT adopted. Its lists feed tools/list
+  // (mergeToolCache) and the deferred routes, and swapping one in mid-session
+  // would change the advertised surface with no list_changed notification
+  // behind it. On disk the newer list still wins (mergeStateDelta), so the
+  // next session starts from it. Pre-warm failures are not adopted either:
+  // this broker's startup sweep has already run, so another pane's later
+  // failure only matters to the NEXT broker, which hydrates it from disk.
+  private applyMergedState(merged: StateSections): void {
+    this.learning.loadSnapshot(merged.learning);
+    this.packDetector.loadSnapshot(merged.packHistory);
   }
 }

@@ -956,6 +956,20 @@ describe("runComplianceCommand child exit propagation", () => {
     expect(r.out).toContain("2/10 passed, 1/5 required");
   });
 
+  it("names skipped checks, which mcp-compliance >= 0.20 leaves out of the score", async () => {
+    const skippedReport = { ...report, summary: { ...report.summary, passed: 9, failed: 1, skipped: 6 } };
+    const r = await runWithChildExit(0, Buffer.from(JSON.stringify(skippedReport)));
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("9/10 passed (6 skipped, left out of the score), 1/5 required");
+  });
+
+  it("prints no skip note when the report has no skips or predates the field", async () => {
+    const zero = { ...report, summary: { ...report.summary, skipped: 0 } };
+    const r = await runWithChildExit(0, Buffer.from(JSON.stringify(zero)));
+    expect(r.out).toContain("2/10 passed, 1/5 required");
+    expect(r.out).not.toContain("skipped");
+  });
+
   it("stays 0 when the child exits cleanly", async () => {
     const r = await runWithChildExit(0);
     expect(r.code).toBe(0);

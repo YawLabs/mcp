@@ -454,6 +454,15 @@ if (subcommand === "compliance") {
                                in by hand, or a supervisor that spawns it under
                                a PTY). A client launch uses a pipe and is
                                unaffected either way.
+    YAW_MCP_PROTOCOL              Which MCP protocol eras the stdio server
+                               serves. \`auto\` (default) serves both: a
+                               client that opens with server/discover gets
+                               2026-07-28, one that opens with initialize gets
+                               the 2025 protocol. \`legacy\` serves 2025 only
+                               and answers server/discover method-not-found,
+                               so a probing client falls back to initialize
+                               (the server side of Claude Code's
+                               MCP_PROTOCOL_NEGOTIATION=legacy).
     YAW_MCP_SERVER_CAP            Max concurrently active servers (default 6).
     YAW_MCP_TOOL_TOKEN_CAP        Ceiling on the ESTIMATED tokens of the loaded
                                tool surface, checked alongside SERVER_CAP
@@ -616,7 +625,12 @@ if (subcommand === "compliance") {
                                handshake (default 15000). This is the FALLBACK
                                only -- a server's own \`connectTimeoutMs\` in
                                bundles.json always wins, so one slow server does
-                               not need the global ceiling raised.
+                               not need the global ceiling raised. On a
+                               saturated machine (CPU >= 50% busy over the wait)
+                               a still-running local child gets this deadline
+                               once more, never longer (unknown load, as on
+                               oam/Windows, counts as busy); a per-server
+                               \`connectTimeoutMs\` is never extended.
     MCP_LIST_TIMEOUT              Milliseconds to wait for a server's tool/
                                resource/prompt inventory calls after the
                                handshake (default 15000).

@@ -105,8 +105,17 @@ describe("probeOam default runner", () => {
    *  assertion below into a machine-dependent failure. Nothing is created, so
    *  there is nothing to clean up. */
   const missingBin = join(tmpdir(), `yaw-mcp-no-such-oam-${process.pid}`, "oam");
+  /** The per-binary verdict cache (oam-verdict-cache.ts) is off for every case
+   *  here: these run against the developer's REAL home, and a case that clears
+   *  OAM_BIN resolves the bare `oam` to whatever is on PATH -- so a verdict a
+   *  real broker recorded for that binary would answer the probe before the
+   *  mocked spawn ever ran, and a mocked "oam 9.9.9" must never be recorded
+   *  against a real binary. The cache has its own describe at the bottom, on a
+   *  temp home. */
+  const originalDisablePersistence = process.env.YAW_MCP_DISABLE_PERSISTENCE;
 
   beforeEach(() => {
+    process.env.YAW_MCP_DISABLE_PERSISTENCE = "1";
     spawnCalls.length = 0;
     killed.length = 0;
     unrefed.length = 0;
@@ -127,6 +136,8 @@ describe("probeOam default runner", () => {
     resetOamBinCache();
     if (originalOamBin === undefined) delete process.env.OAM_BIN;
     else process.env.OAM_BIN = originalOamBin;
+    if (originalDisablePersistence === undefined) delete process.env.YAW_MCP_DISABLE_PERSISTENCE;
+    else process.env.YAW_MCP_DISABLE_PERSISTENCE = originalDisablePersistence;
   });
 
   it("spawns `<bin> --version` with stdout piped and stderr off the broker's stdio", async () => {
@@ -426,5 +437,83 @@ describe("probeOam default runner", () => {
     } finally {
       spy.mockRestore();
     }
+  });
+});
+
+describe("probeOam per-binary verdict cache (default runner)", () => {
+  const KEYS = ["HOME", "USERPROFILE", "OAM_BIN", "YAW_MCP_DISABLE_PERSISTENCE"];
+  const saved: Record<string, string | undefined> = {};
+  let home: string;
+
+  beforeEach(async () => {
+    const { mkdtempSync, writeFileSync } = await import("node:fs");
+    for (const k of KEYS) saved[k] = process.env[k];
+    home = mkdtempSync(join(tmpdir(), "yaw-mcp-probe-cache-"));
+    process.env.HOME = home;
+    process.env.USERPROFILE = home;
+    delete process.env.YAW_MCP_DISABLE_PERSISTENCE;
+    // A REAL file, so the binary has an identity to key on; spawn is mocked,
+    // so its contents never run.
+    const bin = join(home, process.platform === "win32" ? "oam.exe" : "oam");
+    writeFileSync(bin, "stand-in");
+    process.env.OAM_BIN = bin;
+    spawnCalls.length = 0;
+    hangForever = false;
+    errorOnStdout = false;
+    spawnThrows = null;
+    childError = null;
+    stdoutChunks = ["oam 9.9.9\n"];
+    exitCode = 0;
+    exitSignal = null;
+    resetOamBinCache();
+  });
+
+  afterEach(async () => {
+    const { rmSync } = await import("node:fs");
+    resetOamBinCache();
+    for (const k of KEYS) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  const cacheFile = () => join(home, ".yaw-mcp", "oam-probe.json");
+  async function waitForCacheFile(): Promise<void> {
+    const { existsSync } = await import("node:fs");
+    for (let i = 0; i < 200 && !existsSync(cacheFile()); i++) await new Promise((r) => setTimeout(r, 10));
+  }
+
+  it("spawns --version once per binary; a later process is answered from the cache", async () => {
+    const first = await probeOam();
+    expect(first.version).toBe("9.9.9");
+    expect(spawnCalls).toHaveLength(1);
+    await waitForCacheFile();
+
+    // A fresh process: nothing in memory, the file on disk.
+    resetOamBinCache();
+    spawnCalls.length = 0;
+    const second = await probeOam();
+    expect(spawnCalls).toHaveLength(0);
+    expect(second.version).toBe("9.9.9");
+    expect(second.bin).toBe(first.bin);
+    expect(second.failure).toBeNull();
+  });
+
+  it("never records a failed probe, so the next process asks again", async () => {
+    exitCode = 1;
+    const first = await probeOam();
+    expect(first.failure).toBe("exit");
+    // Give a (wrong) write every chance to land before checking for it.
+    await new Promise((r) => setTimeout(r, 50));
+    const { existsSync } = await import("node:fs");
+    expect(existsSync(cacheFile())).toBe(false);
+
+    resetOamBinCache();
+    spawnCalls.length = 0;
+    exitCode = 0;
+    const second = await probeOam();
+    expect(spawnCalls).toHaveLength(1);
+    expect(second.version).toBe("9.9.9");
   });
 });

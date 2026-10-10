@@ -24,7 +24,9 @@ import {
   MAX_TOOLS_PER_SERVER,
   resetOamDowngrades,
   resolveTimeoutEnv,
+  SATURATED_CPU_BUSY,
   scrubInternalSecretsFromProcessEnv,
+  setCpuTimesReaderForTests,
   setSessionVaultPassphrase,
   stripInternalSecretsFromEnv,
   VaultPassphraseRequiredError,
@@ -141,6 +143,10 @@ const _sdkBehavior = {
   // EVERY stdio construction, in order -- the boot-probe fallback respawns,
   // so a single "last" slot can't show the oam -> node downgrade sequence.
   stdioConstructions: [] as Array<{ command: string; args: string[]; env?: Record<string, string> }>,
+  // The pid the mock stdio transport reports. undefined (the default) is a
+  // transport with no child, which never earns the load extension of the
+  // connect deadline -- so every pre-existing timeout test is unaffected.
+  stdioPid: undefined as number | undefined,
 };
 
 vi.mock("@modelcontextprotocol/sdk/client/index.js", () => {
@@ -184,7 +190,7 @@ vi.mock("@modelcontextprotocol/sdk/client/stdio.js", () => {
     _sdkBehavior.stdioConstructions.push(opts);
     const emitter = new EventEmitter();
     _sdkBehavior.stderrEmitter = emitter;
-    return { stderr: emitter };
+    return { stderr: emitter, pid: _sdkBehavior.stdioPid };
   }
   return { StdioClientTransport: MockStdioClientTransport };
 });
@@ -4570,5 +4576,141 @@ describe("connectToUpstream progress reporting", () => {
       (m: string) => messages.push(m),
     );
     expect(messages.some((m) => m.includes("did not boot on oam") && m.includes("retrying on node"))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Connect deadline: one load extension for a live child on a saturated box
+// ---------------------------------------------------------------------------
+describe("connectToUpstream handshake deadline under load", () => {
+  /** A CPU-times source whose every window reports `busy` (0..1). */
+  function cpuAt(busy: number) {
+    let t = 0;
+    return () => {
+      t += 1000;
+      return { idle: t * (1 - busy), total: t };
+    };
+  }
+
+  beforeEach(() => {
+    vi.mocked(hasSecretRefs).mockReturnValue(false);
+    _sdkBehavior.clientClose = () => Promise.resolve();
+    _sdkBehavior.clientListTools = () => Promise.resolve({ tools: [] });
+    _sdkBehavior.clientListResources = () => Promise.resolve({ resources: [] });
+    _sdkBehavior.clientListPrompts = () => Promise.resolve({ prompts: [] });
+    _sdkBehavior.stdioPid = 4242;
+    // Earlier suites leave resolveOamSpawn answering with an oam rewrite; an
+    // oam-hosted timeout then respawns on node and doubles every deadline
+    // these cases measure. Plain node spawns only.
+    vi.mocked(resolveOamSpawn).mockReset();
+    vi.mocked(resolveOamSpawn).mockImplementation(async (command: string, args: string[]) => ({ command, args }));
+    resetOamDowngrades();
+    vi.mocked(defaultRuntime).mockResolvedValue(null);
+    vi.mocked(log).mockClear();
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    setCpuTimesReaderForTests();
+    _sdkBehavior.stdioPid = undefined;
+    vi.clearAllMocks();
+  });
+
+  /** A child that answers initialize after `ms` (or never, for Infinity). */
+  function answersAfter(ms: number) {
+    _sdkBehavior.clientConnect = () =>
+      new Promise<void>((resolve) => {
+        if (Number.isFinite(ms)) setTimeout(resolve, ms);
+      });
+  }
+
+  it("lets a live child on a saturated machine finish past the default deadline", async () => {
+    setCpuTimesReaderForTests(cpuAt(0.95));
+    answersAfter(20_000);
+    const connecting = connectToUpstream(makeLocalConfig({ namespace: "fetch" }));
+    const done = expect(connecting).resolves.toMatchObject({ status: "connected" });
+    await vi.advanceTimersByTimeAsync(20_000);
+    await done;
+    const extended = vi.mocked(log).mock.calls.find(([, msg]) => String(msg).startsWith("Handshake deadline extended"));
+    expect(extended?.[2]).toMatchObject({ namespace: "fetch", waitedMs: 15_000, deadlineMs: 30_000 });
+  });
+
+  it("still fails a hung child, at twice the deadline and no later, and says why it waited", async () => {
+    setCpuTimesReaderForTests(cpuAt(0.95));
+    answersAfter(Number.POSITIVE_INFINITY);
+    let settledAt: number | null = null;
+    const start = Date.now();
+    const connecting = connectToUpstream(makeLocalConfig({ namespace: "fetch" })).finally(() => {
+      settledAt = Date.now() - start;
+    });
+    const failed = expect(connecting).rejects.toMatchObject({ category: "init_timeout" });
+    await vi.advanceTimersByTimeAsync(29_999);
+    expect(settledAt).toBeNull();
+    await vi.advanceTimersByTimeAsync(1);
+    await failed;
+    expect(settledAt).toBe(30_000);
+    await expect(connecting).rejects.toThrow(
+      /didn't complete the MCP handshake within 30s \(including one extension for a slow start\)/,
+    );
+  });
+
+  it("does not extend on an idle machine: a quiet box's 15s silence is a hang", async () => {
+    setCpuTimesReaderForTests(cpuAt(SATURATED_CPU_BUSY - 0.2));
+    answersAfter(20_000);
+    const connecting = connectToUpstream(makeLocalConfig({ namespace: "fetch" }));
+    const failed = expect(connecting).rejects.toThrow(/within 15s\./);
+    await vi.advanceTimersByTimeAsync(15_000);
+    await failed;
+  });
+
+  it("honours a per-server connectTimeoutMs exactly, load or not", async () => {
+    setCpuTimesReaderForTests(cpuAt(1));
+    answersAfter(Number.POSITIVE_INFINITY);
+    const connecting = connectToUpstream(makeLocalConfig({ namespace: "fetch", connectTimeoutMs: 1_000 }));
+    const failed = expect(connecting).rejects.toThrow(/within 1s\./);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await failed;
+  });
+
+  it("extends a live child once when the runtime reports no CPU load (oam on Windows), still capped at 2x", async () => {
+    // oam 0.18.0 on Windows returns every os.cpus() time as 0: no window, no
+    // reading. Unknown load must not read as idle, or the extension never
+    // fires on the runtime the failures were measured on.
+    setCpuTimesReaderForTests(() => ({ idle: 0, total: 0 }));
+    answersAfter(20_000);
+    const connecting = connectToUpstream(makeLocalConfig({ namespace: "fetch" }));
+    const done = expect(connecting).resolves.toMatchObject({ status: "connected" });
+    await vi.advanceTimersByTimeAsync(20_000);
+    await done;
+    const extended = vi.mocked(log).mock.calls.find(([, msg]) => String(msg).startsWith("Handshake deadline extended"));
+    expect(String(extended?.[1])).toContain("reports no CPU load");
+    expect(extended?.[2]).toMatchObject({ namespace: "fetch", deadlineMs: 30_000, cpuBusy: null });
+
+    vi.mocked(log).mockClear();
+    answersAfter(Number.POSITIVE_INFINITY);
+    const hung = connectToUpstream(makeLocalConfig({ namespace: "fetch" }));
+    const failed = expect(hung).rejects.toThrow(/within 30s \(including one extension for a slow start\)/);
+    await vi.advanceTimersByTimeAsync(30_000);
+    await failed;
+  });
+
+  it("does not extend a transport with no child process", async () => {
+    setCpuTimesReaderForTests(cpuAt(1));
+    _sdkBehavior.stdioPid = undefined;
+    answersAfter(Number.POSITIVE_INFINITY);
+    const connecting = connectToUpstream(makeLocalConfig({ namespace: "fetch" }));
+    const failed = expect(connecting).rejects.toThrow(/within 15s\./);
+    await vi.advanceTimersByTimeAsync(15_000);
+    await failed;
+  });
+});
+
+describe("cpuBusyFraction", () => {
+  it("is the non-idle share of the window, clamped, and null for an empty window", async () => {
+    const { cpuBusyFraction } = await import("../upstream.js");
+    expect(cpuBusyFraction({ idle: 0, total: 0 }, { idle: 250, total: 1000 })).toBe(0.75);
+    expect(cpuBusyFraction({ idle: 10, total: 100 }, { idle: 10, total: 100 })).toBeNull();
+    expect(cpuBusyFraction({ idle: 0, total: 0 }, { idle: 2000, total: 1000 })).toBe(0);
   });
 });

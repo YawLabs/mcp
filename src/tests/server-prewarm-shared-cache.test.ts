@@ -224,4 +224,58 @@ describe("persisted pre-warm failures", () => {
       "warn: tools unknown, startup pre-warm failed 5m ago: daemon not running; activate it to retry",
     );
   });
+
+  it("discover flags a served list as possibly stale when its config-changed re-learn is backed off", () => {
+    const old = makeServerConfig();
+    const cfg = makeServerConfig({ args: V2_ARGS });
+    priv.config = { servers: [cfg], configVersion: "v1" };
+    priv.hydrateToolCache({
+      gh: { tools: [{ name: "old_tool" }], learnedAt: Date.now(), configKey: toolCacheConfigKey(old) },
+    });
+    priv.hydratePrewarmFailures({
+      gh: { failedAt: Date.now() - 5 * 60_000, configKey: toolCacheConfigKey(cfg), message: "no such image" },
+    });
+
+    const text = priv
+      .handleDiscover()
+      .content.map((c: { text: string }) => c.text)
+      .join("\n");
+
+    expect(text).toContain(
+      "warn: tools listed may be stale (learned under a previous config); re-learn failed 5m ago: no such image; activate it to retry",
+    );
+    // The sweep will not spawn it, so nothing waits on it.
+    expect(priv.prewarmStillLearning()).toBe(false);
+  });
+
+  it("a shutdown mid-sweep is a refusal, not the server's failure: nothing is banked for other panes", async () => {
+    const cfg = makeServerConfig();
+    priv.config = { servers: [cfg], configVersion: "v1" };
+    let release: () => void = () => {};
+    vi.mocked(connectToUpstream).mockImplementationOnce(
+      () =>
+        new Promise<UpstreamConnection>((resolve) => {
+          release = () => resolve(makeConnection("gh", ["get_me"]));
+        }),
+    );
+
+    const sweep = priv.prewarmDormantServers();
+    await vi.waitFor(() => expect(connectToUpstream).toHaveBeenCalledTimes(1));
+    const closing = server.shutdown();
+    release();
+    await Promise.all([sweep, closing]);
+
+    expect(priv.exportPrewarmFailures()).toEqual({});
+  });
+
+  it("a spawn-gate refusal (disabled entry) is not banked as a failure either", async () => {
+    const cfg = makeServerConfig({ isActive: false });
+    priv.config = { servers: [cfg], configVersion: "v1" };
+
+    const result = await priv.activateOne("gh", undefined, true);
+
+    expect(result.ok).toBe(false);
+    expect(result.refused).toBe(true);
+    expect(connectToUpstream).not.toHaveBeenCalled();
+  });
 });

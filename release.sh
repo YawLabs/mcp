@@ -95,8 +95,9 @@
 #                                    reads 0 as never).
 #   SKIP_OAM_FLOOR_VERIFY=1          DISABLES THE OAM FLOOR GATE -- step 1's
 #                                    `npm run verify:oam-floor`, which hosts a
-#                                    stdio @modelcontextprotocol/sdk server on
-#                                    this machine's oam through `oam run` and
+#                                    stdio @modelcontextprotocol/server server
+#                                    on both protocol eras on this machine's
+#                                    oam through `oam run` and
 #                                    fails when oam is absent, cannot host it,
 #                                    or is below MIN_OAM_VERSION. A last resort
 #                                    for a release that has to go out from a
@@ -1150,9 +1151,10 @@ step 1 "Lint + typecheck + tests + oam floor"
 run_npm_check "Lint" lint 'Found [0-9]+ error' 'Checked [1-9][0-9]* files'  # done_re is live on the exit-0 path: biome's "Checked N files" summary must appear, with N >= 1, or the gate fails on silence -- "Checked 0 files" is biome handed only ignored paths, the very shape the guard exists for. On the 139/134 path it is inert -- the lint-crash guard hard-fails before the ARM64 tolerance block that would read it.
 run_npm_check "Type check" typecheck 'error TS[0-9]' '' 'npx tsc --noEmit'
 # >>> oam floor gate
-# scripts/verify-oam-floor.mjs hosts a stdio @modelcontextprotocol/sdk server
-# on THIS machine's oam through `oam run`, completes initialize + tools/list +
-# tools/call, and fails when oam is absent, cannot host it, or is below
+# scripts/verify-oam-floor.mjs hosts a stdio @modelcontextprotocol/server
+# server on THIS machine's oam through `oam run`, completes both protocol eras
+# (2025-11-25 initialize, 2026-07-28 server/discover; each + tools/list +
+# tools/call), and fails when oam is absent, cannot host it, or is below
 # MIN_OAM_VERSION. It reads nothing from GitHub and moves nothing: the floor is
 # the last release that check passed on, and only `npm run verify:oam-floor --
 # --raise`, run by hand and committed like any other change, raises it. Until

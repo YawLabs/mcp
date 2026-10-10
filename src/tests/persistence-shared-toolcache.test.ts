@@ -2,8 +2,9 @@
 // machine. Each Claude Code / typed pane starts its own yaw-mcp, so state.json
 // is written by many processes; these pin that (a) the launch-config
 // fingerprint and upstream version survive the round trip, (b) a pre-warm
-// failure is persisted and expires, and (c) a save merges with the file
-// instead of letting an older broker's snapshot erase a newer list.
+// failure is persisted and expires, and (c) a broker's merging save
+// (StateSync) lands its delta on top of the file instead of letting an older
+// broker's snapshot erase a newer list or resurrect a cleared failure.
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,13 +12,25 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   loadState,
   mergePrewarmFailures,
-  mergeToolCaches,
   PREWARM_FAILURE_BACKOFF_MS,
   PREWARM_FAILURE_MAX_MESSAGE_CHARS,
+  type SavableState,
   STATE_SCHEMA_VERSION,
+  StateSync,
   saveState,
   TOOLCACHE_MAX_META_CHARS,
 } from "../persistence.js";
+
+/** One broker's save: it hydrated `baseline` at startup and holds `current`
+ *  now, so `current - baseline` is what it lands on top of the file. */
+function brokerSave(file: string, baseline: SavableState, current: SavableState): Promise<boolean> {
+  const sync = new StateSync(
+    { exportCurrent: () => current, applyMerged: () => {} },
+    { filePath: file, lock: { lockWaitMs: 200 } },
+  );
+  sync.setBaseline(baseline);
+  return sync.save();
+}
 
 describe("shared tool cache persistence", () => {
   let dir: string;
@@ -108,33 +121,31 @@ describe("shared tool cache persistence", () => {
     expect(Object.keys((await loadState(file)).prewarmFailures ?? {})).toEqual(["fresh"]);
   });
 
-  describe("mergeWithDisk", () => {
+  describe("a broker's merging save (StateSync)", () => {
     it("keeps a NEWER list another broker wrote instead of overwriting it with an older snapshot", async () => {
       const now = Date.now();
+      const oldGithub = { tools: [{ name: "old_tool" }], learnedAt: now - 60_000 };
       // Broker A (started later) learned github and wrote it.
       await saveState(
         { learning: {}, packHistory: [], toolCache: { github: { tools: [{ name: "get_me" }], learnedAt: now } } },
         file,
       );
-      // Broker B hydrated before that, refreshed fetch, and flushes ITS snapshot.
-      await saveState(
-        {
-          learning: {},
-          packHistory: [],
-          toolCache: {
-            github: { tools: [{ name: "old_tool" }], learnedAt: now - 60_000 },
-            fetch: { tools: [{ name: "fetch" }], learnedAt: now },
-          },
-        },
-        file,
-        { mergeWithDisk: true },
-      );
+      // Broker B hydrated the old github list before that, then learned
+      // fetch -- with its fingerprint -- and flushes.
+      const fetch = { tools: [{ name: "fetch" }], learnedAt: now, configKey: "f1", serverVersion: "1.2.3" };
+      expect(
+        await brokerSave(
+          file,
+          { learning: {}, packHistory: [], toolCache: { github: oldGithub } },
+          { learning: {}, packHistory: [], toolCache: { github: oldGithub, fetch } },
+        ),
+      ).toBe(true);
       const loaded = await loadState(file);
       expect(loaded.toolCache.github.tools).toEqual([{ name: "get_me" }]);
-      expect(loaded.toolCache.fetch.tools).toEqual([{ name: "fetch" }]);
+      expect(loaded.toolCache.fetch).toEqual(fetch);
     });
 
-    it("without the option a save still replaces the cache (the caller owns the snapshot)", async () => {
+    it("saveState (not a broker) still replaces the cache: the caller owns the snapshot", async () => {
       const now = Date.now();
       await saveState(
         { learning: {}, packHistory: [], toolCache: { github: { tools: [{ name: "get_me" }], learnedAt: now } } },
@@ -154,33 +165,51 @@ describe("shared tool cache persistence", () => {
         },
         file,
       );
-      await saveState(
-        { learning: {}, packHistory: [], toolCache: { github: { tools: [{ name: "get_me" }], learnedAt: now } } },
+      await brokerSave(
         file,
-        { mergeWithDisk: true },
+        { learning: {}, packHistory: [] },
+        { learning: {}, packHistory: [], toolCache: { github: { tools: [{ name: "get_me" }], learnedAt: now } } },
       );
       const loaded = await loadState(file);
       expect(loaded.prewarmFailures).toBeUndefined();
       expect(loaded.toolCache.github.tools).toEqual([{ name: "get_me" }]);
     });
 
-    it("an unreadable (corrupt) file merges as empty: the writer's snapshot lands", async () => {
+    it("lands a failure this broker recorded, but not one it only hydrated and another broker since cleared", async () => {
+      const now = Date.now();
+      const hydrated = { failedAt: now - 30_000, configKey: "k", message: "docker down" };
+      const recorded = { failedAt: now, configKey: "k2", message: "no binary" };
+      // The file no longer carries the github failure (another broker's save
+      // dropped it); only this broker's stale copy remembers it.
+      await saveState({ learning: {}, packHistory: [] }, file);
+      await brokerSave(
+        file,
+        { learning: {}, packHistory: [], prewarmFailures: { github: hydrated } },
+        { learning: {}, packHistory: [], prewarmFailures: { github: hydrated, fetch: recorded } },
+      );
+      expect((await loadState(file)).prewarmFailures).toEqual({ fetch: recorded });
+    });
+
+    it("a corrupt (unparseable) file is replaced by the broker's full view, hydrated failures included", async () => {
       writeFileSync(file, "{ not json");
       const now = Date.now();
-      await saveState({ learning: {}, packHistory: [], toolCache: { a: { tools: [], learnedAt: now } } }, file, {
-        mergeWithDisk: true,
-      });
-      expect((await loadState(file)).toolCache).toEqual({ a: { tools: [], learnedAt: now } });
+      // The start-over branch has no baseline to subtract, so a failure this
+      // broker only hydrated lands too -- the file carries nothing else.
+      const hydrated = { failedAt: now - 30_000, configKey: "k", message: "docker down" };
+      await brokerSave(
+        file,
+        { learning: {}, packHistory: [], prewarmFailures: { github: hydrated } },
+        {
+          learning: {},
+          packHistory: [],
+          toolCache: { a: { tools: [], learnedAt: now } },
+          prewarmFailures: { github: hydrated },
+        },
+      );
+      const loaded = await loadState(file);
+      expect(loaded.toolCache).toEqual({ a: { tools: [], learnedAt: now } });
+      expect(loaded.prewarmFailures).toEqual({ github: hydrated });
     });
-  });
-
-  it("mergeToolCaches: newer learnedAt wins per namespace, ours wins a tie", () => {
-    const merged = mergeToolCaches(
-      { a: { tools: [{ name: "ours" }], learnedAt: 5 }, b: { tools: [{ name: "ours" }], learnedAt: 1 } },
-      { a: { tools: [{ name: "disk" }], learnedAt: 5 }, b: { tools: [{ name: "disk" }], learnedAt: 2 } },
-    );
-    expect(merged.a.tools[0].name).toBe("ours");
-    expect(merged.b.tools[0].name).toBe("disk");
   });
 
   it("mergePrewarmFailures: newer failure wins; a list learned at or after it supersedes it", () => {

@@ -1,8 +1,8 @@
 // Cross-session persistence for session-scoped signal (learning +
 // detected packs + learned tool lists). Stored at `~/.yaw-mcp/state.json`.
-// Functions with no state of their own except `saveChain` (see saveState),
-// which serializes every save in this process -- ConnectServer owns the
-// load/save lifecycle.
+// Functions with no state of their own except `saveChain`, which serializes
+// every save in this process; StateSync carries the per-process baseline a
+// merging save needs. ConnectServer owns the load/save lifecycle.
 //
 // Design principles:
 //   - Silent failure. A corrupt or unreadable state file must never
@@ -27,10 +27,14 @@
 //     state.json without limit.
 //   - Atomic writes. Write-rename so a crash mid-flush can't leave
 //     half-written JSON where the loader would see garbage.
+//   - Concurrent writers merge. Every yaw-mcp pane saves the same file, so a
+//     save takes a cross-process lock, re-reads, and merges its own delta in
+//     (see StateSync) rather than overwriting other panes' learning.
 
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { atomicWriteFile } from "./atomic-write.js";
+import { type FileLockOptions, FileLockTimeoutError, withFileLock } from "./file-lock.js";
 import { setJsonKey } from "./json-key.js";
 import { log } from "./logger.js";
 import { userConfigDir } from "./paths.js";
@@ -331,69 +335,114 @@ function countRawEntries(input: unknown): number {
   return Array.isArray(input) ? input.length : Object.keys(input).length;
 }
 
-// In-process serializer. Two saveState calls debounced too close in time
-// would otherwise race -- both would mkdir, both would write to distinct
-// .tmp- files (the pid-timestamp suffix makes the temp names unique),
-// and both would rename onto the same target. Atomic-rename means we
-// never see torn JSON, but the loser's increments are silently dropped.
-// Chaining via this promise serializes the writes -- ONE chain for every
-// path, not one per path: the only file anything saves is ~/.yaw-mcp/
-// state.json, so per-path granularity would buy nothing. The .catch reset
-// keeps a failed save from poisoning the chain for subsequent callers.
+// Two layers of serialization guard every save.
 //
-// The cross-process race (two yaw-mcp instances writing the same file) is
-// a separate problem that needs an OS-level file lock; not handled here.
+// IN-PROCESS: `saveChain`. Two saves debounced too close in time would
+// otherwise interleave their read-merge-write steps. ONE chain for every
+// path, not one per path: the only file anything saves is ~/.yaw-mcp/
+// state.json, so per-path granularity would buy nothing. A failed save does
+// not poison the chain for subsequent callers.
+//
+// CROSS-PROCESS: the sidecar lock in file-lock.ts (`state.json.lock`, O_EXCL
+// take, stale takeover by rename after STATE_LOCK_STALE_MS, ownership-checked
+// release). Every running `yaw-mcp serve` -- one per MCP client pane -- saves
+// this same file, and each used to publish the whole document from the
+// snapshot it loaded at startup: pane A loads, pane B loads, B saves its
+// calls, A saves and B's calls are gone. Now every save takes the lock,
+// RE-READS state.json, merges this process's changes into what is on disk,
+// writes atomically (tmp+rename) and releases. See StateSync for the merge.
+//
+// The lock wait is short (STATE_LOCK_WAIT_MS) because a save also runs on
+// shutdown, under index.ts's 10s force-exit timer. A wait that runs out is
+// NOT a lost save: StateSync keeps its delta and lands it on the next save.
 let saveChain: Promise<void> = Promise.resolve();
 
-// Save persisted state to disk atomically. Best-effort -- failures log
-// but never throw, since a missing save shouldn't crash the session.
-// `toolCache` is optional so the many callers that only carry learning +
-// pack history (tests, and any future partial writer) keep compiling; an
-// omitted cache persists as `{}` rather than silently preserving whatever
-// was on disk -- the caller always owns the full snapshot.
-export type SavableState = Pick<PersistedState, "learning" | "packHistory"> &
-  Partial<Pick<PersistedState, "toolCache" | "prewarmFailures">>;
-
-export interface SaveStateOptions {
-  /** Merge the tool cache and pre-warm failures with what is ON DISK before
-   *  writing, instead of replacing them. Every Claude Code / typed pane runs
-   *  its own broker, each hydrated once at ITS start, so a plain replace is
-   *  last-writer-wins across processes: a broker started before another one
-   *  learned (or refreshed) a server writes its older snapshot back and
-   *  erases the newer list -- and the next pane's broker re-spawns that
-   *  server to learn it again. The merge keeps, per namespace, the entry
-   *  with the newer timestamp, and drops a failure that a newer learned
-   *  list supersedes. Learning and pack history are NOT merged (still the
-   *  writer's snapshot). The read-merge-write is serialized within this
-   *  process (saveChain) but not across processes; two brokers flushing in
-   *  the same few milliseconds can still lose one entry, which the next
-   *  flush or pre-warm repairs. */
-  mergeWithDisk?: boolean;
-}
-
-export function saveState(
-  state: SavableState,
-  filePath: string = statePath(),
-  options: SaveStateOptions = {},
-): Promise<void> {
-  const next = saveChain.then(() => doSaveState(state, filePath, options));
-  saveChain = next.catch(() => undefined);
+function chained<T>(fn: () => Promise<T>): Promise<T> {
+  const next = saveChain.then(fn);
+  saveChain = next.then(
+    () => undefined,
+    () => undefined,
+  );
   return next;
 }
 
-/** Per namespace, the newer of the two tool-cache entries (by learnedAt);
- *  `ours` wins a tie. Exported for tests. */
-export function mergeToolCaches(
-  ours: Record<string, PersistedToolCacheEntry>,
-  disk: Record<string, PersistedToolCacheEntry>,
-): Record<string, PersistedToolCacheEntry> {
-  const out: Record<string, PersistedToolCacheEntry> = {};
-  for (const [ns, entry] of Object.entries(disk)) setJsonKey(out, ns, entry);
-  for (const [ns, entry] of Object.entries(ours)) {
-    const other = Object.hasOwn(out, ns) ? out[ns] : undefined;
-    if (other === undefined || entry.learnedAt >= other.learnedAt) setJsonKey(out, ns, entry);
-  }
-  return out;
+/** How long a save waits on another process's live lock. The critical
+ *  section is one read and one atomic write -- milliseconds -- so this is
+ *  generous for real contention while still bounding a shutdown flush. */
+export const STATE_LOCK_WAIT_MS = 1_500;
+/** Age past which a state.json.lock is abandoned (crashed holder). */
+export const STATE_LOCK_STALE_MS = 10_000;
+
+function stateLockTimeoutMessage(lockPath: string, heldMs: number | null): string {
+  const held = heldMs === null ? "" : ` for ${Math.round(heldMs / 1000)}s`;
+  return `state.json is locked by another yaw-mcp process (${lockPath}, held${held})`;
+}
+
+// What a caller hands a save. `toolCache` and `prewarmFailures` are optional
+// so the many callers that only carry learning + pack history (tests, and any
+// future partial writer) keep compiling.
+export type SavableState = Pick<PersistedState, "learning" | "packHistory"> &
+  Partial<Pick<PersistedState, "toolCache" | "prewarmFailures">>;
+
+/**
+ * OVERWRITE state.json with `state`, under the cross-process lock. The caller
+ * owns the WHOLE document: an omitted cache persists as `{}`, and whatever
+ * another process saved is replaced. That is the right primitive for a writer
+ * that genuinely means "this is the file now" (tests seeding a fixture) and
+ * the wrong one for a running broker -- `yaw-mcp serve` saves through
+ * StateSync, which merges instead. Best-effort: failures log but never throw.
+ */
+export function saveState(
+  state: SavableState,
+  filePath: string = statePath(),
+  lock: FileLockOptions = {},
+): Promise<void> {
+  return chained(async () => {
+    try {
+      await withFileLock(filePath, lockOptions(lock), stateLockTimeoutMessage, () =>
+        writeStatePayload(buildPayload(state), filePath),
+      );
+    } catch (err) {
+      log("warn", "Failed to save yaw-mcp state", { error: errorMessage(err) });
+    }
+  });
+}
+
+function lockOptions(lock: FileLockOptions): FileLockOptions {
+  return {
+    lockWaitMs: lock.lockWaitMs ?? STATE_LOCK_WAIT_MS,
+    lockStaleMs: lock.lockStaleMs ?? STATE_LOCK_STALE_MS,
+    lockTransientMs: lock.lockTransientMs,
+  };
+}
+
+function buildPayload(state: SavableState): PersistedState {
+  return {
+    version: STATE_SCHEMA_VERSION,
+    savedAt: Date.now(),
+    // Sanitize on the way out too: the caps must hold for the bytes we
+    // WRITE, not merely for what a later load is willing to read back, and
+    // they hold for every section -- not only the tool cache -- so the bound
+    // on the file is this module's guarantee rather than each writer's.
+    learning: capLearning(sanitizeLearning(state.learning)),
+    packHistory: capPackHistory(sanitizePackHistory(state.packHistory)),
+    toolCache: sanitizeToolCache(state.toolCache),
+    ...withPrewarmFailures(sanitizePrewarmFailures(state.prewarmFailures)),
+  };
+}
+
+async function writeStatePayload(payload: PersistedState, filePath: string): Promise<void> {
+  await atomicWriteFile(filePath, JSON.stringify(payload, null, 2));
+}
+
+/** The sections a merge works on. The first three are always present;
+ *  `prewarmFailures` keeps the file's absent-when-empty shape (see
+ *  withPrewarmFailures), so a PersistedState is a StateSections as-is. */
+export interface StateSections {
+  learning: Record<string, PersistedLearningUsage>;
+  packHistory: PersistedPackCall[];
+  toolCache: Record<string, PersistedToolCacheEntry>;
+  prewarmFailures?: Record<string, PersistedPrewarmFailure>;
 }
 
 /** Union of two failure maps (newer failedAt wins), minus every failure a
@@ -408,48 +457,248 @@ export function mergePrewarmFailures(
   const merged: Record<string, PersistedPrewarmFailure> = {};
   for (const [ns, f] of Object.entries(disk)) setJsonKey(merged, ns, f);
   for (const [ns, f] of Object.entries(ours)) {
-    const other = Object.hasOwn(merged, ns) ? merged[ns] : undefined;
+    const other = ownValue(merged, ns);
     if (other === undefined || f.failedAt >= other.failedAt) setJsonKey(merged, ns, f);
   }
   const out: Record<string, PersistedPrewarmFailure> = {};
   for (const [ns, f] of Object.entries(merged)) {
-    const learned = Object.hasOwn(toolCache, ns) ? toolCache[ns] : undefined;
+    const learned = ownValue(toolCache, ns);
     if (learned !== undefined && learned.learnedAt >= f.failedAt) continue;
     setJsonKey(out, ns, f);
   }
   return out;
 }
 
-async function doSaveState(state: SavableState, filePath: string, options: SaveStateOptions): Promise<void> {
-  let toolCache = sanitizeToolCache(state.toolCache);
-  let prewarmFailures = sanitizePrewarmFailures(state.prewarmFailures);
-  if (options.mergeWithDisk) {
-    // loadStateClassified, not loadState: a file that cannot be read right
-    // now merges as empty -- this writer's snapshot alone, which is exactly
-    // what a save without the merge writes.
-    const { state: onDisk } = await loadStateClassified(filePath);
-    toolCache = sanitizeToolCache(mergeToolCaches(toolCache, onDisk.toolCache));
-    prewarmFailures = sanitizePrewarmFailures(
-      mergePrewarmFailures(prewarmFailures, onDisk.prewarmFailures ?? {}, toolCache),
-    );
+function ownValue<V>(map: Record<string, V>, key: string): V | undefined {
+  return Object.hasOwn(map, key) ? map[key] : undefined;
+}
+
+function packKey(c: PersistedPackCall): string {
+  return `${c.namespace}\u0000${c.toolName}\u0000${c.at}`;
+}
+
+function countKeys(calls: readonly PersistedPackCall[]): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const c of calls) counts.set(packKey(c), (counts.get(packKey(c)) ?? 0) + 1);
+  return counts;
+}
+
+/** Decrement `key` in `counts`; true when there was one to take. */
+function takeOne(counts: Map<string, number>, key: string): boolean {
+  const n = counts.get(key) ?? 0;
+  if (n === 0) return false;
+  counts.set(key, n - 1);
+  return true;
+}
+
+/**
+ * `disk + (current - baseline)`: apply what changed in this process since
+ * `baseline` (the view it last loaded or saved) on top of `disk` (what is in
+ * the file NOW, other processes' saves included). Pure; exported for tests.
+ *
+ * Why a delta and not a sum: `current` already CONTAINS `baseline` -- the
+ * in-memory store was seeded from the file at startup -- so adding current
+ * totals to disk totals would count every pre-existing observation twice.
+ *
+ *   - learning: dispatched/succeeded add the delta (succeeded may move DOWN:
+ *     the reward grader revises credit with a negative adjustSucceeded), then
+ *     clamp to the store's invariants (>= 0, succeeded <= dispatched);
+ *     lastUsedAt takes the max. A namespace this process did not touch is
+ *     left exactly as the disk has it -- including ABSENT, so a row another
+ *     writer removed (`yaw-mcp reset-learning` deleting the file) is not
+ *     resurrected from this process's stale copy.
+ *   - packHistory: the entries in `current` that `baseline` did not have
+ *     (multiset by namespace+tool+timestamp) are appended to the disk list,
+ *     skipping any already on disk so a retried save is idempotent; then
+ *     stable-sorted by time and capped at PACK_HISTORY_MAX_ENTRIES, newest
+ *     kept. Entries the in-memory ring EVICTED are not deletions.
+ *   - toolCache: per namespace, the newer `learnedAt` wins. A namespace this
+ *     process did not re-learn since `baseline` is not written back over an
+ *     absent disk entry, for the same no-resurrection reason as learning.
+ *
+ * Also used the other way round to refresh the in-memory view after a save:
+ * `mergeStateDelta(written, snapshotSaved, memoryNow)` is "what is on disk
+ * now, plus anything recorded while the save was in flight".
+ */
+export function mergeStateDelta(disk: StateSections, baseline: SavableState, current: SavableState): StateSections {
+  const learning: Record<string, PersistedLearningUsage> = {};
+  for (const [ns, u] of Object.entries(disk.learning)) setJsonKey(learning, ns, { ...u });
+  for (const [ns, cur] of Object.entries(current.learning)) {
+    const base = ownValue(baseline.learning, ns);
+    const dDispatched = cur.dispatched - (base?.dispatched ?? 0);
+    const dSucceeded = cur.succeeded - (base?.succeeded ?? 0);
+    const touched = dDispatched !== 0 || dSucceeded !== 0 || cur.lastUsedAt > (base?.lastUsedAt ?? -1);
+    if (!touched) continue;
+    const prev = ownValue(learning, ns) ?? { dispatched: 0, succeeded: 0, lastUsedAt: 0 };
+    const dispatched = Math.max(0, prev.dispatched + dDispatched);
+    const succeeded = Math.min(dispatched, Math.max(0, prev.succeeded + dSucceeded));
+    setJsonKey(learning, ns, { dispatched, succeeded, lastUsedAt: Math.max(prev.lastUsedAt, cur.lastUsedAt) });
   }
-  const payload: PersistedState = {
-    version: STATE_SCHEMA_VERSION,
-    savedAt: Date.now(),
-    // Sanitize on the way out too: the caps must hold for the bytes we
-    // WRITE, not merely for what a later load is willing to read back, and
-    // they hold for every section -- not only the tool cache -- so the bound
-    // on the file is this module's guarantee rather than each writer's.
-    learning: capLearning(sanitizeLearning(state.learning)),
-    packHistory: capPackHistory(sanitizePackHistory(state.packHistory)),
-    toolCache,
-    ...withPrewarmFailures(prewarmFailures),
-  };
-  try {
-    await atomicWriteFile(filePath, JSON.stringify(payload, null, 2));
-  } catch (err) {
-    log("warn", "Failed to save yaw-mcp state", { error: errorMessage(err) });
+
+  const inBaseline = countKeys(baseline.packHistory);
+  const onDisk = countKeys(disk.packHistory);
+  const packHistory: PersistedPackCall[] = disk.packHistory.map((c) => ({ ...c }));
+  for (const c of current.packHistory) {
+    const k = packKey(c);
+    if (takeOne(inBaseline, k) || takeOne(onDisk, k)) continue;
+    packHistory.push({ namespace: c.namespace, toolName: c.toolName, at: c.at });
   }
+  // Stable: equal timestamps keep disk-then-new order.
+  packHistory.sort((a, b) => a.at - b.at);
+
+  const toolCache: Record<string, PersistedToolCacheEntry> = {};
+  for (const [ns, e] of Object.entries(disk.toolCache)) setJsonKey(toolCache, ns, e);
+  for (const [ns, cur] of Object.entries(current.toolCache ?? {})) {
+    const diskEntry = ownValue(toolCache, ns);
+    if (diskEntry !== undefined) {
+      if (cur.learnedAt > diskEntry.learnedAt) setJsonKey(toolCache, ns, cur);
+      continue;
+    }
+    const base = ownValue(baseline.toolCache ?? {}, ns);
+    if (base === undefined || cur.learnedAt > base.learnedAt) setJsonKey(toolCache, ns, cur);
+  }
+
+  // Pre-warm failures follow the tool cache's rule: a failure this process
+  // recorded since `baseline` is new to the file; one it merely carried from
+  // its own hydration is not written back over an absent disk entry. Then
+  // every failure a learned list (from any process) supersedes is dropped.
+  const ourFailures: Record<string, PersistedPrewarmFailure> = {};
+  for (const [ns, cur] of Object.entries(current.prewarmFailures ?? {})) {
+    const base = ownValue(baseline.prewarmFailures ?? {}, ns);
+    if (base === undefined || cur.failedAt > base.failedAt) setJsonKey(ourFailures, ns, cur);
+  }
+  const prewarmFailures = mergePrewarmFailures(ourFailures, disk.prewarmFailures ?? {}, toolCache);
+
+  return { learning, packHistory: capPackHistory(packHistory), toolCache, ...withPrewarmFailures(prewarmFailures) };
+}
+
+/** Hooks a StateSync drives: read this process's live view, and replace it. */
+export interface StateSyncHooks {
+  /** Snapshot this process's current in-memory state. Called synchronously
+   *  inside the lock, so it must not await. */
+  exportCurrent(): SavableState;
+  /** Replace this process's in-memory learning and pack history with the
+   *  merged view (what is on disk now plus anything recorded while the save
+   *  was in flight). The merged toolCache and prewarmFailures are offered
+   *  too, but StateSync assumes they are NOT adopted: its baseline for those
+   *  sections stays this process's own last export. */
+  applyMerged(merged: StateSections): void;
+}
+
+export interface StateSyncOptions {
+  /** Defaults to statePath(), resolved at each save (not at construction),
+   *  matching what saveState's default argument always did. */
+  filePath?: string;
+  lock?: FileLockOptions;
+}
+
+/**
+ * Merging saver for a long-running process (`yaw-mcp serve`). Holds the
+ * BASELINE -- the state this process last loaded from or wrote to disk -- so
+ * each save sends only its delta (see mergeStateDelta) instead of overwriting
+ * the file with a snapshot that is missing other processes' work.
+ *
+ * One save: take the in-process chain, take the cross-process lock, re-read
+ * state.json, snapshot memory, merge, write atomically, release; then refresh
+ * memory from the merged result (so this pane sees other panes' learning) and
+ * make the written state the new baseline.
+ *
+ * The baseline describes THIS process's memory, never the file, so any other
+ * writer -- another pane, a saveState overwrite, reset-learning deleting the
+ * file -- is just "what is on disk now" to the next merge.
+ *
+ * A save that cannot complete -- the lock wait ran out, the re-read hit a
+ * transient read error, the write failed -- logs ONE line and leaves the
+ * baseline where it was, so the whole pending delta rides on the next save.
+ * Nothing is dropped and nothing is counted twice. save() never throws.
+ */
+export class StateSync {
+  private baseline: SavableState = { learning: {}, packHistory: [], toolCache: {} };
+  private readonly filePath: string | undefined;
+  private readonly lock: FileLockOptions;
+  private readonly hooks: StateSyncHooks;
+
+  constructor(hooks: StateSyncHooks, opts: StateSyncOptions = {}) {
+    this.hooks = hooks;
+    this.filePath = opts.filePath;
+    this.lock = opts.lock ?? {};
+  }
+
+  /** Record what this process loaded at startup. Pass the in-memory view
+   *  AFTER hydration (the stores apply their own caps and sorting), not the
+   *  raw file, or the first delta is computed against the wrong base. */
+  setBaseline(state: SavableState): void {
+    this.baseline = cloneSavable(state);
+  }
+
+  /** Save this process's pending changes. Resolves true when they reached
+   *  disk, false when they are still pending for the next save. */
+  save(): Promise<boolean> {
+    return chained(() => this.saveLocked());
+  }
+
+  private async saveLocked(): Promise<boolean> {
+    const filePath = this.filePath ?? statePath();
+    let written: { payload: PersistedState; snapshot: SavableState } | null;
+    try {
+      written = await withFileLock(filePath, lockOptions(this.lock), stateLockTimeoutMessage, async () => {
+        const onDisk = await loadStateClassified(filePath);
+        // The file exists but could not be read (EBUSY/EACCES): merging into
+        // the empty stand-in would overwrite real data. Defer.
+        if (onDisk.state.loadFailed) return null;
+        const snapshot = cloneSavable(this.hooks.exportCurrent());
+        // A file that parsed cleanly (or does not exist) is the base. One that
+        // is corrupt or at an unreadable version carries nothing usable, so
+        // this process's full view replaces it -- the documented start-over.
+        const merged = onDisk.parsedCleanly
+          ? mergeStateDelta(onDisk.state, this.baseline, snapshot)
+          : mergeStateDelta(emptyState(), { learning: {}, packHistory: [] }, snapshot);
+        const payload = buildPayload(merged);
+        await writeStatePayload(payload, filePath);
+        return { payload, snapshot };
+      });
+    } catch (err) {
+      log("warn", "yaw-mcp state save deferred; pending changes kept for the next save", {
+        error: errorMessage(err),
+        lockTimeout: err instanceof FileLockTimeoutError,
+      });
+      return false;
+    }
+    if (written === null) {
+      log("warn", "yaw-mcp state save deferred: state.json could not be re-read; pending changes kept");
+      return false;
+    }
+    // Synchronous from here: nothing can record between the export and the
+    // apply, so "recorded while the save was in flight" is exact.
+    const refreshed = mergeStateDelta(written.payload, written.snapshot, this.hooks.exportCurrent());
+    this.hooks.applyMerged(refreshed);
+    // Learning and pack history: memory was just refreshed from the written
+    // payload, so the payload is the new base. The tool cache is NOT
+    // refreshed into memory (server.ts applyMergedState says why), so its
+    // base stays what this process last exported -- basing it on the payload
+    // would make a namespace the disk dropped look "newly learned" here on
+    // the next save and resurrect it.
+    // Pre-warm failures are not refreshed into memory either (a broker's own
+    // sweep already ran), so their base is likewise this process's export.
+    this.baseline = cloneSavable({
+      learning: written.payload.learning,
+      packHistory: written.payload.packHistory,
+      toolCache: written.snapshot.toolCache,
+      prewarmFailures: written.snapshot.prewarmFailures,
+    });
+    return true;
+  }
+}
+
+function cloneSavable(s: SavableState): SavableState {
+  const learning: Record<string, PersistedLearningUsage> = {};
+  for (const [ns, u] of Object.entries(s.learning)) setJsonKey(learning, ns, { ...u });
+  const toolCache: Record<string, PersistedToolCacheEntry> = {};
+  for (const [ns, e] of Object.entries(s.toolCache ?? {}))
+    setJsonKey(toolCache, ns, { ...e, tools: e.tools.map((t) => ({ ...t })) });
+  const prewarmFailures: Record<string, PersistedPrewarmFailure> = {};
+  for (const [ns, f] of Object.entries(s.prewarmFailures ?? {})) setJsonKey(prewarmFailures, ns, { ...f });
+  return { learning, packHistory: s.packHistory.map((c) => ({ ...c })), toolCache, prewarmFailures };
 }
 
 /** Most pack-history calls persisted. The same bound PackDetector keeps in

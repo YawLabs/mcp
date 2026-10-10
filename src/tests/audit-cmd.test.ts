@@ -202,11 +202,11 @@ describe("runAudit", () => {
       cwd: home,
       out: io.push,
       err: io.pushErr,
-      runner: async () => ({ grade: "A", score: 99, suiteVersion: "0.17.1" }),
+      runner: async () => ({ grade: "A", score: 99, suiteVersion: "0.20.4" }),
     });
     expect(r.exitCode).toBe(0);
     const cache = await readGradesCache(home);
-    expect(cache.ctxlint.suiteVersion).toBe("0.17.1");
+    expect(cache.ctxlint.suiteVersion).toBe("0.20.4");
   });
 
   it("reports suiteVersion in the --json payload, and omits the key when there is none", async () => {
@@ -222,10 +222,10 @@ describe("runAudit", () => {
       json: true,
       out: io.push,
       err: io.pushErr,
-      runner: async () => ({ grade: "A", score: 99, suiteVersion: "0.17.1" }),
+      runner: async () => ({ grade: "A", score: 99, suiteVersion: "0.20.4" }),
     });
     expect(r.exitCode).toBe(0);
-    expect(JSON.parse(io.out.join("\n")).suiteVersion).toBe("0.17.1");
+    expect(JSON.parse(io.out.join("\n")).suiteVersion).toBe("0.20.4");
 
     // A runner that reports no rubric leaves the key ABSENT rather than null,
     // matching the cache entry a pre-field audit wrote.

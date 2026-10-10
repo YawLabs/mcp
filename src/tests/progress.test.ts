@@ -9,26 +9,25 @@ describe("createProgressReporter", () => {
 
   it("returns a no-op when no progressToken is present", () => {
     const send = vi.fn().mockResolvedValue(undefined);
-    const report = createProgressReporter({ sendNotification: send, _meta: {} });
+    const report = createProgressReporter({ mcpReq: { notify: send, _meta: {} } });
     report("step 1");
     expect(send).not.toHaveBeenCalled();
   });
 
-  it("returns a no-op when extra is undefined", () => {
+  it("returns a no-op when ctx is undefined", () => {
     const report = createProgressReporter(undefined);
     expect(() => report("x")).not.toThrow();
   });
 
-  it("returns a no-op when sendNotification is missing", () => {
-    const report = createProgressReporter({ _meta: { progressToken: "t" } });
+  it("returns a no-op when notify is missing", () => {
+    const report = createProgressReporter({ mcpReq: { _meta: { progressToken: "t" } } });
     expect(() => report("x")).not.toThrow();
   });
 
   it("message-only calls creep strictly upward and never carry a total", () => {
     const send = vi.fn().mockResolvedValue(undefined);
     const report = createProgressReporter({
-      sendNotification: send,
-      _meta: { progressToken: "tok-1" },
+      mcpReq: { notify: send, _meta: { progressToken: "tok-1" } },
     });
     report("spawning");
     report("loaded 3 tools");
@@ -46,8 +45,7 @@ describe("createProgressReporter", () => {
   it("respects explicit progress and total overrides", () => {
     const send = vi.fn().mockResolvedValue(undefined);
     const report = createProgressReporter({
-      sendNotification: send,
-      _meta: { progressToken: 42 },
+      mcpReq: { notify: send, _meta: { progressToken: 42 } },
     });
     report("step", 3, 5);
     expect(send).toHaveBeenCalledWith({
@@ -59,8 +57,7 @@ describe("createProgressReporter", () => {
   it("never emits a progress value at or below the previous one (MCP monotonicity)", () => {
     const send = vi.fn().mockResolvedValue(undefined);
     const report = createProgressReporter({
-      sendNotification: send,
-      _meta: { progressToken: "tok-mono" },
+      mcpReq: { notify: send, _meta: { progressToken: "tok-mono" } },
     });
     report("jump ahead", 5);
     report("caller regressed", 2);
@@ -81,8 +78,7 @@ describe("createProgressReporter", () => {
     // 300% bar — here.
     const send = vi.fn().mockResolvedValue(undefined);
     const report = createProgressReporter({
-      sendNotification: send,
-      _meta: { progressToken: "tok-dispatch" },
+      mcpReq: { notify: send, _meta: { progressToken: "tok-dispatch" } },
     });
     report("Ranking 4 servers");
     report("Asking client to break ranking tie");
@@ -104,8 +100,7 @@ describe("createProgressReporter", () => {
     // milestone to 2/2 — 100% before the last server had even started.
     const send = vi.fn().mockResolvedValue(undefined);
     const report = createProgressReporter({
-      sendNotification: send,
-      _meta: { progressToken: "tok-activate" },
+      mcpReq: { notify: send, _meta: { progressToken: "tok-activate" } },
     });
     report("Loading gh (1/2)", 0, 2);
     report("spawning gh");
@@ -126,8 +121,7 @@ describe("createProgressReporter", () => {
   it("drops total when the nudged value would exceed it (never >100% on the wire)", () => {
     const send = vi.fn().mockResolvedValue(undefined);
     const report = createProgressReporter({
-      sendNotification: send,
-      _meta: { progressToken: "tok-cap" },
+      mcpReq: { notify: send, _meta: { progressToken: "tok-cap" } },
     });
     report("done", 2, 2);
     report("done again", 2, 2); // duplicate milestone — must nudge past 2
@@ -139,7 +133,7 @@ describe("createProgressReporter", () => {
     expect(second.total).toBeUndefined();
   });
 
-  it("swallows a sendNotification rejection and reports it as a warn line", async () => {
+  it("swallows a notify rejection and reports it as a warn line", async () => {
     // The rejection must not reach the caller -- and it must not vanish
     // silently either: the reporter's .catch() logs it. An operator running
     // the suite with LOG_LEVEL=error exported would mute that line, so pin
@@ -152,8 +146,7 @@ describe("createProgressReporter", () => {
     });
     const send = vi.fn().mockRejectedValue(new Error("transport closed"));
     const report = createProgressReporter({
-      sendNotification: send,
-      _meta: { progressToken: "tok" },
+      mcpReq: { notify: send, _meta: { progressToken: "tok" } },
     });
     expect(() => report("x")).not.toThrow();
     // Let the microtask for the rejection resolve
@@ -179,8 +172,7 @@ describe("createProgressReporter", () => {
   it("accepts numeric progress tokens", () => {
     const send = vi.fn().mockResolvedValue(undefined);
     const report = createProgressReporter({
-      sendNotification: send,
-      _meta: { progressToken: 7 },
+      mcpReq: { notify: send, _meta: { progressToken: 7 } },
     });
     report("numeric");
     expect(send.mock.calls[0]![0].params.progressToken).toBe(7);
@@ -196,11 +188,11 @@ describe("isProgressRequested", () => {
   const send = (): Promise<void> => Promise.resolve();
 
   it("is true only when a token AND a channel are both present", () => {
-    expect(isProgressRequested({ sendNotification: send, _meta: { progressToken: "t" } })).toBe(true);
-    expect(isProgressRequested({ sendNotification: send, _meta: { progressToken: 0 } })).toBe(true);
-    expect(isProgressRequested({ sendNotification: send, _meta: {} })).toBe(false);
-    expect(isProgressRequested({ _meta: { progressToken: "t" } })).toBe(false);
-    expect(isProgressRequested({ sendNotification: send, _meta: { progressToken: null } })).toBe(false);
+    expect(isProgressRequested({ mcpReq: { notify: send, _meta: { progressToken: "t" } } })).toBe(true);
+    expect(isProgressRequested({ mcpReq: { notify: send, _meta: { progressToken: 0 } } })).toBe(true);
+    expect(isProgressRequested({ mcpReq: { notify: send, _meta: {} } })).toBe(false);
+    expect(isProgressRequested({ mcpReq: { _meta: { progressToken: "t" } } })).toBe(false);
+    expect(isProgressRequested({ mcpReq: { notify: send, _meta: { progressToken: null } } })).toBe(false);
     expect(isProgressRequested(undefined)).toBe(false);
   });
 
@@ -209,19 +201,19 @@ describe("isProgressRequested", () => {
     // disagree the failure is silent in both directions: a relay wired up for
     // a reporter that discards, or progress asked for and never forwarded.
     const cases = [
-      { sendNotification: send, _meta: { progressToken: "t" } },
-      { sendNotification: send, _meta: { progressToken: 7 } },
-      { sendNotification: send, _meta: { progressToken: 0 } },
-      { sendNotification: send, _meta: {} },
-      { sendNotification: send, _meta: { progressToken: null } },
-      { _meta: { progressToken: "t" } },
+      { mcpReq: { notify: send, _meta: { progressToken: "t" } } },
+      { mcpReq: { notify: send, _meta: { progressToken: 7 } } },
+      { mcpReq: { notify: send, _meta: { progressToken: 0 } } },
+      { mcpReq: { notify: send, _meta: {} } },
+      { mcpReq: { notify: send, _meta: { progressToken: null } } },
+      { mcpReq: { _meta: { progressToken: "t" } } },
       undefined,
     ];
-    for (const extra of cases) {
+    for (const ctx of cases) {
       const spy = vi.fn().mockResolvedValue(undefined);
-      const withSpy = extra === undefined ? undefined : { ...extra, sendNotification: extra.sendNotification && spy };
+      const withSpy = ctx === undefined ? undefined : { mcpReq: { ...ctx.mcpReq, notify: ctx.mcpReq.notify && spy } };
       createProgressReporter(withSpy)("probe");
-      expect(spy.mock.calls.length > 0, JSON.stringify(extra ?? null)).toBe(isProgressRequested(withSpy));
+      expect(spy.mock.calls.length > 0, JSON.stringify(ctx ?? null)).toBe(isProgressRequested(withSpy));
     }
   });
 });
