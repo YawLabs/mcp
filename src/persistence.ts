@@ -17,7 +17,11 @@
 //   - Privacy-conserving. Only namespace names, tool names, and tool
 //     descriptions (all schema identifiers published by the upstream
 //     server, not user inputs) are persisted. No tool arguments,
-//     response payloads, or credentials ever touch disk.
+//     response payloads, or credentials ever touch disk. The tool cache's
+//     `configKey` is a hash over env/header KEY NAMES only, never their
+//     values (see toolCacheConfigKey in server.ts), so not even a hash of
+//     a credential is written. A pre-warm failure's `message` is the
+//     activation error text, truncated.
 //   - Bounded. The tool cache is capped on both read and write — see
 //     the TOOLCACHE_* limits — so a long-lived install can't grow
 //     state.json without limit.
@@ -112,6 +116,29 @@ export interface PersistedTool {
 export interface PersistedToolCacheEntry {
   tools: PersistedTool[];
   learnedAt: number;
+  /** Fingerprint of the launch config the list was learned under (see
+   *  toolCacheConfigKey in server.ts). When the configured entry no longer
+   *  hashes to it -- a pinned version, an image tag, a flag or an env key
+   *  changed -- the list is re-learned at the next pre-warm instead of
+   *  being trusted until the weekly refresh. Absent on entries written
+   *  before it existed: those stay trusted until their weekly refresh
+   *  stamps one. */
+  configKey?: string;
+  /** `serverInfo.version` the upstream reported when the list was learned.
+   *  Informational; invalidation keys on configKey, because the version is
+   *  only knowable by spawning the server. */
+  serverVersion?: string;
+}
+
+/** A startup pre-warm that could not learn a namespace's tools. Persisted so
+ *  the NEXT broker -- every pane starts its own -- does not re-spawn the same
+ *  failing server (a stopped Docker daemon, a declined credential prompt)
+ *  within PREWARM_FAILURE_BACKOFF_MS. Keyed to the config it failed under, so
+ *  an edit retries at once; an explicit activate always retries. */
+export interface PersistedPrewarmFailure {
+  failedAt: number;
+  configKey: string;
+  message: string;
 }
 
 // Bounds on the persisted tool cache. Without these, state.json grows with
@@ -128,6 +155,17 @@ export const TOOLCACHE_MAX_DESCRIPTION_CHARS = 2000;
 /** Drop entries older than this. Bounds staleness: a server that gained or
  *  renamed tools gets re-learned by the next pre-warm after expiry. */
 export const TOOLCACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+/** Longest fingerprint / version string kept on a tool-cache entry. */
+export const TOOLCACHE_MAX_META_CHARS = 128;
+/** How long a recorded pre-warm failure suppresses pre-warm of that
+ *  namespace in every broker on the machine. One hour: long enough that a
+ *  burst of new panes pays one failed spawn instead of one each, short
+ *  enough that a server fixed out-of-band (Docker started, a token set)
+ *  reappears on its own within the hour. */
+export const PREWARM_FAILURE_BACKOFF_MS = 60 * 60 * 1000;
+/** Most pre-warm failures kept, and the longest message kept per failure. */
+export const PREWARM_FAILURE_MAX_ENTRIES = 64;
+export const PREWARM_FAILURE_MAX_MESSAGE_CHARS = 300;
 
 export interface PersistedState {
   version: number;
@@ -137,6 +175,13 @@ export interface PersistedState {
   /** Learned tool lists keyed by namespace. Added in schema v2; absent in
    *  a v1 file, which reads as `{}`. */
   toolCache: Record<string, PersistedToolCacheEntry>;
+  /** Recent startup pre-warm failures keyed by namespace. Optional and
+   *  additive -- no schema bump: a v2 reader that predates it drops the key
+   *  on its next save, which costs at most one extra failed pre-warm. A
+   *  bump would be worse: READABLE_STATE_VERSIONS in an older broker still
+   *  running in another pane would discard the WHOLE file. Absent when
+   *  empty. */
+  prewarmFailures?: Record<string, PersistedPrewarmFailure>;
   /** Set by loadState when the file EXISTS but could not be READ (EACCES,
    *  EBUSY, EISDIR, ...). The state on disk is presumed healthy, so the
    *  caller must not save over it with the empty state returned alongside
@@ -258,6 +303,7 @@ export async function loadStateClassified(filePath: string = statePath()): Promi
         // Absent on a v1 file -> sanitizeToolCache(undefined) -> {}. That IS
         // the v1 -> v2 migration; no other field changed shape.
         toolCache: sanitizeToolCache(p.toolCache),
+        ...withPrewarmFailures(sanitizePrewarmFailures(p.prewarmFailures)),
       },
       // Counted off `p`, BEFORE the sanitizers above run: what the file held,
       // not what survived. See RawStateCounts.
@@ -306,15 +352,87 @@ let saveChain: Promise<void> = Promise.resolve();
 // omitted cache persists as `{}` rather than silently preserving whatever
 // was on disk -- the caller always owns the full snapshot.
 export type SavableState = Pick<PersistedState, "learning" | "packHistory"> &
-  Partial<Pick<PersistedState, "toolCache">>;
+  Partial<Pick<PersistedState, "toolCache" | "prewarmFailures">>;
 
-export function saveState(state: SavableState, filePath: string = statePath()): Promise<void> {
-  const next = saveChain.then(() => doSaveState(state, filePath));
+export interface SaveStateOptions {
+  /** Merge the tool cache and pre-warm failures with what is ON DISK before
+   *  writing, instead of replacing them. Every Claude Code / typed pane runs
+   *  its own broker, each hydrated once at ITS start, so a plain replace is
+   *  last-writer-wins across processes: a broker started before another one
+   *  learned (or refreshed) a server writes its older snapshot back and
+   *  erases the newer list -- and the next pane's broker re-spawns that
+   *  server to learn it again. The merge keeps, per namespace, the entry
+   *  with the newer timestamp, and drops a failure that a newer learned
+   *  list supersedes. Learning and pack history are NOT merged (still the
+   *  writer's snapshot). The read-merge-write is serialized within this
+   *  process (saveChain) but not across processes; two brokers flushing in
+   *  the same few milliseconds can still lose one entry, which the next
+   *  flush or pre-warm repairs. */
+  mergeWithDisk?: boolean;
+}
+
+export function saveState(
+  state: SavableState,
+  filePath: string = statePath(),
+  options: SaveStateOptions = {},
+): Promise<void> {
+  const next = saveChain.then(() => doSaveState(state, filePath, options));
   saveChain = next.catch(() => undefined);
   return next;
 }
 
-async function doSaveState(state: SavableState, filePath: string): Promise<void> {
+/** Per namespace, the newer of the two tool-cache entries (by learnedAt);
+ *  `ours` wins a tie. Exported for tests. */
+export function mergeToolCaches(
+  ours: Record<string, PersistedToolCacheEntry>,
+  disk: Record<string, PersistedToolCacheEntry>,
+): Record<string, PersistedToolCacheEntry> {
+  const out: Record<string, PersistedToolCacheEntry> = {};
+  for (const [ns, entry] of Object.entries(disk)) setJsonKey(out, ns, entry);
+  for (const [ns, entry] of Object.entries(ours)) {
+    const other = Object.hasOwn(out, ns) ? out[ns] : undefined;
+    if (other === undefined || entry.learnedAt >= other.learnedAt) setJsonKey(out, ns, entry);
+  }
+  return out;
+}
+
+/** Union of two failure maps (newer failedAt wins), minus every failure a
+ *  learned list at least as new supersedes -- a broker that later LEARNED the
+ *  server proves the failure is over, whichever process recorded which.
+ *  Exported for tests. */
+export function mergePrewarmFailures(
+  ours: Record<string, PersistedPrewarmFailure>,
+  disk: Record<string, PersistedPrewarmFailure>,
+  toolCache: Record<string, PersistedToolCacheEntry>,
+): Record<string, PersistedPrewarmFailure> {
+  const merged: Record<string, PersistedPrewarmFailure> = {};
+  for (const [ns, f] of Object.entries(disk)) setJsonKey(merged, ns, f);
+  for (const [ns, f] of Object.entries(ours)) {
+    const other = Object.hasOwn(merged, ns) ? merged[ns] : undefined;
+    if (other === undefined || f.failedAt >= other.failedAt) setJsonKey(merged, ns, f);
+  }
+  const out: Record<string, PersistedPrewarmFailure> = {};
+  for (const [ns, f] of Object.entries(merged)) {
+    const learned = Object.hasOwn(toolCache, ns) ? toolCache[ns] : undefined;
+    if (learned !== undefined && learned.learnedAt >= f.failedAt) continue;
+    setJsonKey(out, ns, f);
+  }
+  return out;
+}
+
+async function doSaveState(state: SavableState, filePath: string, options: SaveStateOptions): Promise<void> {
+  let toolCache = sanitizeToolCache(state.toolCache);
+  let prewarmFailures = sanitizePrewarmFailures(state.prewarmFailures);
+  if (options.mergeWithDisk) {
+    // loadStateClassified, not loadState: a file that cannot be read right
+    // now merges as empty -- this writer's snapshot alone, which is exactly
+    // what a save without the merge writes.
+    const { state: onDisk } = await loadStateClassified(filePath);
+    toolCache = sanitizeToolCache(mergeToolCaches(toolCache, onDisk.toolCache));
+    prewarmFailures = sanitizePrewarmFailures(
+      mergePrewarmFailures(prewarmFailures, onDisk.prewarmFailures ?? {}, toolCache),
+    );
+  }
   const payload: PersistedState = {
     version: STATE_SCHEMA_VERSION,
     savedAt: Date.now(),
@@ -324,7 +442,8 @@ async function doSaveState(state: SavableState, filePath: string): Promise<void>
     // on the file is this module's guarantee rather than each writer's.
     learning: capLearning(sanitizeLearning(state.learning)),
     packHistory: capPackHistory(sanitizePackHistory(state.packHistory)),
-    toolCache: sanitizeToolCache(state.toolCache),
+    toolCache,
+    ...withPrewarmFailures(prewarmFailures),
   };
   try {
     await atomicWriteFile(filePath, JSON.stringify(payload, null, 2));
@@ -454,7 +573,12 @@ function sanitizeToolCache(input: unknown): Record<string, PersistedToolCacheEnt
     // that is a corrupt or hand-edited file, not a zero-tool server, so it
     // is still dropped and re-learned. The raw length is what separates them.
     if (tools.length === 0 && Array.isArray(entry.tools) && entry.tools.length > 0) continue;
-    kept.push([namespace, { tools, learnedAt }]);
+    const survivor: PersistedToolCacheEntry = { tools, learnedAt };
+    const configKey = metaString(entry.configKey);
+    if (configKey !== undefined) survivor.configKey = configKey;
+    const serverVersion = metaString(entry.serverVersion);
+    if (serverVersion !== undefined) survivor.serverVersion = serverVersion;
+    kept.push([namespace, survivor]);
   }
 
   // Namespace cap: newest-learned wins. Sorting only when over the cap keeps
@@ -464,6 +588,54 @@ function sanitizeToolCache(input: unknown): Record<string, PersistedToolCacheEnt
     kept.length = TOOLCACHE_MAX_NAMESPACES;
   }
   return Object.fromEntries(kept);
+}
+
+/** A short non-empty string, or undefined. Bounds the optional tool-cache
+ *  metadata the way descriptions are bounded. */
+function metaString(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.length === 0) return undefined;
+  return value.slice(0, TOOLCACHE_MAX_META_CHARS);
+}
+
+/** `{ prewarmFailures }` when there is at least one, else `{}` -- the key
+ *  is absent rather than empty, so a file (and a loaded state) without any
+ *  failure keeps exactly the shape it had before failures were recorded. */
+function withPrewarmFailures(failures: Record<string, PersistedPrewarmFailure>): {
+  prewarmFailures?: Record<string, PersistedPrewarmFailure>;
+} {
+  return Object.keys(failures).length > 0 ? { prewarmFailures: failures } : {};
+}
+
+/**
+ * Coerce persisted pre-warm failures into shape: drop malformed entries and
+ * ones older than PREWARM_FAILURE_BACKOFF_MS (they no longer suppress
+ * anything), truncate the message, and keep the newest
+ * PREWARM_FAILURE_MAX_ENTRIES. A future failedAt (clock skew) is kept, as the
+ * tool cache keeps a future learnedAt.
+ */
+function sanitizePrewarmFailures(input: unknown): Record<string, PersistedPrewarmFailure> {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return {};
+  const now = Date.now();
+  const kept: Array<[string, PersistedPrewarmFailure]> = [];
+  for (const [namespace, value] of Object.entries(input as Record<string, unknown>)) {
+    if (!namespace) continue;
+    if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+    const v = value as Record<string, unknown>;
+    const failedAt = v.failedAt;
+    if (typeof failedAt !== "number" || !Number.isFinite(failedAt) || failedAt < 0) continue;
+    if (now - failedAt > PREWARM_FAILURE_BACKOFF_MS) continue;
+    const configKey = metaString(v.configKey);
+    if (configKey === undefined) continue;
+    const message = typeof v.message === "string" ? v.message.slice(0, PREWARM_FAILURE_MAX_MESSAGE_CHARS) : "";
+    kept.push([namespace, { failedAt, configKey, message }]);
+  }
+  if (kept.length > PREWARM_FAILURE_MAX_ENTRIES) {
+    kept.sort((a, b) => b[1].failedAt - a[1].failedAt);
+    kept.length = PREWARM_FAILURE_MAX_ENTRIES;
+  }
+  const out: Record<string, PersistedPrewarmFailure> = {};
+  for (const [ns, f] of kept) setJsonKey(out, ns, f);
+  return out;
 }
 
 /** True for an ENOENT errno -- "the file is not there", as distinct from

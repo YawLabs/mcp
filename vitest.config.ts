@@ -35,8 +35,25 @@ const TIMING_SENSITIVE = [
   "src/tests/shutdown-on-stdin-close.test.ts",
 ];
 
+// Worker cap on Windows, the cap typed's root vitest.config.ts applies there
+// (maxWorkers 4). Uncapped, `vitest run` takes availableParallelism - 1
+// workers -- 11 on the 12-core Windows workstation -- and that box runs a
+// dozen terminal panes, several of them running their own test suites,
+// builds and cargo at the same time. Eleven workers from one suite
+// oversubscribe it on their own (the note above measured ~4x inside ONE run),
+// and the spawn-heavy suites here then fail on a timeout instead of a bug.
+// Four is a third of the cores: the suite still parallelizes and another
+// pane's run still gets a share. Other platforms keep vitest's default.
+//
+// What it does NOT change: the "timing" project still runs on one worker --
+// resolveConfig applies the fileParallelism:false -> maxWorkers=1 override
+// after this value (see TIMING_SENSITIVE above) -- and VITEST_MAX_WORKERS in
+// the environment still overrides both, for a one-off run on an idle box.
+const windowsWorkerCap = process.platform === "win32" ? { maxWorkers: 4 } : {};
+
 export default defineConfig({
   test: {
+    ...windowsWorkerCap,
     testTimeout: 30000,
     // Explicit, not inherited: hookTimeout defaults to 10 s and does NOT
     // follow testTimeout, so every heavy beforeAll/afterAll (temp-dir setup, a

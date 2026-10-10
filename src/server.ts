@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { getSupportedElicitationModes } from "@modelcontextprotocol/sdk/client/index.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -53,7 +54,14 @@ import { log } from "./logger.js";
 import { computeSecretsReport, META_TOOL_NAMES, META_TOOLS, SERVER_INSTRUCTIONS } from "./meta-tools.js";
 import { isFeatureDisabled } from "./opt-out-env.js";
 import { PackDetector } from "./pack-detect.js";
-import { isPersistenceDisabled, loadState, type PersistedToolCacheEntry, saveState } from "./persistence.js";
+import {
+  isPersistenceDisabled,
+  loadState,
+  type PersistedPrewarmFailure,
+  type PersistedToolCacheEntry,
+  PREWARM_FAILURE_BACKOFF_MS,
+  saveState,
+} from "./persistence.js";
 import { createProgressReporter, isProgressRequested, type ProgressExtra, type ProgressReporter } from "./progress.js";
 import {
   type BuiltinResource,
@@ -299,6 +307,36 @@ export const MAX_VAULT_PASSPHRASE_PROMPTS = 2;
  *  the page and the code reading its submission see it -- no client dialog
  *  ever carries a field for the passphrase. */
 const VAULT_PAGE_FIELD = "passphrase";
+
+/** Fingerprint of everything in a server entry that decides WHICH tool list
+ *  it serves: the process (type, transport, command, args, runtime) or the
+ *  endpoint (url), plus the NAMES of its env vars and headers. Stamped on each
+ *  learned tool list (persistence.ts PersistedToolCacheEntry.configKey) so an
+ *  edit that can change the list -- a pinned `pkg@1.2.3` -> `@1.3.0`, a new
+ *  docker image tag, a `--toolsets` flag, an added env key -- invalidates the
+ *  cached list at once instead of after the weekly refresh.
+ *
+ *  Env and header VALUES are deliberately left out: state.json must never
+ *  carry a credential, not even hashed (a short hash of a weak password is
+ *  brute-forceable offline). The cost is that a change to a value alone --
+ *  say GITHUB_TOOLSETS=repos -> repos,issues -- is picked up by the weekly
+ *  refresh or the next real activation, not instantly. connectTimeoutMs is
+ *  left out too: it changes how long a connect may take, not what it lists.
+ *  Exported for tests. */
+export function toolCacheConfigKey(entry: UpstreamServerConfig): string {
+  const keys = (m: Record<string, string> | undefined): string[] => (m === undefined ? [] : Object.keys(m).sort());
+  const identity = JSON.stringify([
+    entry.type,
+    entry.transport ?? null,
+    entry.command ?? null,
+    entry.args ?? null,
+    keys(entry.env),
+    entry.url ?? null,
+    keys(entry.headers),
+    entry.runtime ?? null,
+  ]);
+  return createHash("sha256").update(identity).digest("hex").slice(0, 16);
+}
 
 /** How many times one session may ask for a given namespace's MISSING CHILD
  *  credentials. Two, for the reason the vault budget above is two: the value
@@ -781,6 +819,19 @@ export class ConnectServer {
   // still ages out under the TTL rather than being refreshed for free on
   // every save.
   private toolCacheLearnedAt = new Map<string, number>();
+  // Launch-config fingerprint (toolCacheConfigKey) and upstream serverInfo
+  // version each toolCache entry was learned under. Persisted beside the
+  // list; a fingerprint that no longer matches the configured entry makes
+  // the list stale (learnedCacheStaleReason). Absent for entries learned
+  // before the fingerprint existed, which stay trusted until the weekly
+  // refresh re-learns -- and stamps -- them.
+  private toolCacheMeta = new Map<string, { configKey?: string; serverVersion?: string }>();
+  // Startup pre-warm failures, this session's and the ones hydrated from
+  // state.json (other panes' brokers). A namespace with a failure younger
+  // than PREWARM_FAILURE_BACKOFF_MS under its CURRENT config is not
+  // pre-warmed again -- one failed spawn per machine per hour instead of
+  // one per pane start. Explicit activation is never gated by this.
+  private prewarmFailures = new Map<string, PersistedPrewarmFailure>();
   // Per-namespace tool filters set by mcp_connect_activate({ tools: [...] }).
   // When a namespace has an entry, only those BARE tool names surface in
   // tools/list; routing tables stay complete so mcp_connect_dispatch can
@@ -1180,6 +1231,7 @@ export class ConnectServer {
         conn.tools.map((t) => ({ name: t.name, description: t.description })),
       );
       this.toolCacheLearnedAt.set(ns, Date.now());
+      this.stampLearnedMeta(ns, conn);
       this.scheduleStateSave();
     }
     this.refreshRoutesAndNotify().catch((err: Error) => {
@@ -1200,9 +1252,56 @@ export class ConnectServer {
    *  than at its snapshot, so a server the sweep has already finished drops
    *  out as soon as its list lands in the cache. */
   private serversPrewarmIsLearning(): UpstreamServerConfig[] {
-    return this.getProfiledActiveServers().filter(
-      (s) => !this.hasKnownTools(s) || this.isLearnedCacheStale(s.namespace),
-    );
+    return this.getProfiledActiveServers().filter((s) => this.wantsPrewarm(s) && !this.prewarmBackoffFor(s));
+  }
+
+  /** Does pre-warm want to learn this server -- no trusted list, or a learned
+   *  one that is stale (by age or by a changed launch config)? */
+  private wantsPrewarm(server: UpstreamServerConfig): boolean {
+    return !this.hasKnownTools(server) || this.learnedCacheStaleReason(server) !== null;
+  }
+
+  /** The recorded pre-warm failure that still suppresses pre-warm of this
+   *  server, or null. Only a failure under the SAME launch config counts: an
+   *  edited entry retries at once. */
+  private prewarmBackoffFor(server: UpstreamServerConfig): PersistedPrewarmFailure | null {
+    const failure = this.prewarmFailures.get(server.namespace);
+    if (failure === undefined) return null;
+    if (Date.now() - failure.failedAt > PREWARM_FAILURE_BACKOFF_MS) return null;
+    if (failure.configKey !== this.configKeyForNamespace(server.namespace)) return null;
+    return failure;
+  }
+
+  /** toolCacheConfigKey of the CONFIGURED entry for a namespace -- the raw
+   *  bundles.json entry, not a connection's launch config, which carries
+   *  session-only elicited env (see effectiveEntry). Undefined when the
+   *  namespace is not configured. */
+  private configKeyForNamespace(namespace: string): string | undefined {
+    const entry = (this.config?.servers ?? []).find((s) => s.namespace === namespace);
+    return entry === undefined ? undefined : toolCacheConfigKey(entry);
+  }
+
+  /** Record the fingerprint + upstream version of a list just learned from
+   *  `conn`, and clear any pre-warm failure the success supersedes. */
+  private stampLearnedMeta(namespace: string, conn: UpstreamConnection): void {
+    const meta: { configKey?: string; serverVersion?: string } = {};
+    const configKey = this.configKeyForNamespace(namespace);
+    if (configKey !== undefined) meta.configKey = configKey;
+    // Optional-chained: a test double may carry a bare client.
+    const version = conn.client?.getServerVersion?.()?.version;
+    if (typeof version === "string" && version.length > 0) meta.serverVersion = version;
+    this.toolCacheMeta.set(namespace, meta);
+    this.prewarmFailures.delete(namespace);
+  }
+
+  /** Persist a pre-warm failure so the other brokers on this machine skip the
+   *  same doomed spawn for PREWARM_FAILURE_BACKOFF_MS. The message is scrubbed
+   *  of credential shapes before it can reach disk. */
+  private recordPrewarmFailure(namespace: string, message: string): void {
+    const configKey = this.configKeyForNamespace(namespace);
+    if (configKey === undefined) return;
+    this.prewarmFailures.set(namespace, { failedAt: Date.now(), configKey, message: scrubForWarning(message) });
+    this.scheduleStateSave();
   }
 
   /** Could the running pre-warm still produce a route for any of these
@@ -1354,7 +1453,7 @@ export class ConnectServer {
   // directly. Copies of the resolution used to live in readers with `??`
   // semantics (empty learned list WINS), so discover could rank a server on
   // an empty list while listing its curated tools. hasKnownTools and
-  // isLearnedCacheStale read this.toolCache raw on purpose: they ask whether
+  // learnedCacheStaleReason read this.toolCache raw on purpose: they ask whether
   // a list was OBSERVED, and an empty one was.
   //
   // Identity preservation: when both sides resolve to the same array
@@ -1409,16 +1508,26 @@ export class ConnectServer {
   // is exactly the per-session `npx -y <pkg>@latest` resolve pre-warm
   // exists to avoid. runActivateOne stamps a fresh learnedAt on every
   // activation, so a server in actual use never looks stale.
-  private isLearnedCacheStale(namespace: string): boolean {
+  //
+  // A learned list is ALSO stale, at any age, when it was learned under a
+  // launch config that no longer matches the configured entry (configKey,
+  // see toolCacheConfigKey): the user moved a pinned version or image tag,
+  // or changed a flag or env key, and the old list describes a different
+  // server. An entry with no recorded configKey predates the fingerprint
+  // and is judged on age alone.
+  private learnedCacheStaleReason(server: UpstreamServerConfig): "age" | "config-changed" | null {
+    const namespace = server.namespace;
     const cached = this.toolCache.get(namespace);
     // An empty learned list ages on the same weekly cadence as any other.
     // Now that hasKnownTools trusts it, exempting it here would pin a
     // zero-tool server as permanently known -- if the upstream later grew
     // tools, nothing would ever re-spawn it to find out.
-    if (cached === undefined) return false;
+    if (cached === undefined) return null;
+    const learnedUnder = this.toolCacheMeta.get(namespace)?.configKey;
+    if (learnedUnder !== undefined && learnedUnder !== toolCacheConfigKey(server)) return "config-changed";
     const learnedAt = this.toolCacheLearnedAt.get(namespace);
-    if (learnedAt === undefined) return false;
-    return Date.now() - learnedAt > ConnectServer.TOOLCACHE_REFRESH_MS;
+    if (learnedAt === undefined) return null;
+    return Date.now() - learnedAt > ConnectServer.TOOLCACHE_REFRESH_MS ? "age" : null;
   }
 
   // Seed the in-memory tool cache from the persisted snapshot. Runs early
@@ -1434,9 +1543,25 @@ export class ConnectServer {
       // arrives empty here is a real zero-tool observation.
       this.toolCache.set(namespace, entry.tools);
       this.toolCacheLearnedAt.set(namespace, entry.learnedAt);
+      const meta: { configKey?: string; serverVersion?: string } = {};
+      if (entry.configKey !== undefined) meta.configKey = entry.configKey;
+      if (entry.serverVersion !== undefined) meta.serverVersion = entry.serverVersion;
+      if (meta.configKey !== undefined || meta.serverVersion !== undefined) this.toolCacheMeta.set(namespace, meta);
       restored++;
     }
     if (restored > 0) log("info", "Restored learned tool lists", { namespaces: restored });
+  }
+
+  /** Seed pre-warm failures recorded by this or another broker (persistence
+   *  has already dropped expired and malformed ones). */
+  private hydratePrewarmFailures(persisted: Record<string, PersistedPrewarmFailure> | undefined): void {
+    for (const [namespace, failure] of Object.entries(persisted ?? {})) this.prewarmFailures.set(namespace, failure);
+  }
+
+  private exportPrewarmFailures(): Record<string, PersistedPrewarmFailure> {
+    const out: Record<string, PersistedPrewarmFailure> = {};
+    for (const [namespace, failure] of this.prewarmFailures) setJsonKey(out, namespace, failure);
+    return out;
   }
 
   // Snapshot the in-memory tool cache for persistence. The persistence layer
@@ -1455,7 +1580,11 @@ export class ConnectServer {
       // the entry silently vanished from state.json -- the same
       // load-side-hardening-undone-one-flush-later shape exportSnapshot
       // (learning.ts) had.
-      setJsonKey(out, namespace, { tools, learnedAt: this.toolCacheLearnedAt.get(namespace) ?? Date.now() });
+      const entry: PersistedToolCacheEntry = { tools, learnedAt: this.toolCacheLearnedAt.get(namespace) ?? Date.now() };
+      const meta = this.toolCacheMeta.get(namespace);
+      if (meta?.configKey !== undefined) entry.configKey = meta.configKey;
+      if (meta?.serverVersion !== undefined) entry.serverVersion = meta.serverVersion;
+      setJsonKey(out, namespace, entry);
     }
     return out;
   }
@@ -1913,6 +2042,7 @@ export class ConnectServer {
         });
       }
       this.hydrateToolCache(persisted.toolCache);
+      this.hydratePrewarmFailures(persisted.prewarmFailures);
       // loadFailed means the state file exists but could not be READ (a
       // transient handle error, not a missing or corrupt file). The empty
       // snapshot we just hydrated is a stand-in, not the truth -- leaving
@@ -2297,16 +2427,42 @@ export class ConnectServer {
     // prewarm didn't create and must not tear down. The isChanged gate
     // in the batch below covers the race where a namespace connects
     // between this snapshot and its activation turn.
-    const dormant = this.getProfiledActiveServers().filter(
-      (s) =>
-        this.connections.get(s.namespace)?.status !== "connected" &&
-        (!this.hasKnownTools(s) || this.isLearnedCacheStale(s.namespace)),
+    const candidates = this.getProfiledActiveServers().filter(
+      (s) => this.connections.get(s.namespace)?.status !== "connected" && this.wantsPrewarm(s),
     );
+    // A server whose pre-warm failed recently -- in THIS broker or in any
+    // other pane's (state.json) -- under the same launch config is skipped:
+    // re-spawning a server that just failed (Docker daemon down, a declined
+    // credential prompt, a missing binary) costs a spawn, a retry delay and
+    // possibly a prompt in every new pane, and the answer will be the same.
+    // Said once per startup, with when it retries, so the missing tools are
+    // never a mystery; discover() carries the same note on the server.
+    const backedOff = candidates.flatMap((s) => {
+      const failure = this.prewarmBackoffFor(s);
+      return failure === null ? [] : [{ namespace: s.namespace, failure }];
+    });
+    if (backedOff.length > 0) {
+      log("info", "Pre-warm skipping servers that failed recently; an explicit activate retries now", {
+        servers: backedOff.map(({ namespace, failure }) => ({
+          namespace,
+          failedAt: new Date(failure.failedAt).toISOString(),
+          retryAfter: new Date(failure.failedAt + PREWARM_FAILURE_BACKOFF_MS).toISOString(),
+          error: failure.message,
+        })),
+      });
+    }
+    const skipped = new Set(backedOff.map((b) => b.namespace));
+    const dormant = candidates.filter((s) => !skipped.has(s.namespace));
     if (dormant.length === 0) return;
 
     log("info", "Pre-warming dormant servers", {
       count: dormant.length,
       namespaces: dormant.map((s) => s.namespace),
+      // Why each one is being spawned, so a re-learn after a config edit
+      // reads as intended rather than as a cache that failed to persist.
+      reasons: Object.fromEntries(
+        dormant.map((s) => [s.namespace, this.hasKnownTools(s) ? this.learnedCacheStaleReason(s) : "unknown"]),
+      ),
     });
 
     const CONCURRENCY = 3;
@@ -2334,6 +2490,7 @@ export class ConnectServer {
                 namespace: server.namespace,
                 message: result.message,
               });
+              this.recordPrewarmFailure(server.namespace, result.message);
               return;
             }
             // isChanged:false means runActivateOne's already-connected
@@ -2377,10 +2534,12 @@ export class ConnectServer {
             }
             anyPopulated = true;
           } catch (err) {
+            const error = err instanceof Error ? err.message : String(err);
             log("warn", "Pre-warm of server failed", {
               namespace: server.namespace,
-              error: err instanceof Error ? err.message : String(err),
+              error,
             });
+            this.recordPrewarmFailure(server.namespace, error);
           }
         }),
       );
@@ -3866,6 +4025,21 @@ export class ConnectServer {
       // over per-call error rate (see formatHealthWarning).
       const warning = formatHealthWarning(connection?.health, this.activationFailures.get(server.namespace));
       if (warning) lines.push(`    ${warning}`);
+      // A server whose tools are unknown because pre-warm is backing off
+      // after a recent failure (possibly in another pane's broker). Without
+      // this the server just has no tool names, and nothing says why or
+      // that activating it retries. Skipped when the session-local warning
+      // above already reports a failure.
+      if (!connection && !warning && !this.hasKnownTools(server)) {
+        const failure = this.prewarmBackoffFor(server);
+        if (failure) {
+          const ageMin = Math.max(1, Math.round((Date.now() - failure.failedAt) / 60_000));
+          const msg = failure.message
+            ? `: ${failure.message.length > 120 ? `${failure.message.slice(0, 117)}...` : failure.message}`
+            : "";
+          lines.push(`    warn: tools unknown, startup pre-warm failed ${ageMin}m ago${msg}; activate it to retry`);
+        }
+      }
 
       // Dormant-reliability warning — pulls from persisted learning when
       // this server isn't currently loaded, so the LLM sees flaky history
@@ -4695,6 +4869,7 @@ export class ConnectServer {
           const toolMeta = connection.tools.map((t) => ({ name: t.name, description: t.description }));
           this.toolCache.set(namespace, toolMeta);
           this.toolCacheLearnedAt.set(namespace, Date.now());
+          this.stampLearnedMeta(namespace, connection);
           // Persist the learned list so the NEXT session skips the pre-warm
           // spawn for this namespace. Debounced + best-effort; a failed save
           // just means we re-learn next time.
@@ -7597,10 +7772,18 @@ export class ConnectServer {
   }
 
   private async flushStateSave(): Promise<void> {
-    await saveState({
-      learning: this.learning.exportSnapshot(),
-      packHistory: this.packDetector.exportSnapshot(),
-      toolCache: this.exportToolCache(),
-    });
+    // mergeWithDisk: every pane runs its own broker, and a plain replace let
+    // an older broker's snapshot erase a list another one had just learned
+    // (see SaveStateOptions in persistence.ts).
+    await saveState(
+      {
+        learning: this.learning.exportSnapshot(),
+        packHistory: this.packDetector.exportSnapshot(),
+        toolCache: this.exportToolCache(),
+        prewarmFailures: this.exportPrewarmFailures(),
+      },
+      undefined,
+      { mergeWithDisk: true },
+    );
   }
 }
