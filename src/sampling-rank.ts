@@ -1,7 +1,6 @@
-import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import type { CreateMessageRequestParamsBase } from "@modelcontextprotocol/sdk/types.js";
+import type { CreateMessageRequestParamsBase, ProtocolEra } from "@modelcontextprotocol/server";
 import { log } from "./logger.js";
-import { capForPrompt, INTENT_MAX } from "./reward-grader.js";
+import { capForPrompt, INTENT_MAX, type SamplingPeer } from "./reward-grader.js";
 import type { UpstreamServerConfig } from "./types.js";
 
 // Top-2 scores within this ratio of each other trigger a sampling
@@ -375,12 +374,14 @@ export function resetNoSamplingNotice(): void {
  *  server.ts's dispatch gate, which checks the capability itself before it
  *  would call bestOfNViaSampling (so a client without sampling never sees the
  *  "asking LLM to pick" progress line) and emits the notice when it skips. */
-export function noteNoSamplingCapability(): void {
+export function noteNoSamplingCapability(era?: ProtocolEra): void {
   if (noSamplingNoticeLogged) return;
   noSamplingNoticeLogged = true;
   log(
     "info",
-    "Client does not advertise the sampling capability; the LLM routing tiebreak is off and YAW_MCP_ROUTE_EFFORT=aggressive has no effect",
+    era === "modern"
+      ? "The client is on MCP 2026-07-28, where a server cannot ask it for sampling; the LLM routing tiebreak is off and YAW_MCP_ROUTE_EFFORT=aggressive has no effect"
+      : "Client does not advertise the sampling capability; the LLM routing tiebreak is off and YAW_MCP_ROUTE_EFFORT=aggressive has no effect",
   );
 }
 
@@ -394,17 +395,18 @@ export function noteNoSamplingCapability(): void {
 // fewer than 2 candidates, or total failure it returns null and the caller
 // falls back to the ranker's order — it never throws.
 export async function bestOfNViaSampling(
-  server: Server,
+  server: SamplingPeer,
   intent: string,
   candidates: TiebreakCandidate[],
   n: number,
 ): Promise<string | null> {
   const caps = server.getClientCapabilities();
-  if (!caps?.sampling) {
-    // Defensive: server.ts's gate already checks the capability (and emits
-    // this notice) before calling, so production never lands here. Kept for
-    // any other caller, behind the same once-per-process flag.
-    noteNoSamplingCapability();
+  // The era first, for the reason SamplingPeer gives.
+  if (server.era === "modern" || !caps?.sampling) {
+    // Defensive: server.ts's gate already checks the era and the capability
+    // (and emits this notice) before calling, so production never lands
+    // here. Kept for any other caller, behind the same once-per-process flag.
+    noteNoSamplingCapability(server.era);
     return null;
   }
   if (candidates.length < 2) return null;

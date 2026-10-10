@@ -109,6 +109,7 @@ import { fileURLToPath } from "node:url";
 import { CURRENT_OS, type InstallOS } from "./install-targets.js";
 import { stripInternalSecretsFromEnv } from "./internal-secret-env.js";
 import { log } from "./logger.js";
+import { oamBinaryIdentity, readOamVerdict, writeOamVerdict } from "./oam-verdict-cache.js";
 import { sidecarsNodeModules } from "./paths.js";
 import { isEphemeralMountPath, type StableSpellingDeps, stableSpellingOf } from "./stable-entry.js";
 
@@ -496,6 +497,9 @@ export interface OamProbe {
 }
 
 let oamProbeCache: OamProbe | undefined;
+/** When set, oamProbeCache is only good until this Date.now() value. Set for a
+ *  TIMEOUT verdict alone -- see OAM_PROBE_TIMEOUT_RECHECK_MS. */
+let oamProbeCacheExpiresAt: number | undefined;
 
 /**
  * Extract the first version from `oam --version` output ("oam 0.6.0").
@@ -763,10 +767,25 @@ function classifyProbeFailure(err: unknown): OamProbeFailure {
  */
 /** How long ONE `oam --version` attempt gets. A timeout is retried once and
  *  falls back to node only if the retry fails as well, so a wedged binary
- *  costs two of these windows. Matches the 3s budget uv-bootstrap's onPath()
- *  probe already uses; resolveUv retries a timeout of that same PATH probe
- *  once in the same way. */
-export const OAM_PROBE_TIMEOUT_MS = 3_000;
+ *  costs two of these windows.
+ *
+ *  10s, up from the 3s uv-bootstrap's onPath() probe uses. The probe now runs
+ *  once per oam BINARY rather than once per process -- a clean answer is
+ *  remembered across processes (oam-verdict-cache.ts) -- so the window is paid
+ *  on the first launch after an install or update, not on every pane. And the
+ *  3s window was measured too tight: on 2026-10-09 (perf study m3), 8 brokers
+ *  starting together on a saturated box saw `oam --version` outlive 3s twice
+ *  in 37 of 260 processes, each of which then hosted every sidecar on node. */
+export const OAM_PROBE_TIMEOUT_MS = 10_000;
+
+/** How long a TIMEOUT verdict stands before the next connect probes again.
+ *  Every other verdict is an answer about the binary and stands for the
+ *  process lifetime; a timeout is an answer about the moment (a saturated
+ *  machine), so it must not pin a long-lived broker to node until restart.
+ *  It is never written to the cross-process cache either, so the next launch
+ *  asks afresh. A minute keeps a genuinely wedged binary from charging two
+ *  probe windows to every connect in a burst. */
+export const OAM_PROBE_TIMEOUT_RECHECK_MS = 60_000;
 
 /**
  * SIGKILL, not the SIGTERM default. The kill is best-effort either way (see
@@ -997,6 +1016,10 @@ let oamProbeInFlight: Promise<OamProbe> | undefined;
 let oamProbeGeneration = 0;
 
 export async function probeOam(run: (bin: string) => Promise<string> = spawnVersionProbe): Promise<OamProbe> {
+  if (oamProbeCache !== undefined && oamProbeCacheExpiresAt !== undefined && Date.now() >= oamProbeCacheExpiresAt) {
+    oamProbeCache = undefined;
+    oamProbeCacheExpiresAt = undefined;
+  }
   if (oamProbeCache !== undefined) return oamProbeCache;
   if (oamProbeInFlight !== undefined) return oamProbeInFlight;
   const generation = oamProbeGeneration;
@@ -1029,18 +1052,32 @@ async function probeOamUncached(run: (bin: string) => Promise<string>, generatio
    *  result is still RETURNED to this call's own caller either way -- it is
    *  correct for the state it observed; it just must not become the cache a
    *  post-reset caller reads. */
-  const publish = (probe: OamProbe): OamProbe => {
-    if (generation === oamProbeGeneration) oamProbeCache = probe;
+  const publish = (probe: OamProbe, ttlMs?: number): OamProbe => {
+    if (generation === oamProbeGeneration) {
+      oamProbeCache = probe;
+      oamProbeCacheExpiresAt = ttlMs === undefined ? undefined : Date.now() + ttlMs;
+    }
     return probe;
   };
+  /** The cross-process verdict cache applies only to the REAL probe: an
+   *  injected runner is a stand-in binary whose answer says nothing about the
+   *  file on disk. Keyed on the absolute path the bare name resolves to, so a
+   *  PATH change that swaps binaries is a different key. Null -- nothing read
+   *  or written -- when the binary cannot be located or stat'ed. */
+  const identity = (() => {
+    if (run !== spawnVersionProbe) return null;
+    const abs = resolveBinAbsolute(bin);
+    return abs ? oamBinaryIdentity(abs) : null;
+  })();
   /** Run the probe, retrying ONLY a timeout, and only once -- the same rule
    *  uv-bootstrap's resolveUv applies to its PATH probe. Every other rejection
    *  (ENOENT, a non-zero exit, EACCES) is a real answer and reaches the catch
    *  below on the first attempt, so the routine oam-absent path pays nothing
    *  for this. A timeout is not an answer: a saturated machine can push a
-   *  working binary past OAM_PROBE_TIMEOUT_MS, and because the result is
-   *  published for the process lifetime, that one slow start would otherwise
-   *  pin every sidecar to node until restart.
+   *  working binary past OAM_PROBE_TIMEOUT_MS, and every sidecar spawned
+   *  while that verdict stands lands on node. (A timeout verdict now lapses
+   *  after OAM_PROBE_TIMEOUT_RECHECK_MS instead of standing for the process
+   *  lifetime, but the connects inside that window still pay for it.)
    *
    *  The retry runs inside the collapsed probe (oamProbeInFlight), so racing
    *  connects share it rather than each starting their own. A wedged oam -- the
@@ -1063,7 +1100,17 @@ async function probeOamUncached(run: (bin: string) => Promise<string>, generatio
     }
   };
   try {
-    const version = parseOamVersion(await runRetryingTimeout());
+    const remembered = identity ? readOamVerdict(identity) : undefined;
+    let version: string | null;
+    if (remembered !== undefined) {
+      version = remembered;
+      log("debug", "oam --version answered from the per-binary cache", { bin, oamVersion: version });
+    } else {
+      version = parseOamVersion(await runRetryingTimeout());
+      // Only a CLEAN exit reaches this line -- every failure threw -- so this
+      // is an answer about the binary and safe to share with later launches.
+      if (identity) void writeOamVerdict(identity, version);
+    }
     if (version !== null && compareVersions(version, MIN_OAM_VERSION) < 0) {
       log("warn", "oam is installed but below the minimum supported version; falling back to node", {
         // The full token, prerelease suffix included: a build reporting
@@ -1138,10 +1185,15 @@ async function probeOamUncached(run: (bin: string) => Promise<string>, generatio
      *  EINVALs is still a real failure and takes the generic branch. */
     const shellShim = isShellShimSpawnRefusal(code, bin);
     if (code === "ETIMEDOUT") {
-      log("warn", "oam did not respond to --version twice; falling back to node for this process", {
-        timeoutMs: OAM_PROBE_TIMEOUT_MS,
-        bin,
-      });
+      log(
+        "warn",
+        "oam did not respond to --version twice; falling back to node for now (probed again on a later connect)",
+        {
+          timeoutMs: OAM_PROBE_TIMEOUT_MS,
+          recheckAfterMs: OAM_PROBE_TIMEOUT_RECHECK_MS,
+          bin,
+        },
+      );
     } else if (shellShim) {
       log(
         "warn",
@@ -1169,20 +1221,25 @@ async function probeOamUncached(run: (bin: string) => Promise<string>, generatio
     // Everything else, an explicit OAM_BIN that resolves to nothing included, is
     // an oam the user believes they have, which doctor must not report as "not
     // installed".
-    return publish({
-      bin: null,
-      binPath: null,
-      version: null,
-      belowMin: false,
-      failure: absent ? null : classifyProbeFailure(err),
-      failureDetail: absent
-        ? null
-        : shellShim
-          ? `${bin} is a .cmd/.bat shim and the version probe spawns without a shell; point OAM_BIN at the .exe it wraps`
-          : err instanceof Error
-            ? err.message
-            : String(err),
-    });
+    // A timeout is the one verdict about the MOMENT rather than the binary:
+    // it stands for OAM_PROBE_TIMEOUT_RECHECK_MS, not the process lifetime.
+    return publish(
+      {
+        bin: null,
+        binPath: null,
+        version: null,
+        belowMin: false,
+        failure: absent ? null : classifyProbeFailure(err),
+        failureDetail: absent
+          ? null
+          : shellShim
+            ? `${bin} is a .cmd/.bat shim and the version probe spawns without a shell; point OAM_BIN at the .exe it wraps`
+            : err instanceof Error
+              ? err.message
+              : String(err),
+      },
+      code === "ETIMEDOUT" ? OAM_PROBE_TIMEOUT_RECHECK_MS : undefined,
+    );
   }
 }
 
@@ -1201,6 +1258,7 @@ async function probeOamUncached(run: (bin: string) => Promise<string>, generatio
 export function resetOamBinCache(): void {
   warnedOamUnavailable = false;
   oamProbeCache = undefined;
+  oamProbeCacheExpiresAt = undefined;
   oamProbeInFlight = undefined;
   oamProbeGeneration++;
   // Cleared here too so the once-per-package pinned notice does not leak
@@ -2075,9 +2133,13 @@ export async function resolveOamSpawn(
         detail: probe.failureDetail,
         // No install commands: the install is already there. Pointing OAM_BIN
         // at a working copy is the actionable move, and the probe is cached for
-        // the process lifetime, so repairing it needs a restart to take effect.
+        // the process lifetime, so repairing it needs a restart to take effect
+        // -- except a timeout, which lapses and is probed again on its own.
         overrideWith: "OAM_BIN",
-        thenRestart: "restart yaw-mcp; this probe is cached for the process lifetime",
+        thenRestart:
+          probe.failure === "timeout"
+            ? `nothing to do if oam was only slow: the probe runs again after ${OAM_PROBE_TIMEOUT_RECHECK_MS / 1000}s`
+            : "restart yaw-mcp; this probe is cached for the process lifetime",
       });
     } else {
       log("warn", "a server opted in to oam but oam is not installed; running it on node instead", {

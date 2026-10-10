@@ -19,6 +19,7 @@ import {
   OAM_INSTALL_PS1,
   OAM_INSTALL_SH,
   OAM_PROBE_TIMEOUT_MS,
+  OAM_PROBE_TIMEOUT_RECHECK_MS,
   oamFailureLabel,
   oamHeapOomHint,
   oamInstallAdvice,
@@ -2003,12 +2004,66 @@ describe("probeOam timeout", () => {
   beforeEach(() => resetOamBinCache());
   afterEach(() => resetOamBinCache());
 
-  it("declares a 3s probe timeout, the literal uv's onPath budget also uses", async () => {
-    // A LITERAL pin, not the cross-module relationship the old title claimed:
-    // uv-bootstrap's onPath hard-codes its own `3_000` rather than importing
-    // this constant, so the two budgets can drift with nothing failing. Keeping
-    // them equal is a manual job until one of them exports the number.
-    expect(OAM_PROBE_TIMEOUT_MS).toBe(3_000);
+  it("declares a 10s probe timeout and a 60s life for a timeout verdict", async () => {
+    // LITERAL pins. 10s, not uv's 3s: the probe runs once per oam binary now
+    // (oam-verdict-cache.ts), and 3s was measured too tight on a saturated box
+    // (37 of 260 brokers timed out twice in the 2026-10-09 study).
+    expect(OAM_PROBE_TIMEOUT_MS).toBe(10_000);
+    expect(OAM_PROBE_TIMEOUT_RECHECK_MS).toBe(60_000);
+  });
+
+  it("lets a timeout verdict lapse, so one slow moment does not pin a long-lived broker to node", async () => {
+    vi.useFakeTimers();
+    try {
+      let calls = 0;
+      let answer = false;
+      const run = async () => {
+        calls++;
+        if (answer) return `oam ${MIN_OAM_VERSION}\n`;
+        const err = new Error(`oam --version exceeded ${OAM_PROBE_TIMEOUT_MS}ms`) as Error & { code?: string };
+        err.code = "ETIMEDOUT";
+        throw err;
+      };
+      const first = await probeOam(run);
+      expect(first.failure).toBe("timeout");
+      expect(calls).toBe(2);
+      // Inside the window the verdict stands: no probe per connect.
+      vi.setSystemTime(Date.now() + OAM_PROBE_TIMEOUT_RECHECK_MS - 1);
+      expect(await probeOam(run)).toBe(first);
+      expect(calls).toBe(2);
+      // Past it, the next connect asks again -- and gets oam.
+      answer = true;
+      vi.setSystemTime(Date.now() + 1);
+      const second = await probeOam(run);
+      expect(calls).toBe(3);
+      expect(second.bin).not.toBeNull();
+      expect(second.failure).toBeNull();
+      // A real answer stands for the process lifetime again.
+      vi.setSystemTime(Date.now() + 10 * OAM_PROBE_TIMEOUT_RECHECK_MS);
+      expect(await probeOam(run)).toBe(second);
+      expect(calls).toBe(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps every non-timeout failure for the process lifetime", async () => {
+    vi.useFakeTimers();
+    try {
+      let calls = 0;
+      const run = async () => {
+        calls++;
+        const err = new Error("oam exited 1") as Error & { code?: string };
+        err.code = "EOAMEXIT";
+        throw err;
+      };
+      const first = await probeOam(run);
+      vi.setSystemTime(Date.now() + 10 * OAM_PROBE_TIMEOUT_RECHECK_MS);
+      expect(await probeOam(run)).toBe(first);
+      expect(calls).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("falls back to node when the probe times out", async () => {

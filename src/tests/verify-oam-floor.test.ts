@@ -33,6 +33,7 @@ import {
   FLOOR_CHANGELOG,
   FLOOR_SRC,
   FLOOR_TEST,
+  HOSTED,
   installCommand,
   isPrerelease,
   oamVersion,
@@ -174,7 +175,7 @@ describe("verify-oam-floor raiseFloorText", () => {
     const block = renderFloorBlock({ next: "0.17.0", prev: "0.16.3", day: "2026-09-21" });
     expect(block[0]).toBe(`${BLOCK_HEAD}0.17.0**`);
     expect(block[2]).toContain(
-      "`npm run verify:oam-floor` hosted a stdio `@modelcontextprotocol/sdk` server on oam v0.17.0",
+      "`npm run verify:oam-floor` hosted a stdio `@modelcontextprotocol/server` server on oam v0.17.0",
     );
     expect(block[2]).toContain("on 2026-09-21");
     expect(block[2]).toContain("the floor was 0.16.3");
@@ -344,11 +345,53 @@ describe("verify-oam-floor probeHosting", () => {
   // tools/list and tools/call over stdio, exactly what `oam run` would carry.
   // This is the case that proves the server is a working SDK server before
   // anyone blames oam for it.
-  it("completes initialize + tools/list + tools/call against the probe server on node", async () => {
-    const r = await probeHosting({ command: process.execPath, args: [join(REPO_ROOT, PROBE_SERVER)], cwd: REPO_ROOT });
+  it.each([
+    "2025-11-25",
+    "2026-07-28",
+  ])("completes %s + tools/list + tools/call against the probe server on node", async (era) => {
+    const r = await probeHosting({
+      command: process.execPath,
+      args: [join(REPO_ROOT, PROBE_SERVER)],
+      cwd: REPO_ROOT,
+      era,
+    });
     expect(r.tools).toEqual(["ping"]);
     expect(r.reply).toMatch(/^pong:\d+-\d+$/);
     expect(r.ms).toBeGreaterThan(0);
+  });
+
+  it("rejects a 2025-only server on 2026-07-28, naming its -32601 answer to server/discover", async () => {
+    // What the probe server was before it moved to serveStdio, and what the
+    // floor must now refuse to vouch for: a server a modern client cannot open.
+    const src = `
+let buf = "";
+const send = (m) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...m }) + "\\n");
+process.stdin.on("data", (c) => {
+  buf += c.toString();
+  let i;
+  while ((i = buf.indexOf("\\n")) >= 0) {
+    const line = buf.slice(0, i); buf = buf.slice(i + 1);
+    if (!line.trim()) continue;
+    const msg = JSON.parse(line);
+    if (msg.id !== undefined) send({ id: msg.id, error: { code: -32601, message: "Method not found" } });
+  }
+});
+process.stdin.resume();
+`;
+    await expect(
+      probeHosting({ command: process.execPath, args: ["-e", src], timeoutMs: 10_000, era: "2026-07-28" }),
+    ).rejects.toThrow("server/discover answered error -32601: Method not found");
+  });
+
+  it("rejects on 2026-07-28 with the server's stderr tail when the child dies before answering", async () => {
+    await expect(
+      probeHosting({
+        command: process.execPath,
+        args: ["-e", 'console.error("boom: no such module"); process.exit(3)'],
+        timeoutMs: 10_000,
+        era: "2026-07-28",
+      }),
+    ).rejects.toThrow(/before the probe finished\n {2}server stderr \(tail\): boom: no such module/);
   });
 
   it("rejects with the server's stderr tail when the child dies before initialize", async () => {
@@ -393,6 +436,8 @@ function drive(opts: {
   raise?: boolean;
   installed?: string | NodeJS.ErrnoException | Error;
   probe?: "ok" | Error;
+  /** Fail only the probe of this era, with `probe` as the error. */
+  failEra?: string;
   floor?: string;
   env?: NodeJS.ProcessEnv;
   platform?: NodeJS.Platform;
@@ -406,7 +451,7 @@ function drive(opts: {
   };
   if (opts.src !== undefined) byPath[FLOOR_SRC] = opts.src;
   const lines: string[] = [];
-  const probes: { command: string; args: string[]; cwd: string; timeoutMs: number }[] = [];
+  const probes: { command: string; args: string[]; cwd: string; timeoutMs: number; era: string }[] = [];
   // The options each `oam --version` read was handed: the script must pass
   // the same timeout it gives the hosting probe, or the header's promise that
   // VERIFY_OAM_FLOOR_TIMEOUT_MS bounds the whole probe stops at the version.
@@ -425,7 +470,7 @@ function drive(opts: {
     },
     probeHosting: async (o) => {
       probes.push(o);
-      if (opts.probe instanceof Error) throw opts.probe;
+      if (opts.probe instanceof Error && (opts.failEra === undefined || opts.failEra === o.era)) throw opts.probe;
       return { tools: ["ping"], reply: "pong:1-1", ms: 42 };
     },
     readFile: (p) => {
@@ -443,14 +488,21 @@ function drive(opts: {
 }
 
 describe("verify-oam-floor verifyOamFloor", () => {
-  it("passes on an oam at the floor that hosts the probe, spawning `oam run <probe server>` in the repo", async () => {
+  it("passes on an oam at the floor that hosts the probe on both eras, spawning `oam run <probe server>` once per era", async () => {
     const d = drive({});
     expect(await d.run()).toBe(0);
-    expect(d.probes).toEqual([{ command: "oam", args: ["run", PROBE_SERVER], cwd: "/repo", timeoutMs: 30_000 }]);
+    const spawned = { command: "oam", args: ["run", PROBE_SERVER], cwd: "/repo", timeoutMs: 30_000 };
+    expect(d.probes).toEqual([
+      { ...spawned, era: "2025-11-25" },
+      { ...spawned, era: "2026-07-28" },
+    ]);
     expect(d.versionReads).toEqual([{ timeoutMs: 30_000 }]);
-    expect(d.lines.at(-1)).toBe(
-      `${TAG} OK -- oam 0.16.3 hosts a stdio @modelcontextprotocol/sdk server (initialize + tools/list + tools/call); the floor 0.16.3 stands`,
+    expect(d.lines).toContain(
+      `${TAG} oam 0.16.3 hosted ${PROBE_SERVER} on 2026-07-28: server/discover + tools/list ["ping"] + tools/call -> "pong:1-1" in 42 ms`,
     );
+    expect(d.lines.at(-1)).toBe(`${TAG} OK -- oam 0.16.3 hosts ${HOSTED}; the floor 0.16.3 stands`);
+    expect(HOSTED).toContain("2025-11-25: initialize + tools/list + tools/call");
+    expect(HOSTED).toContain("2026-07-28: server/discover + tools/list + tools/call");
     expect(d.lines.join("\n")).not.toContain("--raise");
     expect(d.writes).toEqual([]);
   });
@@ -474,7 +526,7 @@ describe("verify-oam-floor verifyOamFloor", () => {
       );
       // The mechanism check still ran -- an oam that is both old and broken
       // is two findings, and this one is the more important.
-      expect(d.probes).toHaveLength(1);
+      expect(d.probes).toHaveLength(2);
       expect(d.writes).toEqual([]);
     }
   });
@@ -513,7 +565,22 @@ describe("verify-oam-floor verifyOamFloor", () => {
     });
     expect(await d.run()).toBe(1);
     expect(d.lines.at(-1)).toBe(
-      `${TAG} FAIL -- oam 0.17.0 could not host a stdio @modelcontextprotocol/sdk server through \`oam run ${PROBE_SERVER}\`: Connection closed\n  server stderr (tail): OAM-NATIVE0001`,
+      `${TAG} FAIL -- oam 0.17.0 could not host a stdio @modelcontextprotocol/server server on protocol 2025-11-25 through \`oam run ${PROBE_SERVER}\`: Connection closed\n  server stderr (tail): OAM-NATIVE0001`,
+    );
+    expect(d.writes).toEqual([]);
+  });
+
+  it("fails when only the 2026-07-28 opening fails, naming that era, after the 2025 one passed", async () => {
+    const d = drive({
+      installed: "0.17.0",
+      probe: new Error("server/discover answered error -32601: Method not found"),
+      failEra: "2026-07-28",
+      raise: true,
+    });
+    expect(await d.run()).toBe(1);
+    expect(d.probes.map((p) => p.era)).toEqual(["2025-11-25", "2026-07-28"]);
+    expect(d.lines.at(-1)).toBe(
+      `${TAG} FAIL -- oam 0.17.0 could not host a stdio @modelcontextprotocol/server server on protocol 2026-07-28 through \`oam run ${PROBE_SERVER}\`: server/discover answered error -32601: Method not found`,
     );
     expect(d.writes).toEqual([]);
   });

@@ -16,7 +16,7 @@
 // indexer handles.) The pid+timestamp+counter suffix makes the tmp name unique
 // across concurrent processes AND within this one; in-process serialization
 // of the LOGICAL read-modify-write is still the caller's concern (see
-// persistence.ts:saveState) -- unique tmp names stop the writes from
+// persistence.ts's saveChain + file-lock.ts) -- unique tmp names stop the writes from
 // tearing each other, they don't stop a last-writer-wins overwrite.
 //
 // PERMISSIONS: rename() publishes a brand-new inode, so the surviving
