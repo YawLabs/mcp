@@ -1194,15 +1194,15 @@ export class ConnectServer {
     });
   };
 
-  /** The active servers the startup pre-warm still has to spawn to learn:
-   *  no trusted tool list yet, or a learned one past its refresh window.
-   *  The same predicate prewarmDormantServers selects by, read NOW rather
-   *  than at its snapshot, so a server the sweep has already finished drops
-   *  out as soon as its list lands in the cache. */
+  /** The active servers the startup pre-warm still has to SPAWN to learn:
+   *  no trusted tool list yet. A learned-but-stale list is deliberately not
+   *  in here: the cache it came from is served straight away and revalidated
+   *  in the background (prewarmDormantServers), so a caller waiting on the
+   *  sweep must not wait for that refresh before answering from a list it
+   *  already has. Read NOW rather than at the sweep's snapshot, so a server
+   *  the sweep has already finished drops out as soon as its list lands. */
   private serversPrewarmIsLearning(): UpstreamServerConfig[] {
-    return this.getProfiledActiveServers().filter(
-      (s) => !this.hasKnownTools(s) || this.isLearnedCacheStale(s.namespace),
-    );
+    return this.getProfiledActiveServers().filter((s) => !this.hasKnownTools(s));
   }
 
   /** Could the running pre-warm still produce a route for any of these
@@ -1249,6 +1249,14 @@ export class ConnectServer {
    *  tool timeout (Codex: 300 s). Neither private nor readonly, so a test can
    *  shrink it without a cast; nothing outside the tests writes it. */
   static STARTUP_PREWARM_WAIT_MS = 20_000;
+
+  /** How many server activations one pass runs at once. prewarmDormantServers
+   *  had this as an inline `CONCURRENCY = 3`; handleActivate now shares it so
+   *  a multi-server `mcp_connect_activate` no longer pays one connect timeout
+   *  per namespace in sequence, while both passes bound how many children a
+   *  single call can start (and how many elicitation prompts can be up at
+   *  once) to the same number. */
+  private static readonly ACTIVATION_CONCURRENCY = 3;
 
   /** The line a load reply needs for a client that never re-lists tools
    *  (NO_RELIST_CLIENTS), or null for every other client.
@@ -2249,8 +2257,9 @@ export class ConnectServer {
   // server rather than a per-session `npx -y <pkg>@latest` resolve for
   // every active server (which is what it degenerated into while the
   // learned cache had nowhere to persist). A learned list past
-  // TOOLCACHE_REFRESH_MS counts as dormant again so @latest drift gets
-  // re-learned weekly instead of only at the 30-day persistence expiry.
+  // TOOLCACHE_REFRESH_MS is refreshed by this same pass, but as a separate
+  // REVALIDATION population (below): the cached list keeps serving until
+  // the refresh lands, so a weekly drift check is no longer a cold start.
   //
   // The child it spawns is DISCARDED: the tool list is what this wants, and
   // holding the upstream open would mean N idle processes for the session.
@@ -2261,7 +2270,8 @@ export class ConnectServer {
   // that takes a lock, binds a port, opens a DB session or writes a login
   // audit event does that side effect twice. YAW_MCP_PREWARM=0 is the escape
   // hatch for the second kind (isPrewarmEnabled says what turning it off
-  // costs).
+  // costs). A WARM cache costs no spawn at all -- nothing here runs for a
+  // server whose list is known and inside its refresh window.
   //
   // Cap-exempt in both directions, deliberately -- the reasoning is at the
   // cap check in runActivateOne. The consequence to know is that the
@@ -2297,24 +2307,50 @@ export class ConnectServer {
     // prewarm didn't create and must not tear down. The isChanged gate
     // in the batch below covers the race where a namespace connects
     // between this snapshot and its activation turn.
-    const dormant = this.getProfiledActiveServers().filter(
-      (s) =>
-        this.connections.get(s.namespace)?.status !== "connected" &&
-        (!this.hasKnownTools(s) || this.isLearnedCacheStale(s.namespace)),
+    const available = this.getProfiledActiveServers().filter(
+      (s) => this.connections.get(s.namespace)?.status !== "connected",
     );
-    if (dormant.length === 0) return;
+    // Two populations, one sweep. `dormant` has NO trusted list, so spawning
+    // it is the only way to learn what it offers -- that is the spawn the
+    // header describes. `revalidate` already has one and is merely past
+    // TOOLCACHE_REFRESH_MS; its cached list is being served right now
+    // (tools/list, discover, the deferred routes), so this pass refreshes it
+    // in the BACKGROUND beside that answer rather than as a precondition of
+    // anything. Before the split the two went through the same branch and the
+    // weekly re-learn was indistinguishable from a cold start -- which is
+    // what left readers (prewarmStillLearning / prewarmCouldRoute) treating a
+    // warm cache as "still being learned" and holding a call behind a wait
+    // whose only purpose is servers nothing is known about yet.
+    const dormant = available.filter((s) => !this.hasKnownTools(s));
+    const revalidate = available.filter((s) => this.hasKnownTools(s) && this.isLearnedCacheStale(s.namespace));
+    if (dormant.length === 0 && revalidate.length === 0) return;
 
-    log("info", "Pre-warming dormant servers", {
-      count: dormant.length,
-      namespaces: dormant.map((s) => s.namespace),
-    });
+    if (dormant.length > 0) {
+      log("info", "Pre-warming dormant servers", {
+        count: dormant.length,
+        namespaces: dormant.map((s) => s.namespace),
+      });
+    }
+    if (revalidate.length > 0) {
+      log("info", "Revalidating learned tool lists past their refresh window", {
+        count: revalidate.length,
+        namespaces: revalidate.map((s) => s.namespace),
+      });
+    }
 
-    const CONCURRENCY = 3;
+    // Learning first: a server that offers nothing yet is the one a client
+    // cannot see at all, so it takes the earlier batches.
+    const sweep = [
+      ...dormant.map((server) => ({ server, revalidate: false })),
+      ...revalidate.map((server) => ({ server, revalidate: true })),
+    ];
+
+    const CONCURRENCY = ConnectServer.ACTIVATION_CONCURRENCY;
     let anyPopulated = false;
-    for (let i = 0; i < dormant.length; i += CONCURRENCY) {
-      const batch = dormant.slice(i, i + CONCURRENCY);
+    for (let i = 0; i < sweep.length; i += CONCURRENCY) {
+      const batch = sweep.slice(i, i + CONCURRENCY);
       await Promise.all(
-        batch.map(async (server) => {
+        batch.map(async ({ server, revalidate: isRefresh }) => {
           try {
             const result = await this.activateOne(server.namespace, undefined, /* fromPrewarm */ true);
             if (!result.ok) {
@@ -2327,6 +2363,19 @@ export class ConnectServer {
               // the session. Cheap now, and it stops the stale entry becoming
               // load-bearing later.
               this.prewarmNamespaces.delete(server.namespace);
+              if (isRefresh) {
+                // A failed REVALIDATION is not a lost answer: the list the
+                // cache already holds stays served, so this is a background
+                // nicety that did not run, not a server that is invisible.
+                // Debug rather than warn -- the same server being down is a
+                // warn on its next real activation, where it actually blocks
+                // someone.
+                log("debug", "Background revalidation of a learned tool list did not run", {
+                  namespace: server.namespace,
+                  message: result.message,
+                });
+                return;
+              }
               // A failed prewarm means the namespace gets no toolCache
               // entry and stays invisible in tools/list for the session --
               // the exact UX prewarm exists to prevent. Never silent.
@@ -5687,49 +5736,69 @@ export class ConnectServer {
     const total = namespaces.length;
     // Namespaces this call left loaded, for the exec hint below.
     const loadedOk: string[] = [];
-    let i = 0;
-    for (const namespace of namespaces) {
-      i += 1;
-      progress?.(`Loading ${namespace} (${i}/${total})`, i - 1, total);
-      const r = await this.activateOne(namespace, progress);
-      results.push(r.message);
-      // Flags plus the sessionActivated add, shared with handleDispatch.
-      this.recordExplicitLoad(tally, namespace, r);
-      if (r.ok) loadedOk.push(namespace);
-      if (r.ok) {
-        // The server's own initialize-time `instructions`, if it sent any.
-        // Collected here and rendered after the loop, so the broker's own
-        // per-namespace lines come first and the third-party text is a
-        // separate, later block rather than interleaved with them.
-        //
-        // ONCE per namespace per session. The text is a static property of
-        // the server, so reprinting up to MAX_UPSTREAM_INSTRUCTIONS_BYTES of
-        // it on every re-activate -- a `tools` filter change, a reload after
-        // an idle unload -- would spend, on repeats of one paragraph, exactly
-        // the context this broker exists to save. The set is not cleared by
-        // deactivate for the same reason: what the server said has not
-        // changed, and the model has already read it this session.
-        const captured = this.connections.get(namespace)?.instructions;
-        if (captured && !this.instructionsShown.has(namespace)) {
-          this.instructionsShown.add(namespace);
-          upstreamInstructions.push(fenceUpstreamInstructions(namespace, captured));
+    // Activations run in bounded batches of ACTIVATION_CONCURRENCY (the same
+    // constant prewarmDormantServers batches by) instead of one connect
+    // timeout per namespace in sequence. Order is preserved where it is
+    // observable: the milestone reports are emitted up front in configured
+    // order, and the bookkeeping below replays in the SAME order after the
+    // batch settles -- results, sessionActivated (recordExplicitLoad),
+    // loadedOk, the instructions block and the filter rollback are all
+    // applied from an ordered array, so the reply, the tally and the
+    // tools/list surface are byte-identical to the serial loop's.
+    // progress is per-namespace inside activateOne, and the pre-reported
+    // milestone counts forwards rather than regressing, so the reporter's
+    // strictly-increasing contract holds across a batch.
+    for (let start = 0; start < total; start += ConnectServer.ACTIVATION_CONCURRENCY) {
+      const batch = namespaces.slice(start, start + ConnectServer.ACTIVATION_CONCURRENCY);
+      const settled = await Promise.all(
+        batch.map(async (namespace, j) => {
+          const i = start + j + 1;
+          progress?.(`Loading ${namespace} (${i}/${total})`, i - 1, total);
+          return this.activateOne(namespace, progress);
+        }),
+      );
+      for (let j = 0; j < batch.length; j++) {
+        const namespace = batch[j];
+        const r = settled[j];
+        results.push(r.message);
+        // Flags plus the sessionActivated add, shared with handleDispatch.
+        this.recordExplicitLoad(tally, namespace, r);
+        if (r.ok) loadedOk.push(namespace);
+        if (r.ok) {
+          // The server's own initialize-time `instructions`, if it sent any.
+          // Collected here and rendered after the loop, so the broker's own
+          // per-namespace lines come first and the third-party text is a
+          // separate, later block rather than interleaved with them.
+          //
+          // ONCE per namespace per session. The text is a static property of
+          // the server, so reprinting up to MAX_UPSTREAM_INSTRUCTIONS_BYTES of
+          // it on every re-activate -- a `tools` filter change, a reload after
+          // an idle unload -- would spend, on repeats of one paragraph, exactly
+          // the context this broker exists to save. The set is not cleared by
+          // deactivate for the same reason: what the server said has not
+          // changed, and the model has already read it this session.
+          const captured = this.connections.get(namespace)?.instructions;
+          if (captured && !this.instructionsShown.has(namespace)) {
+            this.instructionsShown.add(namespace);
+            upstreamInstructions.push(fenceUpstreamInstructions(namespace, captured));
+          }
         }
-      }
-      if (!r.ok) {
-        // Roll back a filter we installed for a namespace that never came
-        // up. Otherwise the entry outlives this call and narrows the tool
-        // surface of a LATER, successful activation nobody filtered — and
-        // for a namespace that isn't installed at all it is permanent.
-        if (installedFilter && installedFilter.namespace === namespace) {
-          if (installedFilter.prev) this.toolFilters.set(namespace, installedFilter.prev);
-          else this.toolFilters.delete(namespace);
-          installedFilter = null;
-          // Rolled back, so there is no filter left to report unmatched names
-          // against -- and the server never came up, so its tool list is
-          // unknown anyway.
-          filterRequestedFor = null;
-          // The surface never actually moved, so don't announce that it did.
-          filtersChanged = false;
+        if (!r.ok) {
+          // Roll back a filter we installed for a namespace that never came
+          // up. Otherwise the entry outlives this call and narrows the tool
+          // surface of a LATER, successful activation nobody filtered — and
+          // for a namespace that isn't installed at all it is permanent.
+          if (installedFilter && installedFilter.namespace === namespace) {
+            if (installedFilter.prev) this.toolFilters.set(namespace, installedFilter.prev);
+            else this.toolFilters.delete(namespace);
+            installedFilter = null;
+            // Rolled back, so there is no filter left to report unmatched names
+            // against -- and the server never came up, so its tool list is
+            // unknown anyway.
+            filterRequestedFor = null;
+            // The surface never actually moved, so don't announce that it did.
+            filtersChanged = false;
+          }
         }
       }
     }
