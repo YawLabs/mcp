@@ -373,6 +373,13 @@ export interface DoctorJsonSnapshot {
     savedAt: string | null;
     learningEntries: number | null;
     packHistoryEntries: number | null;
+    /** The file's other two sections, counted the same way (null for a
+     *  disabled or unusable state, 0 for missing/fresh): learned tool lists
+     *  per namespace, and namespaces whose startup pre-warm failed within
+     *  the backoff window. Without them a file holding only tool caches or
+     *  only pre-warm failures read as empty-but-healthy here. */
+    toolCacheEntries: number | null;
+    prewarmFailures: number | null;
   };
   reliability: Array<{
     namespace: string;
@@ -1552,6 +1559,8 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
         savedAt: null,
         learningEntries: null,
         packHistoryEntries: null,
+        toolCacheEntries: null,
+        prewarmFailures: null,
       };
     }
     if (statePeek.kind === "missing") {
@@ -1568,6 +1577,8 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
         savedAt: null,
         learningEntries: 0,
         packHistoryEntries: 0,
+        toolCacheEntries: 0,
+        prewarmFailures: 0,
       };
     }
     if (!persisted) {
@@ -1579,6 +1590,8 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
         savedAt: null,
         learningEntries: null,
         packHistoryEntries: null,
+        toolCacheEntries: null,
+        prewarmFailures: null,
       };
     }
     const fresh = persisted.savedAt === 0;
@@ -1590,6 +1603,8 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
       savedAt: fresh ? null : new Date(persisted.savedAt).toISOString(),
       learningEntries: fresh ? 0 : Object.keys(persisted.learning).length,
       packHistoryEntries: fresh ? 0 : persisted.packHistory.length,
+      toolCacheEntries: fresh ? 0 : Object.keys(persisted.toolCache).length,
+      prewarmFailures: fresh ? 0 : Object.keys(persisted.prewarmFailures ?? {}).length,
     };
   })();
 
@@ -2971,6 +2986,8 @@ function renderStateSection(opts: {
     print(`  last saved:           ${formatRelativeAge((opts.now ?? Date.now)() - persisted.savedAt)} ago`);
     print(`  learning entries:     ${Object.keys(persisted.learning).length}`);
     print(`  pack history entries: ${persisted.packHistory.length}`);
+    print(`  tool caches:          ${Object.keys(persisted.toolCache).length}`);
+    print(`  pre-warm failures:    ${Object.keys(persisted.prewarmFailures ?? {}).length}`);
   }
   print("");
 }

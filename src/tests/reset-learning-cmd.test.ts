@@ -519,12 +519,26 @@ describe("runResetLearning -- confirmation", () => {
 
   function writeState(
     learning: Record<string, unknown> = { gh: { dispatched: 3, succeeded: 2, lastUsedAt: 1 } },
+    extra: Record<string, unknown> = {},
   ): void {
     writeFileSync(
       stateFile,
-      JSON.stringify({ version: STATE_SCHEMA_VERSION, savedAt: 1, learning, packHistory: [], toolCache: {} }),
+      JSON.stringify({ version: STATE_SCHEMA_VERSION, savedAt: 1, learning, packHistory: [], toolCache: {}, ...extra }),
     );
   }
+
+  it("previews pre-warm failures when they are the only thing the file holds", async () => {
+    // On the REFUSED run, so it is the preview and not the success report that
+    // names the one section a three-count preview called "0, 0, 0".
+    writeState({}, { prewarmFailures: { gh: { failedAt: Date.now() - 60_000, configKey: "k", message: "m" } } });
+    const io = cap();
+    const r = await runResetLearning({ home, env: {}, isTTY: false, out: io.push, err: io.pushErr });
+    expect(r.exitCode).toBe(2);
+    expect(existsSync(stateFile)).toBe(true);
+    const out = io.out.join("");
+    expect(out).toContain("learning entries:     0");
+    expect(out).toContain("pre-warm failures:    1");
+  });
 
   it("refuses off a TTY, and the file survives", async () => {
     // The delete is irreversible -- a rebuilt learning store costs the user

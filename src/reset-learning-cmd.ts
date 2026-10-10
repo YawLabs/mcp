@@ -234,10 +234,14 @@ export async function runResetLearning(opts: ResetLearningOptions = {}): Promise
   // consequence someone running a reset wants to see up front.
   const toolCacheCount = rawCounts.toolCache;
   // The optional fourth section (persistence.ts PersistedState.prewarmFailures).
-  // A file that holds nothing but failures is not empty: deleting it lets every
-  // broker on the machine re-spawn servers that failed to pre-warm within the
-  // last hour, which is a reasonable thing to want from a reset and exactly
-  // why it should be said, not hidden behind three zeros.
+  // A file that holds nothing but failures is not empty: deleting it lets
+  // every broker STARTED AFTER the delete pre-warm those servers again. A
+  // running broker keeps the failures it holds in memory (its sweep already
+  // ran, and discover keeps the skip note until it restarts) but does not
+  // write them back on its next save -- StateSync lands only what a process
+  // recorded since its baseline. Lifting the backoff is a reasonable thing to
+  // want from a reset, and exactly why it is said here rather than hidden
+  // behind three zeros.
   const prewarmFailureCount = rawCounts.prewarmFailures;
 
   // ----- destructive-action confirmation --------------------------------

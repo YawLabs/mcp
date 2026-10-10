@@ -192,9 +192,11 @@ export interface StatusPayload {
     packHistory: number;
     toolCaches: number;
     /** Namespaces whose startup pre-warm failed within the backoff window
-     *  (persistence.ts prewarmFailures) -- the servers every broker on this
-     *  machine is currently skipping at startup. Sanitized like the rest, so
-     *  an expired failure is not counted. */
+     *  (persistence.ts prewarmFailures). A broker skips such a server at
+     *  startup only while its configured entry still matches the config the
+     *  failure was recorded against; an entry edited, disabled or removed
+     *  since is still counted here but no longer skipped. Sanitized like the
+     *  rest, so an expired failure is not counted. */
     prewarmFailures: number;
     savedAt: number | null;
   };

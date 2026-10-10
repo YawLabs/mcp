@@ -943,6 +943,9 @@ describe("runDoctor — STATE section", () => {
     expect(txt).toMatch(/STATE/);
     expect(txt).toMatch(/learning entries: +2/);
     expect(txt).toMatch(/pack history entries: +2/);
+    // The file's other two sections are accounted for too, as concrete 0s.
+    expect(txt).toMatch(/tool caches: +0/);
+    expect(txt).toMatch(/pre-warm failures: +0/);
     expect(txt).toMatch(/last saved: +5m ago/);
   });
 
@@ -1481,6 +1484,8 @@ describe("runDoctor — --json", () => {
     // Crucially NOT the healthy-fresh shape (learningEntries: 0).
     expect(parsed.state.learningEntries).toBeNull();
     expect(parsed.state.packHistoryEntries).toBeNull();
+    expect(parsed.state.toolCacheEntries).toBeNull();
+    expect(parsed.state.prewarmFailures).toBeNull();
     // A corrupt file yields no reliability data either.
     expect(parsed.reliability).toEqual([]);
   });
@@ -1522,6 +1527,51 @@ describe("runDoctor — --json", () => {
     expect(parsed.state.disabled).toBe(false);
     expect(parsed.state.savedAt).toBeNull();
     expect(parsed.state.learningEntries).toBe(0);
+    expect(parsed.state.toolCacheEntries).toBe(0);
+    expect(parsed.state.prewarmFailures).toBe(0);
+  });
+
+  it("counts a state.json whose only content is pre-warm failures, in text and --json", async () => {
+    // Regression: the STATE section enumerated learning and pack history
+    // only, so a file holding nothing but recorded pre-warm failures (every
+    // broker on the box skipping those servers at startup) read as
+    // empty-but-healthy.
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    writeFileSync(
+      join(synthHome, ".yaw-mcp", STATE_FILENAME),
+      JSON.stringify({
+        version: STATE_SCHEMA_VERSION,
+        savedAt: Date.now() - 60_000,
+        learning: {},
+        packHistory: [],
+        toolCache: { gh: { tools: [{ name: "listPrs" }], learnedAt: Date.now() } },
+        prewarmFailures: {
+          cold: { failedAt: Date.now() - 60_000, configKey: "k", message: "daemon not running" },
+          // Expired: dropped by the loader, so not "what yaw-mcp will use".
+          stale: { failedAt: 1, configKey: "k", message: "m" },
+        },
+      }),
+    );
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      json: true,
+      skipRegistryCheck: true,
+    });
+    const parsed = JSON.parse(r.lines[0]);
+    expect(parsed.state.status).toBe("ok");
+    expect(parsed.state.learningEntries).toBe(0);
+    expect(parsed.state.toolCacheEntries).toBe(1);
+    expect(parsed.state.prewarmFailures).toBe(1);
+
+    const text = captureOut();
+    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: text.out, skipRegistryCheck: true });
+    expect(text.text()).toMatch(/tool caches: +1/);
+    expect(text.text()).toMatch(/pre-warm failures: +1/);
   });
 
   it("marks state.status 'disabled' when persistence is off", async () => {

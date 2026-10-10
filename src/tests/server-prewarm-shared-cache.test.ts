@@ -277,8 +277,10 @@ describe("persisted pre-warm failures", () => {
 
     await priv.prewarmDormantServers();
 
-    // The claim must not outlive the attempt: left behind, evaluateCapFor
-    // would skip this namespace's slot for the rest of the session.
+    // The claim must not outlive the attempt: the `!result.ok` branch
+    // releases it, and a throw is the same outcome with a different exit.
+    // Left behind it says prewarm owns a namespace it does not, which the
+    // next explicit activate would clear and nothing else would.
     expect(priv.prewarmNamespaces.has("gh")).toBe(false);
     expect(priv.activationInflight.has("gh")).toBe(false);
     expect(priv.exportPrewarmFailures().gh?.message).toBe("elicitation transport closed");
