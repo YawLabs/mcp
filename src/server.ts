@@ -6470,11 +6470,40 @@ export class ConnectServer {
     const total = namespaces.length;
     // Namespaces this call left loaded, for the exec hint below.
     const loadedOk: string[] = [];
+    // Claim, UP FRONT, every namespace the startup prewarm is already
+    // connecting. The loop below is sequential, so without this a claim only
+    // lands when the loop reaches that namespace -- and a prewarm that
+    // finishes in the meantime sees no claim, disconnects the child it just
+    // booted, and the loop then spawns the same server again. Measured on
+    // 2026-10-09 (m3, `activate {servers:[fetch,npmjs]}` on a cold home): the
+    // loop sat awaiting fetch's prewarm while npmjs's prewarm completed and
+    // was torn down, so every aggregator started npmjs twice. Joining here
+    // goes through activateOne exactly as the loop would (the claim and its
+    // cap check), just earlier; namespaces with no prewarm in flight still
+    // spawn one at a time, in order. The one ordering consequence: under a
+    // nearly full cap, an already-booting prewarmed server is preferred over
+    // a later-listed one that would need a fresh spawn -- the cheaper of the
+    // two to admit.
+    const preClaimed = new Map<string, Promise<ActivationResult>>();
+    for (const namespace of namespaces) {
+      if (preClaimed.has(namespace)) continue;
+      if (!this.prewarmNamespaces.has(namespace) || !this.activationInflight.has(namespace)) continue;
+      const claim = this.activateOne(namespace, progress);
+      // Awaited in the loop below; this only keeps a rejection that lands
+      // while the loop is still awaiting an earlier namespace from surfacing
+      // as unhandled.
+      claim.catch(() => {});
+      preClaimed.set(namespace, claim);
+    }
     let i = 0;
     for (const namespace of namespaces) {
       i += 1;
       progress?.(`Loading ${namespace} (${i}/${total})`, i - 1, total);
-      const r = await this.activateOne(namespace, progress);
+      const claimed = preClaimed.get(namespace);
+      // Consumed once: a namespace listed twice takes the ordinary path the
+      // second time, as it always has.
+      preClaimed.delete(namespace);
+      const r = await (claimed ?? this.activateOne(namespace, progress));
       results.push(r.message);
       // Flags plus the sessionActivated add, shared with handleDispatch.
       this.recordExplicitLoad(tally, namespace, r);
