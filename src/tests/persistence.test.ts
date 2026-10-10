@@ -13,6 +13,7 @@ import {
   loadState,
   loadStateClassified,
   PACK_HISTORY_MAX_ENTRIES,
+  PREWARM_FAILURE_BACKOFF_MS,
   STATE_SCHEMA_VERSION,
   saveState,
   TOOLCACHE_MAX_DESCRIPTION_CHARS,
@@ -273,25 +274,37 @@ describe("persistence.loadState", () => {
             { namespace: "", toolName: "t", at: 2 },
           ],
           toolCache: { expired: { tools: [{ name: "t" }], learnedAt: Date.now() - TOOLCACHE_TTL_MS - 1000 } },
+          // Both expired (the sanitizer drops them) -- and both counted.
+          prewarmFailures: {
+            gh: { failedAt: Date.now() - PREWARM_FAILURE_BACKOFF_MS - 1000, configKey: "k", message: "m" },
+            fetch: { failedAt: Date.now() - PREWARM_FAILURE_BACKOFF_MS - 1000, configKey: "k", message: "m" },
+          },
         }),
         "utf8",
       );
       const c = await loadStateClassified(file);
-      expect(c.rawCounts).toEqual({ learning: 2, packHistory: 2, toolCache: 1 });
+      expect(c.rawCounts).toEqual({ learning: 2, packHistory: 2, toolCache: 1, prewarmFailures: 2 });
       // The sanitized state is the narrower view, and still is.
       expect(Object.keys(c.state.learning)).toEqual(["gh"]);
       expect(c.state.packHistory).toHaveLength(1);
       expect(c.state.toolCache).toEqual({});
+      expect(c.state.prewarmFailures).toBeUndefined();
+    });
+
+    it("counts the optional prewarmFailures section as 0 when the key is absent", async () => {
+      writeFileSync(
+        file,
+        JSON.stringify({ version: STATE_SCHEMA_VERSION, savedAt: 0, learning: {}, packHistory: [], toolCache: {} }),
+        "utf8",
+      );
+      expect((await loadStateClassified(file)).rawCounts.prewarmFailures).toBe(0);
     });
 
     it("reports all-zero rawCounts for a missing file and for one it could not parse", async () => {
-      expect((await loadStateClassified(join(dir, "absent.json"))).rawCounts).toEqual({
-        learning: 0,
-        packHistory: 0,
-        toolCache: 0,
-      });
+      const zero = { learning: 0, packHistory: 0, toolCache: 0, prewarmFailures: 0 };
+      expect((await loadStateClassified(join(dir, "absent.json"))).rawCounts).toEqual(zero);
       writeFileSync(file, "{ not json", "utf8");
-      expect((await loadStateClassified(file)).rawCounts).toEqual({ learning: 0, packHistory: 0, toolCache: 0 });
+      expect((await loadStateClassified(file)).rawCounts).toEqual(zero);
     });
 
     it("classifies a BOM-prefixed file as clean, matching loadState's own strip", async () => {

@@ -147,6 +147,36 @@ describe("runResetLearning", () => {
     const combined = io.out.join("");
     expect(combined).not.toContain("contents unreadable");
     expect(combined).toContain("tool caches removed:          0");
+    expect(combined).toContain("pre-warm failures removed:    0");
+  });
+
+  // Regression: the fourth section (persistence.ts prewarmFailures) was
+  // deleted in silence, so a file holding nothing but recorded pre-warm
+  // failures previewed and reported as 0 / 0 / 0 -- "empty" -- while the
+  // delete really lifted an hour-long backoff for every broker on the box.
+  it("reports the pre-warm failures it deleted, even when they are the file's only content", async () => {
+    const payload = {
+      version: STATE_SCHEMA_VERSION,
+      savedAt: Date.now(),
+      learning: {},
+      packHistory: [],
+      toolCache: {},
+      prewarmFailures: {
+        gh: { failedAt: Date.now() - 60_000, configKey: "k1", message: "daemon not running" },
+        // Expired: the loader drops it, the report still counts it (it was
+        // in the file, and the unlink destroyed it).
+        stale: { failedAt: 1, configKey: "k2", message: "m" },
+      },
+    };
+    writeFileSync(stateFile, JSON.stringify(payload), "utf8");
+    const io = captureIO();
+    const r = await runResetLearning({ home, env: {}, force: true, out: io.push, err: io.pushErr });
+    expect(r.exitCode).toBe(0);
+    expect(r.removed).toBe(true);
+    const combined = io.out.join("");
+    expect(combined).toContain("learning entries removed:     0");
+    expect(combined).toContain("tool caches removed:          0");
+    expect(combined).toContain("pre-warm failures removed:    2");
   });
 
   it("counts what the FILE held, not what survived sanitization", async () => {

@@ -233,6 +233,12 @@ export async function runResetLearning(opts: ResetLearningOptions = {}): Promise
   // upstream handshake on the next session, which is exactly the kind of
   // consequence someone running a reset wants to see up front.
   const toolCacheCount = rawCounts.toolCache;
+  // The optional fourth section (persistence.ts PersistedState.prewarmFailures).
+  // A file that holds nothing but failures is not empty: deleting it lets every
+  // broker on the machine re-spawn servers that failed to pre-warm within the
+  // last hour, which is a reasonable thing to want from a reset and exactly
+  // why it should be said, not hidden behind three zeros.
+  const prewarmFailureCount = rawCounts.prewarmFailures;
 
   // ----- destructive-action confirmation --------------------------------
   // Gated on the file actually being there. A missing one falls through to the
@@ -253,6 +259,7 @@ export async function runResetLearning(opts: ResetLearningOptions = {}): Promise
       print(`  learning entries:     ${learningCount}`);
       print(`  pack history entries: ${packCount}`);
       print(`  tool caches:          ${toolCacheCount}`);
+      print(`  pre-warm failures:    ${prewarmFailureCount}`);
     } else {
       print("  contents unreadable -- it will be deleted as it is.");
     }
@@ -305,6 +312,7 @@ export async function runResetLearning(opts: ResetLearningOptions = {}): Promise
   print(`  learning entries removed:     ${learningCount}`);
   print(`  pack history entries removed: ${packCount}`);
   print(`  tool caches removed:          ${toolCacheCount}`);
+  print(`  pre-warm failures removed:    ${prewarmFailureCount}`);
   for (const line of RUNNING_SERVE_NOTE) print(line);
   return { exitCode: 0, lines, removed: true, path: filePath };
 }

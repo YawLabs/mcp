@@ -268,6 +268,22 @@ describe("persisted pre-warm failures", () => {
     expect(priv.exportPrewarmFailures()).toEqual({});
   });
 
+  it("a thrown activation releases the pre-warm claim and is recorded as a failure", async () => {
+    const cfg = makeServerConfig();
+    priv.config = { servers: [cfg], configVersion: "v1" };
+    // activateOne takes the claim, then runActivateOne throws past every
+    // `!result.ok` branch straight into the sweep's catch.
+    priv.runActivateOne = vi.fn().mockRejectedValue(new Error("elicitation transport closed"));
+
+    await priv.prewarmDormantServers();
+
+    // The claim must not outlive the attempt: left behind, evaluateCapFor
+    // would skip this namespace's slot for the rest of the session.
+    expect(priv.prewarmNamespaces.has("gh")).toBe(false);
+    expect(priv.activationInflight.has("gh")).toBe(false);
+    expect(priv.exportPrewarmFailures().gh?.message).toBe("elicitation transport closed");
+  });
+
   it("a spawn-gate refusal (disabled entry) is not banked as a failure either", async () => {
     const cfg = makeServerConfig({ isActive: false });
     priv.config = { servers: [cfg], configVersion: "v1" };

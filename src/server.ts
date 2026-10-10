@@ -3206,6 +3206,16 @@ export class ConnectServer {
             }
             anyPopulated = true;
           } catch (err) {
+            // Release the claim activateOne(fromPrewarm) took, as the
+            // `!result.ok` branch does: a throw is the same outcome with a
+            // different exit. Nothing prewarm owns survives it -- a
+            // connection that came up before the throw was either torn down
+            // above (after the claim was already released) or converted by an
+            // explicit activate (which released it itself), so the delete is
+            // never racing a live owner. Left in place, the stale claim would
+            // hide this namespace from evaluateCapFor's slot count for the
+            // rest of the session.
+            this.prewarmNamespaces.delete(server.namespace);
             const error = err instanceof Error ? err.message : String(err);
             log("warn", "Pre-warm of server failed", {
               namespace: server.namespace,
