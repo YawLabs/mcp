@@ -404,7 +404,7 @@ yaw-mcp does **not** block outbound traffic, firewall DNS, analyze source, or pi
 
 ## Missing credentials
 
-If a server exits with something like `GITHUB_TOKEN is required` and your client advertises MCP [elicitation](https://modelcontextprotocol.io/specification/server/elicitation), yaw-mcp prompts for the value and retries, rather than failing the call outright. A client on MCP 2026-07-28 is not prompted: that revision has no server-to-client requests (see [`docs/protocol-eras.md`](./docs/protocol-eras.md)).
+If a server exits with something like `GITHUB_TOKEN is required` and your client advertises MCP [elicitation](https://modelcontextprotocol.io/specification/server/elicitation), yaw-mcp prompts for the value and retries, rather than failing the call outright. On MCP 2026-07-28, which has no server-to-client requests, the prompt comes back inside the tool call's reply and the client's retry carries the answer (see [`docs/protocol-eras.md`](./docs/protocol-eras.md)).
 
 ## Environment variables
 

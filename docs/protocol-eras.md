@@ -12,8 +12,10 @@ Pre-warm and the opt-in auto-load start once per process: after the `initialize`
 
 2026-07-28 has no server-to-client requests. yaw-mcp therefore sends no `elicitation/create`, `sampling/createMessage` or `roots/list` in a 2026-07-28 session, whatever capabilities the client declares:
 
-- A server that fails on a missing credential is reported with its own error instead of a prompt for the value; store the value with `yaw-mcp secrets set` (or in the server's `env` in `bundles.json`) and activate again.
-- The sampling tiebreak and `YAW_MCP_REWARD_GRADER` are inactive, as for a client without the sampling capability.
+- **Secret entry rides on the tool call.** When a server fails on a missing credential, or its env needs the locked local vault, the `tools/call` that was loading it answers `input_required` with one elicitation: URL mode pointing at the masked-entry page on 127.0.0.1 (no `elicitationId`; that revision's URL mode has none), or, for a client that declares form mode only, a consent form with no fields, after which yaw-mcp opens the page in the browser itself. The client retries the call with the user's answer; the retry waits for the page (with progress heartbeats), and the load then runs with the value in place. Decline, expiry and a passphrase that does not unlock the vault get the same answers as on the 2025 protocol, and no `notifications/elicitation/complete` is sent. A call carries one prompt at a time: a second server in the same call that needs one is asked on the next round.
+- The retry finds its prompt through a signed `requestState` (HMAC, a random key per process, bound to `tools/call`). It holds the prompt's own id and a digest of the call's name and arguments, never the page address or a secret; a forged, expired or foreign one is refused with -32602, and a replay of one already answered gets a refusal.
+- Loads no client request carries -- pre-warm, the opt-in auto-load, `mcp_connect_exec` steps -- ask nothing; the next explicit activate of that server asks. `yaw-mcp secrets set` (or the server's `env` in `bundles.json`) avoids the prompt altogether.
+- The sampling tiebreak and `YAW_MCP_REWARD_GRADER` do not run: sampling has no request to ride on there (the grader runs after the tool result has gone, and the tiebreak has a 2 s budget). yaw-mcp logs once that each is inactive on 2026-07-28.
 - Upstream servers are told the client supports none of the three, so a sidecar sees a client without them rather than one whose requests yaw-mcp cannot forward.
 
 On the 2025 protocol all of this works as before.

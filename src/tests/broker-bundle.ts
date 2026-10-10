@@ -1,5 +1,5 @@
-// The esbuild bundle of src/index.ts that four suites spawn: index-dispatch,
-// e2e-round-trip, shutdown-on-stdin-close and serve-era. It is built and warmed up ONCE
+// The esbuild bundle of src/index.ts that five suites spawn: index-dispatch,
+// e2e-round-trip, shutdown-on-stdin-close, serve-era and secret-entry-modern-process. It is built and warmed up ONCE
 // per vitest run, by broker-bundle.setup.ts (the root global setup), and only
 // when the run includes one of those suites; each suite gets the path through
 // useBrokerBundle() below and keeps its own temp dir for HOME. index.ts
@@ -213,6 +213,7 @@ export const BROKER_BUNDLE_CONSUMERS: readonly string[] = [
   "src/tests/e2e-round-trip.test.ts",
   "src/tests/shutdown-on-stdin-close.test.ts",
   "src/tests/serve-era.test.ts",
+  "src/tests/secret-entry-modern-process.test.ts",
 ];
 
 /** Whether a run whose test files are `planned` needs the bundle. vitest

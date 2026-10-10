@@ -2269,7 +2269,7 @@ describe("ConnectServer.start() -- the 2026-07-28 session", () => {
       process.env.YAW_MCP_PREWARM = "0";
     });
 
-    it("a missing credential takes the no-elicitation path and writes no request to the wire", async () => {
+    it("a missing credential is asked for in the reply, never by a request on the wire", async () => {
       writeBundles(synthHome, [serverEntry("gh")]);
       vi.mocked(connectToUpstream).mockRejectedValue(new Error("GITHUB_TOKEN is required"));
       const { priv, transport } = await startModern();
@@ -2277,14 +2277,17 @@ describe("ConnectServer.start() -- the 2026-07-28 session", () => {
       // The single retry spawns again after a fixed 1 s; nothing here is about it.
       priv.activationRetryDelayMs = 0;
 
-      // The envelope declares url and form elicitation, as Claude Code's does:
-      // the gate is the era, not the declared capability.
+      // The envelope declares url and form elicitation, as Claude Code's does.
+      // The prompt rides back in the tools/call reply as input_required (the
+      // multi-round-trip flow is covered end to end in
+      // secret-entry-modern.test.ts); nothing is pushed.
       const reply = await request(transport, "tools/call", {
         name: "mcp_connect_activate",
         arguments: { server: "gh" },
       });
-      expect((reply.result as { isError?: boolean }).isError).toBe(true);
-      expect(callText(reply)).toContain("GITHUB_TOKEN");
+      const result = reply.result as { resultType?: string; inputRequests?: Record<string, { params?: unknown }> };
+      expect(result.resultType).toBe("input_required");
+      expect(JSON.stringify(result.inputRequests)).toContain("GITHUB_TOKEN");
       expect(elicit).not.toHaveBeenCalled();
       // Every message yaw-mcp wrote is a reply or a notification: nothing
       // carries a method AND an id.

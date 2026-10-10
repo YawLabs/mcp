@@ -72,6 +72,7 @@ import { META_TOOLS } from "../meta-tools.js";
 import { CONFIG_DIRNAME } from "../paths.js";
 import { brandCancelled, brandRoutingFault, isRoutingFaultResult, routeToolCall } from "../proxy.js";
 import { capContent } from "../result-cap.js";
+import { resetNoSamplingNotice as resetGraderNotice } from "../reward-grader.js";
 import { resetNoSamplingNotice } from "../sampling-rank.js";
 import type { SecretEntryPage, SecretEntryPageOptions } from "../secret-entry-page.js";
 import {
@@ -10864,6 +10865,42 @@ describe("cold tool-list readers share mergeToolCache's precedence", () => {
     } finally {
       write.mockRestore();
       resetNoSamplingNotice();
+    }
+  });
+
+  it("runs neither the dispatch tiebreak nor the reward grader on 2026-07-28, even when the envelope declares sampling", async () => {
+    // 2026-07-28 has no server-to-client request, so sampling is a 2025-only
+    // feature here (SamplingPeer): the grader runs after the result has gone
+    // and best-of-N has a 2 s budget, so neither can ride an input_required
+    // round instead. The era is the gate, not the declared capability.
+    resetNoSamplingNotice();
+    resetGraderNotice();
+    const priv = getPrivate(server);
+    priv.config = makeConfig([
+      makeServerConfig({ id: "a", namespace: "alpha", name: "Alpha", description: "manage github issues" }),
+      makeServerConfig({ id: "b", namespace: "beta", name: "Beta", description: "manage github issues" }),
+    ]);
+    priv.servedEra = "modern";
+    priv.modernClient = { clientInfo: { name: "claude-code", version: "0" }, capabilities: { sampling: {} } };
+    const createMessage = vi.fn();
+    priv.server.createMessage = createMessage;
+    const write = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    vi.stubEnv("LOG_LEVEL", "");
+    try {
+      await priv.handleDispatch("manage github issues", 1);
+      await priv.handleDispatch("manage github issues", 1);
+      await priv.refineRewardInBackground("alpha", 0.5, { toolName: "alpha_list", resultText: "ok" });
+      expect(createMessage).not.toHaveBeenCalled();
+      // One line per feature, each naming its own inert knob.
+      const notices = write.mock.calls.map(([chunk]) => String(chunk)).filter((c) => c.includes("MCP 2026-07-28"));
+      expect(notices).toHaveLength(2);
+      expect(notices.filter((n) => n.includes("YAW_MCP_ROUTE_EFFORT"))).toHaveLength(1);
+      expect(notices.filter((n) => n.includes("YAW_MCP_REWARD_GRADER"))).toHaveLength(1);
+    } finally {
+      vi.unstubAllEnvs();
+      write.mockRestore();
+      resetNoSamplingNotice();
+      resetGraderNotice();
     }
   });
 

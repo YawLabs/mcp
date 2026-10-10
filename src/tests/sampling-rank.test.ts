@@ -579,6 +579,20 @@ describe("bestOfNViaSampling", () => {
     expect(createMessage).not.toHaveBeenCalled();
   });
 
+  it("never samples on 2026-07-28, even when the client declares sampling, and says why once", async () => {
+    resetNoSamplingNotice();
+    mockLog.mockClear();
+    const createMessage = vi.fn();
+    const peer = { era: "modern" as const, getClientCapabilities: () => ({ sampling: {} }), createMessage } as never;
+    expect(await bestOfNViaSampling(peer, "intent", candidates, 3)).toBeNull();
+    expect(await bestOfNViaSampling(peer, "intent", candidates, 1)).toBeNull();
+    expect(createMessage).not.toHaveBeenCalled();
+    const notices = mockLog.mock.calls.filter(([level, msg]) => level === "info" && /sampling/.test(msg));
+    expect(notices).toHaveLength(1);
+    expect(notices[0][1]).toMatch(/MCP 2026-07-28/);
+    resetNoSamplingNotice();
+  });
+
   it("logs ONCE per process that the client has no sampling, so an inert ROUTE_EFFORT is visible", async () => {
     // Every ambiguous dispatch lands here on a client without sampling, and
     // nothing else tells the user YAW_MCP_ROUTE_EFFORT=aggressive does

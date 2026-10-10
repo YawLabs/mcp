@@ -1,3 +1,4 @@
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { getSupportedElicitationModes } from "@modelcontextprotocol/sdk/client/index.js";
 import {
@@ -5,13 +6,20 @@ import {
   CLIENT_CAPABILITIES_META_KEY,
   CLIENT_INFO_META_KEY,
   type ClientCapabilities,
+  createRequestStateCodec,
   type GetPromptResult,
   type HandlerResultTypeMap,
   type Implementation,
+  type InputRequest,
+  type InputRequiredResult,
+  inputRequired,
+  inputResponse,
   type ListPromptsResult,
   type ListResourcesResult,
   type ListToolsResult,
   type ProtocolEra,
+  ProtocolError,
+  ProtocolErrorCode,
   type ReadResourceResult,
   type RequestMethod,
   type RequestTypeMap,
@@ -26,6 +34,7 @@ import { maybeAutoUpgrade } from "./auto-upgrade.js";
 import { bundleActivateHint, CURATED_BUNDLES, matchBundles, topPartialBundles } from "./bundles.js";
 import { bundlesFileHint } from "./bundles-hint.js";
 import { formatShadowLine, installTargetForCli } from "./cli-shadows.js";
+import { canonicalJson } from "./client-config-values.js";
 import { classifyGrade, passesMinCompliance } from "./compliance.js";
 import { loadYawMcpConfig, type Profile, profileAllows, type ResolvedConfig, toProfile } from "./config-loader.js";
 import { estimateFromConnectedTools, estimateFromToolCache, formatCostLabel } from "./cost-estimate.js";
@@ -116,6 +125,7 @@ import {
   openInSystemBrowser,
   openSecretEntryPage,
   SECRET_ENTRY_PAGE_TTL_MS,
+  type SecretEntryOutcome,
   type SecretEntryPage,
   type SecretEntryPageOptions,
 } from "./secret-entry-page.js";
@@ -398,8 +408,31 @@ const VAULT_PAGE_FIELD = "passphrase";
  *  different question. Each such ask spends one of that namespace's prompts,
  *  and a decline latches it for the session exactly as an explicit activate's
  *  decline would. A value typed there that the child accepts stays in
- *  elicitedEnv after prewarm tears the child down, so the next launch uses it. */
+ *  elicitedEnv after prewarm tears the child down, so the next launch uses it.
+ *  That is the 2025 protocol. On 2026-07-28 a prompt rides on a client
+ *  request (InputLeg), and prewarm has none, so it asks nothing and the next
+ *  explicit activate of that server does the asking. */
 const MAX_CREDENTIAL_PROMPTS = 2;
+
+/** The inputRequests key of a 2026-07-28 masked-entry prompt. One key is
+ *  enough: a round carries at most one prompt (see InputLeg). */
+const SECRET_ASK_KEY = "yaw-mcp.secret";
+
+/** How long a posted prompt, and the requestState naming it, can be redeemed
+ *  by a retry. The page itself lives SECRET_ENTRY_PAGE_TTL_MS (3 min); the
+ *  rest is room for a retry that arrives after the page expired to get the
+ *  expiry refusal rather than the codec's bare "invalid or expired" -32602.
+ *  Ten minutes is the codec's own default and the SDK's legacy-shim round
+ *  timeout. */
+const SECRET_ASK_TTL_SECONDS = 600;
+
+/** The activation a prompt was asked for, as the re-run of its call looks it
+ *  up: each missing-credential prompt is its namespace's, the vault prompt is
+ *  the one vault's. */
+const VAULT_ASK_SUBJECT = "vault";
+function credentialAskSubject(namespace: string): string {
+  return `credential:${namespace}`;
+}
 
 /** How many bytes of intermediate step output an exec echoes back when the
  *  caller named an explicit `return`.
@@ -747,6 +780,69 @@ type LoopbackEntryResult =
   | { kind: "unreachable"; reason: SecretPageFailure }
   | { kind: "failed" };
 
+/** The requestState a 2026-07-28 masked-entry prompt round-trips through the
+ *  client. Signed by the codec, not encrypted -- the client can read it -- so
+ *  it names the prompt by an id of its own and binds it to the call by a
+ *  digest; the page's address (its token) is never in it. */
+interface SecretAskState {
+  pageId: string;
+  argsDigest: string;
+}
+
+/** A prompt's result as the re-run of its call receives it: what
+ *  collectSecretOnLoopbackPage produced for a missing-credential prompt, or
+ *  what the vault prompt made of it (verified, rejected, ...). `subject` is
+ *  the activation it answers (credentialAskSubject / VAULT_ASK_SUBJECT). */
+type SecretAnswer =
+  | { subject: string; kind: "credential"; entry: LoopbackEntryResult }
+  | { subject: string; kind: "vault"; outcome: VaultPromptOutcome };
+
+type ElicitAction = "accept" | "decline" | "cancel";
+
+/** One masked-entry prompt handed to a 2026-07-28 client inside an
+ *  input_required result. Lives from the leg that posted it until a retry
+ *  consumes it, or SECRET_ASK_TTL_SECONDS. */
+interface SecretAsk {
+  pageId: string;
+  subject: string;
+  request: InputRequest;
+  /** The client's answer to the prompt, delivered by the retry. */
+  decision: Promise<ElicitAction>;
+  decide: (action: ElicitAction) => void;
+  /** The retry's reporter, set before decide(): the wait on the page then
+   *  heartbeats on the request that is open, not on the answered first leg. */
+  progress?: ProgressReporter;
+  /** The prompt's processed result (credential values stored, the vault
+   *  passphrase verified), set by the path that asked. Never rejects. */
+  settled?: Promise<SecretAnswer>;
+  dropTimer?: ReturnType<typeof setTimeout>;
+}
+
+/** One 2026-07-28 tools/call round, as the secret-entry paths see it. The
+ *  activation code reaches it through the call's progress reporter, which is
+ *  already threaded to every activation the call makes (see inputLegs);
+ *  background activations (prewarm, auto-load, exec steps) have none, and
+ *  so have no request to carry a prompt. */
+interface InputLeg {
+  progress: ProgressReporter;
+  /** This request's envelope capabilities: the ones its prompt must fit. */
+  capabilities: ClientCapabilities | undefined;
+  /** What the retry that started this round brought back, if it was one. */
+  answer: SecretAnswer | null;
+  /** The prompt this round posted. At most one: a later prompt in the same
+   *  call waits for the next round (awaitingInputResult). */
+  ask: SecretAsk | null;
+  /** Set, synchronously, by the path that is about to post `ask`. A call
+   *  activates several namespaces at once, and opening a page takes a while:
+   *  a second path checking `ask` alone in that window would post a second
+   *  prompt, or wait on a vault prompt its own call has yet to hand out. */
+  askClaimed: boolean;
+  /** Settles when `ask` is posted, so the path that asked can stop waiting
+   *  on the prompt and let the call return. */
+  posted: Promise<void>;
+  markPosted: () => void;
+}
+
 /** What one namespace's activation came back with -- activateOne,
  *  runActivateOne, the shared in-flight promise, and the two elicit-and-retry
  *  paths that stand in for runActivateOne's result. One declaration so a new
@@ -957,6 +1053,25 @@ export class ConnectServer {
   // Tracked so shutdown() can close them: a listener keeps the process alive
   // under oam, whose http.Server has no unref().
   private secretEntryPages = new Set<SecretEntryPage>();
+  // 2026-07-28 prompts posted in an input_required result and not yet
+  // redeemed by a retry, by SecretAsk.pageId.
+  private secretAsks = new Map<string, SecretAsk>();
+  // The round each 2026-07-28 tools/call's progress reporter belongs to.
+  // Keyed by the reporter because it is the one per-call value every
+  // activation path is already handed (activateOne, runActivateOne and the
+  // elicitation paths all take it); threading a second parameter through
+  // each of them and their callers would say the same thing at a dozen call
+  // sites. A reporter is made per call and never shared, so the key is exact.
+  private inputLegs = new WeakMap<ProgressReporter, InputLeg>();
+  // Signs the requestState of a 2026-07-28 prompt. A random key per process
+  // is enough: one stdio process serves every round of a flow, and a retry
+  // that outlives it has no page to come back to anyway. Bound to the method
+  // so a state minted for tools/call is refused anywhere else.
+  private readonly requestStateCodec = createRequestStateCodec<SecretAskState>({
+    key: randomBytes(32),
+    ttlSeconds: SECRET_ASK_TTL_SECONDS,
+    bind: (ctx) => ctx.mcpReq.method,
+  });
   // The page opener, the browser launcher and the page TTL. Instance fields
   // (not direct calls) purely so tests can substitute a fake page and a fake
   // browser, the same reason activationRetryDelayMs is one; production never
@@ -1169,6 +1284,10 @@ export class ConnectServer {
         // connection. See SERVER_INSTRUCTIONS.
         instructions: SERVER_INSTRUCTIONS,
         cacheHints: CACHE_HINTS,
+        // Verifies an echoed requestState before the handler runs; a forged,
+        // expired or foreign one is answered -32602 by the SDK. Only the
+        // 2026-07-28 tools/call path mints one (callToolCarryingInput).
+        requestState: { verify: (state, ctx) => this.requestStateCodec.verify(state, ctx) },
         ...(supportedProtocolVersions ? { supportedProtocolVersions } : {}),
       },
     );
@@ -1204,9 +1323,11 @@ export class ConnectServer {
   }
 
   /** What the sampling helpers (sampling-rank.ts, reward-grader.ts) need of
-   *  the client: its push-usable capabilities, and the live instance to ask. */
+   *  the client: the era (sampling runs on the 2025 protocol only), its
+   *  push-usable capabilities, and the live instance to ask. */
   private samplingPeer(): SamplingPeer {
     return {
+      era: this.clientSession().era,
       getClientCapabilities: () => this.pushCapabilities(),
       createMessage: (params, options) => this.server.createMessage(params, options),
     };
@@ -1219,6 +1340,150 @@ export class ConnectServer {
   private pushCapabilities(): ClientCapabilities | undefined {
     const session = this.clientSession();
     return session.canPush ? session.capabilities : undefined;
+  }
+
+  /** The 2026-07-28 round an activation is running for, found through the
+   *  reporter its call was handed (see inputLegs). Undefined on the 2025
+   *  protocol, which asks by push, and for a background activation. */
+  private inputLegFor(progress: ProgressReporter | undefined): InputLeg | undefined {
+    return progress ? this.inputLegs.get(progress) : undefined;
+  }
+
+  /** The elicitation modes a masked-entry prompt may use: the initialize
+   *  declaration on the 2025 protocol, the carrying request's envelope on
+   *  2026-07-28 (the SDK checks an input request against that envelope and
+   *  refuses one it does not cover). */
+  private elicitationCapability(leg: InputLeg | undefined): ClientCapabilities["elicitation"] {
+    return leg ? leg.capabilities?.elicitation : this.pushCapabilities()?.elicitation;
+  }
+
+  /** True when this activation cannot ask because the session is on
+   *  2026-07-28 and nothing carries a prompt for it -- prewarm, auto-load, an
+   *  exec step. Logged as a credential the next explicit activate will ask
+   *  for, rather than as a client that cannot be asked at all. */
+  private noRequestToAskOn(leg: InputLeg | undefined): boolean {
+    return leg === undefined && this.clientSession().era === "modern";
+  }
+
+  /** Post a masked-entry prompt on `leg`: the call returns it as an
+   *  input_required result once its activations have unwound. */
+  private postSecretAsk(leg: InputLeg, subject: string, request: InputRequest): SecretAsk {
+    let decide: (action: ElicitAction) => void = () => {};
+    const decision = new Promise<ElicitAction>((resolve) => {
+      decide = resolve;
+    });
+    const ask: SecretAsk = { pageId: randomUUID(), subject, request, decision, decide };
+    // Past the codec's TTL a retry is refused before it reaches the handler,
+    // so the record has no reader left. unref: a pending drop must not keep
+    // the process up.
+    ask.dropTimer = setTimeout(() => this.dropSecretAsk(ask), SECRET_ASK_TTL_SECONDS * 1000);
+    ask.dropTimer.unref?.();
+    this.secretAsks.set(ask.pageId, ask);
+    leg.ask = ask;
+    leg.markPosted();
+    return ask;
+  }
+
+  private dropSecretAsk(ask: SecretAsk): void {
+    if (ask.dropTimer) clearTimeout(ask.dropTimer);
+    this.secretAsks.delete(ask.pageId);
+  }
+
+  /** The stand-in result of an activation whose prompt waits for the next
+   *  round: this call already posted one (a round carries one), or the vault
+   *  prompt it would join is this call's own. The call answers input_required,
+   *  so its own client never reads this; a call that joined the activation
+   *  from another request does. */
+  private awaitingInputResult(namespace: string): ActivationResult {
+    return {
+      ok: false,
+      isChanged: false,
+      message: `"${namespace}" is waiting on a secret-entry prompt that is still open. Activate it again once that prompt is answered.`,
+    };
+  }
+
+  /** tools/call on a 2026-07-28 connection. There is no server-to-client
+   *  request there, so a masked-entry prompt is returned as an input_required
+   *  result instead of pushed, in the SDK's re-run model (nothing is parked
+   *  between rounds):
+   *
+   *  First round: the call runs as usual. A secret-entry path that would have
+   *  pushed opens its page, posts the prompt on this round and returns early;
+   *  the call then answers with the prompt and a signed requestState naming it
+   *  (SecretAskState). Spawn attempts made before the prompt run again on the
+   *  retry; nothing else in an activation has a side effect worth guarding.
+   *
+   *  Retry: the codec has verified the state before this runs; the digest
+   *  binds it to this call's name and arguments. The client's answer goes to
+   *  the prompt, which waits out the page with its heartbeat on THIS request,
+   *  and the call re-runs with the result -- the credential is in place by
+   *  then, so the activation simply succeeds, and the refusals (declined,
+   *  expired, rejected) come from the same code that words them on the 2025
+   *  protocol. A retry that brings no answer for the prompt is asked again;
+   *  the spec says re-request rather than error. */
+  private async callToolCarryingInput(
+    s: Server,
+    name: string,
+    args: Record<string, unknown>,
+    ctx: ServerContext,
+  ): Promise<CallToolResult | InputRequiredResult> {
+    const argsDigest = createHash("sha256").update(canonicalJson({ name, args })).digest("base64url");
+    const progress = createProgressReporter(ctx);
+    let answer: SecretAnswer | null = null;
+    const state = ctx.mcpReq.requestState<SecretAskState>();
+    if (state !== undefined) {
+      if (state.argsDigest !== argsDigest) {
+        throw new ProtocolError(ProtocolErrorCode.InvalidParams, "requestState was issued for a different tool call");
+      }
+      const ask = this.secretAsks.get(state.pageId);
+      if (!ask) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "That secret-entry prompt is no longer open: a retry already answered it. Call the tool again.",
+            },
+          ],
+          isError: true,
+        };
+      }
+      const response = inputResponse(ctx.mcpReq.inputResponses, SECRET_ASK_KEY);
+      if (response.kind !== "elicit") {
+        return inputRequired({
+          inputRequests: { [SECRET_ASK_KEY]: ask.request },
+          requestState: await this.requestStateCodec.mint(state, ctx),
+        });
+      }
+      // Consumed here, so a replay of the same state cannot answer twice.
+      this.dropSecretAsk(ask);
+      ask.progress = progress;
+      ask.decide(response.action);
+      answer = (await ask.settled) ?? null;
+    }
+
+    let markPosted: () => void = () => {};
+    const posted = new Promise<void>((resolve) => {
+      markPosted = resolve;
+    });
+    const envelope = (ctx.mcpReq.envelope ?? {}) as Record<string, unknown>;
+    const leg: InputLeg = {
+      progress,
+      capabilities: envelope[CLIENT_CAPABILITIES_META_KEY] as ClientCapabilities | undefined,
+      answer,
+      ask: null,
+      askClaimed: false,
+      posted,
+      markPosted,
+    };
+    this.inputLegs.set(progress, leg);
+    const result = await this.handleToolCall(name, args, ctx, { inputLeg: leg });
+    if (leg.ask) {
+      return inputRequired({
+        inputRequests: { [SECRET_ASK_KEY]: leg.ask.request },
+        requestState: await this.requestStateCodec.mint({ pageId: leg.ask.pageId, argsDigest }, ctx),
+      });
+    }
+    return s.projectCallToolResult(result as CallToolResult, this.advertisedOutputSchema(name));
   }
 
   /** Runs ahead of every handler a 2026-07-28 instance serves. Each request
@@ -1321,6 +1586,7 @@ export class ConnectServer {
     handle("tools/call", async (request, ctx) => {
       await this.ready;
       const { name, arguments: args } = request.params;
+      if (era === "modern") return this.callToolCarryingInput(s, name, args ?? {}, ctx);
       const result = await this.handleToolCall(name, args ?? {}, ctx);
       // A low-level handler owns the projection McpServer would apply: the
       // SEP-2106 TextContent append, and on the 2025 era the `{result: ...}`
@@ -2741,7 +3007,11 @@ export class ConnectServer {
     // pipeline on A ages B by 10 calls and can evict B mid-pipeline (the
     // step after next may be routed to it). handleExec ticks ONCE for the
     // whole pipeline instead — see the trackUsageForNamespaces call there.
-    opts?: { deferLearning?: boolean; deferIdleTracking?: boolean },
+    //
+    // inputLeg is the 2026-07-28 round this call runs as (callToolCarryingInput).
+    // Its reporter replaces the one made here: a second reporter on the same
+    // progress token would restart the count, and progress must only rise.
+    opts?: { deferLearning?: boolean; deferIdleTracking?: boolean; inputLeg?: InputLeg },
     // `text` optional, matching routeToolCall (proxy.ts): the proxy path
     // returns the UPSTREAM's body, and an image / audio / resource content
     // block carries no text. The meta-tool branches below all produce text and
@@ -2759,7 +3029,7 @@ export class ConnectServer {
     isError?: boolean;
     stepContent?: Array<{ type: string; text?: string }>;
   }> {
-    const progress = createProgressReporter(ctx);
+    const progress = opts?.inputLeg?.progress ?? createProgressReporter(ctx);
     // THE meta-tool boundary. Everything about why it is here and not
     // anywhere else is on maybeReloadBundles; the two load-bearing facts at
     // this call site are that it runs BEFORE any branch below reads
@@ -5152,6 +5422,20 @@ export class ConnectServer {
     // that tells the user their values were rejected.
     const supplied = this.elicitedEnv.get(namespace) ?? {};
 
+    // A 2026-07-28 retry re-runs its call carrying the answer to the prompt
+    // the first round posted (callToolCarryingInput). Submitted values were
+    // stored before this run, so this activation already launched with them
+    // and is exactly the retry the 2025 path makes with isElicitRetry. Any
+    // other answer gets the words the 2025 path gives right after its prompt,
+    // without re-checking the latch and the budget that prompt already went
+    // through.
+    const leg = this.inputLegFor(progress);
+    const answer = this.takeSecretAnswer(leg, credentialAskSubject(namespace));
+    if (answer?.kind === "credential") {
+      if (answer.entry.kind !== "submitted") return this.credentialEntryRefusal(namespace, missing, answer.entry);
+      isElicitRetry = true;
+    }
+
     // We are already inside the retry a prompt bought, and the child still
     // reports missing exactly the keys we just supplied. Asking again HERE
     // opens a second modal in the same breath as the first, worded
@@ -5241,8 +5525,15 @@ export class ConnectServer {
       return null;
     }
 
-    const caps = this.pushCapabilities();
-    if (!caps?.elicitation) {
+    if (this.noRequestToAskOn(leg)) {
+      log("info", "Missing credentials and no client request to ask on; the next explicit activate will ask", {
+        namespace,
+        missing,
+        era: "modern",
+      });
+      return null;
+    }
+    if (!this.elicitationCapability(leg)) {
       log("info", "Detected missing credentials but client does not support elicitation", {
         namespace,
         missing,
@@ -5250,6 +5541,11 @@ export class ConnectServer {
       });
       return null;
     }
+    // This call already has a prompt, and a round carries one: this one is
+    // asked on the next round, when the call runs again. Before the budget,
+    // which it has not spent.
+    if (leg?.askClaimed) return this.awaitingInputResult(namespace);
+    if (leg) leg.askClaimed = true;
 
     // The values are typed on a masked page served on 127.0.0.1, not into the
     // client's own dialog: a form-mode string field is an ordinary visible
@@ -5278,8 +5574,10 @@ export class ConnectServer {
     // the env path by reading the source.
     const fixHint = `Set ${what} in this server's "env" in ${bundlesFileHint("defines-it")} to skip this prompt in future sessions.`;
     const why = `"${namespace}" cannot start: it reports ${missing.join(", ")} missing. ${fixHint}`;
-    const entry = await this.collectSecretOnLoopbackPage({
+    const subject = credentialAskSubject(namespace);
+    const entryPromise = this.collectSecretOnLoopbackPage({
       namespace,
+      subject,
       why,
       secretNoun: isPlural ? `the values of ${missing.join(", ")}` : `the value of ${missing[0]}`,
       page: {
@@ -5293,81 +5591,29 @@ export class ConnectServer {
       progress,
     });
 
-    if (entry.kind === "failed") {
-      log("info", "Credential elicitation did not complete", { namespace, missing });
-      // shutdown() latched while the prompt was up. Refuse the way every
-      // other shutdown gate does, with the same words: the give-up path's
-      // "spawn failed" invites a retry in a session that is ending.
-      if (this.shuttingDown) return this.shuttingDownRefusal(namespace);
-      return null;
-    }
-    if (entry.kind === "declined") {
-      log("info", "User declined credential elicitation", { namespace });
-      if (this.shuttingDown) return this.shuttingDownRefusal(namespace);
-      // A decline is a decision, not a slip. Latch for the session the
-      // way the vault does: a re-ask would put up the same modal and
-      // hit the same answer. The early check above renders the raw
-      // spawn error on follow-up -- a user who said no wants the
-      // original "could not load" message, not a workaround hint.
-      this.credentialElicited.set(namespace, "declined");
-      return null;
-    }
-    if (entry.kind === "unreachable") {
-      // Same latch rules as the vault path: no-page and no-browser are a
-      // wall a second prompt would hit identically, so asking again wastes
-      // a round-trip. Expired is a user-away state and does not latch --
-      // the user may simply have been away -- so the next activate asks
-      // again while the budget lasts. All three return the refusal rather
-      // than null, as the vault does: it says what happened to the page,
-      // which the give-up path's raw "spawn failed" would not, and it skips
-      // that path's dispatch penalty against a server whose only problem
-      // is a value nobody got to type.
-      log("info", "Credential masked-entry page was unreachable", {
-        namespace,
-        missing,
-        reason: entry.reason,
-      });
-      if (this.shuttingDown) return this.shuttingDownRefusal(namespace);
-      if (entry.reason !== "expired") {
-        // Explicit latch: the early check at the top of this function
-        // already accounts for the no-page / no-browser wall. Without an
-        // add here, the next activate would burn a budget slot on the
-        // SAME wall, not a new reason to ask. The latch carries the
-        // reason so the early check can re-render the same refusal on a
-        // follow-up activate.
-        this.credentialElicited.set(namespace, entry.reason);
+    const entry = leg ? await this.untilPosted(leg, entryPromise) : await entryPromise;
+    if (entry === "posted") {
+      // 2026-07-28: the prompt is posted on this call's round, and the call
+      // has to return for the client to show it. The rest of the prompt runs
+      // on: values the user submits are stored the moment they arrive, so the
+      // retry's re-run launches with them (and so does any later activate, if
+      // the client never retries).
+      const asked = leg?.ask;
+      if (asked) {
+        asked.settled = entryPromise.then(
+          (e): SecretAnswer => {
+            if (e.kind === "submitted") this.storeCredentialValues(namespace, missing, e.values);
+            return { subject, kind: "credential", entry: e };
+          },
+          (): SecretAnswer => ({ subject, kind: "credential", entry: { kind: "failed" } }),
+        );
       }
-      return this.credentialUnreachableRefusal(namespace, missing, entry.reason);
+      return this.awaitingInputResult(namespace);
     }
-
-    // entry.kind === "submitted". Pick the keys we actually asked for, and
-    // only non-empty strings. With the shipped page both filters are
-    // no-ops: its fields are exactly `missing`, every input is `required`,
-    // and its POST handler answers 400 "Every field is required." to a
-    // missing or empty field, so a submitted result carries every asked key
-    // non-empty (secret-entry-page.ts). They are defense in depth against a
-    // page implementation that drifts: an extra field would otherwise leak
-    // into this server's env, and a blank one would override a supplied
-    // value through the merge below.
-    const values: Record<string, string> = {};
-    for (const key of missing) {
-      const v = entry.values[key];
-      if (typeof v === "string" && v.length > 0) values[key] = v;
-    }
-    if (Object.keys(values).length === 0) {
-      // Defensive, like the filter above: the shipped page cannot return a
-      // submission with no non-empty value. Should a drifted page do so,
-      // treat it like a decline -- latch so a follow-up activate hits the
-      // early check at the top of this function instead of re-opening the
-      // page, and let the "empty" reason fall through there to the raw
-      // spawn error, the same as a decline. This return-null is for THIS
-      // activate only; the latch owns the next ask.
-      log("info", "Credential masked-entry page returned no values", { namespace, missing });
-      this.credentialElicited.set(namespace, "empty");
-      return null;
-    }
-
-    this.elicitedEnv.set(namespace, { ...supplied, ...values });
+    // Ended before it was posted (no page, shutdown): the round's slot is free.
+    if (leg) leg.askClaimed = false;
+    if (entry.kind !== "submitted") return this.credentialEntryRefusal(namespace, missing, entry);
+    if (!this.storeCredentialValues(namespace, missing, entry.values)) return null;
     progress?.("Got credentials — retrying load");
     // Recurse — runActivateOne fills the env from elicitedEnv on this
     // attempt (through effectiveEntry).
@@ -5387,6 +5633,109 @@ export class ConnectServer {
     // If the child STILL reports the same key missing, the branch above turns
     // that into a message rather than a second identical modal.
     return this.runActivateOne(namespace, progress, fromPrewarm, /* skipCap */ true, /* isElicitRetry */ true);
+  }
+
+  // The words for a missing-credential prompt that ended without values:
+  // what maybeElicitAndRetry returns right after its prompt, and what a
+  // 2026-07-28 re-run returns for the answer its retry brought back.
+  private credentialEntryRefusal(
+    namespace: string,
+    missing: string[],
+    entry: Exclude<LoopbackEntryResult, { kind: "submitted" }>,
+  ): ActivationResult | null {
+    if (entry.kind === "failed") {
+      log("info", "Credential elicitation did not complete", { namespace, missing });
+      // shutdown() latched while the prompt was up. Refuse the way every
+      // other shutdown gate does, with the same words: the give-up path's
+      // "spawn failed" invites a retry in a session that is ending.
+      if (this.shuttingDown) return this.shuttingDownRefusal(namespace);
+      return null;
+    }
+    if (entry.kind === "declined") {
+      log("info", "User declined credential elicitation", { namespace });
+      if (this.shuttingDown) return this.shuttingDownRefusal(namespace);
+      // A decline is a decision, not a slip. Latch for the session the
+      // way the vault does: a re-ask would put up the same modal and
+      // hit the same answer. The early check above renders the raw
+      // spawn error on follow-up -- a user who said no wants the
+      // original "could not load" message, not a workaround hint.
+      this.credentialElicited.set(namespace, "declined");
+      return null;
+    }
+    // entry.kind === "unreachable". Same latch rules as the vault path:
+    // no-page and no-browser are a wall a second prompt would hit
+    // identically, so asking again wastes a round-trip. Expired is a
+    // user-away state and does not latch -- the user may simply have been
+    // away -- so the next activate asks again while the budget lasts. All
+    // three return the refusal rather than null, as the vault does: it says
+    // what happened to the page, which the give-up path's raw "spawn failed"
+    // would not, and it skips that path's dispatch penalty against a server
+    // whose only problem is a value nobody got to type.
+    log("info", "Credential masked-entry page was unreachable", {
+      namespace,
+      missing,
+      reason: entry.reason,
+    });
+    if (this.shuttingDown) return this.shuttingDownRefusal(namespace);
+    if (entry.reason !== "expired") {
+      // Explicit latch: the early check in maybeElicitAndRetry already
+      // accounts for the no-page / no-browser wall. Without an add here, the
+      // next activate would burn a budget slot on the SAME wall, not a new
+      // reason to ask. The latch carries the reason so the early check can
+      // re-render the same refusal on a follow-up activate.
+      this.credentialElicited.set(namespace, entry.reason);
+    }
+    return this.credentialUnreachableRefusal(namespace, missing, entry.reason);
+  }
+
+  // Store the values a missing-credential page took, for effectiveEntry to
+  // fill into the child's env on the next launch. False when nothing usable
+  // was submitted, which latches the namespace.
+  private storeCredentialValues(namespace: string, missing: string[], submitted: Record<string, string>): boolean {
+    // Pick the keys we actually asked for, and only non-empty strings. With
+    // the shipped page both filters are no-ops: its fields are exactly
+    // `missing`, every input is `required`, and its POST handler answers 400
+    // "Every field is required." to a missing or empty field, so a submitted
+    // result carries every asked key non-empty (secret-entry-page.ts). They
+    // are defense in depth against a page implementation that drifts: an
+    // extra field would otherwise leak into this server's env, and a blank
+    // one would override a supplied value through the merge below.
+    const values: Record<string, string> = {};
+    for (const key of missing) {
+      const v = submitted[key];
+      if (typeof v === "string" && v.length > 0) values[key] = v;
+    }
+    if (Object.keys(values).length === 0) {
+      // Defensive, like the filter above: the shipped page cannot return a
+      // submission with no non-empty value. Should a drifted page do so,
+      // treat it like a decline -- latch so a follow-up activate hits the
+      // early check in maybeElicitAndRetry instead of re-opening the page,
+      // and let the "empty" reason fall through there to the raw spawn
+      // error, the same as a decline. The caller's return-null is for THIS
+      // activate only; the latch owns the next ask.
+      log("info", "Credential masked-entry page returned no values", { namespace, missing });
+      this.credentialElicited.set(namespace, "empty");
+      return false;
+    }
+    this.elicitedEnv.set(namespace, { ...(this.elicitedEnv.get(namespace) ?? {}), ...values });
+    return true;
+  }
+
+  // Wait for a prompt's result, or for it to be posted on a 2026-07-28 round,
+  // whichever comes first. A prompt that fails before it is posted (no page,
+  // shutdown) resolves with its result, exactly as on the 2025 protocol.
+  private untilPosted<T>(leg: InputLeg, result: Promise<T>): Promise<T | "posted"> {
+    return Promise.race([result, leg.posted.then(() => "posted" as const)]);
+  }
+
+  // The answer a 2026-07-28 retry brought back for `subject`, once: the
+  // re-run's first activation of that subject consumes it, so a second pass
+  // through the same activation in the same call asks afresh.
+  private takeSecretAnswer(leg: InputLeg | undefined, subject: string): SecretAnswer | null {
+    if (!leg?.answer || leg.answer.subject !== subject) return null;
+    const answer = leg.answer;
+    leg.answer = null;
+    return answer;
   }
 
   // The vault-passphrase counterpart to maybeElicitAndRetry. Split out
@@ -5422,6 +5771,22 @@ export class ConnectServer {
     progress?: ProgressReporter,
     fromPrewarm = false,
   ): Promise<ActivationResult | null> {
+    // A 2026-07-28 retry re-runs its call with the vault prompt's result
+    // (callToolCarryingInput). A verified passphrase is already the session's
+    // by then, so the re-run resolves its env and never gets here; what does
+    // is a prompt that ended without one, which gets the words the 2025 path
+    // gives the winner right after its prompt.
+    const leg = this.inputLegFor(progress);
+    const answer = this.takeSecretAnswer(leg, VAULT_ASK_SUBJECT);
+    if (answer?.kind === "vault") {
+      if (this.shuttingDown) return this.shuttingDownRefusal(namespace);
+      if (answer.outcome.kind === "rejected") return this.vaultPassphraseRejected(namespace, lastError);
+      if (answer.outcome.kind === "unreachable") {
+        return this.vaultPassphraseUnreachable(namespace, lastError, answer.outcome.reason);
+      }
+      return null;
+    }
+
     // Someone else is already asking. Join their prompt: on success retry
     // straight away (the vault is now unlocked for every namespace, which is
     // the whole point); on a rejected entry report it exactly as the winner
@@ -5436,6 +5801,13 @@ export class ConnectServer {
     // prompt that is about to unlock the vault for it.
     const joined = this.vaultElicitInflight;
     if (joined) {
+      // On 2026-07-28 a follower whose own call holds a prompt -- the vault
+      // prompt it would join, when the leader is another namespace of the
+      // same call -- must not wait on it: that call has to return before the
+      // prompt can reach the client at all. Its re-run finds the vault
+      // unlocked. A follower on any other request waits, as on the 2025
+      // protocol; the prompt settles without it.
+      if (leg?.askClaimed) return this.awaitingInputResult(namespace);
       progress?.("Waiting for the vault passphrase prompt already in flight");
       // The winner's wait on the page is heartbeated (collectSecretOnLoopbackPage)
       // and can run the page's whole TTL; a follower parked on it for that
@@ -5464,8 +5836,16 @@ export class ConnectServer {
 
     if (this.vaultPassphraseElicited) return null;
 
-    const caps = this.pushCapabilities();
-    if (!caps?.elicitation) {
+    if (this.noRequestToAskOn(leg)) {
+      log("info", "Vault is locked and no client request to ask on; the next explicit activate will ask", {
+        namespace,
+        refKeys: lastError.refKeys,
+        reason: lastError.reason,
+        era: "modern",
+      });
+      return null;
+    }
+    if (!this.elicitationCapability(leg)) {
       log("info", "Vault is locked but client does not support elicitation", {
         namespace,
         refKeys: lastError.refKeys,
@@ -5474,16 +5854,43 @@ export class ConnectServer {
       });
       return null;
     }
+    // This call already has a prompt; the vault's is asked next round.
+    if (leg?.askClaimed) return this.awaitingInputResult(namespace);
+    if (leg) leg.askClaimed = true;
 
     const prompt = this.promptForVaultPassphrase(namespace, lastError, progress);
     this.vaultElicitInflight = prompt;
-    let outcome: VaultPromptOutcome;
-    try {
-      outcome = await prompt;
-    } finally {
-      // Only clear OUR entry: a later prompt (the re-ask after a typo)
-      // registers its own, and this one must not delete it.
+    // Only clear OUR entry: a later prompt (the re-ask after a typo)
+    // registers its own, and this one must not delete it.
+    const release = (): void => {
       if (this.vaultElicitInflight === prompt) this.vaultElicitInflight = null;
+    };
+    let outcome: VaultPromptOutcome;
+    if (leg) {
+      const settled = prompt.finally(release);
+      const first = await this.untilPosted(leg, settled);
+      if (first === "posted") {
+        // 2026-07-28: posted on this call's round; the call returns so the
+        // client can show it. The prompt runs on and stays the one followers
+        // join: a passphrase submitted on the page is verified and becomes
+        // the session's as soon as it arrives, whether or not a retry comes.
+        const asked = leg.ask;
+        if (asked) {
+          asked.settled = settled.then(
+            (o): SecretAnswer => ({ subject: VAULT_ASK_SUBJECT, kind: "vault", outcome: o }),
+            (): SecretAnswer => ({ subject: VAULT_ASK_SUBJECT, kind: "vault", outcome: { kind: "unavailable" } }),
+          );
+        }
+        return this.awaitingInputResult(namespace);
+      }
+      leg.askClaimed = false;
+      outcome = first;
+    } else {
+      try {
+        outcome = await prompt;
+      } finally {
+        release();
+      }
     }
 
     // shutdown() latched while the prompt was up. Refuse the way every other
@@ -5638,8 +6045,18 @@ export class ConnectServer {
   // Nothing here is vault-specific. The missing-credential prompt
   // (maybeElicitAndRetry) supplies its own words and fields and goes through
   // the same page.
+  //
+  // On 2026-07-28 nothing is pushed: the same request is posted on the
+  // calling round (InputLeg) and the client answers it on its retry, with no
+  // elicitationId (that revision's URL mode has none) and no completion
+  // notification afterwards. The wait below then heartbeats on the retry,
+  // which is the request still open by the time anyone waits.
   private async collectSecretOnLoopbackPage(request: {
     namespace: string;
+    /** The activation this prompt is for; on 2026-07-28 it names the answer
+     *  the re-run of the call picks up (credentialAskSubject,
+     *  VAULT_ASK_SUBJECT). */
+    subject: string;
     /** Lead of the client dialog: what needs the secret, and why. */
     why: string;
     /** The secret as the dialog's instruction names it, e.g. "your vault
@@ -5648,13 +6065,17 @@ export class ConnectServer {
     page: Omit<SecretEntryPageOptions, "ttlMs">;
     progress?: ProgressReporter;
   }): Promise<LoopbackEntryResult> {
-    const { namespace, why, secretNoun, progress } = request;
+    const { namespace, why, secretNoun } = request;
+    let progress = request.progress;
+    const leg = this.inputLegFor(progress);
     // The SDK's own reading of the capability. Its initialize schema rewrites
     // an empty `elicitation: {}` on the wire into `{ form: {} }` before it is
     // stored (ElicitationCapabilitySchema in the SDK's types), which is what
     // elicitInput's own per-mode guard then checks; this helper reads a bare
-    // `{}` the same way, so the two cannot disagree.
-    const modes = getSupportedElicitationModes(this.pushCapabilities()?.elicitation);
+    // `{}` the same way, so the two cannot disagree. A 2026-07-28 envelope is
+    // not normalized by anyone, and a bare `{}` means form there too, which
+    // this helper supplies.
+    const modes = getSupportedElicitationModes(this.elicitationCapability(leg));
     if (!modes.supportsUrlMode && !modes.supportsFormMode) return { kind: "failed" };
     const mode = modes.supportsUrlMode ? "url" : "form";
 
@@ -5674,33 +6095,62 @@ export class ConnectServer {
     // however long that took.
     const openedAt = Date.now();
     this.secretEntryPages.add(page);
+    const pageResult = (outcome: SecretEntryOutcome): LoopbackEntryResult => {
+      if (outcome.kind === "submitted") return { kind: "submitted", values: outcome.values };
+      if (outcome.kind === "expired") return { kind: "unreachable", reason: "expired" };
+      return { kind: "failed" };
+    };
     try {
       // shutdown() sweeps secretEntryPages synchronously, and this page was
       // still being opened when it did: nothing else will ever close it, so
       // the finally below has to, now, rather than after a prompt nobody is
       // going to answer in a session that is ending.
       if (this.shuttingDown) return { kind: "failed" };
-      let result: Awaited<ReturnType<Server["elicitInput"]>>;
-      try {
-        result =
+      const urlMessage = `${why} Open the link to type ${secretNoun} into a masked field on a page yaw-mcp serves on this computer -- it never passes through this client. Decline to cancel.`;
+      const formMessage = `${why} Accept to open a page yaw-mcp serves on this computer (127.0.0.1) in your browser, and type ${secretNoun} into its masked field there -- it is never typed into this dialog. Decline to cancel.`;
+      let result: { action: ElicitAction };
+      let asked: SecretAsk | undefined;
+      if (leg) {
+        asked = this.postSecretAsk(
+          leg,
+          request.subject,
           mode === "url"
-            ? await this.server.elicitInput({
-                mode: "url",
-                message: `${why} Open the link to type ${secretNoun} into a masked field on a page yaw-mcp serves on this computer -- it never passes through this client. Decline to cancel.`,
-                elicitationId: page.elicitationId,
-                url: page.url,
-              })
-            : await this.server.elicitInput({
-                message: `${why} Accept to open a page yaw-mcp serves on this computer (127.0.0.1) in your browser, and type ${secretNoun} into its masked field there -- it is never typed into this dialog. Decline to cancel.`,
-                requestedSchema: { type: "object", properties: {} },
-              });
-      } catch (err) {
-        log("warn", "Secret entry elicitation failed", {
-          namespace,
-          mode,
-          error: err instanceof Error ? err.message : String(err),
-        });
-        return { kind: "failed" };
+            ? inputRequired.elicitUrl({ message: urlMessage, url: page.url })
+            : inputRequired.elicit({ message: formMessage, requestedSchema: { type: "object", properties: {} } }),
+        );
+        // The page can settle before the retry brings the client's answer:
+        // in URL mode the user may have typed and submitted already, which is
+        // consent enough; an expiry or a close ends the prompt the same way it
+        // would have ended the wait below.
+        const first = await Promise.race([
+          asked.decision.then((action) => ({ action })),
+          page.result.then((outcome) => ({ outcome })),
+        ]);
+        if ("outcome" in first) return pageResult(first.outcome);
+        result = first;
+        progress = asked.progress;
+      } else {
+        try {
+          result =
+            mode === "url"
+              ? await this.server.elicitInput({
+                  mode: "url",
+                  message: urlMessage,
+                  elicitationId: page.elicitationId,
+                  url: page.url,
+                })
+              : await this.server.elicitInput({
+                  message: formMessage,
+                  requestedSchema: { type: "object", properties: {} },
+                });
+        } catch (err) {
+          log("warn", "Secret entry elicitation failed", {
+            namespace,
+            mode,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          return { kind: "failed" };
+        }
       }
       if (result.action !== "accept") {
         log("info", "User declined the secret entry prompt", { namespace, mode, action: result.action });
@@ -5733,11 +6183,11 @@ export class ConnectServer {
       // page included: the page module also ends with "closed" when its
       // listener fails after listen, and that client is still there waiting.
       // Not sent once shutdown() has latched, which is also what closes a
-      // page under the wait: the transport is going with it.
+      // page under the wait: the transport is going with it. Never on
+      // 2026-07-28, which has no such notification: the notifier's own
+      // canPush gate drops it there.
       if (mode === "url" && !this.shuttingDown) this.notifyElicitationComplete(page.elicitationId, namespace);
-      if (outcome.kind === "submitted") return { kind: "submitted", values: outcome.values };
-      if (outcome.kind === "expired") return { kind: "unreachable", reason: "expired" };
-      return { kind: "failed" };
+      return pageResult(outcome);
     } finally {
       page.close();
       this.secretEntryPages.delete(page);
@@ -5798,6 +6248,7 @@ export class ConnectServer {
 
     const entry = await this.collectSecretOnLoopbackPage({
       namespace,
+      subject: VAULT_ASK_SUBJECT,
       why,
       secretNoun: invalid ? "the correct vault passphrase" : "your vault passphrase",
       page: {
@@ -6243,15 +6694,17 @@ export class ConnectServer {
     // makes it, and returns null) so that a client WITHOUT sampling never
     // sees the "asking LLM to pick" progress line: that line promised a
     // round-trip that was never going to happen, and the silent null that
-    // followed read as the LLM having picked nothing.
-    const clientCanSample = this.pushCapabilities()?.sampling !== undefined;
+    // followed read as the LLM having picked nothing. The era comes first:
+    // sampling runs on the 2025 protocol only (see SamplingPeer).
+    const era = this.clientSession().era;
+    const clientCanSample = era === "legacy" && this.pushCapabilities()?.sampling !== undefined;
     const wantsTiebreak = safeBudget === 1 && shouldSample(ranked, effort);
     // The one-time "client has no sampling" notice is emitted HERE, at the
     // gate that skips the round-trip: bestOfNViaSampling is never reached on
     // such a client, so its own copy of the notice could not fire in
     // production, and an operator who set YAW_MCP_ROUTE_EFFORT=aggressive had
     // no way to learn the dial was inert. Same per-process flag either way.
-    if (wantsTiebreak && !clientCanSample) noteNoSamplingCapability();
+    if (wantsTiebreak && !clientCanSample) noteNoSamplingCapability(era);
     if (wantsTiebreak && clientCanSample) {
       progress?.("Top candidates close — asking LLM to pick…");
       const serversByNamespace = new Map(activeServers.map((s) => [s.namespace, s]));
@@ -7787,6 +8240,9 @@ export class ConnectServer {
     // under oam, whose http.Server has no unref(), a listener left open would
     // keep the process alive.
     for (const page of this.secretEntryPages) page.close();
+    // And the 2026-07-28 prompts no retry has redeemed: their pages just
+    // closed, and their drop timers are the last thing referring to them.
+    for (const ask of [...this.secretAsks.values()]) this.dropSecretAsk(ask);
 
     // Flush any pending state save before we stop accepting writes.
     // Cancels the debounce timer so no stale snapshot writes after.

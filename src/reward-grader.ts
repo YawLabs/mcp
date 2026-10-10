@@ -20,7 +20,7 @@
 //   - NEVER-THROWING: any failure (no sampling capability, timeout, declined,
 //     unparseable) returns null and the heuristic stands.
 
-import type { ClientCapabilities, Server } from "@modelcontextprotocol/server";
+import type { ClientCapabilities, ProtocolEra, Server } from "@modelcontextprotocol/server";
 import { log } from "./logger.js";
 import { REWARD_EMPTY_BODY, REWARD_ERROR_SHAPED, type ToolCallResultShape } from "./reward.js";
 
@@ -207,20 +207,26 @@ export function resetNoSamplingNotice(): void {
   noSamplingNoticeLogged = false;
 }
 
-function noteNoSamplingCapability(): void {
+function noteNoSamplingCapability(era: ProtocolEra | undefined): void {
   if (noSamplingNoticeLogged) return;
   noSamplingNoticeLogged = true;
   log(
     "info",
-    "Client does not advertise the sampling capability; YAW_MCP_REWARD_GRADER has no effect and the heuristic reward stands",
+    era === "modern"
+      ? "The client is on MCP 2026-07-28, where a server cannot ask it for sampling; YAW_MCP_REWARD_GRADER has no effect and the heuristic reward stands"
+      : "Client does not advertise the sampling capability; YAW_MCP_REWARD_GRADER has no effect and the heuristic reward stands",
   );
 }
 
 /** The slice of the downstream client a sampling helper uses. server.ts
- *  hands in its session view, whose capabilities are empty on a protocol
- *  revision that cannot carry sampling/createMessage (2026-07-28), so the
- *  capability gate here doubles as the push gate. */
+ *  hands in its session view. Sampling runs on the 2025 protocol only:
+ *  2026-07-28 has no server-to-client request, and its replacement (an
+ *  input_required round) needs a client request to ride on -- the grader
+ *  runs after the tool result has gone, and best-of-N's 2s budget cannot
+ *  absorb a round trip through the user's client. So the era is checked
+ *  before the capability. Absent `era` reads as the 2025 protocol. */
 export interface SamplingPeer {
+  era?: ProtocolEra;
   getClientCapabilities(): ClientCapabilities | undefined;
   createMessage: Server["createMessage"];
 }
@@ -230,8 +236,8 @@ export interface SamplingPeer {
 // out / unparseable. Never throws.
 export async function gradeOutcomeViaSampling(server: SamplingPeer, ctx: GraderContext): Promise<number | null> {
   const caps = server.getClientCapabilities();
-  if (!caps?.sampling) {
-    noteNoSamplingCapability();
+  if (server.era === "modern" || !caps?.sampling) {
+    noteNoSamplingCapability(server.era);
     return null;
   }
 
