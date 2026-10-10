@@ -1713,15 +1713,15 @@ export class ConnectServer {
     });
   };
 
-  /** The active servers the startup pre-warm still has to spawn to learn:
-   *  no trusted tool list yet, or a learned one past its refresh window.
-   *  The same predicate prewarmDormantServers selects by, read NOW rather
-   *  than at its snapshot, so a server the sweep has already finished drops
-   *  out as soon as its list lands in the cache. */
+  /** The active servers the startup pre-warm still has to SPAWN to learn:
+   *  no trusted tool list yet. A learned-but-stale list is deliberately not
+   *  in here: the cache it came from is served straight away and revalidated
+   *  in the background (prewarmDormantServers), so a caller waiting on the
+   *  sweep must not wait for that refresh before answering from a list it
+   *  already has. Read NOW rather than at the sweep's snapshot, so a server
+   *  the sweep has already finished drops out as soon as its list lands. */
   private serversPrewarmIsLearning(): UpstreamServerConfig[] {
-    return this.getProfiledActiveServers().filter(
-      (s) => !this.hasKnownTools(s) || this.isLearnedCacheStale(s.namespace),
-    );
+    return this.getProfiledActiveServers().filter((s) => !this.hasKnownTools(s));
   }
 
   /** Could the running pre-warm still produce a route for any of these
@@ -1768,6 +1768,12 @@ export class ConnectServer {
    *  tool timeout (Codex: 300 s). Neither private nor readonly, so a test can
    *  shrink it without a cast; nothing outside the tests writes it. */
   static STARTUP_PREWARM_WAIT_MS = 20_000;
+
+  /** How many servers the startup pre-warm activates at once (formerly an
+   *  inline `CONCURRENCY = 3` in prewarmDormantServers). handleActivate stays
+   *  sequential and instead joins any namespace the pre-warm is already
+   *  connecting, so a multi-server activate never starts the same child twice. */
+  private static readonly ACTIVATION_CONCURRENCY = 3;
 
   /** The line a load reply needs for a client that never re-lists tools
    *  (NO_RELIST_CLIENTS), or null for every other client.
@@ -2842,8 +2848,9 @@ export class ConnectServer {
   // server rather than a per-session `npx -y <pkg>@latest` resolve for
   // every active server (which is what it degenerated into while the
   // learned cache had nowhere to persist). A learned list past
-  // TOOLCACHE_REFRESH_MS counts as dormant again so @latest drift gets
-  // re-learned weekly instead of only at the 30-day persistence expiry.
+  // TOOLCACHE_REFRESH_MS is refreshed by this same pass, but as a separate
+  // REVALIDATION population (below): the cached list keeps serving until
+  // the refresh lands, so a weekly drift check is no longer a cold start.
   //
   // The child it spawns is DISCARDED: the tool list is what this wants, and
   // holding the upstream open would mean N idle processes for the session.
@@ -2854,7 +2861,8 @@ export class ConnectServer {
   // that takes a lock, binds a port, opens a DB session or writes a login
   // audit event does that side effect twice. YAW_MCP_PREWARM=0 is the escape
   // hatch for the second kind (isPrewarmEnabled says what turning it off
-  // costs).
+  // costs). A WARM cache costs no spawn at all -- nothing here runs for a
+  // server whose list is known and inside its refresh window.
   //
   // Cap-exempt in both directions, deliberately -- the reasoning is at the
   // cap check in runActivateOne. The consequence to know is that the
@@ -2890,24 +2898,50 @@ export class ConnectServer {
     // prewarm didn't create and must not tear down. The isChanged gate
     // in the batch below covers the race where a namespace connects
     // between this snapshot and its activation turn.
-    const dormant = this.getProfiledActiveServers().filter(
-      (s) =>
-        this.connections.get(s.namespace)?.status !== "connected" &&
-        (!this.hasKnownTools(s) || this.isLearnedCacheStale(s.namespace)),
+    const available = this.getProfiledActiveServers().filter(
+      (s) => this.connections.get(s.namespace)?.status !== "connected",
     );
-    if (dormant.length === 0) return;
+    // Two populations, one sweep. `dormant` has NO trusted list, so spawning
+    // it is the only way to learn what it offers -- that is the spawn the
+    // header describes. `revalidate` already has one and is merely past
+    // TOOLCACHE_REFRESH_MS; its cached list is being served right now
+    // (tools/list, discover, the deferred routes), so this pass refreshes it
+    // in the BACKGROUND beside that answer rather than as a precondition of
+    // anything. Before the split the two went through the same branch and the
+    // weekly re-learn was indistinguishable from a cold start -- which is
+    // what left readers (prewarmStillLearning / prewarmCouldRoute) treating a
+    // warm cache as "still being learned" and holding a call behind a wait
+    // whose only purpose is servers nothing is known about yet.
+    const dormant = available.filter((s) => !this.hasKnownTools(s));
+    const revalidate = available.filter((s) => this.hasKnownTools(s) && this.isLearnedCacheStale(s.namespace));
+    if (dormant.length === 0 && revalidate.length === 0) return;
 
-    log("info", "Pre-warming dormant servers", {
-      count: dormant.length,
-      namespaces: dormant.map((s) => s.namespace),
-    });
+    if (dormant.length > 0) {
+      log("info", "Pre-warming dormant servers", {
+        count: dormant.length,
+        namespaces: dormant.map((s) => s.namespace),
+      });
+    }
+    if (revalidate.length > 0) {
+      log("info", "Revalidating learned tool lists past their refresh window", {
+        count: revalidate.length,
+        namespaces: revalidate.map((s) => s.namespace),
+      });
+    }
 
-    const CONCURRENCY = 3;
+    // Learning first: a server that offers nothing yet is the one a client
+    // cannot see at all, so it takes the earlier batches.
+    const sweep = [
+      ...dormant.map((server) => ({ server, revalidate: false })),
+      ...revalidate.map((server) => ({ server, revalidate: true })),
+    ];
+
+    const CONCURRENCY = ConnectServer.ACTIVATION_CONCURRENCY;
     let anyPopulated = false;
-    for (let i = 0; i < dormant.length; i += CONCURRENCY) {
-      const batch = dormant.slice(i, i + CONCURRENCY);
+    for (let i = 0; i < sweep.length; i += CONCURRENCY) {
+      const batch = sweep.slice(i, i + CONCURRENCY);
       await Promise.all(
-        batch.map(async (server) => {
+        batch.map(async ({ server, revalidate: isRefresh }) => {
           try {
             const result = await this.activateOne(server.namespace, undefined, /* fromPrewarm */ true);
             if (!result.ok) {
@@ -2920,6 +2954,19 @@ export class ConnectServer {
               // the session. Cheap now, and it stops the stale entry becoming
               // load-bearing later.
               this.prewarmNamespaces.delete(server.namespace);
+              if (isRefresh) {
+                // A failed REVALIDATION is not a lost answer: the list the
+                // cache already holds stays served, so this is a background
+                // nicety that did not run, not a server that is invisible.
+                // Debug rather than warn -- the same server being down is a
+                // warn on its next real activation, where it actually blocks
+                // someone.
+                log("debug", "Background revalidation of a learned tool list did not run", {
+                  namespace: server.namespace,
+                  message: result.message,
+                });
+                return;
+              }
               // A failed prewarm means the namespace gets no toolCache
               // entry and stays invisible in tools/list for the session --
               // the exact UX prewarm exists to prevent. Never silent.
