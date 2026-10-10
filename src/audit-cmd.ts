@@ -255,7 +255,8 @@ function findServer(servers: UpstreamServerConfig[], namespace: string): Upstrea
 /**
  * Resolve the INSTALLED @yawlabs/mcp-compliance PACKAGE version -- the rubric
  * identifier defaultRunner records as `suiteVersion`. Rubric changes ship as
- * package releases (0.17.x -> 0.18.0), so the package version is what tells a
+ * package releases (0.19.x -> 0.20.0 moved the scoring methodology to 3.0.0,
+ * leaving skipped checks out of the score), so the package version is what tells a
  * letter graded under an older rubric from a current one. The package's
  * exported SPEC_VERSION is NOT that: it is the MCP protocol revision date
  * ("2025-11-25"), identical across compliance releases, so persisting it made

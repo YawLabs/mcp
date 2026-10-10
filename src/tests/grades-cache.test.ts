@@ -446,7 +446,7 @@ describe("readGradesCache -- a __proto__ namespace", () => {
 
 describe("suiteVersion round-trip", () => {
   it("preserves suiteVersion through write and read", async () => {
-    const entry = { grade: "A" as const, score: 99, gradedAt: "2026-08-23T00:00:00.000Z", suiteVersion: "0.17.1" };
+    const entry = { grade: "A" as const, score: 99, gradedAt: "2026-08-23T00:00:00.000Z", suiteVersion: "0.20.4" };
     await writeGrade("ctxlint", entry, synthHome);
     const cache = await readGradesCache(synthHome);
     expect(cache.ctxlint).toEqual(entry);

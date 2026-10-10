@@ -73,7 +73,13 @@ import { log } from "./logger.js";
 import { computeSecretsReport, META_TOOL_NAMES, META_TOOLS, SERVER_INSTRUCTIONS } from "./meta-tools.js";
 import { isFeatureDisabled } from "./opt-out-env.js";
 import { PackDetector } from "./pack-detect.js";
-import { isPersistenceDisabled, loadState, type PersistedToolCacheEntry, saveState } from "./persistence.js";
+import {
+  isPersistenceDisabled,
+  loadState,
+  type PersistedToolCacheEntry,
+  type StateSections,
+  StateSync,
+} from "./persistence.js";
 import {
   createProgressReporter,
   isProgressRequested,
@@ -1218,6 +1224,18 @@ export class ConnectServer {
   // single write; flushed synchronously on shutdown.
   private persistenceReady = false;
   private stateSaveTimer: ReturnType<typeof setTimeout> | null = null;
+  // Merging saver: every flush takes the cross-process state.json lock,
+  // re-reads the file and lands only this process's delta, so concurrent
+  // yaw-mcp panes stop overwriting each other (see persistence.ts StateSync).
+  // Its baseline is set in start() once the stores are hydrated.
+  private readonly stateSync = new StateSync({
+    exportCurrent: () => ({
+      learning: this.learning.exportSnapshot(),
+      packHistory: this.packDetector.exportSnapshot(),
+      toolCache: this.exportToolCache(),
+    }),
+    applyMerged: (merged) => this.applyMergedState(merged),
+  });
   private static readonly STATE_SAVE_DEBOUNCE_MS = 1000;
 
   // How long shutdown() will wait for in-flight activations before it
@@ -2498,6 +2516,14 @@ export class ConnectServer {
         });
       }
       this.hydrateToolCache(persisted.toolCache);
+      // The baseline is the HYDRATED view, not the raw file: the stores cap
+      // and sort what they load, and the first save's delta must be measured
+      // against what memory actually started from.
+      this.stateSync.setBaseline({
+        learning: this.learning.exportSnapshot(),
+        packHistory: this.packDetector.exportSnapshot(),
+        toolCache: this.exportToolCache(),
+      });
       // loadFailed means the state file exists but could not be READ (a
       // transient handle error, not a missing or corrupt file). The empty
       // snapshot we just hydrated is a stand-in, not the truth -- leaving
@@ -8364,11 +8390,30 @@ export class ConnectServer {
     if (this.stateSaveTimer.unref) this.stateSaveTimer.unref();
   }
 
+  // One merging save (see stateSync). A save that could not land -- another
+  // pane held the lock past the wait budget, or state.json was momentarily
+  // unreadable -- has already logged its one line and kept the pending
+  // delta; re-arm the debounce so it lands on the next attempt instead of
+  // waiting for the next recorded call. Never during shutdown: the shutdown
+  // path flushes explicitly and then closes the save path, and a timer armed
+  // here would fire after it.
   private async flushStateSave(): Promise<void> {
-    await saveState({
-      learning: this.learning.exportSnapshot(),
-      packHistory: this.packDetector.exportSnapshot(),
-      toolCache: this.exportToolCache(),
-    });
+    const saved = await this.stateSync.save();
+    if (!saved && !this.shuttingDown) this.scheduleStateSave();
+  }
+
+  // Adopt the merged state a save just wrote: this pane now routes on the
+  // learning and pack history other panes saved. Both are replaced wholesale
+  // -- the merge already folded in everything this process recorded,
+  // including calls that landed while the save was in flight.
+  //
+  // The tool cache is deliberately NOT adopted. Its lists feed tools/list
+  // (mergeToolCache) and the deferred routes, and swapping one in mid-session
+  // would change the advertised surface with no list_changed notification
+  // behind it. On disk the newer list still wins (mergeStateDelta), so the
+  // next session starts from it.
+  private applyMergedState(merged: StateSections): void {
+    this.learning.loadSnapshot(merged.learning);
+    this.packDetector.loadSnapshot(merged.packHistory);
   }
 }

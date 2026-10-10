@@ -11,7 +11,16 @@ interface ComplianceReport {
   grade: string;
   score: number;
   url: string;
-  summary: { total: number; passed: number; failed: number; required: number; requiredPassed: number };
+  summary: {
+    total: number;
+    passed: number;
+    failed: number;
+    required: number;
+    requiredPassed: number;
+    /** Checks that measured nothing (mcp-compliance >= 0.19). They count in
+     *  `passed`, but since 0.20.0 they are left out of `score`. */
+    skipped?: number;
+  };
   tests: unknown[];
   [extra: string]: unknown;
 }
@@ -782,8 +791,14 @@ function printSummary(report: ComplianceReport, out: (s: string) => void): void 
   // target can carry a credential in its query string (`?api_key=...`). The
   // operator typed it, but this line is the one that lands in a pasted
   // ticket, so it goes through the same scrubber every other echo does.
+  // Since mcp-compliance 0.20.0 a skipped check (one that measured nothing)
+  // is left out of the score but still counts in `summary.passed`, so
+  // "9/10 passed" next to a low score reads as a contradiction unless the
+  // skips are named. Optional: an older suite omits the field.
+  const skipped = typeof summary.skipped === "number" && Number.isFinite(summary.skipped) ? summary.skipped : 0;
+  const skippedNote = skipped > 0 ? ` (${skipped} skipped, left out of the score)` : "";
   out(
-    `\nCompliance: ${grade} (${score.toFixed(1)}%) -- ${summary.passed}/${summary.total} passed, ` +
+    `\nCompliance: ${grade} (${score.toFixed(1)}%) -- ${summary.passed}/${summary.total} passed${skippedNote}, ` +
       `${summary.requiredPassed}/${summary.required} required\n` +
       `Target: ${scrubForWarning(url)}\n`,
   );

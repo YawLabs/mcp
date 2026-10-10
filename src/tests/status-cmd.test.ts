@@ -115,7 +115,7 @@ describe("status", () => {
       { namespace: "gh", name: "GitHub", command: "npx", complianceGrade: "C" },
       { namespace: "linear", name: "Linear", command: "npx", complianceGrade: "B" },
     ]);
-    writeGrades({ gh: { grade: "A", score: 97.5, gradedAt: "2026-06-11T00:00:00.000Z", suiteVersion: "0.17.1" } });
+    writeGrades({ gh: { grade: "A", score: 97.5, gradedAt: "2026-06-11T00:00:00.000Z", suiteVersion: "0.20.4" } });
     const payload = await collect();
     const gh = payload.servers.find((s) => s.namespace === "gh");
     expect(gh).toMatchObject({
@@ -123,7 +123,7 @@ describe("status", () => {
       gradeSource: "audit",
       score: 97.5,
       gradedAt: "2026-06-11T00:00:00.000Z",
-      suiteVersion: "0.17.1",
+      suiteVersion: "0.20.4",
     });
     // No cache entry: the catalog letter still shows, tagged as such so the
     // panel can render it differently from a measured one.
