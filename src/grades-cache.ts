@@ -32,7 +32,7 @@ export const GRADES_FILENAME = "grades.json";
 /** One cached grade entry. `grade` is the A-F letter; `score` is the 0-100
  *  percentage; `gradedAt` is an ISO-8601 timestamp of when the audit ran.
  *  `suiteVersion` is the compliance rubric that produced the letter -- the
- *  @yawlabs/mcp-compliance PACKAGE version (e.g. "0.17.1"; rubric changes ship
+ *  @yawlabs/mcp-compliance PACKAGE version (e.g. "0.20.4"; rubric changes ship
  *  as package releases, whereas the package's exported SPEC_VERSION is the MCP
  *  protocol revision date, identical across releases -- see
  *  resolveComplianceSuiteVersion in audit-cmd.ts). Optional because entries

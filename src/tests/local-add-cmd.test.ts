@@ -2733,12 +2733,12 @@ describe("runList", () => {
       out: (s) => io.out.push(s),
       err: (s) => io.err.push(s),
       gradesReader: async () => ({
-        fetch: { grade: "A", score: 100, gradedAt: "2026-08-23T00:00:00.000Z", suiteVersion: "0.17.1" },
+        fetch: { grade: "A", score: 100, gradedAt: "2026-08-23T00:00:00.000Z", suiteVersion: "0.20.4" },
       }),
     });
     const parsed = JSON.parse(io.text());
     expect(parsed.servers[0].complianceGrade).toBe("A");
-    expect(parsed.servers[0].complianceSuiteVersion).toBe("0.17.1");
+    expect(parsed.servers[0].complianceSuiteVersion).toBe("0.20.4");
   });
 
   it("leaves a never-audited server ungraded in json", async () => {
