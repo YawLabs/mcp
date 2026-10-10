@@ -5148,6 +5148,49 @@ describe("prewarm race: explicit activate during prewarm inflight", () => {
     expect(vi.mocked(connectToUpstream)).toHaveBeenCalledTimes(1);
   });
 
+  it("a multi-server activate claims every prewarm in flight up front, so none is torn down and respawned", async () => {
+    // Measured 2026-10-09 (perf study m3): activate {servers:[fetch,npmjs]}
+    // landed while prewarm was booting both. The activate loop is sequential,
+    // so it sat awaiting the first namespace's prewarm while the second one's
+    // prewarm finished unclaimed, disconnected its fresh child, and the loop
+    // then spawned that server a second time.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([
+      makeServerConfig({ namespace: "gh", name: "GitHub" }),
+      makeServerConfig({ namespace: "npm", name: "npm" }),
+    ]);
+    const release: Record<string, (conn: UpstreamConnection) => void> = {};
+    const spawned: string[] = [];
+    vi.mocked(connectToUpstream).mockImplementation((cfg: UpstreamServerConfig) => {
+      spawned.push(cfg.namespace);
+      // A respawn (the bug) resolves at once, so the old behaviour shows up
+      // as a third spawn rather than a hang.
+      if (release[cfg.namespace]) return Promise.resolve(makeConnection(cfg.namespace, ["t"]));
+      return new Promise<UpstreamConnection>((r) => {
+        release[cfg.namespace] = r;
+      });
+    });
+
+    const prewarmPromise = priv.prewarmDormantServers();
+    const activatePromise = priv.handleActivate(["gh", "npm"]);
+    // Let both prewarm connects reach connectToUpstream.
+    for (let i = 0; i < 20 && Object.keys(release).length < 2; i++) await new Promise((r) => setTimeout(r, 0));
+    expect(Object.keys(release).sort()).toEqual(["gh", "npm"]);
+
+    // npm's prewarm finishes FIRST, while the activate loop is still awaiting gh.
+    release.npm(makeConnection("npm", ["search"]));
+    await new Promise((r) => setTimeout(r, 0));
+    release.gh(makeConnection("gh", ["create_issue"]));
+    const result = await activatePromise;
+    await prewarmPromise;
+
+    expect(result.isError).toBeFalsy();
+    expect(spawned.sort()).toEqual(["gh", "npm"]);
+    expect(priv.connections.has("gh")).toBe(true);
+    expect(priv.connections.has("npm")).toBe(true);
+    expect(vi.mocked(disconnectFromUpstream)).not.toHaveBeenCalled();
+  });
+
   it("prewarm still disconnects when it is the sole caller (no explicit activate)", async () => {
     const priv = getPrivate(server);
     priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);

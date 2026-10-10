@@ -1,3 +1,4 @@
+import { cpus } from "node:os";
 import { StringDecoder } from "node:string_decoder";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
@@ -480,6 +481,59 @@ let defaultConnectTimeoutMs: number | undefined;
 function defaultConnectTimeout(): number {
   defaultConnectTimeoutMs ??= resolveTimeoutEnv("MCP_CONNECT_TIMEOUT", 15_000);
   return defaultConnectTimeoutMs;
+}
+
+/** System-wide CPU busy fraction at or above which a local handshake that is
+ *  still pending at its deadline earns ONE extension -- see
+ *  connectToUpstreamOnce.
+ *
+ *  0.5, chosen from measurement rather than from the LoadPercentage figures
+ *  the 2026-10-09 study quoted (42-100%). Those are instantaneous samples; the
+ *  number read here is the AVERAGE over the wait, from os.cpus(), and on the
+ *  same box under the same 8-aggregator cold start it read 0.56-0.79 per run
+ *  while LoadPercentage read 90-100 -- and the runs where every oam-hosted
+ *  sidecar missed the 15s deadline averaged 0.56-0.62. A process start on
+ *  Windows is held up by disk and scanning as much as by CPU, so the CPU share
+ *  under real contention sits lower than "saturated" suggests. An idle box
+ *  reads well under it, and there a child that has not answered in 15s is a
+ *  hang and still fails on time exactly as before. */
+export const SATURATED_CPU_BUSY = 0.5;
+
+/** Cumulative CPU time over every logical CPU, in the units os.cpus()
+ *  reports (milliseconds). Only DIFFERENCES between two samples mean
+ *  anything. */
+export interface CpuTimes {
+  idle: number;
+  total: number;
+}
+
+function readCpuTimes(): CpuTimes {
+  let idle = 0;
+  let total = 0;
+  for (const cpu of cpus()) {
+    const t = cpu.times;
+    idle += t.idle;
+    total += t.user + t.nice + t.sys + t.idle + t.irq;
+  }
+  return { idle, total };
+}
+
+let cpuTimesReader: () => CpuTimes = readCpuTimes;
+
+/** Test hook: substitute the CPU-times source the connect deadline reads.
+ *  Called with no argument it restores the real one. */
+export function setCpuTimesReaderForTests(reader?: () => CpuTimes): void {
+  cpuTimesReader = reader ?? readCpuTimes;
+}
+
+/** Busy fraction (0..1) between two samples, or null when the window carries
+ *  no CPU time at all (a platform whose os.cpus() is empty, or two reads that
+ *  landed inside one accounting tick). Null never extends a deadline. */
+export function cpuBusyFraction(start: CpuTimes, end: CpuTimes): number | null {
+  const total = end.total - start.total;
+  if (!(total > 0)) return null;
+  const busy = 1 - (end.idle - start.idle) / total;
+  return Math.min(1, Math.max(0, busy));
 }
 
 // Bound on per-request listTools/listResources/listPrompts after the
@@ -1764,19 +1818,84 @@ async function connectToUpstreamOnce(
   // Clamped to MAX_TIMEOUT_MS: an out-of-range delay makes setTimeout fire
   // after 1ms, so an absurd config value would fail the connect instantly
   // while every message below quoted the absurd ceiling back at the reader.
+  const explicitConnectTimeout = typeof config.connectTimeoutMs === "number" && config.connectTimeoutMs > 0;
   const connectTimeoutMs = Math.min(
-    typeof config.connectTimeoutMs === "number" && config.connectTimeoutMs > 0
-      ? config.connectTimeoutMs
-      : defaultConnectTimeout(),
+    explicitConnectTimeout ? (config.connectTimeoutMs as number) : defaultConnectTimeout(),
     MAX_TIMEOUT_MS,
   );
+  // ONE load extension, never more. Measured 2026-10-09 (perf study m3): with
+  // 8 aggregators cold-starting together at 100% CPU, 3 of 8 lost `fetch` --
+  // its handshake needed 15-20s, the deadline was 15s, and the single retry
+  // in server.ts spawned a FRESH child that paid the same cold boot under the
+  // same load and timed out again. The child that was killed would have
+  // answered a few seconds later.
+  //
+  // So when the deadline lands and ALL of these hold, the same child gets one
+  // more connectTimeoutMs instead of being killed:
+  //   - it is a local child that was actually spawned (a pid) and has not
+  //     exited -- an exit rejects connect() and settles the race before the
+  //     timer can fire, so a pending race with a pid IS a live child;
+  //   - the machine was saturated over the wait (SATURATED_CPU_BUSY), the
+  //     one condition under which "slow" is the likelier reading than "hung"
+  //     -- or the runtime reports no CPU load at all (see onDeadline);
+  //   - the deadline is the DEFAULT one. A per-server connectTimeoutMs is an
+  //     operator's deliberate number and is honoured exactly.
+  // The hard ceiling is therefore 2x the deadline, and on an idle box that
+  // reports its load a hung child still fails at exactly connectTimeoutMs. The deadline is
+  // armed here, just before connect() spawns the child -- after the vault,
+  // the uv bootstrap and the oam probe -- so none of that is charged to it.
+  const loadAtStart = cpuTimesReader();
+  let deadlineMs = connectTimeoutMs;
+  let extended = false;
   let timedOut = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeoutPromise = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => {
+    const onDeadline = () => {
+      if (!extended && !explicitConnectTimeout && config.type === "local") {
+        const pid = (transport as { pid?: number | null }).pid;
+        const childRunning = typeof pid === "number";
+        const busy = childRunning ? cpuBusyFraction(loadAtStart, cpuTimesReader()) : null;
+        // A runtime that keeps no CPU accounting (oam on Windows reports
+        // every os.cpus() time as 0, measured 2026-10-10 with oam 0.18.0)
+        // gives no load reading at all. Unknown load is NOT read as idle:
+        // that would leave the extension dead on the very runtime the m3
+        // failures were measured on. The live child still earns its one
+        // extension; the 2x ceiling bounds what a real hang costs.
+        const loadUnknown = childRunning && busy === null;
+        if (childRunning && (loadUnknown || (busy as number) >= SATURATED_CPU_BUSY)) {
+          extended = true;
+          deadlineMs = Math.min(connectTimeoutMs * 2, MAX_TIMEOUT_MS);
+          log(
+            "info",
+            loadUnknown
+              ? "Handshake deadline extended once: the child is still running and this runtime reports no CPU load"
+              : "Handshake deadline extended once: the machine is saturated and the child is still running",
+            {
+              namespace: config.namespace,
+              waitedMs: connectTimeoutMs,
+              deadlineMs,
+              cpuBusy: busy === null ? null : Math.round(busy * 100) / 100,
+            },
+          );
+          progress?.(
+            `"${config.namespace}" is slow to start${loadUnknown ? "" : " on a busy machine"} -- waiting up to ${Math.round(deadlineMs / 1000)}s`,
+          );
+          timer = setTimeout(onDeadline, deadlineMs - connectTimeoutMs);
+          return;
+        }
+        // The other half of the decision, for whoever tunes the threshold:
+        // what the box looked like when a deadline was NOT extended.
+        log("debug", "Handshake deadline reached without an extension", {
+          namespace: config.namespace,
+          waitedMs: connectTimeoutMs,
+          childRunning,
+          cpuBusy: busy === null ? null : Math.round(busy * 100) / 100,
+        });
+      }
       timedOut = true;
-      reject(new Error(`Connection timeout after ${connectTimeoutMs}ms`));
-    }, connectTimeoutMs);
+      reject(new Error(`Connection timeout after ${deadlineMs}ms`));
+    };
+    timer = setTimeout(onDeadline, connectTimeoutMs);
   });
   try {
     // Capture the connect promise so that, on timeout, the orphaned
@@ -1792,7 +1911,7 @@ async function connectToUpstreamOnce(
     await withHeartbeat(
       progress,
       (elapsed) =>
-        `"${config.namespace}" is still starting -- ${elapsed}s so far, ${Math.round(connectTimeoutMs / 1000)}s before it is given up on`,
+        `"${config.namespace}" is still starting -- ${elapsed}s so far, ${Math.round(deadlineMs / 1000)}s before it is given up on`,
       () => Promise.race([connectP, timeoutPromise]),
     );
     clearTimeout(timer);
@@ -1817,13 +1936,13 @@ async function connectToUpstreamOnce(
       // and the SDK error carrying the truth was discarded entirely.
       const detail = timedOut ? "" : remoteFailureDetail(err, resolvedServerEnv);
       message = timedOut
-        ? `Remote server at ${config.url} did not respond within ${connectTimeoutMs / 1000}s. Verify the URL is reachable.`
+        ? `Remote server at ${config.url} did not respond within ${deadlineMs / 1000}s. Verify the URL is reachable.`
         : `Remote server at ${config.url} refused the connection.${detail ? ` ${detail}` : ""}`;
     } else if (timedOut) {
       category = "init_timeout";
-      message = `Server "${config.namespace}" started but didn't complete the MCP handshake within ${connectTimeoutMs / 1000}s.${
-        trimmedStderr ? ` stderr tail: ${redactSecretsInOutput(trimmedStderr, resolvedServerEnv).slice(-500)}` : ""
-      }`;
+      message = `Server "${config.namespace}" started but didn't complete the MCP handshake within ${deadlineMs / 1000}s${
+        extended ? " (including one extension for a slow start)" : ""
+      }.${trimmedStderr ? ` stderr tail: ${redactSecretsInOutput(trimmedStderr, resolvedServerEnv).slice(-500)}` : ""}`;
     } else if (trimmedStderr.length > 0) {
       // Non-timeout error with stderr → the child likely exited before
       // the handshake (install failure, missing env var, bad args).
