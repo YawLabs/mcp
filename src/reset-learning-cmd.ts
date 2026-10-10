@@ -9,12 +9,15 @@
 //
 // IMPORTANT: this deletes the file on disk, it does NOT reach into a
 // running session. `yaw-mcp serve` holds the learning store in memory and
-// flushes a full snapshot (server.ts flushStateSave, on a ~1s debounce
-// after every recorded outcome/miss/exec step, plus once on shutdown)
-// without ever re-reading the file first -- so a serve process attached to
-// an MCP client will recreate state.json with every pre-reset entry on its
-// next proxied tool call. That is the NORMAL configuration, so the success
-// report says so explicitly and tells the user to restart the client.
+// saves on a ~1s debounce after every recorded outcome/miss/exec step, plus
+// once on shutdown (server.ts flushStateSave). That save re-reads the file
+// under a lock and merges only what the process recorded since its last
+// save (persistence.ts StateSync), so a current serve does NOT write the
+// pre-reset entries back -- it adopts the reset on its next save. Until that
+// save it still ROUTES on the old learning it holds in memory, and a serve
+// from a yaw-mcp release before the merging save re-saves its whole snapshot
+// over the deleted file. Either way the reset is not in effect for a running
+// client yet, so the success report still tells the user to restart it.
 //
 // Scope is intentionally "all or nothing." A per-namespace flag feels
 // nice but the failure mode is a footgun (user clears one namespace,
@@ -55,8 +58,8 @@ export const RESET_LEARNING_USAGE = `Usage: yaw-mcp reset-learning
   doesn't keep suppressing it.
 
   Restart your MCP client afterwards: a running "yaw-mcp serve" keeps
-  the learning it has in memory and re-saves it over the deleted file
-  on its next tool call.
+  routing on the learning it has in memory until its next save (and one
+  from an older yaw-mcp release re-saves it over the deleted file).
 
   The delete cannot be undone, so when there IS something to remove you
   are shown what the file holds and asked to confirm. A bare Enter is NO.
@@ -67,14 +70,15 @@ export const RESET_LEARNING_USAGE = `Usage: yaw-mcp reset-learning
 
 // Printed on every path that actually removed the file. The delete is a
 // pure filesystem operation with no channel to a live serve process, and
-// that process re-saves its in-memory snapshot without consulting the file
-// first -- so without this the user watches "cleared persisted state" and
-// then keeps getting the exact routing penalty they just cleared, with
-// nothing on screen connecting the two.
+// that process keeps routing on its in-memory learning until its next save
+// (an older release re-saves that learning over the deleted file outright)
+// -- so without this the user watches "cleared persisted state" and then
+// keeps getting the exact routing penalty they just cleared, with nothing on
+// screen connecting the two.
 const RUNNING_SERVE_NOTE = [
   "  note: a running yaw-mcp serve process still holds this learning in",
-  "        memory and re-saves it over the deleted file within a second of",
-  "        the next tool call. Restart your MCP client (or stop that serve",
+  "        memory and keeps routing on it (an older release re-saves it over",
+  "        the deleted file). Restart your MCP client (or stop that serve",
   "        process) for the reset to take effect.",
 ];
 

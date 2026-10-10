@@ -185,9 +185,10 @@ export const SIDECAR_REFRESH_START_DELAY_MS = 60 * 1000;
  *  NOT a key in state.json, which is the obvious-looking home for it. Two
  *  reasons, either one fatal: persistence.ts's loadState rebuilds the state
  *  object from a fixed sanitizer (learning / packHistory / toolCache), so an
- *  unknown key does not survive a load; and saveState writes the WHOLE document
- *  from the running broker's in-memory snapshot, so the next debounced save
- *  would erase a timestamp written behind its back anyway. install-nudge hit
+ *  unknown key does not survive a load; and every save rewrites the WHOLE
+ *  document from those same three sections (the running broker's merge
+ *  re-reads the file through that loader), so the next debounced save would
+ *  erase a timestamp written behind its back anyway. install-nudge hit
  *  the same wall and reached the same answer -- its own small file. */
 export const SIDECAR_REFRESH_STATE_FILENAME = "sidecar-refresh-state.json";
 
