@@ -10,6 +10,8 @@ export const FLOOR_TEST: string;
 export const FLOOR_CHANGELOG: string;
 export const PROBE_SERVER: string;
 export const TAG: string;
+export const ERAS: readonly string[];
+export const HOSTED: string;
 export const BLOCK_HEAD: string;
 
 export function parseArgs(
@@ -33,6 +35,7 @@ export function probeHosting(opts: {
   args: string[];
   cwd?: string;
   timeoutMs?: number;
+  era?: string;
 }): Promise<ProbeResult>;
 
 export function renderFloorBlock(f: { next: string; prev: string; day: string }): string[];
@@ -49,7 +52,13 @@ export interface VerifyDeps {
   cwd?: string;
   out?: (line: string) => void;
   oamVersion?: (bin: string) => Promise<string>;
-  probeHosting?: (o: { command: string; args: string[]; cwd: string; timeoutMs: number }) => Promise<ProbeResult>;
+  probeHosting?: (o: {
+    command: string;
+    args: string[];
+    cwd: string;
+    timeoutMs: number;
+    era: string;
+  }) => Promise<ProbeResult>;
   readFile?: (p: string) => string;
   writeFile?: (p: string, text: string) => void;
   day?: string;

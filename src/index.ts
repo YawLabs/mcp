@@ -454,6 +454,15 @@ if (subcommand === "compliance") {
                                in by hand, or a supervisor that spawns it under
                                a PTY). A client launch uses a pipe and is
                                unaffected either way.
+    YAW_MCP_PROTOCOL              Which MCP protocol eras the stdio server
+                               serves. \`auto\` (default) serves both: a
+                               client that opens with server/discover gets
+                               2026-07-28, one that opens with initialize gets
+                               the 2025 protocol. \`legacy\` serves 2025 only
+                               and answers server/discover method-not-found,
+                               so a probing client falls back to initialize
+                               (the server side of Claude Code's
+                               MCP_PROTOCOL_NEGOTIATION=legacy).
     YAW_MCP_SERVER_CAP            Max concurrently active servers (default 6).
     YAW_MCP_TOOL_TOKEN_CAP        Ceiling on the ESTIMATED tokens of the loaded
                                tool surface, checked alongside SERVER_CAP

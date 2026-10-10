@@ -72,6 +72,7 @@ import { META_TOOLS } from "../meta-tools.js";
 import { CONFIG_DIRNAME } from "../paths.js";
 import { brandCancelled, brandRoutingFault, isRoutingFaultResult, routeToolCall } from "../proxy.js";
 import { capContent } from "../result-cap.js";
+import { resetNoSamplingNotice as resetGraderNotice } from "../reward-grader.js";
 import { resetNoSamplingNotice } from "../sampling-rank.js";
 import type { SecretEntryPage, SecretEntryPageOptions } from "../secret-entry-page.js";
 import {
@@ -86,6 +87,7 @@ import {
   ROUTING_FAULT_DISCONNECTED,
   ROUTING_FAULT_UNKNOWN_TOOL,
   resolveIdleThreshold,
+  resolveProtocolMode,
   resolveToolExposure,
 } from "../server.js";
 import type { UpstreamConnection, UpstreamServerConfig } from "../types.js";
@@ -3105,7 +3107,7 @@ describe("ConnectServer", () => {
       priv.rebuildRoutes();
       const recordOutcome = vi.spyOn(priv.learning, "recordOutcome");
 
-      const result = await priv.handleToolCall("gh_create_issue", {}, { signal: controller.signal });
+      const result = await priv.handleToolCall("gh_create_issue", {}, { mcpReq: { signal: controller.signal } });
 
       expect(result.isError).toBe(true);
       // Health is untouched -- not "booked without the error", which would
@@ -3129,7 +3131,11 @@ describe("ConnectServer", () => {
       priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
       priv.rebuildRoutes();
 
-      const result = await priv.handleToolCall("gh_create_issue", {}, { signal: new AbortController().signal });
+      const result = await priv.handleToolCall(
+        "gh_create_issue",
+        {},
+        { mcpReq: { signal: new AbortController().signal } },
+      );
       expect(result.isError).toBe(true);
       expect(conn.health.totalCalls).toBe(1);
       expect(conn.health.errorCount).toBe(1);
@@ -4918,6 +4924,27 @@ describe("isAutoActivateEnabled", () => {
     // Whitespace-only reads as unset -> default ON.
     vi.stubEnv("YAW_MCP_AUTO_ACTIVATE", "  ");
     expect(isAutoActivateEnabled()).toBe(true);
+  });
+});
+
+describe("resolveProtocolMode (YAW_MCP_PROTOCOL)", () => {
+  it("defaults to auto -- both eras -- when unset, empty or auto", () => {
+    expect(resolveProtocolMode({})).toBe("auto");
+    expect(resolveProtocolMode({ YAW_MCP_PROTOCOL: "" })).toBe("auto");
+    expect(resolveProtocolMode({ YAW_MCP_PROTOCOL: "auto" })).toBe("auto");
+  });
+
+  it("reads legacy case-insensitively and trimmed -- cmd.exe stores 'legacy '", () => {
+    expect(resolveProtocolMode({ YAW_MCP_PROTOCOL: "legacy" })).toBe("legacy");
+    expect(resolveProtocolMode({ YAW_MCP_PROTOCOL: "LEGACY" })).toBe("legacy");
+    expect(resolveProtocolMode({ YAW_MCP_PROTOCOL: "legacy " })).toBe("legacy");
+  });
+
+  it("falls back to auto on an unknown value, which still serves every client", () => {
+    // A version string is the likely mistake: the knob names a mode, not a
+    // revision, and "auto" is the mode that serves 2025-11-25 too.
+    expect(resolveProtocolMode({ YAW_MCP_PROTOCOL: "2025-11-25" })).toBe("auto");
+    expect(resolveProtocolMode({ YAW_MCP_PROTOCOL: "modern" })).toBe("auto");
   });
 });
 
@@ -10838,6 +10865,42 @@ describe("cold tool-list readers share mergeToolCache's precedence", () => {
     } finally {
       write.mockRestore();
       resetNoSamplingNotice();
+    }
+  });
+
+  it("runs neither the dispatch tiebreak nor the reward grader on 2026-07-28, even when the envelope declares sampling", async () => {
+    // 2026-07-28 has no server-to-client request, so sampling is a 2025-only
+    // feature here (SamplingPeer): the grader runs after the result has gone
+    // and best-of-N has a 2 s budget, so neither can ride an input_required
+    // round instead. The era is the gate, not the declared capability.
+    resetNoSamplingNotice();
+    resetGraderNotice();
+    const priv = getPrivate(server);
+    priv.config = makeConfig([
+      makeServerConfig({ id: "a", namespace: "alpha", name: "Alpha", description: "manage github issues" }),
+      makeServerConfig({ id: "b", namespace: "beta", name: "Beta", description: "manage github issues" }),
+    ]);
+    priv.servedEra = "modern";
+    priv.modernClient = { clientInfo: { name: "claude-code", version: "0" }, capabilities: { sampling: {} } };
+    const createMessage = vi.fn();
+    priv.server.createMessage = createMessage;
+    const write = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    vi.stubEnv("LOG_LEVEL", "");
+    try {
+      await priv.handleDispatch("manage github issues", 1);
+      await priv.handleDispatch("manage github issues", 1);
+      await priv.refineRewardInBackground("alpha", 0.5, { toolName: "alpha_list", resultText: "ok" });
+      expect(createMessage).not.toHaveBeenCalled();
+      // One line per feature, each naming its own inert knob.
+      const notices = write.mock.calls.map(([chunk]) => String(chunk)).filter((c) => c.includes("MCP 2026-07-28"));
+      expect(notices).toHaveLength(2);
+      expect(notices.filter((n) => n.includes("YAW_MCP_ROUTE_EFFORT"))).toHaveLength(1);
+      expect(notices.filter((n) => n.includes("YAW_MCP_REWARD_GRADER"))).toHaveLength(1);
+    } finally {
+      vi.unstubAllEnvs();
+      write.mockRestore();
+      resetNoSamplingNotice();
+      resetGraderNotice();
     }
   });
 

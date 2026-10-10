@@ -14,10 +14,13 @@
  *
  * So the floor is now the last VERIFIED release, and this script is the only
  * thing that raises it. Verified means: the installed oam hosts a real stdio
- * @modelcontextprotocol/sdk server (scripts/oam-floor-probe-server.mjs) through
- * `oam run`, and that server completes initialize, tools/list and tools/call --
- * the mechanism check the "MEASURED" note in src/oam-spawn.ts describes, which
- * release.sh used to skip. Nothing here reads GitHub, and nothing here installs
+ * @modelcontextprotocol/server server (scripts/oam-floor-probe-server.mjs)
+ * through `oam run`, and that server completes BOTH protocol eras yaw-mcp
+ * serves, each on a fresh process: 2025-11-25 (initialize, tools/list,
+ * tools/call, through the SDK client yaw-mcp uses upstream) and 2026-07-28
+ * (server/discover, tools/list, tools/call, each with the per-request
+ * envelope) -- the mechanism check the "MEASURED" note in src/oam-spawn.ts
+ * describes, which release.sh used to skip. Nothing here reads GitHub, and nothing here installs
  * anything: a machine without oam fails, by name, and says where to get it.
  *
  * Modes:
@@ -65,12 +68,22 @@ export const FLOOR_CHANGELOG = "CHANGELOG.md";
 export const PROBE_SERVER = "scripts/oam-floor-probe-server.mjs";
 
 export const TAG = "[verify:oam-floor]";
+
+/** The protocol eras the probe completes, in the order it runs them. yaw-mcp
+ *  serves both from one process, so the floor vouches for both. */
+export const ERAS = ["2025-11-25", "2026-07-28"];
+
+/** What an OK line says was hosted. */
+export const HOSTED =
+  "a stdio @modelcontextprotocol/server server on both protocol eras (2025-11-25: initialize + tools/list + tools/call; 2026-07-28: server/discover + tools/list + tools/call)";
 const DEFAULT_TIMEOUT_MS = 30_000;
 const USAGE = `Usage: node scripts/verify-oam-floor.mjs [--raise]
 
-Host a stdio @modelcontextprotocol/sdk server on this machine's oam through
-\`oam run\` and complete initialize + tools/list + tools/call. Passes when the
-installed oam is at or above MIN_OAM_VERSION (${FLOOR_SRC}).
+Host a stdio @modelcontextprotocol/server server on this machine's oam through
+\`oam run\` and complete both protocol eras on it: 2025-11-25 (initialize +
+tools/list + tools/call) and 2026-07-28 (server/discover + tools/list +
+tools/call). Passes when the installed oam is at or above MIN_OAM_VERSION
+(${FLOOR_SRC}).
 
   --raise   Also move MIN_OAM_VERSION, the ratchet literal in ${FLOOR_TEST} and
             a CHANGELOG.md block to the installed version. Writes nothing when
@@ -232,19 +245,25 @@ export function oamVersion(bin, deps = {}) {
 }
 
 /**
- * The mechanism check: connect an SDK client to `command args...` over stdio
+ * The mechanism check: open `command args...` over stdio on one protocol era
  * and run the three calls a sidecar has to survive. Resolves with what the
- * server answered; rejects with the SDK's error plus the child's stderr tail,
- * which under oam is where a boot failure explains itself.
+ * server answered; rejects with the reason plus the child's stderr tail, which
+ * under oam is where a boot failure explains itself.
+ *
+ * `era` picks the opening. "2025-11-25" (the default) connects the SDK client
+ * yaw-mcp uses upstream, which sends initialize. "2026-07-28" speaks the
+ * modern opening by hand -- server/discover, then requests carrying the
+ * per-request envelope -- because the v1 client this package carries cannot.
  *
  * Deliberately unaware of oam: the caller passes `oam run <probe>` and the
  * tests pass `node <probe>`, which is how the probe itself gets verified on a
  * machine with no oam.
  *
- * @param {{ command: string, args: string[], cwd?: string, timeoutMs?: number }} opts
+ * @param {{ command: string, args: string[], cwd?: string, timeoutMs?: number, era?: string }} opts
  * @returns {Promise<{ tools: string[], reply: string, ms: number }>}
  */
 export async function probeHosting(opts) {
+  if (opts.era === "2026-07-28") return probeModern(opts);
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const started = Date.now();
   const transport = new StdioClientTransport({
@@ -268,21 +287,8 @@ export async function probeHosting(opts) {
   try {
     const run = (async () => {
       await client.connect(transport);
-      const listed = await client.listTools();
-      const tools = listed.tools.map((t) => t.name);
-      if (!tools.includes("ping")) {
-        throw new Error(`tools/list answered ${JSON.stringify(tools)}, not the probe's ["ping"]`);
-      }
-      const called = await client.callTool({ name: "ping", arguments: { nonce } });
-      const text = Array.isArray(called.content)
-        ? called.content
-            .filter((c) => c.type === "text")
-            .map((c) => c.text)
-            .join("")
-        : "";
-      if (text !== `pong:${nonce}`) {
-        throw new Error(`tools/call answered ${JSON.stringify(text)}, not "pong:${nonce}"`);
-      }
+      const tools = checkListed(await client.listTools());
+      const text = checkCalled(await client.callTool({ name: "ping", arguments: { nonce } }), nonce);
       return { tools, reply: text, ms: Date.now() - started };
     })();
     return await Promise.race([run, deadline]);
@@ -293,6 +299,120 @@ export async function probeHosting(opts) {
   } finally {
     clearTimeout(timer);
     await client.close().catch(() => {});
+  }
+}
+
+/** The probe's tool names, or a throw when "ping" is not among them: a
+ *  well-formed list from some other server proves nothing about the entry. */
+function checkListed(listed) {
+  const tools = Array.isArray(listed?.tools) ? listed.tools.map((t) => t.name) : [];
+  if (!tools.includes("ping")) {
+    throw new Error(`tools/list answered ${JSON.stringify(tools)}, not the probe's ["ping"]`);
+  }
+  return tools;
+}
+
+/** The call's text, or a throw when it is not the nonce echoed back. */
+function checkCalled(called, nonce) {
+  const text = Array.isArray(called?.content)
+    ? called.content
+        .filter((c) => c.type === "text")
+        .map((c) => c.text)
+        .join("")
+    : "";
+  if (text !== `pong:${nonce}`) {
+    throw new Error(`tools/call answered ${JSON.stringify(text)}, not "pong:${nonce}"`);
+  }
+  return text;
+}
+
+/** The 2026-07-28 opening, by hand: newline-delimited JSON-RPC on the child's
+ *  stdio, every request carrying the envelope a modern client sends. Same
+ *  result, timeout and stderr-tail contract as the 2025 path above. */
+async function probeModern(opts) {
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const started = Date.now();
+  const nonce = `${process.pid}-${started}`;
+  const meta = {
+    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+    "io.modelcontextprotocol/clientInfo": { name: "verify-oam-floor", version: "0" },
+    "io.modelcontextprotocol/clientCapabilities": {},
+  };
+  const child = spawn(opts.command, opts.args, { cwd: opts.cwd, stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (d) => {
+    // Bounded: a chatty server must not grow the tail without limit.
+    stderr = (stderr + d).slice(-2000);
+  });
+  // Every way the child can end early rejects `ended`, so a pending request
+  // never waits out the whole deadline for a process that is already gone.
+  let fail;
+  const ended = new Promise((_, reject) => {
+    fail = reject;
+  });
+  ended.catch(() => {});
+  child.on("error", (err) => fail(err));
+  child.on("close", (code, signal) =>
+    fail(new Error(`the server exited (code ${code}, signal ${signal}) before the probe finished`)),
+  );
+  const pending = new Map();
+  let buf = "";
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (d) => {
+    buf += d;
+    for (let i = buf.indexOf("\n"); i >= 0; i = buf.indexOf("\n")) {
+      const line = buf.slice(0, i).trim();
+      buf = buf.slice(i + 1);
+      if (!line) continue;
+      let msg;
+      try {
+        msg = JSON.parse(line);
+      } catch {
+        fail(new Error(`the server wrote a line that is not JSON: ${JSON.stringify(line.slice(0, 200))}`));
+        return;
+      }
+      pending.get(msg.id)?.(msg);
+    }
+  });
+  let nextId = 1;
+  const request = (method, params) => {
+    const id = nextId++;
+    const answered = new Promise((resolve, reject) => {
+      pending.set(id, (msg) => {
+        pending.delete(id);
+        if (msg.error) reject(new Error(`${method} answered error ${msg.error.code}: ${msg.error.message}`));
+        else resolve(msg.result);
+      });
+    });
+    child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params: { ...params, _meta: meta } })}\n`);
+    return Promise.race([answered, ended]);
+  };
+  let timer;
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`the probe did not finish within ${timeoutMs} ms`)), timeoutMs);
+  });
+  try {
+    const run = (async () => {
+      const discovered = await request("server/discover", {});
+      const versions = discovered?.supportedVersions;
+      if (!Array.isArray(versions) || !versions.includes("2026-07-28")) {
+        throw new Error(`server/discover answered supportedVersions ${JSON.stringify(versions)}, without "2026-07-28"`);
+      }
+      const tools = checkListed(await request("tools/list", {}));
+      const text = checkCalled(await request("tools/call", { name: "ping", arguments: { nonce } }), nonce);
+      return { tools, reply: text, ms: Date.now() - started };
+    })();
+    return await Promise.race([run, deadline]);
+  } catch (err) {
+    const why = err instanceof Error ? err.message : String(err);
+    const tail = stderr.trim();
+    throw new Error(tail ? `${why}\n  server stderr (tail): ${tail.replace(/\r?\n/g, "\n    ")}` : why);
+  } finally {
+    clearTimeout(timer);
+    child.removeAllListeners("close");
+    child.stdin.end();
+    child.kill();
   }
 }
 
@@ -308,7 +428,7 @@ export function renderFloorBlock({ next, prev, day }) {
   return [
     `${BLOCK_HEAD}${next}**`,
     "",
-    `\`npm run verify:oam-floor\` hosted a stdio \`@modelcontextprotocol/sdk\` server on oam v${next} through \`oam run\` on ${day} -- initialize, tools/list and tools/call all completed -- and raised \`MIN_OAM_VERSION\` to it; the floor was ${prev}. A machine whose oam is older hosts its node/npx sidecars on node instead, and logs a warning naming both versions, \`oam self-update\` as the fix, and that yaw-mcp needs a restart afterwards.`,
+    `\`npm run verify:oam-floor\` hosted a stdio \`@modelcontextprotocol/server\` server on oam v${next} through \`oam run\` on ${day} -- both protocol eras, 2025-11-25 (initialize) and 2026-07-28 (server/discover), each through tools/list and tools/call -- and raised \`MIN_OAM_VERSION\` to it; the floor was ${prev}. A machine whose oam is older hosts its node/npx sidecars on node instead, and logs a warning naming both versions, \`oam self-update\` as the fix, and that yaw-mcp needs a restart afterwards.`,
   ];
 }
 
@@ -418,7 +538,7 @@ function today() {
  *   cwd?: string,
  *   out?: (line: string) => void,
  *   oamVersion?: (bin: string, o: { timeoutMs: number }) => Promise<string>,
- *   probeHosting?: (o: { command: string, args: string[], cwd: string, timeoutMs: number }) => Promise<{ tools: string[], reply: string, ms: number }>,
+ *   probeHosting?: (o: { command: string, args: string[], cwd: string, timeoutMs: number, era: string }) => Promise<{ tools: string[], reply: string, ms: number }>,
  *   readFile?: (p: string) => string,
  *   writeFile?: (p: string, text: string) => void,
  *   day?: string,
@@ -485,17 +605,22 @@ export async function verifyOamFloor(opts = {}, deps = {}) {
   // The mechanism check runs BEFORE the version comparison: an oam below the
   // floor that also cannot host the probe is two findings, and the second is
   // the one that matters more.
-  let hosted;
-  try {
-    hosted = await probe({ command: bin, args: ["run", PROBE_SERVER], cwd, timeoutMs });
-  } catch (err) {
-    return fail(
-      `oam ${installed} could not host a stdio @modelcontextprotocol/sdk server through \`oam run ${PROBE_SERVER}\`: ${err instanceof Error ? err.message : String(err)}`,
+  // One fresh process per era: serveStdio pins a connection to the era its
+  // opening chose, so one process cannot answer for both.
+  for (const era of ERAS) {
+    let hosted;
+    try {
+      hosted = await probe({ command: bin, args: ["run", PROBE_SERVER], cwd, timeoutMs, era });
+    } catch (err) {
+      return fail(
+        `oam ${installed} could not host a stdio @modelcontextprotocol/server server on protocol ${era} through \`oam run ${PROBE_SERVER}\`: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    const opening = era === "2026-07-28" ? "server/discover" : "initialize";
+    out(
+      `${TAG} oam ${installed} hosted ${PROBE_SERVER} on ${era}: ${opening} + tools/list ${JSON.stringify(hosted.tools)} + tools/call -> ${JSON.stringify(hosted.reply)} in ${hosted.ms} ms`,
     );
   }
-  out(
-    `${TAG} oam ${installed} hosted ${PROBE_SERVER}: initialize + tools/list ${JSON.stringify(hosted.tools)} + tools/call -> ${JSON.stringify(hosted.reply)} in ${hosted.ms} ms`,
-  );
 
   const cmp = compareVersions(installed, floor);
   if (cmp < 0) {
@@ -510,16 +635,12 @@ export async function verifyOamFloor(opts = {}, deps = {}) {
         `${TAG} note: oam ${installed} is above the floor ${floor}; \`npm run verify:oam-floor -- --raise\` would move the floor to it`,
       );
     }
-    out(
-      `${TAG} OK -- oam ${installed} hosts a stdio @modelcontextprotocol/sdk server (initialize + tools/list + tools/call); the floor ${floor} stands`,
-    );
+    out(`${TAG} OK -- oam ${installed} hosts ${HOSTED}; the floor ${floor} stands`);
     return 0;
   }
 
   if (cmp === 0) {
-    out(
-      `${TAG} OK -- oam ${installed} hosts a stdio @modelcontextprotocol/sdk server (initialize + tools/list + tools/call); the floor is already ${floor}, nothing to raise`,
-    );
+    out(`${TAG} OK -- oam ${installed} hosts ${HOSTED}; the floor is already ${floor}, nothing to raise`);
     return 0;
   }
   let texts;
@@ -544,9 +665,7 @@ export async function verifyOamFloor(opts = {}, deps = {}) {
   out(
     `${TAG} raised the oam floor ${texts.prev} -> ${installed} in ${FLOOR_SRC}, ${FLOOR_TEST} and ${FLOOR_CHANGELOG}; review the diff and commit it`,
   );
-  out(
-    `${TAG} OK -- oam ${installed} hosts a stdio @modelcontextprotocol/sdk server (initialize + tools/list + tools/call); the floor is now ${installed}`,
-  );
+  out(`${TAG} OK -- oam ${installed} hosts ${HOSTED}; the floor is now ${installed}`);
   return 0;
 }
 

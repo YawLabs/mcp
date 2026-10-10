@@ -43,10 +43,11 @@ const hoisted = vi.hoisted(() => ({
   bundlesError: null as Error | null,
 }));
 
-vi.mock("@modelcontextprotocol/sdk/server/stdio.js", () => {
-  // Minimal Transport: Protocol.connect() only assigns onclose/onerror/
-  // onmessage and awaits start(); send() is used by the list-changed
-  // notifications, close() by shutdown().
+vi.mock("@modelcontextprotocol/server/stdio", async (importOriginal) => {
+  // Minimal Transport: the serving entry (or, under YAW_MCP_PROTOCOL=legacy,
+  // Protocol.connect()) only assigns onclose/onerror/onmessage and awaits
+  // start(); send() carries every reply and notification, close() is
+  // shutdown()'s.
   class FakeStdioServerTransport {
     onclose?: () => void;
     onerror?: (err: Error) => void;
@@ -68,7 +69,20 @@ vi.mock("@modelcontextprotocol/sdk/server/stdio.js", () => {
       this.onclose?.();
     }
   }
-  return { StdioServerTransport: FakeStdioServerTransport };
+  // The REAL serveStdio, so the era routing, the probe discard and the
+  // factory wiring under test are the SDK's own; only its default transport
+  // (the process's stdio) is swapped, through the ServeStdioOptions.transport
+  // hook the SDK offers for exactly this.
+  const actual = (await importOriginal()) as typeof import("@modelcontextprotocol/server/stdio");
+  return {
+    ...actual,
+    StdioServerTransport: FakeStdioServerTransport,
+    serveStdio: (factory: Parameters<typeof actual.serveStdio>[0], options: Parameters<typeof actual.serveStdio>[1]) =>
+      actual.serveStdio(factory, {
+        ...options,
+        transport: options?.transport ?? (new FakeStdioServerTransport() as never),
+      }),
+  };
 });
 
 vi.mock("../upstream.js", async (importOriginal) => {
@@ -142,6 +156,9 @@ const ENV_KEYS = [
   // them for a reason no test here is about; the one test that turns it off
   // sets it itself.
   "YAW_MCP_PREWARM",
+  // The protocol escape hatch. An exported YAW_MCP_PROTOCOL=legacy would take
+  // server/discover away from the serving test below.
+  "YAW_MCP_PROTOCOL",
 ] as const;
 
 let synthHome: string;
@@ -175,6 +192,7 @@ beforeEach(() => {
   delete process.env.YAW_MCP_TOOL_EXPOSURE;
   delete process.env.YAW_MCP_CONFIG_RELOAD;
   delete process.env.YAW_MCP_PREWARM;
+  delete process.env.YAW_MCP_PROTOCOL;
 
   cwdSpy = vi.spyOn(process, "cwd").mockReturnValue(synthCwd);
 
@@ -547,6 +565,67 @@ describe("ConnectServer.start() — transport + config load", () => {
   });
 });
 
+describe("ConnectServer.start() — serves before it loads", () => {
+  // Claude Code probes with server/discover and waits min(3 s,
+  // connectTimeout/3) for the answer; a server that misses the bound is
+  // connected on the 2025 protocol and remembered as a legacy peer for seven
+  // days. start() used to load guides, bundles and grades before it connected
+  // (~2.9 s on a loaded box), so the answer has to come from static data
+  // while that load is still running. Here the load is held open on a gate,
+  // so the bound below is about the serving order, not about the box.
+  const MODERN_META = {
+    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+    "io.modelcontextprotocol/clientInfo": { name: "claude-code", version: "2.1.292" },
+    "io.modelcontextprotocol/clientCapabilities": {},
+  };
+
+  function replyTo(transport: { sent: unknown[] }, id: unknown): Record<string, unknown> | undefined {
+    return transport.sent.find((m) => (m as { id?: unknown }).id === id) as Record<string, unknown> | undefined;
+  }
+
+  it("answers server/discover while start() is still loading, and holds tools/list until it is done", async () => {
+    writeBundles(synthHome, [serverEntry("gh")]);
+    const server = new ConnectServer();
+    servers.push(server);
+    const priv = server as any;
+    let releaseLoad: () => void = () => {};
+    const loadGate = new Promise<void>((resolve) => {
+      releaseLoad = resolve;
+    });
+    const loadStartupState = priv.loadStartupState.bind(priv);
+    priv.loadStartupState = async (opts: unknown) => {
+      await loadGate;
+      return loadStartupState(opts);
+    };
+
+    const started = server.start();
+    await vi.waitFor(() => expect(hoisted.transports).toHaveLength(1));
+    const transport = hoisted.transports[0] as (typeof hoisted.transports)[number] & {
+      onmessage?: (msg: unknown) => void;
+    };
+
+    const sentAt = performance.now();
+    transport.onmessage?.({ jsonrpc: "2.0", id: "d1", method: "server/discover", params: { _meta: MODERN_META } });
+    transport.onmessage?.({ jsonrpc: "2.0", id: 1, method: "tools/list", params: { _meta: MODERN_META } });
+    await vi.waitFor(() => expect(replyTo(transport, "d1")).toBeDefined(), { timeout: 1000, interval: 5 });
+    expect(performance.now() - sentAt).toBeLessThan(1000);
+    const discover = replyTo(transport, "d1")?.result as Record<string, unknown>;
+    expect(discover.supportedVersions).toEqual(["2026-07-28"]);
+    expect(discover.instructions).toBe(SERVER_INSTRUCTIONS);
+
+    // tools/list reads the config the gated load has not produced yet, so it
+    // waits on `ready` rather than answering from an empty state.
+    await new Promise((r) => setTimeout(r, 50));
+    expect(replyTo(transport, 1)).toBeUndefined();
+
+    releaseLoad();
+    await started;
+    await vi.waitFor(() => expect(replyTo(transport, 1)).toBeDefined());
+    const tools = (replyTo(transport, 1)?.result as { tools: Array<{ name: string }> }).tools.map((t) => t.name);
+    expect(tools).toEqual(expect.arrayContaining([...META_TOOL_NAMES]));
+  });
+});
+
 describe("ConnectServer.start() — project-bundle trust gate", () => {
   it("ignores an UNTRUSTED project bundles.json and still loads user-global", async () => {
     writeBundles(synthHome, [serverEntry("userglobal")]);
@@ -881,7 +960,10 @@ describe("ConnectServer.start() — persisted state hydration", () => {
     // And the first tools/call, through the real handler, lazily loads the
     // server and returns the upstream's answer rather than `Unknown tool`.
     const call = priv.server._requestHandlers.get("tools/call");
-    const res = await call({ method: "tools/call", params: { name: "known_cached_tool", arguments: {} } }, {} as never);
+    // The minimal handler context the SDK's tools/call wrapper reads: no
+    // requestState, so the call takes the plain (non-retry) path.
+    const ctx = { mcpReq: { requestState: () => undefined } };
+    const res = await call({ method: "tools/call", params: { name: "known_cached_tool", arguments: {} } }, ctx);
     expect(res.isError).toBeFalsy();
     expect(res.content[0].text).toBe("from the upstream");
     expect(spawnedNamespaces()).toEqual(["known"]);
@@ -1986,5 +2068,309 @@ describe("ConnectServer -- what an explicit trust revoke does to a live session"
 
     expect(paragraph).not.toContain("revocation does not");
     expect(paragraph).toContain("--revoke");
+  });
+});
+
+describe("ConnectServer.start() -- the 2026-07-28 session", () => {
+  // Everything below runs through the SDK's real serveStdio era routing over
+  // the fake transport, as a client would see it on the wire. A 2026-07-28
+  // client never sends initialize, so nothing here may rely on the SDK's
+  // initialize-scoped identity: on stdio its getClientVersion() and
+  // getClientCapabilities() stay null in this era.
+
+  /** What Claude Code 2.1.292 declares: url- and form-mode elicitation. */
+  const CC_CAPS = { elicitation: { form: {}, url: {} } };
+
+  function envelope(clientName?: string, capabilities: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      ...(clientName ? { "io.modelcontextprotocol/clientInfo": { name: clientName, version: "0.0.0" } } : {}),
+      "io.modelcontextprotocol/clientCapabilities": capabilities,
+    };
+  }
+
+  type Wire = (typeof hoisted.transports)[number] & { onmessage?: (msg: unknown) => void };
+
+  let nextId = 100;
+
+  /** Send one request and wait for its reply. */
+  async function request(
+    transport: Wire,
+    method: string,
+    params: Record<string, unknown> = {},
+    meta: Record<string, unknown> = envelope("claude-code", CC_CAPS),
+  ): Promise<Record<string, unknown>> {
+    const id = nextId++;
+    transport.onmessage?.({ jsonrpc: "2.0", id, method, params: { ...params, _meta: meta } });
+    let reply: Record<string, unknown> | undefined;
+    await vi.waitFor(() => {
+      reply = transport.sent.find((m) => (m as { id?: unknown }).id === id) as Record<string, unknown> | undefined;
+      expect(reply).toBeDefined();
+    });
+    return reply as Record<string, unknown>;
+  }
+
+  /** start() with no handshake, then the modern opening: server/discover. */
+  async function startModern(): Promise<Started & { transport: Wire }> {
+    const started = await startServer({ handshake: false });
+    const transport = started.transport as Wire;
+    const discover = await request(transport, "server/discover");
+    expect((discover.result as { supportedVersions: string[] }).supportedVersions).toEqual(["2026-07-28"]);
+    return { ...started, transport };
+  }
+
+  function toolNames(reply: Record<string, unknown>): string[] {
+    return (reply.result as { tools: Array<{ name: string }> }).tools.map((t) => t.name);
+  }
+
+  function callText(reply: Record<string, unknown>): string {
+    return (reply.result as { content: Array<{ text: string }> }).content.map((c) => c.text).join("\n");
+  }
+
+  function notifications(transport: Wire, method: string): Array<Record<string, unknown>> {
+    return transport.sent.filter((m) => (m as { method?: string }).method === method) as Array<Record<string, unknown>>;
+  }
+
+  /** A connection whose tools carry the namespace in their description, and
+   *  whose callTool answers with the namespace, so a test can see which
+   *  upstream a listed name and a routed call belong to. */
+  function labelledConnection(config: UpstreamServerConfig, toolNames: string[]): UpstreamConnection {
+    const conn = fakeConnection(config, toolNames);
+    for (const t of conn.tools) (t as { description?: string }).description = `from ${config.namespace}`;
+    (conn.client as { callTool: unknown }).callTool = vi
+      .fn()
+      .mockResolvedValue({ content: [{ type: "text", text: `answered by ${config.namespace}` }] });
+    return conn;
+  }
+
+  describe("identity from the request envelope", () => {
+    it("serves the lite list to a client in LITE_BY_DEFAULT_CLIENTS, read from the envelope", async () => {
+      writeBundles(synthHome, [serverEntry("gh")]);
+      const { transport } = await startModern();
+      const lite = await request(transport, "tools/list", {}, envelope("typed-cli"));
+      expect(toolNames(lite).sort()).toEqual([...LITE_META_TOOL_NAMES].sort());
+    });
+
+    it("serves gateway to a client the envelope does not name, and re-reads identity per request", async () => {
+      writeBundles(synthHome, [serverEntry("gh")]);
+      const { transport } = await startModern();
+      const anonymous = await request(transport, "tools/list", {}, envelope(undefined));
+      expect(toolNames(anonymous).sort()).toEqual([...META_TOOL_NAMES].sort());
+      // Each 2026-07-28 request is self-describing: the next one decides for
+      // itself, nothing is latched from the first.
+      const lite = await request(transport, "tools/list", {}, envelope("typed-cli"));
+      expect(toolNames(lite).sort()).toEqual([...LITE_META_TOOL_NAMES].sort());
+    });
+  });
+
+  it("marks every list uncacheable and private on 2026-07-28", async () => {
+    // Activation, reaping, reload and filters move these lists mid-session,
+    // and only a client with an open listen hears that they moved.
+    writeBundles(synthHome, [serverEntry("gh")]);
+    const { transport } = await startModern();
+    for (const method of ["tools/list", "prompts/list", "resources/list", "resources/templates/list"]) {
+      const reply = await request(transport, method);
+      expect(reply.result, method).toMatchObject({ ttlMs: 0, cacheScope: "private" });
+    }
+  });
+
+  describe("the session starts once, on the first request past discover", () => {
+    it("does not pre-warm on server/discover alone, then pre-warms once on the first request", async () => {
+      writeBundles(synthHome, [serverEntry("gh")]);
+      const { transport, prewarmed } = await startModern();
+      await new Promise((r) => setTimeout(r, 50));
+      expect(spawnedNamespaces()).toEqual([]);
+
+      await request(transport, "tools/list");
+      await prewarmed;
+      expect(spawnedNamespaces()).toEqual(["gh"]);
+      await request(transport, "tools/list");
+      await request(transport, "resources/list");
+      await new Promise((r) => setTimeout(r, 50));
+      expect(spawnedNamespaces()).toEqual(["gh"]);
+    });
+
+    it("a probe the client abandons for initialize starts the session once, from the handshake", async () => {
+      // The slow-start opening: the probe is not answered within the client's
+      // bound, so it sends initialize on the same pipe. The discarded probe
+      // instance must not have started anything.
+      writeBundles(synthHome, [serverEntry("gh")]);
+      const { transport, prewarmed } = await startServer({ handshake: false });
+      const wire = transport as Wire;
+      wire.onmessage?.({
+        jsonrpc: "2.0",
+        id: "probe",
+        method: "server/discover",
+        params: { _meta: envelope("claude-code", CC_CAPS) },
+      });
+      await driveInitialize(wire as any, {}, "claude-code");
+      await prewarmed;
+      await request(wire, "tools/list", {}, {});
+      await new Promise((r) => setTimeout(r, 50));
+      expect(spawnedNamespaces()).toEqual(["gh"]);
+    });
+  });
+
+  describe("list changes", () => {
+    beforeEach(() => {
+      // Pre-warm's own activations would move the lists too; these cases are
+      // about the ones an explicit activate makes.
+      process.env.YAW_MCP_PREWARM = "0";
+    });
+
+    it("on 2026-07-28 reach only an open subscriptions/listen, stamped with its id", async () => {
+      writeBundles(synthHome, [serverEntry("gh"), serverEntry("linear")]);
+      const { transport } = await startModern();
+
+      const first = await request(transport, "tools/call", {
+        name: "mcp_connect_activate",
+        arguments: { server: "gh" },
+      });
+      expect((first.result as { isError?: boolean }).isError).not.toBe(true);
+      expect(notifications(transport, "notifications/tools/list_changed")).toEqual([]);
+
+      transport.onmessage?.({
+        jsonrpc: "2.0",
+        id: "listen-1",
+        method: "subscriptions/listen",
+        params: { notifications: { toolsListChanged: true }, _meta: envelope("claude-code", CC_CAPS) },
+      });
+      await vi.waitFor(() =>
+        expect(notifications(transport, "notifications/subscriptions/acknowledged")).toHaveLength(1),
+      );
+
+      const second = await request(transport, "tools/call", {
+        name: "mcp_connect_activate",
+        arguments: { server: "linear" },
+      });
+      expect((second.result as { isError?: boolean }).isError).not.toBe(true);
+      await vi.waitFor(() => expect(notifications(transport, "notifications/tools/list_changed")).toHaveLength(1));
+      const changed = notifications(transport, "notifications/tools/list_changed")[0];
+      expect((changed.params as { _meta: Record<string, unknown> })._meta).toMatchObject({
+        "io.modelcontextprotocol/subscriptionId": "listen-1",
+      });
+      // Only what the listen asked for: resources and prompts were not.
+      expect(notifications(transport, "notifications/resources/list_changed")).toEqual([]);
+      expect(notifications(transport, "notifications/prompts/list_changed")).toEqual([]);
+    });
+
+    it("on 2025-11-25 go out unsolicited, as before", async () => {
+      writeBundles(synthHome, [serverEntry("gh")]);
+      const { priv, transport } = await startServer();
+      await priv.handleToolCall("mcp_connect_activate", { server: "gh" });
+      await vi.waitFor(() =>
+        expect(notifications(transport as Wire, "notifications/tools/list_changed").length).toBeGreaterThan(0),
+      );
+    });
+  });
+
+  describe("no server-to-client requests on 2026-07-28", () => {
+    beforeEach(() => {
+      process.env.YAW_MCP_PREWARM = "0";
+    });
+
+    it("a missing credential is asked for in the reply, never by a request on the wire", async () => {
+      writeBundles(synthHome, [serverEntry("gh")]);
+      vi.mocked(connectToUpstream).mockRejectedValue(new Error("GITHUB_TOKEN is required"));
+      const { priv, transport } = await startModern();
+      const elicit = vi.spyOn(priv.server, "elicitInput");
+      // The single retry spawns again after a fixed 1 s; nothing here is about it.
+      priv.activationRetryDelayMs = 0;
+
+      // The envelope declares url and form elicitation, as Claude Code's does.
+      // The prompt rides back in the tools/call reply as input_required (the
+      // multi-round-trip flow is covered end to end in
+      // secret-entry-modern.test.ts); nothing is pushed.
+      const reply = await request(transport, "tools/call", {
+        name: "mcp_connect_activate",
+        arguments: { server: "gh" },
+      });
+      const result = reply.result as { resultType?: string; inputRequests?: Record<string, { params?: unknown }> };
+      expect(result.resultType).toBe("input_required");
+      expect(JSON.stringify(result.inputRequests)).toContain("GITHUB_TOKEN");
+      expect(elicit).not.toHaveBeenCalled();
+      // Every message yaw-mcp wrote is a reply or a notification: nothing
+      // carries a method AND an id.
+      const pushed = transport.sent.filter(
+        (m) => (m as { method?: string }).method !== undefined && (m as { id?: unknown }).id !== undefined,
+      );
+      expect(pushed).toEqual([]);
+    });
+
+    it("mirrors no capabilities onto upstreams, so a sidecar never asks for what cannot be forwarded", async () => {
+      writeBundles(synthHome, [serverEntry("gh")]);
+      const capsAtConnect: unknown[] = [];
+      vi.mocked(connectToUpstream).mockImplementation((async (
+        config: UpstreamServerConfig,
+        _onDisconnect: unknown,
+        _onListChanged: unknown,
+        bridge: { getClientCapabilities: () => unknown } | undefined,
+      ) => {
+        capsAtConnect.push(bridge?.getClientCapabilities());
+        return fakeConnection(config, [`${config.namespace}_live`]);
+      }) as unknown as typeof connectToUpstream);
+      const { transport } = await startModern();
+      await request(
+        transport,
+        "tools/call",
+        { name: "mcp_connect_activate", arguments: { server: "gh" } },
+        envelope("claude-code", { ...CC_CAPS, sampling: {}, roots: {} }),
+      );
+      expect(capsAtConnect).toEqual([undefined]);
+    });
+  });
+
+  describe("namespace order", () => {
+    beforeEach(() => {
+      process.env.YAW_MCP_PREWARM = "0";
+    });
+
+    async function activateInOrder(order: string[]): Promise<Wire> {
+      hoisted.transports.length = 0;
+      const { transport } = await startModern();
+      for (const ns of order) {
+        await request(transport, "tools/call", { name: "mcp_connect_activate", arguments: { server: ns } });
+      }
+      return transport;
+    }
+
+    it("tools/list is byte-identical whatever order the servers were activated in", async () => {
+      writeBundles(synthHome, [serverEntry("beta"), serverEntry("alpha")]);
+      vi.mocked(connectToUpstream).mockImplementation((async (config: UpstreamServerConfig) =>
+        labelledConnection(config, ["two", "one"])) as unknown as typeof connectToUpstream);
+      const ba = JSON.stringify((await request(await activateInOrder(["beta", "alpha"]), "tools/list")).result);
+      const ab = JSON.stringify((await request(await activateInOrder(["alpha", "beta"]), "tools/list")).result);
+      expect(ba).toBe(ab);
+      // Namespaces in code-unit order, each upstream's own order kept.
+      const names = (JSON.parse(ab) as { tools: Array<{ name: string }> }).tools
+        .map((t) => t.name)
+        .filter((n) => !n.startsWith("mcp_connect_"));
+      expect(names).toEqual(["alpha_two", "alpha_one", "beta_two", "beta_one"]);
+    });
+
+    it("a colliding wire name routes to the namespace tools/list advertised, whichever loaded first", async () => {
+      // (gh, actions_list) and (gh_actions, list) both flatten to
+      // gh_actions_list. "gh" < "gh_actions", so gh owns the name on both
+      // surfaces, in both activation orders.
+      writeBundles(synthHome, [serverEntry("gh"), serverEntry("gh_actions")]);
+      vi.mocked(connectToUpstream).mockImplementation((async (config: UpstreamServerConfig) =>
+        labelledConnection(config, [
+          config.namespace === "gh" ? "actions_list" : "list",
+        ])) as unknown as typeof connectToUpstream);
+
+      for (const order of [
+        ["gh_actions", "gh"],
+        ["gh", "gh_actions"],
+      ]) {
+        const transport = await activateInOrder(order);
+        const listed = (
+          (await request(transport, "tools/list")).result as { tools: Array<{ name: string; description?: string }> }
+        ).tools.filter((t) => t.name === "gh_actions_list");
+        expect(listed).toHaveLength(1);
+        expect(listed[0].description).toBe("from gh");
+        const called = await request(transport, "tools/call", { name: "gh_actions_list", arguments: {} });
+        expect(callText(called)).toBe("answered by gh");
+      }
+    });
   });
 });

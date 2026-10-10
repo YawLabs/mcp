@@ -8,6 +8,7 @@ import {
   buildResourceRoutes,
   buildToolList,
   buildToolRoutes,
+  compareNamespaces,
   isCancelledResult,
   isRoutingFaultResult,
   type PromptRoute,
@@ -1492,5 +1493,96 @@ describe("buildResourceList / buildPromptList — title + _meta passthrough", ()
     expect(buildResourceList(connections)[0]._meta).toBeUndefined();
     expect(buildPromptList(connections)[0].title).toBeUndefined();
     expect(buildPromptList(connections)[0]._meta).toBeUndefined();
+  });
+});
+
+describe("namespace order -- every list and route table", () => {
+  // The same set of loaded servers must give the same lists whatever order
+  // they were activated in (a Map iterates in insertion order, which is
+  // activation order), and a colliding name must have the same owner on the
+  // list and on the routes. Both come from walking namespaces in code-unit
+  // order; each case builds the maps in BOTH insertion orders.
+  pinLogLevel();
+
+  function both<T>(entries: Array<[string, T]>): Array<Map<string, T>> {
+    return [new Map(entries), new Map([...entries].reverse())];
+  }
+
+  it("compares by code unit, not locale", () => {
+    // localeCompare puts "a" before "B"; a code-unit compare does not, and is
+    // the same on every host.
+    expect(["b", "a", "B", "a_b", "a-b"].sort(compareNamespaces)).toEqual(["B", "a", "a-b", "a_b", "b"]);
+  });
+
+  it("tools/list is identical across insertion orders, upstream order kept within a namespace", () => {
+    const lists = both([
+      ["beta", makeConnection("beta", ["two", "one"])],
+      ["alpha", makeConnection("alpha", ["two", "one"])],
+    ]).map((m) => JSON.stringify(buildToolList(m)));
+    expect(lists[0]).toBe(lists[1]);
+    const names = (JSON.parse(lists[0]) as Array<{ name: string }>)
+      .map((t) => t.name)
+      .filter((n) => !n.startsWith("mcp_connect_"));
+    expect(names).toEqual(["alpha_two", "alpha_one", "beta_two", "beta_one"]);
+  });
+
+  it("deferred placeholders follow namespace order too, after every active one", () => {
+    const idle = [makeInactiveServer("zeta", [{ name: "t" }]), makeInactiveServer("eta", [{ name: "t" }])];
+    const lists = [idle, [...idle].reverse()].map((servers) =>
+      buildToolList(new Map([["mu", makeConnection("mu", ["t"])]]), servers)
+        .map((t) => t.name)
+        .filter((n) => !n.startsWith("mcp_connect_")),
+    );
+    expect(lists[0]).toEqual(["mu_t", "eta_t", "zeta_t"]);
+    expect(lists[1]).toEqual(lists[0]);
+  });
+
+  it("a tool collision goes to the lexically first namespace on the list and the routes alike", () => {
+    for (const connections of both([
+      ["gh_actions", makeConnection("gh_actions", ["list"])],
+      ["gh", makeConnection("gh", ["actions_list"])],
+    ])) {
+      const routes = withCapturedStderr(() => buildToolRoutes(connections)).value;
+      expect(routes.get("gh_actions_list")).toEqual({ namespace: "gh", originalName: "actions_list" });
+      expect(buildToolList(connections).filter((t) => t.name === "gh_actions_list")).toHaveLength(1);
+    }
+  });
+
+  it("a deferred-vs-deferred collision goes to the lexically first namespace", () => {
+    const idle = [
+      makeInactiveServer("gh_actions", [{ name: "list" }]),
+      makeInactiveServer("gh", [{ name: "actions_list" }]),
+    ];
+    for (const servers of [idle, [...idle].reverse()]) {
+      const routes = withCapturedStderr(() => buildToolRoutes(new Map(), servers)).value;
+      expect(routes.get("gh_actions_list")).toMatchObject({ namespace: "gh", originalName: "actions_list" });
+    }
+  });
+
+  it("resources: identical list, and a uri collision has one owner on both surfaces", () => {
+    const orders = both([
+      ["db/x", makeConnection("db/x", [], ["y"])],
+      ["db", makeConnection("db", [], ["x/y", "other"])],
+    ]);
+    const lists = orders.map((m) => JSON.stringify(buildResourceList(m)));
+    expect(lists[0]).toBe(lists[1]);
+    for (const connections of orders) {
+      const routes = withCapturedStderr(() => buildResourceRoutes(connections)).value;
+      expect(routes.get("connect://db/x/y")).toEqual({ namespace: "db", originalUri: "x/y" });
+    }
+  });
+
+  it("prompts: identical list, and a name collision has one owner on both surfaces", () => {
+    const orders = both([
+      ["gh_review", makeConnection("gh_review", [], [], ["pr"])],
+      ["gh", makeConnection("gh", [], [], ["review_pr", "triage"])],
+    ]);
+    const lists = orders.map((m) => JSON.stringify(buildPromptList(m)));
+    expect(lists[0]).toBe(lists[1]);
+    expect((JSON.parse(lists[0]) as Array<{ name: string }>).map((p) => p.name)).toEqual(["gh_review_pr", "gh_triage"]);
+    for (const connections of orders) {
+      const routes = withCapturedStderr(() => buildPromptRoutes(connections)).value;
+      expect(routes.get("gh_review_pr")).toEqual({ namespace: "gh", originalName: "review_pr" });
+    }
   });
 });

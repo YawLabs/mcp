@@ -105,6 +105,27 @@ export interface BuiltinResource {
  */
 export type ToolExposure = "gateway" | "lite" | "full";
 
+/** The order every list and route table below visits namespaces in: a plain
+ *  code-unit compare (never localeCompare, whose answer depends on the host's
+ *  locale). Two things hang off it. A list is byte-identical for the same set
+ *  of loaded servers whatever order they were activated in, which is what a
+ *  client caching it by content needs. And when two namespaces flatten onto
+ *  one wire name (`gh` + `actions_list` vs `gh_actions` + `list`), the list
+ *  and the routes pick the same winner -- the lexically first namespace --
+ *  because both are built in this order. Within a namespace the upstream's own
+ *  order is kept: re-sorting would reorder tools against their own server. */
+export function compareNamespaces(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+function connectionsInOrder(activeConnections: Map<string, UpstreamConnection>): UpstreamConnection[] {
+  return [...activeConnections.values()].sort((a, b) => compareNamespaces(a.config.namespace, b.config.namespace));
+}
+
+function serversInOrder(servers: UpstreamServerConfig[]): UpstreamServerConfig[] {
+  return [...servers].sort((a, b) => compareNamespaces(a.namespace, b.namespace));
+}
+
 export function buildToolList(
   activeConnections: Map<string, UpstreamConnection>,
   inactiveWithCache: UpstreamServerConfig[] = [],
@@ -169,8 +190,9 @@ export function buildToolList(
   // `gh_actions_list`. Without the check the SAME name would be emitted
   // twice in tools/list (MCP names must be unique; clients dedupe
   // arbitrarily or error). First writer wins here, matching the meta-tool
-  // precedence above; buildToolRoutes logs the collision.
-  for (const conn of activeConnections.values()) {
+  // precedence above, and "first" is namespace order (compareNamespaces),
+  // the same order buildToolRoutes picks its winner in; it logs the collision.
+  for (const conn of connectionsInOrder(activeConnections)) {
     // Gateway (and lite, which is gateway with fewer meta-tools) advertises
     // a namespace only once the client has asked for it. A server that is
     // merely CONNECTED does not qualify: yaw-mcp pre-warms dormant servers
@@ -208,7 +230,7 @@ export function buildToolList(
   // filter but no connection would otherwise advertise its FULL cached
   // tool set, so a filtered-out tool reappears the moment its server goes
   // idle. Filters key on the BARE tool name, same as the active branch.
-  for (const server of inactiveWithCache) {
+  for (const server of serversInOrder(inactiveWithCache)) {
     if (activeConnections.has(server.namespace)) continue;
     if (!server.toolCache || server.toolCache.length === 0) continue;
     // These placeholders ARE the ~27,000 tokens gateway mode exists to
@@ -255,19 +277,18 @@ export function buildToolRoutes(
   // and (ns=`gh_actions`, tool=`list`) both produce `gh_actions_list`.
   // Last writer used to win silently; warn once per collision so the
   // operator can rename one of the upstreams.
-  for (const conn of activeConnections.values()) {
+  for (const conn of connectionsInOrder(activeConnections)) {
     for (const tool of conn.tools) {
       const existing = routes.get(tool.namespacedName);
       if (existing && existing.namespace !== conn.config.namespace) {
         // FIRST writer wins, and the `continue` below is load-bearing.
         // buildToolList skips a duplicate namespacedName (see the `seen`
         // guard), so the schema the model is shown belongs to the FIRST
-        // upstream. Letting routes.set fall through here made dispatch
-        // last-writer-wins, so a collision meant the client validated
-        // against one upstream's inputSchema and the call executed a
-        // DIFFERENT upstream's tool -- and a later-activated server could
-        // silently capture an earlier one's traffic. The two surfaces must
-        // agree on the winner; first is the safe direction to agree on.
+        // upstream in namespace order. Letting routes.set fall through here
+        // made dispatch last-writer-wins, so a collision meant the client
+        // validated against one upstream's inputSchema and the call executed
+        // a DIFFERENT upstream's tool. The two surfaces must agree on the
+        // winner, and both walk compareNamespaces order, so they do.
         if (!quiet) {
           log("warn", "Tool route collision; keeping the first upstream, ignoring the later one", {
             tool: tool.namespacedName,
@@ -290,7 +311,7 @@ export function buildToolRoutes(
   // two idle servers whose cached names flatten to the same string, first
   // one wins, and the loser's tool is unreachable until the operator
   // renames a namespace. Warn on that so it isn't silent.
-  for (const server of inactiveWithCache) {
+  for (const server of serversInOrder(inactiveWithCache)) {
     if (activeConnections.has(server.namespace)) continue;
     if (!server.toolCache || server.toolCache.length === 0) continue;
     for (const cached of server.toolCache) {
@@ -349,15 +370,15 @@ export function buildResourceList(
   // that (so is a `connect://${namespace}/${uri}` pair that flattens to one
   // string), and clients then dedupe arbitrarily or error. Builtins seed the
   // set so a builtin SHADOWS an upstream uri here exactly as it does in
-  // routeResourceRead — one winner on both surfaces. First writer wins, and
-  // buildResourceRoutes agrees on that winner.
+  // routeResourceRead — one winner on both surfaces. First writer in
+  // namespace order wins, and buildResourceRoutes agrees on that winner.
   const seen = new Set<string>();
   for (const b of builtins) {
     if (seen.has(b.uri)) continue;
     resources.push({ uri: b.uri, name: b.name, description: b.description, mimeType: b.mimeType });
     seen.add(b.uri);
   }
-  for (const conn of activeConnections.values()) {
+  for (const conn of connectionsInOrder(activeConnections)) {
     if (exposure !== "full" && !exposedNamespaces?.has(conn.config.namespace)) continue;
     for (const r of conn.resources) {
       if (seen.has(r.namespacedUri)) continue;
@@ -381,7 +402,7 @@ export function buildResourceList(
 
 export function buildResourceRoutes(activeConnections: Map<string, UpstreamConnection>): Map<string, ResourceRoute> {
   const routes = new Map<string, ResourceRoute>();
-  for (const conn of activeConnections.values()) {
+  for (const conn of connectionsInOrder(activeConnections)) {
     for (const r of conn.resources) {
       const existing = routes.get(r.namespacedUri);
       if (existing) {
@@ -429,9 +450,10 @@ export function buildPromptList(
   // and (ns=`gh_review`, prompt=`pr`) both render as `gh_review_pr`. MCP
   // prompt names must be unique; without the check the SAME name is emitted
   // twice in prompts/list and clients dedupe arbitrarily or error. First
-  // writer wins, and buildPromptRoutes agrees on that winner.
+  // writer in namespace order wins, and buildPromptRoutes agrees on that
+  // winner.
   const seen = new Set<string>();
-  for (const conn of activeConnections.values()) {
+  for (const conn of connectionsInOrder(activeConnections)) {
     if (exposure !== "full" && !exposedNamespaces?.has(conn.config.namespace)) continue;
     for (const p of conn.prompts) {
       if (seen.has(p.namespacedName)) continue;
@@ -451,19 +473,18 @@ export function buildPromptList(
 
 export function buildPromptRoutes(activeConnections: Map<string, UpstreamConnection>): Map<string, PromptRoute> {
   const routes = new Map<string, PromptRoute>();
-  for (const conn of activeConnections.values()) {
+  for (const conn of connectionsInOrder(activeConnections)) {
     for (const p of conn.prompts) {
       const existing = routes.get(p.namespacedName);
       if (existing && existing.namespace !== conn.config.namespace) {
         // FIRST writer wins, mirroring buildToolRoutes -- and the `continue`
         // is load-bearing for the same reason. buildPromptList skips a
         // duplicate namespacedName, so the prompt (description + argument
-        // list) the client was shown belongs to the FIRST upstream. Letting
-        // routes.set fall through made prompts/get last-writer-wins, so a
-        // collision meant the client picked one upstream's prompt and got a
-        // DIFFERENT upstream's -- and a later-activated server could silently
-        // capture an earlier one's traffic. Both surfaces must agree on the
-        // winner; first is the safe direction to agree on.
+        // list) the client was shown belongs to the FIRST upstream in
+        // namespace order. Letting routes.set fall through made prompts/get
+        // last-writer-wins, so a collision meant the client picked one
+        // upstream's prompt and got a DIFFERENT upstream's. Both surfaces
+        // walk compareNamespaces order, so they agree on the winner.
         log("warn", "Prompt route collision; keeping the first upstream, ignoring the later one", {
           prompt: p.namespacedName,
           keptNamespace: existing.namespace,

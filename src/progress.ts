@@ -6,7 +6,7 @@ export type ProgressReporter = (message: string, progress?: number, total?: numb
 // to give createProgressReporter's parameter one place to index the callback
 // shape out of, so exporting it would advertise an API no caller consumes.
 interface ProgressSender {
-  sendNotification: (notification: {
+  notify: (notification: {
     method: "notifications/progress";
     params: {
       progressToken: string | number;
@@ -17,10 +17,11 @@ interface ProgressSender {
   }) => Promise<void>;
 }
 
-/** The `extra` a request handler receives, narrowed to the parts progress
- *  reporting reads. */
-export type ProgressExtra =
-  | { sendNotification?: ProgressSender["sendNotification"]; _meta?: Record<string, unknown> }
+/** The `ctx` a request handler receives, narrowed to the parts progress
+ *  reporting reads: `ctx.mcpReq.notify` sends a notification related to the
+ *  request being handled, and `ctx.mcpReq._meta` carries its progressToken. */
+export type ProgressContext =
+  | { mcpReq?: { notify?: ProgressSender["notify"]; _meta?: Record<string, unknown> } }
   | undefined;
 
 /** Whether this request can actually receive progress: the client supplied a
@@ -33,9 +34,9 @@ export type ProgressExtra =
  *  to collect notifications the reporter would then drop on the floor. Callers
  *  ask this first. Kept as the single source of the condition so it cannot
  *  drift from the reporter's own early return below, which now uses it. */
-export function isProgressRequested(extra: ProgressExtra): boolean {
-  const token = extra?._meta?.progressToken;
-  return token !== undefined && token !== null && typeof extra?.sendNotification === "function";
+export function isProgressRequested(ctx: ProgressContext): boolean {
+  const token = ctx?.mcpReq?._meta?.progressToken;
+  return token !== undefined && token !== null && typeof ctx?.mcpReq?.notify === "function";
 }
 
 // Returns a progress reporter for the current tool call. If the client
@@ -46,13 +47,13 @@ export function isProgressRequested(extra: ProgressExtra): boolean {
 // (message-only), or additionally say *how far along* with an absolute
 // progress/total pair. Message-only calls omit `total` so the client
 // renders an indeterminate progress bar rather than a misleading percentage.
-export function createProgressReporter(extra: ProgressExtra): ProgressReporter {
-  if (!isProgressRequested(extra)) {
+export function createProgressReporter(ctx: ProgressContext): ProgressReporter {
+  if (!isProgressRequested(ctx)) {
     return () => {};
   }
   // Non-null by isProgressRequested: it checked both of these.
-  const token = extra?._meta?.progressToken as string | number;
-  const send = extra?.sendNotification as ProgressSender["sendNotification"];
+  const token = ctx?.mcpReq?._meta?.progressToken as string | number;
+  const send = ctx?.mcpReq?.notify as ProgressSender["notify"];
 
   // MCP requires progress to strictly increase per token. Two kinds of
   // calls share this one token: explicit milestones (caller supplies an
