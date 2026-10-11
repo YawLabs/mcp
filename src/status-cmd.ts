@@ -191,6 +191,13 @@ export interface StatusPayload {
     calls: number;
     packHistory: number;
     toolCaches: number;
+    /** Namespaces whose startup pre-warm failed within the backoff window
+     *  (persistence.ts prewarmFailures). A broker skips such a server at
+     *  startup only while its configured entry still matches the config the
+     *  failure was recorded against; an entry edited, disabled or removed
+     *  since is still counted here but no longer skipped. Sanitized like the
+     *  rest, so an expired failure is not counted. */
+    prewarmFailures: number;
     savedAt: number | null;
   };
 }
@@ -377,6 +384,7 @@ export async function collectStatus(opts: StatusCommandOptions = {}): Promise<St
       calls: Object.values(learning).reduce((n, u) => n + u.dispatched, 0),
       packHistory: state.state.packHistory.length,
       toolCaches: Object.keys(state.state.toolCache).length,
+      prewarmFailures: Object.keys(state.state.prewarmFailures ?? {}).length,
       savedAt: state.state.savedAt > 0 ? state.state.savedAt : null,
     },
   };

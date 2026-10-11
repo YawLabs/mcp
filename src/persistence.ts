@@ -213,9 +213,13 @@ export interface RawStateCounts {
   learning: number;
   packHistory: number;
   toolCache: number;
+  /** Pre-warm failures the file carried (the optional fourth section; 0 when
+   *  the key is absent). Counted like the others so a file whose only content
+   *  is failures does not read as empty to a report about deleting it. */
+  prewarmFailures: number;
 }
 
-const NO_RAW_COUNTS: RawStateCounts = { learning: 0, packHistory: 0, toolCache: 0 };
+const NO_RAW_COUNTS: RawStateCounts = { learning: 0, packHistory: 0, toolCache: 0, prewarmFailures: 0 };
 
 /** loadState's result plus how the file was classified on the way in. */
 export interface ClassifiedState {
@@ -315,6 +319,7 @@ export async function loadStateClassified(filePath: string = statePath()): Promi
         learning: countRawEntries(p.learning),
         packHistory: countRawEntries(p.packHistory),
         toolCache: countRawEntries(p.toolCache),
+        prewarmFailures: countRawEntries(p.prewarmFailures),
       },
       parsedCleanly: true,
     };

@@ -3206,6 +3206,20 @@ export class ConnectServer {
             }
             anyPopulated = true;
           } catch (err) {
+            // Release the claim activateOne(fromPrewarm) took, as the
+            // `!result.ok` branch does: a throw is the same outcome with a
+            // different exit. Nothing prewarm owns survives it -- the
+            // inflight promise is shared, so a rejection reaches every joiner
+            // and nobody is handed a connection; an explicit joiner released
+            // the claim itself when it joined, and the sweep's own teardown
+            // releases it before its first await -- so this delete never
+            // races a live owner. Left behind, the entry is inert until the
+            // next explicit activate of this namespace clears it (every
+            // reader of prewarmNamespaces also requires an inflight, which
+            // activateOne's finally has already removed), but a claim with
+            // nothing behind it is exactly the stale state the `!result.ok`
+            // branch refuses to leave for a future reader to trust.
+            this.prewarmNamespaces.delete(server.namespace);
             const error = err instanceof Error ? err.message : String(err);
             log("warn", "Pre-warm of server failed", {
               namespace: server.namespace,

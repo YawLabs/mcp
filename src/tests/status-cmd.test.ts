@@ -201,6 +201,12 @@ describe("status", () => {
       },
       packHistory: [{ namespace: "gh", toolName: "listPrs", at: 300 }],
       toolCache: { gh: { tools: [{ name: "listPrs" }], learnedAt: Date.now() } },
+      prewarmFailures: {
+        // Live: counted. Expired: the loader drops it, and status reports
+        // what yaw-mcp will USE, so it is not.
+        cold: { failedAt: Date.now() - 60_000, configKey: "k", message: "daemon not running" },
+        stale: { failedAt: 1, configKey: "k", message: "m" },
+      },
     });
     const payload = await collect();
     expect(payload.learning).toMatchObject({
@@ -210,6 +216,7 @@ describe("status", () => {
       calls: 12,
       packHistory: 1,
       toolCaches: 1,
+      prewarmFailures: 1,
       savedAt: 1700,
     });
     const gh = payload.servers.find((s) => s.namespace === "gh");
