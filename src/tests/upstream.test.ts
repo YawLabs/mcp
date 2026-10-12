@@ -22,6 +22,7 @@ import {
   MAX_RESOURCES_PER_SERVER,
   MAX_TIMEOUT_MS,
   MAX_TOOLS_PER_SERVER,
+  resetManagedDowngrades,
   resetOamDowngrades,
   resolveTimeoutEnv,
   SATURATED_CPU_BUSY,
@@ -212,6 +213,12 @@ vi.mock("../oam-spawn.js", async (importOriginal) => {
   return {
     ...actual,
     resolveOamSpawn: vi.fn((command: string, args: string[]) => ({ command, args })),
+    // The managed-sidecar rewrite chokepoint (upstream.ts applies it after the
+    // oam gate on the paths oam did not take). Passthrough by default so every
+    // pre-existing test still spawns its configured command byte-for-byte; the
+    // managed-rewrite tests below mockResolvedValue a rewrite to observe the
+    // wiring, exactly like resolveOamSpawn's tests do.
+    resolveManagedSpawn: vi.fn((command: string, args: string[]) => ({ command, args })),
     // belowMin:false paired with a version AT the floor. upstream.ts reads only
     // belowMin, so any version would pass -- but a fixture that contradicts
     // MIN_OAM_VERSION reads as a bug to whoever bumps the floor next.
@@ -245,7 +252,7 @@ vi.mock("@modelcontextprotocol/sdk/client/streamableHttp.js", () => ({
 // Import the mocked modules so the wiring tests can configure/assert them.
 import { defaultRuntime } from "../default-runtime.js";
 import { log } from "../logger.js";
-import { MIN_OAM_VERSION, resolveOamSpawn } from "../oam-spawn.js";
+import { MIN_OAM_VERSION, resolveManagedSpawn, resolveOamSpawn } from "../oam-spawn.js";
 import { appendAuditEvent } from "../secrets-audit.js";
 // Import the mocked secrets-vault module so individual tests can configure it.
 import {
@@ -2177,6 +2184,7 @@ describe("connectToUpstream oam runtime wiring", () => {
     _sdkBehavior.stdioConstructions = [];
     vi.mocked(resolveOamSpawn).mockReset();
     resetOamDowngrades();
+    resetManagedDowngrades();
     vi.mocked(defaultRuntime).mockResolvedValue(null);
   });
   afterEach(() => {
@@ -2249,6 +2257,7 @@ describe("connectToUpstream config-level default runtime", () => {
     _sdkBehavior.stdioConstructions = [];
     vi.mocked(resolveOamSpawn).mockReset();
     resetOamDowngrades();
+    resetManagedDowngrades();
     vi.mocked(defaultRuntime).mockResolvedValue(null);
   });
   afterEach(() => {
@@ -2310,6 +2319,7 @@ describe("connectToUpstream oam boot-probe fallback", () => {
     _sdkBehavior.stdioConstructions = [];
     vi.mocked(resolveOamSpawn).mockReset();
     resetOamDowngrades();
+    resetManagedDowngrades();
     vi.mocked(defaultRuntime).mockResolvedValue(null);
   });
   afterEach(() => {
@@ -2566,6 +2576,264 @@ describe("connectToUpstream oam boot-probe fallback", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Managed-sidecar default spawn -- rewriteNpmToManagedNode is the default
+// spawn source on every path the oam gate did not take (runtime:"node", oam
+// absent/unusable, an oam-pinned namespace). Same wiring contract as the oam
+// block above: applied after the oam gate, downgrades ONCE to the original
+// npx command on a boot failure, pins on evidence, and names the spawn source
+// on the connect line.
+// ---------------------------------------------------------------------------
+
+describe("connectToUpstream managed-sidecar default spawn", () => {
+  beforeEach(() => {
+    vi.mocked(hasSecretRefs).mockReturnValue(false);
+    _sdkBehavior.clientConnect = () => Promise.reject(new Error("stop after spawn"));
+    _sdkBehavior.clientClose = () => Promise.resolve();
+    _sdkBehavior.lastStdioArgs = null;
+    _sdkBehavior.stdioConstructions = [];
+    vi.mocked(resolveOamSpawn).mockReset();
+    vi.mocked(resolveManagedSpawn).mockReset();
+    resetOamDowngrades();
+    resetManagedDowngrades();
+    vi.mocked(defaultRuntime).mockResolvedValue(null);
+  });
+  afterEach(() => {
+    vi.clearAllMocks();
+    // clearAllMocks keeps IMPLEMENTATIONS, so the mockReturnValue a managed
+    // test just set would leak into every later describe (which reset
+    // resolveOamSpawn but never had a reason to touch this one) and rewrite
+    // spawns this file's other suites assert never happened. Re-prime the
+    // factory's passthrough explicitly.
+    vi.mocked(resolveManagedSpawn).mockImplementation((command: string, args: string[]) => ({ command, args }));
+  });
+
+  it("rewrites a raw npx launch to the managed tree when oam did not take it", async () => {
+    // oam gate fell through (oam absent / package unresolvable -> command
+    // unchanged); the managed rewrite is the default spawn source there.
+    vi.mocked(resolveOamSpawn).mockImplementation(async (command: string, args: string[]) => ({ command, args }));
+    vi.mocked(resolveManagedSpawn).mockReturnValue({
+      command: "/opt/node/bin/node",
+      args: ["/home/.yaw-mcp/sidecars/node_modules/@yawlabs/fetch-mcp/dist/index.js"],
+    });
+    const config = makeLocalConfig({ command: "npx", args: ["-y", "@yawlabs/fetch-mcp@latest"] });
+    try {
+      await connectToUpstream(config);
+    } catch {
+      /* connect rejects in the mock; we only assert the spawn was rewritten. */
+    }
+    expect(vi.mocked(resolveManagedSpawn)).toHaveBeenCalledOnce();
+    expect(vi.mocked(resolveManagedSpawn)).toHaveBeenCalledWith("npx", ["-y", "@yawlabs/fetch-mcp@latest"]);
+    expect(_sdkBehavior.stdioConstructions[0]?.command).toBe("/opt/node/bin/node");
+    expect(_sdkBehavior.stdioConstructions[0]?.args).toEqual([
+      "/home/.yaw-mcp/sidecars/node_modules/@yawlabs/fetch-mcp/dist/index.js",
+    ]);
+  });
+
+  it("also applies on the runtime:'node' escape hatch", async () => {
+    // Per-server "node" opts out of OAM, not out of the managed tree -- the
+    // managed spawn IS node-hosted, and this path used to spawn raw npx.
+    vi.mocked(resolveManagedSpawn).mockReturnValue({ command: "/opt/node/bin/node", args: ["/sidecars/x.js"] });
+    try {
+      await connectToUpstream(makeLocalConfig({ runtime: "node", command: "npx", args: ["-y", "x"] }));
+    } catch {
+      /* stop after spawn */
+    }
+    expect(vi.mocked(resolveManagedSpawn)).toHaveBeenCalledWith("npx", ["-y", "x"]);
+    expect(_sdkBehavior.stdioConstructions[0]?.command).toBe("/opt/node/bin/node");
+  });
+
+  it("does NOT consult the managed rewrite when oam took the launch", async () => {
+    vi.mocked(resolveOamSpawn).mockResolvedValue({ command: "/usr/bin/oam", args: ["run", "/e.js"] });
+    const config = makeLocalConfig({ runtime: "oam", command: "npx", args: ["-y", "x"] });
+    try {
+      await connectToUpstream(config);
+    } catch {
+      /* stop after spawn */
+    }
+    expect(vi.mocked(resolveManagedSpawn)).not.toHaveBeenCalled();
+    expect(_sdkBehavior.stdioConstructions[0]?.command).toBe("/usr/bin/oam");
+  });
+
+  it("downgrades ONCE to the original npx command when the managed spawn fails to boot", async () => {
+    vi.mocked(resolveManagedSpawn).mockReturnValue({ command: "/opt/node/bin/node", args: ["/sidecars/x.js"] });
+    let connects = 0;
+    _sdkBehavior.clientConnect = () => {
+      connects++;
+      return connects === 1 ? Promise.reject(new Error("managed child crashed")) : Promise.resolve();
+    };
+    const config = makeLocalConfig({ runtime: "node", command: "npx", args: ["-y", "@yawlabs/fetch-mcp@latest"] });
+
+    const connection = await connectToUpstream(config);
+
+    expect(connection.status).toBe("connected");
+    // First spawn = managed tree, second = the original pre-rewrite npx launch
+    // (both rewrites suppressed on the respawn).
+    expect(_sdkBehavior.stdioConstructions.map((c) => c.command)).toEqual(["/opt/node/bin/node", "npx"]);
+    expect(_sdkBehavior.stdioConstructions[1]?.args).toEqual(["-y", "@yawlabs/fetch-mcp@latest"]);
+    expect(vi.mocked(resolveManagedSpawn)).toHaveBeenCalledOnce();
+    expect(vi.mocked(log)).toHaveBeenCalledWith(
+      "warn",
+      "managed-sidecar server failed to boot; downgrading to npx for this session",
+      expect.objectContaining({ namespace: "test" }),
+    );
+  });
+
+  it("the managed pin STICKS for the session, keyed on the launch identity", async () => {
+    vi.mocked(resolveManagedSpawn).mockReturnValue({ command: "/opt/node/bin/node", args: ["/sidecars/x.js"] });
+    let connects = 0;
+    _sdkBehavior.clientConnect = () => {
+      connects++;
+      return connects === 1 ? Promise.reject(new Error("managed child crashed")) : Promise.resolve();
+    };
+    const config = makeLocalConfig({ runtime: "node", command: "npx", args: ["-y", "x"] });
+    expect((await connectToUpstream(config)).status).toBe("connected");
+
+    // Second connect for the same identity: straight to npx, rewrite never
+    // consulted again -- and the connect line names the moved spawn source.
+    _sdkBehavior.stdioConstructions = [];
+    vi.mocked(log).mockClear();
+    vi.mocked(resolveManagedSpawn).mockClear();
+    expect((await connectToUpstream(config)).status).toBe("connected");
+    expect(_sdkBehavior.stdioConstructions.map((c) => c.command)).toEqual(["npx"]);
+    expect(vi.mocked(resolveManagedSpawn)).not.toHaveBeenCalled();
+    expect(vi.mocked(log)).toHaveBeenCalledWith("info", "Connected to upstream", {
+      name: "Test Server",
+      namespace: "test",
+      type: "local",
+      runtime: "node",
+      downgradedFromManaged: true,
+      managedPinned: true,
+    });
+  });
+
+  it("reports BOTH pins additively when a namespace earned the oam AND the managed downgrade", async () => {
+    // Connect 1: oam rewrite applied, boot fails, the npx respawn boots -> the
+    // oam memo pins this launch identity.
+    vi.mocked(resolveOamSpawn).mockResolvedValue({ command: "/usr/bin/oam", args: ["run", "/e.js"] });
+    let connects = 0;
+    _sdkBehavior.clientConnect = () => {
+      connects++;
+      // Attempt 1 (oam) and attempt 3 (managed) are the rewritten boots that
+      // must fail; every respawn and the final plain-npx connect succeed.
+      return connects === 1 || connects === 3
+        ? Promise.reject(new Error("rewritten child crashed"))
+        : Promise.resolve();
+    };
+    const config = makeLocalConfig({ runtime: "oam", command: "npx", args: ["-y", "x"] });
+    expect((await connectToUpstream(config)).status).toBe("connected");
+    expect(_sdkBehavior.stdioConstructions.map((c) => c.command)).toEqual(["/usr/bin/oam", "npx"]);
+
+    // Connect 2: the oam pin skips the oam gate, so the SAME launch now goes
+    // through the managed rewrite; its boot fails the same way and the npx
+    // respawn boots -> the managed memo joins the oam one.
+    vi.mocked(resolveManagedSpawn).mockReturnValue({ command: "/opt/node/bin/node", args: ["/sidecars/x.js"] });
+    _sdkBehavior.stdioConstructions = [];
+    expect((await connectToUpstream(config)).status).toBe("connected");
+    expect(_sdkBehavior.stdioConstructions.map((c) => c.command)).toEqual(["/opt/node/bin/node", "npx"]);
+
+    // Connect 3: both memos pin -> plain npx, and the connect line carries
+    // BOTH pins. An exclusive chain used to report only oamPinned and hide
+    // why the server had ALSO left the managed tree.
+    _sdkBehavior.stdioConstructions = [];
+    vi.mocked(log).mockClear();
+    expect((await connectToUpstream(config)).status).toBe("connected");
+    expect(_sdkBehavior.stdioConstructions.map((c) => c.command)).toEqual(["npx"]);
+    expect(vi.mocked(log)).toHaveBeenCalledWith("info", "Connected to upstream", {
+      name: "Test Server",
+      namespace: "test",
+      type: "local",
+      runtime: "node",
+      downgradedFromOam: true,
+      oamPinned: true,
+      downgradedFromManaged: true,
+      managedPinned: true,
+    });
+  });
+
+  it("does NOT pin the namespace to npx when the npx respawn fails the SAME way", async () => {
+    vi.mocked(resolveManagedSpawn).mockReturnValue({ command: "/opt/node/bin/node", args: ["/sidecars/x.js"] });
+    const config = makeLocalConfig({ runtime: "node", command: "npx", args: ["-y", "x"] });
+    // Both attempts fail identically (no stderr, no ENOENT wording -> the same
+    // "unknown" category on each): the rewrite was never implicated.
+    await expect(connectToUpstream(config)).rejects.toBeInstanceOf(ActivationError);
+    expect(_sdkBehavior.stdioConstructions.map((c) => c.command)).toEqual(["/opt/node/bin/node", "npx"]);
+
+    // The next connect must try the managed tree AGAIN -- no memo was written.
+    _sdkBehavior.stdioConstructions = [];
+    let connects = 0;
+    _sdkBehavior.clientConnect = () => {
+      connects++;
+      return connects === 1 ? Promise.reject(new Error("managed child crashed")) : Promise.resolve();
+    };
+    expect((await connectToUpstream(config)).status).toBe("connected");
+    expect(_sdkBehavior.stdioConstructions.map((c) => c.command)).toEqual(["/opt/node/bin/node", "npx"]);
+  });
+
+  it("pins the namespace to npx when the npx respawn fails a DIFFERENT way", async () => {
+    // Mirror of the oam test: a DIFFERENT ActivationError category still
+    // points at the managed spawn, so the pin is kept -- later connects skip
+    // the failed managed boot entirely.
+    vi.mocked(resolveManagedSpawn).mockReturnValue({ command: "/opt/node/bin/node", args: ["/sidecars/x.js"] });
+    let connects = 0;
+    _sdkBehavior.clientConnect = () => {
+      connects++;
+      // 1st (managed): unclassifiable -> "unknown". 2nd (npx): ENOENT -> "spawn_failure".
+      return Promise.reject(new Error(connects === 1 ? "boot failed" : "spawn npx ENOENT"));
+    };
+    const config = makeLocalConfig({ runtime: "node", command: "npx", args: ["-y", "x"] });
+
+    await expect(connectToUpstream(config)).rejects.toMatchObject({ category: "spawn_failure" });
+    expect(_sdkBehavior.stdioConstructions.map((c) => c.command)).toEqual(["/opt/node/bin/node", "npx"]);
+
+    _sdkBehavior.stdioConstructions = [];
+    vi.mocked(resolveManagedSpawn).mockClear();
+    await expect(connectToUpstream(config)).rejects.toBeInstanceOf(ActivationError);
+    expect(_sdkBehavior.stdioConstructions.map((c) => c.command)).toEqual(["npx"]);
+    expect(vi.mocked(resolveManagedSpawn)).not.toHaveBeenCalled();
+  });
+
+  it("names the managed spawn source on the SUCCESS connect line", async () => {
+    // The only operator-visible trace that a server runs from the managed
+    // tree on the happy path -- pinned here so the shape cannot drift.
+    _sdkBehavior.clientConnect = () => Promise.resolve();
+    resetListHooks();
+    vi.mocked(resolveManagedSpawn).mockReturnValue({ command: "/opt/node/bin/node", args: ["/sidecars/x.js"] });
+
+    await connectToUpstream(makeLocalConfig({ runtime: "node", command: "npx", args: ["-y", "x"] }));
+
+    expect(vi.mocked(log)).toHaveBeenCalledWith("info", "Connected to upstream", {
+      name: "Test Server",
+      namespace: "test",
+      type: "local",
+      runtime: "node",
+      managedSpawn: true,
+    });
+  });
+
+  it("says which runtime the managed downgrade is retrying on", async () => {
+    // Mirror of the oam progress test: the respawn is a second full boot and
+    // the progress line is what makes it legible instead of a second hang.
+    vi.mocked(resolveManagedSpawn).mockReturnValue({ command: "/opt/node/bin/node", args: ["/sidecars/x.js"] });
+    let connects = 0;
+    _sdkBehavior.clientConnect = () => {
+      connects++;
+      return connects === 1 ? Promise.reject(new Error("managed child crashed")) : Promise.resolve();
+    };
+    const messages: string[] = [];
+    await connectToUpstream(
+      makeLocalConfig({ runtime: "node", command: "npx", args: ["-y", "x"] }),
+      undefined,
+      undefined,
+      undefined,
+      (m) => messages.push(m),
+    );
+    expect(
+      messages.some((m) => m.includes("did not boot from the managed sidecar") && m.includes("retrying on npx")),
+    ).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // The timeout knobs resolve on first use, not at import -- the "ignored" warn
 // for a rejected value has to reach a serving broker and stay out of every
 // CLI subcommand that merely loads this module.
@@ -2631,6 +2899,7 @@ describe("connectToUpstream runtime reporting", () => {
     resetListHooks();
     vi.mocked(resolveOamSpawn).mockReset();
     resetOamDowngrades();
+    resetManagedDowngrades();
     vi.mocked(defaultRuntime).mockResolvedValue(null);
     stderr = captureStderr();
   });
@@ -2733,6 +3002,7 @@ describe("connectToUpstream closedBeforeReady", () => {
     _sdkBehavior.lastStdioArgs = null;
     vi.mocked(resolveOamSpawn).mockReset();
     resetOamDowngrades();
+    resetManagedDowngrades();
     vi.mocked(defaultRuntime).mockResolvedValue(null);
   });
   afterEach(() => {
@@ -2898,6 +3168,7 @@ describe("connectToUpstream list-changed chains", () => {
     _sdkBehavior.stdioConstructions = [];
     resetListHooks();
     resetOamDowngrades();
+    resetManagedDowngrades();
     vi.mocked(defaultRuntime).mockResolvedValue(null);
     stderr = captureStderr();
   });
@@ -3189,6 +3460,7 @@ describe("disconnectFromUpstream", () => {
     _sdkBehavior.stdioConstructions = [];
     resetListHooks();
     resetOamDowngrades();
+    resetManagedDowngrades();
     vi.mocked(defaultRuntime).mockResolvedValue(null);
     stderr = captureStderr();
   });
@@ -3283,6 +3555,7 @@ describe("connectToUpstream onclose after ready", () => {
     _sdkBehavior.stdioConstructions = [];
     resetListHooks();
     resetOamDowngrades();
+    resetManagedDowngrades();
     vi.mocked(defaultRuntime).mockResolvedValue(null);
     stderr = captureStderr();
   });
@@ -3329,6 +3602,7 @@ describe("connectToUpstream downstream capability bridge", () => {
     _sdkBehavior.stdioConstructions = [];
     resetListHooks();
     resetOamDowngrades();
+    resetManagedDowngrades();
     vi.mocked(defaultRuntime).mockResolvedValue(null);
   });
 
@@ -3493,6 +3767,7 @@ describe("connectToUpstream activation failure categories", () => {
     _sdkBehavior.notificationHandlers = [];
     resetListHooks();
     resetOamDowngrades();
+    resetManagedDowngrades();
     vi.mocked(defaultRuntime).mockResolvedValue(null);
     stderr = captureStderr();
   });
@@ -3757,6 +4032,7 @@ describe("connectToUpstream remote-entry diagnostics", () => {
     _sdkBehavior.remoteConstructions = [];
     resetListHooks();
     resetOamDowngrades();
+    resetManagedDowngrades();
     vi.mocked(defaultRuntime).mockResolvedValue(null);
     vi.mocked(log).mockClear();
     stderr = captureStderr();
@@ -3827,6 +4103,7 @@ describe("connectToUpstream remote headers", () => {
     _sdkBehavior.remoteConstructions = [];
     resetListHooks();
     resetOamDowngrades();
+    resetManagedDowngrades();
     vi.mocked(defaultRuntime).mockResolvedValue(null);
     vi.mocked(log).mockClear();
     delete process.env.YAW_MCP_VAULT_PASSPHRASE;
@@ -4464,6 +4741,7 @@ describe("connectToUpstream progress reporting", () => {
     _sdkBehavior.clientListPrompts = () => Promise.resolve({ prompts: [] });
     vi.mocked(resolveOamSpawn).mockReset();
     resetOamDowngrades();
+    resetManagedDowngrades();
     vi.mocked(defaultRuntime).mockResolvedValue(null);
   });
 
@@ -4605,6 +4883,7 @@ describe("connectToUpstream handshake deadline under load", () => {
     vi.mocked(resolveOamSpawn).mockReset();
     vi.mocked(resolveOamSpawn).mockImplementation(async (command: string, args: string[]) => ({ command, args }));
     resetOamDowngrades();
+    resetManagedDowngrades();
     vi.mocked(defaultRuntime).mockResolvedValue(null);
     vi.mocked(log).mockClear();
     vi.useFakeTimers();

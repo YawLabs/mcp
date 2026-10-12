@@ -11,6 +11,7 @@ import {
   isOamLaunch,
   isRegistrySpec,
   MIN_OAM_VERSION,
+  managedNodeBin,
   nodeLaunchKind,
   npmCacheDir,
   npxCacheNodeModules,
@@ -29,14 +30,17 @@ import {
   packageName,
   parseOamVersion,
   probeOam,
+  resetManagedEntryMemo,
   resetNpmCacheDir,
   resetOamBinCache,
   resetPinnedSidecarLog,
   resolveBinAbsolute,
+  resolveManagedSpawn,
   resolveNpmEntry,
   resolveOamSpawn,
   resolveStableNpmEntry,
   rewriteForOam,
+  rewriteNpmToManagedNode,
   specConstraint,
   winNormalize,
 } from "../oam-spawn.js";
@@ -980,6 +984,290 @@ describe("rewriteForOam", () => {
       command: "npx",
       args: ["-y", "github:owner/repo"],
     });
+  });
+});
+
+describe("rewriteNpmToManagedNode", () => {
+  // Same stub resolvers rewriteForOam's tests use, minus oam: `nodeBin` plays
+  // the binary role and `resolveEntry` the on-disk lookup.
+  const deps = { nodeBin: "/usr/bin/node", resolveEntry: (p: string) => `/pkgs/${p}/dist/index.js` };
+
+  it("rewrites `npx -y <pkg>@latest` to `node <resolved entry>`", () => {
+    expect(rewriteNpmToManagedNode("npx", ["-y", "@yawlabs/npmjs-mcp@latest"], deps)).toEqual({
+      command: "/usr/bin/node",
+      args: ["/pkgs/@yawlabs/npmjs-mcp/dist/index.js"],
+    });
+  });
+
+  it("rewrites a bare-spec and dist-tag spec the same way (newest-on-disk answer)", () => {
+    expect(rewriteNpmToManagedNode("npx", ["-y", "some-mcp"], deps)).toEqual({
+      command: "/usr/bin/node",
+      args: ["/pkgs/some-mcp/dist/index.js"],
+    });
+    expect(rewriteNpmToManagedNode("npx", ["-y", "some-mcp@next"], deps)).toEqual({
+      command: "/usr/bin/node",
+      args: ["/pkgs/some-mcp/dist/index.js"],
+    });
+  });
+
+  it("keeps a server's own args after the entry, sliced at the spec", () => {
+    // Sliced from the ORIGINAL argv (never filtered) so a server's own
+    // trailing `--yes` survives -- the 0.74.2 bug rewriteForOam documents.
+    // No `--` separator: node hands everything after the entry to the script.
+    expect(rewriteNpmToManagedNode("npx", ["-y", "some-mcp", "--port", "1"], deps)).toEqual({
+      command: "/usr/bin/node",
+      args: ["/pkgs/some-mcp/dist/index.js", "--port", "1"],
+    });
+    expect(rewriteNpmToManagedNode("npx", ["-y", "some-mcp", "--yes", "--port", "1"], deps)).toEqual({
+      command: "/usr/bin/node",
+      args: ["/pkgs/some-mcp/dist/index.js", "--yes", "--port", "1"],
+    });
+  });
+
+  it("honours an exact pin when the on-disk copy declares it", () => {
+    const withVersion = (version: string) => ({
+      nodeBin: "/usr/bin/node",
+      resolveEntry: (p: string, want: string | null) => (want === version ? `/pkgs/${p}/x.js` : null),
+    });
+    expect(rewriteNpmToManagedNode("npx", ["-y", "some-mcp@2.0.0"], withVersion("2.0.0"))).toEqual({
+      command: "/usr/bin/node",
+      args: ["/pkgs/some-mcp/x.js"],
+    });
+  });
+
+  it("stays on npx when no on-disk copy declares the pinned version", () => {
+    // The resolver's null is the contract: npx is the only thing that can
+    // fetch a pinned version the disk does not have.
+    const withVersion = (version: string) => ({
+      nodeBin: "/usr/bin/node",
+      resolveEntry: (p: string, want: string | null) => (want === version ? `/pkgs/${p}/x.js` : null),
+    });
+    expect(rewriteNpmToManagedNode("npx", ["-y", "some-mcp@0.2.0"], withVersion("2.0.0"))).toEqual({
+      command: "npx",
+      args: ["-y", "some-mcp@0.2.0"],
+    });
+  });
+
+  it("stays on npx for a version RANGE, which it cannot evaluate", () => {
+    // The one deliberate divergence from rewriteForOam's refusal set would be
+    // a rewrite that guessed a range -- and it is NOT a divergence: the same
+    // specConstraint answer applies, so `^1.2.3` never resolves to an on-disk
+    // 0.9.0 here either.
+    expect(rewriteNpmToManagedNode("npx", ["-y", "some-mcp@^1.2.3"], deps)).toEqual({
+      command: "npx",
+      args: ["-y", "some-mcp@^1.2.3"],
+    });
+  });
+
+  it("stays on npx for a git or path spec, and for an unparseable flag-first argv", () => {
+    expect(rewriteNpmToManagedNode("npx", ["-y", "./local-server"], deps)).toEqual({
+      command: "npx",
+      args: ["-y", "./local-server"],
+    });
+    expect(rewriteNpmToManagedNode("npx", ["-y", "github:owner/repo"], deps)).toEqual({
+      command: "npx",
+      args: ["-y", "github:owner/repo"],
+    });
+    expect(rewriteNpmToManagedNode("npx", ["-y", "--package=x", "run"], deps)).toEqual({
+      command: "npx",
+      args: ["-y", "--package=x", "run"],
+    });
+  });
+
+  it("refuses every non-npx launch, including the oam command upstream hands back", () => {
+    // After the oam gate the command can be `oam ...` (oam took the launch) or
+    // a bare node entry (rewritten there); only an npx shape is input here.
+    expect(rewriteNpmToManagedNode("node", ["/srv/index.js"], deps)).toEqual({
+      command: "node",
+      args: ["/srv/index.js"],
+    });
+    expect(rewriteNpmToManagedNode("oam", ["run", "/srv/index.js"], deps)).toEqual({
+      command: "oam",
+      args: ["run", "/srv/index.js"],
+    });
+    expect(rewriteNpmToManagedNode("docker", ["run", "-i", "img"], deps)).toEqual({
+      command: "docker",
+      args: ["run", "-i", "img"],
+    });
+    expect(rewriteNpmToManagedNode("uvx", ["some-server"], deps)).toEqual({
+      command: "uvx",
+      args: ["some-server"],
+    });
+  });
+
+  it("stays on npx when there is no node bin or no package spec at all", () => {
+    expect(rewriteNpmToManagedNode("npx", ["-y", "some-mcp"], { ...deps, nodeBin: null })).toEqual({
+      command: "npx",
+      args: ["-y", "some-mcp"],
+    });
+    expect(rewriteNpmToManagedNode("npx", ["-y"], deps)).toEqual({ command: "npx", args: ["-y"] });
+    expect(rewriteNpmToManagedNode("npx", [], deps)).toEqual({ command: "npx", args: [] });
+  });
+
+  it("rewrites a launch that names npx by its Windows shim or absolute path", () => {
+    // nodeLaunchKind matches the BASENAME (npx.cmd, /usr/local/bin/npx), so
+    // the rewrite must too -- a string-equality regression would silently opt
+    // every Windows-configured server out of the managed tree.
+    expect(rewriteNpmToManagedNode("npx.cmd", ["-y", "some-mcp"], deps)).toEqual({
+      command: "/usr/bin/node",
+      args: ["/pkgs/some-mcp/dist/index.js"],
+    });
+    expect(rewriteNpmToManagedNode("/usr/local/bin/npx", ["-y", "some-mcp"], deps)).toEqual({
+      command: "/usr/bin/node",
+      args: ["/pkgs/some-mcp/dist/index.js"],
+    });
+  });
+});
+
+describe("managedNodeBin", () => {
+  it("answers process.execPath when the broker itself runs on node", () => {
+    expect(managedNodeBin(process.env, process.platform, "/usr/local/bin/node")).toBe("/usr/local/bin/node");
+    expect(managedNodeBin(process.env, "win32", String.raw`C:\Program Files\nodejs\node.exe`)).toBe(
+      String.raw`C:\Program Files\nodejs\node.exe`,
+    );
+  });
+
+  it("falls back to PATH lookup when execPath is NOT node (an oam-hosted broker)", () => {
+    // Staged under SYNTH_ROOT (the file's fs-injection mock), never the real
+    // machine: a PATH entry that resolved the host's own node would make this
+    // test read the developer's install layout -- exactly the machine
+    // dependence the staging exists to prevent. An earlier draft pointed PATH
+    // at C:\Program Files\nodejs and returned null on this ARM64 box.
+    fsEntries.set(`${SYNTH_ROOT}/bin/node`, "exec");
+    fsEntries.set(`${SYNTH_ROOT}/bin/node.exe`, "exec");
+    try {
+      // POSIX spelling: found directly, absolute result guaranteed. fsKey
+      // folds BOTH sides to forward slashes -- node:path is platform-native
+      // (see the file header), so on a Windows runner join() backslashes the
+      // synthetic POSIX path the staged lookup then answers through fsKey.
+      expect(fsKey(managedNodeBin({ PATH: `${SYNTH_ROOT}/bin` }, "linux", "/usr/bin/oam") ?? "")).toBe(
+        fsKey(`${SYNTH_ROOT}/bin/node`),
+      );
+      // Windows: found through PATHEXT (carried in the injected env), and the
+      // result comes back in the cmd-safe backslash spelling winNormalize
+      // promises every consumer that spawns through a shell.
+      expect(managedNodeBin({ PATH: `${SYNTH_ROOT}/bin`, PATHEXT: ".exe" }, "win32", `${SYNTH_ROOT}/oam.exe`)).toBe(
+        winNormalize(`${SYNTH_ROOT}/bin/node.exe`, "win32"),
+      );
+    } finally {
+      fsEntries.delete(`${SYNTH_ROOT}/bin/node`);
+      fsEntries.delete(`${SYNTH_ROOT}/bin/node.exe`);
+    }
+  });
+
+  it("returns null when no node can be identified (-> stay on npx)", () => {
+    expect(managedNodeBin({ PATH: "" }, "linux", "/usr/bin/oam")).toBeNull();
+    // A relative PATH entry is refused by resolveBinAbsolute: join would
+    // resolve it against the broker's cwd, a coincidence -- not a node.
+    expect(managedNodeBin({ PATH: "rel/bin" }, "linux", "/usr/bin/oam")).toBeNull();
+  });
+});
+
+describe("resolveManagedSpawn entry memo", () => {
+  // Real temp dirs, the resolveNpmEntry describe's pattern: every injectable
+  // passed explicitly so the host's real home / npm cache never answers.
+  function fixture(): { root: string; npx: string; managedRoot: string; brokerUrl: string; cleanup: () => void } {
+    const root = mkdtempSync(join(tmpdir(), "managedspawn-"));
+    const npx = join(root, "_npx");
+    const managedRoot = join(root, "managed", "node_modules");
+    mkdirSync(join(npx, "aaa", "node_modules", "@yawlabs", "mcp", "dist"), { recursive: true });
+    mkdirSync(managedRoot, { recursive: true });
+    const brokerUrl = pathToFileURL(join(npx, "aaa", "node_modules", "@yawlabs", "mcp", "dist", "index.js")).href;
+    return { root, npx, managedRoot, brokerUrl, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+  }
+
+  function writePkg(dir: string, json: Record<string, unknown>): void {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "package.json"), JSON.stringify(json));
+    const bin = json.bin;
+    const rel = typeof bin === "string" ? bin : Object.values(bin as Record<string, string>)[0];
+    const entry = join(dir, rel as string);
+    mkdirSync(dirname(entry), { recursive: true });
+    writeFileSync(entry, "");
+  }
+
+  const NODE = "/usr/bin/node";
+  const spawnWith = (brokerUrl: string, managedRoot: string | null) => (args: string[]) =>
+    resolveManagedSpawn("npx", args, brokerUrl, null, managedRoot, NODE);
+
+  beforeEach(() => {
+    resetManagedEntryMemo();
+  });
+
+  it("memoizes a stable managed-tree hit: the entry survives deleting the copy", () => {
+    const { managedRoot, brokerUrl, cleanup } = fixture();
+    const pkgDir = join(managedRoot, "some-mcp");
+    writePkg(pkgDir, { name: "some-mcp", version: "1.0.0", bin: { "some-mcp": "dist/index.js" } });
+    const entry = join(pkgDir, "dist", "index.js");
+    const spawn = spawnWith(brokerUrl, managedRoot);
+    try {
+      expect(spawn(["-y", "some-mcp"])).toEqual({ command: NODE, args: [entry] });
+      // The memo is the only thing that can answer the second call: the disk
+      // copy is gone, and a miss would fall through to npx.
+      rmSync(pkgDir, { recursive: true, force: true });
+      expect(spawn(["-y", "some-mcp"])).toEqual({ command: NODE, args: [entry] });
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("does NOT memoize a miss: a later sidecars install is found without a restart", () => {
+    const { managedRoot, brokerUrl, cleanup } = fixture();
+    const spawn = spawnWith(brokerUrl, managedRoot);
+    try {
+      expect(spawn(["-y", "some-mcp"])).toEqual({ command: "npx", args: ["-y", "some-mcp"] });
+      writePkg(join(managedRoot, "some-mcp"), {
+        name: "some-mcp",
+        version: "1.0.0",
+        bin: { "some-mcp": "dist/index.js" },
+      });
+      expect(spawn(["-y", "some-mcp"])).toEqual({
+        command: NODE,
+        args: [join(managedRoot, "some-mcp", "dist", "index.js")],
+      });
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("does NOT memoize an npx-cache hit: the content-hashed path changes on refresh", () => {
+    const { npx, brokerUrl, cleanup } = fixture();
+    const dir = join(npx, "bbb", "node_modules", "some-mcp");
+    writePkg(dir, { name: "some-mcp", version: "1.0.0", bin: { "some-mcp": "dist/index.js" } });
+    const spawn = spawnWith(brokerUrl, null);
+    try {
+      expect(spawn(["-y", "some-mcp"])).toEqual({ command: NODE, args: [join(dir, "dist", "index.js")] });
+      // A manual `npx -y some-mcp@latest` refresh lands in a NEW hash dir;
+      // memoizing the old path would pin the stale copy forever. The second
+      // call re-resolves -- to a miss once the only copy is gone.
+      rmSync(dir, { recursive: true, force: true });
+      expect(spawn(["-y", "some-mcp"])).toEqual({ command: "npx", args: ["-y", "some-mcp"] });
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("a pinned spec bypasses the memo instead of hosting the memoized wrong version", () => {
+    // The correctness case the bypass exists for: the memo holds the 1.0.0
+    // entry and the spec asks for @2.0.0 -- consulting the memo would host a
+    // build the config did not ask for, the exact failure the pin rule
+    // prevents (satisfiesExactPin).
+    const { managedRoot, brokerUrl, cleanup } = fixture();
+    writePkg(join(managedRoot, "some-mcp"), {
+      name: "some-mcp",
+      version: "1.0.0",
+      bin: { "some-mcp": "dist/index.js" },
+    });
+    const spawn = spawnWith(brokerUrl, managedRoot);
+    try {
+      expect(spawn(["-y", "some-mcp"])).toEqual({
+        command: NODE,
+        args: [join(managedRoot, "some-mcp", "dist", "index.js")],
+      });
+      expect(spawn(["-y", "some-mcp@2.0.0"])).toEqual({ command: "npx", args: ["-y", "some-mcp@2.0.0"] });
+    } finally {
+      cleanup();
+    }
   });
 });
 
