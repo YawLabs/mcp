@@ -7,6 +7,7 @@ import { CURRENT_OS } from "../install-targets.js";
 import {
   compareVersions,
   createProbeCollector,
+  isBuildTreePath,
   isOamCommand,
   isOamLaunch,
   isRegistrySpec,
@@ -1160,6 +1161,45 @@ describe("managedNodeBin", () => {
     // A relative PATH entry is refused by resolveBinAbsolute: join would
     // resolve it against the broker's cwd, a coincidence -- not a node.
     expect(managedNodeBin({ PATH: "rel/bin" }, "linux", "/usr/bin/oam")).toBeNull();
+  });
+});
+
+describe("isBuildTreePath", () => {
+  it("refuses cargo's plain and cross-target layouts, in any spelling", () => {
+    expect(isBuildTreePath("/repo/target/release/oam")).toBe(true);
+    expect(isBuildTreePath(join("C:", "repo", "target", "release", "oam.exe"))).toBe(true);
+    // Cross-target: /target/<triple>/release/ -- covered by the bare segment.
+    expect(isBuildTreePath("/repo/target/x86_64-unknown-linux-gnu/release/oam")).toBe(true);
+  });
+
+  it("refuses debug and out trees and cmake-build prefixes", () => {
+    expect(isBuildTreePath("/repo/target/debug/oam")).toBe(true);
+    expect(isBuildTreePath("/repo/out/oam")).toBe(true);
+    expect(isBuildTreePath("/repo/cmake-build-debug/oam")).toBe(true);
+    expect(isBuildTreePath("/repo/cmake-build-release/oam")).toBe(true);
+  });
+
+  it("is case-insensitive and separator-agnostic", () => {
+    expect(isBuildTreePath("C:\\Repo\\TARGET\\Release\\oam.exe")).toBe(true);
+    expect(isBuildTreePath("C:/Repo/Target/Debug/oam.exe")).toBe(true);
+  });
+
+  it("is a SEGMENT match, not a substring match", () => {
+    // "debug" as a path fragment of a DIFFERENT name must not refuse.
+    expect(isBuildTreePath("/repo/debugger/oam")).toBe(false);
+    expect(isBuildTreePath("/repo/mydebug/oam")).toBe(false);
+    // ...but a deeper target dir under it still does.
+    expect(isBuildTreePath("/repo/debugger/target/release/oam")).toBe(true);
+    // "out" as a substring ("checkout", "about") must not refuse either.
+    expect(isBuildTreePath("/repo/checkout/oam")).toBe(false);
+    // "targeting" is not the target segment.
+    expect(isBuildTreePath("/repo/targeting/oam")).toBe(false);
+  });
+
+  it("accepts installed-release paths", () => {
+    expect(isBuildTreePath(join(".oam", "bin", "oam.exe"))).toBe(false);
+    expect(isBuildTreePath("/usr/local/bin/oam")).toBe(false);
+    expect(isBuildTreePath(String.raw`C:\Users\jeff\scoop\apps\yaw\current\runtime\oam.exe`)).toBe(false);
   });
 });
 
@@ -2885,6 +2925,40 @@ describe("resolveOamSpawn -- unavailable-oam warning", () => {
     const lines = captureStderrLines();
     await resolveOamSpawn("node", ["a.js"]);
     expect(lines.filter((l) => l.includes("opted in to oam but oam is not installed"))).toHaveLength(0);
+  });
+
+  it("names the BUILD-TREE label, with the OAM_BIN fix, not the install commands", async () => {
+    // build-tree is the one failure where "install oam" is actively wrong --
+    // the user HAS oam, it is just a dev build. The warn must carry the
+    // failure's own label (oamFailureLabel) and point at the PATH/OAM_BIN
+    // choice, never at the installer.
+    await probeOam(async () => {
+      throw new Error("build-tree refusal happens before any spawn -- unreachable injected run");
+    });
+    // The injected runner bypasses the gate by design, so prime the cache by
+    // building the refusal the way production reaches it: reset, set a real
+    // build-tree OAM_BIN, probe with the default runner.
+    resetOamBinCache();
+    const { mkdirSync: mk, writeFileSync: wr, rmSync: rm } = await import("node:fs");
+    const dir = join(tmpdir(), `yaw-mcp-bt-warn-${process.pid}`, "target", "release");
+    mk(dir, { recursive: true });
+    wr(join(dir, "oam.exe"), "");
+    const savedBin = process.env.OAM_BIN;
+    process.env.OAM_BIN = join(dir, "oam.exe");
+    try {
+      await probeOam();
+      const lines = captureStderrLines();
+      await resolveOamSpawn("node", ["a.js"]);
+      const warnings = lines.filter((l) => l.includes("oam is installed and unusable"));
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain(oamFailureLabel("build-tree"));
+      expect(warnings[0]).not.toContain(oamFailureLabel("spawn"));
+      expect(warnings[0]).not.toContain("oamjs.org/install.sh");
+    } finally {
+      if (savedBin === undefined) delete process.env.OAM_BIN;
+      else process.env.OAM_BIN = savedBin;
+      rm(join(tmpdir(), `yaw-mcp-bt-warn-${process.pid}`), { recursive: true, force: true });
+    }
   });
 });
 
