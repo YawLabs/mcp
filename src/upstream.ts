@@ -29,7 +29,7 @@ import {
   stripInternalSecretsFromEnv,
 } from "./internal-secret-env.js";
 import { log } from "./logger.js";
-import { oamHeapOomHint, probeOam, resolveOamSpawn } from "./oam-spawn.js";
+import { oamHeapOomHint, probeOam, resolveManagedSpawn, resolveOamSpawn } from "./oam-spawn.js";
 import { appendAuditEvent } from "./secrets-audit.js";
 import {
   checkVaultPassphrase,
@@ -1206,12 +1206,24 @@ interface SpawnAttempt {
    *  SURVIVES THE DOWNGRADE ATTEMPT ON PURPOSE: it stays true while the second
    *  launch is plain node, and the runtime log at the end of
    *  connectToUpstreamOnce keys `downgradedFromOam` on exactly that pair
-   *  (flag true + disableOamRewrite true). Resetting it at the top of
+   *  (flag true + suppressRewrites true). Resetting it at the top of
    *  connectToUpstreamOnce -- which reads like a correct cleanup -- would
    *  silently turn the post-downgrade success line into an ordinary node line
    *  and erase the only trace that a server left oam. */
   oamRewriteApplied: boolean;
   oamVersion: string | null;
+  /** True when rewriteNpmToManagedNode actually CHANGED the launch (node bin
+   *  found, npx spec resolvable on disk) -- the managed-tree default spawn
+   *  source. Independent of oamRewriteApplied and mutually exclusive with it
+   *  in practice: the managed rewrite runs only AFTER the oam gate, so it
+   *  fires on the paths where oam did not take the launch (runtime:"node",
+   *  oam absent/below-min, an oam-pinned namespace).
+   *
+   *  SURVIVES BOTH RESPAWN ATTEMPTS for the same reason oamRewriteApplied
+   *  does: the wrapper's catch keys its branch and the runtime report keys
+   *  `downgradedFromManaged` on (flag true + rewrites suppressed), so a reset
+   *  at the top of connectToUpstreamOnce would erase the only trace. */
+  managedRewriteApplied: boolean;
   /** The local branch's resolved env from the FIRST attempt, so the downgrade
    *  respawn reuses it instead of unlocking the vault (and writing a second
    *  "injected" audit event per secret) for a child that gets the identical
@@ -1248,6 +1260,27 @@ function isPinnedToNode(config: UpstreamServerConfig): boolean {
 /** Reset the session-scoped oam downgrade memo (test hook). */
 export function resetOamDowngrades(): void {
   oamDowngradedNamespaces.clear();
+}
+
+/** Namespaces whose MANAGED-spawned boot failed this session AND whose npx
+ *  respawn produced a different outcome -- the mirror of oamDowngradedNamespaces
+ *  for the managed-tree rewrite. Keyed the same way (namespace + launch
+ *  identity) for the same reason: bundles.json is a live re-read, and evidence
+ *  about the old launch says nothing about a fixed one. A CONFIRMED managed
+ *  downgrade sticks so callers' retry loops do not re-pay the failed managed
+ *  boot on every attempt; it pins the namespace to RAW NPX (the original
+ *  pre-rewrite command), not to node -- npx is the only thing that can still
+ *  fetch a package the managed tree failed to serve. */
+const managedDowngradedNamespaces = new Map<string, string>();
+
+/** Is this exact launch the one an earlier managed downgrade pinned to npx? */
+function isPinnedToNpx(config: UpstreamServerConfig): boolean {
+  return managedDowngradedNamespaces.get(config.namespace) === launchIdentity(config);
+}
+
+/** Reset the session-scoped managed downgrade memo (test hook). */
+export function resetManagedDowngrades(): void {
+  managedDowngradedNamespaces.clear();
 }
 
 /** Forwarding surface for the DOWNSTREAM MCP client (the LLM host connected
@@ -1335,19 +1368,20 @@ export async function connectToUpstream(
   bridge?: DownstreamClientBridge,
   progress?: ConnectProgress,
 ): Promise<UpstreamConnection> {
-  const attempt: SpawnAttempt = { oamRewriteApplied: false, oamVersion: null };
+  const attempt: SpawnAttempt = { oamRewriteApplied: false, oamVersion: null, managedRewriteApplied: false };
   try {
     return await connectToUpstreamOnce(config, onDisconnect, onListChanged, bridge, attempt, false, progress);
   } catch (err) {
-    // Boot-probe fallback: when the spawn was oam-rewritten and the boot
-    // failed (spawn error, connect/initialize handshake failure, or the
-    // child dying during the initial capability fetch -- all surfaced as
-    // ActivationError), respawn ONCE with the original pre-rewrite command.
-    // Exactly one downgrade per call, no retry ladder: a second failure
-    // propagates; the namespace memo above makes a CONFIRMED downgrade stick
-    // for the rest of the session. Non-oam spawns and non-activation errors
-    // (e.g. vault refusals, which would fail identically on node) rethrow
-    // untouched. A child that dies AFTER a healthy boot still gets no
+    // Boot-probe fallback: when a REWRITE was applied (oam, or the managed
+    // sidecar tree) and the boot failed (spawn error, connect/initialize
+    // handshake failure, or the child dying during the initial capability
+    // fetch -- all surfaced as ActivationError), respawn ONCE with the
+    // original pre-rewrite command. Exactly one downgrade per rewrite per
+    // call, no retry ladder: a second failure propagates; the namespace memos
+    // above make a CONFIRMED downgrade stick for the rest of the session.
+    // Spawns no rewrite touched, and non-activation errors (e.g. vault
+    // refusals, which would fail identically on the original command),
+    // rethrow untouched. A child that dies AFTER a healthy boot still gets no
     // auto-fallback (see oam-spawn.ts).
     //
     // Accepted tradeoff: ANY ActivationError qualifies, including a
@@ -1355,73 +1389,126 @@ export async function connectToUpstream(
     // child that dies right after the handshake surfaces there too, and
     // cheaply distinguishing "dead child" from "healthy server returning a
     // JSON-RPC error" isn't possible at this layer. Worst case is one extra
-    // node boot before the same error propagates (bounded by the memo).
-    if (!attempt.oamRewriteApplied || !(err instanceof ActivationError)) throw err;
-    log("warn", "oam-hosted server failed to boot; downgrading to node for this session", {
-      namespace: config.namespace,
-      oamVersion: attempt.oamVersion,
-      category: err.category,
-      error: err.message,
-    });
-    // The memo is deliberately NOT written before this respawn. Nothing clears
-    // it for the life of the process (a changed launch identity stops MATCHING
-    // it, but this config's identity is the one being pinned), so adding it up
-    // front pins the namespace to node even when the node attempt fails
-    // IDENTICALLY -- and an identical
-    // failure is evidence oam was never the cause (a server missing
-    // GITHUB_TOKEN fails install_failure on both runtimes). server.ts's
-    // maybeElicitAndRetry then supplies the credential and re-connects
-    // IN-PROCESS: that retry, and every later reconnect, would run on node
-    // while doctor still reports "oam". The respawn itself does not need the
-    // memo -- it passes disableOamRewrite = true, which bypasses the gate
-    // directly.
-    //
-    // The respawn re-runs connectToUpstreamOnce but NOT the vault: the first
-    // attempt parked its resolved env on `attempt` (SpawnAttempt.resolvedEnv)
-    // and the second launch reuses it, so `yaw-mcp secrets audit` records ONE
-    // "injected" event per secret name for this logical activation -- one
-    // event per thing the operator did, not per child the broker tried on
-    // their behalf. The node child receives the identical values the oam
-    // child did, so nothing the audit could say about the second spawn is not
-    // already said by the first.
-    try {
-      // The downgrade respawn is a SECOND full boot -- another spawn, another
-      // handshake, another inventory -- and it was invisible from outside: the
-      // caller saw one "Spawning" line and then up to two timeouts' worth of
-      // silence. Say which runtime is being tried now, or the retry looks like
-      // the first attempt hanging.
-      progress?.(`"${config.namespace}" did not boot on oam -- retrying on node`);
-      const connection = await connectToUpstreamOnce(
-        config,
-        onDisconnect,
-        onListChanged,
-        bridge,
-        attempt,
-        true,
-        progress,
-      );
-      // node booted where oam did not: oam IS implicated, so make it stick
-      // for THIS launch (see the memo's doc for why the identity is the key).
-      oamDowngradedNamespaces.set(config.namespace, launchIdentity(config));
-      return connection;
-    } catch (nodeErr) {
-      // A DIFFERENT ActivationError category still points at something
-      // oam-specific, so keep the cost saving for those. The SAME category --
-      // or anything not classifiable as an ActivationError at all -- leaves the
-      // memo untouched so a later connect may try oam again: one wasted oam
-      // boot is far cheaper than silently disabling oam hosting for the rest of
-      // the process on evidence that never implicated it.
-      if (nodeErr instanceof ActivationError && nodeErr.category !== err.category) {
+    // boot on the original command before the same error propagates (bounded
+    // by the memos).
+    if (!(err instanceof ActivationError)) throw err;
+    if (attempt.oamRewriteApplied) {
+      log("warn", "oam-hosted server failed to boot; downgrading to node for this session", {
+        namespace: config.namespace,
+        oamVersion: attempt.oamVersion,
+        category: err.category,
+        error: err.message,
+      });
+      // The memo is deliberately NOT written before this respawn. Nothing clears
+      // it for the life of the process (a changed launch identity stops MATCHING
+      // it, but this config's identity is the one being pinned), so adding it up
+      // front pins the namespace to node even when the node attempt fails
+      // IDENTICALLY -- and an identical
+      // failure is evidence oam was never the cause (a server missing
+      // GITHUB_TOKEN fails install_failure on both runtimes). server.ts's
+      // maybeElicitAndRetry then supplies the credential and re-connects
+      // IN-PROCESS: that retry, and every later reconnect, would run on node
+      // while doctor still reports "oam". The respawn itself does not need the
+      // memo -- it passes suppressRewrites = true, which bypasses both gates
+      // directly (so the respawn is the ORIGINAL npx launch, managed rewrite
+      // included -- a second rewrite layered on a failed one would hide which
+      // rewrite broke).
+      //
+      // The respawn re-runs connectToUpstreamOnce but NOT the vault: the first
+      // attempt parked its resolved env on `attempt` (SpawnAttempt.resolvedEnv)
+      // and the second launch reuses it, so `yaw-mcp secrets audit` records ONE
+      // "injected" event per secret name for this logical activation -- one
+      // event per thing the operator did, not per child the broker tried on
+      // their behalf. The node child receives the identical values the oam
+      // child did, so nothing the audit could say about the second spawn is not
+      // already said by the first.
+      try {
+        // The downgrade respawn is a SECOND full boot -- another spawn, another
+        // handshake, another inventory -- and it was invisible from outside: the
+        // caller saw one "Spawning" line and then up to two timeouts' worth of
+        // silence. Say which runtime is being tried now, or the retry looks like
+        // the first attempt hanging.
+        progress?.(`"${config.namespace}" did not boot on oam -- retrying on node`);
+        const connection = await connectToUpstreamOnce(
+          config,
+          onDisconnect,
+          onListChanged,
+          bridge,
+          attempt,
+          true,
+          progress,
+        );
+        // node booted where oam did not: oam IS implicated, so make it stick
+        // for THIS launch (see the memo's doc for why the identity is the key).
         oamDowngradedNamespaces.set(config.namespace, launchIdentity(config));
-      } else {
-        log("warn", "node respawn also failed; not pinning this server to node (oam was likely not the cause)", {
-          namespace: config.namespace,
-          category: err.category,
-          error: nodeErr instanceof Error ? nodeErr.message : String(nodeErr),
-        });
+        return connection;
+      } catch (nodeErr) {
+        // A DIFFERENT ActivationError category still points at something
+        // oam-specific, so keep the cost saving for those. The SAME category --
+        // or anything not classifiable as an ActivationError at all -- leaves the
+        // memo untouched so a later connect may try oam again: one wasted oam
+        // boot is far cheaper than silently disabling oam hosting for the rest of
+        // the process on evidence that never implicated it.
+        if (nodeErr instanceof ActivationError && nodeErr.category !== err.category) {
+          oamDowngradedNamespaces.set(config.namespace, launchIdentity(config));
+        } else {
+          log("warn", "node respawn also failed; not pinning this server to node (oam was likely not the cause)", {
+            namespace: config.namespace,
+            category: err.category,
+            error: nodeErr instanceof Error ? nodeErr.message : String(nodeErr),
+          });
+        }
+        throw nodeErr;
       }
-      throw nodeErr;
     }
+    if (attempt.managedRewriteApplied) {
+      // The managed->npx mirror of the oam->node block above: the spawn came
+      // from the managed sidecar tree (or any on-disk copy resolveNpmEntry
+      // found) and the boot failed; respawn ONCE on the original npx launch,
+      // where npx's fetch-on-demand is the one thing that can still serve a
+      // package the on-disk copy could not. Same evidence rule for the memo:
+      // only a respawn with a DIFFERENT outcome (booted fine, or failed a
+      // different way) pins the namespace -- an identical failure means the
+      // rewrite was never the cause (a server missing GITHUB_TOKEN fails the
+      // same way on either command), and pinning on that would leave the
+      // server on raw npx -- the exact cost this rewrite exists to remove --
+      // for the rest of the session on evidence that implicated nothing.
+      log("warn", "managed-sidecar server failed to boot; downgrading to npx for this session", {
+        namespace: config.namespace,
+        category: err.category,
+        error: err.message,
+      });
+      try {
+        progress?.(`"${config.namespace}" did not boot from the managed sidecar -- retrying on npx`);
+        const connection = await connectToUpstreamOnce(
+          config,
+          onDisconnect,
+          onListChanged,
+          bridge,
+          attempt,
+          true,
+          progress,
+        );
+        managedDowngradedNamespaces.set(config.namespace, launchIdentity(config));
+        return connection;
+      } catch (npxErr) {
+        if (npxErr instanceof ActivationError && npxErr.category !== err.category) {
+          managedDowngradedNamespaces.set(config.namespace, launchIdentity(config));
+        } else {
+          log(
+            "warn",
+            "npx respawn also failed; not pinning this server to npx (the managed sidecar was likely not the cause)",
+            {
+              namespace: config.namespace,
+              category: err.category,
+              error: npxErr instanceof Error ? npxErr.message : String(npxErr),
+            },
+          );
+        }
+        throw npxErr;
+      }
+    }
+    throw err;
   }
 }
 
@@ -1439,7 +1526,7 @@ async function connectToUpstreamOnce(
   onListChanged: ((namespace: string) => void) | undefined,
   bridge: DownstreamClientBridge | undefined,
   attempt: SpawnAttempt,
-  disableOamRewrite: boolean,
+  suppressRewrites: boolean,
   progress?: ConnectProgress,
 ): Promise<UpstreamConnection> {
   // Mirror the DOWNSTREAM client's declared capabilities onto this upstream
@@ -1592,8 +1679,8 @@ async function connectToUpstreamOnce(
       // hatch. Applied AFTER resolveUvSpawn so uv/uvx stay on their managed
       // binary; resolveOamSpawn only rewrites node/npx and otherwise (incl. when
       // oam is absent or below min version) returns the command unchanged -- a
-      // pure optimization. disableOamRewrite is the boot-probe downgrade path:
-      // the wrapper re-runs this function once with the rewrite suppressed so
+      // pure optimization. suppressRewrites is the boot-probe downgrade path:
+      // the wrapper re-runs this function once with BOTH rewrites suppressed so
       // the ORIGINAL node/npx command spawns.
       // `optedIn` is the difference between "the user asked for oam" and "oam is
       // simply the default now". Both spawn on oam when it is available, but only
@@ -1614,7 +1701,7 @@ async function connectToUpstreamOnce(
       const configured = config.runtime ?? (await defaultRuntime());
       const optedIn = configured !== null;
       const effectiveRuntime = configured ?? "oam";
-      if (effectiveRuntime === "oam" && !disableOamRewrite && !isPinnedToNode(config)) {
+      if (effectiveRuntime === "oam" && !suppressRewrites && !isPinnedToNode(config)) {
         // Awaited since issue #91: the oam probe is async so a wedged oam binary
         // cannot block the event loop here. The probe result is cached, so only
         // the first connect of the process actually waits on it.
@@ -1623,6 +1710,27 @@ async function connectToUpstreamOnce(
           attempt.oamRewriteApplied = true;
           attempt.oamVersion = (await probeOam()).version;
           resolved = rewritten;
+        }
+      }
+      // Managed sidecar tree as the DEFAULT spawn source on every path the oam
+      // gate above did not take: runtime:"node", oam absent/below-min/unusable,
+      // a namespace pinned to node by an earlier oam downgrade. Each of those
+      // used to spawn raw `npx pkg@latest`, which re-resolves the spec against
+      // the registry on EVERY spawn -- every pane pays that again. Applied AFTER
+      // the oam gate: when oam took the launch the command is now `oam ...` and
+      // the pure rewrite no-ops on it (not an npx launch), so oam keeps the host.
+      // Gated on suppressRewrites so BOTH downgrade respawns (oam->node and
+      // managed->npx) yield the ORIGINAL npx command -- a second rewrite layered
+      // on a failed one would hide which rewrite broke. Skipped when the oam
+      // rewrite just applied: the command is now `oam ...` and the pure rewrite
+      // would no-op on it anyway, but keeping it out makes "oam took the launch,
+      // managed was not consulted" observable to the wiring test. No probe here:
+      // this path never involves the oam binary.
+      if (!suppressRewrites && !attempt.oamRewriteApplied && !isPinnedToNpx(config)) {
+        const managed = resolveManagedSpawn(resolved.command, resolved.args);
+        if (managed.command !== resolved.command) {
+          attempt.managedRewriteApplied = true;
+          resolved = managed;
         }
       }
     } catch (err) {
@@ -1981,23 +2089,44 @@ async function connectToUpstreamOnce(
   }
 
   // Name the runtime that actually won: "oam" (with the probed oam version)
-  // when the rewrite applied, an explicit downgrade marker when the boot-probe
-  // fallback respawned on node, that same marker plus `oamPinned` when the
-  // session memo skipped the rewrite for a namespace an EARLIER downgrade
-  // pinned to node, and nothing extra for plain node spawns.
+  // when the oam rewrite applied, node + `managedSpawn` when the managed sidecar
+  // tree did, explicit downgrade markers when the boot-probe fallbacks respawned
+  // on the original command, those markers plus `oamPinned` / `managedPinned`
+  // when the session memo skipped a rewrite for a namespace an EARLIER downgrade
+  // pinned, and nothing extra for plain spawns no rewrite touched.
+  //
+  // `runtime` stays within {node, oam} deliberately: npx IS a node launcher (the
+  // oam downgrade's raw-npx respawn has always reported "node"), so the spawn
+  // SOURCE rides in the markers -- managedSpawn / downgradedFromManaged /
+  // managedPinned -- exactly as downgradedFromOam / oamPinned already carry it
+  // for the oam side.
   //
   // The pinned case is why this is not a two-way branch: a memo-served connect
-  // never sets oamRewriteApplied, so it used to log as an ordinary node spawn
-  // and the only trace that the server had left oam was the warn line from the
+  // never sets the rewrite flag, so it used to log as an ordinary spawn and
+  // the only trace that the server had left oam was the warn line from the
   // connect that pinned it -- invisible to anyone reading a later reconnect,
   // and the exact question doctor output raises ("why is this on node?").
   let runtimeFields: Record<string, unknown> = {};
   if (attempt.oamRewriteApplied) {
-    runtimeFields = disableOamRewrite
+    runtimeFields = suppressRewrites
       ? { runtime: "node", downgradedFromOam: true }
       : { runtime: "oam", oamVersion: attempt.oamVersion };
-  } else if (config.type === "local" && isPinnedToNode(config)) {
-    runtimeFields = { runtime: "node", downgradedFromOam: true, oamPinned: true };
+  } else if (attempt.managedRewriteApplied) {
+    runtimeFields = suppressRewrites
+      ? { runtime: "node", downgradedFromManaged: true }
+      : { runtime: "node", managedSpawn: true };
+  } else if (config.type === "local" && (isPinnedToNode(config) || isPinnedToNpx(config))) {
+    // ADDITIVE, not an else-if chain: both memos can pin the same launch
+    // (oam boot failed and the npx respawn won; later the managed boot failed
+    // and the npx respawn won again). An exclusive chain reported only
+    // oamPinned and hid why the server ALSO left the managed tree.
+    const oamPin = isPinnedToNode(config);
+    const managedPin = isPinnedToNpx(config);
+    runtimeFields = {
+      runtime: "node",
+      ...(oamPin && { downgradedFromOam: true, oamPinned: true }),
+      ...(managedPin && { downgradedFromManaged: true, managedPinned: true }),
+    };
   }
   log("info", "Connected to upstream", {
     name: config.name,

@@ -1439,6 +1439,133 @@ export function rewriteForOam(
   return { command, args };
 }
 
+/**
+ * The node binary `rewriteNpmToManagedNode` spawns resolved entries with, or
+ * null when none can be identified (-> stay on npx).
+ *
+ * `process.execPath` when it IS node -- the broker's own runtime, which is the
+ * node guaranteed to exist for this process. When the broker itself runs on
+ * another runtime (oam-hosted, `oam run dist/index.js`, where execPath names
+ * the oam binary), fall back to resolving `node` off PATH: an npx launch on
+ * PATH implies its sibling node is there too, and resolveBinAbsolute already
+ * does that search the way the OS loader would (its result is guaranteed
+ * absolute). Null there keeps npx -- spawning a node we cannot locate would
+ * fail where npx still works.
+ */
+export function managedNodeBin(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+  execPath: string = process.execPath,
+): string | null {
+  if (nodeLaunchKind(execPath) === "node") return execPath;
+  return resolveBinAbsolute("node", env, platform);
+}
+
+/** Dependencies of {@link rewriteNpmToManagedNode}: the node binary to spawn
+ *  with (null -> stay on npx) and the on-disk entry resolver. Same
+ *  `resolveEntry(pkg, wantVersion)` contract as {@link OamRewriteDeps} --
+ *  an exact pin must return null rather than a copy declaring something else. */
+export interface ManagedRewriteDeps {
+  nodeBin: string | null;
+  resolveEntry: (pkg: string, wantVersion: string | null) => string | null;
+}
+
+/**
+ * Pure rewrite of an npx launch to the MANAGED sidecar tree (or any on-disk
+ * copy resolveNpmEntry finds): the default spawn source on the paths where
+ * oam does not take the launch -- `runtime: "node"`, oam absent or unusable,
+ * a namespace an oam downgrade pinned, and every launch on a machine below
+ * MIN_OAM_VERSION. Each of those used to spawn raw `npx pkg@latest`, which
+ * re-resolves the spec against the registry on EVERY spawn -- every pane pays
+ * that again. upstream.ts applies this AFTER the oam gate, so oam keeps the
+ * host whenever it took the launch (an oam command is not nodeLaunchKind
+ * "npx" and falls straight through).
+ *
+ *   npx [-y] <pkg> [...rest]  -> <nodeBin> <resolved entry> [...rest]
+ *
+ * Refuses exactly what rewriteForOam refuses, through the SAME shared
+ * predicates in the same order (npxSpecIndex -> flag spec -> isRegistrySpec
+ * -> specConstraint -> resolveEntry null), because sidecars-cmd's collectors
+ * partition the server set on those answers and a rule that lives in two
+ * places can drop a server out of both reports (see collectNonRegistrySpecs).
+ * In particular a version RANGE stays on npx: nothing here can evaluate
+ * `^1.2.3` against an on-disk copy, and `^1.2.3` resolving to a 0.9.0 on
+ * disk is the exact major-version jump specConstraint's doc exists to
+ * prevent. The managed tree never holds a range-spec package either --
+ * collectSidecarSpecs refuses to install one.
+ *
+ * Rest args ride through verbatim, sliced after the spec (npxSpecIndex) --
+ * never filtered -- so the node child receives the same argv tail npx would
+ * hand the server, and a server's own `--yes` is not eaten (the 0.74.2 bug).
+ * No `--` separator: node passes everything after the entry script to the
+ * script itself.
+ *
+ * Returns {command, args} UNCHANGED for every refusal -- a pure
+ * optimization, never a correctness dependency (see the module header).
+ */
+export function rewriteNpmToManagedNode(
+  command: string,
+  args: string[],
+  deps: ManagedRewriteDeps,
+): { command: string; args: string[] } {
+  if (!deps.nodeBin) {
+    log("debug", "no node binary located for the managed sidecar spawn; staying on npx", { command });
+    return { command, args };
+  }
+  if (nodeLaunchKind(command) !== "npx") return { command, args };
+  const specIdx = npxSpecIndex(args);
+  const spec = specIdx === -1 ? undefined : args[specIdx];
+  if (!spec) return { command, args };
+  if (spec.startsWith("-")) {
+    // The flag and the argv LENGTH, never the argv: everything after the flag
+    // belongs to the server, and a server's args are where a token rides
+    // (rewriteForOam's redaction rule, mirrored -- the logger does no
+    // redaction and debug logs reach support tickets).
+    log("debug", "npx launch carries flags yaw-mcp does not parse; staying on npx instead of the managed tree", {
+      flag: spec,
+      argc: args.length,
+    });
+    return { command, args };
+  }
+  if (!isRegistrySpec(spec)) {
+    log("debug", "npx spec is a git/path target, not a registry package; staying on npx instead of the managed tree", {
+      spec,
+    });
+    return { command, args };
+  }
+  const constraint = specConstraint(spec);
+  // A range needs an evaluator this module deliberately does not carry --
+  // see the doc comment. npx re-resolves it and honours it; `node <entry>`
+  // runs whatever sits at the path.
+  if (constraint.kind === "range") {
+    log("debug", "npx spec constrains the version with a range yaw-mcp cannot evaluate; staying on npx", {
+      package: packageName(spec),
+      range: constraint.raw,
+    });
+    return { command, args };
+  }
+  const wantVersion = constraint.kind === "exact" ? constraint.version : null;
+  const entry = deps.resolveEntry(packageName(spec), wantVersion);
+  if (!entry) {
+    // Two reasons, two lines -- same split as rewriteForOam: nothing on disk
+    // at all (install it: `yaw-mcp sidecars install`) versus nothing AT THE
+    // PINNED VERSION (npx is not a fallback there, it is the only thing that
+    // can honour the pin).
+    if (wantVersion !== null) {
+      log("debug", "no on-disk copy declares the pinned version; staying on npx so the pin is honoured", {
+        package: packageName(spec),
+        version: wantVersion,
+      });
+    } else {
+      log("debug", "npx package has no on-disk entry; staying on npx instead of the managed tree", {
+        package: packageName(spec),
+      });
+    }
+    return { command, args };
+  }
+  return { command: deps.nodeBin, args: [entry, ...args.slice(specIdx + 1)] };
+}
+
 /** The path fragment that marks an npm `_npx` cache directory. Derived once:
  *  npxCacheNodeModules locates the cache with it and both resolvers CLASSIFY
  *  on it (cache copies are fine to spawn but wrong to persist, and they take
@@ -2158,6 +2285,25 @@ export async function resolveOamSpawn(
     // The three injectables (fromUrl, npmCache, managedRoot) keep their
     // production defaults -- explicit `undefined` rather than a reorder,
     // because they are positional and every test call site passes them.
+    resolveEntry: (pkg, wantVersion) => resolveNpmEntry(pkg, undefined, undefined, undefined, wantVersion),
+  });
+}
+
+/**
+ * Apply {@link rewriteNpmToManagedNode} with the production defaults wired --
+ * the spawn-time wrapper upstream.ts calls AFTER the oam gate, mirroring
+ * resolveOamSpawn. Pure apart from the resolved defaults: it probes nothing
+ * (no oam involved on this path) and resolves the entry through
+ * resolveNpmEntry (managed tree first, then npx caches, pin-aware) and the
+ * node binary through {@link managedNodeBin}.
+ *
+ * Exists as a named export so the wiring test has ONE chokepoint to mock,
+ * exactly like resolveOamSpawn: upstream.test.ts spreads the real module and
+ * stubs the two spawn rewrites, keeping every other helper real.
+ */
+export function resolveManagedSpawn(command: string, args: string[]): { command: string; args: string[] } {
+  return rewriteNpmToManagedNode(command, args, {
+    nodeBin: managedNodeBin(),
     resolveEntry: (pkg, wantVersion) => resolveNpmEntry(pkg, undefined, undefined, undefined, wantVersion),
   });
 }
