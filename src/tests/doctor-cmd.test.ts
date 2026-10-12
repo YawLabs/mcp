@@ -2207,6 +2207,17 @@ describe("runDoctor — OAM RUNTIME section", () => {
     failure: "timeout" as const,
     failureDetail: "oam --version exceeded 3000ms",
   });
+  // A build-tree binary: same bin:null/failure shape as the wedged one, but
+  // the fix differs -- nothing is broken with a dev build, so the generic
+  // "run `oam --version` by hand" advice is exactly wrong for it.
+  const oamBuildTree = () => ({
+    bin: null,
+    binPath: null,
+    version: null,
+    belowMin: false,
+    failure: "build-tree" as const,
+    failureDetail: "C:\\build\\oam\\target\\release\\oam.exe is a compiler output binary (build-tree), not a release",
+  });
   // A `--version` that ran and printed no dotted triple. oam IS used to host
   // sidecars in this state, and the MIN_OAM_VERSION gate never ran.
   const oamUnknownVersion = () => ({
@@ -2737,6 +2748,19 @@ describe("runDoctor — OAM RUNTIME section", () => {
     expect(txt).toContain("did not answer in time");
     expect(txt).toContain("oam --version exceeded 3000ms");
     expect(txt).not.toMatch(/binary: {2}not installed/);
+  });
+
+  it("gives a build-tree oam its own fix line, not the run-it-by-hand one", async () => {
+    // A build-tree binary answers --version fine, which is exactly why running
+    // it by hand cannot tell it apart from a release; the actionable fix is
+    // the PATH/OAM_BIN choice. The generic line must not appear alongside it.
+    const cap = captureOut();
+    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, oamProbe: oamBuildTree });
+    const txt = cap.text();
+    expect(txt).toContain("installed but UNUSABLE");
+    expect(txt).toContain("local build-tree oam, not a release");
+    expect(txt).toContain("fix: point OAM_BIN (or PATH) at the installed oam, then restart yaw-mcp");
+    expect(txt).not.toContain("run `oam --version` by hand");
   });
 
   it("keeps saying not-installed when oam is genuinely absent", async () => {

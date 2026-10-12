@@ -685,11 +685,14 @@ const BUILD_TREE_PREFIXES = ["cmake-build-"];
  *
  * The segments are anywhere in the path, so `target` also covers cargo's
  * cross-target layout (/target/<triple>/release/) -- every cargo target dir
- * nests under target/ -- and a user's own directory names (a checkout under
- * .../debug/my-project/) match only when they themselves sit in a build tree,
- * which is the conservative side of this gate: refusing a working binary makes
- * the warn and the fix visible; accepting a dev build is the failure mode the
- * version string cannot catch.
+ * nests under target/. The match is UNCONDITIONAL, and that accepts false
+ * positives on purpose: a user's own directory that merely carries one of
+ * these names (a checkout under .../debug/, a project inside .../out/) is
+ * refused too, though no build produced the binary sitting there. That is
+ * the conservative side of this gate -- refusing a working binary makes the
+ * warn and the fix visible (OAM_BIN can point wherever the user actually
+ * means), while accepting a dev build is the failure mode the version
+ * string cannot catch.
  */
 export function isBuildTreePath(p: string): boolean {
   const parts = p.toLowerCase().split(/[\\/]+/);

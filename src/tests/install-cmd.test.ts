@@ -492,6 +492,16 @@ const OAM_BROKEN = async (): Promise<OamProbe> => ({
   failure: "timeout",
   failureDetail: "oam --version timed out after 3000ms",
 });
+/** A build-tree binary: unusable like OAM_BROKEN, but the fix is the
+ *  PATH/OAM_BIN choice -- "fix or reinstall" cannot help a dev build. */
+const OAM_BUILD_TREE = async (): Promise<OamProbe> => ({
+  bin: null,
+  binPath: null,
+  version: null,
+  belowMin: false,
+  failure: "build-tree",
+  failureDetail: "C:\\build\\oam\\target\\release\\oam.exe is a compiler output binary (build-tree), not a release",
+});
 const OAM_ENTRY = "/opt/nm/@yawlabs/mcp/dist/index.js";
 /** A probe that must never run. The refusal tests below reach their exit
  *  BEFORE runInstall probes oam, so they are hermetic by ORDERING alone --
@@ -3723,6 +3733,31 @@ describe("runInstall — oam launch entry", () => {
       expect(absentOut).not.toMatch(/Fix or reinstall/);
     } finally {
       rmSync(absentHome, { recursive: true, force: true });
+    }
+  });
+
+  it("gives a build-tree oam the PATH/OAM_BIN fix, not fix-or-reinstall", async () => {
+    // A dev build answers --version fine; reinstalling cannot change what
+    // PATH or OAM_BIN names. The build-tree branch must carry its own tail,
+    // and the broken wording must not leak into it.
+    const buildTreeHome = mkdtempSync(join(tmpdir(), "yaw-mcp-install-buildtree-"));
+    try {
+      const cap = captureIo();
+      const r = await runInstall({
+        clientId: "claude-code",
+        scope: "user",
+        os: "linux",
+        home: buildTreeHome,
+        io: cap.io,
+        oamProbe: OAM_BUILD_TREE,
+      });
+      expect(r.exitCode).toBe(0);
+      const out = r.messages.join(" ");
+      expect(out).toMatch(/local build-tree oam, not a release/);
+      expect(out).toContain("Point OAM_BIN (or PATH) at the installed oam");
+      expect(out).not.toMatch(/Fix or reinstall/);
+    } finally {
+      rmSync(buildTreeHome, { recursive: true, force: true });
     }
   });
 
