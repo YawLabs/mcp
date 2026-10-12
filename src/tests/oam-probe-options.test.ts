@@ -18,6 +18,7 @@
 // turning while a probe hangs".
 
 import { EventEmitter } from "node:events";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -300,24 +301,106 @@ describe("probeOam default runner", () => {
     // The explicit half lives in oam-spawn-probe-log.test.ts; binPath is null
     // on both paths, so nothing here depends on the variable being set.
     delete process.env.OAM_BIN;
+    // The build-tree gate reads the REAL PATH before anything spawns: on a
+    // machine whose `oam` resolves into a compiler output tree (this one --
+    // a target/release oam is first on PATH), the gate refuses and the probe
+    // returns failure:"build-tree" instead of the absence this test pins.
+    // A PATH with no oam anywhere IS the machine this test is about.
+    const savedPath = process.env.PATH;
+    process.env.PATH = "";
     const enoent = new Error("spawn oam ENOENT") as Error & { code?: string };
     enoent.code = "ENOENT";
     childError = enoent;
 
-    const probe = await probeOam();
+    try {
+      const probe = await probeOam();
 
-    // ENOENT is ABSENCE, not a failure: `bin === null` already says everything
-    // there is to say, and tagging it would make doctor report a broken install
-    // on every node-only machine.
-    expect(probe).toEqual({
-      bin: null,
-      binPath: null,
-      version: null,
-      belowMin: false,
-      failure: null,
-      failureDetail: null,
-    });
-    expect(killed, "probe waited for the deadline instead of settling on 'error'").toEqual([]);
+      // ENOENT is ABSENCE, not a failure: `bin === null` already says everything
+      // there is to say, and tagging it would make doctor report a broken install
+      // on every node-only machine.
+      expect(probe).toEqual({
+        bin: null,
+        binPath: null,
+        version: null,
+        belowMin: false,
+        failure: null,
+        failureDetail: null,
+      });
+      expect(killed, "probe waited for the deadline instead of settling on 'error'").toEqual([]);
+    } finally {
+      // Restore: later tests in this file call probeOam with the default
+      // runner too, and a wiped PATH would change their premises as well.
+      if (savedPath === undefined) delete process.env.PATH;
+      else process.env.PATH = savedPath;
+    }
+  });
+
+  it("refuses a build-tree binary by path text BEFORE anything spawns", async () => {
+    // The gate's whole point: a target/release oam reports the same version
+    // string as a release, so it must never be asked (let alone trusted or
+    // verdict-cached). spawnCalls staying empty is the load-bearing assertion
+    // -- the refusal happens in resolveBinAbsolute's result, not in the child.
+    const dir = join(tmpdir(), `yaw-mcp-buildtree-${process.pid}`, "target", "release");
+    const bin = join(dir, "oam.exe");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(bin, "");
+    process.env.OAM_BIN = bin;
+    try {
+      const probe = await probeOam();
+      expect(probe).toEqual({
+        bin: null,
+        binPath: null,
+        version: null,
+        belowMin: false,
+        failure: "build-tree",
+        failureDetail: expect.stringContaining("compiler output binary"),
+      });
+      expect(spawnCalls, "build-tree binary reached the spawn").toEqual([]);
+    } finally {
+      rmSync(join(tmpdir(), `yaw-mcp-buildtree-${process.pid}`), { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a bare `oam` whose PATH lookup lands in a build tree, and names the PATH fix", async () => {
+    // The shape this machine actually has: a dev checkout's target/release
+    // oam sits EARLIER on PATH than ~/.oam/bin. OAM_BIN is cleared so the
+    // gate resolves the bare name against the (temp) PATH.
+    delete process.env.OAM_BIN;
+    const dir = join(tmpdir(), `yaw-mcp-pathbuildtree-${process.pid}`, "target", "debug");
+    const bin = join(dir, "oam.exe");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(bin, "");
+    const savedPath = process.env.PATH;
+    process.env.PATH = dir;
+    try {
+      const probe = await probeOam();
+      expect(probe.failure).toBe("build-tree");
+      expect(probe.failureDetail).toContain(bin);
+      expect(spawnCalls).toEqual([]);
+    } finally {
+      if (savedPath === undefined) delete process.env.PATH;
+      else process.env.PATH = savedPath;
+      rmSync(join(tmpdir(), `yaw-mcp-pathbuildtree-${process.pid}`), { recursive: true, force: true });
+    }
+  });
+
+  it("still accepts a release binary outside any build tree (false-positive guard)", async () => {
+    // The segments match ANYWHERE in the path, so the inverse case needs
+    // pinning too: an installed release whose own directory happens to carry
+    // none of the segments must probe and answer normally.
+    const dir = join(tmpdir(), `yaw-mcp-release-${process.pid}`);
+    const bin = join(dir, "oam.exe");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(bin, "");
+    process.env.OAM_BIN = bin;
+    try {
+      const probe = await probeOam();
+      expect(probe.failure).toBeNull();
+      expect(probe.version).toBe("9.9.9");
+      expect(spawnCalls).toHaveLength(1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("falls back to node when the probe exits non-zero", async () => {
