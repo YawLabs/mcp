@@ -7,9 +7,10 @@
 //   * The cache is keyed by content hash, so it accumulates every version ever
 //     fetched and nothing ever names which one is current.
 //   * `npx` re-resolved `@latest` on every spawn, which is what kept those
-//     servers up to date. `oam run <entry>` cannot -- oam has no fetch-on-
-//     demand -- so once oam is the default, npx stops running for that server
-//     and the cache stops being refreshed. The version pins itself.
+//     servers up to date. Once a spawn stops going through npx -- `oam run`
+//     cannot (oam has no fetch-on-demand), and neither can the managed-tree
+//     `node <entry>` spawn that took over when oam is absent -- the cache
+//     stops being refreshed. The version pins itself.
 //
 // Installing into a directory yaw-mcp owns fixes both: one copy per package, a
 // version that is written down, and a single command that moves it forward.

@@ -2706,6 +2706,50 @@ describe("connectToUpstream managed-sidecar default spawn", () => {
     });
   });
 
+  it("reports BOTH pins additively when a namespace earned the oam AND the managed downgrade", async () => {
+    // Connect 1: oam rewrite applied, boot fails, the npx respawn boots -> the
+    // oam memo pins this launch identity.
+    vi.mocked(resolveOamSpawn).mockResolvedValue({ command: "/usr/bin/oam", args: ["run", "/e.js"] });
+    let connects = 0;
+    _sdkBehavior.clientConnect = () => {
+      connects++;
+      // Attempt 1 (oam) and attempt 3 (managed) are the rewritten boots that
+      // must fail; every respawn and the final plain-npx connect succeed.
+      return connects === 1 || connects === 3
+        ? Promise.reject(new Error("rewritten child crashed"))
+        : Promise.resolve();
+    };
+    const config = makeLocalConfig({ runtime: "oam", command: "npx", args: ["-y", "x"] });
+    expect((await connectToUpstream(config)).status).toBe("connected");
+    expect(_sdkBehavior.stdioConstructions.map((c) => c.command)).toEqual(["/usr/bin/oam", "npx"]);
+
+    // Connect 2: the oam pin skips the oam gate, so the SAME launch now goes
+    // through the managed rewrite; its boot fails the same way and the npx
+    // respawn boots -> the managed memo joins the oam one.
+    vi.mocked(resolveManagedSpawn).mockReturnValue({ command: "/opt/node/bin/node", args: ["/sidecars/x.js"] });
+    _sdkBehavior.stdioConstructions = [];
+    expect((await connectToUpstream(config)).status).toBe("connected");
+    expect(_sdkBehavior.stdioConstructions.map((c) => c.command)).toEqual(["/opt/node/bin/node", "npx"]);
+
+    // Connect 3: both memos pin -> plain npx, and the connect line carries
+    // BOTH pins. An exclusive chain used to report only oamPinned and hide
+    // why the server had ALSO left the managed tree.
+    _sdkBehavior.stdioConstructions = [];
+    vi.mocked(log).mockClear();
+    expect((await connectToUpstream(config)).status).toBe("connected");
+    expect(_sdkBehavior.stdioConstructions.map((c) => c.command)).toEqual(["npx"]);
+    expect(vi.mocked(log)).toHaveBeenCalledWith("info", "Connected to upstream", {
+      name: "Test Server",
+      namespace: "test",
+      type: "local",
+      runtime: "node",
+      downgradedFromOam: true,
+      oamPinned: true,
+      downgradedFromManaged: true,
+      managedPinned: true,
+    });
+  });
+
   it("does NOT pin the namespace to npx when the npx respawn fails the SAME way", async () => {
     vi.mocked(resolveManagedSpawn).mockReturnValue({ command: "/opt/node/bin/node", args: ["/sidecars/x.js"] });
     const config = makeLocalConfig({ runtime: "node", command: "npx", args: ["-y", "x"] });

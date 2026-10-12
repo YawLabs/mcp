@@ -2290,6 +2290,29 @@ export async function resolveOamSpawn(
 }
 
 /**
+ * Process-lifetime memo of {@link resolveNpmEntry} HITS from the stable trees
+ * (managed + durable -- real directories that `sidecars install` and an
+ * `npm install` update IN PLACE, so a pinned path keeps picking up new
+ * builds). Everything else re-resolves on purpose:
+ *   - a MISS is never memoized: a package not installed yet would stay on
+ *     npx for the process lifetime, hiding every later `sidecars install`;
+ *   - an npx-cache hit is never memoized: `_npx/<hash>` paths are content-
+ *     hashed, so a manual `npx -y <pkg>@latest` refresh lands in a NEW
+ *     directory and a memoized path would pin the stale copy forever.
+ * This caps the per-connect directory walk the managed gate added to the
+ * runtime:"node" / oam-absent paths at one walk per package per process.
+ * Keyed by package name only: the everyday lookup this exists for is the
+ * no-pin one, and a pinned lookup is rare enough to stay unmemoized.
+ *
+ * Accepted tradeoff: a durable install UNINSTALLED while the broker runs
+ * leaves its dead path memoized until restart -- each connect then burns the
+ * one-shot npx downgrade instead of re-scanning to a cache copy. The server
+ * still serves (the respawn works); only the per-connect cost of a decision
+ * npm has already made is paid.
+ */
+const managedEntryMemo = new Map<string, string>();
+
+/**
  * Apply {@link rewriteNpmToManagedNode} with the production defaults wired --
  * the spawn-time wrapper upstream.ts calls AFTER the oam gate, mirroring
  * resolveOamSpawn. Pure apart from the resolved defaults: it probes nothing
@@ -2304,7 +2327,16 @@ export async function resolveOamSpawn(
 export function resolveManagedSpawn(command: string, args: string[]): { command: string; args: string[] } {
   return rewriteNpmToManagedNode(command, args, {
     nodeBin: managedNodeBin(),
-    resolveEntry: (pkg, wantVersion) => resolveNpmEntry(pkg, undefined, undefined, undefined, wantVersion),
+    resolveEntry: (pkg, wantVersion) => {
+      if (wantVersion !== null) return resolveNpmEntry(pkg, undefined, undefined, undefined, wantVersion);
+      const memoed = managedEntryMemo.get(pkg);
+      if (memoed !== undefined) return memoed;
+      const hit = resolveNpmEntry(pkg, undefined, undefined, undefined, null);
+      // The marker check is what makes memoizing safe: a hit FROM an npx
+      // cache directory carries the fragment in its own path.
+      if (hit !== null && !hit.includes(NPX_CACHE_MARKER)) managedEntryMemo.set(pkg, hit);
+      return hit;
+    },
   });
 }
 
