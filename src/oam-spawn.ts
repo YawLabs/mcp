@@ -430,12 +430,17 @@ let warnedOamUnavailable = false;
 /** Why the probe produced no usable binary even though oam was present on
  *  disk. `null` is BOTH "oam is usable" and "oam is absent" -- absence is the
  *  routine case and is already conveyed by `bin === null` with no failure.
- *    "timeout" -- `oam --version` outlived OAM_PROBE_TIMEOUT_MS on both
- *                 attempts (a timeout is retried once; see probeOamUncached)
- *    "exit"    -- it ran and exited non-zero (or died on a signal)
- *    "spawn"   -- it could not be executed at all (EACCES, a non-executable
- *                 file, or an injected `run` that rejected without a code) */
-export type OamProbeFailure = "timeout" | "exit" | "spawn";
+ *    "timeout"    -- `oam --version` outlived OAM_PROBE_TIMEOUT_MS on both
+ *                    attempts (a timeout is retried once; see probeOamUncached)
+ *    "exit"       -- it ran and exited non-zero (or died on a signal)
+ *    "spawn"      -- it could not be executed at all (EACCES, a non-executable
+ *                    file, or an injected `run` that rejected without a code)
+ *    "build-tree" -- it lives in a compiler output directory (see
+ *                    isBuildTreePath) and is refused BEFORE anything spawns, so
+ *                    `run` never sees it. Present-but-unusable, not absent:
+ *                    the user has a binary; it is just not one anyone should
+ *                    run -- same distinction timeout/exit/spawn exist for. */
+export type OamProbeFailure = "timeout" | "exit" | "spawn" | "build-tree";
 
 /**
  * Plain-English form of an OamProbeFailure -- the one line a support ticket
@@ -458,6 +463,7 @@ export type OamProbeFailure = "timeout" | "exit" | "spawn";
 export function oamFailureLabel(failure: OamProbeFailure): string {
   if (failure === "timeout") return "`oam --version` did not answer in time";
   if (failure === "exit") return "`oam --version` exited non-zero";
+  if (failure === "build-tree") return "the binary is a local build-tree oam, not a release";
   return "the binary could not be executed";
 }
 
@@ -651,6 +657,43 @@ function isExecutableFile(candidate: string, platform: NodeJS.Platform): boolean
     // "not the binary", and the caller's next candidate is the answer.
     return false;
   }
+}
+
+/**
+ * Compiler output directories a local oam build lives in. A binary there is a
+ * developer's build, not a release anyone else has: same `oam 0.9.0` version
+ * string, uncommitted code behind it -- typed refuses the same shapes in
+ * scripts/gen-runtime-manifest.mjs (BUILD_TREE_SEGMENTS/BUILD_TREE_PREFIXES)
+ * and scripts/build-installer.sh (_is_build_tree), and Yaw's hook runtime
+ * rejects /target/release/ and /target/debug/ candidates. This list is broader
+ * than the hook rule on purpose: it matches typed's gate so the two projects
+ * certify the SAME binaries. `target` also covers cargo's cross-target layout
+ * (/target/<triple>/release/) because the segment match is anywhere in the
+ * path, and every cargo target dir nests under target/.
+ */
+const BUILD_TREE_SEGMENTS = new Set(["target", "debug", "out"]);
+const BUILD_TREE_PREFIXES = ["cmake-build-"];
+
+/**
+ * True when a resolved binary path sits in a compiler output tree. Pure path
+ * test, any separator, any case: resolved through the caller (resolveBinAbsolute
+ * or an OAM_BIN spelling) before this runs, and deliberately NOT through
+ * realpath -- Yaw's hook runtime applies the same rule to PATH candidates by
+ * path text, so the two projects reject the same builds, and a realpath round
+ * trip adds an fs call to the connect path for a case the path test already
+ * covers.
+ *
+ * The segments are anywhere in the path, so `target` also covers cargo's
+ * cross-target layout (/target/<triple>/release/) -- every cargo target dir
+ * nests under target/ -- and a user's own directory names (a checkout under
+ * .../debug/my-project/) match only when they themselves sit in a build tree,
+ * which is the conservative side of this gate: refusing a working binary makes
+ * the warn and the fix visible; accepting a dev build is the failure mode the
+ * version string cannot catch.
+ */
+export function isBuildTreePath(p: string): boolean {
+  const parts = p.toLowerCase().split(/[\\/]+/);
+  return parts.some((seg) => BUILD_TREE_SEGMENTS.has(seg) || BUILD_TREE_PREFIXES.some((pre) => seg.startsWith(pre)));
 }
 
 /**
@@ -1048,6 +1091,12 @@ async function probeOamUncached(run: (bin: string) => Promise<string>, generatio
    *  failure/absence split at OamProbe.failure exists to prevent. */
   const explicit = Boolean(process.env.OAM_BIN);
   const bin = winNormalize(process.env.OAM_BIN || (process.platform === "win32" ? "oam.exe" : "oam"));
+  /** The absolute path `bin` names, resolved once for everything below: the
+   *  build-tree check, the verdict-cache identity, and the success path's
+   *  binPath. A bare name comes back from resolveBinAbsolute as found on PATH
+   *  (or null when it is not there at all -- absence is handled by the probe
+   *  itself, exactly as before this field existed). */
+  const absResolved = resolveBinAbsolute(bin);
   /** Publish only if no reset landed while we were awaiting the spawn. The
    *  result is still RETURNED to this call's own caller either way -- it is
    *  correct for the state it observed; it just must not become the cache a
@@ -1059,15 +1108,50 @@ async function probeOamUncached(run: (bin: string) => Promise<string>, generatio
     }
     return probe;
   };
+  // The refusal applies to the REAL spawn path only. `absResolved` comes from
+  // THIS process's PATH, so an injected `run` (tests, and any embedder passing
+  // a stand-in) says nothing about which file would spawn -- the same rule the
+  // identity gate below already applies -- and gating it keeps the suite
+  // host-independent on a machine whose agent shell has a build-tree oam first
+  // on PATH (the exact condition this rule exists to refuse).
+  if (run === spawnVersionProbe && absResolved !== null && isBuildTreePath(absResolved)) {
+    // A build-tree binary is refused by PATH TEXT, before any spawn: `run` is
+    // never called, so a dev build cannot even answer --version here. Same
+    // rule typed applies to its own runtime manifest (gen-runtime-manifest.mjs)
+    // and Yaw applies to hook runtime candidates: version strings do not carry
+    // build identity -- the target/release copy on this machine reported the
+    // same `oam 0.9.0` as the installed ones while carrying code the installs
+    // did not. Returning here also keeps it out of the verdict cache below: no
+    // dev build can be blessed under a version its uncommitted code does not
+    // earn. The fix differs by who chose the path: an explicit OAM_BIN is fixed
+    // by editing OAM_BIN (resolveOamSpawn's failure branch says so with its own
+    // wording); a bare name landing here means a build dir sits EARLIER on PATH
+    // than the install, fixed by PATH order.
+    log("warn", "oam resolves to a local build-tree binary; falling back to node for this process", {
+      bin: absResolved,
+      fix: explicit
+        ? "point OAM_BIN at the installed oam (~/.oam/bin)"
+        : "put ~/.oam/bin ahead of the build tree on PATH",
+      thenRestart: "restart yaw-mcp; this probe is cached for the process lifetime",
+    });
+    return publish({
+      bin: null,
+      binPath: null,
+      version: null,
+      belowMin: false,
+      failure: "build-tree",
+      failureDetail: `${absResolved} is a compiler output binary (build-tree), not a release`,
+    });
+  }
   /** The cross-process verdict cache applies only to the REAL probe: an
    *  injected runner is a stand-in binary whose answer says nothing about the
    *  file on disk. Keyed on the absolute path the bare name resolves to, so a
    *  PATH change that swaps binaries is a different key. Null -- nothing read
-   *  or written -- when the binary cannot be located or stat'ed. */
+   *  or written -- when the binary cannot be located or stat'ed. A build-tree
+   *  binary never reaches this: the refusal above returns first. */
   const identity = (() => {
     if (run !== spawnVersionProbe) return null;
-    const abs = resolveBinAbsolute(bin);
-    return abs ? oamBinaryIdentity(abs) : null;
+    return absResolved ? oamBinaryIdentity(absResolved) : null;
   })();
   /** Run the probe, retrying ONLY a timeout, and only once -- the same rule
    *  uv-bootstrap's resolveUv applies to its PATH probe. Every other rejection
@@ -1152,9 +1236,10 @@ async function probeOamUncached(run: (bin: string) => Promise<string>, generatio
     }
     return publish({
       bin,
-      // Resolved once, alongside the probe that proved the name spawns, so the
-      // install path never has to re-derive it (or spawn `where`/`which`).
-      binPath: resolveBinAbsolute(bin),
+      // Resolved once (absResolved, above), alongside the probe that proved the
+      // name spawns, so the install path never has to re-derive it (or spawn
+      // `where`/`which`).
+      binPath: absResolved,
       version,
       belowMin: false,
       failure: null,

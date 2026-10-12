@@ -2758,7 +2758,15 @@ function renderOamRuntimeSection(opts: {
     // --version -- appeared only as a raw JSON log line on stderr.
     print(`  binary:  installed but UNUSABLE (${oamFailureLabel(probe.failure)}); servers run on node`);
     if (probe.failureDetail !== null) print(`           detail: ${probe.failureDetail}`);
-    print("           fix: run `oam --version` by hand; OAM_BIN overrides which binary is probed");
+    if (probe.failure === "build-tree") {
+      // The generic fix below ("run `oam --version` by hand") is wrong here:
+      // that binary answers --version fine, which is exactly why it cannot be
+      // told apart from a release by running it. The fix is the PATH/OAM_BIN
+      // choice, spelled out in the detail line.
+      print("           fix: point OAM_BIN (or PATH) at the installed oam, then restart yaw-mcp");
+    } else {
+      print("           fix: run `oam --version` by hand; OAM_BIN overrides which binary is probed");
+    }
   } else if (probe.bin === null) {
     print("  binary:  not installed -- node/npx spawns are used directly");
     // The one branch a reader can act on and the one that used to end without
