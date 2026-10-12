@@ -403,6 +403,67 @@ describe("probeOam default runner", () => {
     }
   });
 
+  it("an injected runner bypasses the build-tree gate (host-independence contract)", async () => {
+    // `run === spawnVersionProbe` is what scopes the refusal to the REAL
+    // spawn path: an injected runner is a stand-in whose answer says nothing
+    // about which file would spawn. Dropping the condition keeps every other
+    // test here green while breaking every embedder and test on a machine
+    // whose PATH carries a build-tree oam -- so it is pinned the other way.
+    const dir = join(tmpdir(), `yaw-mcp-buildtree-injected-${process.pid}`, "target", "release");
+    const bin = join(dir, "oam.exe");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(bin, "");
+    process.env.OAM_BIN = bin;
+    try {
+      const probe = await probeOam(async () => "oam 9.9.9\n");
+      expect(probe.version).toBe("9.9.9");
+      expect(probe.failure).toBeNull();
+    } finally {
+      rmSync(join(tmpdir(), `yaw-mcp-buildtree-injected-${process.pid}`), { recursive: true, force: true });
+    }
+  });
+
+  it("a build-tree refusal is memoized in-process: one warn, second probe silent", async () => {
+    // The warn rides the same once-per-process semantics as the exit/spawn
+    // fallbacks: publish() caches the refusal, so a broker that reconnects
+    // does not re-print it on every connect.
+    const dir = join(tmpdir(), `yaw-mcp-buildtree-memo-${process.pid}`, "target", "release");
+    const bin = join(dir, "oam.exe");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(bin, "");
+    process.env.OAM_BIN = bin;
+    try {
+      const warnLines: string[] = [];
+      vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown): boolean => {
+        warnLines.push(String(chunk));
+        return true;
+      });
+      const first = await probeOam();
+      expect(first.failure).toBe("build-tree");
+      const second = await probeOam();
+      expect(second.failure).toBe("build-tree");
+      expect(warnLines.filter((l) => l.includes("build-tree binary"))).toHaveLength(1);
+    } finally {
+      vi.restoreAllMocks();
+      rmSync(join(tmpdir(), `yaw-mcp-buildtree-memo-${process.pid}`), { recursive: true, force: true });
+    }
+  });
+
+  it("an explicit-but-ABSENT OAM_BIN never reaches the build-tree gate", async () => {
+    // Which branch owns which user error: the build-tree refusal is for a
+    // binary that EXISTS (absResolved non-null). A named-and-missing path
+    // makes resolveBinAbsolute return null, so the gate cannot fire -- the
+    // probe answers as an ordinary success whose binPath is null. (The
+    // broken-config classification of a FAILING spawn is
+    // oam-spawn-probe-log.test.ts's territory; the mocked child here
+    // succeeds, which is the deterministic way to pin the gate boundary.)
+    process.env.OAM_BIN = join(tmpdir(), `yaw-mcp-buildtree-absent-${process.pid}`, "target", "release", "oam.exe");
+    const probe = await probeOam();
+    expect(probe.failure).toBeNull();
+    expect(probe.version).toBe("9.9.9");
+    expect(probe.binPath).toBeNull();
+  });
+
   it("falls back to node when the probe exits non-zero", async () => {
     // A broken install that fails `--version`. Same node fallback as absent,
     // but classified as "exit": it RAN, so the fix is to repair the install
@@ -598,5 +659,35 @@ describe("probeOam per-binary verdict cache (default runner)", () => {
     const second = await probeOam();
     expect(spawnCalls).toHaveLength(1);
     expect(second.version).toBe("9.9.9");
+  });
+
+  it("never records a build-tree REFUSAL either: no dev build is blessed", async () => {
+    // The cache keys on the binary's identity; a verdict from a build-tree
+    // binary certifies nothing (same version string, uncommitted bytes
+    // behind it). The refusal must return before the identity write, so the
+    // next PROCESS probes again instead of reading a blessing that proves
+    // nothing. Same shape as the failed-probe test above, but through the
+    // gate: a REAL build-tree OAM_BIN (exists on disk, path refused), with
+    // persistence ON and a temp home.
+    const { mkdirSync: mk, writeFileSync: wr } = await import("node:fs");
+    const dir = join(home, "buildtree", "target", "release");
+    mk(dir, { recursive: true });
+    wr(join(dir, process.platform === "win32" ? "oam.exe" : "oam"), "");
+    process.env.OAM_BIN = join(dir, process.platform === "win32" ? "oam.exe" : "oam");
+    resetOamBinCache();
+
+    const first = await probeOam();
+    expect(first.failure).toBe("build-tree");
+    // Give a (wrong) write every chance to land before checking for it.
+    await new Promise((r) => setTimeout(r, 50));
+    const { existsSync } = await import("node:fs");
+    expect(existsSync(cacheFile())).toBe(false);
+
+    // And the next process asks the REAL question again: the refusal stands
+    // (path text unchanged), it was not remembered as a version answer.
+    resetOamBinCache();
+    const second = await probeOam();
+    expect(second.failure).toBe("build-tree");
+    expect(spawnCalls).toHaveLength(0);
   });
 });
