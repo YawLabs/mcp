@@ -1354,10 +1354,18 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     // install they already have, and doctor's OAM RUNTIME section plus
     // default-runtime's per-server reason report the same failure. Two wordings
     // is how one report says "unusable" and the next says "not installed".
+    //
+    // build-tree gets its own tail: "Fix or reinstall oam" is the wrong advice
+    // for a dev build -- nothing is broken with it, it is simply not a release,
+    // and reinstalling cannot change what PATH or OAM_BIN names.
     runtimeLines.push(
-      `Runtime: node (oam is installed but unusable: ${oamFailureLabel(oamProbeResult.failure)}` +
-        `${oamProbeResult.failureDetail ? ` -- ${oamProbeResult.failureDetail}` : ""}. Fix or reinstall oam and ` +
-        "re-run install to host yaw-mcp on it.)",
+      oamProbeResult.failure === "build-tree"
+        ? `Runtime: node (${oamFailureLabel(oamProbeResult.failure)}` +
+            `${oamProbeResult.failureDetail ? ` -- ${oamProbeResult.failureDetail}` : ""}. Point OAM_BIN (or PATH) ` +
+            "at the installed oam and re-run install to host yaw-mcp on it.)"
+        : `Runtime: node (oam is installed but unusable: ${oamFailureLabel(oamProbeResult.failure)}` +
+            `${oamProbeResult.failureDetail ? ` -- ${oamProbeResult.failureDetail}` : ""}. Fix or reinstall oam and ` +
+            "re-run install to host yaw-mcp on it.)",
     );
   } else if (!opts.suppressOamAbsentNote) {
     // Plain absence -- binPath and bin both null, not below-min, no failure --
