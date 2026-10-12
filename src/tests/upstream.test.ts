@@ -2768,6 +2768,69 @@ describe("connectToUpstream managed-sidecar default spawn", () => {
     expect((await connectToUpstream(config)).status).toBe("connected");
     expect(_sdkBehavior.stdioConstructions.map((c) => c.command)).toEqual(["/opt/node/bin/node", "npx"]);
   });
+
+  it("pins the namespace to npx when the npx respawn fails a DIFFERENT way", async () => {
+    // Mirror of the oam test: a DIFFERENT ActivationError category still
+    // points at the managed spawn, so the pin is kept -- later connects skip
+    // the failed managed boot entirely.
+    vi.mocked(resolveManagedSpawn).mockReturnValue({ command: "/opt/node/bin/node", args: ["/sidecars/x.js"] });
+    let connects = 0;
+    _sdkBehavior.clientConnect = () => {
+      connects++;
+      // 1st (managed): unclassifiable -> "unknown". 2nd (npx): ENOENT -> "spawn_failure".
+      return Promise.reject(new Error(connects === 1 ? "boot failed" : "spawn npx ENOENT"));
+    };
+    const config = makeLocalConfig({ runtime: "node", command: "npx", args: ["-y", "x"] });
+
+    await expect(connectToUpstream(config)).rejects.toMatchObject({ category: "spawn_failure" });
+    expect(_sdkBehavior.stdioConstructions.map((c) => c.command)).toEqual(["/opt/node/bin/node", "npx"]);
+
+    _sdkBehavior.stdioConstructions = [];
+    vi.mocked(resolveManagedSpawn).mockClear();
+    await expect(connectToUpstream(config)).rejects.toBeInstanceOf(ActivationError);
+    expect(_sdkBehavior.stdioConstructions.map((c) => c.command)).toEqual(["npx"]);
+    expect(vi.mocked(resolveManagedSpawn)).not.toHaveBeenCalled();
+  });
+
+  it("names the managed spawn source on the SUCCESS connect line", async () => {
+    // The only operator-visible trace that a server runs from the managed
+    // tree on the happy path -- pinned here so the shape cannot drift.
+    _sdkBehavior.clientConnect = () => Promise.resolve();
+    resetListHooks();
+    vi.mocked(resolveManagedSpawn).mockReturnValue({ command: "/opt/node/bin/node", args: ["/sidecars/x.js"] });
+
+    await connectToUpstream(makeLocalConfig({ runtime: "node", command: "npx", args: ["-y", "x"] }));
+
+    expect(vi.mocked(log)).toHaveBeenCalledWith("info", "Connected to upstream", {
+      name: "Test Server",
+      namespace: "test",
+      type: "local",
+      runtime: "node",
+      managedSpawn: true,
+    });
+  });
+
+  it("says which runtime the managed downgrade is retrying on", async () => {
+    // Mirror of the oam progress test: the respawn is a second full boot and
+    // the progress line is what makes it legible instead of a second hang.
+    vi.mocked(resolveManagedSpawn).mockReturnValue({ command: "/opt/node/bin/node", args: ["/sidecars/x.js"] });
+    let connects = 0;
+    _sdkBehavior.clientConnect = () => {
+      connects++;
+      return connects === 1 ? Promise.reject(new Error("managed child crashed")) : Promise.resolve();
+    };
+    const messages: string[] = [];
+    await connectToUpstream(
+      makeLocalConfig({ runtime: "node", command: "npx", args: ["-y", "x"] }),
+      undefined,
+      undefined,
+      undefined,
+      (m) => messages.push(m),
+    );
+    expect(
+      messages.some((m) => m.includes("did not boot from the managed sidecar") && m.includes("retrying on npx")),
+    ).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------------------

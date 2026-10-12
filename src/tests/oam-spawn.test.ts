@@ -30,10 +30,12 @@ import {
   packageName,
   parseOamVersion,
   probeOam,
+  resetManagedEntryMemo,
   resetNpmCacheDir,
   resetOamBinCache,
   resetPinnedSidecarLog,
   resolveBinAbsolute,
+  resolveManagedSpawn,
   resolveNpmEntry,
   resolveOamSpawn,
   resolveStableNpmEntry,
@@ -1101,6 +1103,20 @@ describe("rewriteNpmToManagedNode", () => {
     expect(rewriteNpmToManagedNode("npx", ["-y"], deps)).toEqual({ command: "npx", args: ["-y"] });
     expect(rewriteNpmToManagedNode("npx", [], deps)).toEqual({ command: "npx", args: [] });
   });
+
+  it("rewrites a launch that names npx by its Windows shim or absolute path", () => {
+    // nodeLaunchKind matches the BASENAME (npx.cmd, /usr/local/bin/npx), so
+    // the rewrite must too -- a string-equality regression would silently opt
+    // every Windows-configured server out of the managed tree.
+    expect(rewriteNpmToManagedNode("npx.cmd", ["-y", "some-mcp"], deps)).toEqual({
+      command: "/usr/bin/node",
+      args: ["/pkgs/some-mcp/dist/index.js"],
+    });
+    expect(rewriteNpmToManagedNode("/usr/local/bin/npx", ["-y", "some-mcp"], deps)).toEqual({
+      command: "/usr/bin/node",
+      args: ["/pkgs/some-mcp/dist/index.js"],
+    });
+  });
 });
 
 describe("managedNodeBin", () => {
@@ -1144,6 +1160,114 @@ describe("managedNodeBin", () => {
     // A relative PATH entry is refused by resolveBinAbsolute: join would
     // resolve it against the broker's cwd, a coincidence -- not a node.
     expect(managedNodeBin({ PATH: "rel/bin" }, "linux", "/usr/bin/oam")).toBeNull();
+  });
+});
+
+describe("resolveManagedSpawn entry memo", () => {
+  // Real temp dirs, the resolveNpmEntry describe's pattern: every injectable
+  // passed explicitly so the host's real home / npm cache never answers.
+  function fixture(): { root: string; npx: string; managedRoot: string; brokerUrl: string; cleanup: () => void } {
+    const root = mkdtempSync(join(tmpdir(), "managedspawn-"));
+    const npx = join(root, "_npx");
+    const managedRoot = join(root, "managed", "node_modules");
+    mkdirSync(join(npx, "aaa", "node_modules", "@yawlabs", "mcp", "dist"), { recursive: true });
+    mkdirSync(managedRoot, { recursive: true });
+    const brokerUrl = pathToFileURL(join(npx, "aaa", "node_modules", "@yawlabs", "mcp", "dist", "index.js")).href;
+    return { root, npx, managedRoot, brokerUrl, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+  }
+
+  function writePkg(dir: string, json: Record<string, unknown>): void {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "package.json"), JSON.stringify(json));
+    const bin = json.bin;
+    const rel = typeof bin === "string" ? bin : Object.values(bin as Record<string, string>)[0];
+    const entry = join(dir, rel as string);
+    mkdirSync(dirname(entry), { recursive: true });
+    writeFileSync(entry, "");
+  }
+
+  const NODE = "/usr/bin/node";
+  const spawnWith = (brokerUrl: string, managedRoot: string | null) => (args: string[]) =>
+    resolveManagedSpawn("npx", args, brokerUrl, null, managedRoot, NODE);
+
+  beforeEach(() => {
+    resetManagedEntryMemo();
+  });
+
+  it("memoizes a stable managed-tree hit: the entry survives deleting the copy", () => {
+    const { managedRoot, brokerUrl, cleanup } = fixture();
+    const pkgDir = join(managedRoot, "some-mcp");
+    writePkg(pkgDir, { name: "some-mcp", version: "1.0.0", bin: { "some-mcp": "dist/index.js" } });
+    const entry = join(pkgDir, "dist", "index.js");
+    const spawn = spawnWith(brokerUrl, managedRoot);
+    try {
+      expect(spawn(["-y", "some-mcp"])).toEqual({ command: NODE, args: [entry] });
+      // The memo is the only thing that can answer the second call: the disk
+      // copy is gone, and a miss would fall through to npx.
+      rmSync(pkgDir, { recursive: true, force: true });
+      expect(spawn(["-y", "some-mcp"])).toEqual({ command: NODE, args: [entry] });
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("does NOT memoize a miss: a later sidecars install is found without a restart", () => {
+    const { managedRoot, brokerUrl, cleanup } = fixture();
+    const spawn = spawnWith(brokerUrl, managedRoot);
+    try {
+      expect(spawn(["-y", "some-mcp"])).toEqual({ command: "npx", args: ["-y", "some-mcp"] });
+      writePkg(join(managedRoot, "some-mcp"), {
+        name: "some-mcp",
+        version: "1.0.0",
+        bin: { "some-mcp": "dist/index.js" },
+      });
+      expect(spawn(["-y", "some-mcp"])).toEqual({
+        command: NODE,
+        args: [join(managedRoot, "some-mcp", "dist", "index.js")],
+      });
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("does NOT memoize an npx-cache hit: the content-hashed path changes on refresh", () => {
+    const { npx, brokerUrl, cleanup } = fixture();
+    const dir = join(npx, "bbb", "node_modules", "some-mcp");
+    writePkg(dir, { name: "some-mcp", version: "1.0.0", bin: { "some-mcp": "dist/index.js" } });
+    const spawn = spawnWith(brokerUrl, null);
+    try {
+      expect(spawn(["-y", "some-mcp"])).toEqual({ command: NODE, args: [join(dir, "dist", "index.js")] });
+      // A manual `npx -y some-mcp@latest` refresh lands in a NEW hash dir;
+      // memoizing the old path would pin the stale copy forever. The second
+      // call re-resolves -- to a miss once the only copy is gone.
+      rmSync(dir, { recursive: true, force: true });
+      expect(spawn(["-y", "some-mcp"])).toEqual({ command: "npx", args: ["-y", "some-mcp"] });
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("a pinned spec bypasses the memo instead of hosting the memoized wrong version", () => {
+    // The correctness case the bypass exists for: the memo holds the 1.0.0
+    // entry and the spec asks for @2.0.0 -- consulting the memo would host a
+    // build the config did not ask for, the exact failure the pin rule
+    // prevents (satisfiesExactPin).
+    const { managedRoot, brokerUrl, cleanup } = fixture();
+    writePkg(join(managedRoot, "some-mcp"), {
+      name: "some-mcp",
+      version: "1.0.0",
+      bin: { "some-mcp": "dist/index.js" },
+    });
+    const spawn = spawnWith(brokerUrl, managedRoot);
+    try {
+      expect(spawn(["-y", "some-mcp"])).toEqual({
+        command: NODE,
+        args: [join(managedRoot, "some-mcp", "dist", "index.js")],
+      });
+      expect(spawn(["-y", "some-mcp@2.0.0"])).toEqual({ command: "npx", args: ["-y", "some-mcp@2.0.0"] });
+    } finally {
+      cleanup();
+    }
   });
 });
 

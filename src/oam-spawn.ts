@@ -2312,6 +2312,13 @@ export async function resolveOamSpawn(
  */
 const managedEntryMemo = new Map<string, string>();
 
+/** Reset the managed-entry memo (test hook) -- the memo is process-lifetime
+ *  by design, so without this the first test to exercise the real
+ *  resolveManagedSpawn makes every later one order-dependent. */
+export function resetManagedEntryMemo(): void {
+  managedEntryMemo.clear();
+}
+
 /**
  * Apply {@link rewriteNpmToManagedNode} with the production defaults wired --
  * the spawn-time wrapper upstream.ts calls AFTER the oam gate, mirroring
@@ -2320,18 +2327,32 @@ const managedEntryMemo = new Map<string, string>();
  * resolveNpmEntry (managed tree first, then npx caches, pin-aware) and the
  * node binary through {@link managedNodeBin}.
  *
+ * The four injectables default to the production lookups so the caller in
+ * upstream.ts passes exactly (command, args); tests pass fixture values
+ * explicitly -- same pattern as resolveNpmEntry's own tail params, and for
+ * the same reason: a default that read the host's real home or npm cache
+ * would make the memo tests pass or fail on what the developer happens to
+ * have installed.
+ *
  * Exists as a named export so the wiring test has ONE chokepoint to mock,
  * exactly like resolveOamSpawn: upstream.test.ts spreads the real module and
  * stubs the two spawn rewrites, keeping every other helper real.
  */
-export function resolveManagedSpawn(command: string, args: string[]): { command: string; args: string[] } {
+export function resolveManagedSpawn(
+  command: string,
+  args: string[],
+  fromUrl: string = import.meta.url,
+  npmCache: string | null = npmCacheDir(fromUrl),
+  managedRoot: string | null = sidecarsNodeModules(),
+  nodeBin: string | null = managedNodeBin(),
+): { command: string; args: string[] } {
   return rewriteNpmToManagedNode(command, args, {
-    nodeBin: managedNodeBin(),
+    nodeBin,
     resolveEntry: (pkg, wantVersion) => {
-      if (wantVersion !== null) return resolveNpmEntry(pkg, undefined, undefined, undefined, wantVersion);
+      if (wantVersion !== null) return resolveNpmEntry(pkg, fromUrl, npmCache, managedRoot, wantVersion);
       const memoed = managedEntryMemo.get(pkg);
       if (memoed !== undefined) return memoed;
-      const hit = resolveNpmEntry(pkg, undefined, undefined, undefined, null);
+      const hit = resolveNpmEntry(pkg, fromUrl, npmCache, managedRoot, null);
       // The marker check is what makes memoizing safe: a hit FROM an npx
       // cache directory carries the fragment in its own path.
       if (hit !== null && !hit.includes(NPX_CACHE_MARKER)) managedEntryMemo.set(pkg, hit);
