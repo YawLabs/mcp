@@ -618,6 +618,26 @@ describe("addJsoncArrayElement / removeJsoncArrayElements over non-scalar elemen
     );
   });
 
+  // parseJsonc tolerates an unterminated `/*` at end of file; parseTree flags
+  // it but still builds the tree. The array is an array -- it must not be
+  // reported as "a array, not an array".
+  it("appends to an array in a document with a recoverable parse error", () => {
+    const src = '{"permissions":{"allow":["x"]}} /* unterminated';
+    const out = addJsoncArrayElement(src, ["permissions", "allow"], "y");
+    expect(parseJsonc(out)).toEqual({ permissions: { allow: ["x", "y"] } });
+    expect(addJsoncArrayElement(src, ["permissions", "allow"], "x")).toBe(src);
+  });
+
+  // The remove path's half of the case above: it returned `src` unchanged, so
+  // a caller that read the element from `parseJsonc` reported it removed while
+  // the bytes still carried it.
+  it("removes from an array in a document with a recoverable parse error", () => {
+    const src = '{"permissions":{"allow":["x","y"]}} /* unterminated';
+    const out = removeJsoncArrayElements(src, ["permissions", "allow"], (v) => v === "x");
+    expect(parseJsonc(out)).toEqual({ permissions: { allow: ["y"] } });
+    expect(removeJsoncArrayElements(src, ["permissions", "allow"], (v) => v === "z")).toBe(src);
+  });
+
   it("returns the input when a removal's path names no array", () => {
     const src = lf("{", '  "rules": 1', "}", "");
     expect(removeJsoncArrayElements(src, ["rules"], () => true)).toBe(src);

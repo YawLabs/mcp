@@ -1710,8 +1710,12 @@ async function runSecretsRotate(opts: SecretsCommandOptions, io: SecretsIo): Pro
       io.out(
         `Rotated ${count} secret${count === 1 ? "" : "s"} under a new passphrase (encryption re-wrapped, token values unchanged).\n`,
       );
-      io.out("Vault locked -- the next secrets command will prompt for the new passphrase.\n");
+      // No promise of a prompt: with YAW_MCP_VAULT_PASSPHRASE set (the
+      // documented deployment) the next command reads the env, not a TTY.
+      io.out("Vault locked -- the next secrets command needs the NEW passphrase.\n");
     }
+    const envKeyed = opts.passphrase === undefined && (process.env.YAW_MCP_VAULT_PASSPHRASE ?? "").length > 0;
+    rotateVaultNudge(io, path, opts.json, envKeyed);
     return { exitCode: 0 };
   } finally {
     // Zero this command's copy of the OLD key on every exit, including the
@@ -1907,6 +1911,37 @@ function resetVaultNudge(io: SecretsIo, path: string, json: boolean | undefined,
     "  `yaw-mcp doctor` reports whether the passphrase it can see unlocks the vault.",
   ];
   io.err(`yaw-mcp secrets: the vault at ${path} was reset.\n${lines.join("\n")}\n`);
+}
+
+/** rotate's counterpart to resetVaultNudge: the same two holders of the OLD
+ *  passphrase survive a rotation. A YAW_MCP_VAULT_PASSPHRASE still set to the
+ *  old value is fed to the next command without a prompt and fails unlock
+ *  with the wrong-passphrase message (which points at `reset`), and a running
+ *  yaw-mcp server re-derives from its old value because the salt changed. */
+function rotateVaultNudge(io: SecretsIo, path: string, json: boolean | undefined, envKeyed: boolean): void {
+  if (json) {
+    io.err(
+      `${JSON.stringify({
+        warning: "vault-rotated",
+        path,
+        passphrase_source: envKeyed ? "env" : "prompt",
+        hint: "Update YAW_MCP_VAULT_PASSPHRASE to the new passphrase wherever it is set (this shell, a shell profile, any client config `env` block) -- the old value no longer unlocks the vault. A running yaw-mcp server keeps the passphrase it started with -- restart it (restart your MCP client). `yaw-mcp doctor` reports whether the passphrase it sees unlocks the vault.",
+      })}\n`,
+    );
+    return;
+  }
+  const lines = [
+    envKeyed
+      ? "  YAW_MCP_VAULT_PASSPHRASE in THIS shell still holds the OLD passphrase -- set it to the new one"
+      : "  A YAW_MCP_VAULT_PASSPHRASE in a shell profile or a client config `env` block still holds the",
+    envKeyed
+      ? "  before the next secrets command, and update any shell profile or client config `env` block too."
+      : "  OLD passphrase -- update it to the new one.",
+    "  A yaw-mcp server that is already running keeps the passphrase it started with and can no longer",
+    "  open the vault with it: restart it (restart your MCP client).",
+    "  `yaw-mcp doctor` reports whether the passphrase it can see unlocks the vault.",
+  ];
+  io.err(`yaw-mcp secrets: the vault at ${path} was re-keyed under a new passphrase.\n${lines.join("\n")}\n`);
 }
 
 /**

@@ -177,8 +177,18 @@ describe("readLineFromTTY -- raw mode unavailable", () => {
     stdin.setRawMode = () => {
       throw new Error("EIO: i/o error, setRawMode");
     };
-    const { stream } = fakeStdout();
+    const { stream, text } = fakeStdout();
     expect(await readLineFromTTY(asStream(stdin), stream, "? ", true)).toBe("y");
+    // Cooked mode: the terminal already echoed "y" and the Enter, so the
+    // reader writes only the prompt -- echoing again showed the answer twice.
+    expect(text()).toBe("? ");
+  });
+
+  it("an echo read in raw mode still writes the answer and the newline back", async () => {
+    const stdin = new FakeTTYStdin(["y\r"]);
+    const { stream, text } = fakeStdout();
+    expect(await readLineFromTTY(asStream(stdin), stream, "? ", true)).toBe("y");
+    expect(text()).toBe("? y\n");
   });
 });
 

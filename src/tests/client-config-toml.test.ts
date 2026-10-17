@@ -2705,6 +2705,11 @@ describe("root keys -- one top-level line, added and never changed", () => {
     expect(() => insertTomlRootKey(null, "x", 1e21)).toThrow(
       `the top-level "x" read back as the float 1e+21, where the value written is an integer`,
     );
+    // On a FLOAT_FIELDS key too: exponent form takes no `.0` (`1e+21.0` does
+    // not parse), so the refusal names the field rather than a parse error.
+    expect(() => insertTomlRootKey(null, TIMEOUT, 1e21)).toThrow(
+      `the top-level "${TIMEOUT}" read back as the float 1e+21, where the value written is an integer`,
+    );
     // The integer 60 spelled as an integer is what the rule asks for, on that
     // key as on any other.
     expect(() => verifyTomlRootInsert("", lf(`${TIMEOUT} = 60`), TIMEOUT, 60)).not.toThrow();

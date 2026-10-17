@@ -1,7 +1,7 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.YawLabs/mcp",
-  "description": "One install, every MCP server, managed from yaw.sh/mcp. Runs locally: no account, no sign-in.",
+  "description": "MCP gateway: one local install fronts every MCP server for Claude Code, Cursor, and VS Code.",
   "version": "1.1.1",
   "packages": [
     {

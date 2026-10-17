@@ -688,14 +688,6 @@ function callTimeout(): number {
   return callTimeoutMs;
 }
 
-// `text` is OPTIONAL on the items this returns, and that is not pedantry: on
-// the success path the body is whatever the upstream sent, and MCP content
-// blocks include image / audio / resource_link / embedded-resource shapes that
-// carry no `text` at all. Declaring `text: string` told every consumer
-// (server.ts books health, prunes, grades and $ref-binds off these) that a
-// string was always there, so `content[0].text` type-checked and handed them
-// `undefined` at runtime on any non-text tool result. The two fault paths and
-// the catch below do always produce text; the union is what the union has.
 /** One upstream progress notification, as the SDK hands it to `onprogress`. */
 export interface UpstreamProgress {
   progress: number;
@@ -729,6 +721,14 @@ export interface RouteToolCallOptions {
   onprogress?: (p: UpstreamProgress) => void;
 }
 
+// `text` is OPTIONAL on the items this returns, and that is not pedantry: on
+// the success path the body is whatever the upstream sent, and MCP content
+// blocks include image / audio / resource_link / embedded-resource shapes that
+// carry no `text` at all. Declaring `text: string` told every consumer
+// (server.ts books health, prunes, grades and $ref-binds off these) that a
+// string was always there, so `content[0].text` type-checked and handed them
+// `undefined` at runtime on any non-text tool result. The two fault paths and
+// the catch below do always produce text; the union is what the union has.
 export async function routeToolCall(
   toolName: string,
   args: Record<string, unknown>,

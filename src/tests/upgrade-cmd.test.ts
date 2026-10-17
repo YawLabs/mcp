@@ -665,6 +665,27 @@ describe("localInstallRoot", () => {
     expect(localInstallRoot("/home/jeff/yaw/yaw-mcp/dist/index.js")).toBeNull();
     expect(localInstallRoot(undefined)).toBeNull();
   });
+
+  it("falls back to the realpath for a shim outside the tree, whose literal path has no node_modules segment", () => {
+    expect(localInstallRoot("/home/u/bin/yaw-mcp", () => "/proj/node_modules/@yawlabs/mcp/dist/index.js")).toBe(
+      "/proj",
+    );
+  });
+
+  it("prefers the literal path and never realpaths it when it already names a tree", () => {
+    const realpath = vi.fn(() => "/elsewhere/node_modules/@yawlabs/mcp/dist/index.js");
+    expect(localInstallRoot("/proj/app/node_modules/.bin/yaw-mcp", realpath)).toBe("/proj/app");
+    expect(realpath).not.toHaveBeenCalled();
+  });
+
+  it("returns null when the realpath fails or also lacks a node_modules segment", () => {
+    expect(
+      localInstallRoot("/home/u/bin/yaw-mcp", () => {
+        throw new Error("ENOENT");
+      }),
+    ).toBeNull();
+    expect(localInstallRoot("/home/u/bin/yaw-mcp", () => "/home/u/src/yaw-mcp/dist/index.js")).toBeNull();
+  });
 });
 
 describe("runningPackageDir -- the copy that is RUNNING, as opposed to the tree npm runs in", () => {
@@ -1652,6 +1673,49 @@ describe("runUpgrade", () => {
         command: "npm install @yawlabs/mcp@latest",
         cwd: "/proj/app",
       });
+    });
+
+    // A shim OUTSIDE the tree: the literal argv[1] has no node_modules
+    // segment, detectInstallMethod's realpath pass still says
+    // local-node-modules, and the root must come from that same realpath.
+    const outOfTreeShim = {
+      argvPath: "/home/u/bin/yaw-mcp",
+      realpath: (p: string) => {
+        if (p === "/home/u/bin/yaw-mcp") return "/proj/app/node_modules/@yawlabs/mcp/dist/index.js";
+        throw new Error(`ENOENT: ${p}`);
+      },
+    };
+
+    it("--json reports the realpath's root for a shim outside the tree", async () => {
+      const io = captureIO();
+      await runUpgrade({
+        json: true,
+        currentVersion: "0.40.0",
+        ...outOfTreeShim,
+        fetchLatest: async () => "0.45.0",
+        out: io.push,
+        err: io.pushErr,
+      });
+      expect(JSON.parse(io.out.join("\n"))).toMatchObject({ method: "local-node-modules", cwd: "/proj/app" });
+    });
+
+    it("--run spawns in the realpath's root for a shim outside the tree (not exit 2)", async () => {
+      const io = captureIO();
+      const spawned: Array<{ cmd: string; args: string[]; cwd?: string }> = [];
+      const r = await runUpgrade({
+        run: true,
+        currentVersion: "0.40.0",
+        ...outOfTreeShim,
+        fetchLatest: async () => "0.45.0",
+        spawnImpl: async (cmd, args, cwd) => {
+          spawned.push({ cmd, args, cwd });
+          return 0;
+        },
+        out: io.push,
+        err: io.pushErr,
+      });
+      expect(r.exitCode).toBe(0);
+      expect(spawned).toEqual([{ cmd: "npm", args: ["install", "@yawlabs/mcp@latest"], cwd: "/proj/app" }]);
     });
 
     it("--json reports cwd: null for a method whose command runs anywhere", async () => {

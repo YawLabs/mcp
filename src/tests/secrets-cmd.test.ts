@@ -2449,8 +2449,10 @@ describe("runSecrets rotate -- the success path re-keys EVERY entry", () => {
     const r = await runSecrets({ action: "rotate", passphrase: ROT_PASS, newPassphrase: ROT_NEW, home }, io);
     expect(r.exitCode).toBe(0);
     expect(outText()).toContain("Rotated 3 secrets");
-    // rotate drops the derived key, so the very next command re-prompts.
-    expect(outText()).toContain("Vault locked");
+    // rotate drops the derived key, so the very next command must re-derive
+    // under the NEW passphrase (from a prompt, or from the env if set).
+    expect(outText()).toContain("Vault locked -- the next secrets command needs the NEW passphrase");
+    expect(outText()).not.toContain("will prompt");
     expect(isUnlocked()).toBe(false);
 
     const after = JSON.parse(readFileSync(vaultPath(home), "utf8")) as VaultFile;
@@ -2493,6 +2495,7 @@ describe("runSecrets rotate -- the success path re-keys EVERY entry", () => {
     }
     lock();
     io.out.mockReset();
+    io.err.mockReset();
     const r = await runSecrets(
       { action: "rotate", passphrase: ROT_PASS, newPassphrase: ROT_NEW, home, json: true },
       io,
@@ -2500,6 +2503,33 @@ describe("runSecrets rotate -- the success path re-keys EVERY entry", () => {
     expect(r.exitCode).toBe(0);
     expect(JSON.parse(outText())).toEqual({ ok: true, rotated: true, secret_count: 3 });
     expect(outText()).not.toContain("Vault locked");
+    // The stale-passphrase nudge rides err as one JSON line, like reset's.
+    const errLines = io.err.mock.calls
+      .map((c) => c[0] as string)
+      .join("")
+      .split("\n")
+      .filter((l) => l.length > 0)
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+    expect(errLines).toEqual([
+      expect.objectContaining({ warning: "vault-rotated", path: vaultPath(home), passphrase_source: "prompt" }),
+    ]);
+  });
+
+  it("with YAW_MCP_VAULT_PASSPHRASE set, the nudge says the env still holds the OLD passphrase and to restart a running server", async () => {
+    // The documented deployment: the env carries the current passphrase. After
+    // rotate it is stale and the next command reads it without prompting, so
+    // the success path must say so instead of promising a prompt.
+    await runSecrets({ action: "set", name: "ONLY", value: "v", passphrase: ROT_PASS, home }, io);
+    lock();
+    io.out.mockReset();
+    io.err.mockReset();
+    process.env.YAW_MCP_VAULT_PASSPHRASE = ROT_PASS;
+    const r = await runSecrets({ action: "rotate", newPassphrase: ROT_NEW, home, io: nonTTYIo() }, io);
+    expect(r.exitCode).toBe(0);
+    const err = io.err.mock.calls.map((c) => c[0] as string).join("");
+    expect(err).toContain("YAW_MCP_VAULT_PASSPHRASE in THIS shell still holds the OLD passphrase");
+    expect(err).toContain("restart it (restart your MCP client)");
+    expect(outText()).not.toContain("will prompt");
   });
 
   it("takes the NEW passphrase from YAW_MCP_VAULT_PASSPHRASE_NEW, warning when it is too short", async () => {
@@ -4607,8 +4637,9 @@ describe("runSecrets --json -- every stderr line is a JSON object", () => {
     );
     expect(r.exitCode).toBe(0);
     const lines = errLines();
-    expect(lines).toHaveLength(1);
+    expect(lines).toHaveLength(2);
     expect(lines[0]).toMatchObject({ warning: "short-passphrase", subject: "the new passphrase", min_length: 12 });
+    expect(lines[1]).toMatchObject({ warning: "vault-rotated" });
     expect(JSON.parse(outText())).toMatchObject({ ok: true, rotated: true });
   });
 
@@ -4715,7 +4746,7 @@ describe("runSecrets --json -- every stderr line is a JSON object", () => {
       ["set", { action: "set", name: "OTHER", value: "v", passphrase: PASS }],
       ["remove", { action: "remove", name: "GH", force: true, passphrase: PASS, io: nonTTYIo() }],
       ["rotate", { action: "rotate", passphrase: PASS, newPassphrase: "a-brand-new-long-passphrase" }],
-    ] as const)("%s --json succeeds with the warning as a JSON line, and nothing reaches process.stderr", async (_a, opts) => {
+    ] as const)("%s --json succeeds with the warning as a JSON line, and nothing reaches process.stderr", async (a, opts) => {
       const r = await runSecrets({ ...opts, home, json: true }, io);
       expect(r.exitCode).toBe(0);
       expect(stderrWrites).toEqual([]);
@@ -4725,6 +4756,8 @@ describe("runSecrets --json -- every stderr line is a JSON object", () => {
           path: vaultPath(home),
           message: expect.stringContaining("Vault verification token is malformed"),
         },
+        // rotate's stale-passphrase nudge is a JSON line too.
+        ...(a === "rotate" ? [expect.objectContaining({ warning: "vault-rotated", path: vaultPath(home) })] : []),
       ]);
       expect(JSON.parse(outText())).toMatchObject({ ok: true });
     });

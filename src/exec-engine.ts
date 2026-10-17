@@ -68,6 +68,9 @@ export function parseRefPath(raw: string): Array<string | number> | null {
       if (i < raw.length && raw[i] !== "." && raw[i] !== "[") return null;
       continue;
     }
+    // A stray `]` with no opener is the other half of "unbalanced brackets":
+    // accumulating it would turn `a]` into a step id `a]` instead of null.
+    if (ch === "]") return null;
     current += ch;
     lastWasBracket = false;
     i++;

@@ -528,10 +528,6 @@ function scoreAgainstIndex(queryTerms: string[], index: RankingIndex): RankedRes
   return results;
 }
 
-// Rank a list of servers against a free-text query. Returns results sorted
-// descending by score, only including entries with score > 0 (matches at
-// least one query term in some field). Zero-score servers are omitted so
-// the caller can cleanly tell "no match" from "weak match".
 /** One tool, ranked across every configured server. */
 export interface RankedTool {
   namespace: string;
@@ -615,6 +611,10 @@ export function rankTools(query: string, servers: RankableServer[]): RankedTool[
   );
 }
 
+// Rank a list of servers against a free-text query. Returns results sorted
+// descending by score, only including entries with score > 0 (matches at
+// least one query term in some field). Zero-score servers are omitted so
+// the caller can cleanly tell "no match" from "weak match".
 export function rankServers(context: string, servers: RankableServer[]): RankedResult[] {
   // Identifier floor on the query, not the prose floor: "use pg" has to
   // survive tokenization or the short-namespace fix on the document side is

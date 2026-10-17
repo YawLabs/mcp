@@ -1,7 +1,7 @@
 // `yaw-mcp completion <shell>` — prints a shell completion script to
 // stdout. Every decent CLI has this; surfacing it as a first-class
 // subcommand means a user can one-line it into their completions dir
-// (the install instructions render right below the script for each
+// (the install instructions render at the top of the script for each
 // shell, commented out so they're preserved but don't pollute the
 // sourced file).
 //

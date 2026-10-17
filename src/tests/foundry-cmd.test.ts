@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { FOUNDRY_FILENAME } from "../foundry.js";
 import { DEFAULT_OUT, defaultLoadServers, FOUNDRY_USAGE, parseFoundryArgs, runFoundryExport } from "../foundry-cmd.js";
@@ -9,6 +9,7 @@ import { localBundlesPath } from "../local-bundles.js";
 import { CONFIG_DIRNAME, userConfigDir } from "../paths.js";
 import { STATE_SCHEMA_VERSION, statePath } from "../persistence.js";
 import type { RankableServer } from "../relevance.js";
+import { FOUNDRY_FIXTURE, REPO_ROOT } from "./foundry-fixture.js";
 
 const SERVERS: RankableServer[] = [
   { namespace: "github", name: "GitHub", description: "issues pull requests", tools: [{ name: "create_issue" }] },
@@ -28,6 +29,14 @@ describe("parseFoundryArgs", () => {
       expect(p.options.out).toBe(DEFAULT_OUT);
       expect(p.options.json).toBe(false);
     }
+  });
+
+  it("DEFAULT_OUT names the same file the routing gate loads", () => {
+    // foundry-routing.test.ts loads FOUNDRY_FIXTURE, not DEFAULT_OUT, so this
+    // is the one place the two are tied together. Both sides import the gate's
+    // path from foundry-fixture.ts, so moving either the gate's fixture or
+    // DEFAULT_OUT alone fails here.
+    expect(resolve(REPO_ROOT, DEFAULT_OUT)).toBe(resolve(FOUNDRY_FIXTURE));
   });
 
   it("flags --help with a `help` discriminant rather than by the error string", () => {

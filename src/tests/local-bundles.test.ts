@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { IMPORT_USAGE } from "../import-cmd.js";
 import {
   BUNDLES_FILENAME,
   BUNDLES_LOCK_NAME,
@@ -327,6 +328,18 @@ describe("loadLocalBundles", () => {
     });
     const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
     expect(r.config?.servers[0].type).toBe("remote");
+  });
+
+  it("treats an unrecognised type (VS Code's 'http') as unset for the inference, and warns", async () => {
+    // Inferring only on an ABSENT key loaded this as "local" while
+    // isRemoteEntry called it remote -- the disagreement, with no warning.
+    writeBundles(synthHome, {
+      version: 1,
+      servers: [{ namespace: "vsc", name: "VSC", type: "http", url: "https://x.test/mcp" }],
+    });
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(r.config?.servers[0].type).toBe("remote");
+    expect(r.warnings.some((w) => w.includes('invalid type "http"') && w.includes('"vsc"'))).toBe(true);
   });
 
   it("an explicit type wins over the inference", async () => {
@@ -1309,6 +1322,24 @@ describe("upsertUserBundle merges onto the stored entry", () => {
     expect(res.entry.env).toEqual({ TOKEN: "secret", STILL_REQUIRED: "" });
   });
 
+  it("drops optionalEnvKeys with env when a stdio entry is converted to remote", async () => {
+    // The marker names env's blank seeds; the conversion deletes env, so a
+    // kept marker would describe seeds the remote entry no longer has.
+    writeBundles(synthHome, {
+      version: 1,
+      servers: [
+        { namespace: "gh", name: "GH", command: "npx", env: { OPT: "" }, optionalEnvKeys: ["OPT"], isActive: true },
+      ],
+    });
+    await upsertUserBundle(
+      { namespace: "gh", name: "GH", type: "remote", url: "https://x.test/mcp", isActive: true },
+      { home: synthHome },
+    );
+    expect(stored().url).toBe("https://x.test/mcp");
+    expect(stored().env).toBeUndefined();
+    expect(stored().optionalEnvKeys).toBeUndefined();
+  });
+
   it("leaves no empty env husk when the last required key is dropped", async () => {
     writeBundles(synthHome, {
       version: 1,
@@ -1800,7 +1831,7 @@ describe("bundlesSignature", () => {
 // there -- Node maps the mode to the read-only attribute alone -- so an
 // unqualified "file mode 0600" told half the users something untrue about
 // where their plaintext credential ended up. The write path is POSIX-gated
-// (see doUpsertUserBundle); this pins the DOC to the same platform split.
+// (see writeBundlesFile); this pins the DOC to the same platform split.
 describe("the README's 0600 claim names the platform it is true on", () => {
   it("qualifies the bundles.json mode claim rather than stating it flatly", () => {
     const readme = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "README.md"), "utf8");
@@ -1810,5 +1841,22 @@ describe("the README's 0600 claim names the platform it is true on", () => {
     expect(sentence).toContain("0600");
     // The half that was missing: Windows does not get that mode.
     expect(sentence).toMatch(/Windows/);
+  });
+
+  // Every mention, not just the first: the import paragraph carried a second,
+  // unqualified "file mode 0600" after the first sentence had been fixed.
+  it("qualifies EVERY 0600 mention in the README", () => {
+    const readme = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "README.md"), "utf8");
+    const hits = [...readme.matchAll(/0600/g)].map((m) => m.index ?? 0);
+    expect(hits.length, "no 0600 mention found; re-point this guard").toBeGreaterThan(1);
+    for (const at of hits) {
+      expect(readme.slice(at, at + 200), `README 0600 mention at offset ${at} names no platform`).toMatch(/Windows/);
+    }
+  });
+
+  it("IMPORT_USAGE qualifies the same claim", () => {
+    const idx = IMPORT_USAGE.indexOf("file mode 0600");
+    expect(idx, "the import 0600 sentence moved; re-point this guard").toBeGreaterThan(-1);
+    expect(IMPORT_USAGE.slice(idx, idx + 120)).toMatch(/Windows/);
   });
 });

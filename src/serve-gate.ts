@@ -16,6 +16,8 @@
 // dispatches at import time and cannot be imported by a test. This decision
 // is the part worth pinning, so it lives where it can be called directly.
 
+import { isFeatureEnabled } from "./opt-out-env.js";
+
 /** Escape hatch for the one case the TTY heuristic gets wrong on purpose: a
  *  human who really does want to hand-feed JSON-RPC to the server from a
  *  terminal (or a supervisor that spawns it under a PTY). Documented in the
@@ -49,10 +51,12 @@ hand -- set ${STDIO_OVERRIDE_ENV}=1.
 /**
  * Serve, or explain and stop.
  *
- * `isTTY === true` is the whole test, and it is deliberately the STRICT
- * comparison every other TTY check in this repo uses (secrets-cmd.ts,
- * local-add-cmd.ts): Node leaves `isTTY` UNDEFINED for a pipe, a socket, a
- * file and /dev/null, and sets it to true only for a character device
+ * `isTTY === true` is the whole test: the same undefined-is-not-a-TTY rule
+ * every other TTY check in this repo applies, whether spelled as this strict
+ * comparison (secrets-cmd.ts, trust-cmd.ts) or as Boolean() coercion
+ * (local-add-cmd.ts and the other *-cmd.ts prompts), which has the identical
+ * truth table for boolean|undefined. Node leaves `isTTY` UNDEFINED for a
+ * pipe, a socket, a file and /dev/null, and sets it to true only for a character device
  * attached to a terminal. So no MCP client launch can land in the explain
  * branch -- the SDK's StdioClientTransport spawns with `stdio: pipe`, and
  * every other stdin shape a supervisor might hand us (a file, a closed fd,
@@ -68,11 +72,10 @@ hand -- set ${STDIO_OVERRIDE_ENV}=1.
  * did allocate a PTY has a one-variable fix rather than a dead end.
  */
 export function decideServeMode(stdin: TtyProbe | undefined, env: NodeJS.ProcessEnv): ServeDecision {
-  // Trimmed before the compare, for the cmd.exe reason the auto-load gate
-  // documents in server.ts: `set YAW_MCP_STDIO=1 && yaw-mcp` keeps the space
-  // before `&&`, so the value arrives as "1 " and an exact match would drop
-  // an override the user did set.
-  if (env[STDIO_OVERRIDE_ENV]?.trim() === "1") return { kind: "serve" };
+  // The shared opt-in parser: trimmed, so cmd.exe's `set YAW_MCP_STDIO=1 &&
+  // yaw-mcp` (value "1 ") still counts, and `1`/`true` are the on spellings,
+  // the same as every other YAW_MCP_* opt-in.
+  if (isFeatureEnabled(STDIO_OVERRIDE_ENV, env)) return { kind: "serve" };
   if (stdin?.isTTY !== true) return { kind: "serve" };
   return { kind: "explain", text: EXPLAINER };
 }

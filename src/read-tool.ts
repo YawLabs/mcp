@@ -75,8 +75,16 @@ export function formatReadToolOutput(result: ReadToolResult): string {
   }
   if (!loaded) {
     lines.push("");
+    // Both routes the read_tool description offers. Exec is not a
+    // second-best: for a client that never re-lists tools mid-session
+    // (NO_RELIST_CLIENTS in server.ts), activate-then-call fails in the
+    // client, and an exec step by name is the route that works there --
+    // but only for a server whose tool list is CACHED. Exec resolves a
+    // name through loaded or cached tools and fails the step otherwise,
+    // and the transient read that renders this note writes no tool cache,
+    // so the clause stays conditional rather than promising a load.
     lines.push(
-      `Note: "${server.namespace}" is not currently loaded. Call mcp_connect_activate({ server: "${server.namespace}" }) before invoking this tool.`,
+      `Note: "${server.namespace}" is not currently loaded. Call mcp_connect_activate({ server: "${server.namespace}" }) before invoking this tool, or call it by name from an mcp_connect_exec step (exec loads a server whose tools are cached; otherwise activate it first).`,
     );
   }
   return lines.join("\n");

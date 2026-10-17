@@ -96,6 +96,13 @@ describe("formatReadToolOutput", () => {
     });
     expect(text).toContain("not currently loaded");
     expect(text).toContain('mcp_connect_activate({ server: "gh" })');
+    // The exec route too: for a non-relisting client it is the only one
+    // that works, and read_tool's own description offers it as a peer.
+    expect(text).toContain("mcp_connect_exec");
+    // Exec only reaches a server whose tools are cached (a never-loaded one
+    // fails the step), so the note must not promise an unconditional load.
+    expect(text).toContain("exec loads a server whose tools are cached; otherwise activate it first");
+    expect(text).not.toContain("exec loads the server on first use");
   });
 
   it("omits the description line when the tool has no description", () => {

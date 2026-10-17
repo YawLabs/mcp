@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 vi.mock("../logger.js", () => ({ log: vi.fn() }));
 
 import { log } from "../logger.js";
-import { INTENT_MAX } from "../reward-grader.js";
+import { INTENT_MAX, TOOL_NAME_MAX } from "../reward-grader.js";
 import {
   AGGRESSIVE_AMBIGUITY_THRESHOLD,
   BEST_OF_N_TEMPERATURE,
@@ -136,6 +136,15 @@ describe("buildTiebreakPrompt", () => {
     expect(prompt).not.toContain("d".repeat(CANDIDATE_DESCRIPTION_MAX + 1));
     // An in-bounds description passes through untouched, no marker.
     expect(prompt).toContain("gitlab -- short\n");
+  });
+
+  it("caps each tool name at TOOL_NAME_MAX: names are third-party data with no bound of their own", () => {
+    const prompt = buildTiebreakPrompt("x", [
+      { namespace: "github", score: 1, tools: [{ name: "n".repeat(TOOL_NAME_MAX + 500) }, { name: "list_prs" }] },
+      { namespace: "gitlab", score: 0.95, tools: [] },
+    ]);
+    expect(prompt).toContain(`tools: ${"n".repeat(TOOL_NAME_MAX)}..., list_prs`);
+    expect(prompt).not.toContain("n".repeat(TOOL_NAME_MAX + 1));
   });
 });
 

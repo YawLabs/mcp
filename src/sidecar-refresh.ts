@@ -166,7 +166,7 @@ export const SIDECAR_REFRESH_THROTTLE_MS = 24 * 60 * 60 * 1000;
  *  bounded couple of seconds and then read as "unknown", not hold a socket and
  *  a timer open behind a long-lived server process. The probes run in parallel,
  *  so N packages cost ONE budget, not N. */
-export const SIDECAR_REGISTRY_TIMEOUT_MS = 2000;
+const SIDECAR_REGISTRY_TIMEOUT_MS = 2000;
 
 /** How long past its cheap gates the check sleeps before it probes the
  *  registry or touches the tree. server.ts fires maybeRefreshSidecars the
@@ -190,7 +190,7 @@ export const SIDECAR_REFRESH_START_DELAY_MS = 60 * 1000;
  *  re-reads the file through that loader), so the next debounced save would
  *  erase a timestamp written behind its back anyway. install-nudge hit
  *  the same wall and reached the same answer -- its own small file. */
-export const SIDECAR_REFRESH_STATE_FILENAME = "sidecar-refresh-state.json";
+const SIDECAR_REFRESH_STATE_FILENAME = "sidecar-refresh-state.json";
 
 /** Absolute path to the throttle-state file inside `~/.yaw-mcp/`. */
 export function sidecarRefreshStatePath(home: string = homedir()): string {

@@ -350,8 +350,8 @@ export interface DoctorJsonSnapshot {
    *  whether a passphrase is available. `passphraseSet` is a boolean and
    *  `entries` holds names only -- no secret value, and no passphrase, ever
    *  appears in this snapshot. Mirrors the text path's SECRET VAULT section
-   *  (which is omitted when there is no vault, no refs and no plaintext
-   *  credential; the JSON block is
+   *  (which is omitted when there is no vault, no refs, no malformed ref and
+   *  no plaintext credential; the JSON block is
    *  always present so consumers can read it unconditionally).
    *
    *  Declared as the collector's own type, not re-spelled here: the emitted
@@ -578,8 +578,8 @@ export interface ClientProbeResult {
   scope: InstallScope;
   path: string;
   /** Where inside the file this slot's entry lives (`mcpServers`;
-   *  `projects[<dir>].mcpServers` for Claude Code's local scope;
-   *  for Codex CLI).
+   *  `servers` for VS Code; `projects[<dir>].mcpServers` for Claude Code's
+   *  local scope; `mcp_servers` for Codex CLI).
    *
    *  Carried because `path` alone does not identify an ENTRY. Two scopes can
    *  read the same file and mean DIFFERENT entries (Claude Code user vs
@@ -724,7 +724,10 @@ export interface ClientProbeResult {
    *  Additive JSON field. */
   unavailableReason?: string;
   /** An absolute launch `command` in the entry that no longer exists on disk,
-   *  or null. Only absolute paths are checked -- a bare "npx"/"cmd" is
+   *  or null. For an oam launch behind a wrapper (`cmd /d /s /c <oam> ...`,
+   *  `sh -c "<oam> ..."`) the unwrapped absolute oam binary is checked too,
+   *  since there `command` is only the wrapper. Only absolute paths are
+   *  checked -- a bare "npx"/"cmd" is
    *  PATH-resolved and cannot be verified cheaply. This catches the failure
    *  mode an absolute entry introduces: `install` can write a path (an oam
    *  binary, a global node_modules entry), and if that later moves or is
@@ -1927,8 +1930,9 @@ export interface VaultStatus {
   checkMarkerCorrupt: boolean;
   /** Servers whose configured env carries `${secret:NAME}` refs. */
   refs: Array<{ namespace: string; secretNames: string[] }>;
-  /** Servers whose credential map carries a ${secret:...} span that does not parse (env for a local server, headers for a remote one).
-   *  parse (a space in the name, a missing `}`), each as secrets-vault's
+  /** Servers whose credential map (env for a local server, headers for a
+   *  remote one) carries a ${secret:...} span that does not parse (a space in
+   *  the name, a missing `}`), each as secrets-vault's
    *  bounded display form of the span -- never the raw env value.
    *  resolveServerEnv refuses these spawns exactly as it does a missing name,
    *  and without this line the section said "no server env references
@@ -2193,8 +2197,9 @@ async function collectVaultStatus(opts: {
  *  which doctor -- running as its own process from a shell -- cannot see. A
  *  warning would take a perfectly healthy machine to exit 2.
  *
- *  Omitted entirely when there is no vault, nothing references one, and no
- *  server carries a plaintext credential that could move into one. */
+ *  Omitted entirely when there is no vault, nothing references one, no server
+ *  carries a malformed ${secret:...} ref, and no server carries a plaintext
+ *  credential that could move into one. */
 function renderVaultSection(opts: {
   status: VaultStatus;
   print: (s?: string) => void;
@@ -2306,7 +2311,7 @@ function renderVaultSection(opts: {
     print(`  missing:    referenced but not stored -- ${status.missing.join(", ")}`);
     print("              store each with `yaw-mcp secrets set <name>`");
   }
-  if (status.plaintext.length > 0) renderPlaintextCredentials(status, print);
+  if (status.plaintext.length > 0) renderPlaintextCredentials(status, print, opts.os);
   print("");
 }
 
@@ -2354,8 +2359,19 @@ function suggestSecretName(p: VaultStatus["plaintext"][number], key: string): { 
 function renderPlaintextCredentials(
   status: Pick<VaultStatus, "plaintext" | "bundlesPath" | "bundlesUserGlobal">,
   print: (s?: string) => void,
+  os: InstallOS,
 ): void {
   const userGlobal = status.bundlesUserGlobal;
+  // Whether a pasteable line single-quoted a value. The quotes are what stop
+  // bash, zsh and PowerShell expanding `${secret:NAME}` to nothing, but
+  // cmd.exe keeps them as part of the value (`set` stores it verbatim), so on
+  // Windows the block ends with the same caveat `add --env`'s help gives.
+  // Tracked per shape: an `env.KEY='${secret:NAME}'` value has no space, so
+  // cmd.exe users can drop the quotes; the `--header 'KEY: ...'` re-add has a
+  // space after the colon, so dropping them would split it into two argv
+  // tokens -- cmd.exe needs double quotes there instead.
+  let envQuoted = false;
+  let headerQuoted = false;
   // Per-line label: the full path once in the header, then "bundles.json" for
   // the user-global file and the full path again for a project file, so a
   // hand-edit line can never be read as pointing at the global file.
@@ -2391,6 +2407,7 @@ function renderPlaintextCredentials(
       const { name, stored } = suggestSecretName(p, key);
       const ref = `\${secret:${name}}`;
       if (p.channel === "env" && userGlobal) {
+        envQuoted = true;
         if (stored) {
           print(`      yaw-mcp set ${p.namespace} env.${key}='${ref}'`);
           print(`        (first \`yaw-mcp secrets set ${name}\` if the stored value is not this one)`);
@@ -2414,6 +2431,7 @@ function renderPlaintextCredentials(
           // its kind want the bare key, and "Bearer <key>" there is rejected.
           const example = CREDENTIAL_HEADER_NAMES.has(key.toLowerCase()) ? `Bearer ${ref}` : ref;
           // The re-add only for the user-global file: `add` writes there too.
+          if (userGlobal) headerQuoted = true;
           print(
             userGlobal
               ? `        (e.g. "${example}"), or re-add with \`yaw-mcp add ${p.namespace} --url <url> --header '${key}: ...'\``
@@ -2424,6 +2442,22 @@ function renderPlaintextCredentials(
         // a value match.
         if (stored) print(`        (first \`yaw-mcp secrets set ${name}\` if the stored value is not this one)`);
       }
+    }
+  }
+  if (os === "windows" && (envQuoted || headerQuoted)) {
+    print("              PowerShell: keep the single quotes above.");
+    // Each reason only for the shape it describes: a header-only block never
+    // reaches the server with a quoted token -- cmd.exe does not group on
+    // single quotes, so the spaced value splits and `add` refuses it.
+    if (envQuoted) {
+      print("              cmd.exe keeps single quotes as part of an env value, so the server");
+      print("              would receive a quoted token:");
+      print("              cmd.exe: drop the quotes around each env.KEY='...' value.");
+    }
+    if (headerQuoted) {
+      print("              cmd.exe does not group on single quotes, so a single-quoted --header");
+      print("              value splits at the space and `yaw-mcp add` refuses it:");
+      print('              cmd.exe: double-quote each --header value instead (--header "KEY: ...").');
     }
   }
 }
@@ -3873,8 +3907,23 @@ export function isForeignAbsoluteLaunch(command: string, platform: NodeJS.Platfo
  * only if that value also looks like an absolute path that does not exist.
  */
 export function oamRunEntryPath(command: string, args: readonly string[]): string | null {
+  return oamLaunchParts(command, args)?.entry ?? null;
+}
+
+/**
+ * The two paths an oam launch actually depends on, read through any wrapper:
+ * `oam` is the unwrapped oam binary token, `entry` the `run` entry file (null
+ * when there is none to check). Null when the launch is not an oam launch.
+ *
+ * The one place both doctor (launchChecks) and the healer (heal-entries.ts)
+ * get these from, because the bug class they share is checking only the raw
+ * `command`: under `cmd /d /s /c C:\...\oam.exe run ...` the command word is
+ * `cmd`, and every existence or foreign-path test on it alone says nothing
+ * about the binary or the entry that will really be launched.
+ */
+export function oamLaunchParts(command: string, args: readonly string[]): { oam: string; entry: string | null } | null {
   const unwrapped = oamArgvTokens(command, args);
-  return unwrapped === null ? null : oamRunEntryFromTokens(unwrapped.rest);
+  return unwrapped === null ? null : { oam: unwrapped.oam, entry: oamRunEntryFromTokens(unwrapped.rest) };
 }
 
 /** The `run` half of oamRunEntryPath, over an already-unwrapped oam argv --
@@ -4161,6 +4210,11 @@ function rootLinePlacement(syntax: SyntaxName): string {
  *  running platform, and with it the foreign-path branches could only ever
  *  execute on a POSIX runner and the native-drive-letter one only on win32
  *  -- so on a Windows-only maintainer box the WSL wiring here never ran. */
+/** cmd.exe's default PATHEXT, lowercased: the suffixes Windows tries on an
+ *  extensionless launch path. A fixed list rather than process.env.PATHEXT --
+ *  the client's environment, not doctor's, is what resolves the launch. */
+const WIN_PATHEXT = [".com", ".exe", ".bat", ".cmd"];
+
 function launchChecks(
   entry: unknown,
   exists: (p: string) => boolean,
@@ -4170,6 +4224,12 @@ function launchChecks(
   "launchCommandMissing" | "launchRuntime" | "launchOamNotAbsolute" | "launchOamEntryMissing" | "launchForeignPath"
 > {
   const isAbsolute = platform === "win32" ? win32.isAbsolute : posix.isAbsolute;
+  // Whether a launch path resolves to a file. On Windows an extensionless
+  // path is completed by the launcher -- cmd.exe walks PATHEXT and libuv's
+  // spawn tries .com/.exe -- so `C:\tools\oam` starts C:\tools\oam.exe and
+  // must not read as missing. Through the injected seam, never the real fs.
+  const launchable = (p: string): boolean =>
+    exists(p) || (platform === "win32" && win32.extname(p) === "" && WIN_PATHEXT.some((ext) => exists(p + ext)));
   let launchCommandMissing: string | null = null;
   let launchRuntime: "oam" | "node" | null = null;
   let launchOamNotAbsolute: string | null = null;
@@ -4193,7 +4253,7 @@ function launchChecks(
         // PATH warning for a fully absolute Windows path.
         launchForeignPath = command;
       } else {
-        if (isAbsolute(command) && !exists(command)) launchCommandMissing = command;
+        if (isAbsolute(command) && !launchable(command)) launchCommandMissing = command;
         if (launchRuntime === "oam") {
           // Every oam-specific check reads the UNWRAPPED launch, not the raw
           // argv: launchRuntime is "oam" for the `cmd /d /s /c oam run ...`
@@ -4202,7 +4262,7 @@ function launchChecks(
           // wrapper's own switch. A null unwrap (a quoted `sh -c` payload,
           // which isOamLaunch still classifies) means nothing is checked --
           // under-reporting is the safe direction.
-          const oamArgv = oamArgvTokens(command, args);
+          const oamArgv = oamLaunchParts(command, args);
           if (oamArgv !== null) {
             // A BARE oam is the one shape the absolute-path check above
             // cannot see, and it is the shape older installs actually
@@ -4222,10 +4282,16 @@ function launchChecks(
             // read as "OK (runs on oam)".
             if (isForeignAbsoluteLaunch(oamArgv.oam, platform)) launchForeignPath = oamArgv.oam;
             else if (!isAbsolute(oamArgv.oam)) launchOamNotAbsolute = oamArgv.oam;
+            // A wrapped absolute oam binary (`cmd /d /s /c C:\gone\oam.exe
+            // run ...`) is the one the raw-`command` exists check above never
+            // sees -- there `command` is the wrapper. A bare (unwrapped) oam
+            // was already checked as `command`, so this only adds the wrapped
+            // case.
+            else if (oamArgv.oam !== command && !launchable(oamArgv.oam)) launchCommandMissing = oamArgv.oam;
             // `oam run [--no-check] <entry>`: unlike npx, oam cannot fetch a
             // missing entry on demand, so a stale path here is a hard
             // launch failure rather than a slow start.
-            const entryPath = oamRunEntryFromTokens(oamArgv.rest);
+            const entryPath = oamArgv.entry;
             if (entryPath !== null && isAbsolute(entryPath) && !exists(entryPath)) {
               launchOamEntryMissing = entryPath;
             }

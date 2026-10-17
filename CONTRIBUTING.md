@@ -17,6 +17,7 @@ git checkout -b your-branch-name
 
 # 4. Make your changes, then verify everything passes
 npm run lint:fix
+npm run typecheck
 npm run build
 npm test
 ```
@@ -25,8 +26,8 @@ npm test
 
 1. **One PR per change.** Keep PRs focused — a bug fix, a new feature, or a refactor, not all three.
 2. **Branch from `main`** (or `master` if that's the default branch).
-3. **Run `npm run lint:fix`** before committing — CI will reject formatting issues.
-4. **Run `npm test`** and confirm all tests pass.
+3. **Run `npm run lint:fix`** before committing — there is no CI here; the release script's lint gate is the only automated check, so a formatting diff reaches review unflagged.
+4. **Run `npm run typecheck` and `npm test`** and confirm both pass. Neither the build nor the tests type-check, so `typecheck` is the only step that catches a type error.
 5. **Write a clear PR title and description** — explain *what* changed and *why*.
 6. **All PRs require approval** from a maintainer before merging.
 
@@ -36,7 +37,9 @@ npm test
 |---------|-------------|
 | `npm install` | Install dependencies |
 | `npm run build` | Compile TypeScript |
-| `npm run dev` | Run in development mode |
+| `npm run dev` | Rebuild `dist/` on every source change (pair with `npm start` or a client pointed at `dist/index.js`) |
+| `npm start` | Run the built server (`node dist/index.js`) |
+| `npm run typecheck` | Type-check with `tsc --noEmit` |
 | `npm test` | Run the test suite |
 | `npm run lint` | Check for lint errors |
 | `npm run lint:fix` | Auto-fix lint and formatting |
@@ -54,7 +57,7 @@ npm test
 If you're an AI agent (Claude Code, Copilot, Cursor, etc.) submitting a PR:
 
 1. **Fork the repo** and work on a branch — direct pushes to the default branch are blocked.
-2. **Always run `npm run lint:fix && npm run build && npm test`** before committing. Do not skip this.
+2. **Always run `npm run lint:fix && npm run typecheck && npm run build && npm test`** before committing. Do not skip this.
 3. **Do not add unrelated changes** — no drive-by refactors, no extra comments, no unrelated formatting fixes.
 4. **PR description must explain the change clearly** — what problem does it solve, how does it work, how was it tested.
 5. **One logical change per PR.** If you're fixing a bug and adding a feature, that's two PRs.

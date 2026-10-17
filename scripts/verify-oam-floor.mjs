@@ -42,7 +42,9 @@
  *
  * Environment: OAM_BIN names the binary, as it does for the broker; otherwise
  * `oam` (`oam.exe` on Windows) is looked up on PATH. VERIFY_OAM_FLOOR_TIMEOUT_MS
- * bounds the whole probe (default 30000, a cold oam start included).
+ * bounds each spawn on its own -- the `oam --version` read and each era's
+ * hosting probe (default 30000 apiece, a cold oam start included) -- so a run
+ * can take up to three times the value.
  *
  * The version helpers here duplicate parseOamVersion / compareVersions in
  * src/oam-spawn.ts on purpose: this runs from a checkout with no build step,
@@ -51,9 +53,9 @@
  */
 
 import { spawn } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
@@ -91,7 +93,7 @@ tools/call). Passes when the installed oam is at or above MIN_OAM_VERSION
   --help    This text.
 
 Env: OAM_BIN (the binary; otherwise oam on PATH), VERIFY_OAM_FLOOR_TIMEOUT_MS
-(whole probe, default ${DEFAULT_TIMEOUT_MS}).
+(per spawn: the version read and each era's probe; default ${DEFAULT_TIMEOUT_MS}).
 `;
 
 // ---------------------------------------------------------------------------
@@ -562,9 +564,9 @@ export async function verifyOamFloor(opts = {}, deps = {}) {
     timeoutRaw !== undefined && /^\d+$/.test(timeoutRaw) && Number(timeoutRaw) > 0
       ? Number(timeoutRaw)
       : DEFAULT_TIMEOUT_MS;
-  // Bound below timeoutMs so the version read shares the budget the header
-  // promises for the whole probe: bound to the default instead, a hung
-  // `oam --version` outlived a VERIFY_OAM_FLOOR_TIMEOUT_MS set lower.
+  // The version read gets the same per-spawn bound as each era's probe:
+  // bound to the default instead, a hung `oam --version` outlived a
+  // VERIFY_OAM_FLOOR_TIMEOUT_MS set lower.
   const versionOf = deps.oamVersion ?? oamVersion;
 
   // The floor first: a source that cannot be read is a repo problem, and it
@@ -669,8 +671,29 @@ export async function verifyOamFloor(opts = {}, deps = {}) {
   return 0;
 }
 
+/**
+ * True when `argv1` (process.argv[1]) names the module at `moduleUrl`. Node
+ * realpaths the main module's URL (unless --preserve-symlinks-main) but leaves
+ * argv[1] as typed, so from a junctioned or symlinked checkout a raw compare
+ * of the two was false: the run block below was skipped, and the script --
+ * `-- --raise` and a bad flag included -- printed nothing and exited 0, a
+ * silence that reads as a pass. Both sides are realpath'd, so the answer holds
+ * with or without --preserve-symlinks-main.
+ */
+export function isMainModule(argv1, moduleUrl) {
+  if (!argv1) return false;
+  const real = (p) => {
+    try {
+      return realpathSync(p);
+    } catch {
+      return p;
+    }
+  };
+  return real(argv1) === real(fileURLToPath(moduleUrl));
+}
+
 // Run only when invoked as a script, so the tests can import the helpers.
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isMainModule(process.argv[1], import.meta.url)) {
   const parsed = parseArgs(process.argv.slice(2));
   if (!parsed.ok) {
     process.stdout.write(parsed.error);

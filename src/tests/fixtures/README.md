@@ -14,8 +14,8 @@ by policy -- the local gates `release.sh` runs are the release check).
 ### What the gate measures
 
 Each corpus entry is a real `(redacted token bag -> chosen namespace)` pair,
-where `chosen` is the server the FULL pipeline (BM25 + rerank + health +
-learning + sampling) actually routed that intent to. The gate re-ranks the
+where `chosen` is the server the FULL pipeline (BM25 + health + learning +
+sampling tiebreak) actually routed that intent to. The gate re-ranks the
 snapshot catalog with **BM25 only** and asserts `chosen` is still in the top-3
 for at least `FOUNDRY_TOP3_FLOOR` of the weighted entries.
 
@@ -47,7 +47,7 @@ This gate exists only to add the thing that file cannot have: real traffic.
    of entries makes a floor that measures noise.
 
 3. **Export.** From the repo root, with a local `bundles.json` present (the
-   export snapshots the server catalog so the corpus replays in CI without a
+   export snapshots the server catalog so the corpus replays under `npm test` without a
    live config):
 
    ```
@@ -110,7 +110,7 @@ A synthetic corpus at this path would be worse than the honest skip:
   BM25 already does -- circular, and green by construction.
 - **It would manufacture confidence.** The gate's whole premise is real
   traffic. A green "regression gate over REAL harvested dispatches" that never
-  saw a dispatch is a false signal in every CI summary that reads it.
+  saw a dispatch is a false signal in every test-run summary that reads it.
 - **It would be indistinguishable from real data later.** The corpus format
   carries no provenance field. A future reader cannot tell an invented token
   bag from a harvested one.

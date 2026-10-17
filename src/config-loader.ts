@@ -31,7 +31,8 @@ import { parseJsonc } from "./jsonc.js";
 import { jsonErrorLocation, NAMESPACE_RE } from "./local-bundles.js";
 import { log } from "./logger.js";
 import { migrateLegacyConfigPaths, type PendingLegacyMigration, planLegacyConfigMigration } from "./migrate.js";
-import { findProjectConfigDir, userConfigDir } from "./paths.js";
+import { isFeatureEnabled } from "./opt-out-env.js";
+import { findProjectConfigDir, normalizeForCompare, userConfigDir } from "./paths.js";
 
 export const CONFIG_FILENAME = "config.json";
 export const LOCAL_CONFIG_FILENAME = "config.local.json";
@@ -141,9 +142,7 @@ export const READONLY_DIAGNOSTICS_ENV = "YAW_MCP_READONLY_DIAGNOSTICS";
  *  thread an injected environment, and a predicate they cannot hand their own
  *  env to is one they cannot share. */
 export function isReadOnlyDiagnostics(env: NodeJS.ProcessEnv = process.env): boolean {
-  const raw = env[READONLY_DIAGNOSTICS_ENV]?.trim();
-  if (raw === undefined || raw === "") return false;
-  return raw === "1" || raw.toLowerCase() === "true";
+  return isFeatureEnabled(READONLY_DIAGNOSTICS_ENV, env);
 }
 
 /** The warning a read-only load raises for a legacy file it did not move.
@@ -534,12 +533,10 @@ export async function loadYawMcpConfig(opts: LoadConfigOptions = {}): Promise<Re
   // Avoid double-loading when the discovered project dir IS the user-global dir.
   // findProjectConfigDir excludes $HOME, so this only triggers if someone passes
   // a non-homedir `home` override that happens to equal the walk-up match.
-  // Normalize through resolve() (and case-fold on win32) so a case-variant or
+  // Normalize through resolve() and paths.ts normalizeForCompare (case-fold on
+  // win32 and darwin, the same rule the walk applies) so a case-variant or
   // unnormalized home override doesn't byte-mismatch and double-load.
-  const normalizeDir = (d: string): string => {
-    const r = resolve(d);
-    return process.platform === "win32" ? r.toLowerCase() : r;
-  };
+  const normalizeDir = (d: string): string => normalizeForCompare(resolve(d));
   const projectIsGlobal = projectConfigDir !== null && normalizeDir(projectConfigDir) === normalizeDir(globalDir);
   const project = projectIsGlobal || !projectPath ? null : await readConfigAt(projectPath, "project", warnings);
   if (project) loadedFiles.push(project);

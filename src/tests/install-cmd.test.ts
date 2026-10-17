@@ -906,6 +906,23 @@ describe("summarizeBundles", () => {
     expect(s.path).toBe(join(synthHome, ".yaw-mcp", "bundles.json"));
   });
 
+  it("counts ENABLED servers only, unlike `yaw-mcp list`", async () => {
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    writeFileSync(
+      join(synthHome, ".yaw-mcp", "bundles.json"),
+      JSON.stringify({
+        version: 1,
+        servers: [
+          { namespace: "a", command: "x" },
+          { namespace: "b", command: "y", isActive: false },
+        ],
+      }),
+    );
+    const s = await summarizeBundles({ home: synthHome, cwd: synthCwd });
+    expect(s.state).toBe("servers");
+    expect(s.count).toBe(1);
+  });
+
   it("separates a file that is there and unusable from an empty one", async () => {
     mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
     writeFileSync(join(synthHome, ".yaw-mcp", "bundles.json"), "{oops");
@@ -5945,7 +5962,27 @@ describe("runUninstall", () => {
     });
     expect(r.exitCode).toBe(1);
     expect(cap.stderr()).toMatch(/is not valid JSON/);
+    // The shared remedy install, doctor and import print (unparseableConfigFix).
+    expect(cap.stderr()).toContain("refusing to edit it; fix the JSON by hand, or move the file aside, then re-run.");
     expect(readFileSync(join(synthHome, ".claude.json"), "utf8")).toBe("{ not json");
+  });
+
+  it("refuses a non-object client config with the same shared remedy", async () => {
+    writeFileSync(join(synthHome, ".claude.json"), "[]");
+    const cap = captureIo();
+    const r = await runUninstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      force: true,
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(cap.stderr()).toContain(
+      "is not a JSON object -- refusing to edit it; fix the JSON by hand, or move the file aside, then re-run.",
+    );
+    expect(readFileSync(join(synthHome, ".claude.json"), "utf8")).toBe("[]");
   });
 
   it("removes the local-scope entry from projects[<dir>] without touching other projects", async () => {

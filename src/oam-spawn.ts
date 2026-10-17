@@ -376,7 +376,7 @@ export function oamInstallAdvice(os: InstallOS): string {
 /** The installer's default install dir for `os`: install.ps1 uses
  *  %LOCALAPPDATA%\oam\bin, install.sh uses ~/.oam/bin (OAM_INSTALL_DIR
  *  overrides both). */
-export function oamReleaseDir(os: InstallOS): string {
+function oamReleaseDir(os: InstallOS): string {
   return os === "windows" ? "%LOCALAPPDATA%\\oam\\bin" : "~/.oam/bin";
 }
 
@@ -846,21 +846,6 @@ function classifyProbeFailure(err: unknown): OamProbeFailure {
   return "spawn";
 }
 
-/**
- * Probe the oam binary (`oam --version`) once per process and cache the
- * result; a timed-out attempt is retried once before that result is decided
- * (see probeOamUncached). OAM_BIN
- * overrides the binary path; it's normalized to a cmd-safe path so a
- * forward-slash OAM_BIN still spawns. The version output is parsed and gated
- * against MIN_OAM_VERSION: a below-min install is reported with bin=null
- * (same fallback as oam-absent) plus ONE warn log naming both versions. An
- * unparseable version is treated as usable -- a working `--version` proves
- * oam exists, and refusing on a future format change would silently disable
- * every opted-in server.
- *
- * `run` is injectable so the parse + gate logic is testable without a real
- * binary on PATH.
- */
 /** How long ONE `oam --version` attempt gets. A timeout is retried once and
  *  falls back to node only if the retry fails as well, so a wedged binary
  *  costs two of these windows.
@@ -1111,6 +1096,24 @@ let oamProbeInFlight: Promise<OamProbe> | undefined;
  *  probe can populate the cache for the next. */
 let oamProbeGeneration = 0;
 
+/**
+ * Probe the oam binary (`oam --version`) once per process and cache the
+ * result; a timed-out attempt is retried once before that result is decided
+ * (see probeOamUncached), and a timeout verdict lapses after
+ * OAM_PROBE_TIMEOUT_RECHECK_MS instead of standing for the process lifetime.
+ * OAM_BIN overrides the binary path; it's normalized with winNormalize, not
+ * for this spawn (spawnVersionProbe uses no shell, so a forward-slash path
+ * spawns fine) but because the probed binPath is what install persists, where
+ * a cmd-safe path matters. The version output is parsed and gated
+ * against MIN_OAM_VERSION: a below-min install is reported with bin=null
+ * (same fallback as oam-absent) plus ONE warn log naming both versions. An
+ * unparseable version is treated as usable -- a working `--version` proves
+ * oam exists, and refusing on a future format change would silently disable
+ * every opted-in server.
+ *
+ * `run` is injectable so the parse + gate logic is testable without a real
+ * binary on PATH.
+ */
 export async function probeOam(run: (bin: string) => Promise<string> = spawnVersionProbe): Promise<OamProbe> {
   if (oamProbeCache !== undefined && oamProbeCacheExpiresAt !== undefined && Date.now() >= oamProbeCacheExpiresAt) {
     oamProbeCache = undefined;
@@ -1259,13 +1262,15 @@ async function probeOamUncached(run: (bin: string) => Promise<string>, generatio
         // on), so below-min always means out of date, and oam updates itself
         // in place.
         updateWith: "oam self-update",
-        // ...but updating alone changes nothing here. oamProbeCache is written
-        // once per process and only ever cleared by a test hook, so every
-        // opted-in server keeps landing on node until the broker restarts --
-        // and an MCP broker under a desktop client lives for days. Without this
-        // the user runs the update, sees no further log line, and reads a
-        // working fix as a fix that did not work. The timeout and generic
-        // failure warns say "for this process" for the same reason.
+        // ...but updating alone changes nothing here. A non-timeout verdict
+        // like this one is cached for the process lifetime and only cleared by
+        // a test hook (only a timeout verdict lapses, after
+        // OAM_PROBE_TIMEOUT_RECHECK_MS), so every opted-in server keeps landing
+        // on node until the broker restarts -- and an MCP broker under a
+        // desktop client lives for days. Without this the user runs the update,
+        // sees no further log line, and reads a working fix as a fix that did
+        // not work. The generic failure warns say "for this process" for the
+        // same reason; the timeout warn says it is probed again instead.
         thenRestart: "restart yaw-mcp; this probe is cached for the process lifetime",
       });
       return publish({ bin: null, binPath: null, version, belowMin: true, failure: null, failureDetail: null });
@@ -1650,11 +1655,13 @@ export function rewriteNpmToManagedNode(
   args: string[],
   deps: ManagedRewriteDeps,
 ): { command: string; args: string[] } {
+  // Launch kind FIRST: a docker/uvx/oam command was never npx, so a missing
+  // node must not log "staying on npx" for it.
+  if (nodeLaunchKind(command) !== "npx") return { command, args };
   if (!deps.nodeBin) {
     log("debug", "no node binary located for the managed sidecar spawn; staying on npx", { command });
     return { command, args };
   }
-  if (nodeLaunchKind(command) !== "npx") return { command, args };
   const specIdx = npxSpecIndex(args);
   const spec = specIdx === -1 ? undefined : args[specIdx];
   if (!spec) return { command, args };
@@ -2101,7 +2108,8 @@ function packageEntry(pkgDir: string, pkg: string): PackageHit | null {
  * Resolve a package name to an on-disk RUNNABLE entry, or `null`. Searches the
  * broker's own node_modules first, then every npx cache -- an `npx -y <pkg>`
  * server lives in a `_npx/<hash>/node_modules` the broker's own resolver can't
- * see, so without this an opted-in npx server silently falls back to Node.
+ * see, so without this an npx server silently stays on npx under both the oam
+ * and the managed-node rewrite.
  * Among cached copies the HIGHEST version wins. Resolves the package's BIN
  * (read straight from package.json) rather than require.resolve's library "."
  * export. `null` keeps the npx/node command.
@@ -2269,12 +2277,16 @@ export function resetPinnedSidecarLog(): void {
  * Say, once per package, that a sidecar is running from an on-disk copy rather
  * than through npx.
  *
- * This is the one user-visible consequence of hosting on oam that is otherwise
- * invisible. `npx -y <pkg>@latest` re-resolves the tag on every spawn, so those
- * servers used to update themselves; `oam run <entry>` cannot, because oam has
- * no fetch-on-demand. Worse, once oam is the default, npx stops running for
- * these servers at all, so the cache that supplied the entry also stops being
- * refreshed -- the version pins itself indefinitely.
+ * This is the one user-visible consequence of skipping npx that is otherwise
+ * invisible, and it applies to BOTH rewrites that consume resolveNpmEntry: the
+ * oam one (`oam run <entry>`) and the managed-node one (`node <entry>`, the
+ * path every launch oam did not take goes through). The message therefore
+ * names neither host. `npx -y <pkg>@latest` re-resolves the tag on every
+ * spawn, so those servers used to update themselves; a direct `<host> <entry>`
+ * spawn cannot, because neither oam nor node fetches on demand. Worse, once the
+ * rewrite applies, npx stops running for these servers at all, so the cache
+ * that supplied the entry also stops being refreshed -- the version pins
+ * itself indefinitely.
  *
  * Logged at info, not debug: a debug-level line is exactly how the resolver's
  * failure to find these packages at all went unnoticed.
@@ -2291,7 +2303,7 @@ function notePinnedSidecar(pkg: string, version: string | null, source: PinSourc
   pinnedReported.add(pkg);
   log(
     source === "managed" ? "debug" : "info",
-    "hosting sidecar on oam from an on-disk copy; it will not self-update the way npx does",
+    "running sidecar from an on-disk copy instead of npx; it will not self-update the way npx does",
     {
       package: pkg,
       version: version ?? "unknown",
@@ -2486,10 +2498,15 @@ export function resolveManagedSpawn(
   fromUrl: string = import.meta.url,
   npmCache: string | null = npmCacheDir(fromUrl),
   managedRoot: string | null = sidecarsNodeModules(),
-  nodeBin: string | null = managedNodeBin(),
+  // Omitted -> managedNodeBin(), resolved lazily below: when the broker is not
+  // running on node that is a PATH walk, and upstream.ts calls this for EVERY
+  // local server oam did not take, including every non-npx one (docker, uvx,
+  // python), which never needs a node binary.
+  nodeBin?: string | null,
 ): { command: string; args: string[] } {
+  if (nodeLaunchKind(command) !== "npx") return { command, args };
   return rewriteNpmToManagedNode(command, args, {
-    nodeBin,
+    nodeBin: nodeBin === undefined ? managedNodeBin() : nodeBin,
     resolveEntry: (pkg, wantVersion) => {
       if (wantVersion !== null) return resolveNpmEntry(pkg, fromUrl, npmCache, managedRoot, wantVersion);
       const memoed = managedEntryMemo.get(pkg);

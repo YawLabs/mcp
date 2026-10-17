@@ -1,9 +1,9 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { FOUNDRY_TOP3_FLOOR, type FoundryCorpus, loadFoundryCorpus, scoreCorpus } from "../foundry-corpus.js";
 import { type RankableServer, rankServers } from "../relevance.js";
+import { FOUNDRY_FIXTURE } from "./foundry-fixture.js";
 
 // ═══════════════════════════════════════════════════════════════════════
 // Foundry routing regression gate (BM25 floor on REAL harvested dispatches).
@@ -18,9 +18,9 @@ import { type RankableServer, rankServers } from "../relevance.js";
 // That is recorded here rather than papered over. This file has three states:
 //
 //   1. fixture ABSENT  -> DORMANT. Reported as a `todo` row plus a stderr
-//      banner plus a test annotation, and named so a CI summary cannot read
-//      it as coverage. Does not fail: harvesting is a maintainer opt-in
-//      (YAW_MCP_FOUNDRY=1), not something CI can do for itself.
+//      banner plus a test annotation, and named so a test-run summary cannot
+//      read it as coverage. Does not fail: harvesting is a maintainer opt-in
+//      (YAW_MCP_FOUNDRY=1), not something the test suite can do for itself.
 //   2. fixture PRESENT but not valid -> HARD FAIL. Previously this collapsed
 //      into state 1 (loadFoundryCorpus returns null for missing AND for
 //      malformed/empty/wrong-version), which meant a bumped
@@ -42,14 +42,15 @@ import { type RankableServer, rankServers } from "../relevance.js";
 // this path is the default --out of `yaw-mcp foundry export`. The harvest
 // procedure lives in src/tests/fixtures/README.md.
 //
-// BM25-only, so it runs with no Voyage key, exactly like routing-quality.
+// BM25-only, so it needs no network or credentials, exactly like routing-quality.
 // ═══════════════════════════════════════════════════════════════════════
 
-// Resolved from THIS module's URL, not process.cwd(): a run started anywhere
-// but the repo root (an editor's test runner, a monorepo-wide invocation) would
+// Resolved from a module URL, not process.cwd(): a run started anywhere but
+// the repo root (an editor's test runner, a monorepo-wide invocation) would
 // otherwise miss a committed fixture and drop the gate into exactly the dormant
-// state this file exists to make loud. Matches the sibling test files.
-const FIXTURE = fileURLToPath(new URL("./fixtures/foundry-corpus.json", import.meta.url));
+// state this file exists to make loud. Shared with foundry-cmd.test.ts, which
+// pins `foundry export`'s DEFAULT_OUT to this same path.
+const FIXTURE = FOUNDRY_FIXTURE;
 const HARVEST_DOC = join("src", "tests", "fixtures", "README.md");
 
 // Existence and validity are separate questions -- conflating them is what
@@ -107,7 +108,7 @@ describe("foundry routing regression gate", () => {
     // ---- State 1: no corpus harvested yet. Dormant, loudly. ----
     // This gate reported a quiet "skipped" from the day it landed because
     // src/tests/fixtures/ never existed, and a quiet skip reads like coverage
-    // in a CI summary. Three surfaces, because no single one survives every
+    // in a test-run summary. Three surfaces, because no single one survives every
     // way the suite gets run (all three verified against vitest 4.1):
     //   - a `todo` row: counted in the default reporter's summary line
     //     ("N todo") and carried as status "todo" by --reporter=json,

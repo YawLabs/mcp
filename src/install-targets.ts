@@ -845,9 +845,11 @@ function pathFor(
         };
       }
       // Linux. Hardcoded ~/.config rather than honouring $XDG_CONFIG_HOME:
-      // that would need the same caller-resolved threading %APPDATA% gets,
-      // and this function reads no environment. On a box that sets it, this
-      // path is wrong -- copy resolveAppDataDir's shape if that ever bites.
+      // this function reads no environment, and resolveInstallPath does not
+      // hand it the value. The value IS already caller-resolved and threaded
+      // as base.env.xdgConfigHome (the Zed row reads it); on a box that sets
+      // it this path is wrong -- pass it into pathFor and apply Zed's
+      // absolute-only rule (zedConfigDir) if that ever bites.
       return {
         absolute: join(home, ".config", "Code", "User", "mcp.json"),
         display: "~/.config/Code/User/mcp.json",
@@ -902,8 +904,10 @@ export interface BuildLaunchEntryOptions {
    *  takes to pick up a new release).
    *
    *  RESERVED SEAM WITH NO LIVE CALLER. Nothing in src/ passes `pkg`:
-   *  install-cmd sends {os, oamBinPath, oamEntry}, try-cmd sends {os, upstream},
-   *  and `parseInstallArgs` has no `--pkg` flag -- the `@latest` default is what
+   *  install-cmd and heal-entries send {os, oamBinPath, oamEntry, windowsWrap},
+   *  try-cmd sends {os, upstream} (the buildLaunchEntry rule in
+   *  client-config-boundary.test.ts holds the allowed callers), and
+   *  `parseInstallArgs` has no `--pkg` flag -- the `@latest` default is what
    *  every caller wants. So the precedence rule documented under `oamBinPath`
    *  (a `pkg` pin beats the oam path) is reached only from
    *  install-targets.test.ts, and combinations of `pkg` with the rest of the
@@ -1365,13 +1369,11 @@ export function blockedContainerFix(then: string, syntax: SyntaxName = "JSON"): 
 /** Claude Code's settings.json and the `permissions.allow` grant install adds
  *  to it live in claude-code-settings.ts -- it is a permissions file, not an
  *  MCP server list, and the grant is spliced one array ELEMENT at a time so a
- *  comment inside that list survives. Re-exported here because every caller
- *  reaches this module for the Claude Code path questions. */
-export {
-  CLAUDE_CODE_ALLOW_PATTERN,
-  prepareClaudeCodeSettingsPatch,
-  resolveClaudeCodeSettingsPath,
-} from "./claude-code-settings.js";
+ *  comment inside that list survives. The two path/pattern helpers are
+ *  re-exported here because the install, install-targets and typed tests
+ *  import them from this module; src/ callers import claude-code-settings.ts
+ *  directly. */
+export { CLAUDE_CODE_ALLOW_PATTERN, resolveClaudeCodeSettingsPath } from "./claude-code-settings.js";
 /** The third of that set: the by-hand fix for a file that PARSES for yaw-mcp
  *  but not for the client that owns it -- strict JSON carrying a comment or a
  *  trailing comma, so the client loads no server from it at all.

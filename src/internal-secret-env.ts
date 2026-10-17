@@ -14,9 +14,9 @@
 // untouched, so a passphrase parked in yaw-mcp's env block -- exactly where
 // README tells the user to put it -- reached every pre/postinstall script in
 // @yawlabs/mcp's dependency tree through `npm install -g`. upstream.ts
-// still re-exports the Set and both helpers for the importers that reach
-// them through it (audit-cmd.ts and upstream's tests); every other consumer,
-// server.ts included, imports from here.
+// still re-exports the Set and both helpers for upstream's tests, which reach
+// them through it; every production consumer, server.ts and audit-cmd.ts
+// included, imports from here.
 
 /** Env keys that are for THIS process only and must never leak into a
  *  spawned child -- an upstream server, or the package manager the

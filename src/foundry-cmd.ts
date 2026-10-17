@@ -4,7 +4,7 @@
 //
 // This is a MAINTAINER command: it snapshots the local server catalog (from
 // bundles.json) so the corpus is self-contained and the BM25 floor can be
-// replayed in CI without a live config. See foundry-corpus.ts for what the
+// replayed by the local test suite without a live config. See foundry-corpus.ts for what the
 // gate measures (a BM25-floor regression check on real intents, NOT a
 // correctness oracle).
 //
@@ -35,10 +35,14 @@ import { userConfigDir } from "./paths.js";
 import { loadState, statePath } from "./persistence.js";
 import type { RankableServer } from "./relevance.js";
 
-/** Default corpus destination. Exported because three files independently
- *  depend on this exact path -- the parser's default, the usage text, and the
- *  routing gate that loads the fixture -- so a change here has to move all of
- *  them together instead of silently un-gating routing. */
+/** Default corpus destination, relative to the repo root. The parser's
+ *  default and the usage text below both read it. The routing gate
+ *  (src/tests/foundry-routing.test.ts) does NOT: it loads FOUNDRY_FIXTURE
+ *  from src/tests/foundry-fixture.ts, resolved from a module URL so it works
+ *  from any cwd. Exported so foundry-cmd.test.ts can pin this against that
+ *  same FOUNDRY_FIXTURE -- move either one alone and that test fails, instead
+ *  of `foundry export` writing where the gate never looks and routing going
+ *  un-gated. */
 export const DEFAULT_OUT = path.join("src", "tests", "fixtures", "foundry-corpus.json");
 
 export interface ParsedFoundryArgs {
@@ -138,7 +142,7 @@ export async function defaultLoadServers(cwd: string | undefined, home: string):
  *  loader skips it, so "no bundles.json found" would be false for a file that
  *  sits right there. Probed separately because loadLocalBundles reports the
  *  verdict only as warning prose. */
-export async function loadServerCatalog(
+async function loadServerCatalog(
   cwd: string | undefined,
   home: string,
 ): Promise<{

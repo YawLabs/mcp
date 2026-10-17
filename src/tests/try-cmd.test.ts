@@ -6,7 +6,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { atomicWriteFile } from "../atomic-write.js";
 import { buildLaunchEntry, ENTRY_NAME, INSTALL_TARGETS } from "../install-targets.js";
 import {
-  type ExploreServerResponse,
   formatTtl,
   gcExpiredTrials,
   parseDurationMs,
@@ -18,6 +17,7 @@ import {
   TRY_CLEANUP_USAGE,
   TRY_USAGE,
   type TrialMarker,
+  type TrialServer,
   trialGcFailureWarning,
   trialMarkerPath,
   trialsDir,
@@ -66,7 +66,7 @@ function legacyAnonPath(home: string): string {
   return join(trialsDir(home), ".anon");
 }
 
-const SAMPLE: ExploreServerResponse = {
+const SAMPLE: TrialServer = {
   slug: "demo",
   name: "Demo MCP",
   command: "npx",
@@ -325,7 +325,7 @@ describe("anon-id retirement", () => {
       env: {},
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => SAMPLE,
+      resolveServer: async () => SAMPLE,
     });
     expect(r.exitCode).toBe(0);
     // Untouched on disk, byte for byte...
@@ -334,6 +334,30 @@ describe("anon-id retirement", () => {
     // to leak it into any more -- the reporting seam is gone outright -- so
     // the command's own output is the surface left worth checking.
     expect(cap.text()).not.toContain("deadbeef");
+  });
+});
+
+describe("runTry -- the config dir it may be first to create", () => {
+  // On a fresh machine `try` can be the first writer of ~/.yaw-mcp, and no
+  // later writer tightens a dir that already exists. POSIX only: Node maps a
+  // mode to the read-only attribute alone on win32.
+  it.skipIf(process.platform === "win32")("creates ~/.yaw-mcp and trials/ owner-only (0700)", async () => {
+    const { statSync } = await import("node:fs");
+    const cap = captureIO();
+    const r = await runTry({
+      slug: "demo",
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      env: {},
+      out: cap.pushOut,
+      err: cap.pushErr,
+      resolveServer: async () => SAMPLE,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(statSync(join(synthHome, ".yaw-mcp")).mode & 0o777).toBe(0o700);
+    expect(statSync(trialsDir(synthHome)).mode & 0o777).toBe(0o700);
   });
 });
 
@@ -351,7 +375,7 @@ describe("runTry — happy path", () => {
       now: () => 1_700_000_000_000,
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => SAMPLE,
+      resolveServer: async () => SAMPLE,
     });
     expect(r.exitCode).toBe(0);
 
@@ -401,7 +425,7 @@ describe("runTry — happy path", () => {
       env: {},
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => SAMPLE,
+      resolveServer: async () => SAMPLE,
     });
     expect(r.exitCode).toBe(0);
 
@@ -434,7 +458,7 @@ describe("runTry — happy path", () => {
       env: {},
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => ({
+      resolveServer: async () => ({
         ...SAMPLE,
         args: ["-y", "@demo/mcp", "--url", "https://api/x?a=1&b=2"],
       }),
@@ -461,7 +485,7 @@ describe("runTry — missing env vars", () => {
       env: {},
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["FOO_TOKEN"] }),
+      resolveServer: async () => ({ ...SAMPLE, requiredEnvVars: ["FOO_TOKEN"] }),
     });
     expect(r.exitCode).toBe(1);
     expect(cap.errText()).toMatch(/needs the following env var/);
@@ -483,7 +507,7 @@ describe("runTry — missing env vars", () => {
       envOverrides: { FOO_TOKEN: "secret" },
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["FOO_TOKEN"] }),
+      resolveServer: async () => ({ ...SAMPLE, requiredEnvVars: ["FOO_TOKEN"] }),
     });
     expect(r.exitCode).toBe(0);
     const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
@@ -504,7 +528,7 @@ describe("runTry — missing env vars", () => {
       env: { FOO_TOKEN: "ambient-secret" },
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["FOO_TOKEN"] }),
+      resolveServer: async () => ({ ...SAMPLE, requiredEnvVars: ["FOO_TOKEN"] }),
     });
     expect(r.exitCode).toBe(0);
     // `try` (unlike `add`) copies the resolved value inline so the directly-
@@ -582,7 +606,7 @@ describe("runTry — client config perms", () => {
       envOverrides: { FOO_TOKEN: "secret" },
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["FOO_TOKEN"] }),
+      resolveServer: async () => ({ ...SAMPLE, requiredEnvVars: ["FOO_TOKEN"] }),
     });
     expect(r.exitCode).toBe(0);
     // Born owner-only rather than chmodded after the rename: there is no
@@ -616,7 +640,7 @@ describe("runTry — client config perms", () => {
       envOverrides: { FOO_TOKEN: "secret" },
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["FOO_TOKEN"] }),
+      resolveServer: async () => ({ ...SAMPLE, requiredEnvVars: ["FOO_TOKEN"] }),
     });
     expect(r.exitCode).toBe(0);
     expect(modeAskedFor(spy, clientPath())).toBe(0o600);
@@ -648,7 +672,7 @@ describe("runTry — client config perms", () => {
       envOverrides: { FOO_TOKEN: "secret" },
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["FOO_TOKEN"] }),
+      resolveServer: async () => ({ ...SAMPLE, requiredEnvVars: ["FOO_TOKEN"] }),
     });
     expect(r.exitCode).toBe(0);
     expect(modeAskedFor(spy, clientPath())).toBe(0o600);
@@ -674,7 +698,7 @@ describe("runTry — client config perms", () => {
       env: {},
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => SAMPLE,
+      resolveServer: async () => SAMPLE,
     });
     expect(r.exitCode).toBe(0);
     expect(modeAskedFor(spy, clientPath())).toBeUndefined();
@@ -695,7 +719,7 @@ describe("runTry — client config perms", () => {
       env: {},
       out: cap1.pushOut,
       err: cap1.pushErr,
-      fetchExplore: async () => SAMPLE,
+      resolveServer: async () => SAMPLE,
     });
     // Spy only around the cleanup, so the write under test is unambiguous.
     const spy = await spyOnWrites();
@@ -732,7 +756,7 @@ describe("runTry — client config perms", () => {
       env: {},
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => SAMPLE,
+      resolveServer: async () => SAMPLE,
     });
     expect(r.exitCode).toBe(0);
     expect(existsSync(clientPath())).toBe(true);
@@ -753,7 +777,7 @@ describe("runTry — unparseable ttl (programmatic callers)", () => {
       env: {},
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => SAMPLE,
+      resolveServer: async () => SAMPLE,
     });
     expect(r.exitCode).toBe(2);
     expect(cap.errText()).toMatch(/invalid ttl "later"/);
@@ -776,7 +800,7 @@ describe("runTry — dry-run", () => {
       env: {},
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => SAMPLE,
+      resolveServer: async () => SAMPLE,
     });
     expect(r.exitCode).toBe(0);
     expect(r.marker).toBeDefined();
@@ -799,7 +823,7 @@ describe("runTry — slug validation", () => {
         env: {},
         out: cap.pushOut,
         err: cap.pushErr,
-        fetchExplore: async () => SAMPLE,
+        resolveServer: async () => SAMPLE,
       });
       expect(r.exitCode).toBe(2);
     }
@@ -818,7 +842,7 @@ describe("runTry — fetch failure", () => {
       env: {},
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => {
+      resolveServer: async () => {
         throw new Error('yaw-mcp try: no server with slug "demo"');
       },
     });
@@ -852,7 +876,7 @@ describe("runTry — preserves existing client config siblings", () => {
       env: {},
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => SAMPLE,
+      resolveServer: async () => SAMPLE,
     });
     expect(r.exitCode).toBe(0);
     const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
@@ -887,7 +911,7 @@ describe("runTry — unreadable vs invalid client config", () => {
       env: {},
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => SAMPLE,
+      resolveServer: async () => SAMPLE,
     });
     expect(r.exitCode).toBe(1);
     expect(cap.errText()).toContain("is a directory, not a file");
@@ -907,7 +931,7 @@ describe("runTry — unreadable vs invalid client config", () => {
       env: {},
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => SAMPLE,
+      resolveServer: async () => SAMPLE,
     });
     expect(r.exitCode).toBe(1);
     expect(cap.errText()).toMatch(/is not valid JSON/);
@@ -931,7 +955,7 @@ describe("runTry — re-run against a different client", () => {
       envOverrides: { D_TOKEN: "secret" },
       out: cap1.pushOut,
       err: cap1.pushErr,
-      fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["D_TOKEN"] }),
+      resolveServer: async () => ({ ...SAMPLE, requiredEnvVars: ["D_TOKEN"] }),
     });
     const cursorPath = join(synthHome, ".cursor", "mcp.json");
     expect(JSON.parse(readFileSync(cursorPath, "utf8")).mcpServers["yaw-mcp-try-demo"]).toBeDefined();
@@ -947,7 +971,7 @@ describe("runTry — re-run against a different client", () => {
       envOverrides: { D_TOKEN: "secret" },
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["D_TOKEN"] }),
+      resolveServer: async () => ({ ...SAMPLE, requiredEnvVars: ["D_TOKEN"] }),
     });
     expect(r.exitCode).toBe(0);
     // Old client's entry is gone (and the user was told).
@@ -968,7 +992,7 @@ describe("runTry — re-run against a different client", () => {
       cwd: synthCwd,
       os: "linux" as const,
       env: {},
-      fetchExplore: async () => SAMPLE,
+      resolveServer: async () => SAMPLE,
     };
     const cap1 = captureIO();
     await runTry({ ...common, out: cap1.pushOut, err: cap1.pushErr });
@@ -1178,7 +1202,7 @@ describe("runTryCleanup", () => {
       env: {},
       out: cap1.pushOut,
       err: cap1.pushErr,
-      fetchExplore: async () => SAMPLE,
+      resolveServer: async () => SAMPLE,
     });
     expect(existsSync(trialMarkerPath("demo", synthHome))).toBe(true);
 
@@ -1719,7 +1743,7 @@ describe("runTry — previous marker naming the SAME client file", () => {
       cwd: synthCwd,
       os: "linux" as const,
       env: {},
-      fetchExplore: async (): Promise<ExploreServerResponse> => SAMPLE,
+      resolveServer: async (): Promise<TrialServer> => SAMPLE,
     };
     const cap1 = captureIO();
     await runTry({ ...common, out: cap1.pushOut, err: cap1.pushErr });
@@ -1764,7 +1788,7 @@ describe("runTry — catalog URL threading", () => {
       env: catalogEnv,
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async (_slug, catalogUrl) => {
+      resolveServer: async (_slug, catalogUrl) => {
         seen.push(catalogUrl);
         return SAMPLE;
       },
@@ -1802,7 +1826,7 @@ describe("runTry — optional --env overrides", () => {
       envOverrides: { LOG_LEVEL: "", BLANK: "   ", DATABASE_URL: "  postgres://x  " },
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => SAMPLE,
+      resolveServer: async () => SAMPLE,
     });
     expect(r.exitCode).toBe(0);
     const entry = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8")).mcpServers["yaw-mcp-try-demo"];
@@ -1824,7 +1848,7 @@ describe("runTry — dry-run names the cross-client removal", () => {
       env: {},
       out: cap1.pushOut,
       err: cap1.pushErr,
-      fetchExplore: async () => SAMPLE,
+      resolveServer: async () => SAMPLE,
     });
     const cursorPath = join(synthHome, ".cursor", "mcp.json");
 
@@ -1839,7 +1863,7 @@ describe("runTry — dry-run names the cross-client removal", () => {
       env: {},
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => SAMPLE,
+      resolveServer: async () => SAMPLE,
     });
     expect(r.exitCode).toBe(0);
     // The preview must name every write the real run performs -- a removal it
@@ -1888,7 +1912,7 @@ describe("runTry — dry-run names the cross-client removal", () => {
       env: {},
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => SAMPLE,
+      resolveServer: async () => SAMPLE,
     });
     expect(r.exitCode).toBe(0);
     expect(cap.text()).not.toMatch(/would remove: the previous demo trial/);
@@ -1931,7 +1955,7 @@ describe("runTry — dry-run names the cross-client removal", () => {
       env: {},
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => SAMPLE,
+      resolveServer: async () => SAMPLE,
     });
     expect(r.exitCode).toBe(0);
     expect(cap.text()).not.toMatch(/would remove/);
@@ -1971,7 +1995,7 @@ describe("runTry — auto-detected client (no --client)", () => {
       env: {},
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => SAMPLE,
+      resolveServer: async () => SAMPLE,
     });
     expect(r.exitCode).toBe(0);
     expect(r.marker?.clientName).toBe("cursor");
@@ -1993,7 +2017,7 @@ describe("runTry — auto-detected client (no --client)", () => {
       env: {},
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => SAMPLE,
+      resolveServer: async () => SAMPLE,
     });
     expect(r.exitCode).toBe(0);
     // claude-code is first in INSTALL_TARGETS and available on every OS, so
@@ -2025,7 +2049,7 @@ describe("runTry — auto-detected client (no --client)", () => {
       env: {},
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => SAMPLE,
+      resolveServer: async () => SAMPLE,
     });
     expect(r.exitCode).toBe(0);
     expect(cap.errText()).not.toMatch(/could not be read/);
@@ -2058,7 +2082,7 @@ describe("runTry — auto-detected client (no --client)", () => {
       env: { XDG_CONFIG_HOME: xdg },
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => SAMPLE,
+      resolveServer: async () => SAMPLE,
     });
     expect(r.exitCode).toBe(0);
     expect(r.marker?.clientName).toBe("zed");
@@ -2096,7 +2120,7 @@ describe("runTry — auto-detected client (no --client)", () => {
         env: {},
         out: cap.pushOut,
         err: cap.pushErr,
-        fetchExplore: async () => SAMPLE,
+        resolveServer: async () => SAMPLE,
       });
       expect(r.exitCode).toBe(0);
       expect(r.marker?.clientName).toBe("claude-code");
@@ -2119,7 +2143,7 @@ describe("runTry — auto-detected client (no --client)", () => {
         env: {},
         out: cap.pushOut,
         err: cap.pushErr,
-        fetchExplore: async () => SAMPLE,
+        resolveServer: async () => SAMPLE,
       });
       expect(r.exitCode).toBe(0);
       expect(r.marker?.clientName).toBe("cursor");
@@ -2141,7 +2165,7 @@ describe("runTry -- an explicitly named client with nothing configured", () => {
       env: {},
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => SAMPLE,
+      resolveServer: async () => SAMPLE,
     });
     expect(r.exitCode).toBe(0);
     // Trials are user-scoped by design, and VS Code now has a user scope, so
@@ -2198,7 +2222,7 @@ describe("runTry -- a trial never lands in a commit-to-share file when a private
       envOverrides: { FOO_TOKEN: "secret" },
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["FOO_TOKEN"] }),
+      resolveServer: async () => ({ ...SAMPLE, requiredEnvVars: ["FOO_TOKEN"] }),
     });
 
     // No --yes needed, because nothing commit-to-share is being written.
@@ -2227,7 +2251,7 @@ describe("runTry -- a trial never lands in a commit-to-share file when a private
       envOverrides: { FOO_TOKEN: "secret" },
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["FOO_TOKEN"] }),
+      resolveServer: async () => ({ ...SAMPLE, requiredEnvVars: ["FOO_TOKEN"] }),
     });
     expect(r.exitCode).toBe(0);
     expect(cap.errText()).not.toContain("Committing that file publishes the value");
@@ -2270,7 +2294,7 @@ describe("runTry — previous marker the real peel refuses", () => {
       env: {},
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => SAMPLE,
+      resolveServer: async () => SAMPLE,
     });
     expect(r.exitCode).toBe(0);
     expect(cap.errText()).toMatch(/couldn't remove the previous demo trial \(not-a-trial-entry\)/);
@@ -2309,7 +2333,7 @@ describe("runTry — env objects with their own lookup semantics", () => {
       env,
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["GITHUB_TOKEN"] }),
+      resolveServer: async () => ({ ...SAMPLE, requiredEnvVars: ["GITHUB_TOKEN"] }),
     });
     expect(r.exitCode).toBe(0);
     expect(cap.errText()).not.toMatch(/needs the following env var/);
@@ -2344,7 +2368,7 @@ describe("runTry — env objects with their own lookup semantics", () => {
       envOverrides: { GITHUB_TOKEN: "explicit" },
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["GITHUB_TOKEN"] }),
+      resolveServer: async () => ({ ...SAMPLE, requiredEnvVars: ["GITHUB_TOKEN"] }),
     });
     expect(r.exitCode).toBe(0);
     const entry = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8")).mcpServers["yaw-mcp-try-demo"];
@@ -2374,7 +2398,7 @@ describe("runTry — trial marker write failure", () => {
       envOverrides: { D_TOKEN: "secret" },
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["D_TOKEN"] }),
+      resolveServer: async () => ({ ...SAMPLE, requiredEnvVars: ["D_TOKEN"] }),
     });
     expect(r.exitCode).toBe(1);
     expect(r.written).toEqual([]);
@@ -2406,7 +2430,7 @@ describe("runTry — client-config write failure on a re-run", () => {
       os: "linux" as const,
       env: {},
       envOverrides: { D_TOKEN: "secret" },
-      fetchExplore: async (): Promise<ExploreServerResponse> => ({ ...SAMPLE, requiredEnvVars: ["D_TOKEN"] }),
+      resolveServer: async (): Promise<TrialServer> => ({ ...SAMPLE, requiredEnvVars: ["D_TOKEN"] }),
     };
     const cap1 = captureIO();
     const first = await runTry({
@@ -2469,7 +2493,7 @@ describe("runTry — client-config write failure on a re-run", () => {
       os: "linux" as const,
       env: {},
       envOverrides: { D_TOKEN: "secret" },
-      fetchExplore: async (): Promise<ExploreServerResponse> => ({ ...SAMPLE, requiredEnvVars: ["D_TOKEN"] }),
+      resolveServer: async (): Promise<TrialServer> => ({ ...SAMPLE, requiredEnvVars: ["D_TOKEN"] }),
     };
     const cap1 = captureIO();
     const first = await runTry({
@@ -2564,7 +2588,7 @@ describe("runTry — client-config write failure on a re-run", () => {
       env: {},
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => SAMPLE,
+      resolveServer: async () => SAMPLE,
     });
     expect(r.exitCode).toBe(1);
     expect(cap.errText()).toMatch(/couldn't remove the previous demo trial \(not-a-trial-entry\)/);
@@ -2593,7 +2617,7 @@ describe("runTry — client-config write failure on a re-run", () => {
       env: {},
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => SAMPLE,
+      resolveServer: async () => SAMPLE,
     });
     expect(r.exitCode).toBe(1);
     expect(existsSync(trialMarkerPath("demo", synthHome))).toBe(false);
@@ -2618,7 +2642,7 @@ describe("runTry -- refusals that were resolver internals", () => {
       env: {},
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => SAMPLE,
+      resolveServer: async () => SAMPLE,
     });
     expect(r.exitCode).toBe(2);
     // Byte-exact. It names the undocumented config path rather than claiming
@@ -2645,7 +2669,7 @@ describe("runTry -- refusals that were resolver internals", () => {
       env: {},
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => {
+      resolveServer: async () => {
         throw new Error("no server named demo in the catalog");
       },
     });
@@ -2666,7 +2690,7 @@ describe("runTry -- re-running for a slug that is already wired", () => {
       env: {},
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => SAMPLE,
+      resolveServer: async () => SAMPLE,
     });
   };
 
@@ -2688,7 +2712,7 @@ describe("runTry -- re-running for a slug that is already wired", () => {
       env: {},
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => SAMPLE,
+      resolveServer: async () => SAMPLE,
     });
     expect(r.exitCode).toBe(0);
     expect(cap.text()).toMatch(/[Rr]eplac/);
@@ -2705,7 +2729,7 @@ describe("runTry -- re-running for a slug that is already wired", () => {
       env: {},
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => SAMPLE,
+      resolveServer: async () => SAMPLE,
     });
     expect(cap.text()).not.toMatch(/[Rr]eplac/);
   });
@@ -2724,7 +2748,7 @@ describe("runTry -- re-running for a slug that is already wired", () => {
       env: {},
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => SAMPLE,
+      resolveServer: async () => SAMPLE,
     });
     expect(r.exitCode).toBe(0);
     expect(cap.text()).toMatch(/would replace/i);
@@ -2744,7 +2768,7 @@ describe("runTryCleanup -- confirmation", () => {
       env: {},
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => SAMPLE,
+      resolveServer: async () => SAMPLE,
     });
   };
 
@@ -2853,7 +2877,7 @@ describe("trial provenance -- the entry at the name may not be OURS any more", (
       env: {},
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => SAMPLE,
+      resolveServer: async () => SAMPLE,
     });
   };
 
@@ -2963,7 +2987,7 @@ describe("trial provenance -- the entry at the name may not be OURS any more", (
   });
 });
 
-// The catalog's `"optional": true` flag, as the explore response carries it
+// The catalog's `"optional": true` flag, as the resolved catalog entry carries it
 // (optionalEnvVars, split from requiredEnvVars by resolveCatalogSlug). The
 // server runs without these, so the trial never refuses over one -- but a
 // value the shell or --env holds still reaches the directly-launched trial
@@ -2984,7 +3008,7 @@ describe("runTry -- optional env vars", () => {
       env: {},
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: [], optionalEnvVars: ["FOO_TOKEN"] }),
+      resolveServer: async () => ({ ...SAMPLE, requiredEnvVars: [], optionalEnvVars: ["FOO_TOKEN"] }),
     });
     expect(r.exitCode).toBe(0);
     expect(cap.errText()).not.toMatch(/needs the following env var/);
@@ -3001,7 +3025,7 @@ describe("runTry -- optional env vars", () => {
       env: {},
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["REQ"], optionalEnvVars: ["OPT"] }),
+      resolveServer: async () => ({ ...SAMPLE, requiredEnvVars: ["REQ"], optionalEnvVars: ["OPT"] }),
     });
     expect(r.exitCode).toBe(1);
     const err = cap.errText();
@@ -3020,7 +3044,7 @@ describe("runTry -- optional env vars", () => {
       env: { FOO_TOKEN: "ambient-secret" },
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: [], optionalEnvVars: ["FOO_TOKEN"] }),
+      resolveServer: async () => ({ ...SAMPLE, requiredEnvVars: [], optionalEnvVars: ["FOO_TOKEN"] }),
     });
     expect(r.exitCode).toBe(0);
     const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
@@ -3037,7 +3061,7 @@ describe("runTry -- optional env vars", () => {
       envOverrides: { FOO_TOKEN: "given", LOG_LEVEL: "debug" },
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: [], optionalEnvVars: ["FOO_TOKEN"] }),
+      resolveServer: async () => ({ ...SAMPLE, requiredEnvVars: [], optionalEnvVars: ["FOO_TOKEN"] }),
     });
     expect(r.exitCode).toBe(0);
     expect(cap.text()).toMatch(/env keys:\s+FOO_TOKEN \(optional\), LOG_LEVEL\b/);
@@ -3083,7 +3107,7 @@ describe("codex-cli trials -- cleanup reads config.toml as TOML", () => {
       env: {},
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => SAMPLE,
+      resolveServer: async () => SAMPLE,
     });
     expect(r.exitCode).toBe(0);
     expect(readFileSync(codexPath(), "utf8")).toContain("[mcp_servers.yaw-mcp-try-demo]");
@@ -3108,7 +3132,7 @@ describe("codex-cli trials -- cleanup reads config.toml as TOML", () => {
       env: {},
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async () => ({ ...SAMPLE, slug: "other" }),
+      resolveServer: async () => ({ ...SAMPLE, slug: "other" }),
     });
     expect(r.exitCode).toBe(0);
     expect(r.marker?.format).toBe("jsonc");
@@ -3204,7 +3228,7 @@ describe("codex-cli trials -- cleanup reads config.toml as TOML", () => {
       cwd: synthCwd,
       os: "linux" as const,
       env: {},
-      fetchExplore: async (): Promise<ExploreServerResponse> => SAMPLE,
+      resolveServer: async (): Promise<TrialServer> => SAMPLE,
     };
 
     const preview = captureIO();

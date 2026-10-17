@@ -1106,6 +1106,34 @@ describe("rewriteNpmToManagedNode", () => {
     expect(rewriteNpmToManagedNode("npx", [], deps)).toEqual({ command: "npx", args: [] });
   });
 
+  it("does not claim an npx fallback for a non-npx launch when no node bin is located", () => {
+    // The launch kind is checked before nodeBin: a docker command with no
+    // locatable node used to log "staying on npx" for a launch that was never
+    // npx. logger.ts resolves LOG_LEVEL per call, so raising it here is enough.
+    const prior = process.env.LOG_LEVEL;
+    process.env.LOG_LEVEL = "debug";
+    const chunks: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown): boolean => {
+      chunks.push(String(chunk));
+      return true;
+    });
+    try {
+      expect(rewriteNpmToManagedNode("docker", ["run", "-i", "img"], { ...deps, nodeBin: null })).toEqual({
+        command: "docker",
+        args: ["run", "-i", "img"],
+      });
+      expect(chunks.join("")).not.toContain("staying on npx");
+      // ...while the npx case still says it, so the assertion above is not
+      // vacuous (the line would be suppressed if the level were not raised).
+      rewriteNpmToManagedNode("npx", ["-y", "some-mcp"], { ...deps, nodeBin: null });
+      expect(chunks.join("")).toContain("staying on npx");
+    } finally {
+      spy.mockRestore();
+      if (prior === undefined) delete process.env.LOG_LEVEL;
+      else process.env.LOG_LEVEL = prior;
+    }
+  });
+
   it("rewrites a launch that names npx by its Windows shim or absolute path", () => {
     // nodeLaunchKind matches the BASENAME (npx.cmd, /usr/local/bin/npx), so
     // the rewrite must too -- a string-equality regression would silently opt
@@ -1307,6 +1335,60 @@ describe("resolveManagedSpawn entry memo", () => {
       });
       expect(spawn(["-y", "some-mcp@2.0.0"])).toEqual({ command: "npx", args: ["-y", "some-mcp@2.0.0"] });
     } finally {
+      cleanup();
+    }
+  });
+
+  it("omitted nodeBin is resolved lazily: no PATH walk for a non-npx launch, one for npx", () => {
+    // managedNodeBin is a same-module call, so a vi.spyOn on the export would
+    // not intercept it. Observe the PATH walk itself instead: a non-node
+    // execPath forces managedNodeBin onto resolveBinAbsolute, and a recording
+    // process.env counts its PATH reads. An eager default parameter would read
+    // PATH for the docker launch too.
+    const { root, managedRoot, brokerUrl, cleanup } = fixture();
+    const binDir = join(root, "bin");
+    mkdirSync(binDir, { recursive: true });
+    const fakeNode = join(binDir, process.platform === "win32" ? "node.exe" : "node");
+    writeFileSync(fakeNode, "");
+    chmodSync(fakeNode, 0o755);
+    writePkg(join(managedRoot, "some-mcp"), {
+      name: "some-mcp",
+      version: "1.0.0",
+      bin: { "some-mcp": "dist/index.js" },
+    });
+    const realEnv = process.env;
+    const execPathDesc = Object.getOwnPropertyDescriptor(process, "execPath");
+    let pathReads = 0;
+    const recording = new Proxy(
+      { ...realEnv, PATH: binDir, Path: undefined, path: undefined },
+      {
+        get(target, key, receiver) {
+          if (typeof key === "string" && key.toLowerCase() === "path") pathReads++;
+          return Reflect.get(target, key, receiver);
+        },
+      },
+    );
+    try {
+      Object.defineProperty(process, "execPath", {
+        value: join(root, "oam"),
+        configurable: true,
+        writable: true,
+      });
+      process.env = recording as NodeJS.ProcessEnv;
+      expect(resolveManagedSpawn("docker", ["run", "-i", "img"], brokerUrl, null, managedRoot)).toEqual({
+        command: "docker",
+        args: ["run", "-i", "img"],
+      });
+      expect(pathReads).toBe(0);
+      // Positive control: the same setup DOES walk PATH for npx and spawns the
+      // node it found there.
+      const npx = resolveManagedSpawn("npx", ["-y", "some-mcp"], brokerUrl, null, managedRoot);
+      expect(pathReads).toBeGreaterThan(0);
+      expect(npx.args).toEqual([join(managedRoot, "some-mcp", "dist", "index.js")]);
+      expect(npx.command.toLowerCase()).toBe(fakeNode.toLowerCase());
+    } finally {
+      process.env = realEnv;
+      if (execPathDesc) Object.defineProperty(process, "execPath", execPathDesc);
       cleanup();
     }
   });
@@ -2102,6 +2184,9 @@ describe("resolveNpmEntry", () => {
       const [note] = captureNotices(() => resolveNpmEntry("@yawlabs/fetch-mcp", brokerUrl, null, null));
       expect(note, "a durable hit reported no pin at all").toBeDefined();
       expect(note.source).toBe("durable");
+      // Host-neutral: the same notice fires on the managed-node rewrite, the
+      // common oam-absent path, so naming oam as the host would be false there.
+      expect(String(note.msg)).not.toMatch(/\boam\b/);
       expect(note.refreshWith).toBe("npm install @yawlabs/fetch-mcp@latest");
       // No Ctrl-C note here: `npm install` exits on its own, so the guidance
       // is npx-cache-only and the field must not leak onto other sources.

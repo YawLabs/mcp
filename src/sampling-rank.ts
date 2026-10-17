@@ -1,11 +1,11 @@
 import type { CreateMessageRequestParamsBase, ProtocolEra } from "@modelcontextprotocol/server";
 import { log } from "./logger.js";
-import { capForPrompt, INTENT_MAX, type SamplingPeer } from "./reward-grader.js";
+import { capForPrompt, extractText, INTENT_MAX, type SamplingPeer, TOOL_NAME_MAX } from "./reward-grader.js";
 import type { UpstreamServerConfig } from "./types.js";
 
 // Top-2 scores within this ratio of each other trigger a sampling
 // tiebreak. 0.9 means "runner-up scored ≥90% of the leader" — if the
-// gap is wider than that, BM25+rerank is confident enough on its own.
+// gap is wider than that, BM25 is confident enough on its own.
 export const SAMPLING_TIEBREAK_RATIO = 0.9;
 
 // Small budget — the LLM's job here is to name one candidate, not to
@@ -86,7 +86,8 @@ export const CANDIDATE_DESCRIPTION_MAX = 300;
 // Build a compact prompt describing the candidate servers. Keep it
 // under a few hundred tokens so the sampling round-trip is cheap.
 //
-// The intent and every description are length-capped HERE, not by the caller:
+// The intent, every description and every tool name (TOOL_NAME_MAX, shared
+// with the grader) are length-capped HERE, not by the caller:
 // server.ts's handleDispatch rejects only an EMPTY intent and passes the rest
 // verbatim, and under the "aggressive" effort dial this prompt goes out up to
 // MAX_SAMPLES times per dispatch, each billed to the client's sampling budget.
@@ -100,7 +101,7 @@ export function buildTiebreakPrompt(intent: string, candidates: TiebreakCandidat
       c.tools.length > 0
         ? c.tools
             .slice(0, 8)
-            .map((t) => t.name)
+            .map((t) => capForPrompt(t.name, TOOL_NAME_MAX))
             .join(", ")
         : "(no tool metadata yet)";
     const desc = c.description ? ` -- ${capForPrompt(c.description, CANDIDATE_DESCRIPTION_MAX)}` : "";
@@ -177,24 +178,6 @@ export function parseTiebreakResponse(response: string, candidates: TiebreakCand
 
 function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-// createMessage can return content as a single block or an array (when
-// the LLM used tools). For tiebreak we only care about text; collect
-// any text blocks we find and join them.
-function extractText(content: unknown): string {
-  if (!content) return "";
-  if (Array.isArray(content)) {
-    return content
-      .map((c) => (c && typeof c === "object" && "type" in c && c.type === "text" && "text" in c ? String(c.text) : ""))
-      .filter(Boolean)
-      .join("\n");
-  }
-  if (typeof content === "object" && content !== null && "type" in content) {
-    const block = content as { type: string; text?: string };
-    if (block.type === "text" && typeof block.text === "string") return block.text;
-  }
-  return "";
 }
 
 // Build TiebreakCandidate descriptors for a subset of servers sharing

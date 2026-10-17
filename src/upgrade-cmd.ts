@@ -19,7 +19,9 @@
 //
 // Exit codes:
 //   0  already on the latest version, there is nothing to run (npx /
-//      bundled-app), OR the registry was unreachable (see OFFLINE below)
+//      bundled-app), the registry was unreachable (see OFFLINE below), OR
+//      --run installed successfully (even when the post-run WARNING below
+//      fires)
 //   1  upgrade available but nothing was installed -- either --run was not
 //      passed (human-interactive mode), or --json was, which is a report-only
 //      snapshot that never spawns. `--json --run` on a stale install is
@@ -109,6 +111,12 @@ export interface UpgradeCommandOptions {
   fetchLatest?: () => Promise<string | null>;
   /** Test hook: override the argv path detection. */
   argvPath?: string;
+  /** Test hook: replace the realpath behind detectInstallMethod,
+   *  localInstallRoot and runningPackageDir, so a bin shim can be resolved
+   *  without a real symlink on disk. It does NOT reach refineInstallMethod's
+   *  comparablePath or the running-prefix walk (detectRunningInstallPrefix);
+   *  both still call realpathSync directly. */
+  realpath?: (p: string) => string;
   /** Test hook: override the current version. */
   currentVersion?: string;
   /** Test hook: override stdout. */
@@ -340,13 +348,14 @@ function classifyEntrypoint(argvPath: string): InstallMethod {
   // signal: the path lives under a `node_modules` that is NOT inside
   // the current project's node_modules. Since we can't reliably tell
   // global vs local from argv alone, use the npm prefix marker on
-  // common platforms and a `\\npm\\node_modules\\` Windows marker.
+  // common platforms. The same marker covers the Windows default prefix
+  // (`%APPDATA%\npm\node_modules\...`, i.e. `/AppData/Roaming/npm/...` once
+  // normalized), so that layout needs no rule of its own.
   if (/\/npm\/node_modules\/@yawlabs\/mcp\//.test(normalized)) return "global-npm";
   // `<prefix>/lib/node_modules` -- anchored on real Node-root shapes; see the
   // two regex definitions above for why a bare `/lib/` marker was unsafe.
   if (POSIX_GLOBAL_LIB_PREFIX.test(normalized)) return "global-npm";
   if (MANAGED_NODE_LIB_PREFIX.test(normalized)) return "global-npm";
-  if (/\/AppData\/Roaming\/npm\/node_modules\/@yawlabs\/mcp\//.test(normalized)) return "global-npm";
   // `~/.npm-global` is the prefix npm's own docs tell a user to create to
   // escape a sudo-owned default (`npm config set prefix ~/.npm-global`), so it
   // is the ONE custom prefix with a conventional name. Both global layouts:
@@ -388,15 +397,34 @@ function classifyEntrypoint(argvPath: string): InstallMethod {
 
 /** For a local-node-modules install, the directory `npm install` must run
  *  in: the package-tree root, i.e. everything before the FIRST
- *  `/node_modules/` segment of the entrypoint path. Null when the path
- *  doesn't contain a node_modules segment. */
-export function localInstallRoot(argvPath: string | undefined): string | null {
+ *  `/node_modules/` segment of the entrypoint path. Same literal-then-realpath
+ *  order as runningPackageDir: a shim OUTSIDE the tree
+ *  (`~/bin/yaw-mcp -> /proj/node_modules/.bin/yaw-mcp`) carries no
+ *  node_modules segment in its literal path, yet detectInstallMethod's
+ *  realpath pass classifies it local-node-modules -- without the fallback the
+ *  root came back null and the command lost its `cwd`. Null when neither the
+ *  literal path nor its realpath contains a node_modules segment (or the
+ *  segment sits at index 0, a node_modules at the filesystem root). */
+export function localInstallRoot(
+  argvPath: string | undefined,
+  realpath: (p: string) => string = realpathSync,
+): string | null {
   if (!argvPath) return null;
+  const literal = treeRootOf(argvPath);
+  if (literal !== null) return literal;
+  try {
+    return treeRootOf(realpath(argvPath));
+  } catch {
+    return null;
+  }
+}
+
+function treeRootOf(p: string): string | null {
   // Separator normalization preserves length, so an index found in the
   // normalized string addresses the same spot in the original -- slicing
   // the original keeps Windows drive letters and backslashes intact.
-  const idx = argvPath.replace(/\\/g, "/").indexOf("/node_modules/");
-  return idx > 0 ? argvPath.slice(0, idx) : null;
+  const idx = p.replace(/\\/g, "/").indexOf("/node_modules/");
+  return idx > 0 ? p.slice(0, idx) : null;
 }
 
 /** The `@yawlabs/mcp` package directory the RUNNING copy was loaded from --
@@ -434,7 +462,7 @@ export function runningPackageDir(
 
 function packageDirOf(p: string): string | null {
   const marker = "/node_modules/@yawlabs/mcp/";
-  // Separator normalization preserves length (same trick as localInstallRoot),
+  // Separator normalization preserves length (same trick as treeRootOf),
   // so the index found in the normalized string slices the ORIGINAL and keeps
   // drive letters and backslashes intact.
   const idx = p.replace(/\\/g, "/").lastIndexOf(marker);
@@ -962,7 +990,10 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
   // mislabel it `unknown` and suggest a bogus `npm install -g`. Detect the
   // SEA blob first and short-circuit to the binary method.
   const sea = opts.isSea ? opts.isSea() : await detectSea();
-  const method = sea ? "binary" : await refineInstallMethod(detectInstallMethod(argvPath), argvPath, opts.npmPrefix);
+  const realpath = opts.realpath ?? realpathSync;
+  const method = sea
+    ? "binary"
+    : await refineInstallMethod(detectInstallMethod(argvPath, realpath), argvPath, opts.npmPrefix);
 
   let latest: string | null;
   try {
@@ -1030,7 +1061,7 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
   // `npm install @yawlabs/mcp@latest` run from the wrong directory does not
   // upgrade the tree -- it writes a stray package.json + node_modules wherever
   // it landed and leaves the stale copy in place.
-  const installRoot = method === "local-node-modules" ? localInstallRoot(argvPath) : null;
+  const installRoot = method === "local-node-modules" ? localInstallRoot(argvPath, realpath) : null;
 
   if (opts.json) {
     // The snapshot's command is the paste-safe prefixed form: scripts and
@@ -1131,13 +1162,13 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
   // One whitelist for every spawn surface: UPGRADE_COMMANDS. The `--prefix`
   // arg rides in only for global-npm, and only when it survived quoting.
   const spec = upgradeSpawnSpec(method, globalPrefixArg);
-  // The `installRoot !== null` guard is defensive-dead, kept only so a future
-  // localInstallRoot change cannot produce `cwd: undefined` and silently
-  // install into the process cwd: localInstallRoot returns null exactly when
-  // `/node_modules/` sits at index 0, i.e. a node_modules directory at the
-  // filesystem root, which no real classification produces
-  // (detectInstallMethod only labels a path local-node-modules when there is a
-  // tree above it).
+  // The `installRoot !== null` guard refuses rather than spawn with no cwd
+  // (which would install into the process cwd and leave the stale copy put).
+  // localInstallRoot resolves an out-of-tree bin shim through its realpath, so
+  // the guard fires only when neither argv[1] nor its realpath yields a root:
+  // the realpath failing between the two walks, or a node_modules at the
+  // filesystem root (index 0). Either way --run exits 2 like any other
+  // non-runnable install, and the listing prints no `in <root>:` line.
   const runSpec: { cmd: string; args: string[]; cwd?: string } | null =
     spec === null
       ? null
@@ -1241,7 +1272,7 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
     // prefix machinery exists to prevent. Advisory: stderr, exit code
     // unchanged (see the header). Unreadable means unverifiable, and
     // unverifiable stays quiet rather than crying wolf.
-    const pkgDir = runningPackageDir(argvPath);
+    const pkgDir = runningPackageDir(argvPath, realpath);
     const running = pkgDir === null ? null : await (opts.installedVersion ?? defaultInstalledVersion)(pkgDir);
     // OLDER than the fetched latest, not merely different: `latest` was
     // fetched before the child ran and `@latest` resolves the dist-tag at

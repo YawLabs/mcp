@@ -206,12 +206,16 @@ export function patchPermissionsAllowText(raw: string, patterns: string[], op: "
  *  publishing rename. */
 export type SettingsFingerprint = { mtimeMs: number; size: number } | null;
 
+/** null ONLY for ENOENT. Any other stat failure (EACCES on the parent,
+ *  ENOTDIR, ELOOP, ...) rethrows: read as "absent", it would skip the read and
+ *  render a fresh settings.json holding nothing but permissions.allow. */
 async function settingsFingerprint(path: string): Promise<SettingsFingerprint> {
   try {
     const st = await stat(path);
     return { mtimeMs: st.mtimeMs, size: st.size };
-  } catch {
-    return null;
+  } catch (err) {
+    if ((err as { code?: unknown } | null)?.code === "ENOENT") return null;
+    throw err;
   }
 }
 
@@ -233,6 +237,24 @@ export interface ClaudeCodeSettingsPatch {
   malformedReason?: string;
 }
 
+/** Read `settings.json` (or settings.local.json) for the given scope,
+ *  compute the next version with the yaw-mcp allow-pattern unioned into
+ *  `permissions.allow` (or dropped from it, under `op: "remove"`), and return
+ *  both the path and the rendered JSON.
+ *  Returns `changed: false` when the pattern is already present (or already
+ *  absent) -- caller can skip the write entirely. Returns null for scopes that
+ *  have no corresponding settings file. Malformed or non-object existing files
+ *  are left untouched (changed: false, malformed: true, malformedReason set);
+ *  the caller emits a warning so the skip isn't silent. Every non-null result
+ *  carries the file's `fingerprint` from BEFORE the read, for the caller to
+ *  compare again ahead of its write (see the settings patch in runInstall).
+ *
+ *  `op` is a parameter rather than a second function because everything AROUND
+ *  the one-line transform -- the fingerprint-before-read discipline, the
+ *  malformed/non-object reporting, the `permissions`-is-not-an-object
+ *  pre-empt, the comment-preserving splice of exactly the `allow` node -- is
+ *  delicate and had to be identical on both sides. `uninstall` copying it
+ *  would have been a second place for that reasoning to drift. */
 export async function prepareClaudeCodeSettingsPatch(opts: {
   scope: InstallScope;
   home: string;
@@ -256,10 +278,25 @@ export async function prepareClaudeCodeSettingsPatch(opts: {
   // Fingerprinted BEFORE the read, for the same reason the client config is
   // (runInstall, ahead of its readFile): taken after, a write landing between
   // the read and the stat would be carried forward under a fresh fingerprint.
-  // null is "absent", which is the existence test this used to be an
-  // existsSync for; an unreadable file still reaches the readFile below and
-  // is reported from there.
-  const fingerprint = await settingsFingerprint(path);
+  // null is "absent" (ENOENT), which is the existence test this used to be an
+  // existsSync for. A file that stats but cannot be read still reaches the
+  // readFile below and is reported from there; a stat that fails any other
+  // way is reported here, and the file is left alone.
+  let fingerprint: SettingsFingerprint;
+  try {
+    fingerprint = await settingsFingerprint(path);
+  } catch (e) {
+    return {
+      path,
+      nextJson: "",
+      changed: false,
+      added: [],
+      removed: [],
+      malformed: true,
+      malformedReason: `could not stat it (${(e as Error).message})`,
+      fingerprint: null,
+    };
+  }
   if (fingerprint !== null) {
     try {
       const raw = await readFile(path, "utf8");
@@ -347,6 +384,24 @@ export async function prepareClaudeCodeSettingsPatch(opts: {
     // than re-serialized.
     try {
       const next = patchPermissionsAllowText(rawSettings, [CLAUDE_CODE_ALLOW_PATTERN], op);
+      // `added` / `removed` were computed from the PARSED value; the bytes are
+      // what lands on disk. If the splice did not actually make that change, a
+      // report built from the value would claim a removal (or an addition) the
+      // file never got. Check the bytes, and report the miss instead.
+      const nextAllow = (parseJsonc(next) as { permissions?: { allow?: unknown } } | null)?.permissions?.allow;
+      const hasPattern = Array.isArray(nextAllow) && nextAllow.includes(CLAUDE_CODE_ALLOW_PATTERN);
+      if (next === rawSettings || hasPattern !== (op === "add")) {
+        return {
+          path,
+          nextJson: "",
+          changed: false,
+          added: [],
+          removed: [],
+          malformed: true,
+          malformedReason: `could not splice permissions.allow (the edit left the pattern ${op === "add" ? "absent" : "present"})`,
+          fingerprint,
+        };
+      }
       // The client configs' own terminator, so a CRLF settings.json with no
       // final line break gets a CRLF, not a bare LF.
       return { path, nextJson: terminateWithNewline(next), changed: true, added, removed, fingerprint };

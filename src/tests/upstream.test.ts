@@ -4783,6 +4783,9 @@ describe("connectToUpstream progress reporting", () => {
     await vi.advanceTimersByTimeAsync(5_000);
     expect(messages).toHaveLength(2);
     expect(messages[1]).toContain("10s so far");
+    // The 15s is the TOTAL budget: phrased as a limit, not as time remaining
+    // ("10s so far, 15s before it is given up on" read as 15 more seconds).
+    expect(messages[1]).toContain("10s so far of a 15s limit");
 
     // ...and it stops when the phase does, rather than ticking forever.
     await vi.advanceTimersByTimeAsync(20_000);

@@ -23,8 +23,20 @@ type LogLevel = keyof typeof LOG_LEVELS;
 // embedding host that flips it mid-session is silently ignored. The lookup is
 // one env read plus an object index, far cheaper than the JSON.stringify it
 // gates.
+//
+// The ONE reader of LOG_LEVEL: minLevel and logLevelRequested both go through
+// it, so they cannot disagree. Trimmed (cmd.exe's `set LOG_LEVEL=debug && ...`
+// keeps the space before `&&`) and own-property-checked, so `constructor` or
+// `toString` is an unrecognized value rather than an Object.prototype member.
+// Null for unset or unrecognized.
+function resolveLogLevel(): LogLevel | null {
+  const raw = process.env.LOG_LEVEL?.trim().toLowerCase();
+  return raw !== undefined && Object.hasOwn(LOG_LEVELS, raw) ? (raw as LogLevel) : null;
+}
+
 function minLevel(): number {
-  return LOG_LEVELS[process.env.LOG_LEVEL?.toLowerCase() as LogLevel] ?? LOG_LEVELS.info;
+  const level = resolveLogLevel();
+  return level === null ? LOG_LEVELS.info : LOG_LEVELS[level];
 }
 
 // A host that closes our stderr first (the pipe reader exits before we do)
@@ -84,8 +96,7 @@ export function setLogSurface(next: LogSurface): void {
  *  for it, so treating `LOG_LEVEL=chatty` as an opt-in would turn a typo into
  *  a wall of JSON. */
 function logLevelRequested(): boolean {
-  const raw = process.env.LOG_LEVEL?.trim().toLowerCase();
-  return raw !== undefined && raw in LOG_LEVELS;
+  return resolveLogLevel() !== null;
 }
 
 /** One `key=value` tail for the plain-text CLI rendering. Never throws: `data`

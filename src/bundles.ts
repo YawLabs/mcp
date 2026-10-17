@@ -112,7 +112,18 @@ export function matchBundles(installedNamespaces: Iterable<string>): BundleMatch
  * so the model has a ready-to-run call site without a second round-trip.
  */
 export function bundleActivateHint(bundle: CuratedBundle): string {
-  return `mcp_connect_activate({ servers: ${JSON.stringify(bundle.namespaces)} })`;
+  return activateServersCall(bundle.namespaces);
+}
+
+/**
+ * The ready-to-run activate call for a namespace set, in `servers`, the
+ * array form activate reads. resolveNamespaces (server.ts) also takes a
+ * single `server` string, but no `namespaces` key, so a multi-namespace
+ * hint must use `servers`. Every "load these together" hint renders through
+ * here so none can drift to a parameter name the tool ignores.
+ */
+export function activateServersCall(namespaces: readonly string[]): string {
+  return `mcp_connect_activate({ servers: ${JSON.stringify(namespaces)} })`;
 }
 
 /**

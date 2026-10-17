@@ -1478,4 +1478,18 @@ describe("trustStatusFor takes the platform it folds under, like readTrustStore"
     expect(trustStatusFor(path, bytes, linuxStore, "linux")).toBe("trusted");
     expect(trustStatusFor(path.toUpperCase(), bytes, linuxStore, "linux")).toBe("untrusted");
   });
+
+  it("reads only OWN entries: a record inherited through the prototype never grants trust", async () => {
+    // Same guard revokeTrust applies to this map. A plain index would find
+    // an inherited key and, with a matching digest, return "trusted".
+    const path = projectBundlesPath(join(synthCwd, "proto"));
+    const bytes = Buffer.from("{}");
+    const inherited = {
+      [normalizeTrustKey(path)]: { path, sha256: hashTrustContent(bytes), grantedAt: "2026-01-01T00:00:00.000Z" },
+    };
+    const healthy = await readTrustStore(synthHome);
+    expect(healthy.malformed).toBe(false);
+    const store = { ...healthy, entries: Object.create(inherited) as typeof healthy.entries };
+    expect(trustStatusFor(path, bytes, store)).toBe("untrusted");
+  });
 });

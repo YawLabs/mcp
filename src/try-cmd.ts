@@ -30,7 +30,7 @@
 //     arbitrary JSON or TOML file.
 //   - NOTHING IS SENT ANYWHERE AND NOTHING IS FINGERPRINTED. `try` used to
 //     POST a {slug, action, anonId} triple to /api/try/event; that endpoint
-//     died with the hosted backend and the poster is now a no-op, so no trial
+//     died with the hosted backend and the poster was deleted, so no trial
 //     event leaves the machine. The anonId (a truncated SHA-256 of hostname +
 //     username) is gone with it: it is no longer computed and no longer
 //     persisted to ~/.yaw-mcp/trials/.anon.
@@ -66,7 +66,7 @@ import { chmod, mkdir, readdir, readFile, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { atomicWriteFile } from "./atomic-write.js";
-import { CATALOG_SLUG_RE, resolveCatalogSlug } from "./catalog.js";
+import { CATALOG_SLUG_RE, ENV_KEY_RE, resolveCatalogSlug } from "./catalog.js";
 import { clientChoices, resolveClientArg } from "./client-aliases.js";
 import {
   applyClientConfigEdits,
@@ -189,7 +189,7 @@ export const TRIALS_DIRNAME = "trials";
  *  arbitrary JSON or TOML file on disk. */
 export const TRIAL_ENTRY_PREFIX = "yaw-mcp-try-";
 
-export interface ExploreServerResponse {
+export interface TrialServer {
   slug: string;
   name: string;
   command: string;
@@ -285,13 +285,13 @@ export interface TryCommandOptions {
    *  which also flips atomicWriteFile out of its Windows rename-retry path
    *  (the AV/indexer EPERM dance) on the machine this suite runs on. */
   platform?: NodeJS.Platform;
-  /** Override for tests; defaults to the catalog read in defaultFetchExplore.
+  /** Override for tests; defaults to the catalog read in defaultResolveServer.
    *  `catalogUrl` carries runTry's resolved $YAW_MCP_CATALOG_URL override
    *  (undefined when unset or empty) so the seam never has to read
    *  process.env behind the caller's injected `env`. `warn` is the sink for
    *  the catalog's staleness note, so it lands on this command's stderr
    *  writer rather than the real process.stderr. */
-  fetchExplore?: (slug: string, catalogUrl?: string, warn?: (line: string) => void) => Promise<ExploreServerResponse>;
+  resolveServer?: (slug: string, catalogUrl?: string, warn?: (line: string) => void) => Promise<TrialServer>;
   out?: (s: string) => void;
   err?: (s: string) => void;
   /** Override for tests; defaults to Date.now(). */
@@ -372,7 +372,8 @@ export function parseTryArgs(
         const eq = v.indexOf("=");
         const key = v.slice(0, eq);
         const val = v.slice(eq + 1);
-        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
+        // ENV_KEY_RE: the one "shell identifier" rule `add` and `set` share.
+        if (!ENV_KEY_RE.test(key)) {
           return { ok: false, error: `--env: invalid KEY "${key}"` };
         }
         env[key] = val;
@@ -800,13 +801,13 @@ async function peelTrialEntry(
 // resolves every other env lookup through its injectable `opts.env`, and a
 // lone process.env read inside the seam means an embedded caller (or a test)
 // that supplies `env` is silently overridden by the ambient environment.
-async function defaultFetchExplore(
+async function defaultResolveServer(
   slug: string,
   catalogUrl?: string,
   warn?: (line: string) => void,
-): Promise<ExploreServerResponse> {
+): Promise<TrialServer> {
   const resolved = await resolveCatalogSlug(slug, { catalogUrl, warn });
-  const out: ExploreServerResponse = {
+  const out: TrialServer = {
     slug: resolved.slug,
     name: resolved.name,
     command: resolved.command,
@@ -951,12 +952,12 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   // the SAME injectable env every other lookup here uses -- and an EMPTY value
   // counts as unset: `fetch("")` throws a bare TypeError that catalog.ts's
   // friendly wrapper cannot recognize as its own URL, so it is rethrown raw.
-  const fetchExplore = opts.fetchExplore ?? defaultFetchExplore;
+  const resolveServer = opts.resolveServer ?? defaultResolveServer;
   const catalogUrl =
     env.YAW_MCP_CATALOG_URL !== undefined && env.YAW_MCP_CATALOG_URL.length > 0 ? env.YAW_MCP_CATALOG_URL : undefined;
-  let server: ExploreServerResponse;
+  let server: TrialServer;
   try {
-    server = await fetchExplore(slug, catalogUrl, printErr);
+    server = await resolveServer(slug, catalogUrl, printErr);
   } catch (e) {
     // Prefixed like every other message this command prints. It was the one
     // bare line here, so a user reading a piped stderr (or a bug report) could
@@ -1462,7 +1463,10 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   // deleted.
   const written: string[] = [];
   try {
-    await mkdir(trialsDir(home), { recursive: true });
+    // 0o700: on a fresh machine this mkdir creates ~/.yaw-mcp itself, and no
+    // later writer tightens a dir that already exists -- bundles.json (which
+    // can carry --env secrets) would then live in a listable directory.
+    await mkdir(trialsDir(home), { recursive: true, mode: 0o700 });
     await atomicWriteFile(trialMarkerPath(slug, home), markerJson);
     written.push(trialMarkerPath(slug, home));
   } catch (e) {

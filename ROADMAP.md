@@ -16,7 +16,7 @@
 - [x] Local server spawning (stdio) + remote server connections (HTTP)
 - [x] Namespace-based tool routing
 - [x] tools/list_changed notifications on load/unload
-- [x] ~~60s config polling with version hash comparison~~ _(removed 0.74.0 -- bundles.json is read once at startup)_
+- [x] ~~60s config polling with version hash comparison~~ _(removed 0.74.0; since 1.0.0 every `mcp_connect_*` call checks bundles.json and re-reads it when it changed; `YAW_MCP_CONFIG_RELOAD=0` restores read-once)_
 - [x] Auto-unload servers idle for 10+ tool calls
 - [x] Directive tool descriptions for context-aware LLM behavior
 - [x] Graceful shutdown (SIGTERM/SIGINT)

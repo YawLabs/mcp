@@ -92,11 +92,11 @@ export interface UpstreamServerConfig {
  *  `headers`, resolved immediately before the transport is built. Reading the
  *  wrong one either invents a cause or hides a real one.
  *
- *  `type` alone is not enough. validateEntry (local-bundles.ts) defaults
- *  anything without an explicit `"type": "remote"` to "local", so a
- *  hand-written url+headers entry that omits the field reads as local and its
- *  headers -- the only credential it has -- get treated as a channel nothing
- *  uses. The url fallback is the same shape test renderLaunch and pinGaps in
+ *  `type` alone is not enough. validateEntry (local-bundles.ts) used to
+ *  default anything without an explicit `"type": "remote"` to "local", so a
+ *  hand-written url+headers entry that omitted the field read as local and its
+ *  headers -- the only credential it had -- got treated as a channel nothing
+ *  uses; that is the history behind this fallback. The url fallback is the same shape test renderLaunch and pinGaps in
  *  trust-cmd.ts already apply.
  *
  *  It lives here, in the module that owns UpstreamServerConfig and imports
@@ -106,8 +106,10 @@ export interface UpstreamServerConfig {
  *  dependency chain.
  *
  *  The url fallback and validateEntry now agree rather than merely coexisting:
- *  validateEntry INFERS `type: "remote"` for a command-less url entry, so by
- *  the time any reader sees a loaded config the two answers are the same one.
+ *  validateEntry INFERS `type: "remote"` for a command-less url entry whose
+ *  `type` is absent or unrecognised, so by the time any reader sees a loaded
+ *  config the two answers are the same one -- except for an explicit
+ *  `"type": "local"`, which validateEntry honours as the user's override.
  *  The fallback still earns its place for callers holding an entry that never
  *  went through validateEntry -- `add`'s in-flight entry before it is written,
  *  and any hand-built object in a test. */

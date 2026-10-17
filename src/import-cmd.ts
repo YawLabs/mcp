@@ -130,7 +130,8 @@ export const IMPORT_USAGE = `Usage: yaw-mcp import <client> [flags]
   yaw-mcp's own entry is never imported, under any of its names. Each server's
   command, args, url, headers and env come across as they are -- an import that
   dropped the env would produce servers that cannot start -- so a credential
-  sitting in your client config lands in bundles.json (file mode 0600). Move it
+  sitting in your client config lands in bundles.json (file mode 0600 on
+  macOS/Linux; on Windows only as private as your user profile's ACL). Move it
   into the vault afterwards with \`yaw-mcp secrets set NAME\` and
   \`yaw-mcp set <server> env.KEY='\${secret:NAME}'\`.
 

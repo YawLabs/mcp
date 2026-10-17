@@ -162,11 +162,11 @@ function entriesOf(container: Record<string, unknown>, transform?: EntryTransfor
 /** The document a fresh file starts as: the entry nested under its container
  *  path.
  *
- *  Byte-for-byte the shape `mergeClientConfig({}, containerPath, entry)`
- *  produces in install-cmd.ts, which is what the missing-file path renders
- *  today. The two are pinned against each other in
- *  src/tests/client-config-json.test.ts, so a divergence fails the suite
- *  rather than showing up as a differently-shaped fresh config. */
+ *  Byte-for-byte the shape install-cmd's retired `mergeClientConfig({},
+ *  containerPath, entry)` produced for the missing-file path.
+ *  src/tests/client-config-json.test.ts pins these bytes directly, so a
+ *  change fails the suite rather than showing up as a differently-shaped
+ *  fresh config. */
 export function buildFreshConfig(
   containerPath: readonly string[],
   key: string,

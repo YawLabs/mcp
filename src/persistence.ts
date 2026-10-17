@@ -37,6 +37,7 @@ import { atomicWriteFile } from "./atomic-write.js";
 import { type FileLockOptions, FileLockTimeoutError, withFileLock } from "./file-lock.js";
 import { setJsonKey } from "./json-key.js";
 import { log } from "./logger.js";
+import { isFeatureEnabled } from "./opt-out-env.js";
 import { userConfigDir } from "./paths.js";
 
 export const STATE_SCHEMA_VERSION = 2;
@@ -74,9 +75,7 @@ export const DISABLE_PERSISTENCE_ENV = "YAW_MCP_DISABLE_PERSISTENCE";
  * one copy that did not trim, so persistence stayed ON for exactly that shell.
  */
 export function isPersistenceDisabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  const raw = env[DISABLE_PERSISTENCE_ENV]?.trim();
-  if (raw === undefined || raw === "") return false;
-  return raw === "1" || raw.toLowerCase() === "true";
+  return isFeatureEnabled(DISABLE_PERSISTENCE_ENV, env);
 }
 
 // Versions loadState will still read. v1 is identical to v2 minus the
@@ -168,7 +167,7 @@ export const TOOLCACHE_MAX_META_CHARS = 128;
  *  reappears on its own within the hour. */
 export const PREWARM_FAILURE_BACKOFF_MS = 60 * 60 * 1000;
 /** Most pre-warm failures kept, and the longest message kept per failure. */
-export const PREWARM_FAILURE_MAX_ENTRIES = 64;
+const PREWARM_FAILURE_MAX_ENTRIES = 64;
 export const PREWARM_FAILURE_MAX_MESSAGE_CHARS = 300;
 
 export interface PersistedState {
@@ -374,9 +373,9 @@ function chained<T>(fn: () => Promise<T>): Promise<T> {
 /** How long a save waits on another process's live lock. The critical
  *  section is one read and one atomic write -- milliseconds -- so this is
  *  generous for real contention while still bounding a shutdown flush. */
-export const STATE_LOCK_WAIT_MS = 1_500;
+const STATE_LOCK_WAIT_MS = 1_500;
 /** Age past which a state.json.lock is abandoned (crashed holder). */
-export const STATE_LOCK_STALE_MS = 10_000;
+const STATE_LOCK_STALE_MS = 10_000;
 
 function stateLockTimeoutMessage(lockPath: string, heldMs: number | null): string {
   const held = heldMs === null ? "" : ` for ${Math.round(heldMs / 1000)}s`;
@@ -506,7 +505,8 @@ function takeOne(counts: Map<string, number>, key: string): boolean {
  * totals to disk totals would count every pre-existing observation twice.
  *
  *   - learning: dispatched/succeeded add the delta (succeeded may move DOWN:
- *     the reward grader revises credit with a negative adjustSucceeded), then
+ *     the reward grader and handleExec's blame split revise credit with a
+ *     negative adjustSucceeded), then
  *     clamp to the store's invariants (>= 0, succeeded <= dispatched);
  *     lastUsedAt takes the max. A namespace this process did not touch is
  *     left exactly as the disk has it -- including ABSENT, so a row another

@@ -413,6 +413,29 @@ describe("runDoctor — client detection", () => {
     expect(cap.text()).toContain("oam cannot fetch it on demand");
   });
 
+  it("flags a missing oam BINARY through a cmd wrapper", async () => {
+    // The raw-`command` exists check sees only `cmd`; the absolute oam binary
+    // inside the wrapper used to go unchecked, so a gone binary with a present
+    // entry read "OK (runs on oam)".
+    const entryFile = join(synthHome, "broker.js");
+    writeFileSync(entryFile, "");
+    const goneBin = join(synthHome, "gone", "oam");
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({
+        mcpServers: {
+          [ENTRY_NAME]: { command: "cmd", args: ["/d", "/s", "/c", goneBin, "run", "--no-check", entryFile] },
+        },
+      }),
+    );
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, err: () => {} });
+    const client = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
+    expect(client?.launchCommandMissing).toBe(goneBin);
+    expect(client?.launchOamEntryMissing).toBeNull();
+    expect(cap.text()).not.toContain("runs on oam");
+  });
+
   // The bare-oam check used to inspect `command` alone, so a bare `oam`
   // reached THROUGH a wrapper -- which isOamLaunch accepts, and which the
   // client resolves against its own PATH exactly like the un-wrapped bare
@@ -4921,6 +4944,54 @@ describe("runDoctor -- a launch path written for another OS", () => {
     const client = native.find((c) => c.clientId === "claude-code" && c.scope === "user");
     expect(client?.launchForeignPath).toBeNull();
     expect(client?.launchCommandMissing).toBe(oamExe);
+  });
+
+  // cmd.exe (PATHEXT) and libuv's spawn both complete an extensionless path
+  // on Windows, so `<dir>\oam` with `<dir>\oam.exe` on disk launches fine.
+  // A real file, not a stub: the path is win32-absolute on every runner
+  // (`/tmp/...` is rooted under win32 semantics), so this runs everywhere.
+  it("on win32 an extensionless wrapped oam resolves through PATHEXT, not launchCommandMissing", async () => {
+    writeFileSync(join(synthHome, "oam.exe"), "");
+    const bare = join(synthHome, "oam");
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({
+        mcpServers: { [ENTRY_NAME]: { command: "cmd", args: ["/d", "/s", "/c", bare, "run", "--no-check", "x.js"] } },
+      }),
+    );
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "windows",
+      platform: "win32",
+      out: () => {},
+      err: () => {},
+    });
+    const client = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
+    expect(client?.launchRuntime).toBe("oam");
+    expect(client?.launchCommandMissing).toBeNull();
+    // Control: with no oam.<ext> beside it, the same entry is still missing.
+    rmSync(join(synthHome, "oam.exe"));
+    const gone = await probeClientsAsync({ home: synthHome, os: "windows", cwd: synthCwd, platform: "win32" });
+    expect(gone.find((c) => c.clientId === "claude-code" && c.scope === "user")?.launchCommandMissing).toBe(bare);
+  });
+
+  it("on win32 an extensionless unwrapped oam command resolves through PATHEXT, not launchCommandMissing", async () => {
+    writeFileSync(join(synthHome, "oam.exe"), "");
+    const bare = join(synthHome, "oam");
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: bare, args: ["run", "--no-check", "x.js"] } } }),
+    );
+    const native = await probeClientsAsync({ home: synthHome, os: "windows", cwd: synthCwd, platform: "win32" });
+    const client = native.find((c) => c.clientId === "claude-code" && c.scope === "user");
+    expect(client?.launchRuntime).toBe("oam");
+    expect(client?.launchCommandMissing).toBeNull();
+    // Control: with no oam.<ext> beside it, the same entry is still missing.
+    rmSync(join(synthHome, "oam.exe"));
+    const gone = await probeClientsAsync({ home: synthHome, os: "windows", cwd: synthCwd, platform: "win32" });
+    expect(gone.find((c) => c.clientId === "claude-code" && c.scope === "user")?.launchCommandMissing).toBe(bare);
   });
 });
 

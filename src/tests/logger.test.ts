@@ -186,6 +186,21 @@ describe("log() reads LOG_LEVEL per call, not once at import", () => {
     expect(stderrWrites.length).toBe(1);
     expect(JSON.parse(stderrWrites[0].trim()).msg).toBe("still-shown");
   });
+
+  it("trims a padded LOG_LEVEL (cmd.exe keeps the space before &&)", () => {
+    vi.stubEnv("LOG_LEVEL", " debug ");
+    log("debug", "padded-visible");
+    expect(stderrWrites.length).toBe(1);
+    expect(JSON.parse(stderrWrites[0].trim()).msg).toBe("padded-visible");
+  });
+
+  it("treats an Object.prototype key as unrecognized, not as a threshold", () => {
+    vi.stubEnv("LOG_LEVEL", "constructor");
+    log("debug", "proto-filtered");
+    log("info", "proto-shown");
+    expect(stderrWrites.length).toBe(1);
+    expect(JSON.parse(stderrWrites[0].trim()).msg).toBe("proto-shown");
+  });
 });
 
 // -----------------------------------------------------------------------
@@ -263,6 +278,13 @@ describe("log() on the CLI surface", () => {
     log("info", "still-dropped");
     log("warn", "still-plain");
     expect(stderrWrites).toEqual(["yaw-mcp: warning: still-plain\n"]);
+  });
+
+  it("does not treat an Object.prototype key as an opt-in", () => {
+    vi.stubEnv("LOG_LEVEL", "constructor");
+    log("info", "proto-dropped");
+    log("warn", "proto-plain");
+    expect(stderrWrites).toEqual(["yaw-mcp: warning: proto-plain\n"]);
   });
 
   it("still emits the line when data cannot be serialized", () => {

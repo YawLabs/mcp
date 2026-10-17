@@ -240,4 +240,13 @@ describe("computeOutcomeReward", () => {
       expect(computeOutcomeReward(result)).toBe(0.2);
     });
   });
+
+  describe("edge: malformed non-array content", () => {
+    it("grades a string or object `content` as an empty body, without iterating or throwing", () => {
+      // A string used to be iterated per character (no block had type
+      // "text", so it graded as substance, 1.0) and an object threw.
+      expect(computeOutcomeReward({ content: "oops" } as never)).toBe(0.3);
+      expect(computeOutcomeReward({ content: { text: "oops" } } as never)).toBe(0.3);
+    });
+  });
 });

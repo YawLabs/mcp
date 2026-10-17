@@ -4,7 +4,7 @@
 // only have to prove their feature CALLS it, not re-prove the spellings.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { isFeatureDisabled, isTestSandbox } from "../opt-out-env.js";
+import { isFeatureDisabled, isFeatureEnabled, isTestSandbox, resolveNonNegativeIntEnv } from "../opt-out-env.js";
 
 const NAME = "YAW_MCP_TEST_OPT_OUT";
 
@@ -58,6 +58,63 @@ describe("isFeatureDisabled", () => {
 
   it("looks at the named variable and no other", () => {
     expect(isFeatureDisabled(NAME, { YAW_MCP_OTHER: "0" })).toBe(false);
+  });
+});
+
+describe("isFeatureEnabled", () => {
+  // The two documented on spellings, any case, padded or not (cmd.exe's
+  // `set VAR=1 && ...` delivers "1 ").
+  it.each(["1", "true", "TRUE", "True", "1 ", " true ", "\t1\t"])("is on for %j", (value) => {
+    expect(isFeatureEnabled(NAME, { [NAME]: value })).toBe(true);
+  });
+
+  // Everything else fails CLOSED, the right direction for an opt-in.
+  it.each(["", " ", "0", "false", "yes", "on", "11", "1abc", "tru"])("is off for %j", (value) => {
+    expect(isFeatureEnabled(NAME, { [NAME]: value })).toBe(false);
+  });
+
+  it("is off when unset, and defaults to process.env", () => {
+    expect(isFeatureEnabled(NAME, {})).toBe(false);
+    vi.stubEnv(NAME, "1");
+    expect(isFeatureEnabled(NAME)).toBe(true);
+  });
+});
+
+describe("resolveNonNegativeIntEnv", () => {
+  it.each([
+    ["0", 0],
+    ["7", 7],
+    [" 12 ", 12],
+    ["100000", 100_000],
+  ])("parses the digit run %j", (value, expected) => {
+    expect(resolveNonNegativeIntEnv(NAME, 6, { [NAME]: value })).toBe(expected);
+  });
+
+  // parseInt would read every one of these as a prefix -- 0 (the disable
+  // sentinel for the caps) or 1 -- instead of falling back.
+  it.each([
+    "",
+    " ",
+    "0x10",
+    "0.5",
+    "0abc",
+    "1e2",
+    "100_000",
+    "-1",
+    "+5",
+    "abc",
+  ])("falls back to the default for %j", (value) => {
+    expect(resolveNonNegativeIntEnv(NAME, 6, { [NAME]: value })).toBe(6);
+  });
+
+  it("falls back when unset, and for a run too long to be finite", () => {
+    expect(resolveNonNegativeIntEnv(NAME, 6, {})).toBe(6);
+    expect(resolveNonNegativeIntEnv(NAME, 6, { [NAME]: "9".repeat(400) })).toBe(6);
+  });
+
+  it("rejects a value under `min` to the default", () => {
+    expect(resolveNonNegativeIntEnv(NAME, 10, { [NAME]: "0" }, 1)).toBe(10);
+    expect(resolveNonNegativeIntEnv(NAME, 10, { [NAME]: "1" }, 1)).toBe(1);
   });
 });
 

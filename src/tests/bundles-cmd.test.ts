@@ -160,7 +160,7 @@ describe("runBundlesCommand — match", () => {
     rmSync(home, { recursive: true, force: true });
   });
 
-  it("needs no token and no network -- an empty config still exits 0", async () => {
+  it("needs no network -- an empty config still exits 0", async () => {
     const io = captureIO();
     const r = await run({ out: io.push, err: io.pushErr });
     expect(r.exitCode).toBe(0);

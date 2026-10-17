@@ -22,10 +22,11 @@
 
 import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmdirSync, rmSync, symlinkSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
+import { pathToFileURL } from "node:url";
 import { afterAll, describe, expect, it } from "vitest";
 import {
   BLOCK_HEAD,
@@ -35,6 +36,7 @@ import {
   FLOOR_TEST,
   HOSTED,
   installCommand,
+  isMainModule,
   isPrerelease,
   oamVersion,
   PROBE_SERVER,
@@ -453,8 +455,8 @@ function drive(opts: {
   const lines: string[] = [];
   const probes: { command: string; args: string[]; cwd: string; timeoutMs: number; era: string }[] = [];
   // The options each `oam --version` read was handed: the script must pass
-  // the same timeout it gives the hosting probe, or the header's promise that
-  // VERIFY_OAM_FLOOR_TIMEOUT_MS bounds the whole probe stops at the version.
+  // the same timeout it gives each hosting probe, or the header's promise that
+  // VERIFY_OAM_FLOOR_TIMEOUT_MS bounds every spawn skips the version read.
   const versionReads: { timeoutMs?: number }[] = [];
   const writes: string[] = [];
   const deps: VerifyDeps = {
@@ -462,8 +464,8 @@ function drive(opts: {
     platform: opts.platform ?? "linux",
     cwd: "/repo",
     out: (l) => lines.push(l),
-    oamVersion: async (_bin: string, o?: { timeoutMs?: number }) => {
-      versionReads.push(o ?? {});
+    oamVersion: async (_bin: string, o: { timeoutMs: number }) => {
+      versionReads.push(o);
       const v = opts.installed ?? "0.16.3";
       if (typeof v === "string") return v;
       throw v;
@@ -684,6 +686,38 @@ describe("verify-oam-floor as a script", () => {
     const bad = runScript(["--nope"]);
     expect(bad.status).toBe(2);
     expect(bad.out).toContain("unknown option --nope");
+  });
+
+  it("runs from a junctioned or symlinked checkout instead of exiting 0 in silence", () => {
+    // Node realpaths the main module's URL but not argv[1], so the old raw
+    // compare skipped the whole run block through a link: no output, exit 0,
+    // which a hand-run `-- --raise` reads as a pass.
+    const root = mkdtempSync(join(tmpdir(), "verify-oam-floor-link-"));
+    tmpRoots.push(root);
+    const linked = join(root, "scripts");
+    symlinkSync(join(REPO_ROOT, "scripts"), linked, "junction");
+    try {
+      const viaLink = join(linked, "verify-oam-floor.mjs");
+      expect(isMainModule(viaLink, pathToFileURL(script).href)).toBe(true);
+      expect(isMainModule(undefined, pathToFileURL(script).href)).toBe(false);
+      expect(isMainModule(join(REPO_ROOT, "package.json"), pathToFileURL(script).href)).toBe(false);
+      const r = spawnSync(process.execPath, [viaLink, "--nope"], {
+        cwd: root,
+        encoding: "utf8",
+        env: process.env,
+        timeout: 60_000,
+      });
+      expect(r.status).toBe(2);
+      expect(`${r.stdout ?? ""}${r.stderr ?? ""}`).toContain("unknown option --nope");
+    } finally {
+      // Remove the link itself, non-recursively, before afterAll's recursive
+      // rm of the temp root can ever walk into the real scripts/ through it.
+      try {
+        unlinkSync(linked);
+      } catch {
+        rmdirSync(linked);
+      }
+    }
   });
 
   it("is what `npm run verify:oam-floor` runs", () => {

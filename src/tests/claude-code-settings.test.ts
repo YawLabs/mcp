@@ -152,6 +152,27 @@ describe("prepareClaudeCodeSettingsPatch", () => {
     expect(patch?.nextJson).toContain('"Bash(ls:*)",\n      "mcp__mcp__*"');
   });
 
+  it("uninstall over a trailing unterminated comment drops the pattern from the bytes it reports removed", async () => {
+    // parseJsonc tolerates the unterminated `/*`, so the value-level check saw
+    // our pattern and reported it removed -- while the splice refused the
+    // document and handed back the original bytes, pattern and all.
+    const home = freshHome();
+    mkdirSync(join(home, ".claude"), { recursive: true });
+    const before = `{"permissions":{"allow":["Bash(ls:*)","${CLAUDE_CODE_ALLOW_PATTERN}"]}} /* unterminated`;
+    writeFileSync(join(home, ".claude", "settings.json"), before, "utf8");
+    const patch = await prepareClaudeCodeSettingsPatch({
+      scope: "user",
+      home,
+      projectDir: undefined,
+      claudeConfigDir: undefined,
+      op: "remove",
+    });
+    expect(patch?.changed).toBe(true);
+    expect(patch?.removed).toEqual([CLAUDE_CODE_ALLOW_PATTERN]);
+    expect(patch?.nextJson).not.toContain(CLAUDE_CODE_ALLOW_PATTERN);
+    expect(patch?.nextJson).toContain('"Bash(ls:*)"');
+  });
+
   it("reports a non-object `permissions` by shape instead of repairing it", async () => {
     const home = freshHome();
     mkdirSync(join(home, ".claude"), { recursive: true });

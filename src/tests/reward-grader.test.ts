@@ -14,6 +14,7 @@ import {
   isUncertainReward,
   parseGrade,
   resetNoSamplingNotice,
+  TOOL_NAME_MAX,
 } from "../reward-grader.js";
 
 const mockLog = vi.mocked(log);
@@ -101,6 +102,11 @@ describe("firstResultText", () => {
     expect(firstResultText({ content: [{ type: "text", text: "   " }] })).toBe("(empty result)");
   });
 
+  it('returns "(empty result)" for malformed non-array content instead of iterating or throwing', () => {
+    expect(firstResultText({ content: "oops" } as never)).toBe("(empty result)");
+    expect(firstResultText({ content: { text: "oops" } } as never)).toBe("(empty result)");
+  });
+
   it("truncates long bodies", () => {
     const long = "x".repeat(1000);
     const out = firstResultText({ content: [{ type: "text", text: long }] });
@@ -155,6 +161,12 @@ describe("buildGraderPrompt", () => {
     expect(p).toContain("YES, PARTIAL, or NO");
     // The labelled form parseGrade prefers.
     expect(p).toContain("GRADE: <word>");
+  });
+
+  it("caps the upstream tool name: it is third-party data nothing else bounds", () => {
+    const p = buildGraderPrompt({ toolName: "t".repeat(TOOL_NAME_MAX + 500), resultText: "[]" });
+    expect(p).toContain(`Tool called: ${"t".repeat(TOOL_NAME_MAX)}...`);
+    expect(p).not.toContain("t".repeat(TOOL_NAME_MAX + 1));
   });
 
   it("omits the goal line when no intent is known", () => {

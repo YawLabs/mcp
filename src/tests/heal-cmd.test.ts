@@ -107,7 +107,7 @@ describe("runHeal -- a stale entry the sweep could not re-point", () => {
     const { exitCode } = await runHeal({ json: true }, sweepOf({ failed: [FAILED] }));
     expect(exitCode).toBe(1);
     const parsed = JSON.parse(io.stdout()) as Record<string, unknown>;
-    expect(parsed).toEqual({ healed: [], unhealable: [], failed: [FAILED], count: 0, dryRun: false });
+    expect(parsed).toEqual({ healed: [], unhealable: [], failed: [FAILED], count: 0, dryRun: false, readOnly: false });
     // The error still reaches a person reading stderr; stdout stays pure JSON.
     expect(io.stderr()).toBe(failedBlock("could not"));
   });
@@ -179,8 +179,46 @@ describe("runHeal -- the outcomes that were already right keep their output and 
     const io = captureStreams();
     const { exitCode } = await runHeal({ json: true }, sweepOf({ healed: [HEALED] }));
     expect(exitCode).toBe(0);
-    expect(JSON.parse(io.stdout())).toEqual({ healed: [HEALED], unhealable: [], failed: [], count: 1, dryRun: false });
+    expect(JSON.parse(io.stdout())).toEqual({
+      healed: [HEALED],
+      unhealable: [],
+      failed: [],
+      count: 1,
+      dryRun: false,
+      readOnly: false,
+    });
     expect(io.stderr()).toBe("");
+  });
+
+  it("under YAW_MCP_READONLY_DIAGNOSTICS says it checked nothing, never 'No stale yaw-mcp entries found.'", async () => {
+    // The sweep returns before reading any config, so its empty lists are
+    // "not checked", and the old transcript claimed a clean scan.
+    const io = captureStreams();
+    const { exitCode } = await runHeal({}, sweepOf({ skipped: "read-only" }));
+    expect(exitCode).toBe(0);
+    expect(io.stdout()).toBe("");
+    expect(io.stderr()).toContain("not checked -- YAW_MCP_READONLY_DIAGNOSTICS is set");
+
+    const json = captureStreams();
+    await runHeal({ json: true }, sweepOf({ skipped: "read-only" }));
+    expect(JSON.parse(json.stdout())).toEqual({
+      healed: [],
+      unhealable: [],
+      failed: [],
+      count: 0,
+      dryRun: false,
+      readOnly: true,
+    });
+  });
+
+  it("the read-only marker comes from the real sweep, not only the seam", async () => {
+    const io = captureStreams();
+    const { exitCode } = await runHeal({}, (opts) =>
+      healStaleBrokerEntries({ ...opts, env: { YAW_MCP_READONLY_DIAGNOSTICS: "1" } }),
+    );
+    expect(exitCode).toBe(0);
+    expect(io.stdout()).not.toContain("No stale yaw-mcp entries found.");
+    expect(io.stderr()).toContain("YAW_MCP_READONLY_DIAGNOSTICS");
   });
 
   it("names the project for each local-scope entry, so one file's entries are not N identical lines", async () => {
@@ -209,7 +247,14 @@ describe("runHeal -- the outcomes that were already right keep their output and 
     const io = captureStreams();
     const { exitCode } = await runHeal({ json: true, dryRun: true }, sweepOf({ healed: [HEALED] }));
     expect(exitCode).toBe(0);
-    expect(JSON.parse(io.stdout())).toEqual({ healed: [HEALED], unhealable: [], failed: [], count: 1, dryRun: true });
+    expect(JSON.parse(io.stdout())).toEqual({
+      healed: [HEALED],
+      unhealable: [],
+      failed: [],
+      count: 1,
+      dryRun: true,
+      readOnly: false,
+    });
   });
 
   it("prints a healed entry's project-local note under it, in the transcript only", async () => {
