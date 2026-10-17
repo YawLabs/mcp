@@ -4945,6 +4945,54 @@ describe("runDoctor -- a launch path written for another OS", () => {
     expect(client?.launchForeignPath).toBeNull();
     expect(client?.launchCommandMissing).toBe(oamExe);
   });
+
+  // cmd.exe (PATHEXT) and libuv's spawn both complete an extensionless path
+  // on Windows, so `<dir>\oam` with `<dir>\oam.exe` on disk launches fine.
+  // A real file, not a stub: the path is win32-absolute on every runner
+  // (`/tmp/...` is rooted under win32 semantics), so this runs everywhere.
+  it("on win32 an extensionless wrapped oam resolves through PATHEXT, not launchCommandMissing", async () => {
+    writeFileSync(join(synthHome, "oam.exe"), "");
+    const bare = join(synthHome, "oam");
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({
+        mcpServers: { [ENTRY_NAME]: { command: "cmd", args: ["/d", "/s", "/c", bare, "run", "--no-check", "x.js"] } },
+      }),
+    );
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "windows",
+      platform: "win32",
+      out: () => {},
+      err: () => {},
+    });
+    const client = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
+    expect(client?.launchRuntime).toBe("oam");
+    expect(client?.launchCommandMissing).toBeNull();
+    // Control: with no oam.<ext> beside it, the same entry is still missing.
+    rmSync(join(synthHome, "oam.exe"));
+    const gone = await probeClientsAsync({ home: synthHome, os: "windows", cwd: synthCwd, platform: "win32" });
+    expect(gone.find((c) => c.clientId === "claude-code" && c.scope === "user")?.launchCommandMissing).toBe(bare);
+  });
+
+  it("on win32 an extensionless unwrapped oam command resolves through PATHEXT, not launchCommandMissing", async () => {
+    writeFileSync(join(synthHome, "oam.exe"), "");
+    const bare = join(synthHome, "oam");
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: bare, args: ["run", "--no-check", "x.js"] } } }),
+    );
+    const native = await probeClientsAsync({ home: synthHome, os: "windows", cwd: synthCwd, platform: "win32" });
+    const client = native.find((c) => c.clientId === "claude-code" && c.scope === "user");
+    expect(client?.launchRuntime).toBe("oam");
+    expect(client?.launchCommandMissing).toBeNull();
+    // Control: with no oam.<ext> beside it, the same entry is still missing.
+    rmSync(join(synthHome, "oam.exe"));
+    const gone = await probeClientsAsync({ home: synthHome, os: "windows", cwd: synthCwd, platform: "win32" });
+    expect(gone.find((c) => c.clientId === "claude-code" && c.scope === "user")?.launchCommandMissing).toBe(bare);
+  });
 });
 
 describe("runDoctor -- a TRANSIENT client-config read (EBUSY / EAGAIN)", () => {

@@ -628,6 +628,16 @@ describe("addJsoncArrayElement / removeJsoncArrayElements over non-scalar elemen
     expect(addJsoncArrayElement(src, ["permissions", "allow"], "x")).toBe(src);
   });
 
+  // The remove path's half of the case above: it returned `src` unchanged, so
+  // a caller that read the element from `parseJsonc` reported it removed while
+  // the bytes still carried it.
+  it("removes from an array in a document with a recoverable parse error", () => {
+    const src = '{"permissions":{"allow":["x","y"]}} /* unterminated';
+    const out = removeJsoncArrayElements(src, ["permissions", "allow"], (v) => v === "x");
+    expect(parseJsonc(out)).toEqual({ permissions: { allow: ["y"] } });
+    expect(removeJsoncArrayElements(src, ["permissions", "allow"], (v) => v === "z")).toBe(src);
+  });
+
   it("returns the input when a removal's path names no array", () => {
     const src = lf("{", '  "rules": 1', "}", "");
     expect(removeJsoncArrayElements(src, ["rules"], () => true)).toBe(src);

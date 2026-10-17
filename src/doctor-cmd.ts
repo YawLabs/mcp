@@ -2445,11 +2445,18 @@ function renderPlaintextCredentials(
     }
   }
   if (os === "windows" && (envQuoted || headerQuoted)) {
-    print("              PowerShell: keep the single quotes above. cmd.exe keeps single quotes");
-    print("              as part of the value, so the server would receive a quoted token:");
-    if (envQuoted) print("              cmd.exe: drop the quotes around each env.KEY='...' value.");
+    print("              PowerShell: keep the single quotes above.");
+    // Each reason only for the shape it describes: a header-only block never
+    // reaches the server with a quoted token -- cmd.exe does not group on
+    // single quotes, so the spaced value splits and `add` refuses it.
+    if (envQuoted) {
+      print("              cmd.exe keeps single quotes as part of an env value, so the server");
+      print("              would receive a quoted token:");
+      print("              cmd.exe: drop the quotes around each env.KEY='...' value.");
+    }
     if (headerQuoted) {
-      // The value has a space, so unquoted it splits into two arguments.
+      print("              cmd.exe does not group on single quotes, so a single-quoted --header");
+      print("              value splits at the space and `yaw-mcp add` refuses it:");
       print('              cmd.exe: double-quote each --header value instead (--header "KEY: ...").');
     }
   }
@@ -4203,6 +4210,11 @@ function rootLinePlacement(syntax: SyntaxName): string {
  *  running platform, and with it the foreign-path branches could only ever
  *  execute on a POSIX runner and the native-drive-letter one only on win32
  *  -- so on a Windows-only maintainer box the WSL wiring here never ran. */
+/** cmd.exe's default PATHEXT, lowercased: the suffixes Windows tries on an
+ *  extensionless launch path. A fixed list rather than process.env.PATHEXT --
+ *  the client's environment, not doctor's, is what resolves the launch. */
+const WIN_PATHEXT = [".com", ".exe", ".bat", ".cmd"];
+
 function launchChecks(
   entry: unknown,
   exists: (p: string) => boolean,
@@ -4212,6 +4224,12 @@ function launchChecks(
   "launchCommandMissing" | "launchRuntime" | "launchOamNotAbsolute" | "launchOamEntryMissing" | "launchForeignPath"
 > {
   const isAbsolute = platform === "win32" ? win32.isAbsolute : posix.isAbsolute;
+  // Whether a launch path resolves to a file. On Windows an extensionless
+  // path is completed by the launcher -- cmd.exe walks PATHEXT and libuv's
+  // spawn tries .com/.exe -- so `C:\tools\oam` starts C:\tools\oam.exe and
+  // must not read as missing. Through the injected seam, never the real fs.
+  const launchable = (p: string): boolean =>
+    exists(p) || (platform === "win32" && win32.extname(p) === "" && WIN_PATHEXT.some((ext) => exists(p + ext)));
   let launchCommandMissing: string | null = null;
   let launchRuntime: "oam" | "node" | null = null;
   let launchOamNotAbsolute: string | null = null;
@@ -4235,7 +4253,7 @@ function launchChecks(
         // PATH warning for a fully absolute Windows path.
         launchForeignPath = command;
       } else {
-        if (isAbsolute(command) && !exists(command)) launchCommandMissing = command;
+        if (isAbsolute(command) && !launchable(command)) launchCommandMissing = command;
         if (launchRuntime === "oam") {
           // Every oam-specific check reads the UNWRAPPED launch, not the raw
           // argv: launchRuntime is "oam" for the `cmd /d /s /c oam run ...`
@@ -4269,7 +4287,7 @@ function launchChecks(
             // sees -- there `command` is the wrapper. A bare (unwrapped) oam
             // was already checked as `command`, so this only adds the wrapped
             // case.
-            else if (oamArgv.oam !== command && !exists(oamArgv.oam)) launchCommandMissing = oamArgv.oam;
+            else if (oamArgv.oam !== command && !launchable(oamArgv.oam)) launchCommandMissing = oamArgv.oam;
             // `oam run [--no-check] <entry>`: unlike npx, oam cannot fetch a
             // missing entry on demand, so a stale path here is a hard
             // launch failure rather than a slow start.

@@ -770,6 +770,9 @@ export function addJsoncArrayElement(src: string, path: Array<string | number>, 
  *  line, which annotates the element being removed -- exactly as a removed
  *  object member's does.
  *
+ *  A document with a parse error jsonc-parser recovers from takes a
+ *  whole-array write instead, as in `addJsoncArrayElement`.
+ *
  *  Returns the input unchanged, byte for byte and BOM included, when nothing
  *  matches or `path` names no array. An emptied list is left as `[]` rather
  *  than deleted: dropping a key the user's file declares is a bigger liberty
@@ -782,7 +785,23 @@ export function removeJsoncArrayElements(
   if (path.length === 0) throw new Error("removeJsoncArrayElements: path must not be empty");
   const debommed = src.charCodeAt(0) === 0xfeff ? src.slice(1) : src;
   const array = arrayNodeAt(debommed, path);
-  if (array === null) return src;
+  if (array === null) {
+    // The same recoverable-parse-error case `addJsoncArrayElement` falls back
+    // on (an unterminated `/*` at end of file, which `parseJsonc` tolerates):
+    // `arrayNodeAt` refuses the document, but the tree still holds the array.
+    // Returning `src` here would leave the element in place while a caller
+    // that decided from `parseJsonc`'s value reports it removed. No node to
+    // splice from, so take the whole-array write of what stays -- which drops
+    // the comments inside the array, the add path's trade too.
+    const errors: ParseError[] = [];
+    const root = parseTree(debommed, errors, { allowTrailingComma: true });
+    const existing = root === undefined ? undefined : findNodeAtLocation(root, path);
+    if (existing?.type !== "array") return src;
+    const elements = (existing.children ?? []).map(elementValue);
+    const kept = elements.filter((e) => !matches(e));
+    if (kept.length === elements.length) return src;
+    return editJsoncPath(debommed, path, kept);
+  }
   const doomed = (array.children ?? []).filter((child) => matches(elementValue(child)));
   if (doomed.length === 0) return src;
   // One at a time, each against the text the last one produced: `removeMember`

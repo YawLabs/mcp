@@ -9985,6 +9985,51 @@ describe("find_tool", () => {
     expect(text).not.toContain('server "gh"');
   });
 
+  it("fills the page with usable hits when blocked tools outrank more than limit of them", async () => {
+    const priv = getPrivate(server);
+    const blocked = Array.from({ length: 3 }, (_, i) => ({
+      name: `delete_issue_${i}`,
+      description: "Delete an issue",
+    }));
+    const usable = Array.from({ length: 3 }, (_, i) => ({ name: `tracker_${i}`, description: "issue" }));
+    priv.config = makeConfig([cold("gh", blocked), cold("linear", usable)]);
+    // Precondition, before the profile blocks anything: the soon-blocked
+    // tools really do outrank the usable ones, so a plain slice of the
+    // ranking would fill the page with them.
+    const raw = (await priv.handleToolCall("mcp_connect_find_tool", { query: "delete issue", limit: 2 })).content[0]
+      .text;
+    expect(raw).toContain("gh_delete_issue_");
+    expect(raw).not.toContain("linear_tracker");
+    priv.profile = { path: "/h/.yaw-mcp/config.json", blockedTools: ["gh_delete_*"] };
+    const text = (await priv.handleToolCall("mcp_connect_find_tool", { query: "delete issue", limit: 2 })).content[0]
+      .text;
+    expect(text).toContain("(2 of 6)");
+    expect(text).toContain("linear_tracker_0");
+    expect(text).toContain("linear_tracker_1");
+    expect(text).not.toContain("[blocked]");
+    expect(text).toContain('To use one: mcp_connect_activate with server "linear".');
+    expect(text).toContain('4 more match (3 of them blocked); raise "limit" to see them.');
+  });
+
+  it("reaches usable hits past fifty blocked ones at the limit ceiling", async () => {
+    const priv = getPrivate(server);
+    const blocked = Array.from({ length: 55 }, (_, i) => ({
+      name: `delete_issue_${i}`,
+      description: "Delete an issue",
+    }));
+    priv.config = makeConfig([cold("gh", blocked), cold("linear", [{ name: "tracker", description: "issue" }])]);
+    priv.profile = { path: "/h/.yaw-mcp/config.json", blockedTools: ["gh_delete_*"] };
+    const text = (await priv.handleToolCall("mcp_connect_find_tool", { query: "delete issue", limit: 50 })).content[0]
+      .text;
+    expect(text).toContain("(50 of 56)");
+    expect(text).toContain("linear_tracker");
+    expect(text).toContain('To use one: mcp_connect_activate with server "linear".');
+    // The usable hit leads; the 49 blocked ones that fit follow it.
+    expect(text.indexOf("linear_tracker")).toBeLessThan(text.indexOf("[blocked]"));
+    expect(text).toContain('6 more match, all blocked by the profile\'s "blockedTools" list.');
+    expect(text).not.toContain('raise "limit"');
+  });
+
   it("says every match is blocked rather than naming a server to activate", async () => {
     const priv = getPrivate(server);
     priv.config = makeConfig([cold("gh", [{ name: "delete_issue", description: "Delete an issue" }])]);

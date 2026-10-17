@@ -7880,21 +7880,22 @@ export class ConnectServer {
       };
     }
 
-    const shown = ranked.slice(0, cap);
-    const lines: string[] = [`Tools matching "${query}" (${shown.length} of ${ranked.length}):`, ""];
     // A tool the profile's blockedTools denies still ranks (the deny is a
     // call-time policy, not a catalog edit), so it is labelled `[blocked]` --
     // discover's wording -- with no schema line and no activate pointer:
     // the call gate refuses it, and listing it as usable contradicted the
-    // user's own policy and cost the model a wasted round trip.
-    const usable: typeof shown = [];
-    for (const hit of shown) {
-      if (this.isToolDenied(`${hit.namespace}_${hit.name}`)) {
-        lines.push(`  ${hit.namespace}_${hit.name} [blocked]`);
-        if (hit.description) lines.push(`    ${hit.description}`);
-        continue;
-      }
-      usable.push(hit);
+    // user's own policy and cost the model a wasted round trip. The page
+    // fills from usable hits first and takes blocked ones only into the room
+    // left: slicing the raw ranking let high-ranked blocked tools crowd every
+    // usable match past the cutoff, dropping the activate pointer -- and at
+    // the limit ceiling no `limit` could reach them.
+    const usableRanked = ranked.filter((h) => !this.isToolDenied(`${h.namespace}_${h.name}`));
+    const blockedRanked = ranked.filter((h) => this.isToolDenied(`${h.namespace}_${h.name}`));
+    const usable = usableRanked.slice(0, cap);
+    const blockedShown = blockedRanked.slice(0, cap - usable.length);
+    const shownCount = usable.length + blockedShown.length;
+    const lines: string[] = [`Tools matching "${query}" (${shownCount} of ${ranked.length}):`, ""];
+    for (const hit of usable) {
       const connection = this.connections.get(hit.namespace);
       const live = connection?.status === "connected" ? connection.tools.find((t) => t.name === hit.name) : undefined;
       lines.push(`  ${hit.namespace}_${hit.name}${live ? " [loaded]" : ""}`);
@@ -7905,14 +7906,31 @@ export class ConnectServer {
         lines.push(`    schema not loaded -- activate "${hit.namespace}", or use mcp_connect_read_tool.`);
       }
     }
-    if (ranked.length > shown.length) {
+    for (const hit of blockedShown) {
+      lines.push(`  ${hit.namespace}_${hit.name} [blocked]`);
+      if (hit.description) lines.push(`    ${hit.description}`);
+    }
+    const hidden = ranked.length - shownCount;
+    if (hidden > 0) {
+      // Usable hits always fill the page first, so a hidden usable match
+      // means the page is all usable; the blocked count is broken out so
+      // "N more" never reads as N more tools the model could call.
+      const hiddenBlocked = blockedRanked.length - blockedShown.length;
+      const more =
+        hiddenBlocked === hidden
+          ? `${hidden} more match, all blocked by the profile's "blockedTools" list`
+          : hiddenBlocked > 0
+            ? `${hidden} more match (${hiddenBlocked} of them blocked)`
+            : `${hidden} more match`;
       // At the ceiling a bigger `limit` is clamped back to the same page, so
       // telling the model to raise it would be advice it cannot follow.
       lines.push(
         "",
-        shown.length >= ConnectServer.FIND_TOOL_MAX_LIMIT
-          ? `${ranked.length - shown.length} more match; narrow the query (limit is capped at ${ConnectServer.FIND_TOOL_MAX_LIMIT}).`
-          : `${ranked.length - shown.length} more match; raise "limit" to see them.`,
+        hiddenBlocked === hidden
+          ? `${more}.`
+          : shownCount >= ConnectServer.FIND_TOOL_MAX_LIMIT
+            ? `${more}; narrow the query (limit is capped at ${ConnectServer.FIND_TOOL_MAX_LIMIT}).`
+            : `${more}; raise "limit" to see them.`,
       );
     }
     // The namespaces behind the shown usable matches, in first-appearance

@@ -384,6 +384,24 @@ export async function prepareClaudeCodeSettingsPatch(opts: {
     // than re-serialized.
     try {
       const next = patchPermissionsAllowText(rawSettings, [CLAUDE_CODE_ALLOW_PATTERN], op);
+      // `added` / `removed` were computed from the PARSED value; the bytes are
+      // what lands on disk. If the splice did not actually make that change, a
+      // report built from the value would claim a removal (or an addition) the
+      // file never got. Check the bytes, and report the miss instead.
+      const nextAllow = (parseJsonc(next) as { permissions?: { allow?: unknown } } | null)?.permissions?.allow;
+      const hasPattern = Array.isArray(nextAllow) && nextAllow.includes(CLAUDE_CODE_ALLOW_PATTERN);
+      if (next === rawSettings || hasPattern !== (op === "add")) {
+        return {
+          path,
+          nextJson: "",
+          changed: false,
+          added: [],
+          removed: [],
+          malformed: true,
+          malformedReason: `could not splice permissions.allow (the edit left the pattern ${op === "add" ? "absent" : "present"})`,
+          fingerprint,
+        };
+      }
       // The client configs' own terminator, so a CRLF settings.json with no
       // final line break gets a CRLF, not a bare LF.
       return { path, nextJson: terminateWithNewline(next), changed: true, added, removed, fingerprint };

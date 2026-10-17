@@ -523,8 +523,11 @@ describe("SECRET VAULT -- plaintext credentials, the Windows quoting caveat", ()
     expect(win).toContain("env.TAILSCALE_API_KEY='${secret:");
     expect(win).toContain("PowerShell: keep the single quotes above.");
     expect(win).toContain("cmd.exe: drop the quotes around each env.KEY='...' value.");
+    expect(win).toContain("so the server\n");
+    expect(win).toContain("would receive a quoted token:");
     // No header line printed, so no header advice.
     expect(win).not.toContain('--header "KEY: ..."');
+    expect(win).not.toContain("splits at the space");
     // POSIX shells all honour the quotes: no caveat there.
     const linux = await textOn("linux");
     expect(linux).not.toContain("PowerShell:");
@@ -549,6 +552,10 @@ describe("SECRET VAULT -- plaintext credentials, the Windows quoting caveat", ()
     expect(win).toContain("PowerShell: keep the single quotes above.");
     expect(win).toContain('cmd.exe: double-quote each --header value instead (--header "KEY: ...").');
     expect(win).not.toContain("drop the quotes");
+    // The reason a header-only block fails under cmd.exe is the split, not a
+    // quoted token reaching the server (that is the env shape's reason).
+    expect(win).toContain("value splits at the space and `yaw-mcp add` refuses it:");
+    expect(win).not.toContain("quoted token");
     expect(await textOn("linux")).not.toContain("cmd.exe");
   });
 });
