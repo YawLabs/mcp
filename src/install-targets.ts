@@ -1160,8 +1160,12 @@ export function buildLaunchEntry(opts: BuildLaunchEntryOptions): LaunchEntry {
   const pkg = opts.pkg ?? "@yawlabs/mcp@latest";
   // Host the broker on oam when the caller resolved both halves. No `cmd /c`
   // wrap on Windows: that exists because `npx` is a `.cmd` shim the client
-  // cannot spawn directly, and oam is a real executable. `--no-check` keeps
-  // the TypeScript checker off a long-lived stdio server.
+  // cannot spawn directly, and oam is a real executable. `--no-check` does
+  // nothing for this entry: oam only checks TypeScript entries (.ts/.mts/.cts),
+  // and this one is dist/index.js. It stays for two reasons. Dropping it
+  // would change the entry already written into existing client configs, for
+  // no runtime gain. And it keeps the checker off if the entry ever becomes
+  // TypeScript.
   //
   // `opts.pkg` disables this path. `pkg` exists to pin a spec ("@yawlabs/
   // mcp@0.73.0"), and npx honours that on every spawn -- but oamEntry is a

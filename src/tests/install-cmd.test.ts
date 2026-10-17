@@ -3754,7 +3754,9 @@ describe("runInstall — oam launch entry", () => {
       expect(r.exitCode).toBe(0);
       const out = r.messages.join(" ");
       expect(out).toMatch(/local build-tree oam, not a release/);
-      expect(out).toContain("Point OAM_BIN (or PATH) at the installed oam");
+      expect(out).toContain("Fix: put ~/.oam/bin ahead of the build tree on PATH, or point OAM_BIN at an installed");
+      expect(out).toContain("with no release installed, reorder PATH first");
+      expect(out).toContain("then re-run install to host yaw-mcp on it.)");
       expect(out).not.toMatch(/Fix or reinstall/);
     } finally {
       rmSync(buildTreeHome, { recursive: true, force: true });

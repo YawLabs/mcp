@@ -141,6 +141,7 @@ import {
   MIN_OAM_VERSION,
   nodeLaunchKind,
   type OamProbe,
+  oamBuildTreeFix,
   oamFailureLabel,
   oamInstallCommand,
   oamNoBinaryReason,
@@ -1361,8 +1362,8 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     runtimeLines.push(
       oamProbeResult.failure === "build-tree"
         ? `Runtime: node (${oamFailureLabel(oamProbeResult.failure)}` +
-            `${oamProbeResult.failureDetail ? ` -- ${oamProbeResult.failureDetail}` : ""}. Point OAM_BIN (or PATH) ` +
-            "at the installed oam and re-run install to host yaw-mcp on it.)"
+            `${oamProbeResult.failureDetail ? ` -- ${oamProbeResult.failureDetail}` : ""}. Fix: ` +
+            `${oamBuildTreeFix(os)}; then re-run install to host yaw-mcp on it.)`
         : `Runtime: node (oam is installed but unusable: ${oamFailureLabel(oamProbeResult.failure)}` +
             `${oamProbeResult.failureDetail ? ` -- ${oamProbeResult.failureDetail}` : ""}. Fix or reinstall oam and ` +
             "re-run install to host yaw-mcp on it.)",
