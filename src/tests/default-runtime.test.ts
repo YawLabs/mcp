@@ -91,6 +91,18 @@ describe("describeDefaultRuntime", () => {
     });
   });
 
+  it("trims the env value, so cmd.exe's `set VAR=node && ...` still opts out", async () => {
+    // cmd.exe keeps the space before `&&` in the value. Untrimmed, "node "
+    // was invalid and fell through to bundles.json's oam default.
+    writeBundles(synthHome, { version: 1, servers: [], defaultRuntime: "oam" });
+    const r = await describeDefaultRuntime({
+      env: { YAW_MCP_DEFAULT_RUNTIME: "node " },
+      cwd: synthCwd,
+      home: synthHome,
+    });
+    expect(r).toEqual({ runtime: "node", source: "env", path: null });
+  });
+
   it("ignores an invalid env value and falls through", async () => {
     const r = await describeDefaultRuntime({
       env: { YAW_MCP_DEFAULT_RUNTIME: "wasm" },

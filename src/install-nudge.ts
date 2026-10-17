@@ -28,6 +28,7 @@
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { log } from "./logger.js";
+import { isFeatureEnabled } from "./opt-out-env.js";
 import { CONFIG_DIRNAME } from "./paths.js";
 
 /** Minimum ShadowHit.count (over the tail-500 history window scanned by
@@ -72,11 +73,7 @@ export function installNudgeStatePath(home: string): string {
  *  an exact `=== "1"` read as "not enabled". A typo still fails CLOSED, the
  *  right direction for a feature that reads shell history. */
 export function installNudgeEnabled(env: NodeJS.ProcessEnv, config: { installNudge?: boolean } | null): boolean {
-  const raw = env.YAW_MCP_INSTALL_NUDGE;
-  if (raw !== undefined) {
-    const trimmed = raw.trim();
-    if (trimmed === "1" || trimmed.toLowerCase() === "true") return true;
-  }
+  if (isFeatureEnabled("YAW_MCP_INSTALL_NUDGE", env)) return true;
   if (config?.installNudge === true) return true;
   return false;
 }

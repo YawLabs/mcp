@@ -846,7 +846,10 @@ function tomlNumber(value: number | bigint, key: string): string {
   if (!Number.isFinite(value)) {
     throw new TomlRenderError(`cannot write ${String(value)} as the "${key}" value: it is not a finite number`);
   }
-  if (FLOAT_FIELDS.has(key) && Number.isInteger(value)) return `${value}.0`;
+  // Only a plain-digit integral value takes the `.0`: at magnitude 1e21 and up
+  // String() is already exponent form (`1e+21`), which TOML reads as a float,
+  // and `1e+21.0` does not parse at all.
+  if (FLOAT_FIELDS.has(key) && Number.isInteger(value) && Math.abs(value) < 1e21) return `${value}.0`;
   return String(value);
 }
 
@@ -1972,7 +1975,7 @@ function rootInsertEdits(text: string, scan: TomlScan, line: string): SpanEdit[]
  *  renderer's own `tomlKey` / `tomlValue`. So an integral value the renderer
  *  spells as a float is a float here too: `60` on a `FLOAT_FIELDS` key is
  *  `60.0`, and an integer of magnitude 1e21 or more is in exponent form
- *  (`1e+21`). `verifyTomlRootInsert` refuses an integer that reads back as a
+ *  (`1e+21`, on any key, `FLOAT_FIELDS` included). `verifyTomlRootInsert` refuses an integer that reads back as a
  *  float, so such a value cannot be written as a root default. */
 function rootKeyLine(key: string, value: TomlRootValue): string {
   return `${tomlKey(key)} = ${tomlValue(value, key)}`;

@@ -31,7 +31,13 @@ import {
 } from "@modelcontextprotocol/server";
 import { type StdioServerHandle, StdioServerTransport, serveStdio } from "@modelcontextprotocol/server/stdio";
 import { maybeAutoUpgrade } from "./auto-upgrade.js";
-import { bundleActivateHint, CURATED_BUNDLES, matchBundles, topPartialBundles } from "./bundles.js";
+import {
+  activateServersCall,
+  bundleActivateHint,
+  CURATED_BUNDLES,
+  matchBundles,
+  topPartialBundles,
+} from "./bundles.js";
 import { bundlesFileHint } from "./bundles-hint.js";
 import { formatShadowLine, installTargetForCli } from "./cli-shadows.js";
 import { canonicalJson } from "./client-config-values.js";
@@ -70,8 +76,14 @@ import { setJsonKey } from "./json-key.js";
 import { LearningStore, PENALTY_RATE_THRESHOLD } from "./learning.js";
 import { bundlesSignature, loadLocalBundles } from "./local-bundles.js";
 import { log } from "./logger.js";
-import { computeSecretsReport, META_TOOL_NAMES, META_TOOLS, SERVER_INSTRUCTIONS } from "./meta-tools.js";
-import { isFeatureDisabled } from "./opt-out-env.js";
+import {
+  computeSecretsReport,
+  FIND_TOOL_MAX_LIMIT,
+  META_TOOL_NAMES,
+  META_TOOLS,
+  SERVER_INSTRUCTIONS,
+} from "./meta-tools.js";
+import { isFeatureDisabled, isFeatureEnabled, resolveNonNegativeIntEnv } from "./opt-out-env.js";
 import { PackDetector } from "./pack-detect.js";
 import {
   isPersistenceDisabled,
@@ -194,9 +206,7 @@ export function isAutoLoadEnabled(): boolean {
   // Trimmed like every other env resolver (resolveToolExposure,
   // parseMinCompliance): cmd.exe's `set VAR=1 && ...` keeps the space
   // before `&&`, so the raw value arrives as "1 " on Windows.
-  const raw = process.env.YAW_MCP_AUTO_LOAD?.trim();
-  if (raw === undefined || raw === "") return false;
-  return raw === "1" || raw.toLowerCase() === "true";
+  return isFeatureEnabled("YAW_MCP_AUTO_LOAD");
 }
 
 /** Which protocol eras the downstream face serves. */
@@ -508,15 +518,12 @@ export function resolveIdleThreshold(): number {
   const current = process.env.YAW_MCP_IDLE_THRESHOLD?.trim();
   const raw = current !== undefined && current !== "" ? current : process.env.MCP_CONNECT_IDLE_THRESHOLD;
   if (!raw) return DEFAULT_IDLE_CALL_THRESHOLD;
-  // Strict digit-run parse, the same shape resolveServerCap (server-cap.ts)
-  // was hardened to. Number.parseInt's PREFIX parsing turns "1e2" into 1 and
-  // "10abc" into 10, so a malformed value silently made the reaper far more
-  // aggressive than the operator asked for instead of falling back to the
-  // documented default.
-  const trimmed = raw.trim();
-  if (!/^\d+$/.test(trimmed)) return DEFAULT_IDLE_CALL_THRESHOLD;
-  const n = Number.parseInt(trimmed, 10);
-  if (!Number.isFinite(n) || n < 1) return DEFAULT_IDLE_CALL_THRESHOLD;
+  // The shared strict digit-run parse (opt-out-env.ts). Number.parseInt's
+  // PREFIX parsing turns "1e2" into 1 and "10abc" into 10, so a malformed
+  // value silently made the reaper far more aggressive than the operator
+  // asked for instead of falling back to the documented default. Floor of 1:
+  // a 0 here would reap on every call rather than meaning "off".
+  const n = resolveNonNegativeIntEnv("IDLE_THRESHOLD", DEFAULT_IDLE_CALL_THRESHOLD, { IDLE_THRESHOLD: raw }, 1);
   // adaptiveThreshold() clamps its computed result to ADAPTIVE_MAX, so a
   // baseline above that ceiling is silently capped -- YAW_MCP_IDLE_THRESHOLD=100
   // behaves exactly like 50. Say so once per distinct configured value
@@ -1038,8 +1045,9 @@ export class ConnectServer {
   private prewarmFailures = new Map<string, PersistedPrewarmFailure>();
   // Per-namespace tool filters set by mcp_connect_activate({ tools: [...] }).
   // When a namespace has an entry, only those BARE tool names surface in
-  // tools/list; routing tables stay complete so mcp_connect_dispatch can
-  // still reach unlisted tools. Cleared on activate-without-tools of the
+  // tools/list; routing tables stay complete so a direct tools/call or an
+  // mcp_connect_exec step can still reach unlisted tools. Cleared on
+  // activate-without-tools of the
   // same namespace and on deactivate.
   private toolFilters = new Map<string, Set<string>>();
   // Namespaces the CLIENT explicitly activated this session. In gateway mode
@@ -1073,7 +1081,7 @@ export class ConnectServer {
   // unreadable, or empty.
   private guides: LoadedGuides = { user: null, project: null };
   // Tracks whether the client has actually READ `yaw-mcp://guide` this
-  // session. meta-tools.ts uses this to fire a one-shot nudge in the
+  // session. attachGuideNudge (below) uses this to fire a one-shot nudge in the
   // next tool response reminding the client to read the guide — but
   // only if (a) at least one guide is present and (b) the client
   // hasn't read it yet. Cleared on startup; no persistence.
@@ -1593,7 +1601,7 @@ export class ConnectServer {
           "Project + user guidance from YAW-MCP.md. Read this to learn how THIS user/project routes MCP work (which servers to prefer, where credentials live, gotchas).",
         mimeType: "text/markdown",
         read: () => {
-          // Flip the session flag — the meta-tools one-shot nudge keys
+          // Flip the session flag — attachGuideNudge's one-shot nudge keys
           // off this so we only remind the client to read the guide if
           // they haven't yet. Re-render at read time so the auto
           // "Active servers" section reflects the current connection
@@ -1965,7 +1973,7 @@ export class ConnectServer {
   // their tools in tools/list before activation; first tools/call on any
   // of those tools triggers lazy activation via activateOne in
   // handleToolCall. Merges in any in-session toolCache (this.toolCache)
-  // that hasn't yet been persisted to bundles.json, so recently-used
+  // that hasn't yet been flushed to state.json, so recently-used
   // servers that got idle-evicted still appear as deferred.
   private getDeferredServers(): UpstreamServerConfig[] {
     const out: UpstreamServerConfig[] = [];
@@ -2721,17 +2729,10 @@ export class ConnectServer {
     // override OR the resolved config flag (either enables it; off by
     // default). Gating here means a fresh load per session picks up a
     // config change on restart. When this stays false, buildDiscoverOutput
-    // never runs the shell-history scan.
-    //
-    // The env value is trimmed here rather than inside installNudgeEnabled
-    // (whose contract is a literal "1", so a stray value can't turn the scan
-    // on) for the cmd.exe reason isAutoLoadEnabled documents: `set
-    // YAW_MCP_INSTALL_NUDGE=1 && ...` keeps the space before `&&`, so the
-    // value arrives as "1 " and the gate silently stayed off. Only the one
-    // key is overridden; every other env read still sees process.env.
-    const rawNudge = process.env.YAW_MCP_INSTALL_NUDGE?.trim();
-    const nudgeGateEnv = rawNudge === undefined ? process.env : { ...process.env, YAW_MCP_INSTALL_NUDGE: rawNudge };
-    this.installNudge = installNudgeEnabled(nudgeGateEnv, resolvedConfig);
+    // never runs the shell-history scan. installNudgeEnabled trims the env
+    // value itself (the shared isFeatureEnabled parse), so cmd.exe's "1 "
+    // still enables it.
+    this.installNudge = installNudgeEnabled(process.env, resolvedConfig);
     if (this.installNudge) {
       log("info", "Shadow-driven install nudge enabled");
     }
@@ -3255,8 +3256,9 @@ export class ConnectServer {
     const sources = [this.guides.user?.path, this.guides.project?.path].filter(Boolean).join(", ");
     const text = `[yaw-mcp] Tip: read the \`yaw-mcp://guide\` resource for project-specific routing & credential guidance (from ${sources}). This hint appears once per session.`;
     // Appended as its OWN text block, never spliced into an existing one:
-    // exec and secrets return a single block whose text is JSON.stringify
-    // of a documented payload, and tacking prose onto that text breaks
+    // secrets, and exec once a step has run, return a single block whose
+    // text is JSON.stringify of a documented payload (exec's pre-step-0
+    // refusals are plain `exec: ...` text), and tacking prose onto that breaks
     // JSON.parse on the body the tool description promises. A separate
     // block keeps every documented body byte-identical. Building a fresh
     // content array (rather than pushing in place) also matters: some
@@ -4475,9 +4477,14 @@ export class ConnectServer {
     const scores = new Map<string, number>();
     let sorted: typeof activeServers;
     if (context) {
+      // Ranked over allProfiled, not activeServers: BM25's IDF depends on the
+      // corpus size, so ranking a focused call's one-element set printed a
+      // different `(relevance: X)` on the focused card than the full listing
+      // gives the same server for the same query. byNamespace below narrows
+      // the result to the card loop's set.
       const ranked = rankServers(
         context,
-        activeServers.map((s) => this.rankableFor(s)),
+        allProfiled.map((s) => this.rankableFor(s)),
       );
       for (const r of ranked) scores.set(r.namespace, r.score);
       // Index by namespace once rather than re-scanning activeServers for
@@ -4595,8 +4602,9 @@ export class ConnectServer {
     if (actionablePacks.length > 0 && !focused) {
       lines.push("Recurring packs (activate together — seen before):");
       for (const pack of actionablePacks.slice(0, 3)) {
-        const nsJson = JSON.stringify(pack.namespaces);
-        lines.push(`  {${pack.namespaces.join(", ")}} — seen ${pack.frequency}x; activate with namespaces=${nsJson}`);
+        lines.push(
+          `  {${pack.namespaces.join(", ")}} — seen ${pack.frequency}x; activate with ${activateServersCall(pack.namespaces)}`,
+        );
       }
       lines.push("");
     }
@@ -4845,10 +4853,10 @@ export class ConnectServer {
     // disagree: a bundle whose only missing member was a DISABLED server
     // read as complete in discover while match called it partial.
     //
-    // Reuses `activeServers` rather than calling getProfiledActiveServers()
+    // Reuses `allProfiled` rather than calling getProfiledActiveServers()
     // a second time: it is the same list, and the re-call paid for another
     // mergeToolCache clone per server on every uncached discover.
-    const allInstalled = activeServers.map((s) => s.namespace);
+    const allInstalled = allProfiled.map((s) => s.namespace);
     const bundleGaps = topPartialBundles(allInstalled, 3);
     if (!focused && bundleGaps.length > 0) {
       lines.push("\nBundle completions (install to unlock curated stacks):");
@@ -5655,22 +5663,17 @@ export class ConnectServer {
       // the next meta-tool boundary, and the successful activation that
       // follows clears this record outright (see the delete on the success
       // path). The TTL is the backstop for the case where they never retry.
-      this.activationFailures.set(namespace, {
-        at: Date.now(),
-        message: lastError instanceof Error ? lastError.message : String(lastError),
-      });
+      const errorMessage = lastError instanceof Error ? lastError.message : String(lastError);
+      this.activationFailures.set(namespace, { at: Date.now(), message: errorMessage });
       // discover renders this failure as a `warn: last activation failed ...`
       // line, but the failure touches nothing in the discover cache key, so
       // a re-discover inside the 3s TTL would hand back the pre-failure text.
       this.invalidateDiscoverCache();
 
-      // Prefer the ActivationError's message (includes stderr tail + category
-      // hint) over the raw SDK error. Falls back cleanly for transport errors.
-      const message =
-        lastError instanceof ActivationError
-          ? `Failed to load "${namespace}": ${lastError.message}`
-          : `Failed to load "${namespace}": ${lastError instanceof Error ? lastError.message : String(lastError)}`;
-      return { ok: false, isChanged: false, message };
+      // No separate ActivationError arm: ActivationError extends Error and
+      // carries its stderr tail + category hint inside `message`, so an
+      // instanceof branch returned the identical string (as in handleReadTool).
+      return { ok: false, isChanged: false, message: `Failed to load "${namespace}": ${errorMessage}` };
     } finally {
       this.pendingActivations.delete(namespace);
     }
@@ -6842,7 +6845,8 @@ export class ConnectServer {
 
     // A filter change on an already-connected server is the one surface move
     // dispatch cannot make: routes are unchanged (whoever connected it rebuilt
-    // them, and dispatch still reaches hidden tools), but tools/list moved.
+    // them, and a direct tools/call or an exec step still reaches hidden
+    // tools), but tools/list moved.
     await this.announceExplicitLoads(tally, filtersChanged);
 
     // A filter name that matched NOTHING is a silent hole otherwise. The
@@ -7706,7 +7710,11 @@ export class ConnectServer {
         const errorRate = h.totalCalls > 0 ? Math.round((h.errorCount / h.totalCalls) * 100) : 0;
         const idleCount = this.idleCallCounts.get(namespace) ?? 0;
         const idleLimit = adaptiveThreshold(namespace, this.recentToolCalls, resolveIdleThreshold());
-        const toolNames = conn.tools.map((t) => t.name).join(", ");
+        // Same `[blocked]` label discover uses: a denied tool is still in
+        // the upstream list, but calling it is refused.
+        const toolNames = conn.tools
+          .map((t) => (this.isToolDenied(`${namespace}_${t.name}`) ? `${t.name} [blocked]` : t.name))
+          .join(", ");
 
         lines.push(`  ${namespace} [${conn.status}] (${conn.config.type})`);
         lines.push(`    tools: ${conn.tools.length} — ${toolNames}`);
@@ -7760,9 +7768,17 @@ export class ConnectServer {
     // operator knows which ones have been unreliable before reloading
     // them. Threshold + sort shared with `yaw-mcp doctor` via
     // selectFlakyNamespaces (see usage-hints.ts).
+    //
+    // Filtered to ACTIVATABLE namespaces: learning persists across restarts
+    // and nothing prunes it on load (learning.ts), so without this a server
+    // the user removed from bundles.json -- or disabled, or a project
+    // profile blocks -- kept appearing as a "dormant" server the model may
+    // reload, though activate refuses it. getProfiledActiveServers (isActive
+    // + profileAllows) is the same set discover filters pack history on.
     const now = Date.now();
+    const installed = new Set(this.getProfiledActiveServers().map((s) => s.namespace));
     const flaky = selectFlakyNamespaces(
-      this.learning.entries().filter(({ namespace }) => !this.connections.has(namespace)),
+      this.learning.entries().filter(({ namespace }) => installed.has(namespace) && !this.connections.has(namespace)),
       5,
     );
     if (flaky.length > 0) {
@@ -7789,7 +7805,7 @@ export class ConnectServer {
    *  against a 30-server setup can match a hundred tools. Ten is enough to
    *  choose from and small enough that the reply stays cheap. */
   private static readonly FIND_TOOL_DEFAULT_LIMIT = 10;
-  private static readonly FIND_TOOL_MAX_LIMIT = 50;
+  private static readonly FIND_TOOL_MAX_LIMIT = FIND_TOOL_MAX_LIMIT;
 
   /** Search every configured server's tools by what they do.
    *
@@ -7866,7 +7882,19 @@ export class ConnectServer {
 
     const shown = ranked.slice(0, cap);
     const lines: string[] = [`Tools matching "${query}" (${shown.length} of ${ranked.length}):`, ""];
+    // A tool the profile's blockedTools denies still ranks (the deny is a
+    // call-time policy, not a catalog edit), so it is labelled `[blocked]` --
+    // discover's wording -- with no schema line and no activate pointer:
+    // the call gate refuses it, and listing it as usable contradicted the
+    // user's own policy and cost the model a wasted round trip.
+    const usable: typeof shown = [];
     for (const hit of shown) {
+      if (this.isToolDenied(`${hit.namespace}_${hit.name}`)) {
+        lines.push(`  ${hit.namespace}_${hit.name} [blocked]`);
+        if (hit.description) lines.push(`    ${hit.description}`);
+        continue;
+      }
+      usable.push(hit);
       const connection = this.connections.get(hit.namespace);
       const live = connection?.status === "connected" ? connection.tools.find((t) => t.name === hit.name) : undefined;
       lines.push(`  ${hit.namespace}_${hit.name}${live ? " [loaded]" : ""}`);
@@ -7878,18 +7906,27 @@ export class ConnectServer {
       }
     }
     if (ranked.length > shown.length) {
-      lines.push("", `${ranked.length - shown.length} more match; raise "limit" to see them.`);
+      // At the ceiling a bigger `limit` is clamped back to the same page, so
+      // telling the model to raise it would be advice it cannot follow.
+      lines.push(
+        "",
+        shown.length >= ConnectServer.FIND_TOOL_MAX_LIMIT
+          ? `${ranked.length - shown.length} more match; narrow the query (limit is capped at ${ConnectServer.FIND_TOOL_MAX_LIMIT}).`
+          : `${ranked.length - shown.length} more match; raise "limit" to see them.`,
+      );
     }
-    // The namespaces behind the shown matches, in first-appearance order, so
-    // the model can act without re-deriving them from the lines above.
-    const namespaces = [...new Set(shown.map((h) => h.namespace))];
+    // The namespaces behind the shown usable matches, in first-appearance
+    // order, so the model can act without re-deriving them from the lines above.
+    const namespaces = [...new Set(usable.map((h) => h.namespace))];
     const primary = namespaces[0];
     const alsoTry = namespaces.slice(1);
     lines.push(
       "",
-      alsoTry.length > 0
-        ? `To use one: mcp_connect_activate with server "${primary}" (or ${alsoTry.join(", ")}).`
-        : `To use one: mcp_connect_activate with server "${primary}".`,
+      primary === undefined
+        ? 'Every match shown is blocked by the profile\'s "blockedTools" list.'
+        : alsoTry.length > 0
+          ? `To use one: mcp_connect_activate with server "${primary}" (or ${alsoTry.join(", ")}).`
+          : `To use one: mcp_connect_activate with server "${primary}".`,
     );
     return { content: [{ type: "text", text: lines.join("\n") }] };
   }
@@ -7912,10 +7949,29 @@ export class ConnectServer {
       };
     }
 
+    // Only packs activate can satisfy: every namespace must be in the
+    // profiled active set (installed, enabled, profile-allowed). Pack history
+    // persists across restarts and nothing prunes it, so a pack naming a
+    // server since removed, disabled or profile-blocked would otherwise get
+    // a "ready-to-run" call that activate refuses -- the same filter
+    // discover's Recurring packs block applies.
+    const installedNamespaces = new Set(this.getProfiledActiveServers().map((s) => s.namespace));
+    const actionable = detected.filter((pack) => pack.namespaces.every((ns) => installedNamespaces.has(ns)));
+    if (actionable.length === 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "No recurring multi-server patterns among the servers you can activate now. Earlier patterns name servers that are no longer installed, enabled, or allowed by this project's profile.",
+          },
+        ],
+      };
+    }
+
     // Rank by frequency (primary) then recency (secondary). Both matter:
     // a pattern that repeated 5 times hours ago still beats one that
     // repeated twice last minute, but at equal frequency fresher wins.
-    const ranked = [...detected].sort((a, b) => {
+    const ranked = [...actionable].sort((a, b) => {
       if (b.frequency !== a.frequency) return b.frequency - a.frequency;
       return b.lastSeenAt - a.lastSeenAt;
     });
@@ -7929,15 +7985,14 @@ export class ConnectServer {
     for (const pack of ranked) {
       const nsList = pack.namespaces.join(", ");
       const secondsAgo = Math.max(0, Math.round((Date.now() - pack.lastSeenAt) / 1000));
-      lines.push(`  {${nsList}} — seen ${pack.frequency} times (last ${secondsAgo}s ago)`);
+      // Each pack carries its own ready-to-run call, as the suggest
+      // description promises. `mcp_connect_activate` is the call for a
+      // known namespace set; `dispatch` picks servers by intent, so pointing
+      // at it here would make the model re-describe a set it already has.
+      lines.push(
+        `  {${nsList}} — seen ${pack.frequency} times (last ${secondsAgo}s ago); activate with ${activateServersCall(pack.namespaces)}`,
+      );
     }
-    // Nudge toward the concrete action. `mcp_connect_activate` is the
-    // loading meta-tool — `dispatch` is for invoking tools on servers
-    // that are already active, so pointing at dispatch here used to
-    // send the model the wrong direction.
-    const top = ranked[0];
-    const nsJson = JSON.stringify(top.namespaces);
-    lines.push(`\nTo load the top pack in one step, call \`mcp_connect_activate\` with namespaces=${nsJson}.`);
 
     return { content: [{ type: "text", text: lines.join("\n") }] };
   }

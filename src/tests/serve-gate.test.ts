@@ -61,10 +61,15 @@ describe("decideServeMode", () => {
     expect(decideServeMode({ isTTY: true }, { [STDIO_OVERRIDE_ENV]: "1 " })).toEqual({ kind: "serve" });
   });
 
+  it("accepts true, the other on spelling of the shared opt-in parser", () => {
+    expect(decideServeMode({ isTTY: true }, { [STDIO_OVERRIDE_ENV]: "true" })).toEqual({ kind: "serve" });
+  });
+
   it("does not treat any other override value as opt-in", () => {
     // "0" is what a user sets to turn something OFF; an empty string is a
-    // declared-but-unset CI variable. Neither may force the server on.
-    for (const value of ["0", "", "true", "yes"]) {
+    // declared-but-unset CI variable. Neither may force the server on, and
+    // nor may a spelling the shared parser does not accept.
+    for (const value of ["0", "", "yes", "on", "11"]) {
       expect(decideServeMode({ isTTY: true }, { [STDIO_OVERRIDE_ENV]: value }).kind).toBe("explain");
     }
   });

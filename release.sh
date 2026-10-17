@@ -159,12 +159,18 @@ set -Eeuo pipefail
 # banner used to report its own line ("line 60") for every failure in the
 # script, which is worse than useless when a 500-line release dies mid-run.
 # `fail()` sets it explicitly because an outright `exit 1` does not fire ERR.
+#
+# ABORTED marks an exit 1 that is a pre-flight REFUSAL with its own "Aborted:"
+# message (the non-tty confirm brake and the two behaviour-change-gate
+# aborts): nothing failed and nothing was released, so the failure banner
+# would only add a misleading "failed at line unknown" under the real reason.
 WORKDIR=""
 FAIL_LINE=""
+ABORTED=""
 trap 'FAIL_LINE=$LINENO' ERR
 cleanup() {
   rc=$?
-  if [ $rc -ne 0 ]; then
+  if [ $rc -ne 0 ] && [ -z "$ABORTED" ]; then
     echo -e "\n  [x] Release failed at line ${FAIL_LINE:-unknown} (exit code $rc)\n" >&2
   fi
   if [ -n "$WORKDIR" ] && [ -d "$WORKDIR" ]; then
@@ -180,7 +186,7 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 if [ "${NO_COLOR:-0}" = "1" ] || [ ! -t 1 ]; then
   # CYAN belongs in this list: step() and every banner below use it, so
-  # omitting it emitted raw ANSI into pipes and CI logs even under NO_COLOR=1.
+  # omitting it emitted raw ANSI into pipes and captured logs even under NO_COLOR=1.
   RED=''; GREEN=''; YELLOW=''; CYAN=''; NC=''
 fi
 
@@ -351,8 +357,8 @@ run_npm_check() {
 # required. (The --build-only + --upload-asset subcommands were removed in
 # v0.70.3 when the SEA binary track was dropped -- npm install is the install
 # story now; see docs/v0.70.3-binary-track-decision.md.)
-# Env may pre-set SKIP_CONFIRM=1 to skip the y/N prompt (e.g. CI, scripted
-# release). Default off. The -y/--yes arg below overrides the env to true.
+# Env may pre-set SKIP_CONFIRM=1 to skip the y/N prompt (e.g. a scripted or
+# agent-driven release). Default off. The -y/--yes arg below overrides the env to true.
 # Normalized here because the gate below compares against the literal
 # "true" -- without this, the documented SKIP_CONFIRM=1 spelling still
 # prompted (commit 3cbe778 changed only the default line, not the gate).
@@ -432,7 +438,9 @@ NPM_WAIT_BUDGET=$((10#$NPM_WAIT_BUDGET))
 
 # --- Guard: the repo-local toolchain must actually be installed. The
 # `command -v` checks above cover the PATH tools; these four live in
-# node_modules/.bin and are exactly what package.json's scripts exec:
+# node_modules/.bin. Three are exactly what package.json's scripts exec; biome's
+# shim stands in for @biomejs/biome, which "lint" needs installed (scripts/lint.mjs
+# runs the platform binary or biome's JS entry, never the shim):
 #   biome  -> "lint"      (step 1)   vitest -> "test"  (step 1)
 #   tsc    -> "typecheck" (step 1)   tsup   -> "build" (step 2, and again via
 #                                              prepublishOnly inside step 4)
@@ -1064,6 +1072,7 @@ if [ "$SKIP_CONFIRM" != "true" ] && [ "$RESUMING" != "true" ]; then
   if [ ! -t 0 ]; then
     echo "Aborted: stdin is not a terminal, so the confirm prompt cannot be answered."
     echo "Re-run with -y (or SKIP_CONFIRM=1 ./release.sh ${VERSION}) to release non-interactively."
+    ABORTED=1
     exit 1
   fi
   # Behaviour-change prompt, deliberately BEFORE the release confirm rather
@@ -1103,6 +1112,7 @@ if [ "$SKIP_CONFIRM" != "true" ] && [ "$RESUMING" != "true" ]; then
     # decline below exits 0.
     if [ -z "$OFF_SWITCH" ]; then
       echo "Aborted: a default-on behaviour change ships with a documented way back, or it does not ship."
+      ABORTED=1
       exit 1
     fi
     # Scoped to the UNRELEASED section, not the whole file. The point of the
@@ -1126,6 +1136,7 @@ if [ "$SKIP_CONFIRM" != "true" ] && [ "$RESUMING" != "true" ]; then
     # contains it -- an abort on the answer the prompt above asks for.
     if ! grep -qF -e "$OFF_SWITCH" <<<"$UNRELEASED_BODY"; then
       echo "Aborted: '${OFF_SWITCH}' does not appear in CHANGELOG.md's Unreleased section -- document it there first."
+      ABORTED=1
       exit 1
     fi
     echo -e "  ${CYAN}${OFF_SWITCH}${NC} found in the Unreleased section."

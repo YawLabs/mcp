@@ -130,7 +130,11 @@ export function resetDefaultRuntimeCache(): void {
  * connect path does not honor -- so the parse lives in exactly one place.
  */
 function readEnvChoice(env: NodeJS.ProcessEnv): RuntimeChoice | null {
-  const raw = env.YAW_MCP_DEFAULT_RUNTIME;
+  // Trimmed first for the cmd.exe `set VAR=node && yaw-mcp` idiom, which
+  // keeps the space before `&&` in the value -- the same rule resolveTimeoutEnv
+  // (upstream.ts) and decideServeMode (serve-gate.ts) apply. Untrimmed, an
+  // explicit "node " opt-out warned and fell through to the oam default.
+  const raw = env.YAW_MCP_DEFAULT_RUNTIME?.trim();
   if (raw === "oam" || raw === "node") return raw;
   if (raw !== undefined && raw !== "" && !warnedInvalidEnv) {
     warnedInvalidEnv = true;

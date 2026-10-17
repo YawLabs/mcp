@@ -477,8 +477,12 @@ function render(value: unknown): string {
 /** English for the SHAPE of a value read out of the user's file, for an error
  *  about a field whose type is wrong. `typeof` alone calls null and an array
  *  "object", and those two are exactly the shapes a hand edit produces -- the
- *  reader needs to know WHICH one to go fix. */
-function describeJsonShape(value: unknown): string {
+ *  reader needs to know WHICH one to go fix.
+ *
+ *  Not install-targets.ts's exported describeJsonShape: that one names an
+ *  array's LENGTH (install/doctor wording, test-pinned) and has no absent or
+ *  object case, both of which an `env` field here needs. */
+function describeFieldShape(value: unknown): string {
   if (value === null) return "null";
   if (Array.isArray(value)) return "an array";
   const t = typeof value;
@@ -540,18 +544,45 @@ export async function runSet(opts: SetCommandOptions): Promise<SetCommandResult>
   const ctx: SetContext = { verb, target, path, home, print, printErr, err };
   if (opts.secret) return runSetSecret(opts, ctx);
 
+  // The refusals and the [y/N] confirmation run OUTSIDE the lock, the order
+  // runSetSecret documents: other writers give up on the lock after
+  // BUNDLES_LOCK_WAIT_MS, and a human answering a prompt takes longer. Holding
+  // it across the question made every concurrent `add`/`remove` (and the Yaw
+  // app's writer) fail with advice to delete the lock file.
+  const pre = await locateEntry(ctx, assignments);
+  if (!pre.ok) return pre.result;
+  const preProjected = projectEnv(ctx, pre, assignments);
+  if (!preProjected.ok) return preProjected.result;
+  const refused = await confirmDestructive(opts, ctx, pre, preProjected.env, assignments);
+  if (refused) return refused;
+
   // Both serializers the write-path header in local-bundles.ts names: the
   // in-process chain (serializeBundleWrite) and the cross-process lock. The
   // lock alone left `set` able to interleave with an in-process upsert --
   // real for an embedded caller or a test that runs the verbs back to back.
   return serializeBundleWrite(() =>
     withBundlesLock(home, async () => {
+      // Re-read under the lock: the write splices into THIS text, never the
+      // pre-prompt one, so another writer's update cannot be lost.
       const loc = await locateEntry(ctx, assignments);
       if (!loc.ok) return loc.result;
+      // Compare against the pre-lock read, which the [y/N] prompt (when one
+      // ran -- not under --force, nor when nothing is destroyed) was based on.
+      // If another writer changed a targeted env value since, refuse rather
+      // than overwrite a value this run never looked at -- compared by JSON text, as
+      // runSetSecret does, since a non-string value is a fresh object per parse.
+      const changedKeys = [...new Set(assignments.filter((a) => a.field === "env").map((a) => a.key as string))].filter(
+        (key) => JSON.stringify(loc.originalEnv[key]) !== JSON.stringify(pre.originalEnv[key]),
+      );
+      if (loc.namespace !== pre.namespace || changedKeys.length > 0) {
+        const what = changedKeys.length > 0 ? changedKeys.map((k) => `env.${k}`).join(", ") : "the entry";
+        const error = `${what} on "${pre.namespace}" changed in ${path} since it was read -- nothing was written; re-run to apply.`;
+        if (opts.json) printErr(JSON.stringify({ ok: false, error, path, namespace: pre.namespace }));
+        else printErr(`yaw-mcp ${verb}: ${error}`);
+        return { exitCode: 1, written: [] };
+      }
       const projected = projectEnv(ctx, loc, assignments);
       if (!projected.ok) return projected.result;
-      const refused = await confirmDestructive(opts, ctx, loc, projected.env, assignments);
-      if (refused) return refused;
       return applyAssignments(opts, ctx, loc, assignments);
     }),
   );
@@ -716,7 +747,7 @@ async function locateEntry(ctx: SetContext, assignments: Assignment[]): Promise<
   if (!envIsMap && envAssignments.length > 0) {
     const targeted = envAssignments.map((a) => `env.${a.key}`).join(", ");
     printErr(
-      `yaw-mcp ${verb}: "${namespace}" in ${path} has an "env" that is ${describeJsonShape(entry.env)}, not an object of "NAME": "value" pairs.`,
+      `yaw-mcp ${verb}: "${namespace}" in ${path} has an "env" that is ${describeFieldShape(entry.env)}, not an object of "NAME": "value" pairs.`,
     );
     printErr(`  Fix that field by hand (or delete it), then re-run to set ${targeted}.`);
     return refuse(1);
@@ -731,7 +762,7 @@ async function locateEntry(ctx: SetContext, assignments: Assignment[]): Promise<
   // report a broken field in the user file ("is a function ... remove it by
   // hand") over a key that was never there: the same false-report class the
   // refusal below exists to prevent, produced by the refusal itself.
-  // describeJsonShape answering "a function" is the tell -- no JSON parse
+  // describeFieldShape answering "a function" is the tell -- no JSON parse
   // can produce one.
   //
   // Object.assign(Object.create(null), ...) at EACH map rather than a spread
@@ -783,7 +814,7 @@ function projectEnv(
     const current = projectedEnv[key];
     if (current !== undefined && typeof current !== "string") {
       printErr(
-        `yaw-mcp ${verb}: env.${key} on "${namespace}" is ${describeJsonShape(current)} in ${path}, not a string -- remove it by hand.`,
+        `yaw-mcp ${verb}: env.${key} on "${namespace}" is ${describeFieldShape(current)} in ${path}, not a string -- remove it by hand.`,
       );
       printErr("  Nothing was written; re-run once that field is a string or gone.");
       return { ok: false, result: { exitCode: 1, written: [] } };
@@ -979,11 +1010,6 @@ async function applyAssignments(
       liveScalars[a.field] === undefined && a.field in scalarDefaults ? scalarDefaults[a.field] : liveScalars[a.field];
     if (current === a.value) {
       applied.push(`${a.field}: already ${render(a.value)}`);
-      jsonUnchanged.push({ field: a.field });
-      continue;
-    }
-    if (a.value === undefined && current === undefined) {
-      applied.push(`${a.field}: already unset`);
       jsonUnchanged.push({ field: a.field });
       continue;
     }

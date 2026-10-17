@@ -154,8 +154,10 @@ describe("healStaleBrokerEntries", () => {
   it("writes nothing when read-only diagnostics is set", async () => {
     const p = writeCodexConfig(tomlEntry(DEAD));
     const before = readFileSync(p, "utf8");
-    const healed = await heal({ env: { YAW_MCP_READONLY_DIAGNOSTICS: "1" } });
-    expect(healed).toEqual([]);
+    const r = await healResult({ env: { YAW_MCP_READONLY_DIAGNOSTICS: "1" } });
+    expect(r.healed).toEqual([]);
+    // Marked, so `yaw-mcp heal` can say "not checked" instead of "clean".
+    expect(r.skipped).toBe("read-only");
     expect(readFileSync(p, "utf8")).toBe(before);
   });
 
@@ -248,6 +250,25 @@ describe("healStaleBrokerEntries -- a config written for another OS", () => {
     const p = writeCodexConfig(winEntryToml());
     const before = readFileSync(p, "utf8");
     const healed = await heal({ platform: "linux" });
+    expect(healed.filter((x) => x.clientId === "codex-cli")).toEqual([]);
+    expect(readFileSync(p, "utf8")).toBe(before);
+  });
+
+  it("leaves a cmd-WRAPPED Windows oam entry alone when inspected from POSIX", async () => {
+    // The raw `command` is just `cmd`, which no foreign-path test flags; the
+    // drive-letter paths live inside the wrapper. Testing only `command`
+    // let this shape through to gate 2, which then read the working entry as
+    // broken and rewrote it with Linux paths.
+    const p = writeCodexConfig(
+      [
+        "[mcp_servers.mcp]",
+        `command = 'cmd'`,
+        `args = ['/d', '/s', '/c', '${WIN_OAM}', 'run', '--no-check', '${WIN_ENTRY}']`,
+        "",
+      ].join("\n"),
+    );
+    const before = readFileSync(p, "utf8");
+    const healed = await heal({ platform: "linux", os: "linux" });
     expect(healed.filter((x) => x.clientId === "codex-cli")).toEqual([]);
     expect(readFileSync(p, "utf8")).toBe(before);
   });

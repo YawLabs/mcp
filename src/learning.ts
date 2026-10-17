@@ -158,13 +158,16 @@ export class LearningStore {
   }
 
   // Apply a DELTA to a namespace's success credit WITHOUT touching the
-  // dispatched count. Used by the optional LLM reward grader (reward-grader.ts)
-  // to revise a previously-recorded heuristic reward in the background: the
-  // caller records the heuristic via recordOutcome immediately, then later
-  // adjusts by (graded - heuristic) once the LLM verdict lands. Adding a delta
-  // (rather than setting an absolute) stays correct under concurrent
-  // recordOutcome calls on the same namespace. No-op for an unknown namespace
-  // (nothing to revise); succeeded is clamped to [0, dispatched].
+  // dispatched count. Two callers, both in server.ts:
+  //   - refineRewardInBackground, for the optional LLM reward grader: the
+  //     heuristic reward is recorded via recordOutcome immediately, then
+  //     revised by (graded - heuristic) once the verdict lands;
+  //   - handleExec's invalid-params blame split, which docks a producer step
+  //     by a flat -0.5 without booking it a second dispatch.
+  // Both rely on the same property: adding a delta (rather than setting an
+  // absolute) stays correct under concurrent recordOutcome calls on the same
+  // namespace and never double-counts a dispatch. No-op for an unknown
+  // namespace (nothing to revise); succeeded is clamped to [0, dispatched].
   adjustSucceeded(namespace: string, delta: number): void {
     const u = this.usage.get(namespace);
     if (!u || !Number.isFinite(delta)) return;

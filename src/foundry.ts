@@ -41,6 +41,7 @@
 import { appendFile, mkdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
+import { isFeatureEnabled } from "./opt-out-env.js";
 import { userConfigDir } from "./paths.js";
 import { tokenizeQuery } from "./relevance.js";
 
@@ -311,10 +312,7 @@ export interface FoundryTrace {
 // (case-insensitive, whitespace-trimmed). Anything else -- unset, "0",
 // "false", "yes", garbage -- is treated as disabled. Privacy-safe default.
 export function isFoundryEnabled(): boolean {
-  const raw = process.env.YAW_MCP_FOUNDRY;
-  if (!raw) return false;
-  const v = raw.trim().toLowerCase();
-  return v === "1" || v === "true";
+  return isFeatureEnabled("YAW_MCP_FOUNDRY");
 }
 
 // Hard cap on the harvest file size. Once foundry.jsonl exceeds this, we

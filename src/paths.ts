@@ -2,6 +2,7 @@ import { realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { log } from "./logger.js";
+import { isFeatureEnabled } from "./opt-out-env.js";
 
 // Per-platform cache root for anything yaw-mcp fetches at runtime (uv
 // binary today; potentially more later). Matches the conventions each
@@ -211,7 +212,7 @@ function rememberWarnedUntrustedDir(candidate: string): void {
 // real environment as well.
 function ownedByCurrentUser(st: Awaited<ReturnType<typeof stat>>, env: NodeJS.ProcessEnv): boolean {
   const geteuid = (process as { geteuid?: () => number }).geteuid;
-  if (typeof geteuid !== "function") return env[ALLOW_UNOWNED_ENV] === "1";
+  if (typeof geteuid !== "function") return isFeatureEnabled(ALLOW_UNOWNED_ENV, env);
   return typeof st.uid === "number" && st.uid === geteuid.call(process);
 }
 

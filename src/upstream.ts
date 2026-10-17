@@ -106,7 +106,7 @@ export class VaultPassphraseRequiredError extends Error {
  *  Carries only the KEY. The message deliberately does not quote the value:
  *  it is a decrypted secret, and the runtime's own `Headers` TypeError quotes
  *  it, which is why that error is caught and discarded rather than wrapped. */
-export class InvalidResolvedValueError extends Error {
+class InvalidResolvedValueError extends Error {
   constructor(public readonly key: string) {
     super(`invalid resolved value for "${key}"`);
     this.name = "InvalidResolvedValueError";
@@ -1135,21 +1135,6 @@ function remoteFailureDetail(err: unknown, resolved: Record<string, string>): st
   return redactSecretsInOutput(parts.join(": "), resolved).replace(/\s+/g, " ").trim().slice(0, 200);
 }
 
-/** Attach the child's stderr tail to an ActivationError raised AFTER the
- *  handshake -- the inventory-fetch window, where a child that dies mid-fetch
- *  surfaces either as "disconnected during initialization" or as a tools/list
- *  error, and where nothing used to carry the reason it printed on the way
- *  out. The pre-handshake catch already does this; without it here the
- *  elicitation haystack (server.ts scans `stderrTail` for "SOME_TOKEN is
- *  required") and the oam heap-cap hint both lost their input exactly where
- *  the comment on the boot-probe downgrade says such deaths surface.
- *
- *  Deliberately narrow: only an ActivationError that has NO tail yet and only
- *  when something was actually captured. message, category and cause are
- *  carried over verbatim so the downgrade gate (which compares categories) and
- *  server.ts's instanceof branches behave exactly as before -- the tail and the
- *  appended reason are additive. Remote connections never populate the ring,
- *  so this is a no-op for them. */
 /** Redact resolved secret values out of an ActivationError's own MESSAGE.
  *
  *  withStderrTail below redacts only the tail it APPENDS, and returns the
@@ -1175,6 +1160,21 @@ function redactActivationMessage(err: unknown, env: Record<string, string>): unk
   return new ActivationError(safe, err.category, err.stderrTail, err.cause);
 }
 
+/** Attach the child's stderr tail to an ActivationError raised AFTER the
+ *  handshake -- the inventory-fetch window, where a child that dies mid-fetch
+ *  surfaces either as "disconnected during initialization" or as a tools/list
+ *  error, and where nothing used to carry the reason it printed on the way
+ *  out. The pre-handshake catch already does this; without it here the
+ *  elicitation haystack (server.ts scans `stderrTail` for "SOME_TOKEN is
+ *  required") and the oam heap-cap hint both lost their input exactly where
+ *  the comment on the boot-probe downgrade says such deaths surface.
+ *
+ *  Deliberately narrow: only an ActivationError that has NO tail yet and only
+ *  when something was actually captured. message, category and cause are
+ *  carried over verbatim so the downgrade gate (which compares categories) and
+ *  server.ts's instanceof branches behave exactly as before -- the tail and the
+ *  appended reason are additive. Remote connections never populate the ring,
+ *  so this is a no-op for them. */
 function withStderrTail(err: unknown, stderrRing: string, env: Record<string, string>): unknown {
   if (!(err instanceof ActivationError) || err.stderrTail) return err;
   const trimmed = stderrRing.trim();
@@ -1515,9 +1515,9 @@ export async function connectToUpstream(
 // The internal-secret strip (INTERNAL_SECRET_ENV_KEYS and the two helpers
 // built on it) lives in internal-secret-env.ts now, so the self-upgrade spawns
 // in auto-upgrade.ts / upgrade-cmd.ts can share it without loading the MCP
-// SDK. Re-exported under the same names for the importers that still reach
-// them through here (audit-cmd.ts and upstream's tests); server.ts and every
-// other consumer import internal-secret-env.ts directly.
+// SDK. Re-exported under the same names for upstream's tests, which still
+// reach them through here; every production consumer (server.ts, audit-cmd.ts
+// and the rest) imports internal-secret-env.ts directly.
 export { INTERNAL_SECRET_ENV_KEYS, scrubInternalSecretsFromProcessEnv, stripInternalSecretsFromEnv };
 
 async function connectToUpstreamOnce(
@@ -2016,10 +2016,12 @@ async function connectToUpstreamOnce(
     // package, a container image being pulled, or a child that started and
     // will never answer initialize. The tick names the deadline as well as the
     // elapsed time, so the reader knows whether waiting longer can still work.
+    // deadlineMs is the TOTAL budget, so it is phrased as a limit the elapsed
+    // time counts toward, never as time remaining.
     await withHeartbeat(
       progress,
       (elapsed) =>
-        `"${config.namespace}" is still starting -- ${elapsed}s so far, ${Math.round(deadlineMs / 1000)}s before it is given up on`,
+        `"${config.namespace}" is still starting -- ${elapsed}s so far of a ${Math.round(deadlineMs / 1000)}s limit`,
       () => Promise.race([connectP, timeoutPromise]),
     );
     clearTimeout(timer);

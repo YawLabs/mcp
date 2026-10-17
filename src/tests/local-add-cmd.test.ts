@@ -195,6 +195,14 @@ describe("parseAddArgs", () => {
     }
   });
 
+  it("rejects a header the MCP transport owns, which the loader would drop on every load", () => {
+    for (const reserved of ["Mcp-Session-Id: x", "mcp-protocol-version: 2025-06-18"]) {
+      const r = parseAddArgs(["x", "--url", "https://a.test/mcp", "--header", reserved]);
+      expect(r.ok, reserved).toBe(false);
+      expect(!r.ok && r.error).toContain("is set by the MCP transport");
+    }
+  });
+
   it("rejects a header value carrying a newline or NUL", () => {
     // Refused while the user is still looking at the command that made the
     // typo. upstream.ts refuses it at connect time too, which is the

@@ -215,9 +215,10 @@ export async function atomicWriteFile(
  * sweep is housekeeping on the side of a write that has already succeeded,
  * and must not turn that write into a failure.
  *
- * Exported for the test; nothing else calls it directly.
+ * Called only from atomicWriteFile; atomic-write.test.ts exercises it
+ * through that.
  */
-export async function sweepStaleTmpSiblings(dir: string, base: string, own: string): Promise<void> {
+async function sweepStaleTmpSiblings(dir: string, base: string, own: string): Promise<void> {
   const prefix = `${base}.tmp-`;
   let names: string[];
   try {

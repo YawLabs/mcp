@@ -154,7 +154,8 @@ function validateEntry(entry: unknown, warnings: string[]): UpstreamServerConfig
   // "command is required for local servers" and never sent them. The entry
   // failed either way; the cost was that the diagnostic named the vault when
   // the real fault was the missing field. Inferring here fixes it at the
-  // source: one answer, decided once, before any reader sees the entry.
+  // source: one answer, decided once, before any reader sees the entry -- for
+  // every entry without an explicit "local" (the documented override below).
   //
   // A url+command entry is NOT inferred -- that is genuinely ambiguous, and an
   // explicit `"type"` is the only honest way to resolve it, so it keeps the
@@ -166,8 +167,20 @@ function validateEntry(entry: unknown, warnings: string[]): UpstreamServerConfig
   // on the shape a hand-edit most plausibly produces (clearing the command
   // field rather than deleting the key). Both sides now agree that an empty
   // command is no command.
+  //
+  // A PRESENT but unrecognised `type` (VS Code's "http" / "sse", or a typo)
+  // counts as unset for the inference, and warns: inferring only on an ABSENT
+  // key left `{ url, type: "http" }` loading as "local" while isRemoteEntry
+  // called it remote -- the same disagreement, silently. Only an explicit
+  // "local" or "remote" overrides the inference.
   const hasCommand = typeof e.command === "string" && e.command.trim() !== "";
-  const inferredRemote = e.type === undefined && typeof e.url === "string" && !hasCommand;
+  const typeKnown = e.type === "local" || e.type === "remote";
+  if (e.type !== undefined && !typeKnown) {
+    warnings.push(
+      `bundles.json: ignoring invalid type ${JSON.stringify(e.type)} on "${namespace}" (expected "local" or "remote")`,
+    );
+  }
+  const inferredRemote = !typeKnown && typeof e.url === "string" && !hasCommand;
   const type: "local" | "remote" = e.type === "remote" || inferredRemote ? "remote" : "local";
   const transport =
     e.transport === "streamable-http" || e.transport === "sse" || e.transport === "stdio"
@@ -360,9 +373,10 @@ function validateEntry(entry: unknown, warnings: string[]): UpstreamServerConfig
   // dropped rather than passed on: upstream ignores anything <= 0 anyway, and
   // dropping keeps a typo from reading as configured.
   //
-  // A dropped value gets a WARNING, unlike transport/runtime/env above, because
-  // this is the one field whose whole purpose is to change a FAILURE the user is
-  // already staring at. `MCP_CONNECT_TIMEOUT`'s help says a server's own
+  // A dropped value gets a WARNING, unlike transport/runtime above (and env's
+  // silent blank-seed drop; env's shape rejections do warn), because this
+  // field's whole purpose is to change a FAILURE the user is already staring
+  // at. `MCP_CONNECT_TIMEOUT`'s help says a server's own
   // connectTimeoutMs wins, so the natural response to a handshake timeout is to
   // set it here -- and `"60000"` with the quotes (or a `0`, or a `null`) then
   // leaves the same timeout firing at the same ceiling with nothing anywhere
@@ -1333,7 +1347,7 @@ function envStrings(raw: unknown): Record<string, string> | undefined {
  * outside the writer's vocabulary. All of it silently, under an "Updated ..."
  * success line.
  *
- * Three rules, in order:
+ * Four rules, in order:
  *   1. A field the incoming entry leaves UNDEFINED keeps its on-disk value.
  *      (Defined fields win: command/args/description are exactly what a
  *      re-add is FOR.)
@@ -1392,6 +1406,9 @@ function mergeServerEntry(
     // warns and ignores it; leaving it behind keeps a credential in
     // bundles.json that nothing will ever use and no surface will explain.
     delete merged.env;
+    // And the marker that describes env's blank seeds: with no env left, a
+    // stored optionalEnvKeys names seeds the remote entry does not have.
+    delete merged.optionalEnvKeys;
   }
   if (typeof incoming.command === "string" && incoming.transport === "stdio" && incoming.url === undefined) {
     delete merged.url;
@@ -1787,29 +1804,35 @@ async function doUpsertUserBundle(
     // version-less cases. A `?? CURRENT` here used to look like the
     // defaulting step, but it could never fire -- both of that function's
     // returns carry a number.
-    //
-    // dirMode 0o700 so a freshly-created ~/.yaw-mcp/ is born owner-only
-    // (matching secrets-vault): bundles.json can carry per-server `--env`
-    // secrets, so its parent dir must not be group/other-listable.
-    //
-    // "0600" is a POSIX-ONLY claim, and every doc that repeats it has to say
-    // so. Measured on the Node this ships on (22.x, win32): a file born with
-    // mode 0o600 stats back as 0o666, and a follow-up chmod to 0o600 leaves
-    // it at 0o666 -- Node maps the mode to the read-only ATTRIBUTE alone
-    // there, so what actually protects the file is the NTFS ACL it inherits
-    // from the user profile. That is also why the chmod below is POSIX-gated
-    // rather than best-effort everywhere: on Windows it is not a fallback
-    // that might work, it is a call that provably does nothing.
-    await atomicWriteFile(path, `${JSON.stringify(file, null, 2)}\n`, "utf8", 0o600, 0o700);
-    if (process.platform !== "win32") {
-      try {
-        await chmod(path, 0o600);
-      } catch {
-        // chmod not supported on this filesystem; not fatal.
-      }
-    }
+    await writeBundlesFile(path, file);
     return { path, replaced, entry: written, launchChanged: target.launchChanged, warnings };
   });
+}
+
+/** The one serialize-and-write for the user-global bundles.json, shared by
+ *  upsert and remove.
+ *
+ *  dirMode 0o700 so a freshly-created ~/.yaw-mcp/ is born owner-only
+ *  (matching secrets-vault): bundles.json can carry per-server `--env`
+ *  secrets, so its parent dir must not be group/other-listable.
+ *
+ *  "0600" is a POSIX-ONLY claim, and every doc that repeats it has to say
+ *  so. Measured on the Node this ships on (22.x, win32): a file born with
+ *  mode 0o600 stats back as 0o666, and a follow-up chmod to 0o600 leaves
+ *  it at 0o666 -- Node maps the mode to the read-only ATTRIBUTE alone
+ *  there, so what actually protects the file is the NTFS ACL it inherits
+ *  from the user profile. That is also why the chmod below is POSIX-gated
+ *  rather than best-effort everywhere: on Windows it is not a fallback
+ *  that might work, it is a call that provably does nothing. */
+async function writeBundlesFile(path: string, file: LocalBundlesFile): Promise<void> {
+  await atomicWriteFile(path, `${JSON.stringify(file, null, 2)}\n`, "utf8", 0o600, 0o700);
+  if (process.platform !== "win32") {
+    try {
+      await chmod(path, 0o600);
+    } catch {
+      // chmod not supported on this filesystem; not fatal.
+    }
+  }
 }
 
 /**
@@ -1842,18 +1865,7 @@ async function doRemoveUserBundle(namespace: string, opts: { home?: string }): P
     // `file.version` round-trips from readRawUserBundles, which already
     // preserves a newer on-disk version and defaults a version-less file to
     // CURRENT -- see the same note in doUpsertUserBundle.
-    //
-    // dirMode 0o700 so a freshly-created ~/.yaw-mcp/ is born owner-only
-    // (matching secrets-vault): bundles.json can carry per-server `--env`
-    // secrets, so its parent dir must not be group/other-listable.
-    await atomicWriteFile(path, `${JSON.stringify(file, null, 2)}\n`, "utf8", 0o600, 0o700);
-    if (process.platform !== "win32") {
-      try {
-        await chmod(path, 0o600);
-      } catch {
-        // chmod not supported on this filesystem; not fatal.
-      }
-    }
+    await writeBundlesFile(path, file);
     return { path, removed: true, warnings };
   });
 }

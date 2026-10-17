@@ -21,8 +21,9 @@
 //                        authenticated data (AAD) -- see encryptEntry.
 //
 // Per-entry encryption (not one envelope around the whole vault) means:
-//   1. Adding/rotating a single secret rewrites only its entry, not the
-//      full vault -- smaller diff, smaller torn-write blast radius.
+//   1. Adding/rotating a single secret changes only that entry's ciphertext;
+//      every other entry is byte-identical between saves (the file itself is
+//      always rewritten whole, atomically, by saveVault).
 //   2. A corrupt or tampered entry fails to decrypt on its own; the other
 //      entries stay readable instead of the whole vault going opaque.
 //

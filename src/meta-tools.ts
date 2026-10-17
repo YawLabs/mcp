@@ -18,6 +18,10 @@ import { isRemoteEntry } from "./types.js";
 // a hardcoded "<80%" or "Max 16 steps" is a lie the moment either moves.
 const PENALTY_RATE_PCT = Math.round(PENALTY_RATE_THRESHOLD * 100);
 
+/** find_tool's ceiling on `limit`. Lives here, not in server.ts, so the
+ *  `limit` schema text below quotes the same number handleFindTool clamps to. */
+export const FIND_TOOL_MAX_LIMIT = 50;
+
 /**
  * The server-level `instructions` string sent once in the initialize result.
  *
@@ -229,7 +233,7 @@ export const META_TOOLS = {
         },
         limit: {
           type: "number",
-          description: "Maximum matches to return. Default 10.",
+          description: `Maximum matches to return. Default 10, cap ${FIND_TOOL_MAX_LIMIT}.`,
         },
       },
       required: ["query"],
@@ -261,7 +265,7 @@ export const META_TOOLS = {
   bundles: {
     name: "mcp_connect_bundles",
     description:
-      'List curated multi-server \'bundles\' (`pr-review` = github + linear, `devops-incident` = github + pagerduty + slack, ...) for a known multi-server WORKFLOW, each with a ready-to-run `mcp_connect_activate namespaces=[...]` call. `action="match"` partitions them against the installed servers into READY (activate now) and PARTIAL (names the missing namespaces; `yaw-mcp add <slug>` installs one, catalog at https://yaw.sh/mcp/catalog/). `action="list"` (default) returns the whole catalog. Static data, no network call.',
+      'List curated multi-server \'bundles\' (`pr-review` = github + linear, `devops-incident` = github + pagerduty + slack, ...) for a known multi-server WORKFLOW, each with a ready-to-run `mcp_connect_activate({ servers: [...] })` call. `action="match"` partitions them against the installed servers into READY (activate now) and PARTIAL (names the missing namespaces; `yaw-mcp add <slug>` installs one, catalog at https://yaw.sh/mcp/catalog/). `action="list"` (default) returns the whole catalog. Static data, no network call.',
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -307,9 +311,9 @@ export const META_TOOLS = {
     // Joined rather than one literal so the step cap can be interpolated from
     // MAX_EXEC_STEPS -- the constant validateExecRequest actually enforces.
     description: [
-      "Run a short DECLARATIVE pipeline of upstream tool calls in one round-trip, when you already know the 2-4 calls and one step's output feeds another's args -- e.g. `a = gh_list_prs(); b = gh_get_pr(a[0].number); return b`. Not a sandbox: no expressions, loops, branches or arithmetic. Steps run in order; the only data flow is `{\"$ref\": \"<stepId>[.path.to.value]\"}` (dot keys, `[N]`/`.N` indexing), which substitutes a prior step's output into a later step's args. A `$ref` reads the output as the server sent it, before the pruning and size cap applied to the echoed copy. Each `tool` is a namespaced upstream name: a loaded server is called directly; an unloaded server whose tools are cached is loaded on first use (its tools join this session; it can still be refused). A POLICY refusal (server disabled, project profile, compliance floor) is decided before step 0 runs and refuses the whole pipeline with nothing done, so a re-run repeats no side effect; a server-cap refusal is only knowable when the step is reached and fails it there, with `partial` holding what already ran. A name neither loaded nor cached fails its step.",
+      "Run a short DECLARATIVE pipeline of upstream tool calls in one round-trip, when you already know the 2-4 calls and one step's output feeds another's args -- e.g. `a = gh_list_prs(); b = gh_get_pr(a[0].number); return b`. No expressions, loops, branches or arithmetic. Steps run in order; the only data flow is `{\"$ref\": \"<stepId>[.path.to.value]\"}` (dot keys, `[N]`/`.N` indexing), substituting a prior step's output into a later step's args. A `$ref` reads the output as the server sent it, before the pruning and size cap applied to the echoed copy. Each `tool` is a namespaced upstream name: a loaded server is called directly; an unloaded server whose tools are cached is loaded on first use (its tools join this session). A compliance-floor refusal is decided before step 0 runs and refuses the whole pipeline with nothing done, so a re-run repeats no side effect; a server-cap refusal is only knowable when the step is reached and fails it there, with `partial` holding what already ran. A name neither loaded nor cached, or on a disabled/profile-blocked server, fails its step.",
       `Max ${MAX_EXEC_STEPS} steps per exec.`,
-      "Any failure returns `{ ok: false, failedStep, error, partial }`. Success returns `{ ok: true, result, steps }`; with a named `return`, `result` is that step's output, `stepKeys` is added, and `steps` is dropped once the intermediates exceed about 4 KB. Name a `return` when one value is enough: it keeps a large intermediate out of your context.",
+      "Refused before step 0: plain `exec: ...` text; a later failure: `{ ok: false, failedStep, error, partial }`. Success returns `{ ok: true, result, steps }`; with a named `return`, `result` is that step's output, `stepKeys` is added, and `steps` is dropped once the intermediates exceed about 4 KB. Name a `return` when one value is enough: it keeps a large intermediate out of your context.",
     ].join(" "),
     inputSchema: {
       type: "object" as const,
@@ -432,8 +436,7 @@ export function computeSecretsReport(
     // `.exec()`/`.test()` elsewhere would make the scan silently skip leading
     // matches, and a skipped `${secret:NAME}` drops a row from the report,
     // which reads as "this server needs no secrets". collectSecretRefNames owns
-    // the fresh-instance rule for every name-only caller (upstream.ts's spawn
-    // audit and doctor's vault section are the others).
+    // the fresh-instance rule for every name-only caller.
     // A remote server's credentials ride in `headers`, not `env` -- see
     // isRemoteEntry. Scanning `env` for one meant every remote
     // server was omitted from this report, which reads as "needs no

@@ -50,6 +50,12 @@ describe("exec-engine: parseRefPath", () => {
     expect(parseRefPath("foo[0")).toBeNull();
   });
 
+  it("rejects a stray closing bracket with no opener", () => {
+    expect(parseRefPath("foo]")).toBeNull();
+    expect(parseRefPath("foo]bar")).toBeNull();
+    expect(parseRefPath("s.items]0")).toBeNull();
+  });
+
   it("rejects non-numeric bracket contents", () => {
     expect(parseRefPath("foo[bar]")).toBeNull();
   });

@@ -27,6 +27,7 @@
 //      from 1 and 2, both of which mean nothing was graded at all.
 
 import { homedir } from "node:os";
+import type { ComplianceGrade } from "./compliance.js";
 import { locateComplianceSuite } from "./compliance-cmd.js";
 import { gradesCachePath, writeGrade } from "./grades-cache.js";
 import { scrubForWarning } from "./health-score.js";
@@ -36,6 +37,15 @@ import { createStreamWriter, log } from "./logger.js";
 import { hasSecretRefs } from "./secrets-vault.js";
 import type { UpstreamServerConfig } from "./types.js";
 import { resolveServerEnv } from "./upstream.js";
+
+/** What one compliance run reports: the letter, the score, and the suite
+ *  version that produced it. Spelled once for the runner seam, the default
+ *  runner and the audit loop. */
+export interface AuditReport {
+  grade: ComplianceGrade;
+  score: number;
+  suiteVersion?: string;
+}
 
 export interface AuditCommandOptions {
   /** Positional: the namespace to audit. Required. */
@@ -52,11 +62,7 @@ export interface AuditCommandOptions {
    * real @yawlabs/mcp-compliance runner (loaded lazily so unit tests that
    * inject a runner never spin up a child process).
    */
-  runner?: (target: {
-    command: string;
-    args: string[];
-    env?: Record<string, string>;
-  }) => Promise<{ grade: "A" | "B" | "C" | "D" | "F"; score: number; suiteVersion?: string }>;
+  runner?: (target: { command: string; args: string[]; env?: Record<string, string> }) => Promise<AuditReport>;
   /**
    * Test hook: which platform's spawn semantics to apply. Only the cmd.exe
    * metacharacter gate reads it (the compliance runner uses `shell: true` on
@@ -284,7 +290,7 @@ async function defaultRunner(target: {
   command: string;
   args: string[];
   env?: Record<string, string>;
-}): Promise<{ grade: "A" | "B" | "C" | "D" | "F"; score: number; suiteVersion?: string }> {
+}): Promise<AuditReport> {
   // The compliance PACKAGE version rides along so the cached grade records
   // WHICH rubric produced the letter (see resolveComplianceSuiteVersion for
   // why it is the package version, not the exported SPEC_VERSION) -- read here
@@ -444,7 +450,7 @@ export async function runAudit(opts: AuditCommandOptions = {}): Promise<AuditCom
   }
 
   const runner = opts.runner ?? defaultRunner;
-  let report: { grade: "A" | "B" | "C" | "D" | "F"; score: number; suiteVersion?: string };
+  let report: AuditReport;
   try {
     report = await runner(target);
   } catch (err) {

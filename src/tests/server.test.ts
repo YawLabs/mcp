@@ -550,6 +550,29 @@ describe("ConnectServer", () => {
         expect(text).not.toContain("Redis");
       });
 
+      it("prints the same relevance on a focused card as the full listing gives that server", () => {
+        // BM25's IDF depends on the corpus size, so ranking only the focused
+        // server (a one-document corpus) printed a different score than the
+        // unfocused listing did for the same query.
+        const priv = getPrivate(server);
+        priv.config = makeConfig([
+          makeServerConfig({
+            id: "1",
+            namespace: "gh",
+            name: "GitHub",
+            description: "github issues and pull requests",
+          }),
+          makeServerConfig({ id: "2", namespace: "redis", name: "Redis", description: "redis cache keys" }),
+          makeServerConfig({ id: "3", namespace: "pg", name: "Postgres", description: "postgres sql database" }),
+        ]);
+        const relevanceOf = (text: string) => /GitHub[^\n]*\(relevance: ([\d.]+)\)/.exec(text)?.[1];
+
+        const full = relevanceOf(priv.handleDiscover("github issues", undefined).content[0].text);
+        const focused = relevanceOf(priv.handleDiscover("github issues", "gh").content[0].text);
+        expect(full).toBeDefined();
+        expect(focused).toBe(full);
+      });
+
       it("names a bundles.json warning above the listing", () => {
         // A server whose config was partly thrown away renders with the same
         // [ready] marker as a healthy one, so the model reads a confident
@@ -2518,11 +2541,27 @@ describe("ConnectServer", () => {
         expect(text).toContain("Profile: /h/.yaw-mcp/config.json");
         expect(text).toContain("block tools: gh_delete_repo, pg_drop_*");
       });
+
+      it("labels a denied tool [blocked] in a loaded server's tools line", () => {
+        const priv = getPrivate(server);
+        priv.profile = { path: "/h/.yaw-mcp/config.json", blockedTools: ["gh_delete_repo"] };
+        priv.connections.set("gh", makeConnection("gh", ["create_issue", "delete_repo"]));
+
+        const text = priv.handleHealth().content[0].text;
+        expect(text).toContain("tools: 2 — create_issue, delete_repo [blocked]");
+      });
     });
 
     describe("cross-session reliability block", () => {
+      // The block lists only INSTALLED namespaces, so each case installs the
+      // ones it seeds learning for.
+      const install = (priv: ReturnType<typeof getPrivate>, ...namespaces: string[]) => {
+        priv.config = makeConfig(namespaces.map((namespace, i) => makeServerConfig({ id: String(i), namespace })));
+      };
+
       it("surfaces a flaky dormant namespace from persisted learning", () => {
         const priv = getPrivate(server);
+        install(priv, "flaky");
         priv.learning.loadSnapshot({
           flaky: { dispatched: 10, succeeded: 5, lastUsedAt: Date.now() - 60_000 },
         });
@@ -2533,11 +2572,52 @@ describe("ConnectServer", () => {
         expect(text).toContain("flaky — 10 calls, 50% success, last used");
       });
 
+      it("omits a flaky namespace that is no longer installed", () => {
+        // Learning persists across restarts and nothing prunes it on load, so
+        // a server removed from bundles.json still has a row. Listing it as
+        // "dormant" would invite the model to reload something activate
+        // cannot find.
+        const priv = getPrivate(server);
+        install(priv, "kept");
+        priv.learning.loadSnapshot({
+          kept: { dispatched: 10, succeeded: 5, lastUsedAt: Date.now() },
+          removed: { dispatched: 10, succeeded: 1, lastUsedAt: Date.now() },
+        });
+
+        const text = priv.handleHealth().content[0].text;
+        expect(text).toContain("kept — 10 calls");
+        expect(text).not.toContain("removed");
+      });
+
+      it("omits a flaky namespace that is disabled or profile-blocked", () => {
+        // Still in bundles.json, but activate refuses both, so neither is a
+        // dormant server the model may reload. The block reads the same
+        // getProfiledActiveServers set discover filters pack history on.
+        const priv = getPrivate(server);
+        priv.config = makeConfig([
+          makeServerConfig({ id: "0", namespace: "kept" }),
+          makeServerConfig({ id: "1", namespace: "off", isActive: false }),
+          makeServerConfig({ id: "2", namespace: "denied" }),
+        ]);
+        priv.profile = { path: "/p/.yaw-mcp/config.json", blocked: ["denied"] };
+        priv.learning.loadSnapshot({
+          kept: { dispatched: 10, succeeded: 5, lastUsedAt: Date.now() },
+          off: { dispatched: 10, succeeded: 1, lastUsedAt: Date.now() },
+          denied: { dispatched: 10, succeeded: 1, lastUsedAt: Date.now() },
+        });
+
+        const text = priv.handleHealth().content[0].text;
+        expect(text).toContain("kept — 10 calls");
+        expect(text).not.toContain("off — ");
+        expect(text).not.toContain("denied — ");
+      });
+
       it("skips namespaces currently loaded (in-session block covers them)", () => {
         const priv = getPrivate(server);
         const conn = makeConnection("gh");
         conn.health = { totalCalls: 10, errorCount: 5, totalLatencyMs: 100, ...ZERO_BYTES };
         priv.connections.set("gh", conn);
+        install(priv, "gh");
         priv.learning.loadSnapshot({
           gh: { dispatched: 10, succeeded: 5, lastUsedAt: Date.now() },
         });
@@ -2548,6 +2628,7 @@ describe("ConnectServer", () => {
 
       it("skips namespaces with fewer than 3 dispatches", () => {
         const priv = getPrivate(server);
+        install(priv, "rare");
         priv.learning.loadSnapshot({
           rare: { dispatched: 2, succeeded: 0, lastUsedAt: Date.now() },
         });
@@ -2558,6 +2639,7 @@ describe("ConnectServer", () => {
 
       it("skips namespaces at or above 80% success", () => {
         const priv = getPrivate(server);
+        install(priv, "solid", "perfect");
         priv.learning.loadSnapshot({
           solid: { dispatched: 10, succeeded: 9, lastUsedAt: Date.now() },
           perfect: { dispatched: 5, succeeded: 5, lastUsedAt: Date.now() },
@@ -2569,6 +2651,7 @@ describe("ConnectServer", () => {
 
       it("sorts worst success rate first, then highest dispatched, then alpha", () => {
         const priv = getPrivate(server);
+        install(priv, "zeta", "alpha", "worst", "bbb", "aaa");
         priv.learning.loadSnapshot({
           zeta: { dispatched: 10, succeeded: 5, lastUsedAt: Date.now() },
           alpha: { dispatched: 20, succeeded: 10, lastUsedAt: Date.now() },
@@ -2604,6 +2687,7 @@ describe("ConnectServer", () => {
         for (let i = 0; i < 8; i++) {
           snapshot[`ns${i}`] = { dispatched: 10, succeeded: 5, lastUsedAt: Date.now() };
         }
+        install(priv, ...Object.keys(snapshot));
         priv.learning.loadSnapshot(snapshot);
 
         const result = priv.handleHealth();
@@ -2718,8 +2802,10 @@ describe("ConnectServer", () => {
       const text = result.content[0].text;
       expect(text).toContain("Recurring packs");
       expect(text).toContain("seen 2x");
-      // Both namespaces appear, ready-to-run namespaces=["..","..."] verbatim.
-      expect(text).toMatch(/namespaces=\[.*"gh".*"linear".*\]|namespaces=\[.*"linear".*"gh".*\]/);
+      // Both namespaces appear in a ready-to-run call, in the `servers` shape
+      // activate actually reads (a `namespaces=` key resolves to nothing).
+      expect(text).toMatch(/mcp_connect_activate\(\{ servers: \[("gh","linear"|"linear","gh")\] \}\)/);
+      expect(text).not.toContain("namespaces=");
     });
 
     it("omits the block when every pack is already fully loaded", async () => {
@@ -3803,6 +3889,11 @@ describe("ConnectServer", () => {
 
     it("routes meta-tool suggest and lists detected packs ranked by frequency", async () => {
       const priv = getPrivate(server);
+      // suggest lists only packs activate can satisfy, so both are installed.
+      priv.config = makeConfig([
+        makeServerConfig({ id: "0", namespace: "gh" }),
+        makeServerConfig({ id: "1", namespace: "linear" }),
+      ]);
       const t0 = 1_000_000;
       // Seed two bursts that each contain {gh, linear}
       priv.packDetector.recordCall("gh", "a", t0);
@@ -3817,13 +3908,53 @@ describe("ConnectServer", () => {
       expect(text).toContain("gh");
       expect(text).toContain("linear");
       expect(text).toContain("seen 2 times");
-      // Must nudge toward `activate` (the loading meta-tool) and embed
-      // the concrete namespaces from the top pack so the caller can run
-      // it verbatim. `dispatch` is for invoking tools on already-active
-      // servers — suggesting it here mis-directs the model.
+      // Must nudge toward `activate` and embed each pack's concrete
+      // namespaces, in the `servers` shape activate reads, so the caller can
+      // run it verbatim. `dispatch` picks servers by intent; for a known
+      // namespace set it is the indirect call, so it must not appear here.
       expect(text).toContain("mcp_connect_activate");
       expect(text).not.toContain("mcp_connect_dispatch");
-      expect(text).toMatch(/namespaces=\[.*"gh".*"linear".*\]|namespaces=\[.*"linear".*"gh".*\]/);
+      expect(text).toMatch(/mcp_connect_activate\(\{ servers: \[("gh","linear"|"linear","gh")\] \}\)/);
+      expect(text).not.toContain("namespaces=");
+    });
+
+    it("suggest drops a pack that names a server activate cannot load", async () => {
+      // Pack history persists across restarts, so a pack can outlive one of
+      // its servers. A ready-to-run call naming "gone" would be refused.
+      const priv = getPrivate(server);
+      priv.config = makeConfig([
+        makeServerConfig({ id: "0", namespace: "gh" }),
+        makeServerConfig({ id: "1", namespace: "linear" }),
+        makeServerConfig({ id: "2", namespace: "off", isActive: false }),
+      ]);
+      const t0 = 1_000_000;
+      for (const [i, peer] of ["linear", "gone", "off"].entries()) {
+        for (const rep of [0, 1]) {
+          const at = t0 + i * 60 * 60_000 + rep * 5 * 60_000;
+          priv.packDetector.recordCall("gh", "a", at);
+          priv.packDetector.recordCall(peer, "b", at + 1_000);
+        }
+      }
+
+      const text = (await priv.handleToolCall("mcp_connect_suggest", {})).content[0].text;
+      expect(text).toContain("Detected 1 recurring server pack");
+      expect(text).toMatch(/servers: \[("gh","linear"|"linear","gh")\]/);
+      expect(text).not.toContain("gone");
+      expect(text).not.toContain('"off"');
+    });
+
+    it("suggest says so when every pack names a server activate cannot load", async () => {
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ id: "0", namespace: "gh" })]);
+      const t0 = 1_000_000;
+      priv.packDetector.recordCall("gh", "a", t0);
+      priv.packDetector.recordCall("gone", "b", t0 + 1_000);
+      priv.packDetector.recordCall("gh", "c", t0 + 5 * 60_000);
+      priv.packDetector.recordCall("gone", "d", t0 + 5 * 60_000 + 1_000);
+
+      const text = (await priv.handleToolCall("mcp_connect_suggest", {})).content[0].text;
+      expect(text).toContain("No recurring multi-server patterns among the servers you can activate now");
+      expect(text).not.toContain("mcp_connect_activate");
     });
 
     it("routes meta-tool bundles and separates ready vs partial against installed servers", async () => {
@@ -9834,6 +9965,35 @@ describe("find_tool", () => {
     priv.config = makeConfig([cold("gh", many)]);
     const text = (await priv.handleToolCall("mcp_connect_find_tool", { query: "issue", limit: 9999 })).content[0].text;
     expect(text).toContain("(50 of 80)");
+    // Raising `limit` past the cap is clamped back to this page, so the tail
+    // must not tell the model to do exactly that.
+    expect(text).toContain("30 more match; narrow the query (limit is capped at 50).");
+    expect(text).not.toContain('raise "limit"');
+  });
+
+  it("labels a blockedTools-denied hit [blocked] and never points at it as usable", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([
+      cold("gh", [{ name: "delete_issue", description: "Delete an issue" }]),
+      cold("linear", [{ name: "issue_create", description: "Create an issue" }]),
+    ]);
+    priv.profile = { path: "/h/.yaw-mcp/config.json", blockedTools: ["gh_delete_*"] };
+    const text = (await priv.handleToolCall("mcp_connect_find_tool", { query: "issue" })).content[0].text;
+    expect(text).toContain("gh_delete_issue [blocked]");
+    expect(text).not.toContain('activate "gh"');
+    expect(text).toContain('To use one: mcp_connect_activate with server "linear".');
+    expect(text).not.toContain('server "gh"');
+  });
+
+  it("says every match is blocked rather than naming a server to activate", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([cold("gh", [{ name: "delete_issue", description: "Delete an issue" }])]);
+    priv.profile = { path: "/h/.yaw-mcp/config.json", blockedTools: ["gh_delete_issue"] };
+    const text = (await priv.handleToolCall("mcp_connect_find_tool", { query: "delete issue" })).content[0].text;
+    expect(text).toContain("gh_delete_issue [blocked]");
+    expect(text).not.toContain("schema not loaded");
+    expect(text).not.toContain("mcp_connect_activate");
+    expect(text).toContain('blocked by the profile\'s "blockedTools" list');
   });
 
   it("clamps a zero or negative limit up to one", async () => {

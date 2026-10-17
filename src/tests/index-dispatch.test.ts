@@ -522,6 +522,7 @@ describe("--help environment variable coverage", () => {
 
     const srcDir = fileURLToPath(new URL("../", import.meta.url));
     const read: string[] = [];
+    const helperReads: string[] = [];
     for (const entry of readdirSync(srcDir, { recursive: true })) {
       const rel = String(entry);
       if (!rel.endsWith(".ts") || rel.includes("tests")) continue;
@@ -536,13 +537,41 @@ describe("--help environment variable coverage", () => {
       const code = text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
       for (const m of code.matchAll(/process\.env\.([A-Z_]+)/g)) read.push(m[1]);
       for (const m of code.matchAll(/env\["([A-Z_]+)"\]/g)) read.push(m[1]);
+      // The shared parsers in opt-out-env.ts take the variable NAME as their
+      // first argument, so a knob read through them never spells
+      // `process.env.X`. Match the call, with the name either as a literal
+      // (`isFeatureEnabled("YAW_MCP_FOUNDRY")`) or as a module const
+      // (`isFeatureEnabled(STDIO_OVERRIDE_ENV, env)`), resolved against this
+      // file's `const NAME = "LITERAL"` declarations.
+      const consts = new Map<string, string>();
+      for (const m of code.matchAll(/\bconst\s+([A-Z][A-Z0-9_]*)\s*=\s*"([A-Z][A-Z0-9_]*)"/g)) consts.set(m[1], m[2]);
+      for (const m of code.matchAll(
+        /\b(?:isFeatureEnabled|isFeatureDisabled|resolveNonNegativeIntEnv)\(\s*(?:"([A-Z][A-Z0-9_]*)"|([A-Z][A-Z0-9_]*)\b)/g,
+      )) {
+        const name = m[1] ?? consts.get(m[2]);
+        // An identifier that is not a same-file string const is a scan miss,
+        // not a knob: fail loudly rather than silently dropping the read.
+        expect(name, `${rel}: helper call names ${m[2]}, which is not a same-file string const`).toBeDefined();
+        if (name === undefined) continue;
+        // server.ts's resolveIdleThreshold hands the helper a synthetic
+        // one-key env ({ IDLE_THRESHOLD: raw }) after choosing between the
+        // two real names, which process.env reads above already record.
+        if (name === "IDLE_THRESHOLD") continue;
+        read.push(name);
+        helperReads.push(name);
+      }
     }
-    // Only the literal-name reads are visible to a regex; a handful of knobs
-    // are reached through a const (paths.ts's ALLOW_UNOWNED_ENV) or a
-    // destructured `env` param, so this is a floor on coverage, not a
-    // census. The floor is still the thing that was missing.
+    // Literal-name reads plus the opt-out-env.ts helper calls; a knob reached
+    // through a destructured `env` param is still invisible, so this is a
+    // floor on coverage, not a full census. The floors are the thing that was
+    // missing, and each shape has its own so one regex rotting cannot hide
+    // behind the other's count.
+    expect(
+      new Set(helperReads).size,
+      "the helper-call scan found almost nothing -- isFeatureEnabled/isFeatureDisabled/resolveNonNegativeIntEnv calls stopped matching",
+    ).toBeGreaterThan(10);
     const knobs = [...new Set(read)].filter((n) => !UNDOCUMENTED_INTERNAL_ENV.has(n)).sort();
-    expect(knobs.length, "the scan found almost nothing -- the regexes stopped matching").toBeGreaterThan(10);
+    expect(knobs.length, "the scan found almost nothing -- the regexes stopped matching").toBeGreaterThan(20);
     const missing = knobs.filter((n) => !envBlock.includes(n));
     expect(missing, "read by shipped code, absent from the --help Environment variables block").toEqual([]);
   });

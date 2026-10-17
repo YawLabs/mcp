@@ -48,7 +48,8 @@ const ESC = "\x1b"; // opens a key sequence (arrow, Alt chord) -- never input
  *
  *  A no-echo read that cannot enter raw mode resolves NO_ECHO without
  *  writing the prompt or reading a byte. An echo read carries on
- *  line-buffered: its answer was going to be shown anyway.
+ *  line-buffered: its answer was going to be shown anyway, and the terminal
+ *  echoes it there, so the reader writes nothing back but the prompt.
  *
  *  `keepTab` (no-echo reads only) buffers a Tab instead of dropping it with
  *  the other control bytes; only the secret-value prompt sets it -- see the
@@ -94,13 +95,18 @@ export function readLineFromTTY(
       resolve(NO_ECHO);
       return;
     }
+    // Write typed bytes back (and the closing newline) only in raw mode. On
+    // the cooked fallback the terminal's line discipline has already echoed
+    // every keystroke and the Enter before the line reaches us, so echoing
+    // again showed the answer twice.
+    const echoBack = echo && raw;
     stdout.write(prompt);
     stdin.resume();
     stdin.setEncoding("utf8");
     // Single teardown path: detach the listener, restore the previous raw
     // mode, pause stdin, then settle. Every exit from onData goes through it.
     const finish = (value: string | Cancelled): void => {
-      stdout.write("\n");
+      if (raw) stdout.write("\n");
       stdin.removeListener("data", onData);
       try {
         stdin.setRawMode?.(wasRaw);
@@ -187,7 +193,7 @@ export function readLineFromTTY(
         if (ch === "\b" || ch === DEL) {
           if (chunks.length > 0) {
             chunks.pop();
-            if (echo) stdout.write("\b \b");
+            if (echoBack) stdout.write("\b \b");
           }
           continue;
         }
@@ -204,7 +210,7 @@ export function readLineFromTTY(
         // now would stop the same keystrokes opening that vault.
         if (ch < " " && !(keepTab && ch === TAB)) continue;
         chunks.push(ch);
-        if (echo) stdout.write(ch);
+        if (echoBack) stdout.write(ch);
       }
     }
     stdin.on("data", onData);

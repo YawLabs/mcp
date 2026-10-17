@@ -55,7 +55,9 @@ function displayPath(base: PathBase, segments: readonly string[]): string {
  *  absolute path and the display segments naming it, so the two cannot drift.
  *
  *  Linux hardcodes `~/.config` rather than honouring $XDG_CONFIG_HOME -- the
- *  same rule, and the same known gap, as the existing vscode row's user path. */
+ *  same rule, and the same known gap, as the existing vscode row's user path.
+ *  The value is already threaded as `base.env.xdgConfigHome` (the Zed row
+ *  reads it); this function just does not consult it. */
 function editorRoot(base: PathBase, dirName: string): { dir: string; display: string[] } {
   if (base.os === "windows") return { dir: join(base.appData, dirName), display: ["%APPDATA%", dirName] };
   if (base.os === "macos") {

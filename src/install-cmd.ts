@@ -11,7 +11,8 @@
 // `permissions.allow` patch in its settings.json.
 //
 // The key is `mcp`, NOT `yaw-mcp`: that spelling is a LEGACY_ENTRY_NAME now,
-// detected only to nudge the user into deleting it. Anything keying off this
+// detected and removed in the same write as the new entry unless
+// `--keep-legacy` is passed. Anything keying off this
 // file's behaviour (a migration, an external doctor check) must read `mcp`.
 //
 // ~/.yaw-mcp/config.json is NO LONGER written by install. It existed to carry
@@ -323,9 +324,9 @@ function oamIsAbsent(probe: OamProbe): boolean {
 export type BundlesState = "servers" | "empty" | "unreadable";
 export interface BundlesSummary {
   state: BundlesState;
-  /** Validated servers the loader would serve. Counts disabled entries too,
-   *  matching `yaw-mcp list` so the two surfaces cannot disagree about how
-   *  many servers a machine has. */
+  /** Validated, ENABLED servers (isActive !== false) -- the set the broker
+   *  actually serves. `yaw-mcp list` counts every entry, disabled ones
+   *  included, so the two numbers differ by one per disabled server. */
   count: number;
   /** The file the count came from, or -- when neither file exists -- the file
    *  `yaw-mcp add` would create. The empty-state line has to name where the
@@ -2257,32 +2258,15 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   return { written, wouldWrite: [], messages, exitCode: 0 };
 }
 
-/** Read `settings.json` (or settings.local.json) for the given scope,
- *  compute the next version with the yaw-mcp allow-pattern unioned into
- *  `permissions.allow` (or dropped from it, under `op: "remove"`), and return
- *  both the path and the rendered JSON.
- *  Returns `changed: false` when the pattern is already present (or already
- *  absent) — caller can skip the write entirely. Returns null for scopes that
- *  have no corresponding settings file. Malformed or non-object existing files
- *  are left untouched (changed: false, malformed: true, malformedReason set);
- *  the caller emits a warning so the skip isn't silent. Every non-null result
- *  carries the file's `fingerprint` from BEFORE the read, for the caller to
- *  compare again ahead of its write (see the settings patch in runInstall).
- *
- *  `op` is a parameter rather than a second function because everything AROUND
- *  the one-line transform -- the fingerprint-before-read discipline, the
- *  malformed/non-object reporting, the `permissions`-is-not-an-object
- *  pre-empt, the comment-preserving splice of exactly the `allow` node -- is
- *  delicate and had to be identical on both sides. `uninstall` copying it
- *  would have been a second place for that reasoning to drift. */
 /** The Claude Code `permissions.allow` grant moved to claude-code-settings.ts
  *  when the splice changed from replacing the whole array to editing its one
  *  member (a comment inside the list used to be deleted by every install and
  *  every uninstall). Re-exported here because the tests that pin the merge and
  *  the removal import them from this module.
  *
- *  `prepareClaudeCodeSettingsPatch` is imported, not re-exported: nothing
- *  outside this file calls it. */
+ *  `prepareClaudeCodeSettingsPatch` is imported, not re-exported from here
+ *  (or from install-targets.ts): its tests import it from
+ *  claude-code-settings.ts, where its documentation lives. */
 export { mergePermissionsAllow, removePermissionsAllow } from "./claude-code-settings.js";
 
 /** One `permissions.allow` patch, with the CLAUDE_CONFIG_DIR its file was
@@ -3468,11 +3452,11 @@ async function runInstallAll(
       deferCollisionHint: true,
       clientId: plan.clientId,
       scope: plan.scope,
-      // Only the plans whose scope actually resolves a path from --project-dir
-      // get it. runInstall refuses the flag for a scope that would drop it, so
-      // passing the parent's copy to every client would fail each user-scope
-      // one the moment --project-dir was passed to pull the project-only
-      // client (vscode) into the run.
+      // The CLI refuses --all --project-dir, so this is undefined from the
+      // command line; it is kept for a direct runInstall({ all, projectDir })
+      // and for a user scope that comes to need a project dir
+      // (usesProjectDir is derived from the scope spec). runInstall refuses
+      // the flag for a scope that would drop it, hence the per-plan gate.
       projectDir: plan.usesProjectDir ? opts.projectDir : undefined,
     });
     // ONCE per file, first-seen order. Two rows can share a file -- Claude
@@ -4223,8 +4207,8 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
   if (read.kind === "malformed") {
     err(
       read.reason === "root"
-        ? `yaw-mcp uninstall: ${resolved.absolute} is not a ${read.syntax} object -- refusing to edit. Remove the "${ENTRY_NAME}" entry by hand.`
-        : `yaw-mcp uninstall: ${resolved.absolute} is not valid ${read.syntax} (${read.detail}). Refusing to edit. Fix the file and re-run.`,
+        ? `yaw-mcp uninstall: ${resolved.absolute} is not a ${read.syntax} object -- refusing to edit it; ${unparseableConfigFix("re-run", read.syntax)}.`
+        : `yaw-mcp uninstall: ${resolved.absolute} is not valid ${read.syntax} (${read.detail}) -- refusing to edit it; ${unparseableConfigFix("re-run", read.syntax)}.`,
     );
     return { written: [], wouldWrite: [], messages, exitCode: 1 };
   }
@@ -4719,7 +4703,7 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
   // Names what was NOT touched on purpose: `uninstall` unwires a client, it
   // does not delete the user's servers. Without this line the obvious reading
   // of "uninstall" is that bundles.json went with it.
-  log(uninstallDoneLine(target, resolved.display));
+  log(uninstallDoneLine(target, resolved.display, scope, projectDir));
   return { written, wouldWrite: [], messages, exitCode: 0 };
 }
 
@@ -4734,7 +4718,12 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
  *  its "no longer launches" is scoped to the file the entry left and the note
  *  follows -- an unscoped claim there would be the false all-clear this line
  *  must not print. */
-function uninstallDoneLine(target: InstallTarget, display: string): string {
+function uninstallDoneLine(
+  target: InstallTarget,
+  display: string,
+  scope: InstallScope,
+  projectDir: string | undefined,
+): string {
   const note = target.uninstallNote;
   const head =
     note === undefined
@@ -4743,9 +4732,22 @@ function uninstallDoneLine(target: InstallTarget, display: string): string {
   return (
     `\nDone: ${head} ${reloadRemovalClause(target.reload, target.label)}${note === undefined ? "" : ` ${note}`} ` +
     "Your servers in ~/.yaw-mcp/bundles.json are untouched -- `yaw-mcp install " +
-    `${target.clientId}` +
+    `${target.clientId}${reinstallScopeFlags(target, scope, projectDir)}` +
     "` wires it back."
   );
+}
+
+/** The flags that make `yaw-mcp install <client>` write the scope uninstall
+ *  just emptied. A bare install resolves the row's default (user when the row
+ *  has one, resolveInstallSite), so any other scope names itself, and a scope
+ *  that reads a project directory names the one it resolved -- without them a
+ *  `--scope project` uninstall would advertise a command that wires the user
+ *  scope into a different file. Same shape as yawFreshPaneNote's scopeFlags. */
+function reinstallScopeFlags(target: InstallTarget, scope: InstallScope, projectDir: string | undefined): string {
+  const bareDefault: InstallScope = target.scopes.some((s) => s.scope === "user") ? "user" : target.scopes[0].scope;
+  if (scope === bareDefault && projectDir === undefined) return "";
+  const projectFlag = projectDir === undefined ? "" : ` --project-dir ${quoteArgForDisplay(projectDir) ?? projectDir}`;
+  return ` --scope ${scope}${projectFlag}`;
 }
 
 /** What uninstall says about the row's top-level defaults

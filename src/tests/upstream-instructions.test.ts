@@ -82,6 +82,50 @@ describe("sanitizeUpstreamInstructions", () => {
     expect(clean).toBe("safetextreversed");
   });
 
+  it("strips every format character, including the astral TAG block, and the non-format invisibles", () => {
+    // The TAG block (E0001, E0020-E007F) is the standard way to smuggle
+    // invisible ASCII to a model: "\u{E0069}\u{E0067}..." renders as nothing
+    // and reads as "ig...". It sits above FFFF, so only a `u`-flag expression
+    // can name it. Soft hyphen, ALM, the Mongolian vowel separator and the
+    // interlinear annotation anchors are format characters too; the combining
+    // grapheme joiner, the Hangul fillers, the variation selectors (BMP and
+    // astral), the Mongolian free variation selectors, the Khmer inherent
+    // vowels and the Braille blank are invisible without being Cf.
+    const hidden = [
+      "\u{E0001}",
+      "\u{E0041}",
+      "\u{E007F}",
+      "\u{00AD}",
+      "\u{061C}",
+      "\u{180E}",
+      "\u{FFF9}",
+      "\u{FFFA}",
+      "\u{FFFB}",
+      "\u{034F}",
+      "\u{115F}",
+      "\u{1160}",
+      "\u{3164}",
+      "\u{FFA0}",
+      "\u{2066}",
+      "\u{206F}",
+      "\u{FEFF}",
+      "\u{FE00}",
+      "\u{FE0F}",
+      "\u{E0100}",
+      "\u{E01EF}",
+      "\u{180B}",
+      "\u{180F}",
+      "\u{17B4}",
+      "\u{17B5}",
+      "\u{2800}",
+    ];
+    for (const ch of hidden) {
+      expect(sanitizeUpstreamInstructions(`a${ch}b`), `U+${ch.codePointAt(0)?.toString(16)}`).toBe("ab");
+    }
+    // Tab and newline survive the strip.
+    expect(sanitizeUpstreamInstructions("a\tb\nc")).toBe("a\tb\nc");
+  });
+
   it("catches a delimiter that was split by a zero-width character", () => {
     // Order is the point: hidden characters are stripped BEFORE the markers
     // are matched. Strip second and this forged delimiter reassembles into a

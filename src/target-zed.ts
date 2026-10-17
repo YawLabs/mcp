@@ -96,7 +96,7 @@ export const ZED_TARGET = defineTarget({
     carry: carryZedFields,
   },
   notes:
-    "Zed reads context_servers from settings.json, which allows // comments and trailing commas, and starts, restarts or stops servers when the file is saved -- no restart needed. On Linux the path follows $XDG_CONFIG_HOME when it is set; the Flatpak build reads $FLATPAK_XDG_CONFIG_HOME/zed/settings.json instead, which install does not follow. Zed ignores a project's .zed/settings.json until you trust the project. Needs Zed v0.214.5 (2025-11-26) or newer: earlier versions reject this entry shape.",
+    "Zed reads context_servers from settings.json, which allows // comments and trailing commas, and starts, restarts or stops servers when the file is saved -- no restart needed. On Linux the path follows an absolute $XDG_CONFIG_HOME (Zed ignores a relative one, and so does install); the Flatpak build reads $FLATPAK_XDG_CONFIG_HOME/zed/settings.json instead, which install does not follow. Zed ignores a project's .zed/settings.json until you trust the project. Needs Zed v0.214.5 (2025-11-26) or newer: earlier versions reject this entry shape.",
   resolvePath: resolveZedPath,
   scopes: [
     // User FIRST, like every other multi-scope row: the probe walks this array

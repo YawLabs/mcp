@@ -23,23 +23,19 @@
 // back. Deliberate, and brief; a user who needs the process count itself
 // bounded turns pre-warm off with YAW_MCP_PREWARM=0.
 
+import { resolveNonNegativeIntEnv } from "./opt-out-env.js";
+
 export const DEFAULT_SERVER_CAP = 6;
 
 // 0 disables the cap entirely (for ops/tests); any positive integer
 // overrides the default. Invalid values fall back to the default
 // rather than erroring — a typo in env shouldn't brick activations.
 export function resolveServerCap(env: NodeJS.ProcessEnv = process.env): number {
-  const raw = env.YAW_MCP_SERVER_CAP;
-  if (raw === undefined || raw === "") return DEFAULT_SERVER_CAP;
-  // Strict digit-run parse. parseInt's prefix parsing would turn "0x10",
-  // "0.5", and "0abc" into 0 -- the disable-the-cap sentinel -- and "1e2"
-  // into 1, so a malformed value could silently REMOVE or shrink the
+  // Strict digit-run parse (opt-out-env.ts). parseInt's prefix parsing would
+  // turn "0x10", "0.5", and "0abc" into 0 -- the disable-the-cap sentinel --
+  // and "1e2" into 1, so a malformed value could silently REMOVE or shrink the
   // ceiling instead of falling back to the default as promised above.
-  const trimmed = raw.trim();
-  if (!/^\d+$/.test(trimmed)) return DEFAULT_SERVER_CAP;
-  const n = Number.parseInt(trimmed, 10);
-  if (!Number.isFinite(n)) return DEFAULT_SERVER_CAP;
-  return n;
+  return resolveNonNegativeIntEnv("YAW_MCP_SERVER_CAP", DEFAULT_SERVER_CAP, env);
 }
 
 // Token ceiling across every loaded server's advertised tool surface.
@@ -55,16 +51,10 @@ export function resolveServerCap(env: NodeJS.ProcessEnv = process.env): number {
 export const DEFAULT_TOOL_TOKEN_CAP = 0;
 
 export function resolveToolTokenCap(env: NodeJS.ProcessEnv = process.env): number {
-  const raw = env.YAW_MCP_TOOL_TOKEN_CAP;
-  if (raw === undefined || raw === "") return DEFAULT_TOOL_TOKEN_CAP;
   // Same strict digit-run parse as resolveServerCap, for the same reason:
   // parseInt's prefix parsing turns "0x2000" and "0abc" into 0, which is the
   // DISABLE sentinel here too, so a typo would silently remove the ceiling.
-  const trimmed = raw.trim();
-  if (!/^\d+$/.test(trimmed)) return DEFAULT_TOOL_TOKEN_CAP;
-  const n = Number.parseInt(trimmed, 10);
-  if (!Number.isFinite(n)) return DEFAULT_TOOL_TOKEN_CAP;
-  return n;
+  return resolveNonNegativeIntEnv("YAW_MCP_TOOL_TOKEN_CAP", DEFAULT_TOOL_TOKEN_CAP, env);
 }
 
 export interface LoadedSlot {

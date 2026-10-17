@@ -38,6 +38,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { quoteArgForDisplay } from "../auto-upgrade.js";
 import { yawModeOverlay } from "../claude-code-settings.js";
 import { clientChoices } from "../client-aliases.js";
 import { reloadDoneClause, reloadRemovalClause } from "../client-config.js";
@@ -1338,9 +1339,15 @@ describe("the Done lines speak to typed, and to no other row", () => {
           io: capU.io,
         });
         expect(removed.exitCode, `${what}: ${capU.stderr()}`).toBe(0);
+        // The reinstall hint names the scope it just emptied (and the project
+        // it resolved): a bare `install <client>` writes the user scope.
+        const reinstallFlags =
+          spec.scope === "user"
+            ? ""
+            : ` --scope ${spec.scope}${projectDir === undefined ? "" : ` --project-dir ${quoteArgForDisplay(projectDir) ?? projectDir}`}`;
         expect(doneLine(capU.stdout()), what).toBe(
           `Done: ${t.label} no longer launches yaw-mcp. Restart it to drop the server. Your servers in ` +
-            `~/.yaw-mcp/bundles.json are untouched -- \`yaw-mcp install ${t.clientId}\` wires it back.`,
+            `~/.yaw-mcp/bundles.json are untouched -- \`yaw-mcp install ${t.clientId}${reinstallFlags}\` wires it back.`,
         );
         checked++;
       }

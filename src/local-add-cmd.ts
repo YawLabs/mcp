@@ -31,12 +31,14 @@ import {
   deriveNamespace,
   findShadowingProjectBundles,
   formatBundleCollision,
+  HTTP_HEADER_NAME_RE,
   isRemoteEntry,
   type LaunchChange,
   loadLocalBundles,
   localBundlesPath,
   namespacesForStoredIdentity,
   previewUpsertUserBundle,
+  RESERVED_HEADER_NAMES,
   removeUserBundle,
   STORED_TARGET_RE,
   type UpsertOrigin,
@@ -148,11 +150,6 @@ function parseEnvFlag(v: string | undefined, bag: Record<string, string>): strin
   return null;
 }
 
-/** RFC 7230 field-name: no spaces, no colon, no control bytes. Enforced so a
- *  typo cannot produce an entry that fails opaquely at connect time, and so a
- *  newline can never be smuggled into a header name. */
-const HEADER_NAME_RE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/;
-
 /** `--header "Authorization: Bearer x"`. Split on the FIRST colon only: a
  *  value legitimately contains colons (a URL, a `Bearer` blob), and splitting
  *  greedily would truncate them. */
@@ -162,7 +159,15 @@ function parseHeaderFlag(v: string | undefined, bag: Record<string, string>): st
   if (colon <= 0) return `--header: expected "Name: value", got ${JSON.stringify(v)}`;
   const name = v.slice(0, colon).trim();
   const value = v.slice(colon + 1).trim();
-  if (!HEADER_NAME_RE.test(name)) return `--header: invalid header name ${JSON.stringify(name)}`;
+  // The loader's own name rule and reserved set (local-bundles.ts), not a
+  // private copy: a name the loader drops on every load must be refused here,
+  // while the user is still looking at the command, rather than written and
+  // reported as configured. RFC 7230 field-name: no spaces, no colon, no
+  // control bytes, so a newline can never be smuggled into a header name.
+  if (!HTTP_HEADER_NAME_RE.test(name)) return `--header: invalid header name ${JSON.stringify(name)}`;
+  if (RESERVED_HEADER_NAMES.has(name.toLowerCase())) {
+    return `--header: ${name} is set by the MCP transport and cannot be overridden`;
+  }
   // A blank value is refused rather than dropped: silently omitting the header
   // the user just asked for would send an unauthenticated request and leave
   // them reading a 401 with no sign their flag did nothing.
@@ -407,11 +412,6 @@ function renderEnvKeys(env: Record<string, string>, optionalKeys: string[]): str
     .join(", ");
 }
 
-/** The two stderr notes that follow a write -- in the conditional voice for a
- *  dry run. The preview's stated purpose is to describe the run it previews,
- *  and it used to return before either note, so `add --dry-run` said nothing
- *  about the ambient var the server would depend on, nor about the project
- *  file that would shadow the write. stderr so both survive --json. */
 /** What this entry's ${secret:...} references will do at spawn or connect:
  *  which names the vault does not hold, and which spans do not parse at all.
  *
@@ -448,6 +448,11 @@ async function danglingSecretRefs(
   }
 }
 
+/** The stderr notes that follow a write -- in the conditional voice for a
+ *  dry run. The preview's stated purpose is to describe the run it previews,
+ *  and it used to return before any note, so `add --dry-run` said nothing
+ *  about the ambient var the server would depend on, nor about the project
+ *  file that would shadow the write. stderr so every note survives --json. */
 async function printPostWriteNotes(
   printErr: (s: string) => void,
   opts: {
@@ -1438,7 +1443,7 @@ export async function runRemove(opts: RemoveCommandOptions): Promise<AddCommandR
     const shadow = await findShadowingProjectBundles(cwd, home, env).catch(() => null);
     if (shadow) {
       printErr(
-        `Note: a project-local ${shadow} is in effect; \`remove\` only manages your user-global bundles.json, so a server defined there must be removed from that file directly.`,
+        `Note: a project-local ${displaySafe(shadow)} is in effect; \`remove\` only manages your user-global bundles.json, so a server defined there must be removed from that file directly.`,
       );
     }
     return { exitCode: 0, written: [] };
@@ -1452,7 +1457,7 @@ export async function runRemove(opts: RemoveCommandOptions): Promise<AddCommandR
   const shadow = await findShadowingProjectBundles(cwd, home, env).catch(() => null);
   if (shadow) {
     printErr(
-      `Note: ${shadow} shadows your user-global bundles.json; a server defined there is unaffected by this removal.`,
+      `Note: ${displaySafe(shadow)} shadows your user-global bundles.json; a server defined there is unaffected by this removal.`,
     );
   }
   return { exitCode: 0, written: [res.path] };

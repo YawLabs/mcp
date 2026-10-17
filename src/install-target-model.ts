@@ -33,7 +33,11 @@ export const CURRENT_OS: InstallOS =
 export interface ResolvedPath {
   /** Absolute path to the config file (with ~ / env vars expanded). */
   absolute: string;
-  /** Human-friendly display path with ~ / env-var form preserved. */
+  /** Human-friendly display path with ~ / env-var form preserved.
+   *  Its one runtime reader is uninstall's Done line, and only for a row that
+   *  declares `uninstallNote` (typed); `--list` re-derives a display from
+   *  `absolute` (tildePath); doctor prints `absolute` itself. Every other per-row spelling is pinned by
+   *  tests only -- keep them honest, but do not assume a surface prints them. */
   display: string;
   /** JSON key path to the mcpServers/servers container that holds the
    *  ENTRY_NAME entry. Almost always `[config.root]`, but Claude Code's
@@ -78,9 +82,10 @@ export interface LaunchEntry {
 export const ENTRY_NAME = "mcp";
 
 /** Entry keys earlier installers wrote under: the dead `mcp.hosting` / `mcph`
- *  brand and the interim `yaw-mcp` key. Doctor + install detect these so users
- *  upgrading get a visible nudge instead of silently running two parallel
- *  servers from the same client config. Nothing writes these keys anymore. */
+ *  brand and the interim `yaw-mcp` key, so a client does not silently run two
+ *  parallel servers from one config. `install` removes one in the same write
+ *  as the new entry (`--keep-legacy` opts out); doctor and `install --list`
+ *  report one that remains. Nothing writes these keys anymore. */
 export const LEGACY_ENTRY_NAMES = ["mcp.hosting", "mcph", "yaw-mcp"] as const;
 
 /** What a target's own `resolvePath` / `sites` hooks are handed: the resolved
@@ -151,8 +156,12 @@ export interface SiteSpec {
 }
 
 /** Behaviour a row opts into by NAME rather than by the consumer testing its
- *  `clientId` -- the three `clientId === "claude-code"` branches and the one
- *  `clientId === "vscode"` branch this replaces are what R6 now forbids. */
+ *  `clientId`. The "a client-id branch or an unchecked cast to a client id"
+ *  rule in client-config-boundary.test.ts forbids new clientId branches; two older ones remain allow-listed by name until each becomes
+ *  row data -- install's project-scope approval clause in the Done line
+ *  (`clientId === "claude-code" && scope === "project"`) and import's VS Code
+ *  inputs expansion (`clientId === "vscode"`, which `importVariables` below is
+ *  declared to replace but does not yet). */
 export interface TargetHooks {
   /** Patch the permission file this client reads alongside the launch entry.
    *  "claude-code" is the only scheme there is -- `permissions.allow` in
@@ -174,9 +183,13 @@ export interface TargetHooks {
    *  CLAUDE_CONFIG_DIR); it answers paths only, and the core reads each in the
    *  row's own format -- the one the client parses them with. */
   alsoReads?: (base: PathBase) => ResolvedPath[];
-  /** Which `${...}` expansion rules `import` applies to this client's entries.
-   *  BOTH handlers live in import-cmd.ts; a row only names the value.
-   *  "vscode-inputs" is the inputs-block + `${workspaceFolder}` logic. */
+  /** Which `${...}` expansion rules `import` should apply to this client's
+   *  entries. DECLARED, NOT YET READ: nothing in src/ consumes this field.
+   *  import-cmd.ts still selects the "vscode-inputs" logic (inputs block +
+   *  `${workspaceFolder}`) by `clientId === "vscode"` -- allow-listed in the
+   *  boundary test until import reads this hook instead -- and "cline-env"
+   *  has no handler at all, so a Cline `${env:NAME}` passes through import
+   *  unexpanded. */
   importVariables?: "vscode-inputs" | "cline-env";
 }
 

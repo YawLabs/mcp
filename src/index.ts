@@ -386,7 +386,7 @@ if (subcommand === "compliance") {
                              locked, and cross-session call counts. Writes
                              nothing and makes no network call, so a GUI can
                              poll it. \`--json\` is the machine-readable form.
-    doctor                   Diagnose setup: config, token, clients, learning,
+    doctor                   Diagnose setup: config, clients, learning,
                              upgrade, flaky-namespace reliability rollup.
     bundles [list|match]     Browse curated multi-server bundles. \`list\` shows
                              all; \`match\` partitions against your enabled
@@ -420,8 +420,9 @@ if (subcommand === "compliance") {
                              as \${secret:NAME}.
 
   Other:
-    compliance <target>      Run the 88-test compliance suite against an MCP
-                             server and print the grade.
+    compliance <target>      Run the compliance suite against an MCP server
+                             (88 tests on 2025-11-25, 103 on 2026-07-28) and
+                             print the grade.
     audit <namespace>        Run the compliance suite against a stdio server
                              from your bundles.json and cache its A-F grade in
                              ~/.yaw-mcp/grades.json (shown in \`list\` + the
@@ -505,11 +506,12 @@ if (subcommand === "compliance") {
     YAW_MCP_SIDECAR_REFRESH       Set to \`0\` to disable the background check
                                that keeps managed sidecars (\`yaw-mcp sidecars
                                install\`) current. When a managed tree exists,
-                               each serve start may probe the npm registry for
-                               the packages configured to float (\`@latest\` or
-                               no version) and, at most once a day, run an
-                               \`npm install\`/\`npm update\` in the sidecars
-                               root in the background. Never runs without a
+                               a serve start, at most once a day, probes the
+                               npm registry for the packages configured to
+                               float (\`@latest\` or no version) and, when one
+                               is behind, runs an \`npm install\`/\`npm update\`
+                               in the sidecars root in the background. Never
+                               runs without a
                                managed tree; explicit pins and ranges are
                                never moved (default: on).
     YAW_MCP_PRUNE_RESPONSES       Set to \`0\` to disable response pruning.

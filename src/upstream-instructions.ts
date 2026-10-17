@@ -31,8 +31,10 @@
 //   3. HIDDEN TEXT. Bidi overrides, zero-width characters and C1 controls
 //      make what a human reviews differ from what a model reads, which is the
 //      point of using them in an injection. Defence: control and format
-//      characters are stripped; of the invisible ones only tab and newline
-//      survive.
+//      characters are stripped, along with the invisible non-format
+//      characters named at HIDDEN_CHARS (variation selectors, fillers, the
+//      Braille blank); tab and newline survive. The list is the known set,
+//      not a proof that no other code point renders as nothing.
 //   4. FLOODING. A megabyte of instructions would spend the context this
 //      broker exists to conserve, and pushing the fence header far enough up
 //      the reply is itself an attack on the framing. Defence: a hard byte
@@ -91,12 +93,24 @@ const TRUNCATION_NOTICE = "\n[cut: the server sent more than the instructions ce
 
 /** Characters that let text hide from, or reorder itself for, a reader.
  *
- *  C0 controls minus tab and newline, DEL and the C1 block, then the Unicode
- *  format characters used for zero-width joins (200B-200F), bidirectional
- *  embedding and override (202A-202E), invisible operators and the word
- *  joiner (2060-2064), bidi isolates and interlinear annotation (2066-206F),
- *  and the byte-order mark (FEFF). Carriage return is dropped with the rest:
- *  it serves nothing here, and a lone one can rewrite a rendered line.
+ *  C0 controls minus tab and newline, DEL and the C1 block, then EVERY
+ *  Unicode format character (general category Cf): the zero-width joins
+ *  (200B-200F), bidirectional embedding and override (202A-202E), invisible
+ *  operators and the word joiner (2060-2064), bidi isolates and the
+ *  deprecated format controls (2066-206F), the byte-order mark (FEFF), the
+ *  soft hyphen (00AD), the interlinear annotation anchors (FFF9-FFFB), and
+ *  the astral TAG block (E0001, E0020-E007F) -- the standard vehicle for
+ *  smuggling invisible ASCII to a model, which is why the expression carries
+ *  the `u` flag: without it a code point above FFFF cannot be named. Then the
+ *  invisible characters Unicode does not class as format: the combining
+ *  grapheme joiner (034F), the Hangul fillers (115F, 1160, 3164, FFA0), the
+ *  Braille blank (2800), the Khmer inherent vowels (17B4, 17B5), the
+ *  Mongolian free variation selectors (180B-180D, 180F), and the variation
+ *  selectors (FE00-FE0F and the astral E0100-E01EF) -- the last a known way
+ *  to hang arbitrary bytes off a visible character. Dropping FE0F turns an
+ *  emoji's presentation to text style; that is the accepted cost.
+ *  Carriage return is dropped with the rest: it serves nothing here, and a
+ *  lone one can rewrite a rendered line.
  *
  *  Every member is written as an escape, never as the character itself, so
  *  this file holds no literal control byte of its own -- an invisible
@@ -104,7 +118,7 @@ const TRUNCATION_NOTICE = "\n[cut: the server sent more than the instructions ce
  *  not something a reviewer can see in order to check it. */
 const HIDDEN_CHARS =
   // biome-ignore lint/suspicious/noControlCharactersInRegex: naming control characters is what this expression is for.
-  /[\u0000-\u0008\u000B-\u001F\u007F-\u009F\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u206F\uFEFF]/g;
+  /[\u0000-\u0008\u000B-\u001F\u007F-\u009F\u115F\u1160\u2800\u3164\uFFA0]|\u034F|[\u17B4\u17B5]|[\u180B-\u180F]|[\uFE00-\uFE0F]|[\u{E0100}-\u{E01EF}]|\p{Cf}/gu;
 
 /** Make one server's `instructions` safe to store and, later, to fence.
  *

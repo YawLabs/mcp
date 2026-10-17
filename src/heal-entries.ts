@@ -22,9 +22,11 @@
  * here. Four gates must ALL pass before a single byte is written:
  *
  *   1. SHAPE IS OURS  -- an `oam run` launch whose entry file sits inside a
- *      `node_modules/@yawlabs/mcp/` tree. A hand-written entry, a pinned
- *      `--package` form, a bare `oam`, or an oam entry for somebody else's
- *      server all fail this and are invisible to the sweep.
+ *      `node_modules/@yawlabs/mcp/` tree. This is a PATH-SHAPE test, not an
+ *      authorship test: a hand-written entry that points into such a tree
+ *      passes it like install's own. A pinned `--package` form, an `oam`
+ *      launch with no `run <entry>`, or an oam entry for somebody else's
+ *      server fail it and are invisible to the sweep.
  *   2. ACTUALLY BROKEN -- the entry path is not a regular file: missing, or a
  *      directory, or an unreadable or dangling link. A WORKING entry is never
  *      touched, however unusual it looks, so a user who hand-tuned something
@@ -63,7 +65,7 @@ import {
   terminateWithNewline,
 } from "./client-config.js";
 import { isReadOnlyDiagnostics } from "./config-loader.js";
-import { isForeignAbsoluteLaunch, oamRunEntryPath } from "./doctor-cmd.js";
+import { isForeignAbsoluteLaunch, oamLaunchParts, oamRunEntryPath } from "./doctor-cmd.js";
 import { ENTRY_NAME, resolveAppDataDir } from "./install-target-model.js";
 import {
   buildLaunchEntry,
@@ -163,6 +165,10 @@ export interface HealResult {
   healed: HealedEntry[];
   unhealable: UnhealableConfig[];
   failed: FailedHeal[];
+  /** Set when the sweep did not run at all, so empty lists mean "not
+   *  checked" rather than "nothing stale": `"read-only"` under
+   *  YAW_MCP_READONLY_DIAGNOSTICS (gate 3). Absent on every sweep that ran. */
+  skipped?: "read-only";
 }
 
 export interface HealOptions {
@@ -242,9 +248,14 @@ function norm(p: string, platform: NodeJS.Platform = process.platform): string {
  * because win32's `isAbsolute` accepts `/foo` and `statSync` would then answer
  * about the current drive rather than about the file the entry means.
  */
-function isForeignEntry(command: string, entryPath: string, platform: NodeJS.Platform): boolean {
-  if (isForeignAbsoluteLaunch(command, platform)) return true;
-  if (platform === "win32" && (entryPath.startsWith("/") || command.startsWith("/"))) return true;
+function isForeignEntry(command: string, oamBin: string, entryPath: string, platform: NodeJS.Platform): boolean {
+  // Every path the launch depends on, not only the raw `command`: under a
+  // `cmd /d /s /c C:\...\oam.exe run ...` wrapper `command` is just `cmd`,
+  // and the drive-letter paths that make the entry foreign are the unwrapped
+  // oam binary and the entry file (oamLaunchParts, shared with doctor).
+  const paths = [command, oamBin, entryPath];
+  if (paths.some((p) => isForeignAbsoluteLaunch(p, platform))) return true;
+  if (platform === "win32" && paths.some((p) => p.startsWith("/"))) return true;
   return false;
 }
 
@@ -326,7 +337,7 @@ function isLaunchableFile(entryPath: string): boolean {
 export async function healStaleBrokerEntries(opts: HealOptions = {}): Promise<HealResult> {
   const env = opts.env ?? process.env;
   // Gate 3, checked once and up front.
-  if (isReadOnlyDiagnostics(env)) return { healed: [], unhealable: [], failed: [] };
+  if (isReadOnlyDiagnostics(env)) return { healed: [], unhealable: [], failed: [], skipped: "read-only" };
 
   const os = opts.os ?? CURRENT_OS;
   const platform = opts.platform ?? process.platform;
@@ -433,13 +444,14 @@ export async function healStaleBrokerEntries(opts: HealOptions = {}): Promise<He
       if (launch === null) return;
 
       // Gate 1: an oam launch, pointing into our own package tree.
-      const entryPath = oamRunEntryPath(launch.command, launch.args);
-      if (entryPath === null || !isOwnBrokerEntry(entryPath, platform)) return;
+      const parts = oamLaunchParts(launch.command, launch.args);
+      const entryPath = parts?.entry ?? null;
+      if (parts === null || entryPath === null || !isOwnBrokerEntry(entryPath, platform)) return;
 
       // Written for another OS than the one inspecting: unverifiable here,
       // never broken. See isForeignEntry -- this is the WSL case, and it is
       // checked BEFORE gate 2, because gate 2 is exactly what gets it wrong.
-      if (isForeignEntry(launch.command, entryPath, platform)) return;
+      if (isForeignEntry(launch.command, parts.oam, entryPath, platform)) return;
 
       // Gate 2: only a BROKEN entry is ever rewritten.
       //

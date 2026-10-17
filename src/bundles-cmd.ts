@@ -7,8 +7,7 @@
 // Two actions mirror the meta-tool's `action` parameter:
 //
 //   list    Static view of every curated bundle with activate hints. No
-//           network, no token needed. Good for browsing or sharing in
-//           onboarding docs.
+//           network. Good for browsing or sharing in onboarding docs.
 //
 //   match   Reads the servers yaw-mcp actually MAKES AVAILABLE -- enabled
 //           entries from bundles.json (project file winning over user-global)
@@ -16,7 +15,7 @@
 //           partitions the bundles into "ready to activate" vs "partially
 //           installed". A bundle with zero overlap is omitted from both (and
 //           from --json), not reported as a third set -- see matchBundles in
-//           bundles.ts. Also local: no network, no token needed.
+//           bundles.ts. Also local: no network.
 //
 //           NOT side-effect-free, though: `match` calls loadYawMcpConfig,
 //           which runs the pre-0.12 legacy-path migration before resolving

@@ -47,13 +47,13 @@ import { setTimeout as delay } from "node:timers/promises";
 import { isWin32TransientFsError } from "./atomic-write.js";
 
 /** Sidecar beside the locked file: `<path>.lock`. */
-export const LOCK_SUFFIX = ".lock";
+const LOCK_SUFFIX = ".lock";
 /** Age past which a lock is abandoned, not held. See the header above. */
-export const DEFAULT_LOCK_STALE_MS = 10_000;
+const DEFAULT_LOCK_STALE_MS = 10_000;
 /** Default wait on a LIVE lock. Longer than the stale age on purpose, so
  *  waiting out a crashed holder always fits inside it. Callers with a tighter
  *  budget (persistence.ts, which must not hold up shutdown) pass their own. */
-export const DEFAULT_LOCK_WAIT_MS = 15_000;
+const DEFAULT_LOCK_WAIT_MS = 15_000;
 const LOCK_POLL_MS = 25;
 /** How long the take may keep failing with a transient win32 errno
  *  (isWin32TransientFsError) before that errno is thrown. The usual cause is
@@ -62,7 +62,7 @@ const LOCK_POLL_MS = 25;
  *  still going after a second is not a release -- it is a directory this
  *  process cannot create files in, and the real errno says so better than
  *  a lock timeout would. The give-up deadline still applies if it is shorter. */
-export const DEFAULT_LOCK_TRANSIENT_MS = 1_000;
+const DEFAULT_LOCK_TRANSIENT_MS = 1_000;
 /** How far ahead of Date.now() a lock's mtime may sit and still count as
  *  "taken just now": filesystem timestamp granularity routinely reports an
  *  mtime a hair ahead of the clock, and without the margin a lock taken

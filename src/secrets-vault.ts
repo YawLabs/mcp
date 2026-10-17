@@ -825,6 +825,27 @@ export function newVault(): VaultFile {
   };
 }
 
+/** Matches a `${secret:NAME}` reference. Consumed by resolveSecretRefs,
+ *  collectSecretRefNames and malformedSecretRefSpans below; exported for the
+ *  tests that pin its shape. Production code that only needs the NAMES
+ *  referenced in an env map (meta-tools.ts, upstream.ts, doctor-cmd.ts) goes
+ *  through collectSecretRefNames rather than importing this, and nothing
+ *  should re-declare a local copy: copies of one regex drift.
+ *  Global flag => this object carries mutable lastIndex state that every
+ *  importer shares. String.matchAll does NOT rescue that: its internal clone
+ *  is SEEDED FROM this regex's lastIndex (matchAll only spares the original
+ *  from being advanced), so an offset left behind by any `.exec`/`.test`
+ *  elsewhere makes the next scan silently skip the head of the string.
+ *  Scan with a fresh instance instead --
+ *  `new RegExp(SECRET_REF_RE.source, SECRET_REF_RE.flags)` -- which is what
+ *  collectSecretRefNames below does; name-only callers should go through that
+ *  helper rather than re-deriving the rule. `String.replace` is the one safe
+ *  sharer: on a global regex it zeroes lastIndex before matching and again
+ *  after, which is why resolveSecretRefs below can pass this object directly.
+ *  Built from SECRET_NAME_CLASS (see SECRET_NAME_RE) rather than spelled as
+ *  a literal, so the two can no longer drift apart. */
+export const SECRET_REF_RE = new RegExp(`\\$\\{secret:(${SECRET_NAME_CLASS})\\}`, "g");
+
 /**
  * Scan an env map for `${secret:NAME}` references and substitute the
  * decrypted vault value for each match. Returns the resolved env.
@@ -865,26 +886,6 @@ export function newVault(): VaultFile {
  *     newline. So the span is never returned raw: see MalformedSecretRef
  *     for the two bounded forms it is reduced to.
  */
-/** Matches a `${secret:NAME}` reference. Consumed by resolveSecretRefs,
- *  collectSecretRefNames and malformedSecretRefSpans below; exported for the
- *  tests that pin its shape. Production code that only needs the NAMES
- *  referenced in an env map (meta-tools.ts, upstream.ts, doctor-cmd.ts) goes
- *  through collectSecretRefNames rather than importing this, and nothing
- *  should re-declare a local copy: copies of one regex drift.
- *  Global flag => this object carries mutable lastIndex state that every
- *  importer shares. String.matchAll does NOT rescue that: its internal clone
- *  is SEEDED FROM this regex's lastIndex (matchAll only spares the original
- *  from being advanced), so an offset left behind by any `.exec`/`.test`
- *  elsewhere makes the next scan silently skip the head of the string.
- *  Scan with a fresh instance instead --
- *  `new RegExp(SECRET_REF_RE.source, SECRET_REF_RE.flags)` -- which is what
- *  collectSecretRefNames below does; name-only callers should go through that
- *  helper rather than re-deriving the rule. `String.replace` is the one safe
- *  sharer: on a global regex it zeroes lastIndex before matching and again
- *  after, which is why resolveSecretRefs below can pass this object directly.
- *  Built from SECRET_NAME_CLASS (see SECRET_NAME_RE) rather than spelled as
- *  a literal, so the two can no longer drift apart. */
-export const SECRET_REF_RE = new RegExp(`\\$\\{secret:(${SECRET_NAME_CLASS})\\}`, "g");
 export function resolveSecretRefs(
   env: Record<string, string>,
   vault: VaultFile,

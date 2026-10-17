@@ -207,9 +207,9 @@ export function parseJsonc(src: string): unknown {
 // unparseable document, a delete under a container that does not exist
 // ("Can not delete in empty document"), a parent that is not an object where a
 // key is needed ("Can not add index to parent of type ..."), and array
-// insert/remove. No caller matches on that text: findBlockedContainerSegment
-// in install-cmd.ts and peelEntryFromConfig in try-cmd.ts check for those
-// shapes BEFORE calling rather than catching the throw.
+// insert/remove. No caller matches on that text: client-config-json.ts
+// (blockedSegment, and removeJson's walk-first) checks for those shapes
+// BEFORE calling rather than catching the throw.
 //
 // All helpers are STRING in, STRING out; the caller does the disk IO
 // (atomicWriteFile etc.). Offsets are computed against the text each call is
@@ -585,8 +585,8 @@ export function editJsoncEntry(src: string, containerPath: string[], entryName: 
  *  that does -- callers can detect this via referential equality on the
  *  input/output strings if they need to. A container along `containerPath`
  *  that is itself missing throws instead (jsonc-parser's "Can not delete in
- *  empty document"); peelEntryFromConfig in try-cmd.ts walks the path first
- *  for that reason.
+ *  empty document"); removeJson in client-config-json.ts walks the path
+ *  first for that reason.
  *
  *  Same rationale as `editJsoncEntry`: a read-modify-write that goes through
  *  JSON.parse + JSON.stringify drops user comments; this deletes the entry's
@@ -672,9 +672,11 @@ function elementValue(child: Node): unknown {
   return getNodeValue(child);
 }
 
-/** The ARRAY at `path`, or null when `src` does not parse or nothing of that
- *  type is there. Shared by the two array helpers below so they agree about
- *  what counts as an array to splice into. */
+/** The ARRAY at `path`, or null when `src` does not parse cleanly or nothing
+ *  of that type is there. Shared by the two array helpers below so they agree
+ *  about what counts as an array to splice into. null conflates the two
+ *  cases, so a caller that reports "not an array" must re-check the node's
+ *  type itself (addJsoncArrayElement does). */
 function arrayNodeAt(text: string, path: Array<string | number>): Node | null {
   const errors: ParseError[] = [];
   const root = parseTree(text, errors, { allowTrailingComma: true });
@@ -721,6 +723,19 @@ export function addJsoncArrayElement(src: string, path: Array<string | number>, 
     const errors: ParseError[] = [];
     const root = parseTree(debommed, errors, { allowTrailingComma: true });
     const existing = root === undefined ? undefined : findNodeAtLocation(root, path);
+    if (existing?.type === "array") {
+      // An array that `arrayNodeAt` turned down only because the document
+      // carries a parse error jsonc-parser recovers from (an unterminated
+      // `/*` at end of file, which `parseJsonc` tolerates). `arrayNodeAt`
+      // refuses any document with parse errors, so there is no node to splice
+      // into: take the whole-array write -- the same fallback as the
+      // `edits === null` branch below, which drops comments inside the array
+      // -- after the same no-op check.
+      const wanted = JSON.stringify(value);
+      const elements = (existing.children ?? []).map(elementValue);
+      if (elements.some((e) => JSON.stringify(e) === wanted)) return src;
+      return editJsoncPath(debommed, path, [...elements, value]);
+    }
     if (existing !== undefined) {
       throw new Error(`addJsoncArrayElement: ${path.join(".")} is a ${existing.type}, not an array`);
     }

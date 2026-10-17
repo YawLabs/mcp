@@ -29,9 +29,12 @@
 //      rather than cross-referenced; an earlier version of this line pointed
 //      at "the note on capResult", which does not exist.
 
-/** One MCP content block. Structurally identical to prune.ts's `Content`,
- *  redeclared rather than imported so this module carries no dependency on
- *  the pruning pass it deliberately is not part of. */
+import { resolveNonNegativeIntEnv } from "./opt-out-env.js";
+
+/** One MCP content block. The same shape as prune.ts's `Content` except that
+ *  `text` is optional here -- the honest typing for image and resource blocks,
+ *  which carry none. Redeclared rather than imported so this module carries no
+ *  dependency on the pruning pass it deliberately is not part of. */
 export interface CapContent {
   type: string;
   text?: string;
@@ -54,13 +57,7 @@ export const DEFAULT_MAX_RESULT_BYTES = 100_000;
  *  into 0, which is the DISABLE sentinel, so a typo would silently remove the
  *  ceiling instead of falling back to it. */
 export function resolveMaxResultBytes(env: NodeJS.ProcessEnv = process.env): number {
-  const raw = env.YAW_MCP_MAX_RESULT_BYTES;
-  if (raw === undefined || raw === "") return DEFAULT_MAX_RESULT_BYTES;
-  const trimmed = raw.trim();
-  if (!/^\d+$/.test(trimmed)) return DEFAULT_MAX_RESULT_BYTES;
-  const n = Number.parseInt(trimmed, 10);
-  if (!Number.isFinite(n)) return DEFAULT_MAX_RESULT_BYTES;
-  return n;
+  return resolveNonNegativeIntEnv("YAW_MCP_MAX_RESULT_BYTES", DEFAULT_MAX_RESULT_BYTES, env);
 }
 
 export interface CapResult {

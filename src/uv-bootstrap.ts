@@ -112,12 +112,6 @@ function archiveExt(): "zip" | "tar.gz" {
   return process.platform === "win32" ? "zip" : "tar.gz";
 }
 
-// Resolve a bare command against PATH. Runs the binary with
-// `--version` and considers exit 0 as "present." Faster and more
-// portable than rolling our own PATH walk (which has to cope with
-// PATHEXT on Windows and symlinks on Unix). 3s cap guards against a
-// wedged shim. Exported for the timeout-path test; production callers
-// stay inside this module.
 /** How long a single `<cmd> --version` probe gets before it is inconclusive. */
 export const PATH_PROBE_TIMEOUT_MS = 3_000;
 
@@ -129,8 +123,13 @@ export const PATH_PROBE_TIMEOUT_MS = 3_000;
  *  own history says the same thing from the other direction: a shell-less
  *  probe was tried and reverted for false-negativing on Windows shims and
  *  causing exactly that download. */
-export type PathProbe = "present" | "absent" | "unknown";
+type PathProbe = "present" | "absent" | "unknown";
 
+// Resolve a bare command against PATH. Runs the binary with
+// `--version` and considers exit 0 as "present." Faster and more
+// portable than rolling our own PATH walk (which has to cope with
+// PATHEXT on Windows and symlinks on Unix). The PATH_PROBE_TIMEOUT_MS
+// cap guards against a wedged shim. resolveUv is the production caller.
 async function probePath(cmd: string): Promise<PathProbe> {
   return new Promise((resolve) => {
     let settled = false;
@@ -201,7 +200,9 @@ async function probePath(cmd: string): Promise<PathProbe> {
 
 /** Is `cmd` runnable from PATH? An inconclusive probe reads as false, which is
  *  the historical contract; callers that care about the difference (resolveUv)
- *  use probePath directly. */
+ *  use probePath directly. No production code calls this any more: it is the
+ *  boolean wrapper kept exported for the tests that drive probePath through it
+ *  (the spawn-options and timeout-path tests). */
 export async function onPath(cmd: string): Promise<boolean> {
   return (await probePath(cmd)) === "present";
 }

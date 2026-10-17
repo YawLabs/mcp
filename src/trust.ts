@@ -48,6 +48,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { atomicWriteFile } from "./atomic-write.js";
 import { setJsonKey } from "./json-key.js";
 import { log } from "./logger.js";
+import { isFeatureEnabled } from "./opt-out-env.js";
 import { realpathOrSelf, userConfigDir } from "./paths.js";
 
 /** Canonical filename for the trust store, inside ~/.yaw-mcp/. */
@@ -166,10 +167,8 @@ export function trustStorePath(home: string = homedir()): string {
  * left exactly as resolved. On the RARE case-sensitive APFS volume (opt-in
  * at format time) this folds two genuinely distinct paths into one key; the
  * grant is still pinned to the file's content hash, so what was approved
- * stays byte-exact -- the same trade Windows has always made. NOTE:
- * paths.ts:normalizeForCompare keeps its win32-only split; it compares
- * walk-up boundaries against $HOME, whose casing comes from the OS
- * consistently, so the duplicate-key failure cannot arise there.
+ * stays byte-exact -- the same trade Windows has always made.
+ * paths.ts:normalizeForCompare folds on the same two platforms.
  *
  * `platform` is a PARAMETER rather than a read of the global so a test can
  * exercise another platform's folding branch without faking
@@ -214,8 +213,7 @@ export function hashTrustContent(contents: Buffer | string): string {
  *  space or CR, and "1 " silently keeping the gate on is the kind of failure
  *  nothing reports. */
 export function isTrustBypassEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  const raw = env[TRUST_BYPASS_ENV]?.trim();
-  return raw === "1" || raw?.toLowerCase() === "true";
+  return isFeatureEnabled(TRUST_BYPASS_ENV, env);
 }
 
 function emptyStore(
@@ -404,7 +402,11 @@ export function trustStatusFor(
   // store was folded under: a key folded for darwin and looked up under the
   // linux rule misses, and a caller that injects one without the other is
   // testing the wrong thing.
-  const record = store.entries[normalizeTrustKey(path, platform)];
+  // Own-property lookup, the same guard revokeTrust applies to this map: an
+  // inherited name (constructor, __proto__) must read as no record, whatever
+  // normalizeTrustKey returns.
+  const key = normalizeTrustKey(path, platform);
+  const record = Object.hasOwn(store.entries, key) ? store.entries[key] : undefined;
   if (!record) return "untrusted";
   return record.sha256 === hashTrustContent(contents) ? "trusted" : "changed";
 }

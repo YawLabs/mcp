@@ -413,6 +413,29 @@ describe("runDoctor — client detection", () => {
     expect(cap.text()).toContain("oam cannot fetch it on demand");
   });
 
+  it("flags a missing oam BINARY through a cmd wrapper", async () => {
+    // The raw-`command` exists check sees only `cmd`; the absolute oam binary
+    // inside the wrapper used to go unchecked, so a gone binary with a present
+    // entry read "OK (runs on oam)".
+    const entryFile = join(synthHome, "broker.js");
+    writeFileSync(entryFile, "");
+    const goneBin = join(synthHome, "gone", "oam");
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({
+        mcpServers: {
+          [ENTRY_NAME]: { command: "cmd", args: ["/d", "/s", "/c", goneBin, "run", "--no-check", entryFile] },
+        },
+      }),
+    );
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, err: () => {} });
+    const client = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
+    expect(client?.launchCommandMissing).toBe(goneBin);
+    expect(client?.launchOamEntryMissing).toBeNull();
+    expect(cap.text()).not.toContain("runs on oam");
+  });
+
   // The bare-oam check used to inspect `command` alone, so a bare `oam`
   // reached THROUGH a wrapper -- which isOamLaunch accepts, and which the
   // client resolves against its own PATH exactly like the un-wrapped bare

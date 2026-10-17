@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -521,6 +521,61 @@ describe("runSet -- the clear prompt over a real readline", () => {
     expect(cap.text()).toContain("Aborted.");
     expect(cap.errText()).not.toContain("Aborted.");
     expect(readFileSync(bundlesPath(), "utf8")).toBe(SAMPLE);
+  });
+});
+
+describe("runSet -- the [y/N] prompt runs outside the bundles lock", () => {
+  // Other writers give up on the lock after BUNDLES_LOCK_WAIT_MS, so holding
+  // it while a human answers made every concurrent add/remove fail. The
+  // prompt now runs first; the write re-reads the file under the lock.
+  async function promptThen(
+    assignments: string[],
+    whilePrompting: () => void,
+  ): Promise<{ r: Awaited<ReturnType<typeof runSet>>; lockHeld: boolean; cap: ReturnType<typeof capture> }> {
+    const cap = capture();
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    let lockHeld = true;
+    const prompted = new Promise<void>((resolve) => stdout.on("data", () => resolve()));
+    const pending = runSet({
+      target: "gh",
+      assignments,
+      home: synthHome,
+      isTTY: true,
+      io: { stdin, stdout },
+      ...cap,
+    });
+    await prompted;
+    lockHeld = existsSync(`${bundlesPath()}.lock`);
+    whilePrompting();
+    stdin.write("y\n");
+    const r = await pending;
+    return { r, lockHeld, cap };
+  }
+
+  it("holds no lock at the prompt, and keeps another writer's update made meanwhile", async () => {
+    writeBundles(SAMPLE);
+    const { r, lockHeld } = await promptThen(["env.GITHUB_TOKEN="], () => {
+      // Another writer lands on a DIFFERENT entry while the user is reading.
+      writeFileSync(bundlesPath(), SAMPLE.replace('"name": "Postgres",', '"name": "Postgres", "isActive": false,'));
+    });
+    expect(lockHeld).toBe(false);
+    expect(r.exitCode).toBe(0);
+    const after = read();
+    expect(after.servers[0].env).toEqual({ OTHER: "o" });
+    // Spliced into the re-read text, not the pre-prompt one: no lost update.
+    expect(after.servers[1].isActive).toBe(false);
+  });
+
+  it("refuses when the confirmed env value changed while waiting", async () => {
+    writeBundles(SAMPLE);
+    const changed = SAMPLE.replace('"GITHUB_TOKEN": "t"', '"GITHUB_TOKEN": "rotated"');
+    const { r, cap } = await promptThen(["env.GITHUB_TOKEN="], () => writeFileSync(bundlesPath(), changed));
+    expect(r.exitCode).toBe(1);
+    expect(r.written).toEqual([]);
+    expect(cap.errText()).toContain("env.GITHUB_TOKEN");
+    expect(cap.errText()).toContain("changed");
+    expect(readFileSync(bundlesPath(), "utf8")).toBe(changed);
   });
 });
 

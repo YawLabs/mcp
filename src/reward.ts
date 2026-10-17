@@ -87,9 +87,12 @@ const RULE2_SCAN_LEN = 1000;
 // isEmptyBody's all-block scan, so an error-shaped LATER block can't slip
 // between rule 2 (first-block error-shape) and rule 3 (empty body) -- e.g.
 // content [{text:""},{text:"not found"}] is graded 0.2, not 1.0.
-function firstTextBlock(result: ToolCallResultShape): string | undefined {
+//
+// Exported for reward-grader.ts's firstResultText, so the grader quotes the
+// block this heuristic judged instead of re-spelling the scan.
+export function firstTextBlock(result: ToolCallResultShape): string | undefined {
   const content = result.content;
-  if (!content || content.length === 0) return undefined;
+  if (!Array.isArray(content) || content.length === 0) return undefined;
   for (const block of content) {
     if (typeof block.text === "string" && block.text.trim().length > 0) return block.text;
   }
@@ -106,7 +109,10 @@ function firstTextBlock(result: ToolCallResultShape): string | undefined {
 function isEmptyBody(result: ToolCallResultShape): boolean {
   if (result.structuredContent !== undefined) return false;
   const content = result.content;
-  if (!content || content.length === 0) return true;
+  // Same guard as firstTextBlock: a malformed non-array `content` carries no
+  // readable block. Without it a string iterated per character (each "block"
+  // lacks type "text", so it graded as substance, 1.0) and an object threw.
+  if (!Array.isArray(content) || content.length === 0) return true;
   for (const block of content) {
     if (block.type !== "text") return false;
     if (typeof block.text === "string" && block.text.trim().length > 0) {

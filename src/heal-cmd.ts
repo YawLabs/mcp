@@ -12,7 +12,8 @@
  * Unlike the serve trigger this is not opt-out-able: the user (or the app
  * acting for them) asked for it by name, so `YAW_MCP_AUTO_HEAL=0` -- which
  * governs the UNATTENDED pass -- does not apply. The read-only gate still does,
- * because that one is about never writing behind a diagnostics poll.
+ * because that one is about never writing behind a diagnostics poll; the run
+ * then says it checked nothing rather than reporting a clean sweep.
  *
  * EXIT CODES. 0 for a clean sweep and for a repair; 1 when the sweep threw,
  * or when a stale entry it found could not be re-pointed (the file would not
@@ -45,8 +46,9 @@ const USAGE =
   "upgrade leaves behind when it deletes the directory the entry named.\n" +
   "Only an entry yaw-mcp wrote AND that is currently broken is touched.\n" +
   "\n" +
-  "  --json      Machine-readable result: { healed, unhealable, failed, count, dryRun };\n" +
-  "              with --dry-run, `healed` and `count` are what WOULD be re-pointed\n" +
+  "  --json      Machine-readable result: { healed, unhealable, failed, count, dryRun, readOnly };\n" +
+  "              with --dry-run, `healed` and `count` are what WOULD be re-pointed;\n" +
+  "              readOnly: true means YAW_MCP_READONLY_DIAGNOSTICS kept it from checking\n" +
   "  --dry-run   Report what would change; write nothing\n" +
   "  --quiet     No human transcript\n";
 
@@ -116,6 +118,25 @@ export async function runHeal(
     return { exitCode: 1 };
   }
   const { healed, unhealable, failed } = result;
+  // Under YAW_MCP_READONLY_DIAGNOSTICS the sweep never ran, so its empty lists
+  // are not a clean bill of health: say so instead of "No stale yaw-mcp
+  // entries found.", on stderr (like doctor's `mode: read-only` line, this is
+  // about the run, not a finding) and as `readOnly: true` under --json. Still
+  // exit 0 -- nothing failed; the caller asked for a pass that cannot write.
+  const readOnly = result.skipped === "read-only";
+  if (readOnly) {
+    if (options.json === true) {
+      process.stdout.write(
+        `${JSON.stringify({ healed, unhealable, failed, count: 0, dryRun: options.dryRun === true, readOnly: true }, null, 2)}\n`,
+      );
+    }
+    if (options.quiet !== true) {
+      process.stderr.write(
+        "yaw-mcp heal: not checked -- YAW_MCP_READONLY_DIAGNOSTICS is set, so no config was read or written; unset it to sweep.\n",
+      );
+    }
+    return { exitCode: 0 };
+  }
   // A stale entry the sweep found and could not re-point is an ERROR, not
   // part of the transcript: it goes to stderr in every mode -- --json and
   // --quiet included, as the throw above does -- and the run exits 1. Before,
@@ -139,10 +160,13 @@ export async function runHeal(
     // path is a project-local install (see HealedEntry.note), and every
     // record in the three lists carries `project` only when it is one Claude
     // Code project's container in ~/.claude.json (see HealedEntry.project).
-    // `failed` and `project` are the newest fields; the others keep their
-    // meaning, so a reader that knows only those reads what it always did.
+    // `readOnly` is true only when YAW_MCP_READONLY_DIAGNOSTICS kept the sweep
+    // from running (the early return above), so its empty lists mean "not
+    // checked". `readOnly`, `failed` and `project` are the newest fields; the
+    // others keep their meaning, so a reader that knows only those reads what
+    // it always did.
     process.stdout.write(
-      `${JSON.stringify({ healed, unhealable, failed, count: healed.length, dryRun: options.dryRun === true }, null, 2)}\n`,
+      `${JSON.stringify({ healed, unhealable, failed, count: healed.length, dryRun: options.dryRun === true, readOnly: false }, null, 2)}\n`,
     );
     reportFailures(false);
     return { exitCode };

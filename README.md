@@ -4,7 +4,7 @@
 
 Yaw MCP (the `yaw-mcp` CLI) is an MCP server that fronts every other MCP server you use. Point each AI client (Claude Code, Claude Desktop, Cursor, VS Code) at it once, and your servers load lazily from a single connection instead of a hand-edited `mcpServers` block per client.
 
-It runs entirely on your machine. No account, no sign-in, no telemetry -- your servers live in a local `bundles.json` and your credentials in a local encrypted vault. Running as an MCP server, its only outbound calls are two background npm checks: one for its own updates (`YAW_MCP_AUTO_UPGRADE=0` to disable) and, if you have run `yaw-mcp sidecars install`, a once-a-day check that the managed sidecar packages are current (`YAW_MCP_SIDECAR_REFRESH=0` to disable). `yaw-mcp add` fetches the public server catalog on demand. Nothing else leaves your machine.
+It runs entirely on your machine. No account, no sign-in, no telemetry -- your servers live in a local `bundles.json` and your credentials in a local encrypted vault. Running as an MCP server, its only outbound calls are two background npm checks: one for its own updates (`YAW_MCP_AUTO_UPGRADE=0` to disable) and, if you have run `yaw-mcp sidecars install`, a once-a-day check that the managed sidecar packages are current (`YAW_MCP_SIDECAR_REFRESH=0` to disable). One more is conditional: if a configured server launches through `uv`/`uvx` and `uv` is not on your PATH, yaw-mcp downloads Astral's `uv` release from GitHub once and caches it (see [Runtime detection & `uv` bootstrap](#runtime-detection--uv-bootstrap)). `yaw-mcp add`, `search` and `try` fetch the public server catalog on demand. Nothing else leaves your machine.
 
 It earns its keep when you hit any of these:
 
@@ -35,6 +35,7 @@ Your MCP client (Claude Code, Cursor, ...)
 | `mcp_connect_discover` | List available servers, optionally ranked by a context string. Auto-loads the top match when one clearly wins. Tool-name lists are capped at five per server; pass `server` for one server's full list. `listOnly: true` (for client UIs) returns the same listing with no side effects: no auto-load, no idle tick, no install suggestions. |
 | `mcp_connect_activate` / `deactivate` | Load / unload specific servers by namespace. |
 | `mcp_connect_read_tool` | Return one tool's schema without loading its server. |
+| `mcp_connect_find_tool` | Search every installed server's tools by what they do, from cache: nothing is loaded and no server is contacted. A hit on a loaded server carries its full schema. |
 | `mcp_connect_exec` | Run a short declarative pipeline of tool calls in one round-trip (`{"$ref": "<step>[.path]"}` splices prior outputs; no eval, max 16 steps). |
 | `mcp_connect_bundles` | List curated multi-server presets (PR review, DevOps incident, ...) and match them against your config. |
 | `mcp_connect_suggest` | Surface recurring multi-server workflows learned from usage, with a ready-to-run `activate` call. |
@@ -199,7 +200,7 @@ After an import the client is *still* launching those servers itself, so each on
 
 An imported entry carries no catalog slug, so its handles are its namespace and its **name** (the key the client used). `remove`, `set`, `enable` and `disable` all accept either: `yaw-mcp remove "GitHub Copilot"` works as well as `yaw-mcp remove githubcopilot`.
 
-A credential that was sitting in the client config comes across as a plain value in `bundles.json` (file mode `0600`); the import prints the key names -- never the values -- and points at `yaw-mcp secrets set` for moving them into the [vault](#local-secret-vault).
+A credential that was sitting in the client config comes across as a plain value in `bundles.json` (file mode `0600` on macOS and Linux; on Windows that mode is not applied, so the file is only as private as the NTFS permissions it inherits from your user profile); the import prints the key names -- never the values -- and points at `yaw-mcp secrets set` for moving them into the [vault](#local-secret-vault).
 
 **Servers the catalog does not list.** The catalog is a curated front door, not the only one. Pass `--command` for a local (stdio) server or `--url` for a remote (HTTP) one, and `add` defines the server from your flags instead of looking up a slug -- no catalog fetch, so this also works offline:
 
@@ -238,7 +239,7 @@ yaw-mcp completion <bash|zsh|fish|powershell>   # print a shell-completion scrip
 **Compliance**
 
 ```bash
-yaw-mcp compliance <target>   # run the 88-test compliance suite against a server
+yaw-mcp compliance <target>   # run the compliance suite (88 tests on 2025-11-25, 103 on 2026-07-28)
 yaw-mcp audit <namespace>     # audit a stdio server from bundles.json, cache its A-F grade in grades.json
 ```
 
@@ -377,7 +378,7 @@ yaw-mcp secrets reset           # forgot the passphrase? move the vault aside, l
 yaw-mcp secrets audit [--secret NAME] [--server NS] [--json]   # who consumed which secret, when
 ```
 
-The passphrase derives the key via scrypt and is cached in memory for one process; the on-disk file holds only ciphertext (AES-256-GCM, per-entry IV + tag, one vault salt). `rotate` decrypts every entry first and aborts untouched if any fails -- and it re-wraps the **encryption**, not the underlying tokens (a leaked token is still leaked; rotate it at its source). `audit` reads an append-only `0600` NDJSON log of secret NAME + namespace + timestamp -- never a value -- and writes fail-open so a broken log never blocks a spawn.
+The passphrase derives the key via scrypt and is cached in memory for one process; the on-disk file holds only ciphertext (AES-256-GCM, per-entry IV + tag, one vault salt). `rotate` decrypts every entry first and aborts untouched if any fails -- and it re-wraps the **encryption**, not the underlying tokens (a leaked token is still leaked; rotate it at its source). `audit` reads an append-only NDJSON log (mode `0600` on macOS and Linux; Windows does not apply that mode, so it inherits your profile's NTFS permissions) of secret NAME + namespace + timestamp -- never a value -- and writes fail-open so a broken log never blocks a spawn.
 
 **Forgot the passphrase?** There is no recovery: the file holds only ciphertext under a key derived from the passphrase, and nothing else -- no server, no recovery key -- can open it. `yaw-mcp secrets reset` is the way back to a working vault. It prints the entry names the vault holds (plaintext keys, so no passphrase is needed) so you know what to set again, asks you to type `RESET` (or takes `--force` from a script; without it, no TTY means a refusal), moves the old file aside as `secrets.json.reset-<timestamp>` next to the vault -- it still opens under the old passphrase, should that turn up -- and creates an empty vault under a new passphrase, confirmed twice on a TTY or taken from `YAW_MCP_VAULT_PASSPHRASE` when it is set. It refuses when the passphrase it is given already opens the vault: that is `rotate`, not a reset. Afterwards, a yaw-mcp server that is already running keeps the passphrase it started with and needs a restart, and a `YAW_MCP_VAULT_PASSPHRASE` in a client config's `env` block still holds the old value. `yaw-mcp doctor` says whether the passphrase it can see unlocks the vault.
 
@@ -385,7 +386,7 @@ The passphrase derives the key via scrypt and is cached in memory for one proces
 
 ## Runtime detection & `uv` bootstrap
 
-On startup yaw-mcp probes for `node`, `npx`, `python`, `uvx`, and `docker` (best-effort, 3s per probe) so it can warn when a server's runtime is missing. yaw-mcp itself needs only Node.js.
+yaw-mcp itself needs only Node.js, and it does not probe for each server's runtime up front: a server whose command is not on PATH fails when it is loaded, with a message naming the command (and, after a `uv` or oam rewrite, the binary that actually failed to spawn). Two probes do run. `oam --version` (10 s) decides whether node/npx sidecars are hosted on oam, and its verdict is remembered per binary in `~/.yaw-mcp/oam-probe.json`. `uv --version` (3 s) runs ahead of a Python server -- at startup when an active server launches through `uv`/`uvx`, otherwise on its first load.
 
 Python servers (`sqlite`, `time`, `sentry`, ...) launch via Astral's `uv`/`uvx`. On first encounter, if `uv` isn't on your PATH, yaw-mcp downloads Astral's standalone release, verifies the sha256, and caches it -- reusing your own `uv` if you have one. `uvx ARGS` is always rewritten to `uv tool run ARGS`, so only `uv` needs to be reachable.
 
@@ -393,7 +394,7 @@ Python servers (`sqlite`, `time`, `sentry`, ...) launch via Astral's `uv`/`uvx`.
 
 MCP servers are third-party code you choose to run. yaw-mcp doesn't sandbox them -- that's your OS and network. What it gives you is **visibility and a gate**:
 
-- **Compliance grades (A-F)** -- the `@yawlabs/mcp-compliance` suite (88 tests) grades a server; `yaw-mcp list` shows it in a `GRADE` column and `discover` shows it inline (`github [ready] [A]`). `YAW_MCP_MIN_COMPLIANCE=B` makes `activate` refuse anything below the floor. Ungraded servers pass (don't punish unknown); audit them yourself with `yaw-mcp compliance <target>`.
+- **Compliance grades (A-F)** -- the `@yawlabs/mcp-compliance` suite (88 tests for MCP 2025-11-25, 103 for 2026-07-28, picked by what the server speaks) grades a server; `yaw-mcp list` shows it in a `GRADE` column and `discover` shows it inline (`github [ready] [A]`). `YAW_MCP_MIN_COMPLIANCE=B` makes `activate` refuse anything below the floor. Ungraded servers pass (don't punish unknown); audit them yourself with `yaw-mcp compliance <target>`.
 - **Source transparency** -- `list` and `discover` show the exact `command`, `args`, and `url` each server launches with. Nothing is wrapped.
 - **Local credentials** -- vault values are encrypted at rest (scrypt + AES-256-GCM), injected at spawn, and never logged. Nothing is transmitted off the machine.
 - **Failure output reaches your client** -- when a server fails to start, the tail of its stderr is attached to the activation error, so it lands in your client's context (and your model's) as well as the log. That tail is the server's own output -- never your files, buffers or shell history -- and it is redacted first: values yaw-mcp injected from `bundles.json` or the vault, resolved request headers, and credential-named variables inherited from your shell (`GITHUB_TOKEN`, `AWS_SECRET_ACCESS_KEY`, `NPM_TOKEN`, ...) are each replaced with `***NAME***`, which names the credential to rotate without showing it. An inherited name whose last segment is `PATH`, `FILE`, `DIR`, `HOST`, `PORT`, `PREFIX` or `SIZE` (`SSH_KEY_PATH`, `TOKEN_BUCKET_SIZE`) does not count as credential-named. Redaction is exact-substring on values of 8 characters or more, so a credential parked under a name that does not read as one is not covered. There is no opt-out: the tail is what makes a failed start diagnosable, and the missing-credential prompt below reads the same text.

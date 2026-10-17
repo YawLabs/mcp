@@ -857,6 +857,34 @@ describe("release.sh non-interactive confirm brake", () => {
     expect(r.out).not.toContain("REACHED_STEP_1");
     expect(r.status).toBe(1);
   });
+
+  // The abort is a refusal with its own message, not a failure: under the real
+  // EXIT trap it used to be followed by "[x] Release failed at line unknown
+  // (exit code 1)", since a bare `exit 1` never sets FAIL_LINE.
+  const trapBlock = extractBlock('WORKDIR=""', "trap cleanup EXIT");
+
+  it("prints no failure banner after the abort, while a real failure still gets one", () => {
+    const body = [
+      "set -Eeuo pipefail",
+      trapBlock,
+      STUB_HELPERS,
+      'VERSION="9.9.9"',
+      'SKIP_CONFIRM="false"',
+      'RESUMING="false"',
+      "CYAN=''; YELLOW=''; NC=''",
+      'if [ "${FORCE_FAIL:-}" = "1" ]; then exit 1; fi',
+      block,
+    ].join("\n");
+    const aborted = runBash(body, dir);
+    expect(aborted.out).toContain("Aborted: stdin is not a terminal");
+    expect(aborted.out).not.toContain("Release failed");
+    expect(aborted.status).toBe(1);
+    // The same harness with a plain exit 1 proves the trap is live, so the
+    // assertion above is not passing on a banner that could never print.
+    const failed = runBash(body, dir, { FORCE_FAIL: "1" });
+    expect(failed.out).toContain("Release failed at line unknown (exit code 1)");
+    expect(failed.status).toBe(1);
+  });
 });
 
 describe("release.sh registry_has_version", () => {

@@ -495,9 +495,14 @@ export interface EntryTransform {
    *  itself.
    *
    *  DATA ONLY -- nothing in client-config*.ts reads this field. It lives on
-   *  the transform because an entry's shape is one idea; `buildLaunchEntry`
-   *  in install-targets.ts is what applies it. */
-  windowsLaunch?: { broker: "cmd-wrap" | "bare"; upstream: "cmd-wrap" | "bare" };
+   *  the transform because an entry's shape is one idea. Only `broker` is a
+   *  choice: install and heal read it and hand `buildLaunchEntry` (in
+   *  install-targets.ts) its `windowsWrap`. `upstream` is typed to the one
+   *  value the builder implements -- its upstream branch (try's entries)
+   *  always wraps on Windows and no caller consults the row -- so a row cannot
+   *  declare a `"bare"` that would be silently ignored. Widen it only together
+   *  with a reader. */
+  windowsLaunch?: { broker: "cmd-wrap" | "bare"; upstream: "cmd-wrap" };
   /** Stored value -> the entry `import` reads, in the client's own terms.
    *  `importViewOf` applies it; without it an entry imports as its normalised
    *  self and nothing is disabled, skipped or discarded.
@@ -988,9 +993,7 @@ function makeView(
     legacyKey: () => findLegacyKey(entries.map((e) => e.key)),
     otherServerKeys: () => {
       const skip = new Set<string>([ENTRY_NAME, ...LEGACY_ENTRY_NAMES]);
-      return entries
-        .filter((e) => !skip.has(e.key) && typeof e.value === "object" && e.value !== null && !Array.isArray(e.value))
-        .map((e) => e.key);
+      return entries.filter((e) => !skip.has(e.key) && isRecord(e.value)).map((e) => e.key);
     },
     count: () => entries.length,
     carryableEnv: (key?: string) => carryableEnvOf(at(key)?.value),

@@ -51,7 +51,7 @@ export interface VerifyDeps {
   platform?: NodeJS.Platform;
   cwd?: string;
   out?: (line: string) => void;
-  oamVersion?: (bin: string) => Promise<string>;
+  oamVersion?: (bin: string, o: { timeoutMs: number }) => Promise<string>;
   probeHosting?: (o: {
     command: string;
     args: string[];
@@ -64,3 +64,4 @@ export interface VerifyDeps {
   day?: string;
 }
 export function verifyOamFloor(opts?: { raise?: boolean }, deps?: VerifyDeps): Promise<number>;
+export function isMainModule(argv1: string | undefined, moduleUrl: string): boolean;

@@ -5,14 +5,14 @@
 // What this gate measures (and what it does NOT):
 //   It is a BM25-FLOOR REGRESSION gate, not a correctness oracle. Each entry
 //   is a real (redacted token bag -> chosen server) pair, where `chosen` is
-//   the server the FULL pipeline (BM25 + rerank + health + learning + sampling)
-//   actually routed to. The gate asserts that the BM25-only floor still ranks
+//   the server the FULL pipeline (BM25 + health + learning + sampling
+//   tiebreak) actually routed to. The gate asserts that the BM25-only floor still ranks
 //   `chosen` in its top-K on those real intents -- i.e. a change to BM25
 //   weights/tokenization doesn't drop real-world choices out of contention.
 //   It does NOT claim `chosen` was the objectively correct server; richer
 //   ground-truth labels (re-dispatch / graded-reward / thumbs) are a future
 //   enrichment. Because it scores the BM25 floor (no semantic stage), it
-//   runs in CI exactly like routing-quality.test.ts.
+//   runs under the local `npm test` exactly like routing-quality.test.ts.
 //
 // The corpus is a checked-in fixture, not live data. A maintainer runs
 // `yaw-mcp foundry export` to fold ~/.yaw-mcp/foundry.jsonl into the fixture;
