@@ -831,7 +831,8 @@ describe("rewriteForOam", () => {
   });
 
   it("turns oam's concurrent type-checker off for a TypeScript entry", () => {
-    // `oam run` defaults to `--check warn`, so a rewritten `node server.ts`
+    // Every released oam (through 0.19.0) defaults `oam run` to `--check warn`
+    // (oam main, slated for 0.19.1, does not), so a rewritten `node server.ts`
     // spawns tsgo alongside the sidecar and writes its diagnostics to the
     // child's stderr -- which is what lands in the 500-char failure tail when
     // a boot fails, in place of the real error. node ran the file unchecked;

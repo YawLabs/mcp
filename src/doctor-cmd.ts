@@ -130,6 +130,7 @@ import {
   nodeLaunchKind,
   type OamProbe,
   type OamProbeFailure,
+  oamBuildTreeFix,
   oamInstallAdvice,
   POSIX_SHELL,
   POWERSHELL,
@@ -2762,8 +2763,9 @@ function renderOamRuntimeSection(opts: {
       // The generic fix below ("run `oam --version` by hand") is wrong here:
       // that binary answers --version fine, which is exactly why it cannot be
       // told apart from a release by running it. The fix is the PATH/OAM_BIN
-      // choice, spelled out in the detail line.
-      print("           fix: point OAM_BIN (or PATH) at the installed oam, then restart yaw-mcp");
+      // choice, and oamBuildTreeFix covers the case with no release installed.
+      print(`           fix: ${oamBuildTreeFix(opts.os)}`);
+      print("           then: restart yaw-mcp");
     } else {
       print("           fix: run `oam --version` by hand; OAM_BIN overrides which binary is probed");
     }

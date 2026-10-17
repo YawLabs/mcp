@@ -69,9 +69,10 @@
 // in, so a machine below the floor gets node. The 0.11.0 run here never
 // covered this mode and this repo has not re-measured it; the coverage is
 // oam's gate's, whose matrix has a `pw-isolated` row from v0.18.0 that runs
-// browser_navigate with --isolated on oam and on a node control. oam 0.18.0
-// still refuses TLS over a pipe and tls/http/https/http2 servers on one; the
-// --isolated dial uses neither.
+// browser_navigate with --isolated on oam and on a node control. oam still
+// refuses a TLS client over a pipe (tls.connect({path}), an https socketPath).
+// Its tls/http/https/http2 servers can listen(path) on one from 0.19.0 (#313).
+// The --isolated dial uses neither.
 //
 // Native addons: oam refuses to dlopen a .node addon by default, throwing a
 // CATCHABLE error with code OAM-NATIVE0001 (OAM_ENABLE_NATIVE_ADDONS=1 opts
@@ -370,6 +371,34 @@ export function oamNoBinaryReason(): string {
 export function oamInstallAdvice(os: InstallOS): string {
   if (os === CURRENT_OS && !oamPublishesBinaryForThisMachine()) return oamNoBinaryReason();
   return oamInstallCommand(os);
+}
+
+/** The installer's default install dir for `os`: install.ps1 uses
+ *  %LOCALAPPDATA%\oam\bin, install.sh uses ~/.oam/bin (OAM_INSTALL_DIR
+ *  overrides both). */
+export function oamReleaseDir(os: InstallOS): string {
+  return os === "windows" ? "%LOCALAPPDATA%\\oam\\bin" : "~/.oam/bin";
+}
+
+/**
+ * The fix for a build-tree oam that a bare name finds on PATH. One source for
+ * the wording, which the probe's warn, doctor's OAM RUNTIME section and
+ * `install`'s Runtime line all print.
+ *
+ * Pointing at "the installed oam" is not enough on its own, because there may
+ * be none. Since oam 0.19.0 (#315) the installer refuses while another oam
+ * resolves ahead of its install dir on PATH, and a dev build is the case it
+ * names. So the user has to reorder PATH before they install. Only install.ps1
+ * has the OAM_SKIP_PATH_SHADOW=1 escape; install.sh refuses outright.
+ */
+export function oamBuildTreeFix(os: InstallOS): string {
+  const dir = oamReleaseDir(os);
+  const override = os === "windows" ? " (OAM_SKIP_PATH_SHADOW=1 overrides it)" : "";
+  return (
+    `put ${dir} ahead of the build tree on PATH, or point OAM_BIN at an installed release oam; ` +
+    `with no release installed, reorder PATH first, since the installer (${oamInstallCommand(os)}) ` +
+    `refuses while another oam resolves ahead of ${dir}${override}`
+  );
 }
 
 /**
@@ -1133,8 +1162,8 @@ async function probeOamUncached(run: (bin: string) => Promise<string>, generatio
     log("warn", "oam resolves to a local build-tree binary; falling back to node for this process", {
       bin: absResolved,
       fix: explicit
-        ? "point OAM_BIN at the installed oam (~/.oam/bin)"
-        : "put ~/.oam/bin ahead of the build tree on PATH",
+        ? `point OAM_BIN at the installed oam (${oamReleaseDir(CURRENT_OS)} by default)`
+        : oamBuildTreeFix(CURRENT_OS),
       thenRestart: "restart yaw-mcp; this probe is cached for the process lifetime",
     });
     return publish({
@@ -1401,8 +1430,10 @@ export function nodeLaunchKind(command: string): "node" | "npx" | null {
   return null;
 }
 
-/** Entry extensions oam type-checks. `oam run` defaults to `--check warn`, so a
- *  TypeScript entry spawns tsgo alongside the server. */
+/** Entry extensions oam type-checks; it never checks any other entry. Every
+ *  released oam (through 0.19.0) defaults `oam run` to `--check warn`, so a
+ *  TypeScript entry spawns tsgo alongside the server. oam main (#412, slated
+ *  for 0.19.1 and untagged as of 2026-10-16) makes the default unchecked. */
 const TS_ENTRY_RE = /\.[mc]?ts$/i;
 
 /**
@@ -1421,13 +1452,16 @@ export function rewriteForOam(
   if (!bin) return { command, args };
 
   const toOam = (entry: string, rest: string[]) => {
-    // `oam run` type-checks a TypeScript entry concurrently by default
-    // (--check warn), which spawns tsgo beside the sidecar and writes its
-    // diagnostics to the child's stderr -- where, on a boot failure, they are
-    // what lands in the 500-char failure tail instead of the real error. The
-    // rewrite is billed as a pure optimization of a launch node was already
-    // going to run unchecked, so checking is not ours to add: `--no-check`
-    // keeps the hosted launch behaving like the one it replaced.
+    // Through 0.19.0, `oam run` type-checks a TypeScript entry concurrently by
+    // default (--check warn). That spawns tsgo beside the sidecar and writes
+    // its diagnostics to the child's stderr. On a boot failure, those
+    // diagnostics are what lands in the 500-char failure tail instead of the
+    // real error. The rewrite is billed as a pure optimization of a launch
+    // node was already going to run unchecked, so adding a check is not our
+    // call: `--no-check` keeps the hosted launch behaving like the one it
+    // replaced. oam main (#412, slated for 0.19.1) runs unchecked by default
+    // and still accepts the flag. Keep it while MIN_OAM_VERSION admits an oam
+    // that checks.
     const flags = TS_ENTRY_RE.test(entry) ? ["--no-check"] : [];
     return {
       command: bin,

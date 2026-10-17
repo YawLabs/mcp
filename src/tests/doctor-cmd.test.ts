@@ -2759,8 +2759,23 @@ describe("runDoctor — OAM RUNTIME section", () => {
     const txt = cap.text();
     expect(txt).toContain("installed but UNUSABLE");
     expect(txt).toContain("local build-tree oam, not a release");
-    expect(txt).toContain("fix: point OAM_BIN (or PATH) at the installed oam, then restart yaw-mcp");
+    expect(txt).toContain("fix: put ~/.oam/bin ahead of the build tree on PATH, or point OAM_BIN at an installed");
+    // Since oam 0.19.0 the installer refuses while the build tree shadows its
+    // dir, so the line must say to reorder PATH before installing.
+    expect(txt).toContain("reorder PATH first, since the installer (curl -fsSL https://oamjs.org/install.sh | sh)");
+    expect(txt).not.toContain("OAM_SKIP_PATH_SHADOW");
+    expect(txt).toContain("then: restart yaw-mcp");
     expect(txt).not.toContain("run `oam --version` by hand");
+  });
+
+  it("names the Windows install dir and install.ps1's shadow escape for a build-tree oam", async () => {
+    const cap = captureOut();
+    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "windows", out: cap.out, oamProbe: oamBuildTree });
+    const txt = cap.text();
+    expect(txt).toContain("fix: put %LOCALAPPDATA%\\oam\\bin ahead of the build tree on PATH");
+    expect(txt).toContain("irm https://oamjs.org/install.ps1 | iex");
+    expect(txt).toContain("(OAM_SKIP_PATH_SHADOW=1 overrides it)");
+    expect(txt).not.toContain("~/.oam/bin");
   });
 
   it("keeps saying not-installed when oam is genuinely absent", async () => {
