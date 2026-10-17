@@ -2764,7 +2764,8 @@ function renderOamRuntimeSection(opts: {
       // that binary answers --version fine, which is exactly why it cannot be
       // told apart from a release by running it. The fix is the PATH/OAM_BIN
       // choice, and oamBuildTreeFix covers the case with no release installed.
-      print(`           fix: ${oamBuildTreeFix(opts.os)}`);
+      // viaOamBin comes from the probe: it read process.env, not opts.env.
+      print(`           fix: ${oamBuildTreeFix(opts.os, probe.viaOamBin === true)}`);
       print("           then: restart yaw-mcp");
     } else {
       print("           fix: run `oam --version` by hand; OAM_BIN overrides which binary is probed");

@@ -3754,10 +3754,33 @@ describe("runInstall — oam launch entry", () => {
       expect(r.exitCode).toBe(0);
       const out = r.messages.join(" ");
       expect(out).toMatch(/local build-tree oam, not a release/);
-      expect(out).toContain("Fix: put ~/.oam/bin ahead of the build tree on PATH, or point OAM_BIN at an installed");
+      expect(out).toContain("Fix: put the release oam's dir, ~/.oam/bin (the installer default;");
       expect(out).toContain("with no release installed, reorder PATH first");
       expect(out).toContain("then re-run install to host yaw-mcp on it.)");
       expect(out).not.toMatch(/Fix or reinstall/);
+    } finally {
+      rmSync(buildTreeHome, { recursive: true, force: true });
+    }
+  });
+
+  it("gives an OAM_BIN-named build tree the OAM_BIN fix, not PATH order", async () => {
+    // OAM_BIN wins over PATH, so reordering PATH cannot help; the probe says
+    // which case it saw through viaOamBin.
+    const buildTreeHome = mkdtempSync(join(tmpdir(), "yaw-mcp-install-buildtree-bin-"));
+    try {
+      const cap = captureIo();
+      const r = await runInstall({
+        clientId: "claude-code",
+        scope: "user",
+        os: "linux",
+        home: buildTreeHome,
+        io: cap.io,
+        oamProbe: async () => ({ ...(await OAM_BUILD_TREE()), viaOamBin: true }),
+      });
+      expect(r.exitCode).toBe(0);
+      const out = r.messages.join(" ");
+      expect(out).toContain("Fix: point OAM_BIN at an installed release oam, or unset it to use the oam on PATH");
+      expect(out).not.toContain("ahead of the build tree on PATH");
     } finally {
       rmSync(buildTreeHome, { recursive: true, force: true });
     }

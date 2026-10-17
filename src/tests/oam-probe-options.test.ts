@@ -354,6 +354,8 @@ describe("probeOam default runner", () => {
         belowMin: false,
         failure: "build-tree",
         failureDetail: expect.stringContaining("compiler output binary"),
+        // OAM_BIN named it, so the fix doctor and install print is OAM_BIN's.
+        viaOamBin: true,
       });
       expect(spawnCalls, "build-tree binary reached the spawn").toEqual([]);
     } finally {
@@ -376,6 +378,8 @@ describe("probeOam default runner", () => {
       const probe = await probeOam();
       expect(probe.failure).toBe("build-tree");
       expect(probe.failureDetail).toContain(bin);
+      // A bare name found it on PATH, so the fix is PATH order.
+      expect(probe.viaOamBin).toBe(false);
       expect(spawnCalls).toEqual([]);
     } finally {
       if (savedPath === undefined) delete process.env.PATH;

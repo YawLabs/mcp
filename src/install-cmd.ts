@@ -1363,7 +1363,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
       oamProbeResult.failure === "build-tree"
         ? `Runtime: node (${oamFailureLabel(oamProbeResult.failure)}` +
             `${oamProbeResult.failureDetail ? ` -- ${oamProbeResult.failureDetail}` : ""}. Fix: ` +
-            `${oamBuildTreeFix(os)}; then re-run install to host yaw-mcp on it.)`
+            `${oamBuildTreeFix(os, oamProbeResult.viaOamBin === true)}; then re-run install to host yaw-mcp on it.)`
         : `Runtime: node (oam is installed but unusable: ${oamFailureLabel(oamProbeResult.failure)}` +
             `${oamProbeResult.failureDetail ? ` -- ${oamProbeResult.failureDetail}` : ""}. Fix or reinstall oam and ` +
             "re-run install to host yaw-mcp on it.)",

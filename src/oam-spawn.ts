@@ -381,23 +381,39 @@ export function oamReleaseDir(os: InstallOS): string {
 }
 
 /**
- * The fix for a build-tree oam that a bare name finds on PATH. One source for
- * the wording, which the probe's warn, doctor's OAM RUNTIME section and
- * `install`'s Runtime line all print.
+ * The fix for a build-tree oam. One source for the wording, which the probe's
+ * warn, doctor's OAM RUNTIME section and `install`'s Runtime line all print.
  *
- * Pointing at "the installed oam" is not enough on its own, because there may
- * be none. Since oam 0.19.0 (#315) the installer refuses while another oam
- * resolves ahead of its install dir on PATH, and a dev build is the case it
- * names. So the user has to reorder PATH before they install. Only install.ps1
- * has the OAM_SKIP_PATH_SHADOW=1 escape; install.sh refuses outright.
+ * `viaOamBin` (OamProbe.viaOamBin) picks the branch. An OAM_BIN naming the
+ * build tree wins over PATH, so reordering PATH cannot help there; the fix is
+ * OAM_BIN itself. A bare name landing on a build tree means a build dir sits
+ * earlier on PATH than the release.
+ *
+ * For the PATH case, pointing at "the installed oam" is not enough on its own,
+ * because there may be none. Since oam 0.19.0 (#315) the installer refuses
+ * while another oam resolves ahead of its install dir on PATH, and a dev build
+ * is the case it names. So the user has to reorder PATH before they install.
+ * Only install.ps1 has the OAM_SKIP_PATH_SHADOW=1 escape; install.sh refuses
+ * outright.
+ *
+ * The dir named is the installer's DEFAULT, said as such: OAM_INSTALL_DIR moves
+ * it, and an existing install can live elsewhere (install.sh run from Git Bash
+ * on Windows puts it in ~/.oam/bin).
  */
-export function oamBuildTreeFix(os: InstallOS): string {
+export function oamBuildTreeFix(os: InstallOS, viaOamBin = false): string {
   const dir = oamReleaseDir(os);
+  const where = `${dir} (the installer default; OAM_INSTALL_DIR changes it)`;
+  if (viaOamBin) {
+    return (
+      `point OAM_BIN at an installed release oam, or unset it to use the oam on PATH; ` +
+      `with no release installed, install one first (${oamInstallCommand(os)}, into ${where})`
+    );
+  }
   const override = os === "windows" ? " (OAM_SKIP_PATH_SHADOW=1 overrides it)" : "";
   return (
-    `put ${dir} ahead of the build tree on PATH, or point OAM_BIN at an installed release oam; ` +
-    `with no release installed, reorder PATH first, since the installer (${oamInstallCommand(os)}) ` +
-    `refuses while another oam resolves ahead of ${dir}${override}`
+    `put the release oam's dir, ${where}, ahead of the build tree on PATH, or point OAM_BIN at an ` +
+    `installed release oam; with no release installed, reorder PATH first, since the installer ` +
+    `(${oamInstallCommand(os)}) refuses while another oam resolves ahead of its dir${override}`
   );
 }
 
@@ -529,6 +545,11 @@ export interface OamProbe {
   /** The underlying error message behind `failure`, for diagnostics. Null
    *  whenever `failure` is null. */
   failureDetail: string | null;
+  /** Set with `failure: "build-tree"` only: true when OAM_BIN named the binary,
+   *  false when a bare name found it on PATH. The fix differs (see
+   *  oamBuildTreeFix), and doctor and `install` cannot tell from their own env,
+   *  because the probe reads process.env. */
+  viaOamBin?: boolean;
 }
 
 let oamProbeCache: OamProbe | undefined;
@@ -1161,9 +1182,7 @@ async function probeOamUncached(run: (bin: string) => Promise<string>, generatio
     // than the install, fixed by PATH order.
     log("warn", "oam resolves to a local build-tree binary; falling back to node for this process", {
       bin: absResolved,
-      fix: explicit
-        ? `point OAM_BIN at the installed oam (${oamReleaseDir(CURRENT_OS)} by default)`
-        : oamBuildTreeFix(CURRENT_OS),
+      fix: oamBuildTreeFix(CURRENT_OS, explicit),
       thenRestart: "restart yaw-mcp; this probe is cached for the process lifetime",
     });
     return publish({
@@ -1173,6 +1192,7 @@ async function probeOamUncached(run: (bin: string) => Promise<string>, generatio
       belowMin: false,
       failure: "build-tree",
       failureDetail: `${absResolved} is a compiler output binary (build-tree), not a release`,
+      viaOamBin: explicit,
     });
   }
   /** The cross-process verdict cache applies only to the REAL probe: an
