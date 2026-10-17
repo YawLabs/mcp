@@ -2759,7 +2759,9 @@ describe("runDoctor — OAM RUNTIME section", () => {
     const txt = cap.text();
     expect(txt).toContain("installed but UNUSABLE");
     expect(txt).toContain("local build-tree oam, not a release");
-    expect(txt).toContain("fix: put ~/.oam/bin ahead of the build tree on PATH, or point OAM_BIN at an installed");
+    expect(txt).toContain(
+      "fix: put the release oam's dir, ~/.oam/bin (the installer default; OAM_INSTALL_DIR changes it), ahead of the build tree on PATH",
+    );
     // Since oam 0.19.0 the installer refuses while the build tree shadows its
     // dir, so the line must say to reorder PATH before installing.
     expect(txt).toContain("reorder PATH first, since the installer (curl -fsSL https://oamjs.org/install.sh | sh)");
@@ -2772,10 +2774,28 @@ describe("runDoctor — OAM RUNTIME section", () => {
     const cap = captureOut();
     await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "windows", out: cap.out, oamProbe: oamBuildTree });
     const txt = cap.text();
-    expect(txt).toContain("fix: put %LOCALAPPDATA%\\oam\\bin ahead of the build tree on PATH");
+    expect(txt).toContain("fix: put the release oam's dir, %LOCALAPPDATA%\\oam\\bin (the installer default;");
     expect(txt).toContain("irm https://oamjs.org/install.ps1 | iex");
     expect(txt).toContain("(OAM_SKIP_PATH_SHADOW=1 overrides it)");
     expect(txt).not.toContain("~/.oam/bin");
+  });
+
+  it("tells an OAM_BIN-named build tree to fix OAM_BIN, not PATH order", async () => {
+    // OAM_BIN wins over PATH, so reordering PATH cannot help. The probe reads
+    // process.env, so the branch comes from probe.viaOamBin, not doctor's env.
+    const cap = captureOut();
+    await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      oamProbe: () => ({ ...oamBuildTree(), viaOamBin: true }),
+    });
+    const txt = cap.text();
+    expect(txt).toContain("fix: point OAM_BIN at an installed release oam, or unset it to use the oam on PATH");
+    expect(txt).toContain("install one first (curl -fsSL https://oamjs.org/install.sh | sh, into ~/.oam/bin");
+    expect(txt).not.toContain("ahead of the build tree on PATH");
   });
 
   it("keeps saying not-installed when oam is genuinely absent", async () => {
