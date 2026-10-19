@@ -577,6 +577,39 @@ describe("runSet -- the [y/N] prompt runs outside the bundles lock", () => {
     expect(cap.errText()).toContain("changed");
     expect(readFileSync(bundlesPath(), "utf8")).toBe(changed);
   });
+
+  it("the same refusal under --json is the documented { ok, error, path, namespace } payload", async () => {
+    // The app reads the JSON shape; the text arm above is its prose twin, and
+    // the two can drift -- one gaining `namespace`, say, and the other not.
+    writeBundles(SAMPLE);
+    const changed = SAMPLE.replace('"GITHUB_TOKEN": "t"', '"GITHUB_TOKEN": "rotated"');
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const cap = capture();
+    const prompted = new Promise<void>((resolve) => stdout.on("data", () => resolve()));
+    const pending = runSet({
+      target: "gh",
+      assignments: ["env.GITHUB_TOKEN="],
+      home: synthHome,
+      json: true,
+      isTTY: true,
+      io: { stdin, stdout },
+      ...cap,
+    });
+    await prompted;
+    writeFileSync(bundlesPath(), changed);
+    stdin.write("y\n");
+    const r = await pending;
+    expect(r.exitCode).toBe(1);
+    const payload = JSON.parse(cap.errText()) as Record<string, unknown>;
+    expect(payload).toEqual({
+      ok: false,
+      path: bundlesPath(),
+      namespace: "gh",
+      error: expect.stringContaining("env.GITHUB_TOKEN"),
+    });
+    expect(readFileSync(bundlesPath(), "utf8")).toBe(changed);
+  });
 });
 
 describe("runSet -- an env this command cannot edit", () => {

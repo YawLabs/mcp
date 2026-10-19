@@ -4993,6 +4993,28 @@ describe("runDoctor -- a launch path written for another OS", () => {
     const gone = await probeClientsAsync({ home: synthHome, os: "windows", cwd: synthCwd, platform: "win32" });
     expect(gone.find((c) => c.clientId === "claude-code" && c.scope === "user")?.launchCommandMissing).toBe(bare);
   });
+
+  it("on win32 an oam.cmd shim (npm install -g's shape) resolves through PATHEXT too", async () => {
+    // `npm install -g` writes oam.cmd + oam.ps1, not oam.exe, so the .exe-only
+    // tests above pin a binary that exists only for a manually downloaded
+    // release. .cmd is in the fixed WIN_PATHEXT list; this holds the list to it.
+    writeFileSync(join(synthHome, "oam.cmd"), "");
+    const bare = join(synthHome, "oam");
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: bare, args: ["run", "--no-check", "x.js"] } } }),
+    );
+    const native = await probeClientsAsync({ home: synthHome, os: "windows", cwd: synthCwd, platform: "win32" });
+    const client = native.find((c) => c.clientId === "claude-code" && c.scope === "user");
+    expect(client?.launchRuntime).toBe("oam");
+    expect(client?.launchCommandMissing).toBeNull();
+    // Control: an extension only outside PATHEXT must NOT complete the path --
+    // .ps1 is deliberately absent, and libuv does not try it either.
+    rmSync(join(synthHome, "oam.cmd"));
+    writeFileSync(join(synthHome, "oam.ps1"), "");
+    const ps1only = await probeClientsAsync({ home: synthHome, os: "windows", cwd: synthCwd, platform: "win32" });
+    expect(ps1only.find((c) => c.clientId === "claude-code" && c.scope === "user")?.launchCommandMissing).toBe(bare);
+  });
 });
 
 describe("runDoctor -- a TRANSIENT client-config read (EBUSY / EAGAIN)", () => {

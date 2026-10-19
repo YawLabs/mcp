@@ -638,6 +638,20 @@ describe("addJsoncArrayElement / removeJsoncArrayElements over non-scalar elemen
     expect(removeJsoncArrayElements(src, ["permissions", "allow"], (v) => v === "z")).toBe(src);
   });
 
+  it("the parse-error fallback's whole-array write leaves the trailing junk bytes untouched", () => {
+    // The fallback re-renders the array because there is no node to splice
+    // from; everything OUTSIDE it -- here the unterminated `/*` the parse
+    // error lives in -- must survive byte for byte, or the write is repairing
+    // one thing while mangling the file's tail.
+    const src = '{"permissions":{"allow":["x", /* keep */ "y"]}} /* unterminated';
+    const added = addJsoncArrayElement(src, ["permissions", "allow"], "z");
+    expect(added.endsWith(" /* unterminated")).toBe(true);
+    expect(parseJsonc(added)).toEqual({ permissions: { allow: ["x", "y", "z"] } });
+    const removed = removeJsoncArrayElements(added, ["permissions", "allow"], (v) => v === "x");
+    expect(removed.endsWith(" /* unterminated")).toBe(true);
+    expect(parseJsonc(removed)).toEqual({ permissions: { allow: ["y", "z"] } });
+  });
+
   it("returns the input when a removal's path names no array", () => {
     const src = lf("{", '  "rules": 1', "}", "");
     expect(removeJsoncArrayElements(src, ["rules"], () => true)).toBe(src);

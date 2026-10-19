@@ -221,6 +221,24 @@ describe("runHeal -- the outcomes that were already right keep their output and 
     expect(io.stderr()).toContain("YAW_MCP_READONLY_DIAGNOSTICS");
   });
 
+  it("under read-only, --json --dry-run reports dryRun alongside readOnly, and --quiet drops the note", async () => {
+    // The consumer that reads heal --json (the Yaw app's poller) reads
+    // `dryRun` and `readOnly` together; and --quiet, which drops every other
+    // transcript line, must drop this one too -- its stderr channel is not
+    // the error channel.
+    const io = captureStreams();
+    await runHeal({ json: true, dryRun: true, quiet: true }, sweepOf({ skipped: "read-only" }));
+    expect(JSON.parse(io.stdout())).toEqual({
+      healed: [],
+      unhealable: [],
+      failed: [],
+      count: 0,
+      dryRun: true,
+      readOnly: true,
+    });
+    expect(io.stderr()).toBe("");
+  });
+
   it("names the project for each local-scope entry, so one file's entries are not N identical lines", async () => {
     // ~/.claude.json holds one container per project, and the sweep reaches
     // them all; every line used to read `claude-code (local): <file>`.

@@ -2214,6 +2214,56 @@ describe("release.sh behaviour-change gate (fixture run)", () => {
     expect(r.out).toContain("found in the Unreleased section");
     expect(r.out).toContain("CONTINUED");
   });
+
+  it("the gate's two aborts print no failure banner either, while a real failure still does", () => {
+    // The ABORTED marker was added to every refusal site at once, but the
+    // non-interactive describe pins only the stdin brake. A gate abort is a
+    // refusal a wrapper reads the exit code of: it gets the gate's own
+    // "Aborted:" line and exit 1, never "[x] Release failed".
+    writeFileSync(join(dir, "CHANGELOG.md"), CHANGELOG);
+    const trapBlock = extractBlock('WORKDIR=""', "trap cleanup EXIT");
+    const body = (extra: string[]): string =>
+      [
+        "set -Eeuo pipefail",
+        trapBlock,
+        STUB_HELPERS,
+        'VERSION="0.81.0"',
+        "CYAN=''; YELLOW=''; NC=''",
+        ...extra,
+        block,
+        'echo "CONTINUED"',
+      ].join("\n");
+    const runHarness = (name: string, script: string, input: string, env: Record<string, string> = {}): RunResult => {
+      const file = join(dir, name);
+      writeFileSync(file, script);
+      const r = spawnSync("bash", [file], {
+        cwd: dir,
+        encoding: "utf8",
+        input,
+        env: { ...baseEnv(), NO_COLOR: "1", ...env },
+      });
+      return { status: r.status, out: `${r.stdout ?? ""}${r.stderr ?? ""}` };
+    };
+
+    const blank = runHarness("gate-blank-abort.sh", body([]), "y\n   \n");
+    expect(blank.out).toContain("Aborted: a default-on behaviour change ships with a documented way back");
+    expect(blank.out).not.toContain("Release failed");
+    expect(blank.status).toBe(1);
+
+    const undocumented = runHarness("gate-undocumented-abort.sh", body([]), "y\n--no-such-switch\n");
+    expect(undocumented.out).toContain("does not appear in CHANGELOG.md's Unreleased section");
+    expect(undocumented.out).not.toContain("Release failed");
+    expect(undocumented.status).toBe(1);
+
+    // Positive control: a plain exit 1 under the same harness still gets the
+    // banner, so the assertions above are not passing on a banner that could
+    // never print.
+    const failed = runHarness("gate-force-fail.sh", body(['if [ "${FORCE_FAIL:-}" = "1" ]; then exit 1; fi']), "y\n", {
+      FORCE_FAIL: "1",
+    });
+    expect(failed.out).toContain("Release failed at line unknown (exit code 1)");
+    expect(failed.status).toBe(1);
+  });
 });
 
 // Git for every case below that runs real git: an empty global config, no

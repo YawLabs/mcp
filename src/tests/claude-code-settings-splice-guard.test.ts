@@ -10,7 +10,14 @@ import { CLAUDE_CODE_ALLOW_PATTERN, prepareClaudeCodeSettingsPatch } from "../cl
 // the report from.
 vi.mock("../jsonc.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../jsonc.js")>();
-  return { ...actual, removeJsoncArrayElements: (src: string) => src };
+  // Both ops: patchPermissionsAllowText routes add through addJsoncArrayElement
+  // and remove through removeJsoncArrayElements, and the guard's byte check is
+  // the same one either way.
+  return {
+    ...actual,
+    addJsoncArrayElement: (src: string) => src,
+    removeJsoncArrayElements: (src: string) => src,
+  };
 });
 
 const homes: string[] = [];
@@ -37,6 +44,30 @@ describe("prepareClaudeCodeSettingsPatch -- splice guard", () => {
     });
     expect(patch?.changed).toBe(false);
     expect(patch?.removed).toEqual([]);
+    expect(patch?.malformed).toBe(true);
+    expect(patch?.malformedReason).toContain("could not splice permissions.allow");
+  });
+
+  it("never reports an addition when the add splice left the pattern out of the bytes", async () => {
+    // The add side of the same guard: the report is computed from the PARSED
+    // allow, the bytes are what install publishes, and a splice that no-ops
+    // must not read as "changed: true, added: [pattern]". The mocked
+    // removeJsoncArrayElements above no-ops every call, and
+    // patchPermissionsAllowText routes the add through addJsoncArrayElement,
+    // which is NOT mocked -- so pin the mock to the op the test drives.
+    const home = mkdtempSync(join(tmpdir(), "yaw-ccs-guard-"));
+    homes.push(home);
+    mkdirSync(join(home, ".claude"), { recursive: true });
+    writeFileSync(join(home, ".claude", "settings.json"), `{\n  "permissions": { "allow": [] }\n}\n`, "utf8");
+    const patch = await prepareClaudeCodeSettingsPatch({
+      scope: "user",
+      home,
+      projectDir: undefined,
+      claudeConfigDir: undefined,
+      op: "add",
+    });
+    expect(patch?.changed).toBe(false);
+    expect(patch?.added).toEqual([]);
     expect(patch?.malformed).toBe(true);
     expect(patch?.malformedReason).toContain("could not splice permissions.allow");
   });

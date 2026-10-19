@@ -2530,6 +2530,29 @@ describe("runSecrets rotate -- the success path re-keys EVERY entry", () => {
     expect(err).toContain("YAW_MCP_VAULT_PASSPHRASE in THIS shell still holds the OLD passphrase");
     expect(err).toContain("restart it (restart your MCP client)");
     expect(outText()).not.toContain("will prompt");
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+  });
+
+  it("--json rotate under a set YAW_MCP_VAULT_PASSPHRASE reports passphrase_source: env", async () => {
+    // The scripted-rotation path: CI sets the env, rotates with --json, and a
+    // consumer keys its follow-up (update the secret, restart the client) off
+    // passphrase_source. The env-keyed arm existed only for reset and for
+    // rotate's text mode.
+    await runSecrets({ action: "set", name: "ONLY", value: "v", passphrase: ROT_PASS, home }, io);
+    lock();
+    io.out.mockReset();
+    io.err.mockReset();
+    process.env.YAW_MCP_VAULT_PASSPHRASE = ROT_PASS;
+    const r = await runSecrets({ action: "rotate", newPassphrase: ROT_NEW, home, json: true }, io);
+    expect(r.exitCode).toBe(0);
+    const lines = errJsonLines(io);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({
+      warning: "vault-rotated",
+      path: vaultPath(home),
+      passphrase_source: "env",
+    });
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
   });
 
   it("takes the NEW passphrase from YAW_MCP_VAULT_PASSPHRASE_NEW, warning when it is too short", async () => {
