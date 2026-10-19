@@ -574,8 +574,8 @@ export async function runSet(opts: SetCommandOptions): Promise<SetCommandResult>
       const changedKeys = [...new Set(assignments.filter((a) => a.field === "env").map((a) => a.key as string))].filter(
         (key) => JSON.stringify(loc.originalEnv[key]) !== JSON.stringify(pre.originalEnv[key]),
       );
-      if (loc.namespace !== pre.namespace || changedKeys.length > 0) {
-        const what = changedKeys.length > 0 ? changedKeys.map((k) => `env.${k}`).join(", ") : "the entry";
+      if (changedKeys.length > 0) {
+        const what = changedKeys.map((k) => `env.${k}`).join(", ");
         const error = `${what} on "${pre.namespace}" changed in ${path} since it was read -- nothing was written; re-run to apply.`;
         if (opts.json) printErr(JSON.stringify({ ok: false, error, path, namespace: pre.namespace }));
         else printErr(`yaw-mcp ${verb}: ${error}`);
