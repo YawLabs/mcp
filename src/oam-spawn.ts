@@ -287,7 +287,7 @@ export function npxSpec(args: readonly string[]): string | null {
  * floor that is too high costs a fallback, while one that is too low hosts
  * production sidecars on a build the check never ran on.
  */
-export const MIN_OAM_VERSION = "0.18.0";
+export const MIN_OAM_VERSION = "0.19.1";
 
 /** The oam installer one-liners, as oamjs.org publishes them. Both install the
  *  current release, which always satisfies MIN_OAM_VERSION. */
@@ -1456,9 +1456,10 @@ export function nodeLaunchKind(command: string): "node" | "npx" | null {
 }
 
 /** Entry extensions oam type-checks; it never checks any other entry. Every
- *  released oam (through 0.19.0) defaults `oam run` to `--check warn`, so a
- *  TypeScript entry spawns tsgo alongside the server. oam main (#412, slated
- *  for 0.19.1 and untagged as of 2026-10-16) makes the default unchecked. */
+ *  oam through 0.19.0 defaults `oam run` to `--check warn`, so a TypeScript
+ *  entry spawns tsgo alongside the server. 0.19.1 (#412, measured on the
+ *  release itself) defaults to `off` -- a type-erroring entry runs and exits 0
+ *  -- while still accepting `--no-check`. */
 const TS_ENTRY_RE = /\.[mc]?ts$/i;
 
 /**
@@ -1484,9 +1485,12 @@ export function rewriteForOam(
     // real error. The rewrite is billed as a pure optimization of a launch
     // node was already going to run unchecked, so adding a check is not our
     // call: `--no-check` keeps the hosted launch behaving like the one it
-    // replaced. oam main (#412, slated for 0.19.1) runs unchecked by default
-    // and still accepts the flag. Keep it while MIN_OAM_VERSION admits an oam
-    // that checks.
+    // replaced. From 0.19.1 (#412, now the floor) `oam run` runs unchecked by
+    // default and still accepts the flag, so it is explicit intent rather than
+    // a behavior change -- and it keeps the emitted argv in the same shape
+    // install writes into client configs (install-targets.ts), `run
+    // --no-check <entry>`, which is the shape doctor and the heal pass parse
+    // (oamRunEntryFromTokens skips the flag and takes the entry after it).
     const flags = TS_ENTRY_RE.test(entry) ? ["--no-check"] : [];
     return {
       command: bin,

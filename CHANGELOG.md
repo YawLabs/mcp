@@ -54,6 +54,10 @@ The filter applied to an upstream's `instructions` before the model sees them no
 
 Comment and doc corrections across the tree -- moved or rewritten JSDoc, stale claims about CI, callers and exports, README's runtime detection and meta-tool table, CONTRIBUTING's checklists, the `--help` text for doctor, compliance (88 tests on 2025-11-25, 103 on 2026-07-28) and `YAW_MCP_SIDECAR_REFRESH`, and the import usage's 0600 claim, now qualified as macOS/Linux -- change no behaviour.
 
+**Changed -- the oam floor moves to 0.19.1**
+
+`npm run verify:oam-floor` hosted a stdio `@modelcontextprotocol/server` server on oam v0.19.1 through `oam run` on 2026-10-21 -- both protocol eras, 2025-11-25 (initialize) and 2026-07-28 (server/discover), each through tools/list and tools/call -- and raised `MIN_OAM_VERSION` to it; the floor was 0.18.0. A machine whose oam is older hosts its node/npx sidecars on node instead, and logs a warning naming both versions, `oam self-update` as the fix, and that yaw-mcp needs a restart afterwards.
+
 ## 1.1.1 -- the fix printed for a build-tree oam survives oam 0.19.0's installer, and names `OAM_BIN` when `OAM_BIN` chose the binary
 
 **Fixed -- the build-tree oam fix advice survives oam 0.19.0's installer refusal, and names `OAM_BIN` when `OAM_BIN` chose the binary**

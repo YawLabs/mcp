@@ -831,13 +831,14 @@ describe("rewriteForOam", () => {
   });
 
   it("turns oam's concurrent type-checker off for a TypeScript entry", () => {
-    // Every released oam (through 0.19.0) defaults `oam run` to `--check warn`
-    // (oam main, slated for 0.19.1, does not), so a rewritten `node server.ts`
-    // spawns tsgo alongside the sidecar and writes its diagnostics to the
-    // child's stderr -- which is what lands in the 500-char failure tail when
-    // a boot fails, in place of the real error. node ran the file unchecked;
-    // the rewrite is billed as a pure optimization, so it must not add a
-    // checker the original launch never had.
+    // Every oam through 0.19.0 defaults `oam run` to `--check warn`, so a
+    // rewritten `node server.ts` spawns tsgo alongside the sidecar and writes
+    // its diagnostics to the child's stderr -- which is what lands in the
+    // 500-char failure tail when a boot fails, in place of the real error.
+    // node ran the file unchecked; the rewrite is billed as a pure
+    // optimization, so it must not add a checker the original launch never
+    // had. From 0.19.1 (#412) the default is already off; the flag stays as
+    // explicit intent and config-shape parity with install's entries.
     expect(rewriteForOam("node", ["/srv/server.ts"], oam)).toEqual({
       command: "oam",
       args: ["run", "--no-check", "/srv/server.ts"],
@@ -2838,7 +2839,7 @@ describe("MIN_OAM_VERSION freshness floor", () => {
   /** The ratchet. ONE literal, and the title is built from it, so the two
    *  cannot say different numbers -- the title used to name 0.13.0 while the
    *  body asserted 0.13.1. */
-  const FLOOR = "0.18.0";
+  const FLOOR = "0.19.1";
 
   it(`is at least ${FLOOR} (bump this literal when you bump the floor)`, () => {
     // POLICY (see the constant's doc): the floor is the last oam release the
