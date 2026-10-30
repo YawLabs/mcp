@@ -4,6 +4,10 @@ All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented 
 
 ## Unreleased
 
+**Added -- `release.sh` installs each build into every supported client and launches what it wrote**
+
+`npm run verify:clients` (`scripts/verify-clients.mjs`) runs in step 2, after the build and before the bump, tag and push. Inside a throwaway home it installs the built `dist/` into all 12 client ids at every scope each accepts (20 on Windows). It re-parses every file install reports writing, and launches each distinct entry exactly as its client spawns it: `cmd /c npx` raw, a bare `npx` through the `.cmd` shim. Each launch must complete initialize, tools/list and a tools/call. Where the client's own CLI is on PATH, that CLI reads the sandbox one scope at a time: `claude mcp get` must report the scope under test as Connected, `gemini mcp list` must list the entry, and `codex mcp get --json` must parse it. The run ends with uninstall, and every entry must be gone. The entries stay `npx -y @yawlabs/mcp@latest`, byte for byte what users get. A 127.0.0.1 registry, which the sandbox `~/.npmrc` routes the `@yawlabs` scope to, serves `npm pack` of the checkout as a per-run prerelease that npmjs.org does not have, so a launch that ran anything else cannot pass. It takes 25-100 s. `SKIP_CLIENT_MATRIX=1` is the last-resort skip.
+
 **Changed -- the npm and MCP registry descriptions are one sentence, and the retired "managed from yaw.sh/mcp" is gone**
 
 `package.json` and `server.json` now carry the same description: "MCP gateway: one local install fronts every MCP server for Claude Code, Cursor, and VS Code." The registry's copy no longer says the install is managed from yaw.sh/mcp, which stopped being true when the config went local-only.
