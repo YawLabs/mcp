@@ -108,6 +108,19 @@
 #                                    by hand and committed like any change,
 #                                    does that (see scripts/verify-oam-floor.mjs
 #                                    for why release.sh stopped moving it).
+#   SKIP_CLIENT_MATRIX=1             DISABLES THE CLIENT MATRIX GATE -- step
+#                                    2's `npm run verify:clients`, which
+#                                    installs the dist/ just built into every
+#                                    supported client inside a throwaway home,
+#                                    launches each written entry through a
+#                                    local registry serving this build as
+#                                    @yawlabs/mcp@latest, runs the claude /
+#                                    gemini / codex CLIs found on PATH against
+#                                    it, and uninstalls. About 100 s. A last
+#                                    resort for a machine that cannot run it
+#                                    (no network for the dependency install):
+#                                    the release then ships with no proof an
+#                                    installed entry starts.
 #   GITHUB_TOKEN=<pat>               GitHub token for the step-5 MCP-registry
 #                                    login (needs publish rights on
 #                                    io.github.YawLabs/*). Step 5 reads it only
@@ -1231,6 +1244,24 @@ if [ "$BUILD_RC" -ne 0 ]; then
   [ "$BUILD_TOLERATED" = true ] || fail "Build failed (exit $BUILD_RC)"
 fi
 info "Build complete"
+# >>> client matrix gate
+# scripts/verify-clients.mjs runs the dist/ above, so it sits after the build
+# and before step 3's irreversible bump, tag and push. It installs into every
+# client id `install --help` names, at every scope each accepts, inside a temp
+# HOME; launches each written entry exactly as its client spawns it, through a
+# 127.0.0.1 registry serving `npm pack` of this checkout as @yawlabs/mcp@latest
+# (so the entries stay what users get and still run this build); runs `claude
+# mcp list`, `gemini mcp list` and `codex mcp get` where those CLIs are on
+# PATH; and uninstalls. A client CLI that is absent is a skip line, not a
+# failure. Like the oam floor gate, it prints exactly one
+# `[verify:clients] OK` or `FAIL` line, and its per-check lines are indented,
+# so the anchored patterns cannot match one of them.
+if [ "${SKIP_CLIENT_MATRIX:-}" = "1" ]; then
+  warn "SKIP_CLIENT_MATRIX=1 -- skipping 'Client matrix' (no installed entry was launched against this build)"
+else
+  run_npm_check "Client matrix" verify:clients '^\[verify:clients\] FAIL' '^\[verify:clients\] OK'
+fi
+# <<< client matrix gate
 
 step 3 "Bump version to $VERSION, commit, tag, and push"
 # Re-read current version (the resume path can skip a bump that's already done).
