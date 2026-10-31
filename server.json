@@ -2,12 +2,12 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.YawLabs/mcp",
   "description": "MCP gateway: one local install fronts every MCP server for Claude Code, Cursor, and VS Code.",
-  "version": "1.1.4",
+  "version": "1.1.5",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@yawlabs/mcp",
-      "version": "1.1.4",
+      "version": "1.1.5",
       "transport": {
         "type": "stdio"
       }
