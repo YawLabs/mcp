@@ -243,8 +243,23 @@ const TARGET_ROWS = [
     label: "Gemini CLI",
     config: { format: "jsonc", root: "mcpServers" },
     availableOn: ["macos", "linux", "windows"],
+    // The folder-trust sentence was measured on Gemini CLI 0.66.0 (Linux,
+    // 2026-10-31): in a folder not yet trusted, `gemini mcp list` showed a
+    // working user-level server as "Disabled", with "MCP servers are
+    // configured but disabled because this folder is untrusted. User-level
+    // servers are also suppressed in untrusted folders", and the same entry
+    // connected once the folder was trusted. The prompt it names is that
+    // release's own string. That `mcp list` ran without a TTY and still
+    // treated the folder as untrusted, so a scripted run has no prompt to
+    // answer -- hence the trust-it-once-interactively sentence; the trust
+    // lands in ~/.gemini/trustedFolders.json, which the same probe showed
+    // later runs honour. 0.30 and 0.32 connected the same entry with no
+    // trust recorded, but only from a non-TTY `mcp list`, which those
+    // releases treat as headless and trusted -- their interactive behaviour
+    // was not measured. So the note says "recent" rather than naming a
+    // version range.
     notes:
-      "Gemini CLI merges ~/.gemini/settings.json with <project>/.gemini/settings.json, project winning. `mcpServers` is a top-level key, distinct from the sibling `mcp` object that holds discovery knobs.",
+      'Gemini CLI merges ~/.gemini/settings.json with <project>/.gemini/settings.json, project winning. `mcpServers` is a top-level key, distinct from the sibling `mcp` object that holds discovery knobs. Recent Gemini CLI releases start no MCP server -- user-level ones included -- in a folder you have not trusted: answer yes to its "Do you trust the files in this folder?" prompt, or yaw-mcp shows as Disabled there. Non-interactive runs never ask, so open gemini in the folder once and trust it there; the answer is kept for later runs.',
     scopes: [
       {
         scope: "user",
