@@ -4,6 +4,8 @@ All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented 
 
 ## Unreleased
 
+## 1.1.6 -- `install gemini-cli` says Gemini CLI starts no server in an untrusted folder, and the client matrix passes on macOS and Linux
+
 **Changed -- `install gemini-cli` says Gemini CLI starts no server in an untrusted folder**
 
 Gemini CLI 0.66 starts no MCP server, user-level ones included, in a folder the user has not trusted, and lists each one Disabled. Install succeeded and yaw-mcp simply never appeared there. The install note now says so, and names the fix: answer yes to Gemini's "Do you trust the files in this folder?" prompt. A non-interactive run never shows that prompt, so the note says to open gemini in the folder once and trust it there, and that the answer is kept for later runs.
