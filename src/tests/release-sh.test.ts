@@ -2430,6 +2430,46 @@ describe("release.sh oam floor gate placement", () => {
   });
 });
 
+describe("release.sh client matrix gate placement", () => {
+  const lines = releaseSh.split("\n");
+  const at = (l: string) => {
+    const i = lines.indexOf(l);
+    if (i === -1) {
+      throw new Error(`release.sh anchor not found: ${JSON.stringify(l)}`);
+    }
+    return i;
+  };
+
+  it("runs inside step 2, after the build and before step 3's bump", () => {
+    // After the build because it runs dist/; before step 3 because that step
+    // commits, tags and pushes, and a broken install must stop the release
+    // while nothing has left the machine.
+    const order = [
+      at('step 2 "Build"'),
+      at('info "Build complete"'),
+      at("# >>> client matrix gate"),
+      at(`  run_npm_check "Client matrix" verify:clients '^\\[verify:clients\\] FAIL' '^\\[verify:clients\\] OK'`),
+      at("# <<< client matrix gate"),
+      at('step 3 "Bump version to $VERSION, commit, tag, and push"'),
+    ];
+    expect(order).toEqual([...order].sort((a, b) => a - b));
+  });
+
+  it("anchors on the exact OK / FAIL lines the verifier prints", () => {
+    const verifier = readFileSync(join(repoRoot, "scripts", "verify-clients.mjs"), "utf8");
+    expect(verifier).toContain('export const TAG = "[verify:clients]";');
+    expect(verifier).toContain("`${TAG} OK -- ");
+    expect(verifier).toContain("`${TAG} FAIL -- ");
+    expect(JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8")).scripts["verify:clients"]).toBe(
+      "node scripts/verify-clients.mjs",
+    );
+  });
+
+  it("documents the skip in the header", () => {
+    expect(releaseSh).toContain("#   SKIP_CLIENT_MATRIX=1             DISABLES THE CLIENT MATRIX GATE");
+  });
+});
+
 describe("release.sh origin/main sync guard", () => {
   // With no floor commit for a re-run to carry over, the guard is two stops
   // again: ahead means push, anything else means pull. A resume still passes.
@@ -2672,6 +2712,16 @@ describe("release.sh oam floor gate (stubbed full run)", () => {
     '          echo " Test Files  3 passed (3)"',
     "        fi ;;",
     '      build) mkdir -p dist; echo "built" > dist/index.js ;;',
+    // client-matrix-fail: the verifier's per-check FAIL line (indented, so the
+    // gate's anchored pattern must not match it) and then its summary.
+    "      verify:clients)",
+    '        if [ -f "$FAKE_STATE/client-matrix-fail" ]; then',
+    '          echo "  FAIL  launch cmd /c npx -y @yawlabs/mcp@latest [cursor/user]: exited (1) before answering initialize"',
+    '          echo "[verify:clients] FAIL -- 1 check(s) failed; 20 client scopes over 12 client ids"',
+    "          exit 1",
+    "        fi",
+    '        echo "  FAIL  is how a failed check line starts, and this one is only a fixture"',
+    '        echo "[verify:clients] OK -- 20 client scopes over 12 client ids, 2 launch shape(s), 0 warned, 8 skipped, 99.0s" ;;',
     "    esac ;;",
     "  version)",
     `    node -e 'const fs=require("fs");const j=JSON.parse(fs.readFileSync("package.json","utf8"));j.version=process.argv[1];fs.writeFileSync("package.json",JSON.stringify(j,null,2)+String.fromCharCode(10))' "$2" ;;`,
@@ -2869,6 +2919,7 @@ describe("release.sh oam floor gate (stubbed full run)", () => {
         ALLOW_STALE_REMOTE: "",
         ALLOW_UNVERIFIED_VERSION: "",
         SKIP_OAM_FLOOR_VERIFY: "",
+        SKIP_CLIENT_MATRIX: "",
         ...env,
       },
     });
@@ -2969,7 +3020,8 @@ describe("release.sh oam floor gate (stubbed full run)", () => {
     expect(r.out).toContain("No stale local tag for --follow-tags to carry");
     expect(r.out).toContain("npm: @yawlabs/mcp@1.0.2");
     expect(r.out).toContain("npm tarball: content matches this build");
-    // The verifier ran once, between the type check and the tests.
+    // The verifier ran once, between the type check and the tests, and the
+    // client matrix once, right after the build.
     const runs = npmLog(f)
       .split("\n")
       .filter((l) => l.startsWith("npm run "));
@@ -2979,6 +3031,7 @@ describe("release.sh oam floor gate (stubbed full run)", () => {
       "npm run verify:oam-floor",
       "npm run test",
       "npm run build",
+      "npm run verify:clients",
     ]);
     // Step 5's whole publish path ran: npm answered on the first read, the
     // pinned mcp-publisher came down and passed its sha256 check, logged in
@@ -3146,5 +3199,44 @@ describe("release.sh oam floor gate (stubbed full run)", () => {
     expect(skipped.status).toBe(0);
     expect(npmLog(f)).toContain("npm run verify:oam-floor\n"); // the run that failed under 0
     expect(npmLog(f).split("npm run verify:oam-floor").length - 1).toBe(1); // ...and only that one
+  });
+
+  it("runs the client matrix after the build, and passes over an indented FAIL check line", () => {
+    const f = setup();
+    const r = release(f);
+    expect(r.status).toBe(0);
+    expect(r.out).toContain("[verify:clients] OK");
+    const log = npmLog(f);
+    expect(log.indexOf("npm run build")).toBeGreaterThan(-1);
+    expect(log.indexOf("npm run verify:clients")).toBeGreaterThan(log.indexOf("npm run build"));
+    expect(log.indexOf("npm version")).toBeGreaterThan(log.indexOf("npm run verify:clients"));
+  });
+
+  it("fails the release at step 2 on the client matrix FAIL line, before the bump, the tag and the push", () => {
+    const f = setup();
+    writeFileSync(join(f.state, "client-matrix-fail"), "");
+    const r = release(f);
+    expect(r.out).toContain("[verify:clients] FAIL -- 1 check(s) failed");
+    expect(r.out).toContain("Client matrix failed");
+    expect(r.status).toBe(1);
+    expect(npmLog(f)).not.toContain("npm version");
+    expect(npmLog(f)).not.toContain("npm publish");
+    expect(subjects(f.bare, "main")).toEqual(["fixture"]);
+    expect(git(f.bare, ["tag", "-l"]).trim()).toBe("");
+    expect(JSON.parse(readFileSync(join(f.work, "package.json"), "utf8")).version).toBe("1.0.1");
+  });
+
+  it("skips the client matrix under SKIP_CLIENT_MATRIX=1, saying so, and never on 0", () => {
+    const f = setup();
+    writeFileSync(join(f.state, "client-matrix-fail"), "");
+    const zero = release(f, { SKIP_CLIENT_MATRIX: "0" });
+    expect(zero.out).toContain("Client matrix failed");
+    expect(zero.status).toBe(1);
+
+    const skipped = release(f, { SKIP_CLIENT_MATRIX: "1" });
+    expect(skipped.out).toContain("! SKIP_CLIENT_MATRIX=1 -- skipping 'Client matrix'");
+    expect(skipped.out).toContain("v1.0.2 released to npm + MCP registry.");
+    expect(skipped.status).toBe(0);
+    expect(npmLog(f).split("npm run verify:clients").length - 1).toBe(1); // only the run under 0
   });
 });
