@@ -8,6 +8,16 @@ All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented 
 
 `npm run verify:clients` (`scripts/verify-clients.mjs`) runs in step 2, after the build and before the bump, tag and push. Inside a throwaway home it installs the built `dist/` into all 12 client ids at every scope each accepts (20 on Windows). It re-parses every file install reports writing, and launches each distinct entry exactly as its client spawns it: `cmd /c npx` raw, a bare `npx` through the `.cmd` shim. Each launch must complete initialize, tools/list and a tools/call. Where the client's own CLI is on PATH, that CLI reads the sandbox one scope at a time: `claude mcp get` must report the scope under test as Connected, `gemini mcp list` must list the entry, and `codex mcp get --json` must parse it. The run ends with uninstall, and every entry must be gone. The entries stay `npx -y @yawlabs/mcp@latest`, byte for byte what users get. A 127.0.0.1 registry, which the sandbox `~/.npmrc` routes the `@yawlabs` scope to, serves `npm pack` of the checkout as a per-run prerelease that npmjs.org does not have, so a launch that ran anything else cannot pass. It takes 25-100 s. `SKIP_CLIENT_MATRIX=1` is the last-resort skip.
 
+## 1.1.4 -- the oam floor moves to 0.19.1
+
+There is no 1.1.3: that version was never published.
+
+**Changed -- the oam floor moves to 0.19.1**
+
+`npm run verify:oam-floor` hosted a stdio `@modelcontextprotocol/server` server on oam v0.19.1 through `oam run` on 2026-10-21 -- both protocol eras, 2025-11-25 (initialize) and 2026-07-28 (server/discover), each through tools/list and tools/call -- and raised `MIN_OAM_VERSION` to it; the floor was 0.18.0. A machine whose oam is older hosts its node/npx sidecars on node instead, and logs a warning naming both versions, `oam self-update` as the fix, and that yaw-mcp needs a restart afterwards.
+
+## 1.1.2 -- meta-tool hints name calls the model can make, find_tool, health and discover agree with the project profile, and an upstream's instructions and results are handled more strictly
+
 **Changed -- the npm and MCP registry descriptions are one sentence, and the retired "managed from yaw.sh/mcp" is gone**
 
 `package.json` and `server.json` now carry the same description: "MCP gateway: one local install fronts every MCP server for Claude Code, Cursor, and VS Code." The registry's copy no longer says the install is managed from yaw.sh/mcp, which stopped being true when the config went local-only.
@@ -57,10 +67,6 @@ Every on/off opt-in now goes through one parser that trims and accepts `1` or `t
 The filter applied to an upstream's `instructions` before the model sees them now removes every Unicode format character (`\p{Cf}`, which takes in the astral TAG block, the soft hyphen and U+180E) plus variation selectors, Hangul fillers, U+034F, U+17B4/17B5 and U+2800; tab and newline survive. The reward grader and the sampling tiebreak cap each tool name at 64 characters in their prompts. A tool result whose `content` is not an array is graded as empty (0.3) instead of 1.0, or a throw on an object.
 
 Comment and doc corrections across the tree -- moved or rewritten JSDoc, stale claims about CI, callers and exports, README's runtime detection and meta-tool table, CONTRIBUTING's checklists, the `--help` text for doctor, compliance (88 tests on 2025-11-25, 103 on 2026-07-28) and `YAW_MCP_SIDECAR_REFRESH`, and the import usage's 0600 claim, now qualified as macOS/Linux -- change no behaviour.
-
-**Changed -- the oam floor moves to 0.19.1**
-
-`npm run verify:oam-floor` hosted a stdio `@modelcontextprotocol/server` server on oam v0.19.1 through `oam run` on 2026-10-21 -- both protocol eras, 2025-11-25 (initialize) and 2026-07-28 (server/discover), each through tools/list and tools/call -- and raised `MIN_OAM_VERSION` to it; the floor was 0.18.0. A machine whose oam is older hosts its node/npx sidecars on node instead, and logs a warning naming both versions, `oam self-update` as the fix, and that yaw-mcp needs a restart afterwards.
 
 ## 1.1.1 -- the fix printed for a build-tree oam survives oam 0.19.0's installer, and names `OAM_BIN` when `OAM_BIN` chose the binary
 
