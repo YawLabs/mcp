@@ -701,6 +701,7 @@ async function main() {
             });
             const scope = /Scope: (.+)/.exec(r.out)?.[1]?.trim() ?? "";
             const status = /Status: (.+)/.exec(r.out)?.[1]?.trim() ?? "";
+            if (!scope && r.rc !== 0) return cliFailed("claude", `claude mcp get [${who}]`, r);
             if (!scope.startsWith(SCOPE_LABEL[i.scope]))
               return bad(
                 `claude mcp get [${who}]: expected scope "${SCOPE_LABEL[i.scope]}", got "${scope || tail(r.out)}"`,
@@ -724,24 +725,38 @@ async function main() {
             // Gemini merges ~/.gemini/settings.json under the project's, so a
             // project check with the user file in reach could be answered by
             // it. Run that one from a HOME without it.
+            let checkHome = home;
             if (i.scope !== "user") {
-              const h = isolatedHome();
-              gEnv = { ...gEnv, HOME: h, USERPROFILE: h };
+              checkHome = isolatedHome();
+              gEnv = { ...gEnv, HOME: checkHome, USERPROFILE: checkHome };
               if (IS_WIN)
                 Object.assign(gEnv, {
-                  APPDATA: join(h, "AppData", "Roaming"),
-                  LOCALAPPDATA: join(h, "AppData", "Local"),
+                  APPDATA: join(checkHome, "AppData", "Roaming"),
+                  LOCALAPPDATA: join(checkHome, "AppData", "Local"),
                 });
             }
+            // Gemini 0.66 starts NO MCP server, user-level ones included, in a
+            // folder the user has not trusted, and lists each as "Disabled"
+            // (measured on Linux 2026-10-31; 0.30 and 0.32 treat a non-TTY
+            // run as headless and trusted). Record the trust a person gives,
+            // the way the claude check records project approval: an entry in
+            // ~/.gemini/trustedFolders.json, never an edit to the settings
+            // file install wrote.
+            mkdirSync(join(checkHome, ".gemini"), { recursive: true });
+            writeFileSync(
+              join(checkHome, ".gemini", "trustedFolders.json"),
+              JSON.stringify({ [cwdOf(i)]: "TRUST_FOLDER" }),
+            );
             const t0 = performance.now();
             const r = await runCli("gemini", ["mcp", "list"], { env: gEnv, cwd: cwdOf(i) });
             const line = (r.out.split(/\r?\n/).find((l) => /\bmcp: /.test(l)) ?? "").trim();
             const want = [i.entries[0].command, ...(i.entries[0].args ?? [])].join(" ");
+            if (!line && r.rc !== 0) return cliFailed("gemini", `gemini mcp list [gemini-cli/${i.scope}]`, r, gEnv);
             if (!line.includes(want))
               return bad(
                 `gemini mcp list [gemini-cli/${i.scope}]: entry not listed as \`${want}\`: ${line || tail(r.out)}`,
               );
-            if (/Connected/.test(line))
+            if (/\bConnected\b/.test(line))
               return ok(`gemini mcp list [gemini-cli/${i.scope}]: parsed, Connected${secs(t0)}`);
             // Gemini's `mcp list` gives a server a hard-coded 5 s to connect
             // (commands/mcp/list.js, `client.connect(transport, { timeout:
@@ -749,9 +764,13 @@ async function main() {
             // takes longer on Windows -- the same entry pointed at node
             // directly connects. The launch step is what proves the entry
             // starts, so a parsed-but-slow entry here is a warning, not a FAIL.
-            return warn(
-              `gemini mcp list [gemini-cli/${i.scope}]: parsed, but Disconnected within gemini's 5 s list-only connect budget${secs(t0)}`,
-            );
+            if (/\bDisconnected\b/.test(line))
+              return warn(
+                `gemini mcp list [gemini-cli/${i.scope}]: parsed, but Disconnected within gemini's 5 s list-only connect budget${secs(t0)}`,
+              );
+            // Any other status (Disabled, Blocked, ...) is gemini refusing to
+            // start the entry at all -- not a slow start -- so it is a FAIL.
+            return bad(`gemini mcp list [gemini-cli/${i.scope}]: ${line.replace(/^.*\(stdio\) - /, "")}${secs(t0)}`);
           })(),
         );
       }
@@ -766,6 +785,10 @@ async function main() {
           // file into the launch the launch step ran. Project scope is read
           // only once Codex trusts the project, so it is checked by launch.
           const r = await runCli("codex", ["mcp", "get", "mcp", "--json"], { env, cwd: home });
+          // Before the JSON parse: a codex that exited non-zero printed an
+          // error, not the entry, and parsing from its first "{" reported a
+          // broken codex install as a JSON syntax error.
+          if (r.rc !== 0) return cliFailed("codex", "codex mcp get [codex-cli/user]", r);
           try {
             const got = JSON.parse(r.out.slice(r.out.indexOf("{")));
             const want = codexUser.entries[0];
@@ -778,6 +801,30 @@ async function main() {
           }
         })(),
       );
+
+    /** The outcome for a client CLI command that exited non-zero without the
+     *  output its check reads. When `<name> --version` fails too, the CLI on
+     *  PATH cannot run at all (a broken install: on 2026-10-31 a Mac's codex
+     *  launcher pointed at a native binary npm never unpacked), which says
+     *  nothing about yaw-mcp, so it is a skip that names the cause, like an
+     *  absent CLI. Otherwise the CLI runs and its MCP command failed: a FAIL,
+     *  with the real exit code. */
+    async function cliFailed(name, label, r, cliEnv = env) {
+      const v = await runCli(name, ["--version"], { env: cliEnv, cwd: home });
+      if (v.rc !== 0)
+        return skip(
+          `${label}: the ${name} CLI on PATH cannot run (\`${name} --version\` exited ${v.rc}: ${errorLine(v.out)})`,
+        );
+      return bad(`${label}: ${name} exited ${r.rc}: ${errorLine(r.out)}`);
+    }
+
+    /** The line that says what went wrong: a node launcher that dies prints
+     *  `Error: spawn <path> ENOENT` first and then an inspected error object,
+     *  so the last two lines (`tail`) read `spawnargs: [...] / }`. */
+    function errorLine(out) {
+      const line = out.split(/\r?\n/).find((l) => /\b(Error|ENOENT|EACCES|EPERM)\b/.test(l));
+      return line ? line.trim().slice(0, 400) : tail(out);
+    }
 
     const withCli = new Set(["claude-code", "mcp", "gemini-cli", "codex-cli"]);
     for (const id of new Set(installs.map((i) => i.id)))
