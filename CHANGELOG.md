@@ -4,6 +4,10 @@ All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented 
 
 ## Unreleased
 
+**Changed -- `install gemini-cli` says Gemini CLI starts no server in an untrusted folder**
+
+Gemini CLI 0.66 starts no MCP server, user-level ones included, in a folder the user has not trusted, and lists each one Disabled. Install succeeded and yaw-mcp simply never appeared there. The install note now says so, and names the fix: answer yes to Gemini's "Do you trust the files in this folder?" prompt. A non-interactive run never shows that prompt, so the note says to open gemini in the folder once and trust it there, and that the answer is kept for later runs.
+
 **Fixed -- the client matrix reports a broken or refusing client CLI as what it is, and passes on macOS and Linux**
 
 `npm run verify:clients` read each client CLI's output without its exit code, so a Mac whose codex launcher pointed at a native binary npm never unpacked failed the gate with a JSON syntax error. A CLI command that exits non-zero without the output its check reads now runs `<cli> --version`. When that fails too, the CLI on PATH cannot run, so the check is a skip that quotes its `Error:` line, like an absent CLI. Otherwise it is a FAIL with the real exit code. Gemini CLI 0.66 starts no MCP server, user-level ones included, in a folder the user has not trusted, and lists each one "Disabled", which the gate reported as a slow start. Each gemini check now records the trust a person gives, in the check's own `~/.gemini/trustedFolders.json`, never in the settings file install wrote. "Disconnected" stays a warning about gemini's 5 s list budget, and any other status is a FAIL. Verified on Windows (claude 2.1.314, gemini 0.32.1, codex 0.144.0), macOS 27.2 arm64 (gemini 0.30.0) and Ubuntu 24.04 aarch64 (claude 2.1.316, gemini 0.66.0, codex 0.166.0): all pass, with every installed CLI's check green.

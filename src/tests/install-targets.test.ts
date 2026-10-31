@@ -660,6 +660,20 @@ describe("resolveInstallPath — Windsurf and Gemini CLI", () => {
     // that holds Gemini's own discovery knobs.
     expect(project.containerPath).toEqual(["mcpServers"]);
   });
+
+  it("tells the user Gemini CLI starts no server in an untrusted folder, and how to trust it", () => {
+    // Measured on Gemini CLI 0.66.0: an untrusted folder lists every server
+    // -- user-level ones too -- as Disabled. Without this sentence the
+    // install succeeds and yaw-mcp silently never appears there.
+    const notes = INSTALL_TARGETS.find((t) => t.clientId === "gemini-cli")?.notes ?? "";
+    expect(notes).toContain("in a folder you have not trusted");
+    expect(notes).toContain('"Do you trust the files in this folder?"');
+    expect(notes).toContain("Disabled");
+    // A non-TTY run (measured: `gemini mcp list`) never shows the prompt.
+    expect(notes).toContain("Non-interactive runs never ask");
+    // install prints notes verbatim, and Windows consoles mangle non-ASCII.
+    expect(notes).toMatch(/^[\x20-\x7e]*$/);
+  });
 });
 
 describe("buildLaunchEntry", () => {
