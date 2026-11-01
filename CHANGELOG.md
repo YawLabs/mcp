@@ -4,6 +4,8 @@ All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented 
 
 ## Unreleased
 
+## 1.1.7 -- a server Windows will not start is named with its likely cause, instead of a bare `spawn UNKNOWN`
+
 **Fixed -- a server whose executable Windows will not run is named, with the likely cause, instead of a bare `spawn UNKNOWN`**
 
 A local server whose binary exists but cannot be started -- built for another CPU architecture (an ARM32 exe on Windows ARM64), empty, truncated, or not a program at all -- failed activation with `spawn UNKNOWN` or `spawn EFTYPE` and nothing else: no file name, no cause, because the spawn error carries neither. It now says which command could not be started and why that usually happens, and names the rewritten binary when a uv or oam rewrite was the one that failed. When yaw-mcp itself runs on oam 0.19.2 or later, the Win32 code oam attaches (`winError`) is included, and 216 (`ERROR_EXE_MACHINE_TYPE_MISMATCH`) is called out by name. These failures are now in the `spawn_failure` category rather than `unknown`.
