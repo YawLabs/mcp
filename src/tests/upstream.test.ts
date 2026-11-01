@@ -3840,6 +3840,81 @@ describe("connectToUpstream activation failure categories", () => {
     expect(err.message).toContain("Command './server.sh' is not on PATH or is not executable.");
   });
 
+  /** A spawn error shaped as libuv builds it: the message names no file. */
+  function spawnError(code: string, winError?: number): Error {
+    const err = Object.assign(new Error(`spawn ${code}`), { code, errno: -4094, syscall: "spawn" });
+    // oam 0.19.2 defines it non-enumerable, so a spread or JSON.stringify drops it.
+    if (winError !== undefined) Object.defineProperty(err, "winError", { value: winError, enumerable: false });
+    return err;
+  }
+
+  it("names an unstartable file for spawn EFTYPE instead of PATH advice", async () => {
+    _sdkBehavior.clientConnect = () => Promise.reject(spawnError("EFTYPE"));
+
+    const err = await failedConnect(makeLocalConfig({ command: "C:/tools/server.exe" }));
+
+    expect(err.category).toBe("spawn_failure");
+    expect(err.message).toContain(
+      "Command 'C:/tools/server.exe' could not be started: the OS does not recognise it as a program (spawn EFTYPE",
+    );
+    expect(err.message).not.toContain("not on PATH");
+    expect(err.message).toContain(CONFIG_POINTER);
+  });
+
+  it("reads oam's winError 216 on spawn UNKNOWN as a machine-type mismatch", async () => {
+    _sdkBehavior.clientConnect = () => Promise.reject(spawnError("UNKNOWN", 216));
+
+    const err = await failedConnect(makeLocalConfig({ command: "C:/tools/server.exe" }));
+
+    expect(err.category).toBe("spawn_failure");
+    expect(err.message).toContain("it is built for a CPU architecture this machine cannot run, or is not a valid");
+    expect(err.message).toContain("Win32 error 216 ERROR_EXE_MACHINE_TYPE_MISMATCH");
+    expect(err.message).not.toContain("not on PATH");
+  });
+
+  it("names the command and the likely causes for spawn UNKNOWN with no winError (node, oam < 0.19.2)", async () => {
+    _sdkBehavior.clientConnect = () => Promise.reject(spawnError("UNKNOWN"));
+
+    const err = await failedConnect(makeLocalConfig({ command: "C:/tools/server.exe" }));
+
+    expect(err.category).toBe("spawn_failure");
+    expect(err.message).toContain(
+      "Command 'C:/tools/server.exe' could not be started: the OS refused to run it (spawn UNKNOWN).",
+    );
+    expect(err.message).toContain("another CPU architecture");
+    expect(err.message).not.toContain("Win32 error");
+  });
+
+  it("carries a winError other than 216 without naming a cause for it", async () => {
+    _sdkBehavior.clientConnect = () => Promise.reject(spawnError("UNKNOWN", 1260));
+
+    const err = await failedConnect(makeLocalConfig({ command: "C:/tools/server.exe" }));
+
+    expect(err.message).toContain("(spawn UNKNOWN, Win32 error 1260)");
+    expect(err.message).not.toContain("ERROR_EXE_MACHINE_TYPE_MISMATCH");
+  });
+
+  it("names the rewritten binary when an unstartable spawn was not the config command", async () => {
+    const managed = "C:/Users/u/.yaw-mcp/uv/uvx.exe";
+    vi.mocked(resolveUvSpawn).mockResolvedValueOnce({ command: managed, args: ["mcp-server-git"] });
+    _sdkBehavior.clientConnect = () => Promise.reject(spawnError("UNKNOWN", 216));
+
+    const err = await failedConnect(makeLocalConfig({ command: "uvx", args: ["mcp-server-git"] }));
+
+    expect(err.message).toContain("Command 'uvx' could not be started:");
+    expect(err.message).toContain(`The binary that actually failed to spawn was '${managed}'.`);
+  });
+
+  it("leaves a non-spawn UNKNOWN to the raw-message path", async () => {
+    const err0 = Object.assign(new Error("write UNKNOWN"), { code: "UNKNOWN", syscall: "write" });
+    _sdkBehavior.clientConnect = () => Promise.reject(err0);
+
+    const err = await failedConnect(makeLocalConfig());
+
+    expect(err.category).toBe("unknown");
+    expect(err.message).toContain("write UNKNOWN");
+  });
+
   it("falls through to 'unknown' and surfaces the raw error when nothing matches", async () => {
     _sdkBehavior.clientConnect = () => Promise.reject(new Error("Error POSTing to endpoint (HTTP 500)"));
 
@@ -4955,10 +5030,11 @@ describe("connectToUpstream handshake deadline under load", () => {
     await failed;
   });
 
-  it("extends a live child once when the runtime reports no CPU load (oam on Windows), still capped at 2x", async () => {
-    // oam 0.18.0 on Windows returns every os.cpus() time as 0: no window, no
-    // reading. Unknown load must not read as idle, or the extension never
-    // fires on the runtime the failures were measured on.
+  it("extends a live child once when the runtime reports no CPU load (oam before 0.19.2), still capped at 2x", async () => {
+    // oam before 0.19.2 returns every os.cpus() time as 0 on every platform
+    // (measured on Windows with 0.18.0 and 0.19.1; fixed in 0.19.2, oam #441):
+    // no window, no reading. Unknown load must not read as idle, or the
+    // extension never fires on a yaw-mcp a client runs on an older oam.
     setCpuTimesReaderForTests(() => ({ idle: 0, total: 0 }));
     answersAfter(20_000);
     const connecting = connectToUpstream(makeLocalConfig({ namespace: "fetch" }));
