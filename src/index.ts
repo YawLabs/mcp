@@ -631,7 +631,7 @@ if (subcommand === "compliance") {
                                saturated machine (CPU >= 50% busy over the wait)
                                a still-running local child gets this deadline
                                once more, never longer (unknown load, as on
-                               oam/Windows, counts as busy); a per-server
+                               oam before 0.19.2, counts as busy); a per-server
                                \`connectTimeoutMs\` is never extended.
     MCP_LIST_TIMEOUT              Milliseconds to wait for a server's tool/
                                resource/prompt inventory calls after the

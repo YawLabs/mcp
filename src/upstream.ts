@@ -527,8 +527,10 @@ export function setCpuTimesReaderForTests(reader?: () => CpuTimes): void {
 }
 
 /** Busy fraction (0..1) between two samples, or null when the window carries
- *  no CPU time at all (a platform whose os.cpus() is empty, or two reads that
- *  landed inside one accounting tick). Null never extends a deadline. */
+ *  no CPU time at all (a platform whose os.cpus() is empty, a runtime whose
+ *  os.cpus() times are all 0 -- oam before 0.19.2 -- or two reads that landed
+ *  inside one accounting tick). Null is unknown load, not idle: with a live
+ *  child it still earns the one deadline extension (see onDeadline). */
 export function cpuBusyFraction(start: CpuTimes, end: CpuTimes): number | null {
   const total = end.total - start.total;
   if (!(total > 0)) return null;
@@ -582,7 +584,7 @@ export const MAX_LIST_PAGES = 50;
 // use these to compose actionable messages rather than leaking raw SDK
 // error strings.
 export type ActivationFailureCategory =
-  | "spawn_failure" // command not found / ENOENT
+  | "spawn_failure" // command missing (ENOENT), not executable (EACCES), or refused by the OS (EFTYPE / spawn UNKNOWN)
   | "install_failure" // process spawned but exited non-zero before handshake
   | "init_timeout" // process running but didn't complete init within CONNECT_TIMEOUT
   | "protocol_error" // handshake completed but something downstream failed
@@ -1086,7 +1088,47 @@ function withConfigPointer(message: string, config: UpstreamServerConfig): strin
   return `${message} -> Fix "${config.namespace}" in ${bundlesFileHint("defines-it")}, then activate it again -- the edit is picked up on the next mcp_connect_* call, with no client restart.`;
 }
 
+/** The libuv code of a spawn the OS refused because of the FILE, not because
+ *  the file is missing: EFTYPE (an empty, truncated or non-program file), or
+ *  UNKNOWN on a spawn (libuv's catch-all for a Win32 error its table does not
+ *  name -- a binary for another CPU architecture, measured on Windows ARM64
+ *  with an ARM32 exe). Both arrive as a bare "spawn EFTYPE" / "spawn UNKNOWN"
+ *  that names neither the file nor the cause, so they get their own message.
+ *  Read off `code`/`syscall`, not the message. */
+function unstartableFileCode(err: unknown): "EFTYPE" | "UNKNOWN" | null {
+  if (typeof err !== "object" || err === null) return null;
+  const { code, syscall } = err as { code?: unknown; syscall?: unknown };
+  if (code === "EFTYPE") return "EFTYPE";
+  if (code === "UNKNOWN" && typeof syscall === "string" && syscall.startsWith("spawn")) return "UNKNOWN";
+  return null;
+}
+
+/** The raw Win32 code oam (from 0.19.2, #450) puts on an UNKNOWN system error
+ *  as a non-enumerable `winError`. Absent on node and older oam. */
+function winErrorOf(err: unknown): number | undefined {
+  const value = typeof err === "object" && err !== null ? (err as { winError?: unknown }).winError : undefined;
+  return typeof value === "number" ? value : undefined;
+}
+
+/** ERROR_EXE_MACHINE_TYPE_MISMATCH. Also what a non-program file named .exe
+ *  gives (measured on oam 0.19.2), so it does not prove a wrong architecture. */
+const WIN32_EXE_MACHINE_TYPE_MISMATCH = 216;
+
+function unstartableFileMessage(code: "EFTYPE" | "UNKNOWN", err: unknown, command: string | undefined): string {
+  if (code === "EFTYPE") {
+    return `Command '${command}' could not be started: the OS does not recognise it as a program (spawn EFTYPE -- an empty, truncated or non-executable file). Reinstall or re-download it.`;
+  }
+  const winError = winErrorOf(err);
+  if (winError === WIN32_EXE_MACHINE_TYPE_MISMATCH) {
+    return `Command '${command}' could not be started: it is built for a CPU architecture this machine cannot run, or is not a valid program file (spawn UNKNOWN, Win32 error 216 ERROR_EXE_MACHINE_TYPE_MISMATCH). Install the build for this machine.`;
+  }
+  return `Command '${command}' could not be started: the OS refused to run it (spawn UNKNOWN${
+    winError === undefined ? "" : `, Win32 error ${winError}`
+  }). Common causes: a binary built for another CPU architecture, a corrupt or partial download, or an application-control or antivirus block.`;
+}
+
 function categorizeSpawnError(err: unknown): ActivationFailureCategory {
+  if (unstartableFileCode(err)) return "spawn_failure";
   const msg = err instanceof Error ? err.message : String(err);
   // Node's child_process surfaces ENOENT as the most common spawn failure —
   // binary isn't on PATH. Other codes (EACCES, EPERM) are rare enough to
@@ -1963,9 +2005,12 @@ async function connectToUpstreamOnce(
         const pid = (transport as { pid?: number | null }).pid;
         const childRunning = typeof pid === "number";
         const busy = childRunning ? cpuBusyFraction(loadAtStart, cpuTimesReader()) : null;
-        // A runtime that keeps no CPU accounting (oam on Windows reports
-        // every os.cpus() time as 0, measured 2026-10-10 with oam 0.18.0)
-        // gives no load reading at all. Unknown load is NOT read as idle:
+        // A runtime that keeps no CPU accounting gives no load reading at
+        // all: oam before 0.19.2 reports every os.cpus() time as 0 on every
+        // platform (measured on Windows with 0.18.0 and 0.19.1; 0.19.2 reads
+        // the real counters, oam #441). The reading is taken in THIS process,
+        // and a client entry can run yaw-mcp on any oam, whatever the sidecar
+        // floor says. Unknown load is NOT read as idle:
         // that would leave the extension dead on the very runtime the m3
         // failures were measured on. The live child still earns its one
         // extension; the 2x ceiling bounds what a real hang costs.
@@ -2068,17 +2113,22 @@ async function connectToUpstreamOnce(
         : `Server "${config.namespace}" failed to start. stderr: ${safe.slice(-500)}`;
     } else {
       category = categorizeSpawnError(err);
-      if (category === "spawn_failure") {
-        // Name the CONFIG command first (it is the line the operator has to
-        // edit) but do not stop there: after a uv/oam rewrite the binary that
-        // actually ENOENT'd is one the user never typed, and advising them to
-        // install a runtime that is not the missing thing sends them the wrong
-        // way. When the two differ, say which file the OS could not find.
-        message = `Command '${config.command}' is not on PATH or is not executable. Verify the runtime is installed (e.g. Node.js for npx, Python for uvx).${
-          spawnedCommand && spawnedCommand !== config.command
-            ? ` The binary that actually failed to spawn was '${spawnedCommand}'.`
-            : ""
-        }`;
+      const unstartable = unstartableFileCode(err);
+      // Name the CONFIG command first (it is the line the operator has to
+      // edit) but do not stop there: after a uv/oam rewrite the binary that
+      // actually failed is one the user never typed, and advising them to
+      // install a runtime that is not the missing thing sends them the wrong
+      // way. When the two differ, say which file the OS could not start.
+      const spawnedNote =
+        spawnedCommand && spawnedCommand !== config.command
+          ? ` The binary that actually failed to spawn was '${spawnedCommand}'.`
+          : "";
+      if (unstartable) {
+        // The file exists but the OS would not run it, so "not on PATH" and
+        // "install Node.js" would both point the wrong way.
+        message = `${unstartableFileMessage(unstartable, err, config.command)}${spawnedNote}`;
+      } else if (category === "spawn_failure") {
+        message = `Command '${config.command}' is not on PATH or is not executable. Verify the runtime is installed (e.g. Node.js for npx, Python for uvx).${spawnedNote}`;
       } else {
         message = err instanceof Error ? err.message : String(err);
       }

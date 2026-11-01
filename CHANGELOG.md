@@ -4,6 +4,14 @@ All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented 
 
 ## Unreleased
 
+**Fixed -- a server whose executable Windows will not run is named, with the likely cause, instead of a bare `spawn UNKNOWN`**
+
+A local server whose binary exists but cannot be started -- built for another CPU architecture (an ARM32 exe on Windows ARM64), empty, truncated, or not a program at all -- failed activation with `spawn UNKNOWN` or `spawn EFTYPE` and nothing else: no file name, no cause, because the spawn error carries neither. It now says which command could not be started and why that usually happens, and names the rewritten binary when a uv or oam rewrite was the one that failed. When yaw-mcp itself runs on oam 0.19.2 or later, the Win32 code oam attaches (`winError`) is included, and 216 (`ERROR_EXE_MACHINE_TYPE_MISMATCH`) is called out by name. These failures are now in the `spawn_failure` category rather than `unknown`.
+
+**Changed -- the `MCP_CONNECT_TIMEOUT` docs no longer name oam on Windows as a runtime that reports no CPU load**
+
+oam before 0.19.2 reported every `os.cpus()` time as 0 on every platform, not only Windows; 0.19.2 reports real counters, so yaw-mcp running on it reads the machine load as it does on node. The handshake extension for unknown load is unchanged. The oam floor stays at 0.19.1.
+
 ## 1.1.6 -- `install gemini-cli` says Gemini CLI starts no server in an untrusted folder, and the client matrix passes on macOS and Linux
 
 **Changed -- `install gemini-cli` says Gemini CLI starts no server in an untrusted folder**
