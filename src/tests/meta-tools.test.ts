@@ -38,7 +38,13 @@ describe("meta-tool wire size (tools/list before any activation)", () => {
   const EXEC_WIRE_CEILING = 2_900;
   const EXEC_DESCRIPTION_CEILING = 1_500;
   const DESCRIPTION_TOTAL_CEILING = 5_600;
-  const INSTRUCTIONS_CEILING = 600;
+  // Raised 600 -> 850 on 2026-11-03 (521 -> 836 chars). The added text is the
+  // routing evaluation's model-side gaps: a do-not-route rule for
+  // general-knowledge questions, the find_tool-miss -> dispatch retry, the
+  // exec fallback for a just-loaded tool the client has not re-listed, and
+  // where the installed-servers line lives. Paid once per session in the
+  // system prompt, not per tools/list.
+  const INSTRUCTIONS_CEILING = 850;
 
   it("keeps the whole gateway surface under the ceiling", () => {
     expect(wire("gateway").total).toBeLessThanOrEqual(GATEWAY_WIRE_CEILING);
@@ -80,6 +86,20 @@ describe("SERVER_INSTRUCTIONS carries the routing advice the descriptions no lon
     ]) {
       expect(SERVER_INSTRUCTIONS).toContain(needle);
     }
+  });
+
+  it("says when not to route and how to recover from the two common misses", () => {
+    expect(SERVER_INSTRUCTIONS).toContain("Answer general-knowledge questions directly, without routing.");
+    expect(SERVER_INSTRUCTIONS).toContain(
+      `If ${META_TOOLS.findTool.name} finds nothing, retry with ${META_TOOLS.dispatch.name} in the user's own words.`,
+    );
+    expect(SERVER_INSTRUCTIONS).toContain(
+      `A just-loaded tool reported missing: call it through ${META_TOOLS.exec.name}.`,
+    );
+    // Points at where the installed servers are named (installed-summary.ts),
+    // since the instructions themselves are static and cannot.
+    expect(SERVER_INSTRUCTIONS).toContain("names the installed servers");
+    expect(SERVER_INSTRUCTIONS).toContain("Prefer a server over the CLI it shadows.");
   });
 
   it("is the ONLY home of the guide pointer and the dispatch-vs-discover routing rule", () => {

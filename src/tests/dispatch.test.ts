@@ -25,7 +25,19 @@ vi.mock("../upstream.js", async (importOriginal) => {
   };
 });
 
-import { ConnectServer, clientRelistsTools } from "../server.js";
+import { queryCoverage } from "../relevance.js";
+import {
+  AUTO_ACTIVATE_COVERAGE_MIN_SERVERS,
+  AUTO_ACTIVATE_MARGIN_BM25,
+  AUTO_ACTIVATE_MIN_COVERAGE,
+  ConnectServer,
+  clientRelistsTools,
+  DISPATCH_LOW_COVERAGE_MARGIN,
+  DISPATCH_MAX_FALLBACKS,
+  dispatchConfidenceNote,
+  pickAutoWarmWinner,
+  type RoutingCandidate,
+} from "../server.js";
 import type { UpstreamConnection, UpstreamServerConfig } from "../types.js";
 import { ActivationError, connectToUpstream, disconnectFromUpstream } from "../upstream.js";
 
@@ -891,5 +903,323 @@ describe("clientRelistsTools", () => {
     expect(clientRelistsTools({ name: "Codex-MCP-Client" })).toBe(true);
     expect(clientRelistsTools({})).toBe(true);
     expect(clientRelistsTools(undefined)).toBe(true);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// Routing confidence: the coverage floor on discover's auto-warm, the
+// shared health-adjusted ranking, dispatch's low-confidence note and its
+// runner-up fallback.
+// ═══════════════════════════════════════════════════════════════════════
+
+const cand = (namespace: string, score: number, coverage?: number, matched = 1, contentTerms = 4): RoutingCandidate =>
+  coverage === undefined ? { namespace, score } : { namespace, score, coverage, matched, contentTerms };
+
+describe("pickAutoWarmWinner", () => {
+  it("withholds a decisive winner whose coverage is under the floor", () => {
+    // Redis LRU vs LFU, the shape: one rare word scores the server high, the
+    // rest of the question matches nothing anywhere.
+    expect(pickAutoWarmWinner([cand("redis", 32.9, 0.3), cand("pg", 2, 0.1)])).toBeUndefined();
+    expect(pickAutoWarmWinner([cand("redis", 32.9, AUTO_ACTIVATE_MIN_COVERAGE - 0.001)])).toBeUndefined();
+  });
+
+  it("warms at the floor, and still demands the score floor and margin", () => {
+    expect(pickAutoWarmWinner([cand("pg", 9, AUTO_ACTIVATE_MIN_COVERAGE)])?.namespace).toBe("pg");
+    expect(pickAutoWarmWinner([cand("pg", 0.9, 1)])).toBeUndefined();
+    expect(pickAutoWarmWinner([cand("pg", 9, 1), cand("redis", 8, 1)])).toBeUndefined();
+  });
+
+  it("falls back to score floor and margin alone when coverage was not measured", () => {
+    expect(pickAutoWarmWinner([cand("gh", 9), cand("fs", 1)])?.namespace).toBe("gh");
+  });
+});
+
+describe("dispatchConfidenceNote", () => {
+  const opts = { sampled: false, noSampling: false };
+
+  it("is silent for a decisive, well-covered pick", () => {
+    expect(dispatchConfidenceNote([cand("pg", 20, 0.9), cand("redis", 5, 0.2)], "pg", new Set(["pg"]), opts)).toBe(
+      undefined,
+    );
+  });
+
+  it("flags a close call and names the runners-up, best first", () => {
+    const ranked = [cand("pg", 10, 0.9), cand("redis", 9, 0.5), cand("fs", 3, 0.2), cand("ssh", 2, 0.1)];
+    const note = dispatchConfidenceNote(ranked, "pg", new Set(["pg"]), opts) ?? "";
+    expect(note).toContain("close call (redis scored 9.00 vs 10.00)");
+    expect(note).toContain("Runners-up: redis (9.00), fs (3.00).");
+    expect(note).not.toContain("ssh");
+    expect(note).toContain("answer it directly");
+  });
+
+  it("says the client cannot break the tie when it has no sampling", () => {
+    const note = dispatchConfidenceNote([cand("pg", 10, 0.9), cand("redis", 9, 0.9)], "pg", new Set(["pg"]), {
+      sampled: false,
+      noSampling: true,
+    });
+    expect(note).toContain("this client cannot be asked to break the tie");
+  });
+
+  it("drops the close call an LLM tiebreak already settled, but keeps low coverage", () => {
+    const ranked = [cand("pg", 10, 0.9), cand("redis", 9, 0.9)];
+    expect(dispatchConfidenceNote(ranked, "pg", new Set(["pg"]), { sampled: true, noSampling: false })).toBe(undefined);
+    const weak = [cand("pg", 10, 0.2, 1, 5), cand("redis", 9, 0.9)];
+    const note = dispatchConfidenceNote(weak, "pg", new Set(["pg"]), { sampled: true, noSampling: false }) ?? "";
+    expect(note).toContain("pg matches 1 of the request's 5 content words");
+    expect(note).not.toContain("close call");
+  });
+
+  it("flags low coverage, but not when coverage was not measured", () => {
+    expect(dispatchConfidenceNote([cand("pg", 20, 0.1, 1, 6)], "pg", new Set(["pg"]), opts)).toBe(
+      "Low confidence: pg matches 1 of the request's 6 content words. If pg does not fit, mcp_connect_activate a runner-up or dispatch a more specific intent; if the request needs no tool, answer it directly.",
+    );
+    expect(dispatchConfidenceNote([cand("pg", 20)], "pg", new Set(["pg"]), opts)).toBeUndefined();
+  });
+
+  it("does not flag low coverage on a pick that matches several words and leads decisively", () => {
+    // "create a github issue titled login button broken on safari": the title
+    // words match nothing, but github matches three words and leads 2.6x.
+    const decisive = [cand("gh", 19.65, 0.16, 3, 8), cand("vault", 7.61, 0.1, 1, 8)];
+    expect(dispatchConfidenceNote(decisive, "gh", new Set(["gh"]), opts)).toBeUndefined();
+    expect(19.65 / 7.61).toBeGreaterThanOrEqual(DISPATCH_LOW_COVERAGE_MARGIN);
+    // ...but does when the lead is under DISPATCH_LOW_COVERAGE_MARGIN
+    const thin = [cand("gh", 10, 0.16, 3, 8), cand("vault", 6, 0.1, 1, 8)];
+    expect(dispatchConfidenceNote(thin, "gh", new Set(["gh"]), opts)).toContain(
+      "gh matches 3 of the request's 8 content words",
+    );
+  });
+
+  it("never offers a server this call already loaded or tried", () => {
+    const ranked = [cand("gh", 10, 0.9), cand("slack", 9.5, 0.9), cand("fs", 9, 0.9)];
+    // gh failed, slack was loaded as the fallback: fs is the only runner-up.
+    const note = dispatchConfidenceNote(ranked, "slack", new Set(["gh", "slack"]), opts) ?? "";
+    expect(note).toContain("close call (fs scored 9.00 vs 9.50)");
+    expect(note).toContain("Runners-up: fs (9.00).");
+  });
+});
+
+describe("routing confidence in the dispatch and discover handlers", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    // Same reset-not-clear reasoning as handleDispatch above.
+    vi.resetAllMocks();
+    vi.mocked(disconnectFromUpstream).mockResolvedValue(undefined);
+    server = new ConnectServer();
+  });
+
+  afterEach(async () => {
+    await server.shutdown();
+  });
+
+  const fiveServers = () => [
+    makeServerConfig({ id: "gh-id", namespace: "gh", name: "GitHub", description: "Repos, issues and pull requests" }),
+    makeServerConfig({ id: "pg-id", namespace: "pg", name: "Postgres", description: "Query a postgres database" }),
+    makeServerConfig({ id: "rd-id", namespace: "rd", name: "Redis", description: "Keys and caches in redis" }),
+    makeServerConfig({ id: "fs-id", namespace: "fs", name: "Filesystem", description: "Read and write local files" }),
+    makeServerConfig({ id: "sl-id", namespace: "sl", name: "Slack", description: "Team chat messages" }),
+  ];
+
+  it("measures coverage only from AUTO_ACTIVATE_COVERAGE_MIN_SERVERS servers up", async () => {
+    const priv = getPrivate(server);
+    const five = fiveServers();
+    expect(five).toHaveLength(AUTO_ACTIVATE_COVERAGE_MIN_SERVERS);
+    const full = await priv.rankIntentCandidates("query the postgres database", five);
+    expect(full[0].namespace).toBe("pg");
+    expect(full[0].coverage).toBeGreaterThan(0);
+    expect(full[0].contentTerms).toBeGreaterThan(0);
+    const small = await priv.rankIntentCandidates("query the postgres database", five.slice(0, 4));
+    expect(small[0]).toEqual({ namespace: "pg", score: small[0].score });
+  });
+
+  it("does not measure coverage on a lone server, where IDF cannot tell a word's weight", async () => {
+    // The reason for AUTO_ACTIVATE_COVERAGE_MIN_SERVERS: one GitHub server and
+    // "file a github issue" covers under the floor, because "file" is the only
+    // word it lacks and an unmatched word gets the highest weight there is.
+    const gh = makeServerConfig({ namespace: "gh", name: "GitHub", description: "Repos, issues, and pull requests" });
+    const priv = getPrivate(server);
+    const lone = [priv.rankableFor(gh)];
+    const [cov] = queryCoverage("file a github issue", lone);
+    expect(cov.coverage).toBeCloseTo(0.29, 2);
+    expect(cov.coverage).toBeLessThan(AUTO_ACTIVATE_MIN_COVERAGE);
+    const ranked = await priv.rankIntentCandidates("file a github issue", [gh]);
+    expect(ranked[0].coverage).toBeUndefined();
+  });
+
+  it("discover does not auto-warm a decisive winner that covers too little of the request", async () => {
+    const priv = getPrivate(server);
+    priv.config = { configVersion: "v1", servers: fiveServers() };
+    priv.rankIntentCandidates = async () => [cand("rd", 32.9, 0.3), cand("pg", 2, 0.1)];
+    const result = await priv.handleDiscoverWithAutoWarm("how does redis lru eviction differ from lfu");
+    expect(vi.mocked(connectToUpstream)).not.toHaveBeenCalled();
+    expect(result.content[0].text).not.toContain("Auto-loaded");
+  });
+
+  it("discover auto-warms the same winner dispatch picks: health applies to both", async () => {
+    // Raw BM25 has gh ahead (10 vs 9, too close to warm). gh failed to
+    // activate a moment ago, so routing halves it and pg leads 9 to 5 --
+    // which is what dispatch would load, and now what discover warms.
+    const priv = getPrivate(server);
+    priv.config = { configVersion: "v1", servers: fiveServers() };
+    priv.rankIntentCandidates = async () => [cand("gh", 10, 0.9), cand("pg", 9, 0.9)];
+    priv.activationFailures.set("gh", { at: Date.now(), message: "docker is not running" });
+    vi.mocked(connectToUpstream).mockImplementation(async (cfg: UpstreamServerConfig) =>
+      makeConnection(cfg.namespace, [{ name: "query" }]),
+    );
+    const routed = await priv.routingCandidates("anything", priv.config.servers);
+    expect(routed.map((r: RoutingCandidate) => r.namespace)).toEqual(["pg", "gh"]);
+    expect(routed[0].coverage).toBe(0.9);
+
+    const result = await priv.handleDiscoverWithAutoWarm("anything");
+    expect(vi.mocked(connectToUpstream).mock.calls[0][0].namespace).toBe("pg");
+    expect(result.content[0].text).toContain('Auto-loaded "pg"');
+  });
+
+  it("dispatch flags a close call it could not ask the client about, naming the runner-up", async () => {
+    const priv = getPrivate(server);
+    priv.config = {
+      configVersion: "v1",
+      servers: [
+        makeServerConfig({ id: "a", namespace: "alpha", name: "Alpha", description: "manage github issues" }),
+        makeServerConfig({ id: "b", namespace: "beta", name: "Beta", description: "manage github issues" }),
+      ],
+    };
+    vi.mocked(connectToUpstream).mockImplementation(async (cfg: UpstreamServerConfig) =>
+      makeConnection(cfg.namespace, [{ name: "tool_one" }]),
+    );
+    priv.server.getClientCapabilities = () => ({});
+    const result = await priv.handleDispatch("manage github issues", 1);
+    const text: string = result.content[0].text;
+    expect(result.isError).toBeUndefined();
+    expect(text).toContain('Dispatched "manage github issues" — tried the top 1 of the 2 servers ranked for it.');
+    expect(text).not.toContain("matching server");
+    expect(text).toMatch(/Low confidence: close call \(beta scored [0-9.]+ vs [0-9.]+; this client cannot be asked/);
+    expect(text).toContain("Runners-up: beta");
+  });
+
+  it("dispatch reports no close call once the client's LLM picked between the two", async () => {
+    const priv = getPrivate(server);
+    priv.config = {
+      configVersion: "v1",
+      servers: [
+        makeServerConfig({ id: "a", namespace: "alpha", name: "Alpha", description: "manage github issues" }),
+        makeServerConfig({ id: "b", namespace: "beta", name: "Beta", description: "manage github issues" }),
+      ],
+    };
+    vi.mocked(connectToUpstream).mockImplementation(async (cfg: UpstreamServerConfig) =>
+      makeConnection(cfg.namespace, [{ name: "tool_one" }]),
+    );
+    priv.server.getClientCapabilities = () => ({ sampling: {} });
+    priv.server.createMessage = async () => ({ role: "assistant", content: { type: "text", text: "beta" } });
+    const result = await priv.handleDispatch("manage github issues", 1);
+    expect(vi.mocked(connectToUpstream).mock.calls[0][0].namespace).toBe("beta");
+    expect(result.content[0].text).not.toContain("close call");
+  });
+
+  it("dispatch falls back to a close runner-up when the winner fails to start, and says so", async () => {
+    const priv = getPrivate(server);
+    priv.config = {
+      configVersion: "v1",
+      servers: [
+        // Same name and description: the ranker cannot tell them apart.
+        makeServerConfig({ id: "a-id", namespace: "alpha", name: "GitHub", description: "Repos and issues" }),
+        makeServerConfig({ id: "b-id", namespace: "beta", name: "GitHub", description: "Repos and issues" }),
+      ],
+    };
+    vi.mocked(connectToUpstream).mockImplementation(async (cfg: UpstreamServerConfig) => {
+      if (cfg.namespace === "alpha") throw new ActivationError("docker daemon is not running", "install_failure");
+      return makeConnection(cfg.namespace, [{ name: "tool_one" }]);
+    });
+    const result = await priv.handleDispatch("github issue", 1);
+    const text: string = result.content[0].text;
+    expect(result.isError).toBeUndefined();
+    expect(text).toContain(
+      'Dispatched "github issue" — tried 2 (the top 1, then 1 runner-up) of the 2 servers ranked for it. alpha failed to load; loaded runner-up beta instead.\n',
+    );
+    expect(text).toMatch(/^alpha \(score [0-9.]+\): .*docker daemon is not running/m);
+    expect(text).toMatch(/^beta \(score [0-9.]+, runner-up tried because alpha failed to load\): Loaded "beta"/m);
+    expect(priv.sessionActivated.has("beta")).toBe(true);
+    expect(priv.sessionActivated.has("alpha")).toBe(false);
+    expect(priv.lastIntentByNamespace.get("beta")).toBe("github issue");
+  });
+
+  it("does not swap a failed winner for a runner-up that scores far below it", async () => {
+    // slack shares only "issues" with the request: well outside the
+    // AUTO_ACTIVATE_MARGIN_BM25 of gh, so gh's failure stands and is an error.
+    const priv = getPrivate(server);
+    priv.config = {
+      configVersion: "v1",
+      servers: [
+        makeServerConfig({ id: "gh-id", namespace: "gh", name: "GitHub", description: "Repos and issues" }),
+        makeServerConfig({ id: "sl-id", namespace: "slack", name: "Slack", description: "Issues and team messages" }),
+      ],
+    };
+    vi.mocked(connectToUpstream).mockImplementation(async (cfg: UpstreamServerConfig) => {
+      if (cfg.namespace === "gh") throw new ActivationError("docker daemon is not running", "install_failure");
+      return makeConnection(cfg.namespace, [{ name: "tool_one" }]);
+    });
+    const ranked = await priv.routingCandidates("github issue", priv.config.servers);
+    expect(ranked.map((r: RoutingCandidate) => r.namespace)).toEqual(["gh", "slack"]);
+    expect(ranked[1].score * AUTO_ACTIVATE_MARGIN_BM25).toBeLessThan(ranked[0].score);
+    const result = await priv.handleDispatch("github issue", 1);
+    expect(result.isError).toBe(true);
+    expect(new Set(vi.mocked(connectToUpstream).mock.calls.map((c) => c[0].namespace))).toEqual(new Set(["gh"]));
+    expect(result.content[0].text).not.toContain("runner-up tried");
+    expect(priv.sessionActivated.has("slack")).toBe(false);
+  });
+
+  it("tries at most DISPATCH_MAX_FALLBACKS runners-up, and errors when none starts", async () => {
+    const priv = getPrivate(server);
+    priv.config = {
+      configVersion: "v1",
+      servers: ["a", "b", "c", "d", "e"].map((ns) =>
+        makeServerConfig({ id: ns, namespace: ns, name: ns.toUpperCase(), description: `issues tracker ${ns}` }),
+      ),
+    };
+    vi.mocked(connectToUpstream).mockRejectedValue(
+      new ActivationError("docker daemon is not running", "install_failure"),
+    );
+    const result = await priv.handleDispatch("issues", 1);
+    const tried = new Set(vi.mocked(connectToUpstream).mock.calls.map((c) => c[0].namespace));
+    expect(tried.size).toBe(1 + DISPATCH_MAX_FALLBACKS);
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text.match(/runner-up tried because/g)).toHaveLength(DISPATCH_MAX_FALLBACKS);
+    expect(result.content[0].text).toContain(
+      `tried ${1 + DISPATCH_MAX_FALLBACKS} (the top 1, then ${DISPATCH_MAX_FALLBACKS} runners-up) of the 5 servers ranked for it.\n`,
+    );
+    expect(result.content[0].text).not.toContain("Low confidence");
+  });
+
+  it("does not fall back from a cap refusal, or when nothing else scored", async () => {
+    const priv = getPrivate(server);
+    priv.serverCap = 1;
+    priv.config = {
+      configVersion: "v1",
+      servers: [
+        makeServerConfig({ id: "gh-id", namespace: "gh", name: "GitHub", description: "Repos and issues" }),
+        makeServerConfig({ id: "sl-id", namespace: "slack", name: "Slack", description: "Issues and team messages" }),
+        makeServerConfig({ id: "fs-id", namespace: "fs", name: "Filesystem", description: "Local files" }),
+      ],
+    };
+    priv.connections.set("other", makeConnection("other", [{ name: "t" }]));
+    vi.mocked(connectToUpstream).mockImplementation(async (cfg: UpstreamServerConfig) =>
+      makeConnection(cfg.namespace, [{ name: "tool_one" }]),
+    );
+    const capped = await priv.handleDispatch("github issue", 1);
+    expect(vi.mocked(connectToUpstream)).not.toHaveBeenCalled();
+    expect(capped.content[0].text).not.toContain("runner-up tried");
+
+    // fs shares no word with the intent, so it is not a candidate at all:
+    // the gh failure stands alone rather than loading an unrelated server.
+    priv.serverCap = 10;
+    priv.connections.delete("other");
+    priv.config.servers = priv.config.servers.filter((s: UpstreamServerConfig) => s.namespace !== "slack");
+    vi.mocked(connectToUpstream).mockRejectedValue(
+      new ActivationError("docker daemon is not running", "install_failure"),
+    );
+    const lone = await priv.handleDispatch("github issue", 1);
+    expect(new Set(vi.mocked(connectToUpstream).mock.calls.map((c) => c[0].namespace))).toEqual(new Set(["gh"]));
+    expect(lone.isError).toBe(true);
+    expect(lone.content[0].text).not.toContain("runner-up tried");
   });
 });

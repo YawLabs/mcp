@@ -194,7 +194,12 @@ const BENCHMARK: Array<{ intent: string; expected: string }> = [
   { intent: "run a SELECT query against the users table in the database", expected: "postgres" },
   { intent: "create a ticket for the mobile team to track a regression", expected: "linear" },
   { intent: "download the html of https://example.com/pricing", expected: "fetch" },
-  { intent: "read the contents of a file from disk", expected: "filesystem" },
+  // Was "read the contents of a file from disk", which ranked filesystem #1
+  // only on the word "the" (in filesystem's description, not gdrive's). With
+  // function words out of the query, "read" + "file" is a genuine tie between
+  // filesystem and gdrive and "disk" is in neither description, so the intent
+  // now says "local", the word a user means by "from disk".
+  { intent: "read the contents of a local file from disk", expected: "filesystem" },
   { intent: "search the web for recent news about llms", expected: "brave_search" },
   { intent: "what time is it in Tokyo right now", expected: "time" },
   { intent: "look up the latest unresolved error events in our project", expected: "sentry" },

@@ -39,11 +39,20 @@ export const FIND_TOOL_MAX_LIMIT = 50;
  *
  * Kept exposure-neutral: a `lite` session (proxy.ts ToolExposure) advertises
  * only exec / find_tool / read_tool, but every meta-tool named here is still
- * callable by name, so nothing below is untrue for it.
+ * callable by name, so nothing below is untrue for it. The one exposure-
+ * dependent claim says so itself: the installed-servers line rides on
+ * dispatch's description, or find_tool's under lite (withInstalledServers in
+ * installed-summary.ts).
+ *
+ * Static on purpose: it cannot name the installed servers itself. The SDK
+ * answers server/discover and initialize from this constant before start()
+ * reads any config (see the serve-first comment there), and
+ * serve-era.test.ts / server-start.test.ts pin the sent value to it.
  */
 export const SERVER_INSTRUCTIONS = [
   "yaw-mcp fronts every MCP server the user installed; tools/list shows the mcp_connect_* meta-tools plus servers loaded THIS session. Each load adds tools to your context: unload (mcp_connect_deactivate) when done.",
-  "Concrete task: mcp_connect_dispatch loads the best server in one call. Browsing: mcp_connect_discover. Known 2-4 step chain: mcp_connect_exec (calls a cached server's tool by name, no load needed).",
+  "Concrete task: mcp_connect_dispatch loads the best server in one call; its description (find_tool's when dispatch is unlisted) names the installed servers. Browsing: mcp_connect_discover. Known 2-4 step chain: mcp_connect_exec (calls a cached server's tool by name, no load needed).",
+  "Answer general-knowledge questions directly, without routing. If mcp_connect_find_tool finds nothing, retry with mcp_connect_dispatch in the user's own words. A just-loaded tool reported missing: call it through mcp_connect_exec.",
   "Prefer a server over the CLI it shadows. Read yaw-mcp://guide first when listed: this project's routing rules.",
 ].join(" ");
 
@@ -180,7 +189,7 @@ export const META_TOOLS = {
           type: "string",
           enum: ["off", "auto", "aggressive"],
           description:
-            'Per-call routing-effort dial: "off" never asks the client LLM to break a ranking tie, "auto" (default) asks once on genuine ambiguity, "aggressive" samples best-of-3 on milder ambiguity. Falls back to YAW_MCP_ROUTE_EFFORT. Budget 1 only.',
+            'Per-call routing-effort dial: "off" never asks the client LLM to break a ranking tie, "auto" (default) asks once on genuine ambiguity, "aggressive" samples best-of-3 on milder ambiguity. No effect without client MCP sampling. Falls back to YAW_MCP_ROUTE_EFFORT. Budget 1 only.',
         },
       },
       required: ["intent"],
