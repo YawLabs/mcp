@@ -7,8 +7,11 @@
 // scores over weighted fields. The corpus is tiny (<100s of servers per
 // install), so the O(N*M) prep cost is negligible.
 //
-// We deliberately skip stemming / synonyms / embeddings here -- BM25 with
-// good field weights captures the 80% case. This used to promise "a semantic
+// Terms are normalized before they are counted -- a light suffix fold
+// (normalizeTerm) plus a small generic abbreviation map and aliases derived
+// from the installed servers' own identifiers (see "Term normalization"
+// below) -- but there are no embeddings: lexical BM25 with good field
+// weights captures the bulk of the cases. This used to promise "a semantic
 // Stage 2 (on the server side) will handle semantic matches when it lands";
 // the hosted backend that Stage 2 would have run on is retired, so there is
 // no second stage to land and this file is the whole ranker. (server.ts's
@@ -117,9 +120,10 @@ function tokenizeIdent(text: string | undefined): string[] {
 //
 // So: keep the 1-char floor on the document side and on the query, and
 // subtract exactly the words that are never content terms. Entries are all
-// sub-floor by construction -- a 3+ char word here would be inert, since
-// terms the prose floor already admitted ("the", "and", "for") are unchanged
-// by this fix and out of its scope.
+// sub-floor by construction: tokenizeQuery is also what the foundry harvest
+// and discover's match summary read, so it subtracts only the words below the
+// prose floor that it alone admits. The 3+ char function words ("the", "and",
+// "for") are dropped later, inside the rankers (QUERY_FUNCTION_WORDS).
 //
 // Deliberately ABSENT even though they look like function words: `do`
 // (DigitalOcean), `go` (Go toolchain), `pr`, `id`, `db`, `pg`, `gh`, `ai`,
@@ -179,6 +183,155 @@ export function tokenizeQuery(text: string | undefined): string[] {
   return tokenizeIdent(text).filter((t) => t.length >= MIN_TOKEN_LEN || !SUB_FLOOR_STOPWORDS.has(t));
 }
 
+// --- Term normalization ----------------------------------------------------
+//
+// Exact-token matching missed the commonest surface variation in a request:
+// "open a pull request" never met a description saying "pull requests",
+// "issues" and "issue" were different terms, "vulnerable" never met
+// "vulnerabilities", and "list my PRs" matched nothing GitHub-shaped at all.
+// Every token -- query AND document, every field -- now goes through
+// normalizeTerm before it is counted or looked up, so both sides fold to the
+// same form. tokenize / tokenizeQuery above are unchanged and still return
+// surface tokens: their outside callers (the re-dispatch miss detector, the
+// foundry harvest, discover's match summary) compare raw text, not index
+// terms.
+
+/** Generic developer abbreviations, folded to their long form on both sides.
+ *  Written as a general vocabulary list, not from any install's misses, and
+ *  keyed on no server's namespace: every entry is an abbreviation people type
+ *  for a concept, so "k8s" and "kubernetes", or "repo" and "repository", are
+ *  one term wherever either appears. Two folds a measured prototype found
+ *  harmful are deliberately absent: http -> fetch (every URL in a prompt
+ *  carries "http", so "with playwright, open http://localhost:5173 and take a
+ *  screenshot" went to a fetch server) and folder -> directory (it sent "my
+ *  cloud folder" to a local filesystem server instead of the cloud drive). */
+const ABBREVIATIONS: Readonly<Record<string, readonly string[]>> = {
+  pr: ["pull", "request"],
+  prs: ["pull", "request"],
+  k8s: ["kubernetes"],
+  repo: ["repository"],
+  repos: ["repository"],
+  db: ["database"],
+  dbs: ["database"],
+  gh: ["github"],
+  pkg: ["package"],
+  pkgs: ["package"],
+  dep: ["dependency"],
+  deps: ["dependency"],
+  dir: ["directory"],
+  dirs: ["directory"],
+  doc: ["documentation"],
+  docs: ["documentation"],
+  config: ["configuration"],
+  configs: ["configuration"],
+  cfg: ["configuration"],
+  auth: ["authentication"],
+  env: ["environment"],
+  envs: ["environment"],
+  cred: ["credential"],
+  creds: ["credential"],
+  cert: ["certificate"],
+  certs: ["certificate"],
+  msg: ["message"],
+  msgs: ["message"],
+  img: ["image"],
+  imgs: ["image"],
+  param: ["parameter"],
+  params: ["parameter"],
+  arg: ["argument"],
+  args: ["argument"],
+  info: ["information"],
+  perf: ["performance"],
+  stats: ["statistic"],
+  prod: ["production"],
+  mgmt: ["management"],
+  txn: ["transaction"],
+  js: ["javascript"],
+  ts: ["typescript"],
+  py: ["python"],
+};
+
+/** Words the plural / suffix fold below would mangle into a different word
+ *  ("news" -> "new", "series" -> "sery"). */
+const STEM_EXCEPTIONS = new Set(["news", "series", "species", "always", "perhaps"]);
+
+const VOWEL = /[aeiouy]/;
+
+/** Drop a doubled final consonant left by a suffix strip: "running" -> "runn"
+ *  -> "run", "mapped" -> "mapp" -> "map". l, s and z stay doubled ("installed"
+ *  -> "install", "processed" -> "process"). */
+function undouble(s: string): string {
+  const n = s.length;
+  // n >= 4: a 3-letter stem keeps its double ("adding" -> "add", not "ad",
+  // which would fall under the 3-character floor and leave "adding" unfolded).
+  return n >= 4 && s[n - 1] === s[n - 2] && !/[aeiouylsz]/.test(s[n - 1]) ? s.slice(0, -1) : s;
+}
+
+/** A 3-letter consonant-vowel-consonant stem ("sav", "cod", "fix"). */
+function isShortCvc(s: string): boolean {
+  return s.length === 3 && !VOWEL.test(s[0]) && VOWEL.test(s[1]) && !VOWEL.test(s[2]);
+}
+
+/** Finish an -ed / -ing strip, Porter-style: undouble a doubled consonant
+ *  ("running" -> "runn" -> "run"), else put back the silent e a 4-letter base
+ *  lost ("saved" / "saving" -> "sav" -> "save", "coding" -> "code"), so the
+ *  inflected forms meet the base word, which is too short for the final-e
+ *  strip below. No e after w/x/y ("fixed" -> "fix"). */
+function restoreE(stem: string): string {
+  const u = undouble(stem);
+  if (u !== stem) return u;
+  return isShortCvc(stem) && !/[wxy]$/.test(stem) ? `${stem}e` : stem;
+}
+
+/** Light suffix fold, a few Porter-style rules rather than a full stemmer:
+ *  plurals (ies/sses/xes/ches/shes/s), then -ied/-ing/-ed, then
+ *  -ability/-able, then a final -e. The output is a matching key, not a word
+ *  ("issue" and "issues" both fold to "issu", "create" / "created" /
+ *  "creating" to "creat", "save" / "saved" / "saving" to "save"); it only has
+ *  to be the SAME key for both sides.
+ *
+ *  Tokens of three characters or fewer, and any token containing a digit, are
+ *  returned untouched: those are identifiers (pg, gh, aws, s3, ec2, v2), and
+ *  a fold that turned "aws" into "aw" would be the short-identifier recall
+ *  hole tokenizeIdent exists to close. -ing and -ed strip only when what is
+ *  left still carries a vowel ("string" stays "string", not "str") and never
+ *  from -eed ("speed", "need"). */
+export function normalizeTerm(token: string): string {
+  if (token.length <= 3 || /\d/.test(token) || STEM_EXCEPTIONS.has(token)) return token;
+  let s = token;
+  if (s.endsWith("ies") && s.length > 4) s = `${s.slice(0, -3)}y`;
+  else if (s.endsWith("sses")) s = s.slice(0, -2);
+  else if (/(?:x|z|ch|sh)es$/.test(s)) s = s.slice(0, -2);
+  else if (s.endsWith("s") && !/(?:ss|us|is)$/.test(s)) s = s.slice(0, -1);
+
+  if (s.endsWith("ied") && s.length > 4) s = `${s.slice(0, -3)}y`;
+  else if (s.endsWith("ing") && s.length >= 6 && VOWEL.test(s.slice(0, -3))) s = restoreE(s.slice(0, -3));
+  else if (s.endsWith("ed") && !s.endsWith("eed") && s.length >= 5 && VOWEL.test(s.slice(0, -2))) {
+    const stem = s.slice(0, -2);
+    // A 3-letter -ed stem that is not CVC is a root ending in "ed", not an
+    // inflection of an e-final verb: "embed" stays whole so it meets
+    // "embedding" -> "embed". Cost: "asked" / "ended" / "added" stay whole too.
+    if (stem.length > 3 || isShortCvc(stem)) s = restoreE(stem);
+  }
+
+  if (s.endsWith("ability") && s.length >= 9) s = s.slice(0, -7);
+  else if (s.endsWith("able") && s.length >= 7) s = s.slice(0, -4);
+  if (s.endsWith("e") && s.length >= 5) s = s.slice(0, -1);
+  return s.length >= 3 ? s : token;
+}
+
+/** Surface tokens -> index terms: abbreviation expansion, then the suffix
+ *  fold. One surface token can become several terms ("pr" -> pull, request). */
+function normalizeTokens(tokens: readonly string[]): string[] {
+  const out: string[] = [];
+  for (const t of tokens) {
+    const expanded = ABBREVIATIONS[t];
+    if (expanded) for (const e of expanded) out.push(normalizeTerm(e));
+    else out.push(normalizeTerm(t));
+  }
+  return out;
+}
+
 type FieldName = keyof typeof FIELD_WEIGHTS;
 
 /** A field reduced to exactly what BM25 needs: its token count (for length
@@ -206,19 +359,47 @@ function addTokens(field: FieldStats, tokens: string[]): FieldStats {
   return field;
 }
 
-function buildDocFields(server: RankableServer): DocFields {
+/** One tool's normalized terms, for rankTools. */
+interface ToolTerms {
+  name: Set<string>;
+  /** Name terms in order, duplicates kept -- the tie-break counts how many of
+   *  them the query left unmatched. */
+  nameList: string[];
+  desc: Set<string>;
+}
+
+/** Everything both rankers need from one server, built once per distinct
+ *  server content and cached (see docCache). `tools[i]` is `server.tools[i]`:
+ *  the cache key covers every tool in order, so the alignment holds for any
+ *  server array that produced the same key. */
+interface IndexedDoc {
+  fields: DocFields;
+  tools: ToolTerms[];
+  namespaceTerms: string[];
+}
+
+function buildDoc(server: RankableServer): IndexedDoc {
   const toolName = emptyField();
   const toolDescription = emptyField();
+  const tools: ToolTerms[] = [];
   for (const tool of server.tools) {
-    addTokens(toolName, tokenizeIdent(tool.name));
-    addTokens(toolDescription, tokenize(tool.description));
+    const nameList = normalizeTokens(tokenizeIdent(tool.name));
+    const descList = normalizeTokens(tokenize(tool.description));
+    addTokens(toolName, nameList);
+    addTokens(toolDescription, descList);
+    tools.push({ name: new Set(nameList), nameList, desc: new Set(descList) });
   }
+  const namespaceTerms = normalizeTokens(tokenizeIdent(server.namespace));
   return {
-    namespace: addTokens(emptyField(), tokenizeIdent(server.namespace)),
-    name: addTokens(emptyField(), tokenizeIdent(server.name)),
-    description: addTokens(emptyField(), tokenize(server.description)),
-    toolName,
-    toolDescription,
+    fields: {
+      namespace: addTokens(emptyField(), namespaceTerms),
+      name: addTokens(emptyField(), normalizeTokens(tokenizeIdent(server.name))),
+      description: addTokens(emptyField(), normalizeTokens(tokenize(server.description))),
+      toolName,
+      toolDescription,
+    },
+    tools,
+    namespaceTerms,
   };
 }
 
@@ -305,11 +486,11 @@ function digest(text: string): string {
   return createHash("sha256").update(text).digest("base64url");
 }
 
-/** Per-server DocFields, keyed by the digest of that server's content
+/** Per-server IndexedDoc, keyed by the digest of that server's content
  *  signature. Sized to outlive a corpus edit: when one server activates, the
  *  other N-1 keys are unchanged and their fields are reused. */
 const MAX_CACHED_DOCS = 512;
-const docCache = new Map<string, DocFields>();
+const docCache = new Map<string, IndexedDoc>();
 
 /** Whole-corpus index, keyed by the digest of the joined per-server digests.
  *  A handful of entries covers the alternation between discover's corpus (all
@@ -318,9 +499,12 @@ const MAX_CACHED_INDEXES = 4;
 const indexCache = new Map<string, RankingIndex>();
 
 interface RankingIndex {
-  docs: Array<{ namespace: string; fields: DocFields }>;
+  docs: Array<{ namespace: string } & IndexedDoc>;
   idf: Map<string, number>;
   avgFieldLen: Record<FieldName, number>;
+  /** Query-side aliases derived from this corpus's identifiers (see
+   *  deriveAliases): surface token -> index terms. */
+  aliases: Map<string, string[]>;
 }
 
 /** Build counters, exposed for tests to assert the caches actually hit
@@ -440,21 +624,163 @@ function indexKeyFor(docKeys: string[]): string {
   return digest(docKeys.join(""));
 }
 
-function docFieldsFor(docKey: string, server: RankableServer): DocFields {
+function docFor(docKey: string, server: RankableServer): IndexedDoc {
   const cached = docCache.get(docKey);
   if (cached) {
     touch(docCache, docKey, cached);
     return cached;
   }
   docBuilds++;
-  const fields = buildDocFields(server);
-  putBounded(docCache, docKey, fields, MAX_CACHED_DOCS);
-  return fields;
+  const doc = buildDoc(server);
+  putBounded(docCache, docKey, doc, MAX_CACHED_DOCS);
+  return doc;
+}
+
+// --- Aliases derived from the installed servers ----------------------------
+//
+// The abbreviation map above is generic vocabulary. Installs also carry their
+// own shorthand that no global list can know, and the identifiers already
+// spell it out: a server whose tools say `resource_group` five times is the
+// server "rg" means, and a namespace called `kubernetes` is what "k8s" means.
+// So at index time two alias shapes are read off the corpus's IDENTIFIERS
+// (namespace, server name, tool names -- never prose descriptions, where
+// adjacent words are not a phrase):
+//
+//   * acronym of a recurring two- or three-word identifier phrase
+//     (`virtual_machine` -> "vm", `resource_group` -> "rg");
+//   * numeronym of a long namespace or server-name word
+//     (kubernetes -> "k8s", internationalization -> "i18n").
+//
+// An alias only ever applies to a query token that is NOT itself a term in
+// the corpus, so it can add recall but never re-route a word some server
+// already uses. A short token is precious (see SUB_FLOOR_STOPWORDS and the
+// "go" / "do" namespaces), so the acronym rules are strict: every word of the
+// phrase is a 3+ letter word that is not a common action verb, not a generic
+// product word (mcp, server, api ...) and, in a tool name, not the server's
+// own namespace or name; the phrase recurs (two or more tool names) unless it
+// is exactly one server's namespace or name; and an acronym two different
+// phrases produce is dropped as ambiguous.
+
+/** Generic action verbs that lead most tool names. A phrase starting or
+ *  containing one is an operation, not a noun people abbreviate: `get_user`
+ *  is not "gu". */
+const ACTION_VERBS = new Set([
+  "get",
+  "set",
+  "list",
+  "create",
+  "delete",
+  "update",
+  "add",
+  "remove",
+  "read",
+  "write",
+  "run",
+  "fetch",
+  "search",
+  "find",
+  "check",
+  "show",
+  "open",
+  "close",
+  "start",
+  "stop",
+  "put",
+  "post",
+  "patch",
+  "send",
+  "describe",
+  "query",
+  "execute",
+  "exec",
+  "upload",
+  "download",
+  "install",
+  "enable",
+  "disable",
+]);
+
+/** Words that name the kind of thing a server is rather than what it does.
+ *  Server names are full of them ("Slack MCP Server", "Jira API Client"),
+ *  so a phrase containing one is packaging, not a noun people abbreviate:
+ *  "MCP Server" twice in an install must not make "ms" an alias that routes
+ *  "50 ms" to whichever servers carry the filler. */
+const GENERIC_PRODUCT_WORDS = new Set(["mcp", "server", "tool", "api", "client", "plugin", "service", "sdk", "app"]);
+
+const MIN_NUMERONYM_WORD = 8;
+
+function deriveAliases(servers: RankableServer[], idf: Map<string, number>): Map<string, string[]> {
+  // acronym -> phrase (its normalized terms, space-joined, so
+  // `resource_group` and `resource_groups` are one phrase) -> how many
+  // identifiers carry it
+  const phrases = new Map<string, Map<string, number>>();
+  // phrase -> the servers whose namespace or name carries it
+  const fromName = new Map<string, Set<string>>();
+  const note = (tokens: string[], nameOf: string | undefined) => {
+    for (let len = 2; len <= 3; len++) {
+      for (let i = 0; i + len <= tokens.length; i++) {
+        const words = tokens.slice(i, i + len);
+        if (!words.every((w) => /^[a-z]{3,}$/.test(w) && !ACTION_VERBS.has(w) && !GENERIC_PRODUCT_WORDS.has(w)))
+          continue;
+        const acronym = words.map((w) => w[0]).join("");
+        const key = normalizeTokens(words).join(" ");
+        let byPhrase = phrases.get(acronym);
+        if (!byPhrase) {
+          byPhrase = new Map();
+          phrases.set(acronym, byPhrase);
+        }
+        // Recurrence counts tool names only; a name is recorded in fromName.
+        byPhrase.set(key, (byPhrase.get(key) ?? 0) + (nameOf === undefined ? 1 : 0));
+        if (nameOf !== undefined) {
+          let owners = fromName.get(key);
+          if (!owners) {
+            owners = new Set();
+            fromName.set(key, owners);
+          }
+          owners.add(nameOf);
+        }
+      }
+    }
+  };
+  const aliases = new Map<string, string[]>();
+  const offer = (alias: string, terms: string[]) => {
+    if (idf.has(alias) || ABBREVIATIONS[alias] || SUB_FLOOR_STOPWORDS.has(alias)) return;
+    aliases.set(alias, terms);
+  };
+  for (const server of servers) {
+    const nsTokens = tokenizeIdent(server.namespace);
+    const nameTokens = tokenizeIdent(server.name);
+    note(nsTokens, server.namespace);
+    note(nameTokens, server.namespace);
+    // The server's own words break a tool-name phrase rather than join one:
+    // `electron_scaffold_ipc` is electron's scaffold tool, not an
+    // "electron scaffold" phrase whose acronym is "es".
+    const own = new Set([...nsTokens, ...nameTokens]);
+    for (const tool of server.tools)
+      note(
+        tokenizeIdent(tool.name).map((w) => (own.has(w) ? "" : w)),
+        undefined,
+      );
+    for (const word of [...nsTokens, ...nameTokens]) {
+      if (word.length >= MIN_NUMERONYM_WORD && /^[a-z]+$/.test(word)) {
+        offer(`${word[0]}${word.length - 2}${word[word.length - 1]}`, normalizeTokens([word]));
+      }
+    }
+  }
+  for (const [acronym, byPhrase] of phrases) {
+    if (byPhrase.size !== 1) continue; // ambiguous: two phrases, one acronym
+    const [[key, count]] = [...byPhrase];
+    // A name earns its acronym without recurring only when it is ONE
+    // server's name: a phrase several servers' names share is not what any
+    // one of them is called.
+    if (count >= 2 || fromName.get(key)?.size === 1) offer(acronym, key.split(" "));
+  }
+  return aliases;
 }
 
 function buildIndex(servers: RankableServer[], docKeys: string[]): RankingIndex {
   indexBuilds++;
-  const docs = servers.map((s, i) => ({ namespace: s.namespace, fields: docFieldsFor(docKeys[i], s) }));
+  const docs = servers.map((s, i) => ({ namespace: s.namespace, ...docFor(docKeys[i], s) }));
   const N = docs.length;
 
   // Document frequency — how many servers contain the term in ANY field.
@@ -506,7 +832,66 @@ function buildIndex(servers: RankableServer[], docKeys: string[]): RankingIndex 
     toolDescription: totalLen.toolDescription / denom,
   };
 
-  return { docs, idf, avgFieldLen };
+  return { docs, idf, avgFieldLen, aliases: deriveAliases(servers, idf) };
+}
+
+/** The cached index for this corpus, building it on a miss. The raw
+ *  signatures are transient -- only their digests are held, and only as Map
+ *  keys -- so a corpus of large upstreams does not park its whole text in the
+ *  cache for the life of the process. */
+function indexFor(servers: RankableServer[]): RankingIndex {
+  const docKeys = servers.map((s) => digest(serverSignature(s)));
+  const indexKey = indexKeyFor(docKeys);
+  let index = indexCache.get(indexKey);
+  if (index === undefined) {
+    index = buildIndex(servers, docKeys);
+    putBounded(indexCache, indexKey, index, MAX_CACHED_INDEXES);
+  } else {
+    touch(indexCache, indexKey, index);
+  }
+  return index;
+}
+
+// 3+ character English function words (plus "use" / "using", which carry no
+// intent of their own). The prose floor (3 chars) admits them, so "the",
+// "what", "with" used to be scoring terms in both rankers. In rankServers a
+// query of nothing but them still matched: "the" alone matched 19 of 21
+// servers on one real install, and dispatch, which refuses only a zero-match
+// ranking, loaded one. rankTools has no IDF, so there each one was a flat +1
+// for every tool whose description used it, and on a 73-tool server that
+// alone decided the top of the list ("what is the capital of France" returned
+// an azure tool). Every word here is removed from the query before
+// normalization, by both rankers and by queryCoverage. Closed-class words
+// only: none of these can name a tool, a resource or a domain.
+const QUERY_FUNCTION_WORDS = new Set(
+  (
+    "the and for are that this with what which how does did was were have has had our your their its " +
+    "from into about can could would should will just any all some when where who why whether then than " +
+    "there here also very much many not but via you they them these those been being please thanks thank " +
+    "let lets since until while between among use using"
+  ).split(" "),
+);
+
+/** Normalized query terms for this index, in query order, with `drop`
+ *  removing surface words first. A surface token takes the generic
+ *  abbreviation expansion when it has one; otherwise its folded form, unless
+ *  that form is absent from the corpus and the corpus derived an alias for
+ *  the token. */
+function queryTermsFor(text: string, index: RankingIndex, drop?: ReadonlySet<string>): string[] {
+  const out: string[] = [];
+  for (const t of tokenizeQuery(text)) {
+    if (drop?.has(t)) continue;
+    const expanded = ABBREVIATIONS[t];
+    if (expanded) {
+      for (const e of expanded) out.push(normalizeTerm(e));
+      continue;
+    }
+    const folded = normalizeTerm(t);
+    const alias = index.idf.has(folded) ? undefined : index.aliases.get(t);
+    if (alias) out.push(...alias);
+    else out.push(folded);
+  }
+  return out;
 }
 
 /** Score a prepared index against an already-tokenized query. */
@@ -537,23 +922,15 @@ export interface RankedTool {
   score: number;
 }
 
-/** Did the query name this namespace? True when every identifier token of
- *  it is a query term ("aws" and "s3" for `aws_s3`). The query is tokenized
- *  on the same non-alphanumeric separators the namespace is split on here, so
- *  `aws_s3`, `aws-s3` and "aws s3" in the query all qualify -- while "awss3"
- *  does not: it is one token, and neither branch below joins segments.
- *
- *  The verbatim check is only a fast path. A query term never contains a
- *  separator, so it can equal the whole lowercased namespace only when the
- *  namespace has none either -- and then tokenizeIdent yields that same
- *  single token and the `every` branch answers identically. A whole-string
- *  test alone could never award the bonus to a multi-segment namespace. A
- *  namespace that tokenizes to nothing never matches: an `every` over an
- *  empty list would be vacuously true. */
-function queryNamesNamespace(queryTerms: Set<string>, namespace: string): boolean {
-  if (queryTerms.has(namespace.toLowerCase())) return true;
-  const parts = tokenizeIdent(namespace);
-  return parts.length > 0 && parts.every((p) => queryTerms.has(p));
+/** Did the query name this namespace? True when every identifier term of it
+ *  is a query term ("aws" and "s3" for `aws_s3`). Both sides are split on the
+ *  same non-alphanumeric separators and normalized the same way, so `aws_s3`,
+ *  `aws-s3` and "aws s3" in the query all qualify -- while "awss3" does not:
+ *  it is one token, and nothing here joins segments. A namespace that
+ *  tokenizes to nothing never matches: an `every` over an empty list would be
+ *  vacuously true. */
+function queryNamesNamespace(queryTerms: ReadonlySet<string>, namespaceTerms: readonly string[]): boolean {
+  return namespaceTerms.length > 0 && namespaceTerms.every((p) => queryTerms.has(p));
 }
 
 /** Rank TOOLS across servers, rather than ranking the servers that hold them.
@@ -570,45 +947,86 @@ function queryNamesNamespace(queryTerms: Set<string>, namespace: string): boolea
  *  computed over server-sized documents and its length normalization divides
  *  by a server's total field length. Reusing it per tool would give a tool on
  *  a 60-tool server a systematically different score from the identical tool
- *  on a 3-tool one. The weighting still mirrors FIELD_WEIGHTS (a name hit
- *  outweighs a description hit) so the two rankers agree about what "matches"
- *  means, and each field is tokenized at the floor rankServers uses for the
- *  same field -- the identifier floor for tool names, the prose floor for
- *  descriptions -- so a term that survives for one ranker survives for the
- *  other. */
+ *  on a 3-tool one. (A per-tool BM25 was also measured and rejected: it rewards
+ *  a rare word that happens to sit in an unrelated tool's name -- "select"
+ *  pulled browser select tools over a SQL explain tool -- and its gain
+ *  vanished on prompts reworded away from the descriptions' own wording.) The
+ *  weighting still mirrors FIELD_WEIGHTS (a name hit outweighs a description
+ *  hit) so the two rankers agree about what "matches" means, and each field
+ *  is tokenized and normalized exactly as rankServers indexes it -- the
+ *  identifier floor for tool names, the prose floor for descriptions -- so a
+ *  term that survives for one ranker survives for the other. With no IDF here,
+ *  function words are dropped from the query (QUERY_FUNCTION_WORDS). */
 export function rankTools(query: string, servers: RankableServer[]): RankedTool[] {
-  const queryTerms = new Set(tokenizeQuery(query));
-  if (queryTerms.size === 0 || servers.length === 0) return [];
+  if (tokenizeQuery(query).length === 0 || servers.length === 0) return [];
+  const index = indexFor(servers);
+  const termList = queryTermsFor(query, index, QUERY_FUNCTION_WORDS);
+  const queryTerms = new Set(termList);
+  if (queryTerms.size === 0) return [];
+  // What rankServers scores each server for this same query: the first
+  // tie-break below, so find_tool and dispatch agree on whose tool wins a tie.
+  const serverScore = new Map(scoreAgainstIndex(termList, index).map((r) => [r.namespace, r.score]));
 
-  const out: RankedTool[] = [];
-  for (const server of servers) {
-    for (const tool of server.tools) {
-      // tokenizeIdent for the NAME, matching buildDocFields: a tool name is an
-      // identifier, so `s3_upload` has to yield ["s3", "upload"] here exactly
-      // as it does in the server index, or find_tool("s3") can never hit a
-      // tool rankServers would have credited. (This used the prose tokenizer,
-      // whose 3-char floor dropped `s3`, `pr`, `db` from every tool name, and
-      // the comment claimed a joined form was kept that no tokenizer here has
-      // ever produced.) Descriptions keep the prose floor, as in the index.
-      const nameTerms = new Set(tokenizeIdent(tool.name));
-      const descTerms = new Set(tokenize(tool.description));
+  interface Scored extends RankedTool {
+    serverScore: number;
+    nameHits: number;
+    nameMisses: number;
+    serverTools: number;
+  }
+  const out: Scored[] = [];
+  servers.forEach((server, i) => {
+    const doc = index.docs[i];
+    const namedNamespace = queryNamesNamespace(queryTerms, doc.namespaceTerms);
+    server.tools.forEach((tool, j) => {
+      const terms = doc.tools[j];
       let score = 0;
+      let nameHits = 0;
       for (const term of queryTerms) {
-        if (nameTerms.has(term)) score += FIELD_WEIGHTS.toolName;
-        else if (descTerms.has(term)) score += FIELD_WEIGHTS.toolDescription;
+        if (terms.name.has(term)) {
+          score += FIELD_WEIGHTS.toolName;
+          nameHits++;
+        } else if (terms.desc.has(term)) score += FIELD_WEIGHTS.toolDescription;
       }
+      if (score === 0) return;
       // A namespace hit is worth something but must not carry a tool on its
       // own: "github" should surface github's tools BELOW a tool actually
       // named for what was asked, on any server.
-      if (score > 0 && queryNamesNamespace(queryTerms, server.namespace)) score += 0.5;
-      if (score > 0) out.push({ namespace: server.namespace, name: tool.name, description: tool.description, score });
-    }
-  }
-  // Ties broken by namespace then name so the order is stable across calls --
-  // an unstable list reads as churn to a model comparing two responses.
-  return out.sort(
-    (a, b) => b.score - a.score || a.namespace.localeCompare(b.namespace) || a.name.localeCompare(b.name),
+      if (namedNamespace) score += 0.5;
+      const nameMisses = terms.nameList.filter((t) => !queryTerms.has(t)).length;
+      out.push({
+        namespace: server.namespace,
+        name: tool.name,
+        description: tool.description,
+        score,
+        serverScore: serverScore.get(server.namespace) ?? 0,
+        nameHits,
+        nameMisses,
+        serverTools: server.tools.length,
+      });
+    });
+  });
+  // Equal scores are common (the score is a small sum of field weights), so
+  // the tie-break carries real signal rather than the alphabet: first the tool
+  // on the server rankServers scores higher for this query (BM25 over the
+  // whole server, with IDF -- the one signal here that knows "redis" is rarer
+  // than "list"), then the tool whose NAME the query hit more often (two name
+  // hits beat one name hit plus two description hits at the same total), then
+  // the tool whose name the query covers most completely (`npm_downloads`
+  // over `npm_downloads_bulk` for "downloads"), then the tool on the smaller
+  // server, whose tools are each more specific than one of a 70-tool
+  // catch-all's. Namespace and name last, so the order is stable across calls
+  // -- an unstable list reads as churn to a model comparing two responses.
+  out.sort(
+    (a, b) =>
+      b.score - a.score ||
+      b.serverScore - a.serverScore ||
+      b.nameHits - a.nameHits ||
+      a.nameMisses - b.nameMisses ||
+      a.serverTools - b.serverTools ||
+      a.namespace.localeCompare(b.namespace) ||
+      a.name.localeCompare(b.name),
   );
+  return out.map(({ namespace, name, description, score }) => ({ namespace, name, description, score }));
 }
 
 // Rank a list of servers against a free-text query. Returns results sorted
@@ -618,23 +1036,59 @@ export function rankTools(query: string, servers: RankableServer[]): RankedTool[
 export function rankServers(context: string, servers: RankableServer[]): RankedResult[] {
   // Identifier floor on the query, not the prose floor: "use pg" has to
   // survive tokenization or the short-namespace fix on the document side is
-  // unreachable. Minus closed-class function words -- see SUB_FLOOR_STOPWORDS
-  // for why the identifier floor alone was not safe on the query side.
-  const queryTerms = tokenizeQuery(context);
-  if (queryTerms.length === 0 || servers.length === 0) return [];
+  // unreachable. Minus closed-class function words -- SUB_FLOOR_STOPWORDS
+  // (why the identifier floor alone was not safe on the query side) and
+  // QUERY_FUNCTION_WORDS (the 3+ char ones the prose floor admits).
+  if (tokenizeQuery(context).length === 0 || servers.length === 0) return [];
+  const index = indexFor(servers);
+  return scoreAgainstIndex(queryTermsFor(context, index, QUERY_FUNCTION_WORDS), index);
+}
 
-  // The raw signatures are transient -- only their digests are held, and only
-  // as Map keys -- so a corpus of large upstreams does not park its whole text
-  // in the cache for the life of the process.
-  const docKeys = servers.map((s) => digest(serverSignature(s)));
-  const indexKey = indexKeyFor(docKeys);
-  let index = indexCache.get(indexKey);
-  if (index === undefined) {
-    index = buildIndex(servers, docKeys);
-    putBounded(indexCache, indexKey, index, MAX_CACHED_INDEXES);
-  } else {
-    touch(indexCache, indexKey, index);
-  }
+/** How much of a query one server explains. */
+export interface QueryCoverage {
+  namespace: string;
+  /** IDF-weighted share of the query's content terms this server matches in
+   *  any field: sum(idf of matched terms) / sum(idf of all content terms),
+   *  in [0, 1]. 0 when the query has no content terms. */
+  coverage: number;
+  /** Distinct content terms matched. */
+  matched: number;
+  /** Distinct content terms in the query. */
+  contentTerms: number;
+}
 
-  return scoreAgainstIndex(queryTerms, index);
+/** Query coverage per server, over the same normalized terms and cached index
+ *  rankServers uses. rankServers' score is an absolute BM25 sum: it grows with
+ *  how rare the matched terms are, not with how much of the request a server
+ *  explains, so "how does Redis LRU eviction differ from LFU" scores a redis
+ *  server highly on the one word "redis" while lru / eviction / lfu match
+ *  nothing anywhere. Coverage asks the relative question.
+ *
+ *  Content terms are the query's normalized terms minus QUERY_FUNCTION_WORDS,
+ *  pure numbers and 1-character tokens (arguments and variable names, not
+ *  routing intent). A term no server contains gets the highest IDF the
+ *  index's formula can give (document frequency 0): an unmatched word nobody
+ *  can serve is exactly the evidence that the request is not a tool request.
+ *  Returned in corpus order, one entry per server. */
+export function queryCoverage(query: string, servers: RankableServer[]): QueryCoverage[] {
+  if (servers.length === 0) return [];
+  const index = indexFor(servers);
+  const terms = [
+    ...new Set(queryTermsFor(query, index, QUERY_FUNCTION_WORDS).filter((t) => t.length >= 2 && !/^[0-9]+$/.test(t))),
+  ];
+  const N = index.docs.length;
+  const unseenIdf = Math.log((N + 0.5) / 0.5 + 1);
+  const idfOf = (t: string) => index.idf.get(t) ?? unseenIdf;
+  const total = terms.reduce((sum, t) => sum + idfOf(t), 0);
+  return index.docs.map(({ namespace, fields }) => {
+    let mass = 0;
+    let matched = 0;
+    for (const t of terms) {
+      if ((Object.keys(FIELD_WEIGHTS) as FieldName[]).some((f) => fields[f].counts.has(t))) {
+        mass += idfOf(t);
+        matched++;
+      }
+    }
+    return { namespace, coverage: total > 0 ? mass / total : 0, matched, contentTerms: terms.length };
+  });
 }

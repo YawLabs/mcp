@@ -532,7 +532,9 @@ if (subcommand === "compliance") {
                                with the client LLM: \`off\` | \`auto\` |
                                \`aggressive\` (default auto). The dispatch
                                tool's \`routeEffort\` argument overrides this
-                               per call.
+                               per call. Needs a client that supports MCP
+                               sampling (2025 protocol); without one it has
+                               no effect.
     YAW_MCP_REWARD_GRADER         Set to \`1\` to OPT IN to the LLM reward
                                grader: uncertain dispatch outcomes get a
                                second opinion via client sampling. It spends

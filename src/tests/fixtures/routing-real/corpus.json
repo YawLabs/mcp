@@ -1,0 +1,1567 @@
+{
+  "items": [
+    {
+      "id": "d01",
+      "prompt": "Use the tailscale MCP to list all devices on my tailnet",
+      "category": "direct",
+      "expect_servers": ["tailscale"],
+      "expect_tools": ["tailscale_list_devices"],
+      "notes": ""
+    },
+    {
+      "id": "d02",
+      "prompt": "Run pg_list_tables on the public schema",
+      "category": "direct",
+      "expect_servers": ["postgres"],
+      "expect_tools": ["pg_list_tables"],
+      "notes": "tool named verbatim"
+    },
+    {
+      "id": "d03",
+      "prompt": "With playwright, open http://localhost:5173 and take a screenshot",
+      "category": "direct",
+      "expect_servers": ["playwright"],
+      "expect_tools": ["browser_navigate", "browser_take_screenshot"],
+      "notes": "puppeteer would be wrong: user named playwright"
+    },
+    {
+      "id": "d04",
+      "prompt": "Use context7 to pull the current Next.js App Router docs on route handlers",
+      "category": "direct",
+      "expect_servers": ["context7"],
+      "expect_tools": ["resolve-library-id", "query-docs"],
+      "notes": ""
+    },
+    {
+      "id": "d05",
+      "prompt": "npm_downloads for zod over the last month",
+      "category": "direct",
+      "expect_servers": ["npmjs"],
+      "expect_tools": ["npm_downloads", "npm_downloads_range"],
+      "notes": "tool named verbatim"
+    },
+    {
+      "id": "d06",
+      "prompt": "Call redis_slowlog and show me the 10 slowest recent commands",
+      "category": "direct",
+      "expect_servers": ["redis"],
+      "expect_tools": ["redis_slowlog"],
+      "notes": ""
+    },
+    {
+      "id": "d07",
+      "prompt": "Use the caddy server to list the routes on srv0",
+      "category": "direct",
+      "expect_servers": ["caddy"],
+      "expect_tools": ["caddy_list_routes"],
+      "notes": ""
+    },
+    {
+      "id": "d08",
+      "prompt": "ssh_exec `df -h` on prod-web-1",
+      "category": "direct",
+      "expect_servers": ["ssh"],
+      "expect_tools": ["ssh_exec"],
+      "notes": ""
+    },
+    {
+      "id": "d09",
+      "prompt": "Use the kubernetes MCP to get logs for pod api-7d9f in the staging namespace",
+      "category": "direct",
+      "expect_servers": ["kubernetes"],
+      "expect_tools": ["pods_log"],
+      "notes": ""
+    },
+    {
+      "id": "d10",
+      "prompt": "Run a ctxlint audit on this repo's CLAUDE.md",
+      "category": "direct",
+      "expect_servers": ["ctxlint"],
+      "expect_tools": ["ctxlint_audit"],
+      "notes": ""
+    },
+    {
+      "id": "d11",
+      "prompt": "Use the LemonSqueezy tools to list my subscriptions that are past_due",
+      "category": "direct",
+      "expect_servers": ["lemonsqueezy"],
+      "expect_tools": ["ls_list_subscriptions"],
+      "notes": ""
+    },
+    {
+      "id": "d12",
+      "prompt": "Use the memory server to search_nodes for anything about 'billing migration'",
+      "category": "direct",
+      "expect_servers": ["memory"],
+      "expect_tools": ["search_nodes"],
+      "notes": ""
+    },
+    {
+      "id": "d13",
+      "prompt": "fetch_html_to_markdown https://docs.astral.sh/uv/ and give me the install section",
+      "category": "direct",
+      "expect_servers": ["fetch"],
+      "expect_tools": ["fetch_html_to_markdown", "fetch_reader"],
+      "notes": ""
+    },
+    {
+      "id": "d14",
+      "prompt": "Use the GitHub MCP to open a PR from feat/login into main",
+      "category": "direct",
+      "expect_servers": ["github"],
+      "expect_tools": [],
+      "notes": "github has no cached tools: server-level label only"
+    },
+    {
+      "id": "d15",
+      "prompt": "Search the Terraform registry for the latest hashicorp/aws provider version",
+      "category": "direct",
+      "expect_servers": ["terraform"],
+      "expect_tools": [],
+      "notes": "terraform has no cached tools: server-level label only"
+    },
+    {
+      "id": "d16",
+      "prompt": "Read the KV secret at secret/data/app/db from Vault",
+      "category": "direct",
+      "expect_servers": ["vault"],
+      "expect_tools": [],
+      "notes": "vault has no cached tools: server-level label only"
+    },
+    {
+      "id": "d17",
+      "prompt": "Run electron_audit_security against src/main",
+      "category": "direct",
+      "expect_servers": ["electron"],
+      "expect_tools": ["electron_audit_security"],
+      "notes": ""
+    },
+    {
+      "id": "d18",
+      "prompt": "Use the azure MCP to list my subscriptions",
+      "category": "direct",
+      "expect_servers": ["azure"],
+      "expect_tools": ["subscription_list"],
+      "notes": ""
+    },
+    {
+      "id": "d19",
+      "prompt": "Use sequential thinking to plan the database migration step by step",
+      "category": "direct",
+      "expect_servers": ["sequentialthinking"],
+      "expect_tools": ["sequentialthinking"],
+      "notes": ""
+    },
+    {
+      "id": "d20",
+      "prompt": "Use the filesystem server to show me the directory tree of C:/projects/app",
+      "category": "direct",
+      "expect_servers": ["filesystem"],
+      "expect_tools": ["directory_tree", "list_directory"],
+      "notes": ""
+    },
+    {
+      "id": "d21",
+      "prompt": "puppeteer_navigate to https://example.com and then click #login",
+      "category": "direct",
+      "expect_servers": ["puppeteer"],
+      "expect_tools": ["puppeteer_navigate", "puppeteer_click"],
+      "notes": "playwright would be wrong: user named puppeteer"
+    },
+    {
+      "id": "p01",
+      "prompt": "Which indexes in the database are never actually used and just slow down writes?",
+      "category": "paraphrase",
+      "expect_servers": ["postgres"],
+      "expect_tools": ["pg_unused_indexes", "pg_advisor"],
+      "notes": ""
+    },
+    {
+      "id": "p02",
+      "prompt": "What queries are eating the most time on the DB right now?",
+      "category": "paraphrase",
+      "expect_servers": ["postgres"],
+      "expect_tools": ["pg_top_queries"],
+      "notes": "needs pg_stat_statements"
+    },
+    {
+      "id": "p03",
+      "prompt": "Something is blocking my migration - who's holding the lock?",
+      "category": "paraphrase",
+      "expect_servers": ["postgres"],
+      "expect_tools": ["pg_inspect_locks"],
+      "notes": ""
+    },
+    {
+      "id": "p04",
+      "prompt": "What columns does the orders table have, and what are its foreign keys?",
+      "category": "paraphrase",
+      "expect_servers": ["postgres"],
+      "expect_tools": ["pg_describe_table"],
+      "notes": ""
+    },
+    {
+      "id": "p05",
+      "prompt": "Is there a column called something like customer_id anywhere in the database?",
+      "category": "paraphrase",
+      "expect_servers": ["postgres"],
+      "expect_tools": ["pg_search_columns"],
+      "notes": ""
+    },
+    {
+      "id": "p06",
+      "prompt": "Grab just the article text from https://blog.example.com/post/42 so I can summarize it",
+      "category": "paraphrase",
+      "expect_servers": ["fetch"],
+      "expect_tools": ["fetch_reader", "fetch_html_to_markdown", "fetch_html_to_text"],
+      "notes": ""
+    },
+    {
+      "id": "p07",
+      "prompt": "Hit https://api.example.com/health and tell me what status code comes back",
+      "category": "paraphrase",
+      "expect_servers": ["fetch"],
+      "expect_tools": ["http_get", "http_head"],
+      "notes": ""
+    },
+    {
+      "id": "p08",
+      "prompt": "Is our crawler allowed to scrape /search on example.com?",
+      "category": "paraphrase",
+      "expect_servers": ["fetch"],
+      "expect_tools": ["fetch_robots"],
+      "notes": ""
+    },
+    {
+      "id": "p09",
+      "prompt": "Pull the latest posts from the Hacker News RSS feed",
+      "category": "paraphrase",
+      "expect_servers": ["fetch"],
+      "expect_tools": ["fetch_feed"],
+      "notes": ""
+    },
+    {
+      "id": "p10",
+      "prompt": "How many weekly downloads does fastify get?",
+      "category": "paraphrase",
+      "expect_servers": ["npmjs"],
+      "expect_tools": ["npm_downloads", "npm_downloads_range"],
+      "notes": ""
+    },
+    {
+      "id": "p11",
+      "prompt": "Are there known vulnerabilities in lodash 4.17.20?",
+      "category": "paraphrase",
+      "expect_servers": ["npmjs"],
+      "expect_tools": ["npm_audit", "npm_audit_deep"],
+      "notes": ""
+    },
+    {
+      "id": "p12",
+      "prompt": "Does date-fns ship its own TypeScript types or do I need a @types package?",
+      "category": "paraphrase",
+      "expect_servers": ["npmjs"],
+      "expect_tools": ["npm_types"],
+      "notes": ""
+    },
+    {
+      "id": "p13",
+      "prompt": "Compare zod, yup and valibot - which one is most actively maintained?",
+      "category": "paraphrase",
+      "expect_servers": ["npmjs"],
+      "expect_tools": ["npm_compare", "npm_health"],
+      "notes": ""
+    },
+    {
+      "id": "p14",
+      "prompt": "Check my npm token is still good before I publish",
+      "category": "paraphrase",
+      "expect_servers": ["npmjs"],
+      "expect_tools": ["npm_whoami", "npm_verify_token", "npm_check_auth"],
+      "notes": ""
+    },
+    {
+      "id": "p15",
+      "prompt": "Refund order 482113, the customer was double-charged",
+      "category": "paraphrase",
+      "expect_servers": ["lemonsqueezy"],
+      "expect_tools": ["ls_refund_order"],
+      "notes": "destructive; still the right tool"
+    },
+    {
+      "id": "p16",
+      "prompt": "Make a 20% off coupon code for Black Friday",
+      "category": "paraphrase",
+      "expect_servers": ["lemonsqueezy"],
+      "expect_tools": ["ls_create_discount"],
+      "notes": ""
+    },
+    {
+      "id": "p17",
+      "prompt": "Is the license key 4F2A-99C1-77B0 still valid?",
+      "category": "paraphrase",
+      "expect_servers": ["lemonsqueezy"],
+      "expect_tools": ["ls_validate_license", "ls_get_license_key", "ls_list_license_keys"],
+      "notes": ""
+    },
+    {
+      "id": "p18",
+      "prompt": "Cancel the subscription for jane@acme.com at the end of her billing period",
+      "category": "paraphrase",
+      "expect_servers": ["lemonsqueezy"],
+      "expect_tools": ["ls_cancel_subscription", "ls_list_subscriptions", "ls_list_customers"],
+      "notes": "lookup then cancel; cancel is the target"
+    },
+    {
+      "id": "p19",
+      "prompt": "Send blog.example.com to localhost:4000 through our web server's proxy",
+      "category": "paraphrase",
+      "expect_servers": ["caddy"],
+      "expect_tools": ["caddy_reverse_proxy", "caddy_add_route"],
+      "notes": ""
+    },
+    {
+      "id": "p20",
+      "prompt": "Is HTTPS set up on our web server, and which email is the ACME account using?",
+      "category": "paraphrase",
+      "expect_servers": ["caddy"],
+      "expect_tools": ["caddy_tls"],
+      "notes": ""
+    },
+    {
+      "id": "p21",
+      "prompt": "Show me the last 200 lines of /var/log/nginx/error.log on the prod box",
+      "category": "paraphrase",
+      "expect_servers": ["ssh"],
+      "expect_tools": ["ssh_tail", "ssh_exec", "ssh_read_file"],
+      "notes": ""
+    },
+    {
+      "id": "p22",
+      "prompt": "Is the postgresql systemd unit running on db-01?",
+      "category": "paraphrase",
+      "expect_servers": ["ssh"],
+      "expect_tools": ["ssh_service_status", "ssh_exec"],
+      "notes": "remote host; the postgres server is the wrong pick"
+    },
+    {
+      "id": "p23",
+      "prompt": "Connecting to the build server keeps failing with 'host key verification failed'",
+      "category": "paraphrase",
+      "expect_servers": ["ssh"],
+      "expect_tools": ["ssh_known_hosts_fix", "ssh_diagnose"],
+      "notes": ""
+    },
+    {
+      "id": "p24",
+      "prompt": "Copy dist.tar.gz up to /opt/app on the staging server",
+      "category": "paraphrase",
+      "expect_servers": ["ssh"],
+      "expect_tools": ["ssh_upload"],
+      "notes": ""
+    },
+    {
+      "id": "p25",
+      "prompt": "Which pods in the payments namespace are crash-looping?",
+      "category": "paraphrase",
+      "expect_servers": ["kubernetes"],
+      "expect_tools": ["pods_list_in_namespace", "pods_list", "events_list"],
+      "notes": ""
+    },
+    {
+      "id": "p26",
+      "prompt": "Bump the checkout deployment to 5 replicas",
+      "category": "paraphrase",
+      "expect_servers": ["kubernetes"],
+      "expect_tools": ["resources_scale"],
+      "notes": ""
+    },
+    {
+      "id": "p27",
+      "prompt": "Show me the recent warning events in the cluster",
+      "category": "paraphrase",
+      "expect_servers": ["kubernetes"],
+      "expect_tools": ["events_list"],
+      "notes": ""
+    },
+    {
+      "id": "p28",
+      "prompt": "Remember that the staging DB password rotates every Monday",
+      "category": "paraphrase",
+      "expect_servers": ["memory"],
+      "expect_tools": ["create_entities", "add_observations"],
+      "notes": ""
+    },
+    {
+      "id": "p29",
+      "prompt": "What do you remember about the auth refactor from earlier sessions?",
+      "category": "paraphrase",
+      "expect_servers": ["memory"],
+      "expect_tools": ["search_nodes", "open_nodes", "read_graph"],
+      "notes": ""
+    },
+    {
+      "id": "p30",
+      "prompt": "How many tokens are my CLAUDE.md and AGENTS.md costing every session?",
+      "category": "paraphrase",
+      "expect_servers": ["ctxlint"],
+      "expect_tools": ["ctxlint_token_report"],
+      "notes": ""
+    },
+    {
+      "id": "p31",
+      "prompt": "Check my .mcp.json for hardcoded API keys",
+      "category": "paraphrase",
+      "expect_servers": ["ctxlint"],
+      "expect_tools": ["ctxlint_mcp_audit"],
+      "notes": ""
+    },
+    {
+      "id": "p32",
+      "prompt": "Set up automatic updates for my Electron app with electron-updater",
+      "category": "paraphrase",
+      "expect_servers": ["electron"],
+      "expect_tools": ["electron_configure_auto_update"],
+      "notes": ""
+    },
+    {
+      "id": "p33",
+      "prompt": "electron-builder fails with 'Cannot find module app-builder-bin' - what's wrong?",
+      "category": "paraphrase",
+      "expect_servers": ["electron"],
+      "expect_tools": ["electron_diagnose_build_error"],
+      "notes": ""
+    },
+    {
+      "id": "p34",
+      "prompt": "How much memory is our Redis instance using and how many keys are in it?",
+      "category": "paraphrase",
+      "expect_servers": ["redis"],
+      "expect_tools": ["redis_health"],
+      "notes": ""
+    },
+    {
+      "id": "p35",
+      "prompt": "What's the TTL on the session:abc123 key?",
+      "category": "paraphrase",
+      "expect_servers": ["redis"],
+      "expect_tools": ["redis_key_info", "redis_command"],
+      "notes": ""
+    },
+    {
+      "id": "p36",
+      "prompt": "List the resource groups in my Azure subscription",
+      "category": "paraphrase",
+      "expect_servers": ["azure"],
+      "expect_tools": ["group_list", "arm"],
+      "notes": ""
+    },
+    {
+      "id": "p37",
+      "prompt": "Find every .env file under the project folder",
+      "category": "paraphrase",
+      "expect_servers": ["filesystem"],
+      "expect_tools": ["search_files"],
+      "notes": "client built-in Glob is also fine; if a server is used it is filesystem"
+    },
+    {
+      "id": "j01",
+      "prompt": "Which of our tailnet machines are running an old client version?",
+      "category": "jargon-gap",
+      "expect_servers": ["tailscale"],
+      "expect_tools": ["tailscale_list_devices"],
+      "notes": "machines vs devices"
+    },
+    {
+      "id": "j02",
+      "prompt": "Who's allowed to reach what on the VPN? Show me the access rules",
+      "category": "jargon-gap",
+      "expect_servers": ["tailscale"],
+      "expect_tools": ["tailscale_get_acl"],
+      "notes": "access rules vs acl"
+    },
+    {
+      "id": "j03",
+      "prompt": "Kick the laptop 'old-mbp-2019' off the network and force it to log in again",
+      "category": "jargon-gap",
+      "expect_servers": ["tailscale"],
+      "expect_tools": ["tailscale_expire_device", "tailscale_deauthorize_device"],
+      "notes": ""
+    },
+    {
+      "id": "j04",
+      "prompt": "Mint a one-time join token so a new CI runner can get on the mesh",
+      "category": "jargon-gap",
+      "expect_servers": ["tailscale"],
+      "expect_tools": ["tailscale_create_key"],
+      "notes": "join token vs key"
+    },
+    {
+      "id": "j05",
+      "prompt": "What's eating space in the database - any tables full of dead rows?",
+      "category": "jargon-gap",
+      "expect_servers": ["postgres"],
+      "expect_tools": ["pg_table_bloat", "pg_advisor"],
+      "notes": "dead rows vs bloat"
+    },
+    {
+      "id": "j06",
+      "prompt": "Why is this SELECT slow? Show me how the planner will run it",
+      "category": "jargon-gap",
+      "expect_servers": ["postgres"],
+      "expect_tools": ["pg_explain", "pg_index_advisor"],
+      "notes": "planner vs explain"
+    },
+    {
+      "id": "j07",
+      "prompt": "Who is able to modify invoices in the db?",
+      "category": "jargon-gap",
+      "expect_servers": ["postgres"],
+      "expect_tools": ["pg_table_privileges", "pg_list_roles"],
+      "notes": "write vs privileges"
+    },
+    {
+      "id": "j08",
+      "prompt": "Did the SPA fire any failing XHRs when I loaded the dashboard?",
+      "category": "jargon-gap",
+      "expect_servers": ["playwright"],
+      "expect_tools": ["browser_network_requests", "browser_network_request"],
+      "notes": "XHRs vs network requests; puppeteer has no network tool"
+    },
+    {
+      "id": "j09",
+      "prompt": "Any red errors in devtools on the checkout page?",
+      "category": "jargon-gap",
+      "expect_servers": ["playwright"],
+      "expect_tools": ["browser_console_messages"],
+      "notes": "devtools errors vs console messages"
+    },
+    {
+      "id": "j10",
+      "prompt": "Who ships left-pad and when did they last cut a release?",
+      "category": "jargon-gap",
+      "expect_servers": ["npmjs"],
+      "expect_tools": ["npm_maintainers", "npm_package", "npm_versions"],
+      "notes": ""
+    },
+    {
+      "id": "j11",
+      "prompt": "Is express pulling anything GPL in through its direct deps?",
+      "category": "jargon-gap",
+      "expect_servers": ["npmjs"],
+      "expect_tools": ["npm_license_check"],
+      "notes": "GPL vs license"
+    },
+    {
+      "id": "j12",
+      "prompt": "Was the latest react tarball built in CI with a signed attestation?",
+      "category": "jargon-gap",
+      "expect_servers": ["npmjs"],
+      "expect_tools": ["npm_provenance"],
+      "notes": "attestation vs provenance"
+    },
+    {
+      "id": "j13",
+      "prompt": "Show me last week's sales",
+      "category": "jargon-gap",
+      "expect_servers": ["lemonsqueezy"],
+      "expect_tools": ["ls_list_orders"],
+      "notes": "sales vs orders"
+    },
+    {
+      "id": "j14",
+      "prompt": "How many seats is the customer with code ABC-123 using right now?",
+      "category": "jargon-gap",
+      "expect_servers": ["lemonsqueezy"],
+      "expect_tools": ["ls_list_license_key_instances", "ls_get_license_key"],
+      "notes": "seats vs license key instances"
+    },
+    {
+      "id": "j15",
+      "prompt": "Give me the internal root cert our web server signs local HTTPS with so I can trust it on my laptop",
+      "category": "jargon-gap",
+      "expect_servers": ["caddy"],
+      "expect_tools": ["caddy_pki"],
+      "notes": "root cert vs pki"
+    },
+    {
+      "id": "j16",
+      "prompt": "Which backends behind the proxy are failing health checks?",
+      "category": "jargon-gap",
+      "expect_servers": ["caddy"],
+      "expect_tools": ["caddy_upstreams"],
+      "notes": "backends vs upstreams"
+    },
+    {
+      "id": "j17",
+      "prompt": "Turn this Caddyfile snippet into JSON so I can see what it really does",
+      "category": "jargon-gap",
+      "expect_servers": ["caddy"],
+      "expect_tools": ["caddy_adapt"],
+      "notes": "convert vs adapt; Caddyfile still names the server"
+    },
+    {
+      "id": "j18",
+      "prompt": "My pushes to the company GitLab keep failing with 'Permission denied (publickey)'",
+      "category": "jargon-gap",
+      "expect_servers": ["ssh"],
+      "expect_tools": ["ssh_git_check", "ssh_diagnose", "ssh_key_list"],
+      "notes": "not github: the error is the client SSH key"
+    },
+    {
+      "id": "j19",
+      "prompt": "Which box in the cluster is the hot one - CPU and RAM per worker",
+      "category": "jargon-gap",
+      "expect_servers": ["kubernetes"],
+      "expect_tools": ["nodes_top", "nodes_stats_summary"],
+      "notes": "box/worker vs nodes"
+    },
+    {
+      "id": "j20",
+      "prompt": "Shell into the api container in the prod cluster and print its environment",
+      "category": "jargon-gap",
+      "expect_servers": ["kubernetes"],
+      "expect_tools": ["pods_exec"],
+      "notes": "shell into container vs pods_exec"
+    },
+    {
+      "id": "j21",
+      "prompt": "Jot down that Priya owns the billing service so you know next time",
+      "category": "jargon-gap",
+      "expect_servers": ["memory"],
+      "expect_tools": ["create_entities", "add_observations", "create_relations"],
+      "notes": "jot down vs entities"
+    },
+    {
+      "id": "j22",
+      "prompt": "How much would a D4s v5 VM cost per month in East US?",
+      "category": "jargon-gap",
+      "expect_servers": ["azure"],
+      "expect_tools": ["pricing"],
+      "notes": "cost vs pricing"
+    },
+    {
+      "id": "a01",
+      "prompt": "Open our staging site in a headless browser and click through the signup form",
+      "category": "ambiguous",
+      "expect_servers": ["playwright", "puppeteer"],
+      "expect_tools": [
+        "browser_navigate",
+        "browser_click",
+        "browser_fill_form",
+        "browser_type",
+        "puppeteer_navigate",
+        "puppeteer_click",
+        "puppeteer_fill"
+      ],
+      "notes": ""
+    },
+    {
+      "id": "a02",
+      "prompt": "Take a screenshot of https://example.com",
+      "category": "ambiguous",
+      "expect_servers": ["playwright", "puppeteer"],
+      "expect_tools": ["browser_take_screenshot", "browser_navigate", "puppeteer_screenshot", "puppeteer_navigate"],
+      "notes": ""
+    },
+    {
+      "id": "a03",
+      "prompt": "Get me the docs for Prisma Client's createMany",
+      "category": "ambiguous",
+      "expect_servers": ["context7", "fetch"],
+      "expect_tools": ["query-docs", "resolve-library-id", "fetch_html_to_markdown", "fetch_reader"],
+      "notes": "context7 preferred"
+    },
+    {
+      "id": "a04",
+      "prompt": "Read the Tailwind v4 upgrade guide and tell me what changed for config files",
+      "category": "ambiguous",
+      "expect_servers": ["context7", "fetch"],
+      "expect_tools": [
+        "query-docs",
+        "resolve-library-id",
+        "fetch_html_to_markdown",
+        "fetch_reader",
+        "fetch_html_to_text"
+      ],
+      "notes": ""
+    },
+    {
+      "id": "a05",
+      "prompt": "Count how many sessions are currently in our session store",
+      "category": "ambiguous",
+      "expect_servers": ["redis", "postgres"],
+      "expect_tools": ["redis_scan", "redis_command", "pg_query", "pg_readonly"],
+      "notes": "store backend unspecified"
+    },
+    {
+      "id": "a06",
+      "prompt": "Is the database healthy? Requests have gotten slow",
+      "category": "ambiguous",
+      "expect_servers": ["postgres", "redis"],
+      "expect_tools": ["pg_health", "pg_advisor", "pg_top_queries", "redis_health", "redis_advisor"],
+      "notes": "postgres preferred: 'database'"
+    },
+    {
+      "id": "a07",
+      "prompt": "List the files in /etc/nginx",
+      "category": "ambiguous",
+      "expect_servers": ["ssh", "filesystem"],
+      "expect_tools": ["ssh_ls", "list_directory"],
+      "notes": "remote vs local unspecified"
+    },
+    {
+      "id": "a08",
+      "prompt": "What's the newest hashicorp/aws provider version, and how does the aws_s3_bucket lifecycle block look?",
+      "category": "ambiguous",
+      "expect_servers": ["terraform", "context7"],
+      "expect_tools": ["query-docs", "resolve-library-id"],
+      "notes": "terraform server-level only"
+    },
+    {
+      "id": "a09",
+      "prompt": "Check the health of our Azure Cache for Redis",
+      "category": "ambiguous",
+      "expect_servers": ["azure", "redis"],
+      "expect_tools": ["redis", "resourcehealth", "redis_health"],
+      "notes": "azure preferred (managed resource); redis server works only if REDIS_URL points there"
+    },
+    {
+      "id": "a10",
+      "prompt": "Fetch https://registry.npmjs.org/zod and show me the dist-tags",
+      "category": "ambiguous",
+      "expect_servers": ["npmjs", "fetch"],
+      "expect_tools": ["npm_dist_tags", "npm_package", "http_get"],
+      "notes": "user said fetch but npmjs has the dedicated tool"
+    },
+    {
+      "id": "a11",
+      "prompt": "Run kubectl get pods on the jump host",
+      "category": "ambiguous",
+      "expect_servers": ["ssh", "kubernetes"],
+      "expect_tools": ["ssh_exec", "pods_list"],
+      "notes": "literal: ssh_exec on jump host; intent: pod list"
+    },
+    {
+      "id": "a12",
+      "prompt": "Look up the Electron docs for contextBridge",
+      "category": "ambiguous",
+      "expect_servers": ["electron", "context7", "fetch"],
+      "expect_tools": ["electron_explain_concept", "query-docs", "resolve-library-id", "fetch_html_to_markdown"],
+      "notes": ""
+    },
+    {
+      "id": "a13",
+      "prompt": "Is the TLS certificate on app.example.com about to expire?",
+      "category": "ambiguous",
+      "expect_servers": ["caddy", "ssh"],
+      "expect_tools": ["caddy_tls", "ssh_exec"],
+      "notes": "caddy if it fronts the site; openssl via ssh otherwise"
+    },
+    {
+      "id": "a14",
+      "prompt": "Help me write Terraform for an Azure storage account with private endpoints",
+      "category": "ambiguous",
+      "expect_servers": ["azure", "terraform"],
+      "expect_tools": ["azureterraform", "azureterraformbestpractices", "deploy"],
+      "notes": ""
+    },
+    {
+      "id": "a15",
+      "prompt": "Grab the README for the 'ky' package",
+      "category": "ambiguous",
+      "expect_servers": ["npmjs", "context7", "fetch"],
+      "expect_tools": ["npm_readme", "query-docs", "resolve-library-id", "http_get", "fetch_html_to_markdown"],
+      "notes": "npmjs preferred"
+    },
+    {
+      "id": "n01",
+      "prompt": "Explain the difference between let, const and var in JavaScript",
+      "category": "negative",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": ""
+    },
+    {
+      "id": "n02",
+      "prompt": "Refactor this to async/await: function load(){ return fetchUser().then(u => fetchPosts(u.id)).then(p => p.length) }",
+      "category": "negative",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": "'fetch' token in code; fetch server is wrong"
+    },
+    {
+      "id": "n03",
+      "prompt": "What's the worst-case time complexity of quicksort and why?",
+      "category": "negative",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": ""
+    },
+    {
+      "id": "n04",
+      "prompt": "Write a regex that matches ISO 8601 dates",
+      "category": "negative",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": ""
+    },
+    {
+      "id": "n05",
+      "prompt": "Why does [] + {} produce '[object Object]' in JS?",
+      "category": "negative",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": ""
+    },
+    {
+      "id": "n06",
+      "prompt": "Rename tmp to retryCount in this snippet: let tmp = 0; while (tmp < 3) { tmp++ }",
+      "category": "negative",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": ""
+    },
+    {
+      "id": "n07",
+      "prompt": "What's the difference between a Kubernetes Deployment and a StatefulSet?",
+      "category": "negative",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": "hard negative: conceptual, kubernetes server is wrong"
+    },
+    {
+      "id": "n08",
+      "prompt": "Explain what a Postgres CTE is with a short example",
+      "category": "negative",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": "hard negative: conceptual, postgres server is wrong"
+    },
+    {
+      "id": "n09",
+      "prompt": "Give me a commit message for: fixed off-by-one in pagination",
+      "category": "negative",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": ""
+    },
+    {
+      "id": "n10",
+      "prompt": "Convert this list comprehension to a for loop: [x*x for x in xs if x % 2]",
+      "category": "negative",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": ""
+    },
+    {
+      "id": "n11",
+      "prompt": "What's the difference between TCP and UDP?",
+      "category": "negative",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": ""
+    },
+    {
+      "id": "n12",
+      "prompt": "Write a vitest unit test for a function add(a, b)",
+      "category": "negative",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": ""
+    },
+    {
+      "id": "n13",
+      "prompt": "thanks, that worked!",
+      "category": "negative",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": ""
+    },
+    {
+      "id": "n14",
+      "prompt": "How does Redis LRU eviction differ from LFU?",
+      "category": "negative",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": "hard negative: conceptual, redis server is wrong"
+    },
+    {
+      "id": "n15",
+      "prompt": "Explain CORS preflight requests in simple terms",
+      "category": "negative",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": "hard negative: fetch http_options is wrong"
+    },
+    {
+      "id": "n16",
+      "prompt": "Write a TypeScript type that makes all nested properties optional",
+      "category": "negative",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": ""
+    },
+    {
+      "id": "n17",
+      "prompt": "What does git rebase --onto do?",
+      "category": "negative",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": "github server is wrong"
+    },
+    {
+      "id": "n18",
+      "prompt": "Summarize what we changed in this session",
+      "category": "negative",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": "memory server is wrong"
+    },
+    {
+      "id": "n19",
+      "prompt": "Should I use a Map or a plain object as a dictionary in JS?",
+      "category": "negative",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": ""
+    },
+    {
+      "id": "n20",
+      "prompt": "Draft a multi-stage Dockerfile for a Node 22 app",
+      "category": "negative",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": ""
+    },
+    {
+      "id": "m01",
+      "prompt": "Find which pod is throwing 500s in prod, then save a note about the root cause for next time",
+      "category": "multi-step",
+      "expect_servers": ["kubernetes", "memory"],
+      "expect_tools": ["pods_log", "events_list", "pods_list", "create_entities", "add_observations"],
+      "notes": "both servers required"
+    },
+    {
+      "id": "m02",
+      "prompt": "Check whether ky has any known vulnerabilities, then pull its current docs on retry options",
+      "category": "multi-step",
+      "expect_servers": ["npmjs", "context7"],
+      "expect_tools": ["npm_audit", "npm_audit_deep", "query-docs", "resolve-library-id"],
+      "notes": "both servers required"
+    },
+    {
+      "id": "m03",
+      "prompt": "Add a proxy route for grafana.internal to 100.101.2.3:3000, then confirm the tailnet machine at 100.101.2.3 is online",
+      "category": "multi-step",
+      "expect_servers": ["caddy", "tailscale"],
+      "expect_tools": ["caddy_reverse_proxy", "caddy_add_route", "tailscale_list_devices", "tailscale_get_device"],
+      "notes": "both servers required"
+    },
+    {
+      "id": "m04",
+      "prompt": "Pull the text of our pricing page at https://yaw.sh/pricing and check it matches the prices configured in our store",
+      "category": "multi-step",
+      "expect_servers": ["fetch", "lemonsqueezy"],
+      "expect_tools": [
+        "fetch_html_to_text",
+        "fetch_reader",
+        "fetch_html_to_markdown",
+        "ls_list_variants",
+        "ls_list_prices",
+        "ls_list_products"
+      ],
+      "notes": "both servers required"
+    },
+    {
+      "id": "m05",
+      "prompt": "Tail the app log on prod-web-1 to find the slow query, then explain its plan against the database",
+      "category": "multi-step",
+      "expect_servers": ["ssh", "postgres"],
+      "expect_tools": ["ssh_tail", "ssh_exec", "pg_explain"],
+      "notes": "both servers required"
+    },
+    {
+      "id": "m06",
+      "prompt": "Find Redis keys under cache:user:* with no TTL, then check those user ids still exist in the users table",
+      "category": "multi-step",
+      "expect_servers": ["redis", "postgres"],
+      "expect_tools": ["redis_scan", "redis_key_info", "pg_query", "pg_readonly"],
+      "notes": "both servers required"
+    },
+    {
+      "id": "m07",
+      "prompt": "Before I publish, run the npm pre-publish checks and make sure CLAUDE.md doesn't reference deleted files",
+      "category": "multi-step",
+      "expect_servers": ["npmjs", "ctxlint"],
+      "expect_tools": ["npm_publish_preflight", "ctxlint_audit", "ctxlint_validate_path"],
+      "notes": "both servers required"
+    },
+    {
+      "id": "m08",
+      "prompt": "Scan the Electron main process for security issues and keep the findings in your long-term memory",
+      "category": "multi-step",
+      "expect_servers": ["electron", "memory"],
+      "expect_tools": [
+        "electron_audit_security",
+        "electron_lint_security",
+        "electron_audit_ipc_security",
+        "create_entities",
+        "add_observations"
+      ],
+      "notes": "both servers required"
+    },
+    {
+      "id": "m09",
+      "prompt": "List the namespaces in our AKS cluster and also show the AKS node pool sizes from the Azure side",
+      "category": "multi-step",
+      "expect_servers": ["kubernetes", "azure"],
+      "expect_tools": ["namespaces_list", "aks"],
+      "notes": "both servers required"
+    },
+    {
+      "id": "m10",
+      "prompt": "See which customers bought in the last 24h and check whether their emails are in our Postgres users table",
+      "category": "multi-step",
+      "expect_servers": ["lemonsqueezy", "postgres"],
+      "expect_tools": ["ls_list_orders", "ls_list_customers", "pg_query", "pg_readonly"],
+      "notes": "both servers required"
+    },
+    {
+      "id": "ho-azure-1",
+      "prompt": "which resource groups do we have in the prod azure sub rn?",
+      "category": "heldout",
+      "expect_servers": ["azure"],
+      "expect_tools": [],
+      "notes": "Azure resource listing, slang 'rn' and 'sub'"
+    },
+    {
+      "id": "ho-azure-2",
+      "prompt": "pull the connection string for our storage acct in azure, the one the api uses",
+      "category": "heldout",
+      "expect_servers": ["azure"],
+      "expect_tools": [],
+      "notes": "Azure storage account keys/connection string"
+    },
+    {
+      "id": "ho-caddy-1",
+      "prompt": "add a reverse proxy route on caddy so app.example.dev goes to localhost:3000",
+      "category": "heldout",
+      "expect_servers": ["caddy"],
+      "expect_tools": [],
+      "notes": "Caddy route config"
+    },
+    {
+      "id": "ho-caddy-2",
+      "prompt": "what's the current caddy config look like? want to see which sites are being served",
+      "category": "heldout",
+      "expect_servers": ["caddy"],
+      "expect_tools": [],
+      "notes": "Caddy config read"
+    },
+    {
+      "id": "ho-context7-1",
+      "prompt": "grab me the latest docs for next.js app router middleware, i don't trust my memory of the api",
+      "category": "heldout",
+      "expect_servers": ["context7"],
+      "expect_tools": [],
+      "notes": "Up-to-date library docs lookup; fetch would be a weak alternative but context7 is the intended route"
+    },
+    {
+      "id": "ho-context7-2",
+      "prompt": "how do you set up a zod schema with discriminated unions in v4? check the actual library docs",
+      "category": "heldout",
+      "expect_servers": ["context7"],
+      "expect_tools": [],
+      "notes": "Library documentation retrieval"
+    },
+    {
+      "id": "ho-ctxlint-1",
+      "prompt": "lint my CLAUDE.md and agent context files, are any of the instructions stale or contradictory?",
+      "category": "heldout",
+      "expect_servers": ["ctxlint"],
+      "expect_tools": [],
+      "notes": "Context file linting"
+    },
+    {
+      "id": "ho-ctxlint-2",
+      "prompt": "check if the AGENTS.md in this repo references paths that don't exist anymore",
+      "category": "heldout",
+      "expect_servers": ["ctxlint"],
+      "expect_tools": [],
+      "notes": "Context file broken-ref check; filesystem is not the intended route"
+    },
+    {
+      "id": "ho-electron-1",
+      "prompt": "take a screenshot of the running electron app's main window, the settings pane looks broken",
+      "category": "heldout",
+      "expect_servers": ["electron"],
+      "expect_tools": [],
+      "notes": "Electron app automation/inspection; server name found only via bundles.json listing"
+    },
+    {
+      "id": "ho-electron-2",
+      "prompt": "click the 'new tab' button in our electron build and tell me if any errors show up in the renderer console",
+      "category": "heldout",
+      "expect_servers": ["electron"],
+      "expect_tools": [],
+      "notes": "Electron renderer interaction and console"
+    },
+    {
+      "id": "ho-fetch-1",
+      "prompt": "fetch https://example.com/changelog and summarize what changed in the last release",
+      "category": "heldout",
+      "expect_servers": ["fetch", "playwright", "puppeteer"],
+      "expect_tools": [],
+      "notes": "Plain URL fetch; fetch preferred, browser servers acceptable"
+    },
+    {
+      "id": "ho-fetch-2",
+      "prompt": "can u grab the raw text of that RFC page at rfc-editor.org/rfc/rfc9110 and pull out the section on 409s",
+      "category": "heldout",
+      "expect_servers": ["fetch", "playwright", "puppeteer"],
+      "expect_tools": [],
+      "notes": "Static page retrieval; browser servers acceptable"
+    },
+    {
+      "id": "ho-filesystem-1",
+      "prompt": "list everything in ~/projects/old-stuff and tell me which folders are biggest",
+      "category": "heldout",
+      "expect_servers": ["filesystem"],
+      "expect_tools": [],
+      "notes": "Directory listing outside the repo"
+    },
+    {
+      "id": "ho-filesystem-2",
+      "prompt": "move all the .log files from the downloads dir into an archive folder",
+      "category": "heldout",
+      "expect_servers": ["filesystem"],
+      "expect_tools": [],
+      "notes": "File moves"
+    },
+    {
+      "id": "ho-github-1",
+      "prompt": "any open PRs on our api repo waiting on my review?",
+      "category": "heldout",
+      "expect_servers": ["github"],
+      "expect_tools": [],
+      "notes": "GitHub PR search"
+    },
+    {
+      "id": "ho-github-2",
+      "prompt": "file an issue on the gh repo saying the login redirect loops on safari, tag it as bug",
+      "category": "heldout",
+      "expect_servers": ["github"],
+      "expect_tools": [],
+      "notes": "GitHub issue create; 'gh' abbreviation"
+    },
+    {
+      "id": "ho-kubernetes-1",
+      "prompt": "why is the checkout pod crashlooping in staging? show me the logs",
+      "category": "heldout",
+      "expect_servers": ["kubernetes"],
+      "expect_tools": [],
+      "notes": "k8s pod logs"
+    },
+    {
+      "id": "ho-kubernetes-2",
+      "prompt": "scale the worker deployment in k8s up to 5 replicas",
+      "category": "heldout",
+      "expect_servers": ["kubernetes"],
+      "expect_tools": [],
+      "notes": "k8s abbreviation, deployment scale"
+    },
+    {
+      "id": "ho-lemonsqueezy-1",
+      "prompt": "how many new subs did we get on lemon squeezy this month?",
+      "category": "heldout",
+      "expect_servers": ["lemonsqueezy"],
+      "expect_tools": [],
+      "notes": "Lemon Squeezy subscriptions; split product name"
+    },
+    {
+      "id": "ho-lemonsqueezy-2",
+      "prompt": "refund the last order from jane@acme.io in LS, she got double charged",
+      "category": "heldout",
+      "expect_servers": ["lemonsqueezy"],
+      "expect_tools": [],
+      "notes": "LS abbreviation; refund an order"
+    },
+    {
+      "id": "ho-memory-1",
+      "prompt": "remember that the staging db is the one on port 5433, not 5432",
+      "category": "heldout",
+      "expect_servers": ["memory"],
+      "expect_tools": [],
+      "notes": "Knowledge-graph memory write; mentions db but no db action"
+    },
+    {
+      "id": "ho-memory-2",
+      "prompt": "what did i tell you before about how our deploy naming works? check what you've got stored",
+      "category": "heldout",
+      "expect_servers": ["memory"],
+      "expect_tools": [],
+      "notes": "Memory recall"
+    },
+    {
+      "id": "ho-npmjs-1",
+      "prompt": "what's the latest version of react-query on npm and when was it published?",
+      "category": "heldout",
+      "expect_servers": ["npmjs"],
+      "expect_tools": [],
+      "notes": "npm registry lookup"
+    },
+    {
+      "id": "ho-npmjs-2",
+      "prompt": "how many weekly downloads does left-pad still get lol",
+      "category": "heldout",
+      "expect_servers": ["npmjs"],
+      "expect_tools": [],
+      "notes": "npm download stats"
+    },
+    {
+      "id": "ho-playwright-1",
+      "prompt": "open localhost:5173, log in with the test user and check the dashboard renders without console errors",
+      "category": "heldout",
+      "expect_servers": ["playwright", "puppeteer"],
+      "expect_tools": [],
+      "notes": "Browser automation; playwright vs puppeteer ambiguous"
+    },
+    {
+      "id": "ho-playwright-2",
+      "prompt": "run through the signup form in a real browser and screenshot each step",
+      "category": "heldout",
+      "expect_servers": ["playwright", "puppeteer"],
+      "expect_tools": [],
+      "notes": "Browser flow with screenshots"
+    },
+    {
+      "id": "ho-postgres-1",
+      "prompt": "how many rows are in the users table in pg? and what's the schema look like",
+      "category": "heldout",
+      "expect_servers": ["postgres"],
+      "expect_tools": [],
+      "notes": "'pg' abbreviation; query + schema"
+    },
+    {
+      "id": "ho-postgres-2",
+      "prompt": "run a query to find orders with a null customer_id in the postgres db",
+      "category": "heldout",
+      "expect_servers": ["postgres"],
+      "expect_tools": [],
+      "notes": "SQL query"
+    },
+    {
+      "id": "ho-puppeteer-1",
+      "prompt": "use puppeteer to hit the pricing page and grab a full-page screenshot",
+      "category": "heldout",
+      "expect_servers": ["puppeteer", "playwright"],
+      "expect_tools": [],
+      "notes": "Names puppeteer explicitly; playwright still acceptable"
+    },
+    {
+      "id": "ho-puppeteer-2",
+      "prompt": "spin up headless chrome, go to our marketing site and check if the hero image loads",
+      "category": "heldout",
+      "expect_servers": ["puppeteer", "playwright"],
+      "expect_tools": [],
+      "notes": "Headless chrome phrasing leans puppeteer; both acceptable"
+    },
+    {
+      "id": "ho-redis-1",
+      "prompt": "what's stored under the session:* keys in redis? something's caching stale tokens",
+      "category": "heldout",
+      "expect_servers": ["redis"],
+      "expect_tools": [],
+      "notes": "Redis key scan"
+    },
+    {
+      "id": "ho-redis-2",
+      "prompt": "nuke the rate-limit key for user 4412 in the cache, they're locked out",
+      "category": "heldout",
+      "expect_servers": ["redis"],
+      "expect_tools": [],
+      "notes": "Redis delete without saying redis by name ('the cache')"
+    },
+    {
+      "id": "ho-sequentialthinking-1",
+      "prompt": "think this through step by step before answering: should we shard by tenant or by region, given our write patterns?",
+      "category": "heldout",
+      "expect_servers": ["sequentialthinking"],
+      "expect_tools": [],
+      "notes": "Structured multi-step reasoning request"
+    },
+    {
+      "id": "ho-sequentialthinking-2",
+      "prompt": "break down this race condition carefully, step by step, revising as you go -- two workers both claim the same job sometimes",
+      "category": "heldout",
+      "expect_servers": ["sequentialthinking"],
+      "expect_tools": [],
+      "notes": "Explicit stepwise reasoning with revision"
+    },
+    {
+      "id": "ho-ssh-1",
+      "prompt": "ssh into the build box and check how much disk is left",
+      "category": "heldout",
+      "expect_servers": ["ssh"],
+      "expect_tools": [],
+      "notes": "Remote command over SSH"
+    },
+    {
+      "id": "ho-ssh-2",
+      "prompt": "tail the nginx error log on prod-web-2, something's 502ing",
+      "category": "heldout",
+      "expect_servers": ["ssh"],
+      "expect_tools": [],
+      "notes": "Remote log tail on a named host; ssh implied"
+    },
+    {
+      "id": "ho-tailscale-1",
+      "prompt": "which machines on the tailnet are offline right now?",
+      "category": "heldout",
+      "expect_servers": ["tailscale"],
+      "expect_tools": [],
+      "notes": "Tailnet device status"
+    },
+    {
+      "id": "ho-tailscale-2",
+      "prompt": "update the ACLs so the ci tag can reach the db servers on 5432",
+      "category": "heldout",
+      "expect_servers": ["tailscale"],
+      "expect_tools": [],
+      "notes": "Tailscale ACL edit without naming the product; mentions db port"
+    },
+    {
+      "id": "ho-terraform-1",
+      "prompt": "what args does the aws_s3_bucket resource take in the current tf provider?",
+      "category": "heldout",
+      "expect_servers": ["terraform"],
+      "expect_tools": [],
+      "notes": "Terraform registry/provider docs; 'tf' abbreviation; mentions S3 but is a terraform schema question"
+    },
+    {
+      "id": "ho-terraform-2",
+      "prompt": "find me a decent terraform module for setting up a vpc with private subnets",
+      "category": "heldout",
+      "expect_servers": ["terraform"],
+      "expect_tools": [],
+      "notes": "Terraform module search"
+    },
+    {
+      "id": "ho-vault-1",
+      "prompt": "read the db creds from vault at secret/app/prod",
+      "category": "heldout",
+      "expect_servers": ["vault"],
+      "expect_tools": [],
+      "notes": "Vault secret read"
+    },
+    {
+      "id": "ho-vault-2",
+      "prompt": "rotate the api key we keep in hashicorp vault for the payments service",
+      "category": "heldout",
+      "expect_servers": ["vault"],
+      "expect_tools": [],
+      "notes": "Vault secret write"
+    },
+    {
+      "id": "ho-neg-1",
+      "prompt": "what's the difference between let and const in js?",
+      "category": "negative",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": "General coding knowledge"
+    },
+    {
+      "id": "ho-neg-2",
+      "prompt": "write me a python function that dedupes a list but keeps order",
+      "category": "negative",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": "Code generation, no tool"
+    },
+    {
+      "id": "ho-neg-3",
+      "prompt": "hey, how's it going?",
+      "category": "negative",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": "Chit-chat"
+    },
+    {
+      "id": "ho-neg-4",
+      "prompt": "explain big-O for a hash map lookup vs a binary search tree",
+      "category": "negative",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": "CS fundamentals"
+    },
+    {
+      "id": "ho-neg-5",
+      "prompt": "is it better to use a left join or a subquery here, generally speaking?",
+      "category": "negative",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": "SQL concept question; must not route to postgres"
+    },
+    {
+      "id": "ho-neg-6",
+      "prompt": "what does a 418 status code mean lol",
+      "category": "negative",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": "Trivia; must not route to fetch"
+    },
+    {
+      "id": "ho-neg-7",
+      "prompt": "give me a regex that matches a semver string",
+      "category": "negative",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": "Mentions semver; must not route to npmjs"
+    },
+    {
+      "id": "ho-neg-8",
+      "prompt": "in general, when should you use a k8s StatefulSet instead of a Deployment?",
+      "category": "negative",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": "Concept question; must not route to kubernetes"
+    },
+    {
+      "id": "ho-neg-9",
+      "prompt": "convert this to async/await: fetchUser().then(u => save(u)).catch(log)",
+      "category": "negative",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": "Code rewrite; word 'fetch' must not route to fetch"
+    },
+    {
+      "id": "ho-neg-10",
+      "prompt": "what's a good name for a cli tool that cleans up git branches?",
+      "category": "negative",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": "Brainstorm; must not route to github"
+    },
+    {
+      "id": "ho-unin-jira",
+      "prompt": "move PROJ-482 to in review in jira and assign it to me",
+      "category": "negative_uninstalled",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": "Jira not installed; must not route to github"
+    },
+    {
+      "id": "ho-unin-slack",
+      "prompt": "post in #eng-alerts on slack that the deploy is rolled back",
+      "category": "negative_uninstalled",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": "Slack not installed"
+    },
+    {
+      "id": "ho-unin-gmail",
+      "prompt": "check my gmail for anything from the recruiter this week and draft a reply",
+      "category": "negative_uninstalled",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": "Gmail/email not installed"
+    },
+    {
+      "id": "ho-unin-linear",
+      "prompt": "make a linear ticket for the flaky e2e test and put it in this cycle",
+      "category": "negative_uninstalled",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": "Linear not installed; must not route to github"
+    },
+    {
+      "id": "ho-unin-notion",
+      "prompt": "add these meeting notes to the eng wiki page in notion",
+      "category": "negative_uninstalled",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": "Notion not installed; must not route to memory or filesystem"
+    },
+    {
+      "id": "ho-unin-stripe",
+      "prompt": "refund the last stripe charge for customer cus_8812",
+      "category": "negative_uninstalled",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": "Stripe not installed; must not route to lemonsqueezy"
+    },
+    {
+      "id": "ho-unin-datadog",
+      "prompt": "pull up the p99 latency dashboard in datadog for the api service",
+      "category": "negative_uninstalled",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": "Datadog not installed"
+    },
+    {
+      "id": "ho-unin-sentry",
+      "prompt": "what are the top unresolved errors in sentry for the web app since yesterday?",
+      "category": "negative_uninstalled",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": "Sentry not installed"
+    },
+    {
+      "id": "ho-unin-pagerduty",
+      "prompt": "who's on call in pagerduty tonight? ack the open incident",
+      "category": "negative_uninstalled",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": "PagerDuty not installed"
+    },
+    {
+      "id": "ho-unin-gcal",
+      "prompt": "put a 30 min sync on my google calendar tomorrow at 2",
+      "category": "negative_uninstalled",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": "Google Calendar not installed"
+    },
+    {
+      "id": "ho-unin-s3",
+      "prompt": "list the objects in the s3 bucket prod-uploads and delete anything older than 90 days",
+      "category": "negative_uninstalled",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": "S3 not installed; must not route to filesystem, azure or terraform"
+    },
+    {
+      "id": "ho-unin-mongodb",
+      "prompt": "find all docs in the orders collection in mongo where status is pending",
+      "category": "negative_uninstalled",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": "MongoDB not installed; must not route to postgres or redis"
+    },
+    {
+      "id": "ho-unin-discord",
+      "prompt": "send a message to our discord server's #announcements about the release",
+      "category": "negative_uninstalled",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": "Discord not installed"
+    },
+    {
+      "id": "ho-unin-figma",
+      "prompt": "grab the button component specs from the figma file for the new nav",
+      "category": "negative_uninstalled",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": "Figma not installed; must not route to playwright"
+    },
+    {
+      "id": "ho-unin-twilio",
+      "prompt": "text the on-call number via twilio that the db is down",
+      "category": "negative_uninstalled",
+      "expect_servers": [],
+      "expect_tools": [],
+      "notes": "Twilio not installed; must not route to postgres"
+    }
+  ]
+}

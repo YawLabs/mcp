@@ -1,5 +1,18 @@
 # Test fixtures
 
+## `routing-real/` -- real install, consumed by `src/tests/routing-real.test.ts`
+
+`servers.json` is the maintainer's installed-server inventory on 2026-11-03
+(21 servers): namespace, name, description from `bundles.json`, and each
+server's cached tool names and descriptions from `state.json`'s `toolCache`.
+Nothing else was copied (no env, headers, args, urls, paths). github,
+terraform and vault have empty tool lists because their prewarm fails; that
+is the real condition the gate measures, so do not fill them in.
+
+`corpus.json` is 192 labeled prompts: the routing eval's 125 plus 67 held-out
+prompts written without reading any tool description. The floors in the test
+are the measured values; raise them when ranking improves.
+
 ## `foundry-corpus.json` -- NOT COMMITTED (the routing gate is DORMANT)
 
 `src/tests/foundry-routing.test.ts` is a BM25 routing-regression gate that

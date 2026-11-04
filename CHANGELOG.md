@@ -4,6 +4,30 @@ All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented 
 
 ## Unreleased
 
+**Changed -- routing picks the right server and tool more often for plain-English requests**
+
+Matching now folds plurals and common suffixes ("pull requests" matches "pull request", "vulnerable" matches "vulnerabilities"), understands common developer abbreviations (PR, k8s, repo, db, gh, deps, ...) and derives aliases from each installed server's own names. `find_tool` ignores filler words and no longer breaks ties alphabetically, so a large server no longer wins ties by having more tools. On a 21-server install, the right server ranked first rose from 75% to 81% of test requests, and the right tool ranked first from 39% to 50%.
+
+**Changed -- `discover` auto-loads a server only when the request clearly matches it**
+
+A server is auto-loaded only when enough of the request's meaningful words match it. General questions ("what is the capital of France") and requests for products that are not installed no longer start a server. Dispatch is unaffected: it still loads its best match, and now says when that match is weak and names the runner-up.
+
+**Added -- dispatch falls back to a close runner-up when its pick fails to start**
+
+When the chosen server fails to start, dispatch tries the next candidate if it scored within 1.3x of the failed one and the failed one matched enough of the request's words to be a confident pick, and says which server failed and which was loaded instead. Otherwise the failure is returned as before, so a request for a product that is not installed no longer loads an unrelated server.
+
+**Added -- dispatch replies list the matching tools' arguments, and `exec` checks arguments before calling**
+
+After loading a server, dispatch lists its best-matching tools with their required and optional arguments. `exec` now refuses a call that is missing a required argument, or that passes a key the tool's schema forbids, and names the expected arguments (for example `package` -> `name`), instead of forwarding the call.
+
+**Added -- GitHub, Terraform and Vault tools are searchable before their server has ever started**
+
+`find_tool` and dispatch now rank tools for these three servers from tool lists bundled from their upstream releases (github-mcp-server v2.1.0, terraform-mcp-server v1.4.1, vault-mcp-server v0.2.0), which helps when their docker image cannot start. The server's real tool list replaces the bundled one once it has loaded. `find_tool` also names matching servers whose tools are still unknown.
+
+**Changed -- dispatch's description names the installed servers**
+
+The dispatch tool description now ends with a short line (at most 800 characters) listing the installed servers and what they cover, so a client that searches tool descriptions can find dispatch for a request like "list my PRs". The server instructions now also say to answer general-knowledge questions directly, to retry with dispatch when `find_tool` misses, and to call a just-loaded tool through `mcp_connect_exec` if the client reports it missing.
+
 ## 1.1.7 -- a server Windows will not start is named with its likely cause, instead of a bare `spawn UNKNOWN`
 
 **Fixed -- a server whose executable Windows will not run is named, with the likely cause, instead of a bare `spawn UNKNOWN`**

@@ -1,10 +1,13 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import {
+  normalizeTerm,
+  queryCoverage,
   rankServers,
   rankTools,
   relevanceCacheKeyBytes,
   relevanceCacheStats,
   resetRelevanceCache,
+  tokenizeQuery,
 } from "../relevance.js";
 
 // Single-server score. A `scoreRelevance` export used to do exactly this,
@@ -780,5 +783,364 @@ describe("rankTools (tools across servers)", () => {
     const bare = { namespace: "empty", name: "Empty", description: "nothing yet", tools: [] };
     expect(() => rankTools("anything", [bare, gh])).not.toThrow();
     expect(rankTools("create issue", [bare, gh])).toHaveLength(1);
+  });
+});
+
+describe("normalizeTerm (light suffix fold)", () => {
+  it("folds plurals so both sides meet on one key", () => {
+    expect(normalizeTerm("issues")).toBe(normalizeTerm("issue"));
+    expect(normalizeTerm("requests")).toBe(normalizeTerm("request"));
+    expect(normalizeTerm("dependencies")).toBe(normalizeTerm("dependency"));
+    expect(normalizeTerm("branches")).toBe(normalizeTerm("branch"));
+  });
+
+  it("folds -able / -ability, so vulnerable meets vulnerabilities", () => {
+    expect(normalizeTerm("vulnerable")).toBe(normalizeTerm("vulnerabilities"));
+  });
+
+  it("folds -ing / -ed onto the bare verb", () => {
+    expect(normalizeTerm("running")).toBe(normalizeTerm("run"));
+    expect(normalizeTerm("created")).toBe(normalizeTerm("create"));
+    expect(normalizeTerm("mapped")).toBe(normalizeTerm("map"));
+  });
+
+  it("folds a 4-letter e-final verb and its -ed / -ing / -s forms to one key", () => {
+    for (const [base, forms] of [
+      ["save", ["saved", "saving", "saves"]],
+      ["name", ["named", "naming", "names"]],
+      ["move", ["moved", "moving"]],
+      ["type", ["typed", "typing"]],
+      ["code", ["coded", "coding"]],
+      ["file", ["filed", "filing", "files"]],
+      ["make", ["making", "makes"]],
+    ] as const) {
+      for (const f of forms) expect(normalizeTerm(f), `${f} vs ${base}`).toBe(normalizeTerm(base));
+    }
+    // and it does not collapse a 4-letter word onto a different 3-letter one
+    expect(normalizeTerm("note")).not.toBe(normalizeTerm("not"));
+    expect(normalizeTerm("come")).not.toBe(normalizeTerm("com"));
+  });
+
+  it("keeps a root that ends in -ed whole, so embed meets embedding", () => {
+    expect(normalizeTerm("embedding")).toBe(normalizeTerm("embed"));
+    expect(normalizeTerm("embeds")).toBe(normalizeTerm("embed"));
+  });
+
+  it("keeps a 3-letter stem's double consonant, and adds no e after w/x/y", () => {
+    expect(normalizeTerm("adding")).toBe(normalizeTerm("add"));
+    expect(normalizeTerm("fixed")).toBe(normalizeTerm("fix"));
+    expect(normalizeTerm("fixing")).toBe(normalizeTerm("fix"));
+    expect(normalizeTerm("hoping")).not.toBe(normalizeTerm("hopping"));
+  });
+
+  it("leaves identifiers alone: three characters or fewer, or any digit", () => {
+    for (const t of ["aws", "pg", "gh", "s3", "ec2", "v2", "ses", "bus"]) expect(normalizeTerm(t)).toBe(t);
+    expect(normalizeTerm("utf8s")).toBe("utf8s");
+  });
+
+  it("does not strip a suffix that would leave no vowel, or -eed", () => {
+    expect(normalizeTerm("string")).toBe("string");
+    expect(normalizeTerm("speed")).toBe("speed");
+  });
+
+  it("keeps the listed exceptions whole", () => {
+    expect(normalizeTerm("news")).toBe("news");
+    expect(normalizeTerm("news")).not.toBe(normalizeTerm("new"));
+  });
+});
+
+describe("term normalization in ranking", () => {
+  const gh = {
+    namespace: "github",
+    name: "GitHub",
+    description: "Repos, issues, pull requests",
+    tools: [
+      { name: "list_pull_requests", description: "List open pull requests" },
+      { name: "get_repository", description: "Fetch one repository" },
+    ],
+  };
+  const notes = {
+    namespace: "notes",
+    name: "Notes",
+    description: "Open and edit local notes",
+    tools: [{ name: "open_note", description: "Open a note by title" }],
+  };
+  const npm = {
+    namespace: "npm",
+    name: "npm",
+    description: "Package registry with security audits for vulnerabilities",
+    tools: [{ name: "audit", description: "List known vulnerabilities in a package" }],
+  };
+
+  it("matches a singular query against a plural description", () => {
+    // "pull request" never met "pull requests" in github's text, so "open a
+    // pull request" could only score on "open".
+    expect(rankServers("open a pull request", [gh, notes])[0]?.namespace).toBe("github");
+  });
+
+  it("matches across -able / -ability", () => {
+    expect(rankServers("is lodash vulnerable", [gh, notes, npm]).map((r) => r.namespace)).toEqual(["npm"]);
+  });
+
+  it("expands a generic abbreviation on the query side", () => {
+    expect(rankServers("list my PRs", [gh, notes])[0]?.namespace).toBe("github");
+    expect(rankTools("list my PRs", [gh, notes])[0]).toMatchObject({ namespace: "github", name: "list_pull_requests" });
+  });
+
+  it("expands an abbreviation on the document side too", () => {
+    // A tool named with the short form is found by the long form, and the
+    // short-form namespace by the long-form word.
+    const k = { namespace: "k8s", name: "K8s", tools: [{ name: "get_repo_pods", description: "Pods" }] };
+    expect(rankServers("kubernetes", [k, notes]).map((r) => r.namespace)).toEqual(["k8s"]);
+    expect(rankTools("repository pods", [k, notes])[0]?.name).toBe("get_repo_pods");
+  });
+
+  it("does not change what tokenizeQuery's other callers see", () => {
+    expect(tokenizeQuery("list my PRs for the repos")).toEqual(["list", "prs", "for", "the", "repos"]);
+  });
+});
+
+describe("aliases derived from the installed servers", () => {
+  const cloud = {
+    namespace: "cloud",
+    name: "Cloud",
+    description: "Cloud resources",
+    tools: [
+      { name: "list_resource_groups", description: "List groups" },
+      { name: "create_resource_group", description: "Make a group" },
+      { name: "delete_resource_group", description: "Remove a group" },
+    ],
+  };
+  const chat = {
+    namespace: "chat",
+    name: "Chat",
+    description: "Team chat",
+    tools: [{ name: "send_message", description: "Post a message" }],
+  };
+
+  it("maps the acronym of a recurring tool-name phrase to that phrase", () => {
+    // resource_group(s) recurs in three tool names, so "rg" means it here.
+    // The query carries nothing else, so the alias is the only way to match.
+    expect(rankServers("rg", [chat, cloud]).map((r) => r.namespace)).toEqual(["cloud"]);
+    expect(rankTools("rg", [chat, cloud]).map((t) => t.name)).toHaveLength(3);
+  });
+
+  it("does not build a phrase out of the server's own name", () => {
+    // electron_scaffold_* is electron's scaffold family, not an "electron
+    // scaffold" phrase, so "es" means nothing here.
+    const electron = {
+      namespace: "electron",
+      name: "Electron",
+      description: "Desktop apps",
+      tools: [
+        { name: "electron_scaffold_ipc", description: "IPC" },
+        { name: "electron_scaffold_window", description: "Window" },
+      ],
+    };
+    expect(rankServers("es", [chat, electron])).toEqual([]);
+  });
+
+  it("does not derive an acronym from a phrase that appears only once", () => {
+    const once = { ...cloud, tools: [{ name: "list_resource_groups", description: "List groups" }] };
+    expect(rankServers("rg", [chat, once])).toEqual([]);
+  });
+
+  it("never re-routes a word some server already uses", () => {
+    // "rg" is a real term here (ripgrep), so the derived alias stands down.
+    const search = { namespace: "rg", name: "ripgrep", description: "Fast search", tools: [] };
+    expect(rankServers("rg", [chat, cloud, search]).map((r) => r.namespace)).toEqual(["rg"]);
+  });
+
+  it("drops an acronym two different phrases produce", () => {
+    const store = {
+      namespace: "store",
+      name: "Store",
+      description: "Shop",
+      tools: [
+        { name: "list_refund_grants", description: "Refunds" },
+        { name: "create_refund_grant", description: "Refund" },
+      ],
+    };
+    expect(rankServers("rg", [chat, cloud, store])).toEqual([]);
+  });
+
+  it("makes no acronym of generic product words in server names", () => {
+    // Two "X MCP Server" names used to make "ms" -> mcp server, so "50 ms"
+    // routed to them over the only latency server.
+    const slack = {
+      namespace: "slack",
+      name: "Slack MCP Server",
+      description: "Slack",
+      tools: [
+        { name: "post_message", description: "Post" },
+        { name: "list_channels", description: "Channels" },
+      ],
+    };
+    const jira = {
+      namespace: "jira",
+      name: "Jira MCP Server",
+      description: "Jira",
+      tools: [
+        { name: "create_issue", description: "Create" },
+        { name: "search_issues", description: "Search" },
+      ],
+    };
+    const latency = {
+      namespace: "latency",
+      name: "Latency probe",
+      description: "Network latency",
+      tools: [
+        { name: "ping_host", description: "Ping a host" },
+        { name: "trace_route", description: "Trace a route" },
+      ],
+    };
+    expect(rankServers("is the ping under 50 ms", [slack, jira, latency]).map((r) => r.namespace)).toEqual(["latency"]);
+  });
+
+  it("makes no acronym of a name phrase several servers share", () => {
+    const portal = { namespace: "portal", name: "Acme Billing Portal", description: "Invoices", tools: [] };
+    const reports = { namespace: "reports", name: "Acme Billing Reports", description: "Revenue", tools: [] };
+    expect(rankServers("ab", [chat, portal, reports])).toEqual([]);
+    // ...while one server's own name still earns its acronym.
+    expect(rankServers("ab", [chat, portal]).map((r) => r.namespace)).toEqual(["portal"]);
+  });
+
+  it("maps the numeronym of a long namespace word", () => {
+    const obs = { namespace: "observability", name: "Observability", description: "Metrics and traces", tools: [] };
+    expect(rankServers("o11y dashboards", [chat, obs]).map((r) => r.namespace)).toEqual(["observability"]);
+  });
+});
+
+describe("3+ char function words in the query", () => {
+  const servers = [
+    {
+      namespace: "kv",
+      name: "KV",
+      description: "Store and read the keys of the cache",
+      tools: [{ name: "get_key", description: "Read the value at a key" }],
+    },
+    {
+      namespace: "big",
+      name: "Big",
+      description: "All the things",
+      tools: [
+        { name: "advisor", description: "Get the best advice for the job" },
+        { name: "capital", description: "Track the capital budget" },
+      ],
+    },
+  ];
+
+  it("gives a query of nothing but function words no match at all", () => {
+    expect(rankServers("the", servers)).toEqual([]);
+    expect(rankServers("what is the one that you would use", servers)).toEqual([]);
+    expect(rankTools("the", servers)).toEqual([]);
+  });
+
+  it("does not let a function word carry a tool in find_tool", () => {
+    // Every tool description says "the"; only the content word may score.
+    const hits = rankTools("what is the capital of France", servers);
+    expect(hits.map((h) => h.name)).toEqual(["capital"]);
+  });
+});
+
+describe("rankTools tie-break", () => {
+  it("prefers the tool on the server rankServers scores higher", () => {
+    // Both health tools score the same flat overlap; "redis" names the kv
+    // server, so rankServers prefers it and so does find_tool.
+    // Namespaces chosen so the alphabetical fallback would put pg first.
+    const kv = { namespace: "zcache", name: "Redis", description: "Redis cache", tools: [{ name: "health" }] };
+    const pg = { namespace: "pg", name: "Postgres", description: "SQL database", tools: [{ name: "health" }] };
+    const hits = rankTools("redis health", [pg, kv]);
+    expect(hits.map((h) => h.namespace)).toEqual(["zcache", "pg"]);
+    expect(hits[0].score).toBe(hits[1].score);
+  });
+
+  it("prefers a name hit over description hits of equal total", () => {
+    const s = {
+      namespace: "s",
+      name: "S",
+      tools: [
+        { name: "aaa", description: "slow query report" },
+        { name: "slow_thing", description: "unrelated" },
+      ],
+    };
+    // aaa: two description hits (1 + 1); slow_thing: one name hit (2). Same
+    // total, and the name hit wins.
+    const tie = rankTools("slow report", [s]);
+    expect(tie.map((h) => h.name)).toEqual(["slow_thing", "aaa"]);
+    expect(tie[0].score).toBe(tie[1].score);
+  });
+
+  it("prefers the tool whose name the query covers most completely", () => {
+    const npm = {
+      namespace: "npm",
+      name: "npm",
+      tools: [
+        { name: "bulk_downloads", description: "Many packages" },
+        { name: "downloads", description: "One package" },
+      ],
+    };
+    // bulk_downloads sorts first alphabetically; the uncovered "bulk" puts it second.
+    expect(rankTools("downloads", [npm]).map((h) => h.name)).toEqual(["downloads", "bulk_downloads"]);
+  });
+});
+
+describe("queryCoverage", () => {
+  const servers = [
+    {
+      namespace: "redis",
+      name: "Redis",
+      description: "Redis key-value cache",
+      tools: [{ name: "get_key", description: "Read a key" }],
+    },
+    {
+      namespace: "pg",
+      name: "Postgres",
+      description: "SQL database",
+      tools: [{ name: "run_query", description: "Run a SQL query" }],
+    },
+  ];
+
+  it("returns one entry per server, in corpus order, within [0, 1]", () => {
+    const cov = queryCoverage("read the redis key", servers);
+    expect(cov.map((c) => c.namespace)).toEqual(["redis", "pg"]);
+    for (const c of cov) {
+      expect(c.coverage).toBeGreaterThanOrEqual(0);
+      expect(c.coverage).toBeLessThanOrEqual(1);
+    }
+  });
+
+  it("is 1 when the server matches every content term, ignoring function words", () => {
+    const [redis, pg] = queryCoverage("read the redis key", servers);
+    expect(redis).toMatchObject({ coverage: 1, matched: 3, contentTerms: 3 });
+    expect(pg.coverage).toBe(0);
+  });
+
+  it("drops when the query carries terms no server matches", () => {
+    // lru / eviction / lfu match nothing anywhere: the one hit on "redis"
+    // explains only part of the request, and BM25's absolute score cannot say so.
+    const [redis] = queryCoverage("how does redis lru eviction differ from lfu", servers);
+    expect(redis.matched).toBe(1);
+    expect(redis.coverage).toBeGreaterThan(0);
+    expect(redis.coverage).toBeLessThan(0.4);
+  });
+
+  it("weights terms by IDF, so a rare match counts for more than a common one", () => {
+    const three = [...servers, { namespace: "kv", name: "KV", description: "Another key store", tools: [] }];
+    // "key" is in two of three servers, "sql" in one: matching only the rare
+    // term covers more of the query than matching only the common one.
+    const byNs = new Map(queryCoverage("key sql", three).map((c) => [c.namespace, c.coverage]));
+    expect(byNs.get("pg")).toBeGreaterThan(byNs.get("kv") ?? 1);
+  });
+
+  it("is 0 for every server when the query has no content terms", () => {
+    expect(queryCoverage("what is the", servers).map((c) => c.coverage)).toEqual([0, 0]);
+    expect(queryCoverage("anything", [])).toEqual([]);
+  });
+
+  it("ignores pure numbers and 1-character tokens", () => {
+    const [redis] = queryCoverage("redis key 4412 x", servers);
+    expect(redis.contentTerms).toBe(2);
+    expect(redis.coverage).toBe(1);
   });
 });

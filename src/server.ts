@@ -50,12 +50,14 @@ import { classifyError } from "./error-category.js";
 import {
   collectRefDeps,
   type ExecStepInput,
+  isRefNode,
   RefError,
   resolveArgs,
   stepBindingKey,
   validateExecRefs,
   validateExecRequest,
 } from "./exec-engine.js";
+import { fallbackToolsFor } from "./fallback-tools.js";
 import { appendFoundryTrace, isFoundryEnabled, redactIntent } from "./foundry.js";
 import { closestNames } from "./fuzzy.js";
 import { type GradesCache, readGradesCache } from "./grades-cache.js";
@@ -71,6 +73,7 @@ import {
   type ToolCallRecord,
 } from "./idle-ttl.js";
 import { INSTALL_NUDGE_MIN_COUNT, installNudgeEnabled, recordNudges, shouldNudge } from "./install-nudge.js";
+import { formatInstalledServers, withInstalledServers } from "./installed-summary.js";
 import { isInternalSecretEnvKey } from "./internal-secret-env.js";
 import { setJsonKey } from "./json-key.js";
 import { LearningStore, PENALTY_RATE_THRESHOLD } from "./learning.js";
@@ -122,7 +125,7 @@ import {
 import { type Content, pruneContent } from "./prune.js";
 import { findTool, formatReadToolOutput, formatToolNotFound, normalizeToolName } from "./read-tool.js";
 import { RedispatchTracker } from "./redispatch.js";
-import { type RankableServer, rankServers, rankTools, tokenize, tokenizeQuery } from "./relevance.js";
+import { queryCoverage, type RankableServer, rankServers, rankTools, tokenize, tokenizeQuery } from "./relevance.js";
 import { type CapContent, capContent, resolveMaxResultBytes, serializedBytes } from "./result-cap.js";
 import { computeOutcomeReward } from "./reward.js";
 import {
@@ -567,6 +570,302 @@ export function resolveIdleThreshold(): number {
 // said "set to 0 to disable".
 export function isAutoActivateEnabled(): boolean {
   return !isFeatureDisabled("YAW_MCP_AUTO_ACTIVATE");
+}
+
+// Auto-warm confidence gate, applied by discover(context) to the routing
+// ranking (routingCandidates: BM25 x health x learning, the list dispatch
+// uses): the top score must clear this floor AND either stand alone or beat
+// the runner-up by this ratio. BM25 scores are unbounded positive numbers;
+// the floor and margin were tuned by intuition.
+export const AUTO_ACTIVATE_MIN_SCORE_BM25 = 1.0;
+export const AUTO_ACTIVATE_MARGIN_BM25 = 1.3;
+
+// ...AND the winner must explain enough of the request: its queryCoverage
+// (relevance.ts -- the IDF-weighted share of the query's content words it
+// matches) must reach this. The score tests above cannot tell "the request is
+// about this server" from "the request names one rare word this server has":
+// "How does Redis LRU eviction differ from LFU?" scores redis at 32.9 and
+// clears both, though the question needs no tool. Coverage asks the relative
+// question (0.30 there: lru, eviction and lfu match nothing).
+//
+// Chosen on tests/fixtures/routing-real, excluding its held-out (ho-*) items:
+// 0.38 is the lowest value at which none of the 20 tuning negatives
+// auto-warms (the highest-covered one is 0.365). The cost is correct warms:
+// 71 -> 54 of 105 tuning positives, while wrong positive warms fall 12 -> 3.
+// On the held-out items it cut negative warms 10 -> 3 of 25 and correct
+// warms 27 -> 14 of 42. A miss here costs one extra call (the model
+// dispatches or activates); a wrong warm spawns a process and adds its tools
+// to context. Coverage only ever withholds an auto-warm: dispatch never
+// refuses on it (dispatchConfidenceNote reports it instead). Coverage moves
+// with install size, so tests/routing-real.test.ts also holds the negatives
+// to ceilings on 6- and 12-server cuts of the fixture, and records the
+// unseen-word re-weightings that were measured against this gate and lost.
+export const AUTO_ACTIVATE_MIN_COVERAGE = 0.38;
+
+// Coverage is measured only when at least this many servers are ranked.
+// Its weights are BM25 IDFs, and on a tiny install IDF stops meaning
+// "informative": with one server every word it has gets the minimum weight
+// while a word it lacks gets the maximum, so "file a github issue" against a
+// lone GitHub server covers 0.29 although it is the obvious pick. Below the
+// threshold rankIntentCandidates leaves coverage undefined and the gates
+// fall back to the score floor and margin alone (the behavior before
+// coverage existed). Same number as MARKETPLACE_HINT_THRESHOLD's "sparse
+// install", not tuned: the routing-real corpus has 21 servers.
+export const AUTO_ACTIVATE_COVERAGE_MIN_SERVERS = 5;
+
+/** A routing candidate: rankServers' namespace and score, plus the server's
+ *  queryCoverage for the same query. The coverage fields are undefined when
+ *  it was not measured (fewer than AUTO_ACTIVATE_COVERAGE_MIN_SERVERS ranked). */
+export interface RoutingCandidate {
+  namespace: string;
+  score: number;
+  /** queryCoverage(...).coverage for this server, in [0, 1]. */
+  coverage?: number;
+  /** Distinct content terms of the query this server matches. */
+  matched?: number;
+  /** Distinct content terms in the query. */
+  contentTerms?: number;
+}
+
+// The server discover(context) would auto-warm for this ranking, or
+// undefined when no candidate dominates. Pure (no env read): the caller
+// checks isAutoActivateEnabled() first. Exported so the routing-quality
+// gate in tests/routing-real.test.ts measures the same decision.
+export function pickAutoWarmWinner<T extends { score: number; coverage?: number }>(
+  ranked: readonly T[],
+): T | undefined {
+  const top = ranked[0];
+  const second = ranked[1];
+  const topWinsDecisively =
+    top !== undefined &&
+    top.score >= AUTO_ACTIVATE_MIN_SCORE_BM25 &&
+    (top.coverage === undefined || top.coverage >= AUTO_ACTIVATE_MIN_COVERAGE) &&
+    (second === undefined || top.score / (second.score || 1e-6) >= AUTO_ACTIVATE_MARGIN_BM25);
+  return topWinsDecisively ? top : undefined;
+}
+
+// How many lower-ranked candidates dispatch tries, in total, when a winner
+// fails to activate. Bounded so a dispatch on a machine where most servers
+// cannot start (docker down, say) does not spawn its way down the whole list.
+export const DISPATCH_MAX_FALLBACKS = 2;
+
+/** Whether dispatch may load `next` in place of `failed`, a winner that
+ *  failed to start. Both must hold:
+ *    * `next` is one the ranker could not tell apart from `failed`: a score
+ *      within AUTO_ACTIVATE_MARGIN_BM25 of it, so a failed winner is never
+ *      swapped for a server that merely shares one word with the request.
+ *    * `failed` was not a low-coverage pick (coverageIsLow, the test
+ *      dispatchConfidenceNote reports). A weak winner says the request may
+ *      fit no installed server at all, and a runner-up scoring just under it
+ *      is no better: "list Jira tickets assigned to me in the current sprint"
+ *      ranked kubernetes first at 2.06 with coverage 0.04 (Jira not
+ *      installed), and when kubernetes failed to start the fallback loaded
+ *      lemonsqueezy at 1.79. Inside the margin the lead is under
+ *      DISPATCH_LOW_COVERAGE_MARGIN, so this is the coverage floor itself.
+ *  No score floor: twin servers (two GitHub entries) share every query word,
+ *  so their IDFs and scores are tiny although either one fits, and that is
+ *  the pair a fallback is most for. When coverage was not measured (a small
+ *  install) the margin alone decides, as before coverage existed. Pure;
+ *  exported for tests. */
+export function runnerUpCanReplace(failed: RoutingCandidate, next: RoutingCandidate): boolean {
+  if (next.score * AUTO_ACTIVATE_MARGIN_BM25 < failed.score) return false;
+  return !coverageIsLow(failed, failed.score / (next.score || 1e-6));
+}
+
+// How many runners-up dispatchConfidenceNote names.
+const CONFIDENCE_NOTE_RUNNERS_UP = 2;
+
+// Low coverage alone does not make a dispatch pick doubtful: argument values
+// in the request (a package name, an issue title) are words no server has,
+// so "create a github issue titled login button broken on safari" covers
+// 0.16 while github leads the next server 2.6x. dispatchConfidenceNote
+// reports low coverage only when the pick also rests on a single word or
+// leads the best runner-up by less than this ratio.
+export const DISPATCH_LOW_COVERAGE_MARGIN = 2;
+
+/** dispatchConfidenceNote's low-coverage test, shared with
+ *  runnerUpCanReplace: `pick` matches less of the request than
+ *  AUTO_ACTIVATE_MIN_COVERAGE AND either matches at most one content word or
+ *  leads the best other candidate by less than DISPATCH_LOW_COVERAGE_MARGIN
+ *  (`lead`, a score ratio). False when coverage was not measured. */
+function coverageIsLow(pick: RoutingCandidate, lead: number): boolean {
+  return (
+    pick.coverage !== undefined &&
+    pick.coverage < AUTO_ACTIVATE_MIN_COVERAGE &&
+    ((pick.matched ?? 0) <= 1 || lead < DISPATCH_LOW_COVERAGE_MARGIN)
+  );
+}
+
+/** The low-confidence line dispatch appends after loading `loaded`, or
+ *  undefined when the pick is confident. Two signals, either of which is
+ *  enough:
+ *    * close call -- the best candidate NOT loaded scores within
+ *      AUTO_ACTIVATE_MARGIN_BM25 of `loaded` (the margin discover's auto-warm
+ *      demands). Skipped when an LLM tiebreak picked `loaded` (`sampled`),
+ *      because that is exactly the ambiguity the tiebreak resolved.
+ *    * low coverage -- `loaded` matches less of the request than
+ *      AUTO_ACTIVATE_MIN_COVERAGE AND either matches at most one content word
+ *      or leads the best candidate not loaded by less than
+ *      DISPATCH_LOW_COVERAGE_MARGIN: the words that picked it may be
+ *      incidental, or the request may need no tool at all.
+ *  `noSampling` says the close call went unresolved because the client cannot
+ *  be asked (no MCP sampling), so the model knows the tie is its to break.
+ *  Runners-up are the best-scored candidates not in `loadedSet`, positive
+ *  scores only. Pure; exported for tests. */
+export function dispatchConfidenceNote(
+  ranked: readonly RoutingCandidate[],
+  loaded: string,
+  loadedSet: ReadonlySet<string>,
+  opts: { sampled: boolean; noSampling: boolean },
+): string | undefined {
+  const pick = ranked.find((r) => r.namespace === loaded);
+  if (!pick) return undefined;
+  const others = ranked.filter((r) => !loadedSet.has(r.namespace) && r.score > 0);
+  const best = others[0];
+  const reasons: string[] = [];
+  const lead = best === undefined ? Number.POSITIVE_INFINITY : pick.score / (best.score || 1e-6);
+  if (!opts.sampled && lead < AUTO_ACTIVATE_MARGIN_BM25) {
+    reasons.push(
+      `close call (${best.namespace} scored ${best.score.toFixed(2)} vs ${pick.score.toFixed(2)}${opts.noSampling ? "; this client cannot be asked to break the tie" : ""})`,
+    );
+  }
+  if (coverageIsLow(pick, lead)) {
+    reasons.push(
+      pick.contentTerms !== undefined && pick.contentTerms > 0
+        ? `${loaded} matches ${pick.matched} of the request's ${pick.contentTerms} content words`
+        : `the request has no content words to match`,
+    );
+  }
+  if (reasons.length === 0) return undefined;
+  const runners = others
+    .slice(0, CONFIDENCE_NOTE_RUNNERS_UP)
+    .map((r) => `${r.namespace} (${r.score.toFixed(2)})`)
+    .join(", ");
+  return `Low confidence: ${reasons.join("; ")}.${runners ? ` Runners-up: ${runners}.` : ""} If ${loaded} does not fit, mcp_connect_activate a runner-up or dispatch a more specific intent; if the request needs no tool, answer it directly.`;
+}
+
+// How many of the loaded tools a dispatch reply names, with signatures.
+export const DISPATCH_TOOL_HINTS = 3;
+
+// How many arguments formatToolSignature spells out before "+N more".
+const SIGNATURE_MAX_ARGS = 8;
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return v !== null && typeof v === "object" && !Array.isArray(v);
+}
+
+/** One JSON Schema property as a short type label: `string`, `number|null`
+ *  -> `number`, an array of strings -> `string[]`, an enum without a type ->
+ *  `enum`, a union -> `a|b`, anything else -> `any`. */
+function schemaTypeLabel(prop: unknown): string {
+  if (!isPlainObject(prop)) return "any";
+  const t = prop.type;
+  if (typeof t === "string") {
+    if (t === "array" && isPlainObject(prop.items) && typeof prop.items.type === "string")
+      return `${prop.items.type}[]`;
+    return t;
+  }
+  if (Array.isArray(t)) {
+    const types = t.filter((x): x is string => typeof x === "string" && x !== "null");
+    if (types.length > 0) return types.join("|");
+  }
+  const union = Array.isArray(prop.anyOf) ? prop.anyOf : Array.isArray(prop.oneOf) ? prop.oneOf : undefined;
+  if (union) {
+    const labels = [...new Set(union.map(schemaTypeLabel).filter((l) => l !== "null"))];
+    if (labels.length > 0) return labels.join("|");
+  }
+  if (Array.isArray(prop.enum)) return "enum";
+  return "any";
+}
+
+/** `npmjs_npm_downloads(name: string, period?: string)`: a tool's argument
+ *  names and types from its inputSchema, required ones first (in the
+ *  schema's `required` order), then optional ones marked `?` (in property
+ *  order); past `maxArgs`, "+N more". A schema with no properties renders as
+ *  `name()`. Pure; exported for tests. */
+export function formatToolSignature(name: string, inputSchema: unknown, maxArgs = SIGNATURE_MAX_ARGS): string {
+  const schema = isPlainObject(inputSchema) ? inputSchema : {};
+  const props = isPlainObject(schema.properties) ? schema.properties : {};
+  const required = Array.isArray(schema.required)
+    ? [...new Set(schema.required.filter((k): k is string => typeof k === "string"))]
+    : [];
+  const optional = Object.keys(props).filter((k) => !required.includes(k));
+  const args = [
+    ...required.map((k) => `${k}: ${schemaTypeLabel(props[k])}`),
+    ...optional.map((k) => `${k}?: ${schemaTypeLabel(props[k])}`),
+  ];
+  const shown = args.slice(0, maxArgs);
+  if (args.length > shown.length) shown.push(`+${args.length - shown.length} more`);
+  return `${name}(${shown.join(", ")})`;
+}
+
+/** What checkToolArgs found wrong with a call's arguments. */
+export interface ToolArgsMismatch {
+  /** Required properties the call does not supply. */
+  missing: string[];
+  /** Keys the schema does not list, each with the property it most likely
+   *  meant, when one stands out. */
+  unknown: Array<{ key: string; suggestion?: string }>;
+}
+
+/** Composition keywords that can add properties a top-level `properties`
+ *  does not list; a schema using any of them is not checked for unknown keys. */
+const SCHEMA_COMPOSITION_KEYS = [
+  "allOf",
+  "anyOf",
+  "oneOf",
+  "$ref",
+  "if",
+  "dependencies",
+  "dependentSchemas",
+  "patternProperties",
+  "unevaluatedProperties",
+];
+
+/** Checks `args` against a tool's inputSchema before exec forwards the call.
+ *  Returns null when the args fit, or when the schema cannot settle it:
+ *    * missing required properties are always a mismatch (`required` is an
+ *      explicit list);
+ *    * an unknown key is a mismatch on its own only when the schema lists
+ *      properties, says `additionalProperties: false`, and uses no
+ *      composition keyword that could add properties. JSON Schema reads an
+ *      ABSENT additionalProperties as "extra keys allowed" (pydantic and Go
+ *      generators omit it and their handlers ignore extras), so such a schema
+ *      never fails on an extra key alone;
+ *    * when the call already fails on a missing required property, unknown
+ *      keys are listed under an absent additionalProperties too, as hints
+ *      (`package` given where `name` is required).
+ *  A schema that is not an object, or lists neither properties nor required
+ *  ones, accepts anything here. For each unknown key the suggestion is, in
+ *  order: an unsupplied property that differs only in case or punctuation
+ *  (repoName -> repo_name), the single missing required property when it is
+ *  the only one and this is the only unknown key (package -> name), or a
+ *  close spelling (closestNames). Pure; exported for tests. */
+export function checkToolArgs(inputSchema: unknown, args: Record<string, unknown>): ToolArgsMismatch | null {
+  if (!isPlainObject(inputSchema)) return null;
+  const props = isPlainObject(inputSchema.properties) ? inputSchema.properties : undefined;
+  const required = Array.isArray(inputSchema.required)
+    ? inputSchema.required.filter((k): k is string => typeof k === "string")
+    : [];
+  const has = (k: string) => Object.hasOwn(args, k);
+  const missing = required.filter((k) => !has(k));
+  const additional = inputSchema.additionalProperties;
+  const listsKeys =
+    props !== undefined &&
+    Object.keys(props).length > 0 &&
+    (additional === undefined || additional === false) &&
+    !SCHEMA_COMPOSITION_KEYS.some((k) => k in inputSchema);
+  const unknownKeys = listsKeys ? Object.keys(args).filter((k) => !Object.hasOwn(props, k)) : [];
+  if (missing.length === 0 && (additional !== false || unknownKeys.length === 0)) return null;
+  const unsupplied = Object.keys(props ?? {}).filter((k) => !has(k));
+  const squash = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+  const unknown = unknownKeys.map((key) => {
+    const sameWord = unsupplied.find((p) => squash(p) === squash(key));
+    const onlyPair = missing.length === 1 && unknownKeys.length === 1 ? missing[0] : undefined;
+    const suggestion = sameWord ?? onlyPair ?? closestNames(key, unsupplied, 1)[0];
+    return suggestion === undefined ? { key } : { key, suggestion };
+  });
+  return { missing, unknown };
 }
 
 // Marker phrases that identify an INTERNAL routing/cache fault rather than
@@ -1651,20 +1950,24 @@ export class ConnectServer {
 
     handle("tools/list", async () => {
       await this.ready;
-      return {
-        tools: buildToolList(
-          this.connections,
-          this.getDeferredServers(),
-          this.toolFilters,
-          this.currentExposure(),
-          this.sessionActivated,
-          // Hidden here, refused at the gate, but still ROUTED: dropping the
-          // route instead would make a call by name return `Unknown tool`,
-          // which reads as a typo and sends the model hunting for a name that
-          // is right there.
-          (wireName) => this.isToolDenied(wireName),
-        ) as ListToolsResult["tools"],
-      };
+      const exposure = this.currentExposure();
+      const tools = buildToolList(
+        this.connections,
+        this.getDeferredServers(),
+        this.toolFilters,
+        exposure,
+        this.sessionActivated,
+        // Hidden here, refused at the gate, but still ROUTED: dropping the
+        // route instead would make a call by name return `Unknown tool`,
+        // which reads as a typo and sends the model hunting for a name that
+        // is right there.
+        (wireName) => this.isToolDenied(wireName),
+      );
+      // The installed servers ride on dispatch's description (find_tool's
+      // under lite), not in SERVER_INSTRUCTIONS: initialize is answered
+      // before config loads, this handler runs after. See installed-summary.ts.
+      const installed = formatInstalledServers(this.getProfiledActiveServers());
+      return { tools: withInstalledServers(tools, installed, exposure) as ListToolsResult["tools"] };
     });
 
     handle("tools/call", async (request, ctx) => {
@@ -1909,12 +2212,38 @@ export class ConnectServer {
    *  where the server has one, a tool that needs no arguments (read-only
    *  first), so `args: {}` runs as written. When every tool needs arguments
    *  the line says to fill them in rather than show a call that would fail. */
-  private execHintForNonRelistingClient(loaded: readonly string[]): string | null {
+  private execHintForNonRelistingClient(loaded: readonly string[], preferred?: string): string | null {
     if (clientRelistsTools(this.clientSession().clientInfo)) return null;
+    const example = this.execExample(loaded, preferred);
+    if (example === null) return null;
+    return `This client keeps the tool list it read at startup, so the tools just loaded are not in it and a direct call to one fails. Call them through mcp_connect_exec instead, e.g. ${example.call}${example.fill}`;
+  }
+
+  /** A ready-made exec call for a load reply: `preferred` (a namespaced
+   *  name) when it is a served tool of a loaded namespace, else a served --
+   *  not shadowed -- tool of the first namespace that loaded, preferring one
+   *  that needs no arguments (read-only first), so `args: {}` runs as
+   *  written. When the example needs arguments, `fill` says to supply them
+   *  rather than show a call that would fail. */
+  private execExample(loaded: readonly string[], preferred?: string): { call: string; fill: string } | null {
     const needsNoArgs = (t: { inputSchema: Record<string, unknown> }): boolean => {
       const required = t.inputSchema?.required;
       return !Array.isArray(required) || required.length === 0;
     };
+    const render = (example: { namespacedName: string; inputSchema: Record<string, unknown> }) => ({
+      call: JSON.stringify({ steps: [{ tool: example.namespacedName, args: {} }] }),
+      fill: needsNoArgs(example)
+        ? ""
+        : ` (with the tool's own arguments in "args"; mcp_connect_read_tool shows a tool's arguments)`,
+    });
+    if (preferred !== undefined) {
+      for (const ns of loaded) {
+        const conn = this.connections.get(ns);
+        if (!conn) continue;
+        const hit = this.splitShadowedTools(ns, conn.tools).served.find((t) => t.namespacedName === preferred);
+        if (hit) return render(hit);
+      }
+    }
     for (const ns of loaded) {
       const conn = this.connections.get(ns);
       if (!conn) continue;
@@ -1924,11 +2253,7 @@ export class ConnectServer {
         served.find(needsNoArgs) ??
         served[0];
       if (example === undefined) continue;
-      const call = JSON.stringify({ steps: [{ tool: example.namespacedName, args: {} }] });
-      const fill = needsNoArgs(example)
-        ? ""
-        : ` (with the tool's own arguments in "args"; mcp_connect_read_tool shows a tool's arguments)`;
-      return `This client keeps the tool list it read at startup, so the tools just loaded are not in it and a direct call to one fails. Call them through mcp_connect_exec instead, e.g. ${call}${fill}`;
+      return render(example);
     }
     return null;
   }
@@ -4000,15 +4325,44 @@ export class ConnectServer {
   // same server. mergeToolCache is idempotent, so callers that already pass a
   // merged server (every current one does) pay one small clone and nothing
   // else.
+  //
+  // Only when there is no real list at all -- no connection, no learned
+  // entry (an EMPTY learned list counts: the server was spawned and offered
+  // nothing), no non-empty curated list -- does it fall back to the bundled
+  // list fallback-tools.ts keeps for a few well-known servers, matched by
+  // the image or binary the entry launches. That fallback lives here and
+  // nowhere else: it feeds ranking (dispatch, discover, find_tool) but never
+  // hasKnownTools, getDeferredServers or a route, so pre-warm keeps trying to
+  // learn the real list and no call is ever built from the bundled one.
   private rankableFor(server: UpstreamServerConfig): RankableServer {
-    const connection = this.connections.get(server.namespace);
-    const liveTools = connection?.tools.map((t) => ({ name: t.name, description: t.description }));
     return {
       namespace: server.namespace,
       name: server.name,
       description: server.description,
-      tools: liveTools ?? this.mergeToolCache(server).toolCache ?? [],
+      tools: this.rankableTools(server).tools,
     };
+  }
+
+  // The tool list rankableFor ranks a server on, and where it came from:
+  // "live" (connected), "known" (learned or curated -- possibly an empty
+  // learned list), "bundled" (fallback-tools.ts, never confirmed on this
+  // machine) or "none" (nothing at all; the server ranks on its name and
+  // description only, and find_tool cannot see it).
+  private rankableTools(server: UpstreamServerConfig): {
+    tools: Array<{ name: string; description?: string }>;
+    source: "live" | "known" | "bundled" | "none";
+  } {
+    const connection = this.connections.get(server.namespace);
+    if (connection) {
+      return { tools: connection.tools.map((t) => ({ name: t.name, description: t.description })), source: "live" };
+    }
+    const merged = this.mergeToolCache(server).toolCache;
+    if ((merged && merged.length > 0) || this.toolCache.has(server.namespace)) {
+      return { tools: merged ?? [], source: "known" };
+    }
+    const bundled = fallbackToolsFor(server);
+    if (bundled) return { tools: [...bundled], source: "bundled" };
+    return { tools: merged ?? [], source: "none" };
   }
 
   // BM25 shortlist cap — wider than the budget so downstream re-sorts
@@ -4016,17 +4370,52 @@ export class ConnectServer {
   // promote a server BM25 ranked below the head of the list.
   private static readonly BM25_TOP_K = 25;
 
-  // Local BM25 ranking over the profiled active servers. Shared by
-  // discover's auto-warm gate and dispatch so both pick the same winner
-  // for the same intent.
-  private async rankIntentCandidates(
-    context: string,
-    servers: UpstreamServerConfig[],
-  ): Promise<Array<{ namespace: string; score: number }>> {
+  // Local BM25 ranking over the profiled active servers, each entry carrying
+  // its queryCoverage for the same query (same RankableServer views, so the
+  // same cached index) once there are AUTO_ACTIVATE_COVERAGE_MIN_SERVERS of
+  // them. Raw: routingCandidates applies the health and
+  // learning multipliers on top.
+  private async rankIntentCandidates(context: string, servers: UpstreamServerConfig[]): Promise<RoutingCandidate[]> {
     const bm25Input = servers.map((s) => this.rankableFor(s));
     const bm25 = rankServers(context, bm25Input);
     if (bm25.length === 0) return [];
-    return bm25.slice(0, ConnectServer.BM25_TOP_K);
+    const top = bm25.slice(0, ConnectServer.BM25_TOP_K);
+    if (bm25Input.length < AUTO_ACTIVATE_COVERAGE_MIN_SERVERS) {
+      return top.map((r) => ({ namespace: r.namespace, score: r.score }));
+    }
+    const coverage = new Map(queryCoverage(context, bm25Input).map((c) => [c.namespace, c]));
+    return top.map((r) => {
+      const c = coverage.get(r.namespace);
+      return {
+        namespace: r.namespace,
+        score: r.score,
+        coverage: c?.coverage ?? 0,
+        matched: c?.matched ?? 0,
+        contentTerms: c?.contentTerms ?? 0,
+      };
+    });
+  }
+
+  // The ranking both routing DECISIONS use -- dispatch's pick and discover's
+  // auto-warm -- so the two choose the same server for the same intent:
+  // rankIntentCandidates' BM25 score times the health penalty (recent
+  // activation failures and high error rates shrink it, so routing prefers
+  // servers that work when several match; healthFactor never exceeds 1) times
+  // the learning boost, re-sorted. Coverage is passed through untouched.
+  // discover's rendered listing and its `(relevance: X)` numbers stay raw
+  // BM25 (buildDiscoverOutput): that body is memoized under a key that does
+  // not cover health or learning state.
+  private async routingCandidates(context: string, servers: UpstreamServerConfig[]): Promise<RoutingCandidate[]> {
+    const raw = await this.rankIntentCandidates(context, servers);
+    return raw
+      .map((r) => ({
+        ...r,
+        score:
+          r.score *
+          healthFactor(this.connections.get(r.namespace)?.health, this.activationFailures.get(r.namespace)) *
+          this.learning.boostFactor(r.namespace),
+      }))
+      .sort((a, b) => b.score - a.score);
   }
 
   // Auto-warm confidence gate — applied to discover(context) so a single
@@ -4035,13 +4424,9 @@ export class ConnectServer {
   // YAW_MCP_AUTO_ACTIVATE=0 if it causes surprise. The env read lives in
   // the module-level isAutoActivateEnabled() (re-read per call) rather
   // than a static initializer, which would latch the value at import.
-  //
-  // Top score must clear this floor AND the gap over the runner-up must
-  // be convincing before we auto-activate. BM25 scores are unbounded
-  // positive numbers. Tuned by intuition; revisit when we have real
-  // usage data.
-  private static readonly AUTO_ACTIVATE_MIN_SCORE_BM25 = 1.0;
-  private static readonly AUTO_ACTIVATE_MARGIN_BM25 = 1.3;
+  // The score floor, coverage floor and runner-up margin live in the
+  // module-level pickAutoWarmWinner (AUTO_ACTIVATE_MIN_SCORE_BM25 /
+  // _MIN_COVERAGE / _MARGIN_BM25).
 
   // Below this installed-server count, discover() appends a one-line
   // marketplace pointer so sparse-config users see where to add more.
@@ -4139,24 +4524,16 @@ export class ConnectServer {
     const activeServers = this.getProfiledActiveServers();
     if (activeServers.length === 0) return this.handleDiscover(context, focusNamespace);
 
-    // Use the same ranker dispatch uses so discover + dispatch pick the
-    // same winner for the same intent.
-    const ranked = await this.rankIntentCandidates(context, activeServers);
+    // The ranking dispatch uses (health and learning applied), so discover's
+    // auto-warm and dispatch pick the same winner for the same intent.
+    const ranked = await this.routingCandidates(context, activeServers);
     if (ranked.length === 0) return this.handleDiscover(context, focusNamespace);
 
-    // Only auto-warm if one candidate dominates: top score clears the
-    // floor and either stands alone or beats the runner-up by the
-    // margin.
-    const top = ranked[0];
-    const second = ranked[1];
-    const minScore = ConnectServer.AUTO_ACTIVATE_MIN_SCORE_BM25;
-    const margin = ConnectServer.AUTO_ACTIVATE_MARGIN_BM25;
-    const topWinsDecisively =
-      top !== undefined &&
-      top.score >= minScore &&
-      (second === undefined || top.score / (second.score || 1e-6) >= margin);
-
-    if (!topWinsDecisively || !top) return this.handleDiscover(context, focusNamespace);
+    // Only auto-warm if one candidate dominates: top score clears the floor,
+    // covers enough of the request, and either stands alone or beats the
+    // runner-up by the margin.
+    const top = pickAutoWarmWinner(ranked);
+    if (!top) return this.handleDiscover(context, focusNamespace);
 
     // Already connected -- nothing to SPAWN, but under gateway exposure
     // "connected" is not "advertised": a prewarm-claimed winner, or one
@@ -4208,7 +4585,7 @@ export class ConnectServer {
     }
 
     // Pass the namespace we ACTUALLY warmed, not a bare boolean: the
-    // banner below must name the server rankIntentCandidates picked, which is
+    // banner below must name the server routingCandidates picked, which is
     // not necessarily the head of the list the output renders.
     const output = this.buildDiscoverOutput(context, result.ok ? top.namespace : null, focusNamespace);
     if (result.ok) return output;
@@ -6989,20 +7366,10 @@ export class ConnectServer {
     }
 
     progress?.(`Ranking ${activeServers.length} ${activeServers.length === 1 ? "server" : "servers"}…`);
-    const rankedRaw = await this.rankIntentCandidates(trimmed, activeServers);
-    // Apply health-aware penalty: recent activation failures and high
-    // error rates shrink the score so dispatch prefers working servers
-    // when multiple match. Never boosts above raw score — all else
-    // equal, prefer the one that works.
-    const ranked = rankedRaw
-      .map((r) => ({
-        namespace: r.namespace,
-        score:
-          r.score *
-          healthFactor(this.connections.get(r.namespace)?.health, this.activationFailures.get(r.namespace)) *
-          this.learning.boostFactor(r.namespace),
-      }))
-      .sort((a, b) => b.score - a.score);
+    // BM25 x health x learning: the same list discover's auto-warm decides
+    // on (routingCandidates). Every entry scored above zero on BM25; the
+    // multipliers are positive, so it stays above zero here.
+    const ranked = await this.routingCandidates(trimmed, activeServers);
 
     if (ranked.length === 0) {
       return {
@@ -7019,8 +7386,10 @@ export class ConnectServer {
     // Sampling tiebreak: when BM25+health rank the top-2
     // candidates within a close margin, ask the client LLM to choose.
     // Uses the same model the user is already running — no extra
-    // provider key, no extra cost from yaw-mcp's side. Silently skips if
-    // the client doesn't advertise the sampling capability.
+    // provider key, no extra cost from yaw-mcp's side. Skipped when the
+    // client cannot be asked (no sampling capability, or the 2026-07-28
+    // protocol); the reply's low-confidence note (dispatchConfidenceNote)
+    // then hands the close call to the model instead, naming the runners-up.
     // safeBudget === 1 is intentional: the tiebreak only matters when a
     // single primary is returned. A multi-load (safeBudget>1) tolerates a
     // wrong primary because the close runner-up is also in the returned
@@ -7050,6 +7419,9 @@ export class ConnectServer {
     // production, and an operator who set YAW_MCP_ROUTE_EFFORT=aggressive had
     // no way to learn the dial was inert. Same per-process flag either way.
     if (wantsTiebreak && !clientCanSample) noteNoSamplingCapability(era);
+    // Set when the LLM tiebreak chose the primary: the close call it settled
+    // is then not reported as one.
+    let sampledPick = false;
     if (wantsTiebreak && clientCanSample) {
       progress?.("Top candidates close — asking LLM to pick…");
       const serversByNamespace = new Map(activeServers.map((s) => [s.namespace, s]));
@@ -7069,6 +7441,7 @@ export class ConnectServer {
           const rest = ranked.filter((r) => r.namespace !== picked);
           ranked.length = 0;
           ranked.push(winner, ...rest);
+          sampledPick = true;
           progress?.(`LLM chose ${picked}`);
         }
       }
@@ -7119,42 +7492,163 @@ export class ConnectServer {
 
     // Winners this call left loaded, for the exec hint below.
     const dispatchedOk: string[] = [];
+    // Every namespace this call tried to load, so the confidence note does
+    // not offer one of them as a runner-up.
+    const attempted = new Set(winners.map((w) => w.namespace));
+    // Runner-up fallback: when a winner fails to start (docker down, missing
+    // credential, crash on boot), try the next candidates below the budget
+    // slice instead of answering with only an error. Only when the failed
+    // winner was a confident pick, and only candidates the ranker could not
+    // tell apart from it (runnerUpCanReplace); at most DISPATCH_MAX_FALLBACKS
+    // across the whole call, in ranking order. Otherwise the failure is
+    // reported as it stands. A cap refusal is not a failure to start -- every
+    // other candidate would be refused the same way -- so it never falls back.
+    const fallbackPool = ranked.slice(safeBudget).filter((r) => r.score > 0);
+    let fallbacksLeft = DISPATCH_MAX_FALLBACKS;
+    // "<winner> failed to load; loaded runner-up <ns>" per rescue, for the header.
+    const rescues: string[] = [];
     let i = 0;
     for (const winner of winners) {
       i += 1;
       progress?.(`Loading ${winner.namespace} (${i}/${winners.length})`, i - 1, winners.length);
       const r = await this.activateOne(winner.namespace, progress);
       results.push(`${winner.namespace} (score ${winner.score.toFixed(2)}): ${r.message}`);
-      // Shared with handleActivate. Dispatch has to advertise what it loaded:
-      // the client asked for a server for THIS intent (bounded by `budget`),
-      // and the reply promises the tools are now callable ("no separate
-      // discover + load step" -- meta-tools.ts). Without the sessionActivated
-      // add, the tools/list_changed sent after the loop changes nothing under
-      // the default gateway exposure, and the loaded tools stay invisible to a
-      // client that can only invoke advertised tools. Cap refusals are
-      // expected when the budget exceeds the concurrent-server cap.
-      this.recordExplicitLoad(tally, winner.namespace, r);
-      if (r.ok) dispatchedOk.push(winner.namespace);
       // Activation success is NOT recorded as a learning signal — that
       // would inflate "this server worked" into "every activation
       // counts as a successful tool call," which collapses the
       // dispatched/succeeded ratio that boostFactor and the flaky-
       // namespace warnings rely on. The ground truth is tool-call
       // success, recorded in handleToolCall on the proxy path.
+      // The pool is sorted best first, so its head decides whether any
+      // candidate can replace this winner.
+      const head = fallbackPool[0];
+      if (r.ok || r.capped || fallbacksLeft === 0 || head === undefined || !runnerUpCanReplace(winner, head)) {
+        // Shared with handleActivate. Dispatch has to advertise what it
+        // loaded: the client asked for a server for THIS intent (bounded by
+        // `budget`), and the reply promises the tools are now callable ("no
+        // separate discover + load step" -- meta-tools.ts). Without the
+        // sessionActivated add, the tools/list_changed sent after the loop
+        // changes nothing under the default gateway exposure, and the loaded
+        // tools stay invisible to a client that can only invoke advertised
+        // tools. Cap refusals are expected when the budget exceeds the
+        // concurrent-server cap.
+        this.recordExplicitLoad(tally, winner.namespace, r);
+        if (r.ok) dispatchedOk.push(winner.namespace);
+        continue;
+      }
+      const failed: Array<{ namespace: string; r: ActivationResult }> = [{ namespace: winner.namespace, r }];
+      let rescued = false;
+      while (fallbacksLeft > 0 && fallbackPool.length > 0 && runnerUpCanReplace(winner, fallbackPool[0])) {
+        const next = fallbackPool.shift() as RoutingCandidate;
+        fallbacksLeft -= 1;
+        attempted.add(next.namespace);
+        progress?.(`${winner.namespace} failed to load; trying runner-up ${next.namespace}`);
+        const fr = await this.activateOne(next.namespace, progress);
+        results.push(
+          `${next.namespace} (score ${next.score.toFixed(2)}, runner-up tried because ${winner.namespace} failed to load): ${fr.message}`,
+        );
+        if (fr.ok) {
+          this.recordExplicitLoad(tally, next.namespace, fr);
+          dispatchedOk.push(next.namespace);
+          this.lastIntentByNamespace.set(next.namespace, trimmed);
+          rescues.push(`${winner.namespace} failed to load; loaded runner-up ${next.namespace} instead.`);
+          rescued = true;
+          break;
+        }
+        if (fr.capped) {
+          this.recordExplicitLoad(tally, next.namespace, fr);
+          break;
+        }
+        failed.push({ namespace: next.namespace, r: fr });
+      }
+      if (rescued) {
+        // The dispatch delivered a working server, so the failures it routed
+        // around do not make the reply an error -- their messages are in the
+        // reply above. A failed attempt that still changed a connection keeps
+        // the route rebuild.
+        if (failed.some((f) => f.r.isChanged)) tally.anyChanged = true;
+      } else {
+        for (const f of failed) this.recordExplicitLoad(tally, f.namespace, f.r);
+      }
     }
     // No trailing "Dispatch complete" progress — see handleActivate for
     // the client-side race this avoids.
 
     await this.announceExplicitLoads(tally);
 
-    const execHint = this.execHintForNonRelistingClient(dispatchedOk);
+    // Tool-level guidance: which of the loaded tools fit THIS intent, with
+    // their argument names, so the model's first call does not guess them (a
+    // live run called npm_downloads with "package" where the schema says
+    // "name"). Same rankTools as find_tool, over the servers this call left
+    // loaded; their live inputSchemas give the signatures.
+    const toolHints = this.dispatchToolHints(trimmed, dispatchedOk);
+    if (toolHints.lines.length > 0) {
+      results.push("Best tools for this request (arguments: required first, optional marked ?):", ...toolHints.lines);
+    }
+
+    // The ranker always returns its best guess; say when that guess is weak,
+    // and name the alternatives, so the model can redispatch, activate a
+    // runner-up or answer without a tool. Judged on the first server this
+    // call actually loaded (a fallback, if the winner failed).
+    const loadedPrimary = dispatchedOk[0];
+    if (loadedPrimary) {
+      const note = dispatchConfidenceNote(ranked, loadedPrimary, new Set([...attempted, ...dispatchedOk]), {
+        sampled: sampledPick && loadedPrimary === winners[0]?.namespace,
+        noSampling: !clientCanSample && effort !== "off",
+      });
+      if (note) results.push(note);
+    }
+
+    const execHint = this.execHintForNonRelistingClient(dispatchedOk, toolHints.top);
     if (execHint) results.push(execHint);
 
-    const header = `Dispatched "${trimmed}" — loaded top ${winners.length} of ${ranked.length} matching server${ranked.length === 1 ? "" : "s"}.\n`;
+    // `attempted` counts the runners-up too, so the header never undercounts
+    // the processes this call spawned.
+    const runnersUpTried = attempted.size - winners.length;
+    const tried =
+      runnersUpTried > 0
+        ? `${attempted.size} (the top ${winners.length}, then ${runnersUpTried} ${runnersUpTried === 1 ? "runner-up" : "runners-up"})`
+        : `the top ${winners.length}`;
+    const header = `Dispatched "${trimmed}" — tried ${tried} of the ${ranked.length} server${ranked.length === 1 ? "" : "s"} ranked for it.${rescues.length > 0 ? ` ${rescues.join(" ")}` : ""}\n`;
     return {
       content: [{ type: "text", text: header + results.join("\n") }],
       isError: explicitLoadIsError(tally),
     };
+  }
+
+  /** For a dispatch reply: the DISPATCH_TOOL_HINTS tools of the namespaces
+   *  in `loaded` that rankTools ranks highest for `intent`, each as a
+   *  formatToolSignature line from its live inputSchema. Only served tools
+   *  (not shadowed by another namespace's wire name) that the profile does
+   *  not block. `top` is the first one's namespaced name, for the exec
+   *  example. Empty when no loaded tool shares a word with the intent --
+   *  the server then matched on its name or description, and naming three
+   *  arbitrary tools would be a guess. */
+  private dispatchToolHints(intent: string, loaded: readonly string[]): { lines: string[]; top?: string } {
+    const views: RankableServer[] = [];
+    const byKey = new Map<string, UpstreamConnection["tools"][number]>();
+    for (const ns of loaded) {
+      const conn = this.connections.get(ns);
+      if (!conn) continue;
+      const tools = this.splitShadowedTools(ns, conn.tools).served.filter((t) => !this.isToolDenied(t.namespacedName));
+      for (const t of tools) byKey.set(`${ns}\u0000${t.name}`, t);
+      views.push({
+        namespace: ns,
+        name: conn.config.name,
+        description: conn.config.description,
+        tools: tools.map((t) => ({ name: t.name, description: t.description })),
+      });
+    }
+    if (views.length === 0) return { lines: [] };
+    const lines: string[] = [];
+    let top: string | undefined;
+    for (const hit of rankTools(intent, views).slice(0, DISPATCH_TOOL_HINTS)) {
+      const tool = byKey.get(`${hit.namespace}\u0000${hit.name}`);
+      if (!tool) continue;
+      top ??= tool.namespacedName;
+      lines.push(`  ${formatToolSignature(tool.namespacedName, tool.inputSchema)}`);
+    }
+    return { lines, top };
   }
 
   // Drop every per-namespace bit of session state after its connection has
@@ -7869,7 +8363,25 @@ export class ConnectServer {
         this.getProfiledActiveServers().map((s) => this.rankableFor(s)),
       );
     }
+    // Servers this query matches on name or description whose tool list is
+    // unknown ("none") or only the bundled copy ("bundled"): rankTools could
+    // not see the first kind at all, so a find_tool answer that stays silent
+    // about them reads as "nothing installed does this" -- or worse, hands
+    // back an unrelated tool from a server whose list IS known. Read after
+    // the pre-warm settle above, so a list it just learned is not reported
+    // as unknown.
+    const unseen = this.unseenToolListMatches(query);
     if (ranked.length === 0) {
+      if (unseen.none.length > 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `No known tool matches "${query}". ${this.unseenToolListLine(query, unseen.none)}`,
+            },
+          ],
+        };
+      }
       return {
         content: [
           {
@@ -7898,7 +8410,8 @@ export class ConnectServer {
     for (const hit of usable) {
       const connection = this.connections.get(hit.namespace);
       const live = connection?.status === "connected" ? connection.tools.find((t) => t.name === hit.name) : undefined;
-      lines.push(`  ${hit.namespace}_${hit.name}${live ? " [loaded]" : ""}`);
+      const bundled = unseen.bundled.includes(hit.namespace);
+      lines.push(`  ${hit.namespace}_${hit.name}${live ? " [loaded]" : bundled ? " [bundled list]" : ""}`);
       if (hit.description) lines.push(`    ${hit.description}`);
       if (live) {
         lines.push(`    input schema: ${JSON.stringify(live.inputSchema)}`);
@@ -7946,7 +8459,42 @@ export class ConnectServer {
           ? `To use one: mcp_connect_activate with server "${primary}" (or ${alsoTry.join(", ")}).`
           : `To use one: mcp_connect_activate with server "${primary}".`,
     );
+    const bundledShown = [...new Set(usable.map((h) => h.namespace).filter((ns) => unseen.bundled.includes(ns)))];
+    if (bundledShown.length > 0) {
+      lines.push(
+        `[bundled list]: ${bundledShown.join(", ")} has never loaded on this machine, so its tools above come from yaw-mcp's bundled copy of the upstream list and are unconfirmed; loading it replaces them with what it really serves.`,
+      );
+    }
+    if (unseen.none.length > 0) lines.push(this.unseenToolListLine(query, unseen.none));
     return { content: [{ type: "text", text: lines.join("\n") }] };
+  }
+
+  // How many of the query's best-ranked servers find_tool checks for an
+  // unknown tool list. Wider would name servers that share one weak word
+  // with the query; the point is the plausible ones.
+  private static readonly FIND_TOOL_UNSEEN_TOP = 5;
+
+  /** For find_tool: among the servers rankServers puts in its top
+   *  FIND_TOOL_UNSEEN_TOP for `query`, the ones whose tool list is unknown
+   *  (`none`, in ranking order); and every server ranked on the bundled list
+   *  (`bundled`), so its hits can be labelled. */
+  private unseenToolListMatches(query: string): { none: string[]; bundled: string[] } {
+    const servers = this.getProfiledActiveServers();
+    const sources = new Map(servers.map((s) => [s.namespace, this.rankableTools(s).source]));
+    const top = rankServers(
+      query,
+      servers.map((s) => this.rankableFor(s)),
+    ).slice(0, ConnectServer.FIND_TOOL_UNSEEN_TOP);
+    return {
+      none: top.filter((r) => sources.get(r.namespace) === "none").map((r) => r.namespace),
+      bundled: servers.filter((s) => sources.get(s.namespace) === "bundled").map((s) => s.namespace),
+    };
+  }
+
+  private unseenToolListLine(query: string, namespaces: readonly string[]): string {
+    const plural = namespaces.length > 1;
+    const call = JSON.stringify({ intent: query });
+    return `Not searched: ${namespaces.join(", ")} match${plural ? "" : "es"} this request by name or description, but ${plural ? "their tool lists are" : "its tool list is"} unknown until ${plural ? "they have" : "it has"} loaded once. mcp_connect_dispatch ${call} loads the best match and lists its tools.`;
   }
 
   // Pack suggestion. Surfaces recurring multi-server tool-call sequences from
@@ -8321,6 +8869,45 @@ export class ConnectServer {
           {
             type: "text",
             text: `exec: step "${key}": tool "${step.tool}" cannot be loaded; no step ran. ${gateRefusal}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    // Fifth whole-pipeline refusal: a step whose arguments do not fit its
+    // tool's input schema -- a required property missing, or a key the schema
+    // does not list (a live run sent npm_downloads "package" where the schema
+    // says "name"; the upstream answered -32602 only after the earlier steps
+    // had run). Checked against the schema of a CONNECTED tool only: a
+    // deferred route carries the permissive placeholder schema, and a step
+    // with no route yet resolves later, so both forward unchanged, as does a
+    // step whose whole args is a $ref (its keys are not known until it runs).
+    // A $ref VALUE is fine: the key is present either way. checkToolArgs owns
+    // what counts as a mismatch, including when extra keys are allowed.
+    for (let i = 0; i < steps.length; i++) {
+      const step = steps[i];
+      const route = this.toolRoutes.get(step.tool);
+      if (!route || route.deferred || isRefNode(step.args)) continue;
+      const tool = this.connections.get(route.namespace)?.tools.find((t) => t.name === route.originalName);
+      if (!tool) continue;
+      const mismatch = checkToolArgs(tool.inputSchema, step.args);
+      if (!mismatch) continue;
+      const key = stepBindingKey(step, i);
+      const parts: string[] = [];
+      if (mismatch.missing.length > 0) parts.push(`Missing required: ${mismatch.missing.join(", ")}.`);
+      if (mismatch.unknown.length > 0) {
+        const listed = mismatch.unknown.map((u) =>
+          u.suggestion ? `${u.key} (did you mean "${u.suggestion}"?)` : u.key,
+        );
+        parts.push(`Not in the schema: ${listed.join(", ")}.`);
+      }
+      // Plain text, like the other preflight refusals: nothing ran.
+      return {
+        content: [
+          {
+            type: "text",
+            text: `exec: step "${key}": the arguments do not fit "${step.tool}"; no step ran. ${parts.join(" ")} Expected: ${formatToolSignature(step.tool, tool.inputSchema, Number.POSITIVE_INFINITY)}`,
           },
         ],
         isError: true,

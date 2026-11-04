@@ -123,7 +123,7 @@ vi.mock("../local-bundles.js", async (importOriginal) => {
 import { CONFIG_FILENAME, type ResolvedConfig } from "../config-loader.js";
 import { gradesCachePath } from "../grades-cache.js";
 import { localBundlesPath } from "../local-bundles.js";
-import { LITE_META_TOOL_NAMES, META_TOOL_NAMES, SERVER_INSTRUCTIONS } from "../meta-tools.js";
+import { LITE_META_TOOL_NAMES, META_TOOL_NAMES, META_TOOLS, SERVER_INSTRUCTIONS } from "../meta-tools.js";
 import { CONFIG_DIRNAME } from "../paths.js";
 import { STATE_FILENAME } from "../persistence.js";
 import { ConnectServer } from "../server.js";
@@ -1105,6 +1105,43 @@ describe("ConnectServer.start() — what the initialize handshake decides", () =
     // Verbatim: this is the string Claude Code puts in the system prompt,
     // and the string meta-tools.test.ts pins the length of.
     expect(initializeResult(transport).instructions).toBe(SERVER_INSTRUCTIONS);
+  });
+
+  /** One listed tool's description, by name. */
+  async function listedDescription(priv: any, name: string): Promise<string | undefined> {
+    const handler = priv.server._requestHandlers.get("tools/list");
+    const res = await handler({ method: "tools/list", params: {} }, {} as never);
+    return res.tools.find((t: { name: string }) => t.name === name)?.description;
+  }
+
+  it("names the installed servers on dispatch's description, which initialize cannot", async () => {
+    // The instructions are static (answered before config loads); tools/list
+    // runs after, so this is where the installed set reaches a model whose
+    // deferred-tool search matches on descriptions.
+    writeBundles(synthHome, [
+      serverEntry("gh", { name: "GitHub" }),
+      serverEntry("pg", { description: "Query the prod postgres. Read only." }),
+    ]);
+    const { priv, prewarmed } = await startServer();
+    // Settled first: a learned tool list adds tool-name words to a server
+    // with no description, so the line is only deterministic after prewarm.
+    await prewarmed;
+    const dispatch = await listedDescription(priv, "mcp_connect_dispatch");
+    expect(dispatch).toContain(
+      // gh has no description, so its keywords come from its display name and
+      // the fake upstream's learned `gh_live`; pg's come from its description.
+      "Installed servers: gh (github, live; over `gh`), pg (prod, postgres; over `psql`, `pg_dump`).",
+    );
+    expect(dispatch?.startsWith(META_TOOLS.dispatch.description)).toBe(true);
+    // Only dispatch carries it, and the shared constant is not mutated.
+    expect(await listedDescription(priv, "mcp_connect_find_tool")).toBe(META_TOOLS.findTool.description);
+    expect(META_TOOLS.dispatch.description).not.toContain("Installed servers:");
+  });
+
+  it("moves the installed line to find_tool under lite, where dispatch is not listed", async () => {
+    writeBundles(synthHome, [serverEntry("gh", { name: "GitHub" })]);
+    const { priv } = await startServer({ clientName: "typed-cli" });
+    expect(await listedDescription(priv, "mcp_connect_find_tool")).toContain("Installed servers: gh (github");
   });
 
   it("serves the full meta-tool set to a client that is not typed-cli", async () => {
