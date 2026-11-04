@@ -302,7 +302,11 @@ describe("add --git builds and pins a repo", () => {
       },
     });
     const plain = await add(["fx", "--git", repo.url, "--yes"], failWith("✖ boom → see \u001b[31mlog\u001b[0m"));
-    expect(plain.exitCode, plain.err).toBe(0);
+    expect(plain.exitCode, plain.err).toBe(1);
+    // Written but not launching is NOT success: the remedy printed above is
+    // the only thing the user can act on, so the add exits 1 the way update's
+    // own failed start check does (the --json document still carries
+    // started/startError, and the entry is still in `written`).
     expect(commands).toEqual([process.execPath]);
     expect(plain.out).toContain(
       "Added, but it did not start: ? boom ? see ?[31mlog?[0m. Set its env (yaw-mcp set fx env.KEY",

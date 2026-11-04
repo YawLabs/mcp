@@ -427,12 +427,6 @@ async function runTrustGrant(opts: TrustCommandOptions): Promise<TrustCommandRes
   return { exitCode: await offerGitBuild(opts, preview.servers, path, home, print, printErr) };
 }
 
-/** Shown next to a `sidecars install` hint when some repo has never been
- *  allowed to run its scripts here: the bare command asks on a terminal, and
- *  refuses off one. --yes is never added for the user -- it is the consent. */
-export const GIT_CONSENT_HINT =
-  "  Off a TTY that needs --yes (yaw-mcp sidecars install --yes), which allows the repo's install and build scripts to run (asked once per repo).";
-
 /** After a grant, build the file's git entries that have no build here yet,
  *  with the same builder as `sidecars install`. Only asked on a TTY without
  *  --yes: a script that approved the file is told the command instead. The
@@ -455,9 +449,27 @@ async function offerGitBuild(
   const one = notBuilt.length === 1;
   const what = one ? "1 git server is" : `${notBuilt.length} git servers are`;
   if (opts.yes || !isInteractive(opts)) {
-    print(`${what} not built on this machine. Build ${one ? "it" : "them"} with: yaw-mcp sidecars install`);
-    if (notBuilt.some((s) => s.git && !hasRepoConsent(s.git.url, home))) print(GIT_CONSENT_HINT);
-    return 0;
+    // ONE self-contained line, naming the command that works HERE. Off a TTY
+    // the bare `sidecars install` refuses a repo with no stored grant, so the
+    // old pair -- bare command, then a second line about adding --yes to that
+    // other command -- handed the reader a command that fails first and made
+    // them assemble the working one out of two lines. --yes IS the consent, so
+    // it appears only while consent is missing; with every repo already
+    // allowed here the bare command is the whole answer.
+    const needsConsent = notBuilt.some((s) => s.git && !hasRepoConsent(s.git.url, home));
+    print(
+      `${what} not built on this machine. Build ${one ? "it" : "them"} with: ${
+        needsConsent
+          ? "yaw-mcp sidecars install --yes (runs the repo's install/build scripts; asked once per repo)"
+          : "yaw-mcp sidecars install"
+      }`,
+    );
+    // Exit 1: the file was approved, but what it points at does not run yet,
+    // so a script must not read this as "done". Same verdict the TTY path
+    // gives a build attempt that failed (below). The 0 cases are already
+    // gone: no git entries, or all built, returned above. A DECLINED prompt
+    // stays 0 -- a human was asked and chose not to build.
+    return 1;
   }
   const answer = await askYesNo(
     opts,

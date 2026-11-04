@@ -184,6 +184,13 @@ describe("doctor git sources", () => {
     });
     expect(rows[2]).toMatchObject({ failedStep: "install", builtFor: null, remote: null });
     expect(rows[4]).toMatchObject({ remote: { kind: "tag", behind: false, newerTags: ["v1.4.1", "v1.5.0"] } });
+    // The remedy rides the row too, so a --json consumer reads the same text
+    // the warnings carry without re-deriving it from `build`.
+    expect(rows[1].warning).toBe(
+      `"acme_missing" is not built on this machine (git 2222222). Run: yaw-mcp sidecars install${NO_CONSENT}`,
+    );
+    expect(rows[3].warning).toContain("Rebuild: yaw-mcp update acme_foreign --to 5555555");
+    expect(rows[0].warning).toBeUndefined();
     expect(JSON.stringify(rows)).not.toContain(URL);
 
     expect(r.exitCode).toBe(2);

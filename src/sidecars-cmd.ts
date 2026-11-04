@@ -727,7 +727,8 @@ export const SIDECARS_USAGE = `Usage: yaw-mcp sidecars install [--yes] [--json]
 
   --yes, -y  Allow a git repo's install and build scripts to run. Asked once
              per repo; when stdin or stdout is not a TTY, required until the
-             repo is allowed here.`;
+             repo is allowed here. Recorded per repo in
+             ~/.yaw-mcp/git/consent.json.`;
 
 export function parseSidecarsArgs(
   argv: string[],
@@ -914,29 +915,15 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
     }
   };
 
-  // Before the npm step and on every path after it: a config whose only
-  // servers are git entries still has work here, and each report rides in the
-  // --json document whatever the npm half does.
-  const git =
-    opts.buildGit === false ? [] : await buildGitEntriesFor(servers, bundles.path, opts, home, print, printErr);
-  const gitBad = git.filter((g) => g.status === "failed" || g.status === "refused").length;
-  const gitUnconsented = git.filter((g) => g.status === "needs-consent").length;
-  // Both counts, when a run has both: the consent one names its own remedy.
-  const gitProblems = [
-    ...(gitBad > 0 ? [`${gitBad} git source(s) did not build`] : []),
-    ...(gitUnconsented > 0
-      ? [`${gitUnconsented} git source(s) were not built: their repo's scripts need consent (re-run with --yes)`]
-      : []),
-  ];
-  const gitError = gitProblems.length > 0 ? gitProblems.join("; ") : null;
-  if (git.length > 0) {
-    print("Git sources:");
-    for (const g of git) {
-      print(`  ${g.namespace}  ${g.commit ? g.commit.slice(0, 12) : "(no commit)"}  ${g.status}`);
-      if (g.error) for (const l of g.error.split("\n")) print(`    ${l}`);
-    }
-    print();
-  }
+  // DECLARED before the git build rather than computed after it: two failures
+  // now come first -- an unwritable root, and a tree another process already
+  // holds -- and both have to leave through the SAME document and exit shape
+  // the install path uses. The closures read them at call time, so a return
+  // taken before the build sees the empty values it earned: no git work ran.
+  let git: GitEntryReport[] = [];
+  let gitBad = 0;
+  let gitUnconsented = 0;
+  let gitError: string | null = null;
   const doc = (over: Partial<SidecarsJson>): string =>
     jsonDocument(root, {
       git,
@@ -948,6 +935,90 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
     installed,
     lines,
   });
+  // Guarded: on EACCES/EROFS/ENOSPC these used to reject out of the command,
+  // and the dispatcher printed `yaw-mcp sidecars: <errno>` on stderr with
+  // NOTHING on stdout -- breaking the one-shape-on-every-path --json contract
+  // the MCP panel relies on (it shells out to `sidecars install --json`).
+  const couldNotPrepare = (err: unknown): SidecarsInstallResult => {
+    const msg = err instanceof Error ? err.message : String(err);
+    print(`Could not prepare ${root}: ${msg}. Servers keep resolving from the npx cache.`);
+    if (opts.json) write(doc({ error: `manifest write failed: ${msg}`, conflicts, skipped }));
+    return done(1);
+  };
+
+  // Serialize against the OTHER writer of this tree -- sidecar-refresh's
+  // background refresh, which runs this very command from inside `serve` --
+  // BEFORE the git build, not after it: a run that found the tree held used to
+  // clone and build every git entry and only then exit 1, paying minutes of
+  // work it was always going to throw away (and doing it while another npm was
+  // mid-reify on the very node_modules it may run from). AFTER the mkdir, for
+  // the lockfile's own sake -- it lives in the root and an O_EXCL open cannot
+  // create it in a directory that is not there yet -- and BEFORE the manifest
+  // write, because that write already changes what the other npm is reifying
+  // against. Null is a live holder: say so and stop rather than put a second
+  // npm on the tree (see acquireSidecarsLock for what two reify passes do to
+  // one node_modules).
+  // Exit 1 with `error` set, not exit 0 with a note: nothing was installed and
+  // the caller has to come back, which a script cannot learn from a clean
+  // document.
+  //
+  // Gated on specs: a git-only config installs nothing here, so it keeps the
+  // old shape -- build with no lock (the git build takes its OWN lock,
+  // gitRoot/.lock, so holding this one across it deadlocks with nothing) and
+  // early-return through the empty branch below without ever touching root.
+  let release: (() => void) | null = null;
+  if (specs.length > 0) {
+    try {
+      mkdirSync(root, { recursive: true });
+    } catch (err) {
+      return couldNotPrepare(err);
+    }
+    release = (opts.acquireLock ?? acquireSidecarsLock)(root);
+    if (release === null) {
+      // Name the lock: what holds it is a live refresh, or one whose serve was
+      // killed mid-install and whose npm child may still be reifying the tree
+      // (the lock is honoured until its mtime goes stale for exactly that
+      // reason), and the one thing an operator can do with either is look at
+      // the file.
+      print(
+        `Another yaw-mcp process is refreshing ${root} right now (lock: ${join(root, SIDECARS_LOCK_NAME)}); try again once it finishes.`,
+      );
+      if (opts.json) {
+        write(
+          doc({
+            reason: "locked",
+            error: "another yaw-mcp process is refreshing the managed tree",
+            conflicts,
+            skipped,
+          }),
+        );
+      }
+      return done(1);
+    }
+  }
+
+  // Before the npm step and on every path after it: a config whose only
+  // servers are git entries still has work here, and each report rides in the
+  // --json document whatever the npm half does.
+  git = opts.buildGit === false ? [] : await buildGitEntriesFor(servers, bundles.path, opts, home, print, printErr);
+  gitBad = git.filter((g) => g.status === "failed" || g.status === "refused").length;
+  gitUnconsented = git.filter((g) => g.status === "needs-consent").length;
+  // Both counts, when a run has both: the consent one names its own remedy.
+  const gitProblems = [
+    ...(gitBad > 0 ? [`${gitBad} git source(s) did not build`] : []),
+    ...(gitUnconsented > 0
+      ? [`${gitUnconsented} git source(s) were not built: their repo's scripts need consent (re-run with --yes)`]
+      : []),
+  ];
+  gitError = gitProblems.length > 0 ? gitProblems.join("; ") : null;
+  if (git.length > 0) {
+    print("Git sources:");
+    for (const g of git) {
+      print(`  ${g.namespace}  ${g.commit ? g.commit.slice(0, 12) : "(no commit)"}  ${g.status}`);
+      if (g.error) for (const l of g.error.split("\n")) print(`    ${l}`);
+    }
+    print();
+  }
 
   if (specs.length === 0) {
     // Four different empty states, and telling a first-time user with no config
@@ -1012,59 +1083,12 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
     return done(0);
   }
 
-  // Guarded: on EACCES/EROFS/ENOSPC these used to reject out of the command,
-  // and the dispatcher printed `yaw-mcp sidecars: <errno>` on stderr with
-  // NOTHING on stdout -- breaking the one-shape-on-every-path --json contract
-  // the MCP panel relies on (it shells out to `sidecars install --json`).
-  const couldNotPrepare = (err: unknown): SidecarsInstallResult => {
-    const msg = err instanceof Error ? err.message : String(err);
-    print(`Could not prepare ${root}: ${msg}. Servers keep resolving from the npx cache.`);
-    if (opts.json) write(doc({ error: `manifest write failed: ${msg}`, conflicts, skipped }));
-    return done(1);
-  };
-  try {
-    mkdirSync(root, { recursive: true });
-  } catch (err) {
-    return couldNotPrepare(err);
-  }
-
-  // Serialize against the OTHER writer of this tree -- sidecar-refresh's
-  // background refresh, which runs this very command from inside `serve` --
-  // before the first byte of the tree changes. AFTER the mkdir, because the
-  // lockfile lives in the root and an O_EXCL open cannot create it in a
-  // directory that is not there yet; BEFORE the manifest write, because that
-  // write already changes what the other npm is reifying against. Null is a
-  // live holder: say so and stop rather than put a second npm on the tree (see
-  // acquireSidecarsLock for what two reify passes do to one node_modules).
-  // Exit 1 with `error` set, not exit 0 with a note: nothing was installed and
-  // the caller has to come back, which a script cannot learn from a clean
-  // document.
-  const release = (opts.acquireLock ?? acquireSidecarsLock)(root);
-  if (release === null) {
-    // Name the lock: what holds it is a live refresh, or one whose serve was
-    // killed mid-install and whose npm child may still be reifying the tree
-    // (the lock is honoured until its mtime goes stale for exactly that
-    // reason), and the one thing an operator can do with either is look at
-    // the file.
-    print(
-      `Another yaw-mcp process is refreshing ${root} right now (lock: ${join(root, SIDECARS_LOCK_NAME)}); try again once it finishes.`,
-    );
-    if (opts.json) {
-      write(
-        doc({
-          reason: "locked",
-          error: "another yaw-mcp process is refreshing the managed tree",
-          conflicts,
-          skipped,
-        }),
-      );
-    }
-    return done(1);
-  }
   // Released on EVERY path out of the install below -- a failed manifest
   // write, a failed npm, an exception -- via the one `finally`; a lock left
   // behind would hold the background refresh off this tree for auto-upgrade's
-  // whole stale window over a failure that has already been reported.
+  // whole stale window over a failure that has already been reported. Taken
+  // (or refused) above, before the git build: this `release` is null only on a
+  // git-only config, which took no lock and owns no root.
   try {
     try {
       await atomicWriteFile(join(root, "package.json"), sidecarsManifest(specs));
@@ -1200,7 +1224,7 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
     }
     return done(nothingLanded ? 1 : 0, installed);
   } finally {
-    release();
+    release?.();
   }
 }
 

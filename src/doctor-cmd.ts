@@ -2647,6 +2647,11 @@ export interface GitSourceDoctorEntry {
     behind: boolean;
     newerTags: string[];
   } | null;
+  /** Why this row is not healthy, and the command that fixes it -- the same
+   *  text the text report's warnings carry, so a --json consumer does not
+   *  have to turn `build: missing|mismatch` back into a remedy. Set only
+   *  when there is one. */
+  warning?: string;
 }
 
 const printable = (s: string): string => s.replace(/[^\x20-\x7e]/g, "?");
@@ -2722,7 +2727,9 @@ async function collectGitSources(opts: {
       const failed = await readGitFailedRecord(gitFailedPath(ns, git.commit, opts.home));
       row.build = failed ? "failed" : "missing";
       row.failedStep = failed?.step ?? null;
-      warnings.push(missing.replace(/\s*\n\s*/g, " | "));
+      const text = missing.replace(/\s*\n\s*/g, " | ");
+      row.warning = text;
+      warnings.push(text);
       continue;
     }
     const marker = readBuildMarker(dir, git.commit);
@@ -2738,9 +2745,9 @@ async function collectGitSources(opts: {
     if (buildMatchesHost(marker, opts.platform)) continue;
     row.build = "mismatch";
     const major = /^v?(\d+)/.exec(row.builtFor.node)?.[1] ?? row.builtFor.node;
-    warnings.push(
-      `${ns} was built on ${row.builtFor.platform}-${row.builtFor.arch} node ${major}; this is ${opts.platform}-${process.arch} node ${hostMajor}. Rebuild: yaw-mcp update ${ns} --to ${git.commit.slice(0, 7)}${opts.project ? " --project" : ""}`,
-    );
+    const mismatch = `${ns} was built on ${row.builtFor.platform}-${row.builtFor.arch} node ${major}; this is ${opts.platform}-${process.arch} node ${hostMajor}. Rebuild: yaw-mcp update ${ns} --to ${git.commit.slice(0, 7)}${opts.project ? " --project" : ""}`;
+    row.warning = mismatch;
+    warnings.push(mismatch);
   }
   return { entries, warnings };
 }

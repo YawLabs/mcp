@@ -269,19 +269,22 @@ describe("sidecars install builds pinned git entries", () => {
     expect(JSON.parse(out.join("")).git[0].status).toBe("built");
   }, 120_000);
 
-  it("carries the git reports on the npm path too (here: the locked tree)", async () => {
+  it("carries the git reports on the npm path too (here: the npm failure)", async () => {
     const repo = makeRepo(NPM_FILES);
     const head = git(repo.work, ["rev-parse", "HEAD"]);
     writeUserBundles(home, [
       gitEntry(repo, "fx", head),
       { namespace: "fetch", name: "fetch", command: "npx", args: ["-y", "@yawlabs/fetch-mcp@1.0.0"] },
     ]);
-    const res = await install({ json: true, yes: true, runPm: fakePm([]), acquireLock: () => null });
+    // Not the locked tree any more: a held lock now stops the run BEFORE the
+    // git build (nothing to report), so the path that still has both halves
+    // to report is one where npm itself fails under the build's reports.
+    const res = await install({ json: true, yes: true, runPm: fakePm([]), runNpm: async () => 1 });
     expect(res.exitCode).toBe(1);
     const doc = JSON.parse(out.join(""));
     expect(Object.keys(doc).sort()).toEqual(JSON_KEYS);
-    expect(doc.reason).toBe("locked");
     expect(doc.git).toEqual([{ namespace: "fx", commit: head, status: "built", error: null }]);
+    expect(doc.error).toContain("npm exited 1");
   }, 120_000);
 
   it("the background refresh never builds a git entry", async () => {
@@ -326,15 +329,23 @@ describe("trust shows git sources and offers the build after a grant", () => {
     writeProject([gitEntry(repo, "fx", head), gitEntry(repo, "nc", undefined)]);
 
     const res = await trust({ yes: true, isTTY: false, runPm: fakePm([]) });
-    expect(res.exitCode, err.join("")).toBe(0);
+    // Approved, but nothing was built: the file it points at does not run yet,
+    // so a script must not read a clean exit as done (the TTY path gives a
+    // failed build the same verdict).
+    expect(res.exitCode, err.join("")).toBe(1);
     const text = out.join("");
     expect(text).toContain(`git ${repo.url} @ ${head.slice(0, 12)} (tracking main) [not built]`);
     expect(text).toContain(`git ${repo.url} (tracking main) [no commit]`);
     expect(text).toContain("! NOT covered by the pin: nc has no commit -- it builds whatever main points at.");
     expect(text.match(/! building runs this repo's install and build lifecycle scripts/g)).toHaveLength(2);
     expect(text).not.toContain(join(gitRoot(home), "fx"));
-    expect(text).toContain("1 git server is not built on this machine. Build it with: yaw-mcp sidecars install");
-    expect(text).toContain("Off a TTY that needs --yes (yaw-mcp sidecars install --yes)");
+    // ONE line, naming the command that works off a TTY: with no stored grant
+    // the bare install refuses, so the --yes that IS the consent rides along
+    // rather than as a second line about a different command.
+    expect(text).toContain(
+      "1 git server is not built on this machine. Build it with: yaw-mcp sidecars install --yes (runs the repo's install/build scripts; asked once per repo)",
+    );
+    expect(text).not.toContain("Off a TTY that needs --yes");
     expect(existsSync(join(gitRoot(home), "fx"))).toBe(false);
   }, 60_000);
 
@@ -344,7 +355,8 @@ describe("trust shows git sources and offers the build after a grant", () => {
     await recordRepoConsent(repo.url, home);
     writeProject([gitEntry(repo, "fx", head)]);
     const res = await trust({ yes: true, isTTY: false, runPm: fakePm([]) });
-    expect(res.exitCode, err.join("")).toBe(0);
+    // Unbuilt, so still 1 -- consent only changes WHICH command the hint is.
+    expect(res.exitCode, err.join("")).toBe(1);
     expect(out.join("")).toContain("Build it with: yaw-mcp sidecars install");
     expect(out.join("")).not.toContain("--yes");
   }, 60_000);
@@ -362,7 +374,9 @@ describe("trust shows git sources and offers the build after a grant", () => {
     };
     writeProject([https, ssh]);
     const res = await trust({ yes: true, isTTY: false, runPm: fakePm([]) });
-    expect(res.exitCode, err.join("")).toBe(0);
+    // Neither is built off a TTY (both lack consent), which is not a
+    // successful end state for the caller.
+    expect(res.exitCode, err.join("")).toBe(1);
     const text = out.join("");
     expect(text).toContain("token: vault secret AWS_KEY -> sent to git.evil.example");
     expect(text).toContain(
@@ -575,7 +589,9 @@ describe("remove deletes a git entry's checkout", () => {
       out: () => {},
       err: () => {},
     });
-    expect(granted.exitCode).toBe(0);
+    // The grant landed; the build did not (nothing consented here yet), so the
+    // run still reports unfinished work.
+    expect(granted.exitCode).toBe(1);
     expect(existsSync(join(gitRoot(home), "fx"))).toBe(false);
     // The user file then builds the same commit; only it is recorded.
     writeUserBundles(home, [gitEntry(repo, "fx", head)]);

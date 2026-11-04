@@ -128,6 +128,7 @@ describe("share", () => {
     expect(text).not.toContain(home);
     expect(text).toContain("'CRM_REGION=<set this>'");
     expect(text).toContain("'DATA_DIR=<set this>'");
+    expect(text).toContain("Replace <set this> in any --env flag below with the real value before running this.");
     expect(text).toContain("'EXTRA=${secret:extra_key}'");
     expect(text).toContain("They will be asked for: crm_token (CRM_TOKEN), extra_key (EXTRA)");
     expect(text).toContain(

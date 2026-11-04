@@ -324,6 +324,13 @@ export async function runShare(opts: ShareCommandOptions): Promise<{ exitCode: n
     );
     return { exitCode: 0 };
   }
+  // The placeholder travels INSIDE the paste line on purpose (a paste must be
+  // one byte-exact line), so it needs the only place a human reads this: an
+  // annotation here, never inside the command itself.
+  if (flags.some((f) => f.words.some((w) => w.includes("<set this>")))) {
+    print("Replace <set this> in any --env flag below with the real value before running this.");
+    print();
+  }
   print(`Send this to coworkers with read access to ${repo}:`);
   print();
   if (commands.ssh && commands.https) {

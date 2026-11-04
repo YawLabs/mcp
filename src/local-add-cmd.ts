@@ -135,7 +135,8 @@ export const ADD_USAGE = `Usage: yaw-mcp add <slug> [flags]
                     package.json "bin" or "main".
   --yes             Allow the repo's install/build scripts to run. Asked once
                     per repo on a TTY; off one, required until the repo is
-                    allowed here.
+                    allowed here. Recorded per repo in
+                    ~/.yaw-mcp/git/consent.json.
   --project         Write <project>/.yaw-mcp/bundles.json instead.
   --no-start-check  Skip the one real handshake after the build.
   -- <args>         Arguments passed to the server.
@@ -1611,7 +1612,11 @@ async function runAddGit(opts: AddCommandOptions, spec: GitSpec): Promise<AddCom
       `Note: ${dangling.missing.join(", ")} ${one ? "is" : "are"} not in your vault yet; the server asks for ${one ? "it" : "them"} at runtime, or store ${one ? "it" : "each"} with ${secretsSetRemedy(dangling.missing)}.`,
     );
   }
-  return { exitCode: 0, written: [res.path] };
+  // The entry IS written (and `written` says so) while the handshake that
+  // proves it launches failed: exit 0 told a script the add was fine when the
+  // server it just added does not start. Same shape update-cmd uses for its
+  // own failed start check -- non-zero, with the remedy already printed above.
+  return { exitCode: startError !== null ? 1 : 0, written: [res.path] };
 }
 
 // --- remove -----------------------------------------------------------------
