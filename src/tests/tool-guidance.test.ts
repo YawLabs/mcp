@@ -7,9 +7,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 //     (fallback-tools.ts) in ranking, and find_tool naming what it could not
 //     search;
 //   * dispatch naming the loaded tools that fit the intent, with signatures;
-//   * the exec fallback line on load replies to a client that defers tools
-//     added mid-session (Claude Code), and exec really reaching a tool loaded
-//     a moment ago;
+//   * the exec line on load replies only for a client that never re-lists
+//     tools (none for Claude Code), and exec really reaching a tool loaded a
+//     moment ago;
 //   * exec checking a step's args against the tool's inputSchema first.
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -194,7 +194,8 @@ describe("dispatch names the tools that fit, with their arguments", () => {
 
   it("lists the best-ranked loaded tools as signatures and uses the top one in the exec line", async () => {
     const p = priv();
-    p.server.getClientVersion = () => ({ name: "claude-code", version: "2.1.0" });
+    // A client that never re-lists, the one that still gets an exec line.
+    p.server.getClientVersion = () => ({ name: "codex-mcp-client", version: "0.1.0" });
     p.config = { configVersion: "v1", servers: [npm()] };
     vi.mocked(connectToUpstream).mockImplementation(async (c: UpstreamServerConfig) => connection(c, tools));
     const text: string = (await p.handleDispatch("weekly downloads for the lodash package", 1)).content[0].text;
@@ -209,16 +210,16 @@ describe("dispatch names the tools that fit, with their arguments", () => {
 
   it("names no tools when none shares a word with the intent", async () => {
     const p = priv();
-    p.server.getClientVersion = () => ({ name: "claude-code", version: "2.1.0" });
+    p.server.getClientVersion = () => ({ name: "codex-mcp-client", version: "0.1.0" });
     p.config = { configVersion: "v1", servers: [npm()] };
     vi.mocked(connectToUpstream).mockImplementation(async (c: UpstreamServerConfig) => connection(c, tools));
     const text: string = (await p.handleDispatch("registry", 1)).content[0].text;
     expect(text).not.toContain("Best tools for this request");
-    expect(text).toContain("call it through mcp_connect_exec");
+    expect(text).toContain("Call them through mcp_connect_exec instead");
   });
 });
 
-describe("the exec fallback on load replies, and exec on a tool just loaded", () => {
+describe("no exec line on load replies to a client that re-lists, and exec on a tool just loaded", () => {
   const gh = () => cfg({ id: "gh", namespace: "gh", name: "GitHub", description: "Repos and issues" });
   const ghTools: ToolSpec[] = [
     {
@@ -228,22 +229,11 @@ describe("the exec fallback on load replies, and exec on a tool just loaded", ()
     },
   ];
 
-  it("activate tells a client that re-lists how to reach the tool if the direct call fails", async () => {
-    const p = priv();
-    p.config = { configVersion: "v1", servers: [gh()] };
-    p.server.getClientVersion = () => ({ name: "claude-code", version: "2.1.0" });
-    vi.mocked(connectToUpstream).mockImplementation(async (c: UpstreamServerConfig) => connection(c, ghTools));
-    const text: string = (await p.handleActivate(["gh"])).content[0].text;
-    expect(text).toContain(
-      'If a direct call to a tool just loaded fails with "No such tool available" (some clients, Claude Code among them, hand tools loaded mid-session to the model deferred), call it through mcp_connect_exec, which routes by name and needs no tool-list refresh: {"steps":[{"tool":"gh_create_issue","args":{}}]}',
-    );
-    // Re-activating a server already in the tool list loads nothing new.
-    const again: string = (await p.handleActivate(["gh"])).content[0].text;
-    expect(again).toContain("already loaded");
-    expect(again).not.toContain("mcp_connect_exec");
-  });
-
   it.each([
+    // Claude Code calls a just-loaded tool directly once ToolSearch selects
+    // it: no "No such tool available" in 60 live 1.1.7 sessions, so the line
+    // it used to get cost ~350 characters a reply for nothing.
+    ["Claude Code", { name: "claude-code", version: "2.1.317" }],
     ["a client that calls re-listed tools directly", { name: "cursor-vscode", version: "1.0" }],
     ["a client that sent no clientInfo", undefined],
   ])("adds no exec line for %s", async (_label, client) => {

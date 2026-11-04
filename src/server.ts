@@ -317,16 +317,6 @@ export function clientRelistsTools(clientInfo?: { name?: string }): boolean {
   return !(clientInfo?.name !== undefined && NO_RELIST_CLIENTS.has(clientInfo.name));
 }
 
-/** Clients (by clientInfo.name) that re-list tools on tools/list_changed but
- *  give the model the tools added mid-session deferred, so a direct call
- *  right after a load fails with "No such tool available". Claude Code. */
-export const DEFERRED_TOOL_CLIENTS: ReadonlySet<string> = new Set(["claude-code"]);
-
-/** True only for a client in DEFERRED_TOOL_CLIENTS. */
-export function clientDefersNewTools(clientInfo?: { name?: string }): boolean {
-  return clientInfo?.name !== undefined && DEFERRED_TOOL_CLIENTS.has(clientInfo.name);
-}
-
 /** Who is on the other end of the downstream connection, as every reader of
  *  client identity sees it (see ConnectServer.clientSession).
  *
@@ -659,6 +649,29 @@ export function pickAutoWarmWinner<T extends { score: number; coverage?: number 
 // cannot start (docker down, say) does not spawn its way down the whole list.
 export const DISPATCH_MAX_FALLBACKS = 2;
 
+/** Whether dispatch may load `next` in place of `failed`, a winner that
+ *  failed to start. Both must hold:
+ *    * `next` is one the ranker could not tell apart from `failed`: a score
+ *      within AUTO_ACTIVATE_MARGIN_BM25 of it, so a failed winner is never
+ *      swapped for a server that merely shares one word with the request.
+ *    * `failed` was not a low-coverage pick (coverageIsLow, the test
+ *      dispatchConfidenceNote reports). A weak winner says the request may
+ *      fit no installed server at all, and a runner-up scoring just under it
+ *      is no better: "list Jira tickets assigned to me in the current sprint"
+ *      ranked kubernetes first at 2.06 with coverage 0.04 (Jira not
+ *      installed), and when kubernetes failed to start the fallback loaded
+ *      lemonsqueezy at 1.79. Inside the margin the lead is under
+ *      DISPATCH_LOW_COVERAGE_MARGIN, so this is the coverage floor itself.
+ *  No score floor: twin servers (two GitHub entries) share every query word,
+ *  so their IDFs and scores are tiny although either one fits, and that is
+ *  the pair a fallback is most for. When coverage was not measured (a small
+ *  install) the margin alone decides, as before coverage existed. Pure;
+ *  exported for tests. */
+export function runnerUpCanReplace(failed: RoutingCandidate, next: RoutingCandidate): boolean {
+  if (next.score * AUTO_ACTIVATE_MARGIN_BM25 < failed.score) return false;
+  return !coverageIsLow(failed, failed.score / (next.score || 1e-6));
+}
+
 // How many runners-up dispatchConfidenceNote names.
 const CONFIDENCE_NOTE_RUNNERS_UP = 2;
 
@@ -669,6 +682,19 @@ const CONFIDENCE_NOTE_RUNNERS_UP = 2;
 // reports low coverage only when the pick also rests on a single word or
 // leads the best runner-up by less than this ratio.
 export const DISPATCH_LOW_COVERAGE_MARGIN = 2;
+
+/** dispatchConfidenceNote's low-coverage test, shared with
+ *  runnerUpCanReplace: `pick` matches less of the request than
+ *  AUTO_ACTIVATE_MIN_COVERAGE AND either matches at most one content word or
+ *  leads the best other candidate by less than DISPATCH_LOW_COVERAGE_MARGIN
+ *  (`lead`, a score ratio). False when coverage was not measured. */
+function coverageIsLow(pick: RoutingCandidate, lead: number): boolean {
+  return (
+    pick.coverage !== undefined &&
+    pick.coverage < AUTO_ACTIVATE_MIN_COVERAGE &&
+    ((pick.matched ?? 0) <= 1 || lead < DISPATCH_LOW_COVERAGE_MARGIN)
+  );
+}
 
 /** The low-confidence line dispatch appends after loading `loaded`, or
  *  undefined when the pick is confident. Two signals, either of which is
@@ -703,11 +729,7 @@ export function dispatchConfidenceNote(
       `close call (${best.namespace} scored ${best.score.toFixed(2)} vs ${pick.score.toFixed(2)}${opts.noSampling ? "; this client cannot be asked to break the tie" : ""})`,
     );
   }
-  if (
-    pick.coverage !== undefined &&
-    pick.coverage < AUTO_ACTIVATE_MIN_COVERAGE &&
-    ((pick.matched ?? 0) <= 1 || lead < DISPATCH_LOW_COVERAGE_MARGIN)
-  ) {
+  if (coverageIsLow(pick, lead)) {
     reasons.push(
       pick.contentTerms !== undefined && pick.contentTerms > 0
         ? `${loaded} matches ${pick.matched} of the request's ${pick.contentTerms} content words`
@@ -2195,35 +2217,6 @@ export class ConnectServer {
     const example = this.execExample(loaded, preferred);
     if (example === null) return null;
     return `This client keeps the tool list it read at startup, so the tools just loaded are not in it and a direct call to one fails. Call them through mcp_connect_exec instead, e.g. ${example.call}${example.fill}`;
-  }
-
-  /** The exec line an activate or dispatch reply carries, or null.
-   *  `loaded` is every namespace the call left loaded; `fresh` the subset it
-   *  newly added to the advertised tool list (not already in sessionActivated).
-   *    * A client that never re-lists (NO_RELIST_CLIENTS) gets the line above
-   *      for `loaded`: none of those tools is in its startup list, however
-   *      long ago they were loaded.
-   *    * A client in DEFERRED_TOOL_CLIENTS re-lists but hands tools added
-   *      mid-session to the model deferred: a direct call right after an
-   *      activate or dispatch failed with "No such tool available" in live
-   *      Claude Code runs. It gets the fallback form, for `fresh` only.
-   *    * Every other client re-lists and calls new tools directly: nothing.
-   *  exec needs no tools/list refresh: each step goes through handleToolCall,
-   *  which resolves the name against toolRoutes, and both handlers rebuild
-   *  those routes (announceExplicitLoads) before they write the reply this
-   *  line goes into. */
-  private loadReplyExecHint(loaded: readonly string[], fresh: ReadonlySet<string>, preferred?: string): string | null {
-    const clientInfo = this.clientSession().clientInfo;
-    if (!clientRelistsTools(clientInfo)) {
-      return this.execHintForNonRelistingClient(loaded, preferred);
-    }
-    if (!clientDefersNewTools(clientInfo)) return null;
-    const example = this.execExample(
-      loaded.filter((ns) => fresh.has(ns)),
-      preferred,
-    );
-    if (example === null) return null;
-    return `If a direct call to a tool just loaded fails with "No such tool available" (some clients, Claude Code among them, hand tools loaded mid-session to the model deferred), call it through mcp_connect_exec, which routes by name and needs no tool-list refresh: ${example.call}${example.fill}`;
   }
 
   /** A ready-made exec call for a load reply: `preferred` (a namespaced
@@ -7019,7 +7012,7 @@ export class ConnectServer {
   // through here: they report no cap/error split and no isError. What each
   // handler does beyond this -- activate's filter rollback and upstream
   // `instructions`, dispatch's scored result lines, and the list of loaded
-  // namespaces each passes to loadReplyExecHint -- stays in the
+  // namespaces each passes to execHintForNonRelistingClient -- stays in the
   // handler.
   //
   // Gateway mode advertises a namespace only on a signal of what the user
@@ -7141,10 +7134,8 @@ export class ConnectServer {
     // returns ok:false with capped unset, which recordExplicitLoad books as
     // an error.
     const total = namespaces.length;
-    // Namespaces this call left loaded, and those it newly advertised (not
-    // already in sessionActivated), for the exec hint below.
+    // Namespaces this call left loaded, for the exec hint below.
     const loadedOk: string[] = [];
-    const freshlyAdvertised = new Set<string>();
     // Claim, UP FRONT, every namespace the startup prewarm is already
     // connecting. The loop below is sequential, so without this a claim only
     // lands when the loop reaches that namespace -- and a prewarm that
@@ -7180,7 +7171,6 @@ export class ConnectServer {
       preClaimed.delete(namespace);
       const r = await (claimed ?? this.activateOne(namespace, progress));
       results.push(r.message);
-      if (r.ok && !this.sessionActivated.has(namespace)) freshlyAdvertised.add(namespace);
       // Flags plus the sessionActivated add, shared with handleDispatch.
       this.recordExplicitLoad(tally, namespace, r);
       if (r.ok) loadedOk.push(namespace);
@@ -7274,7 +7264,7 @@ export class ConnectServer {
     // sanitizeUpstreamInstructions neutralizes inside any payload, so no fenced
     // text can pass itself off as that tip or be mistaken for part of it.
     // Broker prose, so it goes BEFORE the third-party blocks (see below).
-    const execHint = this.loadReplyExecHint(loadedOk, freshlyAdvertised);
+    const execHint = this.execHintForNonRelistingClient(loadedOk);
     if (execHint) results.push(execHint);
 
     results.push(...upstreamInstructions);
@@ -7502,25 +7492,18 @@ export class ConnectServer {
 
     // Winners this call left loaded, for the exec hint below.
     const dispatchedOk: string[] = [];
-    // What was advertised before this call, so the exec hint can tell which
-    // loaded namespaces this call newly added to the tool list.
-    const advertisedBefore = new Set(this.sessionActivated);
     // Every namespace this call tried to load, so the confidence note does
     // not offer one of them as a runner-up.
     const attempted = new Set(winners.map((w) => w.namespace));
     // Runner-up fallback: when a winner fails to start (docker down, missing
     // credential, crash on boot), try the next candidates below the budget
-    // slice instead of answering with only an error. Only candidates the
-    // ranker could not tell apart from the failed winner -- a score within
-    // AUTO_ACTIVATE_MARGIN_BM25 of it, the margin discover's auto-warm
-    // demands of a decisive pick -- so a failed winner is never swapped for
-    // a server that merely shares one word with the request; at most
-    // DISPATCH_MAX_FALLBACKS across the whole call, in ranking order. A cap
-    // refusal is not a failure to start -- every other candidate would be
-    // refused the same way -- so it never falls back.
+    // slice instead of answering with only an error. Only when the failed
+    // winner was a confident pick, and only candidates the ranker could not
+    // tell apart from it (runnerUpCanReplace); at most DISPATCH_MAX_FALLBACKS
+    // across the whole call, in ranking order. Otherwise the failure is
+    // reported as it stands. A cap refusal is not a failure to start -- every
+    // other candidate would be refused the same way -- so it never falls back.
     const fallbackPool = ranked.slice(safeBudget).filter((r) => r.score > 0);
-    const closeEnough = (failed: RoutingCandidate, next: RoutingCandidate) =>
-      next.score * AUTO_ACTIVATE_MARGIN_BM25 >= failed.score;
     let fallbacksLeft = DISPATCH_MAX_FALLBACKS;
     // "<winner> failed to load; loaded runner-up <ns>" per rescue, for the header.
     const rescues: string[] = [];
@@ -7537,9 +7520,9 @@ export class ConnectServer {
       // namespace warnings rely on. The ground truth is tool-call
       // success, recorded in handleToolCall on the proxy path.
       // The pool is sorted best first, so its head decides whether any
-      // candidate is close enough to this winner.
+      // candidate can replace this winner.
       const head = fallbackPool[0];
-      if (r.ok || r.capped || fallbacksLeft === 0 || head === undefined || !closeEnough(winner, head)) {
+      if (r.ok || r.capped || fallbacksLeft === 0 || head === undefined || !runnerUpCanReplace(winner, head)) {
         // Shared with handleActivate. Dispatch has to advertise what it
         // loaded: the client asked for a server for THIS intent (bounded by
         // `budget`), and the reply promises the tools are now callable ("no
@@ -7555,7 +7538,7 @@ export class ConnectServer {
       }
       const failed: Array<{ namespace: string; r: ActivationResult }> = [{ namespace: winner.namespace, r }];
       let rescued = false;
-      while (fallbacksLeft > 0 && fallbackPool.length > 0 && closeEnough(winner, fallbackPool[0])) {
+      while (fallbacksLeft > 0 && fallbackPool.length > 0 && runnerUpCanReplace(winner, fallbackPool[0])) {
         const next = fallbackPool.shift() as RoutingCandidate;
         fallbacksLeft -= 1;
         attempted.add(next.namespace);
@@ -7616,11 +7599,7 @@ export class ConnectServer {
       if (note) results.push(note);
     }
 
-    const execHint = this.loadReplyExecHint(
-      dispatchedOk,
-      new Set(dispatchedOk.filter((ns) => !advertisedBefore.has(ns))),
-      toolHints.top,
-    );
+    const execHint = this.execHintForNonRelistingClient(dispatchedOk, toolHints.top);
     if (execHint) results.push(execHint);
 
     // `attempted` counts the runners-up too, so the header never undercounts

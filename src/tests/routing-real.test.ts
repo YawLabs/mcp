@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { fallbackToolsFor } from "../fallback-tools.js";
 import { queryCoverage, type RankableServer, rankServers, rankTools } from "../relevance.js";
-import { pickAutoWarmWinner } from "../server.js";
+import { pickAutoWarmWinner, runnerUpCanReplace } from "../server.js";
 
 // ═══════════════════════════════════════════════════════════════════════
 // Routing-quality gate on REAL server data.
@@ -422,5 +422,56 @@ describe("routing on a real 21-server install", () => {
     const withBundled = count(SERVERS);
     expect(withBundled.top1).toBeGreaterThanOrEqual(6);
     expect(withBundled.top5).toBeGreaterThanOrEqual(8);
+  });
+});
+
+// dispatch's runner-up fallback (server.ts runnerUpCanReplace) on the real
+// rankings: when the winner fails to start, does dispatch load the next
+// server? Measured as if every winner failed. The candidates are what
+// rankIntentCandidates builds: score plus coverage over all 21 servers.
+describe("routing-real: runner-up fallback when the winner fails to start", () => {
+  const candidates = (prompt: string) => {
+    const coverage = new Map(queryCoverage(prompt, SERVERS).map((c) => [c.namespace, c.coverage]));
+    return rankServers(prompt, SERVERS).map((r) => ({ ...r, coverage: coverage.get(r.namespace) ?? 0 }));
+  };
+  const fallsBack = (prompt: string): string | undefined => {
+    const [failed, next] = candidates(prompt);
+    return failed && next && next.score > 0 && runnerUpCanReplace(failed, next) ? next.namespace : undefined;
+  };
+
+  it("does not swap a weak winner for an unrelated runner-up: the live Jira case", () => {
+    // Jira is not installed. kubernetes wins on two words with coverage 0.04,
+    // and lemonsqueezy is within the score margin of it: before the
+    // confidence floor, a kubernetes that failed to start loaded lemonsqueezy.
+    const prompt = "list Jira tickets assigned to me in the current sprint";
+    const [failed, next] = candidates(prompt);
+    expect([failed.namespace, next.namespace]).toEqual(["kubernetes", "lemonsqueezy"]);
+    expect(next.score * 1.3).toBeGreaterThanOrEqual(failed.score);
+    expect(fallsBack(prompt)).toBeUndefined();
+  });
+
+  it("still falls back from a confident winner to the runner-up the request also fits", () => {
+    // a06: postgres then redis, both labeled; m03: caddy then tailscale, a
+    // multi-step prompt that needs both.
+    expect(fallsBack(ITEMS.find((i) => i.id === "a06")?.prompt ?? "")).toBe("redis");
+    expect(fallsBack(ITEMS.find((i) => i.id === "m03")?.prompt ?? "")).toBe("tailscale");
+  });
+
+  it("falls back on far fewer prompts that need no installed server", () => {
+    // Counts over the corpus. Without the floor (margin alone) a failed
+    // winner was replaced on 25 of the 45 negative and negative_uninstalled
+    // prompts; with it, on 6. The cost: 4 of the 10 positives whose runner-up
+    // was a labeled server no longer fall back to it (p28, m04, ho-fetch-2,
+    // ho-memory-1 -- each a winner with coverage under 0.38).
+    let negatives = 0;
+    let correct = 0;
+    for (const item of ITEMS) {
+      const ns = fallsBack(item.prompt);
+      if (ns === undefined) continue;
+      if (item.expect_servers.length === 0) negatives++;
+      else if (item.expect_servers.includes(ns)) correct++;
+    }
+    expect(negatives).toBeLessThanOrEqual(6);
+    expect(correct).toBeGreaterThanOrEqual(6);
   });
 });

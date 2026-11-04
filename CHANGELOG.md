@@ -14,11 +14,11 @@ A server is auto-loaded only when enough of the request's meaningful words match
 
 **Added -- dispatch falls back to a close runner-up when its pick fails to start**
 
-When the chosen server fails to start, dispatch tries the next candidate if it scored within 1.3x of the failed one, and says which server failed and which was loaded instead. Otherwise the failure is returned as before.
+When the chosen server fails to start, dispatch tries the next candidate if it scored within 1.3x of the failed one and the failed one matched enough of the request's words to be a confident pick, and says which server failed and which was loaded instead. Otherwise the failure is returned as before, so a request for a product that is not installed no longer loads an unrelated server.
 
 **Added -- dispatch replies list the matching tools' arguments, and `exec` checks arguments before calling**
 
-After loading a server, dispatch lists its best-matching tools with their required and optional arguments. On Claude Code, where tools loaded mid-session are not yet callable directly, activate and dispatch replies say to call them through `mcp_connect_exec`. `exec` now refuses a call that is missing a required argument, or that passes a key the tool's schema forbids, and names the expected arguments (for example `package` -> `name`), instead of forwarding the call.
+After loading a server, dispatch lists its best-matching tools with their required and optional arguments. `exec` now refuses a call that is missing a required argument, or that passes a key the tool's schema forbids, and names the expected arguments (for example `package` -> `name`), instead of forwarding the call.
 
 **Added -- GitHub, Terraform and Vault tools are searchable before their server has ever started**
 

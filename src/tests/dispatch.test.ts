@@ -37,6 +37,7 @@ import {
   dispatchConfidenceNote,
   pickAutoWarmWinner,
   type RoutingCandidate,
+  runnerUpCanReplace,
 } from "../server.js";
 import type { UpstreamConnection, UpstreamServerConfig } from "../types.js";
 import { ActivationError, connectToUpstream, disconnectFromUpstream } from "../upstream.js";
@@ -998,6 +999,31 @@ describe("dispatchConfidenceNote", () => {
   });
 });
 
+describe("runnerUpCanReplace", () => {
+  it("replaces a confident winner with a runner-up within the margin, not one below it", () => {
+    expect(runnerUpCanReplace(cand("gh", 10, 0.6, 3, 5), cand("sl", 9, 0.5))).toBe(true);
+    expect(runnerUpCanReplace(cand("gh", 13, 0.6, 3, 5), cand("sl", 10, 0.5))).toBe(true);
+    expect(runnerUpCanReplace(cand("gh", 13.1, 0.6, 3, 5), cand("sl", 10, 0.5))).toBe(false);
+  });
+
+  it("never replaces a winner dispatchConfidenceNote would call low-coverage", () => {
+    // The live Jira case: kubernetes on two of six words, lemonsqueezy close behind.
+    const jira = [cand("k8s", 2.06, 0.04, 2, 6), cand("ls", 1.79, 0.1)];
+    expect(runnerUpCanReplace(jira[0], jira[1])).toBe(false);
+    expect(dispatchConfidenceNote(jira, "k8s", new Set(["k8s"]), { sampled: true, noSampling: false })).toContain(
+      "k8s matches 2 of the request's 6 content words",
+    );
+    expect(runnerUpCanReplace(cand("k8s", 9, AUTO_ACTIVATE_MIN_COVERAGE - 0.001, 3), cand("ls", 8.9, 0.9))).toBe(false);
+    expect(runnerUpCanReplace(cand("k8s", 9, AUTO_ACTIVATE_MIN_COVERAGE, 3), cand("ls", 8.9, 0.9))).toBe(true);
+  });
+
+  it("judges on the margin alone when coverage was not measured, however low the scores", () => {
+    // Twin servers share every query word, so BM25 scores them both near 0.
+    expect(runnerUpCanReplace(cand("gh", 0.4), cand("gh2", 0.4))).toBe(true);
+    expect(runnerUpCanReplace(cand("gh", 2), cand("sl", 1.5))).toBe(false);
+  });
+});
+
 describe("routing confidence in the dispatch and discover handlers", () => {
   let server: ConnectServer;
 
@@ -1166,6 +1192,34 @@ describe("routing confidence in the dispatch and discover handlers", () => {
     expect(new Set(vi.mocked(connectToUpstream).mock.calls.map((c) => c[0].namespace))).toEqual(new Set(["gh"]));
     expect(result.content[0].text).not.toContain("runner-up tried");
     expect(priv.sessionActivated.has("slack")).toBe(false);
+  });
+
+  it("falls back from a confident winner but not from a weak one, which still errors", async () => {
+    const priv = getPrivate(server);
+    priv.config = { configVersion: "v1", servers: fiveServers() };
+    vi.mocked(connectToUpstream).mockImplementation(async (cfg: UpstreamServerConfig) => {
+      if (cfg.namespace === "gh") throw new ActivationError("docker daemon is not running", "install_failure");
+      return makeConnection(cfg.namespace, [{ name: "tool_one" }]);
+    });
+
+    // Weak: the Jira shape -- the winner matches 2 of 6 words, coverage 0.04.
+    priv.rankIntentCandidates = async () => [cand("gh", 2.06, 0.04, 2, 6), cand("sl", 1.79, 0.1, 1, 6)];
+    const weak = await priv.handleDispatch("list Jira tickets assigned to me in the current sprint", 1);
+    expect(weak.isError).toBe(true);
+    expect(new Set(vi.mocked(connectToUpstream).mock.calls.map((c) => c[0].namespace))).toEqual(new Set(["gh"]));
+    expect(weak.content[0].text).toMatch(/^gh \(score 2\.06\): .*docker daemon is not running/m);
+    expect(weak.content[0].text).not.toContain("runner-up tried");
+    expect(priv.sessionActivated.has("sl")).toBe(false);
+
+    // Confident: same failure, a well-covered winner -- the runner-up loads.
+    // Clear gh's recorded failure so routing does not halve its score.
+    vi.mocked(connectToUpstream).mockClear();
+    priv.activationFailures.clear();
+    priv.rankIntentCandidates = async () => [cand("gh", 10, 0.6, 3, 5), cand("sl", 9, 0.5, 2, 5)];
+    const confident = await priv.handleDispatch("list open github issues", 1);
+    expect(confident.isError).toBeUndefined();
+    expect(confident.content[0].text).toContain("gh failed to load; loaded runner-up sl instead.");
+    expect(priv.sessionActivated.has("sl")).toBe(true);
   });
 
   it("tries at most DISPATCH_MAX_FALLBACKS runners-up, and errors when none starts", async () => {
