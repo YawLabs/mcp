@@ -58,6 +58,8 @@ export const KNOWN_SUBCOMMANDS = [
   "bundles",
   "completion",
   "upgrade",
+  "update",
+  "share",
   "try",
   "try-cleanup",
   "secrets",

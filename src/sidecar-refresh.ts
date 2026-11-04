@@ -453,6 +453,8 @@ export function backgroundInstallOptions(home: string): SidecarsInstallOptions {
     out: () => {},
     err: () => {},
     acquireLock: () => () => {},
+    // Building a git entry runs repo code; nothing does that from `serve`.
+    buildGit: false,
   };
 }
 

@@ -184,6 +184,9 @@ yaw-mcp status [--json]        # read-only snapshot of loaded servers, activity,
 yaw-mcp add <slug> [--env KEY=value] [--dry-run]   # add a catalog server to bundles.json
 yaw-mcp add <name> --command "npx -y my-mcp"       # ...or define a local server yourself
 yaw-mcp add <name> --url https://host/mcp          # ...or a remote one
+yaw-mcp add [<name>] --git <url>[#ref]             # ...or build one from a git repo (see Private git servers)
+yaw-mcp update [<name>] [--check] [--to <sha>]     # move git servers to their branch's new commit (yaw-mcp itself: upgrade)
+yaw-mcp share <name> [--pin]                       # print the one-line add --git command coworkers paste
 yaw-mcp import <client> [--dry-run]                # adopt the servers a client already has
 yaw-mcp remove <slug-or-namespace-or-name>         # drop a server
 yaw-mcp list [--json]                              # list configured servers with their cached compliance grade
@@ -246,6 +249,59 @@ yaw-mcp audit <namespace>     # audit a stdio server from bundles.json, cache it
 `heal` exists for the entry that pins a path (see [Running yaw-mcp on oam](#running-yaw-mcp-on-oam)): an app upgrade that deletes the directory the path named leaves the client unable to start the broker, and the client cannot report that because it cannot start the thing that would. The broker runs the same sweep at every startup, cross-client, so a client whose entry still works repairs the ones that do not; `heal` is for the machine whose only configured client is the broken one. It touches only an entry yaw-mcp wrote that is currently broken -- a working entry is never rewritten, however unusual it looks -- and prints each old and new path. A stale entry it finds and cannot re-point -- a read-only config file on Windows, say -- is reported on stderr with the step past it, listed under `failed` in `--json`, and makes the run exit 1. `--dry-run` reports without writing; `--quiet` keeps the exit code and `--json` and drops the transcript. `YAW_MCP_AUTO_HEAL=0` turns the startup sweep off; `YAW_MCP_READONLY_DIAGNOSTICS=1` turns both off.
 
 To install completion, redirect to your shell's completions dir, e.g. `yaw-mcp completion zsh > "${fpath[1]}/_yaw-mcp"`, or `yaw-mcp completion powershell >> $PROFILE`.
+
+## Private git servers
+
+A TypeScript MCP server that lives in a private repository -- your own, or your team's -- does not need to be published to npm. `add --git` clones it, installs its dependencies, builds it, and pins the exact commit:
+
+```bash
+yaw-mcp add acme-tools --git git@github.com:acme/acme-tools-mcp.git#main
+yaw-mcp add --git https://github.com/acme/crm-mcp.git#v1.4.0      # name from the repo's yaw-mcp.json
+yaw-mcp add tools --git git@gitlab.acme.dev:infra/mono.git --subdir packages/mcp --entry dist/index.js -- --verbose
+```
+
+- **The ref** after `#` can be a branch, a tag, or a short or full SHA (default: the remote's default branch). It is resolved to a full 40-character commit, and that commit is what `bundles.json` records. Each build lives in its own directory, `~/.yaw-mcp/git/<namespace>/<sha12>`, and the server runs as `node <entry>` from there, with the node yaw-mcp itself runs on -- on oam when oam is installed, like any other node server.
+- **npm, pnpm and yarn** repos all build. The package manager comes from `packageManager` in the root `package.json` (run through corepack when it pins a version), else from the lockfile. Installs are always frozen (`npm ci`, `pnpm install --frozen-lockfile`, `yarn install --frozen-lockfile` or `--immutable`) and include dev dependencies; yarn 2+ builds with `nodeLinker: node-modules`, and a pnpm workspace subdir builds with `--filter`. The build is `<pm> run build`, run only when the package has a `build` script. bun repos are refused.
+- **The entry** is the package's `bin`, then `main`, unless `--entry` says otherwise. `add` starts the server once and lists its tools before it reports success (`--no-start-check` skips that).
+- `--dry-run` only resolves the ref and prints the commit it would pin.
+
+**Build-script consent is asked once per repository.** The first build of a repo shows its install and build lifecycle scripts (pre/post hooks and every workspace package's scripts included), plus any repo config that can run code at install -- `.npmrc`, `.yarnrc`, `.yarnrc.yml` (`yarnPath`, `plugins`), `.pnpmfile.cjs`, `pnpm-workspace.yaml` hooks -- and asks before running them. That config is shown, not blocked. The answer is stored per repository in `~/.yaw-mcp/git/consent.json`, and later builds of the same repo -- `update`, a new ref, `--to`, `sidecars install`, a second server from the same repo -- do not ask again, even when the scripts change. `git@host:org/repo`, `ssh://git@host/org/repo` and `https://host/org/repo.git` count as the same repository. Off a terminal there is nobody to ask, so a repo with no stored grant needs `--yes`, which also records the grant. Nothing is ever cloned or built when yaw-mcp loads, lists, prewarms or activates a server: a server with no build on this machine fails activation with `Run: yaw-mcp sidecars install`.
+
+**The repo's `yaw-mcp.json` (optional).** A server repo can carry a `yaw-mcp.json` at its root (and at `<subdir>/yaw-mcp.json`, which overrides the root key by key) so that a bare `add --git <url>` needs no other flags:
+
+```jsonc
+{
+  "$schema": "https://raw.githubusercontent.com/YawLabs/mcp/main/schemas/yaw-mcp.manifest.v1.json",
+  "version": 1,
+  "namespace": "acme_crm",
+  "description": "Acme CRM: accounts, deals, contacts",
+  "entry": "dist/index.js",
+  "env": {
+    "CRM_TOKEN": { "secret": "crm_token", "required": true, "help": "https://wiki.acme/crm-token" },
+    "CRM_REGION": { "default": "us" }
+  }
+}
+```
+
+It can set the namespace, description, entry, subdir and env declarations -- never what runs: a `command`, `args` or `scripts` key is refused with a warning. Flags beat the manifest, and the manifest beats what `package.json` implies. A nameless `add --git` whose manifest names a namespace a different server already uses is refused, so a repo cannot take over another server's env; give the server a name instead. A secret is written to `bundles.json` as a `${secret:NAME}` reference, never as a value, and `add` offers to store a missing one in the [vault](#local-secret-vault). Every `add --git` prints the env keys it writes, each with the vault secret behind it or `a value (not shown)`. The file is strictly optional: everything in it has a flag, a repo may keep it out of a public mirror, and yaw-mcp never creates it or asks you to.
+
+**Sharing with coworkers.** `yaw-mcp share <name>` prints the line a coworker pastes -- an `SSH:` and an `HTTPS:` form when the URL converts cleanly -- and the secrets they will be asked for. It prints the ref the server tracks, or the exact commit with `--pin`, and warns when that ref is a branch, since each coworker would get whatever the branch points at that day. It never prints env values, vault contents or local paths, and whatever the repo's `yaw-mcp.json` does not declare is spelled out as flags. Read access to the repository is the whole permission model: there is no registry and no sharing layer.
+
+**Updating.** `yaw-mcp update` moves each git server tracking a branch to the commit the branch points at now. The new commit is built beside the current one and `bundles.json` is repointed only after the build succeeds, so a failed build changes nothing. A server tracking a tag or a commit is pinned: it is reported, not moved. `--check` only asks the remote and reports each server as up to date, behind or pinned, plus newer version tags for one tracking a tag. `--ref <ref>` switches what a server tracks, and `--to <sha>` goes back to a build kept on this machine (the current build and the one before it are kept, plus any build another bundles.json on this machine still pins; older ones are deleted). `yaw-mcp remove` deletes the server's builds with it, except one another bundles.json still pins, which it names. A project file you have not trusted is refused by `update` (even `--check`) and `share`, so its URL and vault secret are never used. `update` never touches yaw-mcp itself -- that is `yaw-mcp upgrade`.
+
+**Teammates, through a project file.** `add --git --project` and `update --project` write the server, with its pinned commit, into the project's `.yaw-mcp/bundles.json`, keeping the file's comments; commit that file. A teammate who pulls it runs `yaw-mcp trust`, which shows the git server, its commit, and any vault token the entry would send together with the host it goes to, and, after approval, offers to build it (or run `yaw-mcp sidecars install` later). Project trust and repo consent are separate gates: approving the file does not skip the once-per-repo script consent, and a project entry with no pinned commit is refused rather than built from a moving branch. When the file was approved before your own `--project` write, the approval is renewed for you; otherwise it stays unapproved and the command says so.
+
+**Doctor.** `yaw-mcp doctor` lists git servers under OAM RUNTIME: commit, tracked ref, the last `update --check` result and its age, build status, and the node version and platform the build was made with. Doctor never runs git (a private SSH remote can prompt or hang), so "behind" is only as fresh as your last `update --check`. A missing build, a failed build, or one made for another platform, arch or node major is a warning (exit 2) that names the rebuild command. `doctor --json` carries the same rows in `oamRuntime.git`.
+
+**Credentials.** yaw-mcp uses your own git authentication and never stores a credential:
+
+- **SSH** (`git@host:org/repo`, `ssh://...`): whatever your git already uses -- ssh-agent, `~/.ssh/config`, `core.sshCommand` or `GIT_SSH_COMMAND`.
+- **HTTPS**: your git credential helper (Git Credential Manager, osxkeychain, libsecret), or `--git-token-secret NAME` to read a token from the vault. The token reaches git through a `GIT_ASKPASS` helper for that one git call only; it never goes into argv, the URL, `.git/config`, `bundles.json`, logs or `--json`, and only the secret's name is stored.
+- A URL carrying a token or password (`https://TOKEN@host/...`) is refused before anything is written. A bare username (`https://git@host/...`) is fine.
+- Off a terminal, git runs with `GIT_TERMINAL_PROMPT=0` and `GCM_INTERACTIVE=never`, so it fails fast instead of waiting on a prompt nobody can see. Clone and build output is redacted before it is printed or saved.
+- **Windows and ssh-agent:** Git for Windows ships its own `ssh`, which does not use the Windows OpenSSH agent service. If `ssh -T git@github.com` works in PowerShell but the clone fails to authenticate, point git at the Windows client: `git config --global core.sshCommand C:/Windows/System32/OpenSSH/ssh.exe`.
+- **Host keys:** yaw-mcp never accepts an ssh host key for you. A host ssh does not know yet is reported with the fix (`ssh -T git@<host>` once, to accept it); a host key that CHANGED is reported as a possible interception.
+- A teammate who uses the other protocol than a committed project entry does not need to edit the shared file: git's own rewrite covers it, for example `git config --global url."https://github.com/".insteadOf "git@github.com:"`.
 
 ## Configuration -- `.yaw-mcp/`
 

@@ -23,6 +23,14 @@
 import { readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
+import {
+  buildPinnedGitEntries,
+  type GitBuildContext,
+  gitEntryBuilt,
+  hasRepoConsent,
+  parseGitSpec,
+  recordGitPin,
+} from "./git-source.js";
 import { localBundlesPath, previewBundlesContent, probeProjectTrust } from "./local-bundles.js";
 import { createStreamWriter } from "./logger.js";
 import { isRegistrySpec, specConstraint } from "./oam-spawn.js";
@@ -95,6 +103,8 @@ export interface TrustCommandOptions {
   now?: () => number;
   /** Test hook: replaces process.stdin/stdout for the interactive prompt. */
   io?: { stdin: NodeJS.ReadableStream; stdout: NodeJS.WritableStream };
+  /** Test hook: the package-manager runner for the git build offered after a grant. */
+  runPm?: GitBuildContext["runPm"];
 }
 
 export interface TrustCommandResult {
@@ -261,7 +271,7 @@ async function runTrustGrant(opts: TrustCommandOptions): Promise<TrustCommandRes
   // DOES commit the loader to the project location and shadow the
   // user-global file (see loadLocalBundles), so it silently deletes the
   // user's real server list.
-  const preview = previewBundlesContent(path, raw);
+  const preview = previewBundlesContent(path, raw, home);
   if (!preview.ok) {
     printErr(`yaw-mcp trust: ${displaySafe(path)} is not a usable bundles.json, so there is nothing to review:`);
     for (const w of preview.warnings) printErr(`  ! ${displaySafe(w)}`);
@@ -305,7 +315,7 @@ async function runTrustGrant(opts: TrustCommandOptions): Promise<TrustCommandRes
     for (const s of preview.servers) {
       n += 1;
       print(`    ${n}. ${s.namespace}${s.isActive ? "" : "  (inactive)"}`);
-      const launch = renderLaunch(s);
+      const launch = renderLaunch(s, home);
       print(`       ${launch}`);
       const envKeys = Object.keys(s.env ?? {});
       // Names only, never values -- bundles.json env can hold secrets, and
@@ -319,6 +329,10 @@ async function runTrustGrant(opts: TrustCommandOptions): Promise<TrustCommandRes
       // not a new exfiltration class, just one the preview was silent about.
       const headerKeys = Object.keys(s.headers ?? {});
       if (headerKeys.length > 0) print(`       headers: ${headerKeys.map(displayArg).join(", ")}`);
+      // A git token is the same exposure: the askpass helper hands the vault
+      // value to whichever host the URL names.
+      const token = gitTokenTarget(s);
+      if (token) print(`       token: vault secret ${displayArg(token.name)} -> sent to ${token.to}`);
       for (const gap of pinGaps(s)) print(`       ! ${gap}`);
     }
   }
@@ -410,7 +424,74 @@ async function runTrustGrant(opts: TrustCommandOptions): Promise<TrustCommandRes
   } else {
     print("Restart your MCP client (or yaw-mcp) to load it.");
   }
-  return { exitCode: 0 };
+  return { exitCode: await offerGitBuild(opts, preview.servers, path, home, print, printErr) };
+}
+
+/** Shown next to a `sidecars install` hint when some repo has never been
+ *  allowed to run its scripts here: the bare command asks on a terminal, and
+ *  refuses off one. --yes is never added for the user -- it is the consent. */
+export const GIT_CONSENT_HINT =
+  "  Off a TTY that needs --yes (yaw-mcp sidecars install --yes), which allows the repo's install and build scripts to run (asked once per repo).";
+
+/** After a grant, build the file's git entries that have no build here yet,
+ *  with the same builder as `sidecars install`. Only asked on a TTY without
+ *  --yes: a script that approved the file is told the command instead. The
+ *  repo's own script consent (once per repo) is still asked by the builder. */
+async function offerGitBuild(
+  opts: TrustCommandOptions,
+  servers: UpstreamServerConfig[],
+  file: string,
+  home: string,
+  print: (s?: string) => void,
+  printErr: (s: string) => void,
+): Promise<number> {
+  // A build already here is now in use by this file too: GC must keep it.
+  for (const s of servers) {
+    if (s.git?.commit && gitEntryBuilt(s.namespace, s.git, home))
+      await recordGitPin(s.namespace, file, s.git.commit, home);
+  }
+  const notBuilt = servers.filter((s) => s.git?.commit !== undefined && !gitEntryBuilt(s.namespace, s.git, home));
+  if (notBuilt.length === 0) return 0;
+  const one = notBuilt.length === 1;
+  const what = one ? "1 git server is" : `${notBuilt.length} git servers are`;
+  if (opts.yes || !isInteractive(opts)) {
+    print(`${what} not built on this machine. Build ${one ? "it" : "them"} with: yaw-mcp sidecars install`);
+    if (notBuilt.some((s) => s.git && !hasRepoConsent(s.git.url, home))) print(GIT_CONSENT_HINT);
+    return 0;
+  }
+  const answer = await askYesNo(
+    opts,
+    `Trusted. ${what} not built. Build ${one ? "it" : "them"} now? This runs ${one ? "its" : "their"} install/build scripts. [Y/n] `,
+    readTrustAnswer,
+  );
+  if (answer !== "" && answer !== "y" && answer !== "yes") {
+    print("Not built. Build later with: yaw-mcp sidecars install");
+    return 0;
+  }
+  const reports = await buildPinnedGitEntries(
+    notBuilt,
+    {
+      home,
+      env: opts.env ?? process.env,
+      interactive: true,
+      yes: false,
+      progress: (l) => print(l),
+      warn: (w) => printErr(`warning: ${w}`),
+      confirm: async (lines) => {
+        for (const l of lines) print(l);
+        const a = await askYesNo(opts, "Proceed? [Y/n] ", readTrustAnswer);
+        return a === "" || a === "y" || a === "yes";
+      },
+      runPm: opts.runPm,
+    },
+    true,
+    file,
+  );
+  const failed = reports.filter((r) => r.status === "failed" || r.status === "refused" || r.status === "needs-consent");
+  for (const r of failed) printErr(`yaw-mcp trust: ${r.error ?? `${r.namespace} did not build`}`);
+  if (failed.length === 0) return 0;
+  printErr("The file is approved; retry the build with: yaw-mcp sidecars install");
+  return 1;
 }
 
 /** The refusal for a trust store this build must not write over. Two callers:
@@ -441,7 +522,18 @@ function printStoreRefusal(
 /** How a server would be launched, as one reviewable line. Args containing
  *  whitespace or quotes are JSON-quoted so `sh -c "curl ... | sh"` reads as
  *  the single argument it really is instead of blending into the line. */
-function renderLaunch(s: UpstreamServerConfig): string {
+function renderLaunch(s: UpstreamServerConfig, home: string): string {
+  // The source, not the derived `node <abs entry>`: the absolute path is this
+  // machine's, while the url and commit are what the file actually pins.
+  if (s.git) {
+    const g = s.git;
+    const at = g.commit ? ` @ ${g.commit.slice(0, 12)}` : "";
+    const pinnedSha = g.ref !== undefined && g.commit?.startsWith(g.ref) && /^[0-9a-f]{7,40}$/.test(g.ref);
+    const tracking = g.ref === undefined ? "" : pinnedSha ? " (pinned)" : ` (tracking ${displayArg(g.ref)})`;
+    const subdir = g.subdir ? ` subdir ${displayArg(g.subdir)}` : "";
+    const state = !g.commit ? "[no commit]" : gitEntryBuilt(s.namespace, g, home) ? "[built]" : "[not built]";
+    return `git ${displaySafe(g.url)}${at}${tracking}${subdir} ${state}`;
+  }
   if (s.type === "remote" || (!s.command && s.url)) return `HTTP ${displaySafe(s.url ?? "(no url)")}`;
   const command = s.command ?? "";
   const args = s.args ?? [];
@@ -670,8 +762,37 @@ function unversionedRegistrySpec(s: UpstreamServerConfig): string | null {
   return spec;
 }
 
-/** At most two lines naming content the SHA-256 does not cover. */
+/** A git entry's vault token and the host it goes to, ready to print. An ssh
+ *  or file URL never sends it, and says so. */
+function gitTokenTarget(s: UpstreamServerConfig): { name: string; to: string; sent: boolean } | null {
+  const name = s.git?.tokenSecret;
+  if (!s.git || !name) return null;
+  const parsed = parseGitSpec(s.git.url);
+  if (!parsed.ok) return { name, to: "nothing (the URL is refused at build time)", sent: false };
+  if (parsed.spec.protocol !== "https") return { name, to: "nothing (ignored: not an https URL)", sent: false };
+  return { name, to: displaySafe(parsed.spec.host), sent: true };
+}
+
+/** The lines naming content the SHA-256 does not cover: at most two for a
+ *  command entry, and for a git entry the lifecycle-scripts line plus, with no
+ *  pinned commit, the moving-ref line. */
 function pinGaps(s: UpstreamServerConfig): string[] {
+  if (s.git) {
+    const lines: string[] = [];
+    if (!s.git.commit) {
+      lines.push(
+        `NOT covered by the pin: ${s.namespace} has no commit -- it builds whatever ${s.git.ref ? displayArg(s.git.ref) : "the default branch"} points at.`,
+      );
+    }
+    lines.push("building runs this repo's install and build lifecycle scripts");
+    const token = gitTokenTarget(s);
+    if (token?.sent) {
+      lines.push(
+        `approving lets yaw-mcp read vault secret ${displayArg(token.name)} and send it to ${token.to} whenever it fetches this repo`,
+      );
+    }
+    return lines;
+  }
   if (s.type === "remote" || (!s.command && s.url)) return [];
   const lines: string[] = [];
   const repo = inRepoTokens(s);

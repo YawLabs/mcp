@@ -420,6 +420,7 @@ const JSON_KEYS = [
   "unhosted",
   "conflicts",
   "skipped",
+  "git",
 ].sort();
 
 /** The ordinary installable server, for the tests below that are about the

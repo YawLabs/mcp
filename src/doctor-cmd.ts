@@ -91,6 +91,14 @@ import {
   oamFailureLabel,
   type ServerRuntimeInfo,
 } from "./default-runtime.js";
+import {
+  buildMatchesHost,
+  type GitRefKind,
+  hasRepoConsent,
+  normalizeRepoUrl,
+  readBuildMarker,
+  readGitState,
+} from "./git-source.js";
 import { type GuideFile, loadProjectGuide, projectGuideNotice } from "./guide.js";
 import { scrubForWarning } from "./health-score.js";
 import {
@@ -138,7 +146,7 @@ import {
   probeOam,
 } from "./oam-spawn.js";
 import { isTestSandbox } from "./opt-out-env.js";
-import { normalizeForCompare, userConfigDir } from "./paths.js";
+import { gitBuildDir, gitFailedPath, normalizeForCompare, userConfigDir } from "./paths.js";
 import {
   isPersistenceDisabled,
   isReadableStateVersion,
@@ -180,6 +188,7 @@ import {
   type TrialScanResult,
   trialGcFailureWarning,
 } from "./try-cmd.js";
+import type { UpstreamServerConfig } from "./types.js";
 import {
   BINARY_RETIRED_HINT,
   buildUpgradePlan,
@@ -188,6 +197,7 @@ import {
   fetchLatestVersion,
   refineInstallMethod,
 } from "./upgrade-cmd.js";
+import { gitBuildMissing, readGitFailedRecord } from "./upstream.js";
 import { selectFlakyNamespaces } from "./usage-hints.js";
 
 /**
@@ -492,6 +502,9 @@ export interface DoctorJsonSnapshot {
       installedFor: SidecarsPlatform | null;
       platformMismatch: boolean;
     };
+    /** Servers added with `add --git`, one row per entry, read from each
+     *  build's marker and `.failed` record and from git/state.json only. */
+    git: GitSourceDoctorEntry[];
   };
   upgrade: { current: string; latest: string | null; stale: boolean };
   /** `summary` is the text path's DIAGNOSIS in one string: the verdict; on
@@ -1276,8 +1289,12 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   // collector already ran. They were DISCARDED here, which is how a hand-edited
   // bundles.json that no longer parses -- every server gone -- still printed
   // "All good" and exited 0. See foldBundleWarnings.
-  config.warnings = [...config.warnings, ...foldBundleWarnings(oamStatus.bundleWarnings, trustProbe)];
-  renderOamRuntimeSection({ status: oamStatus, print, os });
+  config.warnings = [
+    ...config.warnings,
+    ...foldBundleWarnings(oamStatus.bundleWarnings, trustProbe),
+    ...oamStatus.git.warnings,
+  ];
+  renderOamRuntimeSection({ status: oamStatus, print, os, now: opts.now ?? Date.now });
 
   // Secret vault: what is stored, which servers reference it, and whether a
   // passphrase is available to unlock it. This is the only surface that
@@ -1674,7 +1691,11 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
   });
   // Identical fold to the text path -- a malformed bundles.json must reach
   // `.warnings` and exit 2 on both surfaces.
-  config.warnings = [...config.warnings, ...foldBundleWarnings(oamStatus.bundleWarnings, trustProbe)];
+  config.warnings = [
+    ...config.warnings,
+    ...foldBundleWarnings(oamStatus.bundleWarnings, trustProbe),
+    ...oamStatus.git.warnings,
+  ];
   // Same collector as the text path's SECRET VAULT section. Emitted
   // unconditionally here (the text section hides itself when there is no
   // vault, no refs and no plaintext credential) so a consumer can read `.vault` without a presence
@@ -1715,6 +1736,7 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
     // emitting only on the text path made the shared-collector claim above
     // false and hid the one machine-level fact from every --json consumer.
     managed: oamStatus.managed,
+    git: oamStatus.git.entries,
   };
 
   // DEPRECATED key, emitted with its original nested shape (both members
@@ -2509,6 +2531,9 @@ interface OamRuntimeStatus {
     installedFor: SidecarsPlatform | null;
     platformMismatch: boolean;
   };
+  /** Git-sourced servers and the warnings their builds earn (missing, failed,
+   *  made for another machine). `entries` is mirrored verbatim into --json. */
+  git: { entries: GitSourceDoctorEntry[]; warnings: string[] };
   /** Why the background sidecar refresh (sidecar-refresh.ts) will pass a
    *  package OVER, keyed by package name -- buildRefreshPlan's `skipped`
    *  reasons, verbatim. Rendered only beside a package doctor has
@@ -2599,6 +2624,125 @@ export function registrySkipCheck(opts: DoctorOptions, override: unknown): boole
 function sidecarLatestFetcher(opts: DoctorOptions): ((pkg: string) => Promise<string | null>) | null {
   const skip = registrySkipCheck(opts, opts.sidecarRegistryFetch);
   return skip ? null : (opts.sidecarRegistryFetch ?? fetchSidecarLatest);
+}
+
+/** One git-sourced server as doctor reports it. */
+export interface GitSourceDoctorEntry {
+  namespace: string;
+  ref: string | null;
+  commit: string | null;
+  /** `mismatch`: built, but for another platform, arch or node major. */
+  build: "ok" | "missing" | "failed" | "mismatch" | "no-commit";
+  /** The step the last failed build stopped at, when `build` is "failed". */
+  failedStep: string | null;
+  /** From the build marker; null when there is no finished build. */
+  builtFor: { node: string; platform: string; arch: string; pm: string; builtAt: string } | null;
+  /** The last `update --check` (or update) verdict for this pin, from
+   *  git/state.json. Null when none was recorded for this commit and url. */
+  remote: {
+    checkedAt: string;
+    kind: GitRefKind | null;
+    /** What the tracked ref pointed at; null when the remote lacked it. */
+    commit: string | null;
+    behind: boolean;
+    newerTags: string[];
+  } | null;
+}
+
+const printable = (s: string): string => s.replace(/[^\x20-\x7e]/g, "?");
+
+/** normalizeRepoUrl can throw on a hand-edited file:// url with a bad %-escape;
+ *  doctor reads that as "not the same repo" rather than failing the report. */
+function sameRepo(a: string, b: string): boolean {
+  try {
+    return normalizeRepoUrl(a) === normalizeRepoUrl(b);
+  } catch {
+    return false;
+  }
+}
+
+function gitRemoteVerdict(
+  namespace: string,
+  git: NonNullable<UpstreamServerConfig["git"]>,
+  state: ReturnType<typeof readGitState>,
+): GitSourceDoctorEntry["remote"] {
+  const s = Object.hasOwn(state, namespace) ? state[namespace] : undefined;
+  if (!s || typeof s !== "object" || git.commit === undefined || s.pinned !== git.commit) return null;
+  if (typeof s.checkedAt !== "string" || Number.isNaN(Date.parse(s.checkedAt))) return null;
+  if (typeof s.url !== "string" || !sameRepo(s.url, git.url)) return null;
+  const commit = typeof s.remote === "string" ? s.remote : null;
+  const tracking = s.kind === "branch" || s.kind === "head";
+  return {
+    checkedAt: s.checkedAt,
+    kind: s.kind ?? null,
+    commit,
+    behind: tracking && commit !== null && commit !== git.commit,
+    newerTags: Array.isArray(s.newerTags) ? s.newerTags.filter((t): t is string => typeof t === "string") : [],
+  };
+}
+
+/**
+ * The git sources block. Reads build markers, `.failed` records and
+ * git/state.json, and spawns nothing: asking the remote (ls-remote) can prompt
+ * for credentials or hang on a private SSH host, so "behind" is whatever the
+ * last `update --check` recorded.
+ */
+async function collectGitSources(opts: {
+  servers: UpstreamServerConfig[];
+  home: string;
+  platform: NodeJS.Platform;
+  /** The servers came from a project bundles.json, so the rebuild hint needs
+   *  `--project`. */
+  project: boolean;
+}): Promise<OamRuntimeStatus["git"]> {
+  const entries: GitSourceDoctorEntry[] = [];
+  const warnings: string[] = [];
+  const withGit = opts.servers.filter((s) => s.git !== undefined);
+  if (withGit.length === 0) return { entries, warnings };
+  const state = readGitState(opts.home);
+  const hostMajor = /^v?(\d+)/.exec(process.version)?.[1] ?? "";
+  for (const server of withGit) {
+    const git = server.git as NonNullable<UpstreamServerConfig["git"]>;
+    const ns = server.namespace;
+    const row: GitSourceDoctorEntry = {
+      namespace: ns,
+      ref: git.ref ?? null,
+      commit: git.commit ?? null,
+      build: "no-commit",
+      failedStep: null,
+      builtFor: null,
+      remote: gitRemoteVerdict(ns, git, state),
+    };
+    entries.push(row);
+    // The loader already warns about an entry with no commit.
+    if (git.commit === undefined) continue;
+    const dir = gitBuildDir(ns, git.commit, opts.home);
+    const missing = await gitBuildMissing(server, opts.home, hasRepoConsent(git.url, opts.home));
+    if (missing !== null) {
+      const failed = await readGitFailedRecord(gitFailedPath(ns, git.commit, opts.home));
+      row.build = failed ? "failed" : "missing";
+      row.failedStep = failed?.step ?? null;
+      warnings.push(missing.replace(/\s*\n\s*/g, " | "));
+      continue;
+    }
+    const marker = readBuildMarker(dir, git.commit);
+    row.build = "ok";
+    if (marker === null) continue;
+    row.builtFor = {
+      node: printable(String(marker.node)),
+      platform: printable(String(marker.platform)),
+      arch: printable(String(marker.arch)),
+      pm: printable(String(marker.pm)),
+      builtAt: printable(String(marker.builtAt)),
+    };
+    if (buildMatchesHost(marker, opts.platform)) continue;
+    row.build = "mismatch";
+    const major = /^v?(\d+)/.exec(row.builtFor.node)?.[1] ?? row.builtFor.node;
+    warnings.push(
+      `${ns} was built on ${row.builtFor.platform}-${row.builtFor.arch} node ${major}; this is ${opts.platform}-${process.arch} node ${hostMajor}. Rebuild: yaw-mcp update ${ns} --to ${git.commit.slice(0, 7)}${opts.project ? " --project" : ""}`,
+    );
+  }
+  return { entries, warnings };
 }
 
 async function collectOamRuntimeStatus(opts: {
@@ -2742,11 +2886,21 @@ async function collectOamRuntimeStatus(opts: {
     platformMismatch:
       installedFor !== null && (installedFor.platform !== hostPlatform || installedFor.arch !== process.arch),
   };
+  const git = await collectGitSources({
+    servers: bundles?.config?.servers ?? [],
+    home: opts.home,
+    platform: hostPlatform,
+    project:
+      bundles?.path != null &&
+      normalizeForCompare(resolve(bundles.path)) !==
+        normalizeForCompare(resolve(localBundlesPath(userConfigDir(opts.home)))),
+  });
   return {
     probe,
     dflt,
     servers,
     managed,
+    git,
     refreshSkips,
     refreshDisabled,
     // The loader-throw warning rides in the same list a malformed file's
@@ -2767,6 +2921,8 @@ function renderOamRuntimeSection(opts: {
    *  own --os override, so a report generated for another machine names that
    *  machine's installer. */
   os: InstallOS;
+  /** Clock for the git sources "as of ... ago" age. */
+  now: () => number;
 }): void {
   const { status, print } = opts;
   const { probe, dflt, servers } = status;
@@ -2956,7 +3112,44 @@ function renderOamRuntimeSection(opts: {
       }
     }
   }
+  renderGitSources(status.git.entries, print, opts.now());
   print("");
+}
+
+function gitRemoteText(remote: GitSourceDoctorEntry["remote"], now: number): string {
+  if (remote === null) return "not checked";
+  const age = `${formatRelativeAge(now - Date.parse(remote.checkedAt))} ago`;
+  if (remote.kind === "tag") {
+    const tags = remote.newerTags.slice(0, 3).map(printable).join(", ");
+    const more = remote.newerTags.length > 3 ? ", ..." : "";
+    return tags !== "" ? `newer tags ${tags}${more} as of ${age}` : `no newer tag as of ${age}`;
+  }
+  if (remote.kind === "sha") return `pinned, checked ${age}`;
+  if (remote.commit === null) return `not on the remote as of ${age}`;
+  return remote.behind ? `behind ${remote.commit.slice(0, 7)} as of ${age}` : `up to date as of ${age}`;
+}
+
+const GIT_BUILD_TEXT: Record<GitSourceDoctorEntry["build"], string> = {
+  ok: "built ok",
+  missing: "not built",
+  failed: "build failed",
+  mismatch: "built for another machine",
+  "no-commit": "no commit pinned",
+};
+
+/** `acme_tools  9f3c2a1 (main; behind 4b77e0d as of 2h ago)  built ok  node 22.11 win32-arm64` */
+function renderGitSources(entries: GitSourceDoctorEntry[], print: (s?: string) => void, now: number): void {
+  if (entries.length === 0) return;
+  print("  git sources:");
+  const widest = entries.reduce((m, e) => Math.max(m, e.namespace.length), 0);
+  for (const e of entries) {
+    const ref = printable(e.ref ?? "HEAD");
+    const pin = e.commit !== null ? `${e.commit.slice(0, 7)} (${ref}; ${gitRemoteText(e.remote, now)})` : `(${ref})`;
+    const build = e.build === "failed" && e.failedStep ? `build failed at ${e.failedStep}` : GIT_BUILD_TEXT[e.build];
+    const node = e.builtFor?.node.replace(/^v/, "").split(".").slice(0, 2).join(".");
+    const host = e.builtFor ? `  node ${node} ${e.builtFor.platform}-${e.builtFor.arch}` : "";
+    print(`    ${e.namespace.padEnd(widest)}  ${pin}  ${build}${host}`);
+  }
 }
 
 // PROJECT GUIDE section — printed ONLY when a project-scoped YAW-MCP.md is

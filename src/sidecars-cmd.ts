@@ -52,6 +52,7 @@ import { dirname, join } from "node:path";
 import { atomicWriteFile } from "./atomic-write.js";
 import { acquireUpgradeLock } from "./auto-upgrade.js";
 import { describeDefaultRuntime, describeServerRuntime } from "./default-runtime.js";
+import { buildPinnedGitEntries, type GitBuildContext, type GitEntryReport } from "./git-source.js";
 import { stripInternalSecretsFromEnv } from "./internal-secret-env.js";
 import { type LoadLocalBundlesResult, loadLocalBundles, localBundlesPath } from "./local-bundles.js";
 import { createStreamWriter } from "./logger.js";
@@ -65,6 +66,7 @@ import {
   specConstraint,
 } from "./oam-spawn.js";
 import { sidecarsNodeModules, sidecarsRoot, userConfigDir } from "./paths.js";
+import { askYesNo, type YesNoOptions } from "./readline-question.js";
 import type { UpstreamServerConfig } from "./types.js";
 
 // paths.ts owns these; they are re-exported for the callers that think of them
@@ -377,6 +379,19 @@ export interface SidecarsInstallOptions {
    *  when it calls this command, so it hands over a no-op rather than contend
    *  with itself (see backgroundInstallOptions there). */
   acquireLock?: (dir: string) => (() => void) | null;
+  /** Build the git entries whose pinned commit has no build. Off for the
+   *  background refresh: nothing is ever cloned or built from `serve`. */
+  buildGit?: boolean;
+  /** `--yes`: the consent to run a git repo's lifecycle scripts, which is
+   *  asked once per repo. Required off a TTY for a repo with no stored grant. */
+  yes?: boolean;
+  env?: NodeJS.ProcessEnv;
+  /** Test hooks for the git consent prompt, as `add` has them. */
+  isTTY?: boolean;
+  promptAnswer?: string;
+  io?: YesNoOptions["io"];
+  /** Injected in tests: the package-manager runner for git builds. */
+  runPm?: GitBuildContext["runPm"];
 }
 
 export interface SidecarsInstallResult {
@@ -422,6 +437,9 @@ interface SidecarsJson {
    *  the same thing to a consumer -- that server keeps resolving through npx --
    *  so they share one field; the human notes name which is which. */
   skipped: Array<{ namespace: string; spec: string }>;
+  /** Every git entry in the config, built or not: `ready` had a build
+   *  already, `built` was built by this run, `refused` has no pinned commit. */
+  git: GitEntryReport[];
 }
 
 /**
@@ -445,6 +463,7 @@ function jsonDocument(root: string, over: Partial<SidecarsJson> = {}): string {
     unhosted: [],
     conflicts: [],
     skipped: [],
+    git: [],
     ...over,
   };
   return `${JSON.stringify(doc, null, 2)}\n`;
@@ -505,6 +524,16 @@ export interface RunNpmOptions {
    *  so a Ctrl-C that kills the CLI no longer reaches npm and the install
    *  keeps running, half-owned, after the user thought they stopped it. */
   windowsHide?: boolean;
+  /** The package manager to run instead of npm, for a git-sourced build
+   *  (git-source.ts): an absolute path found on PATH outside the clone, or
+   *  derived from process.execPath, quoted on Windows -- never a bare name
+   *  (cmd.exe would search the clone, the cwd, first) and never a string a
+   *  repo or a user chose. */
+  bin?: string;
+  /** Laid over the stripped env; an undefined value removes the key. */
+  env?: Record<string, string | undefined>;
+  /** Capture the child's stdout and stderr here instead of passing them on. */
+  output?: (chunk: string) => void;
 }
 
 /** Spawn npm so the user sees progress on a long install.
@@ -523,11 +552,14 @@ export function defaultRunNpm(args: string[], cwd: string, opts: RunNpmOptions =
     // only because every argument is a fixed literal: `cwd` travels as a spawn
     // option rather than in the command line, so no user-controlled path is
     // ever parsed by cmd. Do not interpolate a package name into these args.
+    // The one exception is git-source's `pnpm --filter <name>...`, whose name
+    // must first pass PNPM_FILTER_NAME_RE there: no cmd.exe metacharacter can.
     const platform = opts.platform ?? process.platform;
     const isWindows = platform === "win32";
     let child: ReturnType<typeof spawn>;
+    const overlay = opts.env ?? {};
     try {
-      child = spawn(npmBin(platform), args, {
+      child = spawn(opts.bin ?? npmBin(platform), args, {
         cwd,
         // npm's own progress ("added 220 packages in 12s") goes to its STDOUT,
         // and inheriting that put it ahead of the JSON document under --json --
@@ -538,7 +570,7 @@ export function defaultRunNpm(args: string[], cwd: string, opts: RunNpmOptions =
         // progress belongs on stderr in both, and a mode-dependent stdio is a
         // second shape to get wrong. Only a caller with nowhere to PUT the
         // progress overrides it (see RunNpmOptions.stdio).
-        stdio: opts.stdio ?? ["ignore", 2, "inherit"],
+        stdio: opts.output ? ["ignore", "pipe", "pipe"] : (opts.stdio ?? ["ignore", 2, "inherit"]),
         shell: isWindows,
         // Always an explicit boolean so BOTH shapes are pinned by the spawn
         // test rather than one of them reading as "unset"; ignored off Windows.
@@ -548,7 +580,7 @@ export function defaultRunNpm(args: string[], cwd: string, opts: RunNpmOptions =
         // sitting in process.env. README promises yaw-mcp strips its own
         // secrets from EVERY child it starts; this was the one npm run that
         // did not (upstream.ts and auto-upgrade.ts already do).
-        env: stripInternalSecretsFromEnv(process.env),
+        env: withEnvOverlay(stripInternalSecretsFromEnv(process.env), overlay),
       });
     } catch {
       // spawn can fail SYNCHRONOUSLY rather than emitting 'error' -- an option
@@ -560,9 +592,29 @@ export function defaultRunNpm(args: string[], cwd: string, opts: RunNpmOptions =
       resolve(-1);
       return;
     }
+    if (opts.output) {
+      const sink = opts.output;
+      child.stdout?.setEncoding("utf8").on("data", sink);
+      child.stderr?.setEncoding("utf8").on("data", sink);
+    }
     child.on("error", () => resolve(-1));
     child.on("close", (code, signal) => resolve(code ?? (signal ? -1 : 0)));
   });
+}
+
+function withEnvOverlay(env: NodeJS.ProcessEnv, overlay: Record<string, string | undefined>): NodeJS.ProcessEnv {
+  const out = { ...env };
+  for (const [k, v] of Object.entries(overlay)) {
+    // Windows env names are case-insensitive, so a removal has to catch every
+    // spelling the parent carried, or the child still sees the key.
+    for (const existing of Object.keys(out)) {
+      if (existing === k || (process.platform === "win32" && existing.toUpperCase() === k.toUpperCase())) {
+        delete out[existing];
+      }
+    }
+    if (v !== undefined) out[k] = v;
+  }
+  return out;
 }
 
 /** Name of the lockfile that serializes every writer of the managed tree --
@@ -611,15 +663,15 @@ export const SIDECAR_LOCK_HEARTBEAT_MS = 60 * 1000;
  *  lock whose owner really is gone gets stolen. The timer is unref'd (it must
  *  never hold the process open) and cleared by the release callback, and a
  *  failed touch stops the heartbeat rather than logging once a minute. */
-export function acquireSidecarsLock(dir: string): (() => void) | null {
-  const release = acquireUpgradeLock(dir, SIDECARS_LOCK_NAME);
+export function acquireSidecarsLock(dir: string, lockName: string = SIDECARS_LOCK_NAME): (() => void) | null {
+  const release = acquireUpgradeLock(dir, lockName);
   // Null is "someone else holds it": nothing was taken, so there is nothing to
   // keep warm. (acquireUpgradeLock's other degraded answer -- a no-op release
   // for a directory it could not write -- is indistinguishable from a real
   // take here, and needs no special case: the first touch fails ENOENT and
   // switches the heartbeat off.)
   if (release === null) return null;
-  const lockPath = join(dir, SIDECARS_LOCK_NAME);
+  const lockPath = join(dir, lockName);
   // What acquireUpgradeLock wrote into the file it took: its ownership-checked
   // release reads this back before unlinking, and the heartbeat has to apply
   // the same test. The PATH is not the lock -- the inode is. If this lock is
@@ -653,7 +705,7 @@ export function acquireSidecarsLock(dir: string): (() => void) | null {
   };
 }
 
-export const SIDECARS_USAGE = `Usage: yaw-mcp sidecars install [--json]
+export const SIDECARS_USAGE = `Usage: yaw-mcp sidecars install [--yes] [--json]
 
   Install the MCP servers from your bundles.json into ~/.yaw-mcp/sidecars,
   so they run from one known version instead of whatever npm's npx cache
@@ -667,16 +719,27 @@ export const SIDECARS_USAGE = `Usage: yaw-mcp sidecars install [--json]
   Only npx-launched servers naming a registry package are installed. docker,
   uvx, and native commands are left alone, as are node launches that already
   name a file and npx launches pointing at a git or path target or pinning
-  a version range.`;
+  a version range.
+
+  Git servers (yaw-mcp add --git) are built at the commit bundles.json pins
+  when this machine has no build of it yet. The pin never moves here; that
+  is yaw-mcp update. An entry with no pinned commit is refused.
+
+  --yes, -y  Allow a git repo's install and build scripts to run. Asked once
+             per repo; when stdin or stdout is not a TTY, required until the
+             repo is allowed here.`;
 
 export function parseSidecarsArgs(
   argv: string[],
-): { ok: true; options: { json: boolean } } | { ok: false; error: string; help?: boolean } {
+): { ok: true; options: { json: boolean; yes: boolean } } | { ok: false; error: string; help?: boolean } {
   let json = false;
+  let yes = false;
   let sawInstall = false;
   for (const a of argv) {
     if (a === "--json") {
       json = true;
+    } else if (a === "--yes" || a === "-y") {
+      yes = true;
     } else if (a === "--help" || a === "-h") {
       return { ok: false, error: SIDECARS_USAGE, help: true };
     } else if (a === "install") {
@@ -695,7 +758,7 @@ export function parseSidecarsArgs(
     }
   }
   if (!sawInstall) return { ok: false, error: `yaw-mcp sidecars: expected "install"\n\n${SIDECARS_USAGE}` };
-  return { ok: true, options: { json } };
+  return { ok: true, options: { json, yes } };
 }
 
 /**
@@ -759,6 +822,46 @@ async function unhostedReasons(
   return [...new Set(verdicts.map((v) => v.reason))];
 }
 
+/** Both ends a TTY, and never under --json, whose stdout is the document. */
+function gitInteractive(opts: SidecarsInstallOptions): boolean {
+  if (opts.json) return false;
+  if (opts.isTTY !== undefined) return opts.isTTY;
+  if (opts.promptAnswer !== undefined) return true;
+  return Boolean(process.stdin.isTTY) && Boolean(process.stdout.isTTY);
+}
+
+/** The git half of the install: the same builder `trust` offers after a grant.
+ *  A project file gets the shared-file wording for an entry with no commit. */
+function buildGitEntriesFor(
+  servers: Array<Partial<UpstreamServerConfig>>,
+  bundlesPath: string | null,
+  opts: SidecarsInstallOptions,
+  home: string,
+  print: (s?: string) => void,
+  printErr: (s: string) => void,
+): Promise<GitEntryReport[]> {
+  return buildPinnedGitEntries(
+    servers,
+    {
+      home,
+      env: opts.env ?? process.env,
+      interactive: gitInteractive(opts),
+      yes: opts.yes === true,
+      platform: opts.platform,
+      progress: (l) => print(l),
+      warn: (w) => printErr(`warning: ${w}`),
+      confirm: async (lines) => {
+        for (const l of lines) print(l);
+        const answer = await askYesNo(opts, "Proceed? [Y/n] ");
+        return answer === "" || answer === "y" || answer === "yes";
+      },
+      runPm: opts.runPm,
+    },
+    bundlesPath !== null && bundlesPath !== localBundlesPath(userConfigDir(home)),
+    bundlesPath ?? undefined,
+  );
+}
+
 export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Promise<SidecarsInstallResult> {
   const home = opts.home ?? homedir();
   const write = opts.out ?? createStreamWriter(process.stdout);
@@ -811,6 +914,41 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
     }
   };
 
+  // Before the npm step and on every path after it: a config whose only
+  // servers are git entries still has work here, and each report rides in the
+  // --json document whatever the npm half does.
+  const git =
+    opts.buildGit === false ? [] : await buildGitEntriesFor(servers, bundles.path, opts, home, print, printErr);
+  const gitBad = git.filter((g) => g.status === "failed" || g.status === "refused").length;
+  const gitUnconsented = git.filter((g) => g.status === "needs-consent").length;
+  // Both counts, when a run has both: the consent one names its own remedy.
+  const gitProblems = [
+    ...(gitBad > 0 ? [`${gitBad} git source(s) did not build`] : []),
+    ...(gitUnconsented > 0
+      ? [`${gitUnconsented} git source(s) were not built: their repo's scripts need consent (re-run with --yes)`]
+      : []),
+  ];
+  const gitError = gitProblems.length > 0 ? gitProblems.join("; ") : null;
+  if (git.length > 0) {
+    print("Git sources:");
+    for (const g of git) {
+      print(`  ${g.namespace}  ${g.commit ? g.commit.slice(0, 12) : "(no commit)"}  ${g.status}`);
+      if (g.error) for (const l of g.error.split("\n")) print(`    ${l}`);
+    }
+    print();
+  }
+  const doc = (over: Partial<SidecarsJson>): string =>
+    jsonDocument(root, {
+      git,
+      ...over,
+      error: over.error ?? gitError,
+    });
+  const done = (exitCode: number, installed: SidecarsInstallResult["installed"] = []): SidecarsInstallResult => ({
+    exitCode: exitCode === 0 && gitBad + gitUnconsented > 0 ? 1 : exitCode,
+    installed,
+    lines,
+  });
+
   if (specs.length === 0) {
     // Four different empty states, and telling a first-time user with no config
     // at all that their bundles.json has no npx servers describes a file that
@@ -831,15 +969,15 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
         bundles.warnings.length > 0 ? bundles.warnings.join("; ") : `${bundles.path}: could not be read or parsed`;
       print(`Could not read ${bundles.path} -- nothing to install.`);
       print("Fix the file (the warning above says what is wrong), then run this again.");
-      if (opts.json) write(jsonDocument(root, { reason: "unreadable-config", error: detail }));
-      return { exitCode: 1, installed: [], lines };
+      if (opts.json) write(doc({ reason: "unreadable-config", error: detail }));
+      return done(1);
     }
     if (bundles.config === null) {
       print("No servers configured yet -- nothing to install.");
       print("Add one with `yaw-mcp add <slug>`, then run this again.");
       printSkipped();
-      if (opts.json) write(jsonDocument(root, { reason: "no-config", skipped }));
-      return { exitCode: 0, installed: [], lines };
+      if (opts.json) write(doc({ reason: "no-config", skipped }));
+      return done(0);
     }
     if (skipped.length > 0) {
       // Every npx server was passed over. Saying "no npx-launched servers" here
@@ -856,18 +994,22 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
       printSkipped();
       if (opts.json) {
         write(
-          jsonDocument(root, {
+          doc({
             reason: ranges.length === 0 ? "only-non-registry-specs" : "only-skipped-specs",
             skipped,
           }),
         );
       }
-      return { exitCode: 0, installed: [], lines };
+      return done(0);
     }
-    print("No npx-launched servers in bundles.json -- nothing to install.");
-    print("docker, uvx, and native commands run as configured; only npx servers are installed here.");
-    if (opts.json) write(jsonDocument(root, { reason: "no-npx-servers", skipped }));
-    return { exitCode: 0, installed: [], lines };
+    if (git.length > 0) {
+      print("No npx-launched servers in bundles.json.");
+    } else {
+      print("No npx-launched servers in bundles.json -- nothing to install.");
+      print("docker, uvx, and native commands run as configured; only npx servers are installed here.");
+    }
+    if (opts.json) write(doc({ reason: "no-npx-servers", skipped }));
+    return done(0);
   }
 
   // Guarded: on EACCES/EROFS/ENOSPC these used to reject out of the command,
@@ -877,8 +1019,8 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
   const couldNotPrepare = (err: unknown): SidecarsInstallResult => {
     const msg = err instanceof Error ? err.message : String(err);
     print(`Could not prepare ${root}: ${msg}. Servers keep resolving from the npx cache.`);
-    if (opts.json) write(jsonDocument(root, { error: `manifest write failed: ${msg}`, conflicts, skipped }));
-    return { exitCode: 1, installed: [], lines };
+    if (opts.json) write(doc({ error: `manifest write failed: ${msg}`, conflicts, skipped }));
+    return done(1);
   };
   try {
     mkdirSync(root, { recursive: true });
@@ -909,7 +1051,7 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
     );
     if (opts.json) {
       write(
-        jsonDocument(root, {
+        doc({
           reason: "locked",
           error: "another yaw-mcp process is refreshing the managed tree",
           conflicts,
@@ -917,7 +1059,7 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
         }),
       );
     }
-    return { exitCode: 1, installed: [], lines };
+    return done(1);
   }
   // Released on EVERY path out of the install below -- a failed manifest
   // write, a failed npm, an exception -- via the one `finally`; a lock left
@@ -967,8 +1109,8 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
     const code = await runNpm(["install", "--no-audit", "--no-fund"], root);
     if (code !== 0) {
       print(`npm install failed (exit ${code}). Servers keep resolving from the npx cache.`);
-      if (opts.json) write(jsonDocument(root, { error: `npm exited ${code}`, conflicts, skipped }));
-      return { exitCode: 1, installed: [], lines };
+      if (opts.json) write(doc({ error: `npm exited ${code}`, conflicts, skipped }));
+      return done(1);
     }
 
     // Record which platform/arch just filled the tree (see installedPlatform
@@ -1054,9 +1196,9 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
     const error = nothingLanded ? "npm exited 0 but no requested package resolved in the managed tree" : null;
 
     if (opts.json) {
-      write(jsonDocument(root, { installed, conflicts, skipped, error, updateError, unhosted, markerError }));
+      write(doc({ installed, conflicts, skipped, error, updateError, unhosted, markerError }));
     }
-    return { exitCode: nothingLanded ? 1 : 0, installed, lines };
+    return done(nothingLanded ? 1 : 0, installed);
   } finally {
     release();
   }

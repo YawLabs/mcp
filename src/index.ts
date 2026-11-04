@@ -19,12 +19,14 @@ import { parseSearchArgs, runSearch } from "./search-cmd.js";
 import { parseSecretsArgs, runSecrets } from "./secrets-cmd.js";
 import { decideServeMode } from "./serve-gate.js";
 import { ConnectServer } from "./server.js";
+import { parseShareArgs, runShare } from "./share-cmd.js";
 import { registerShutdownTriggers } from "./shutdown-triggers.js";
 import { parseSidecarsArgs, runSidecarsInstall } from "./sidecars-cmd.js";
 import { parseStatusArgs, runStatus } from "./status-cmd.js";
 import { retiredSubcommandReplacement, suggestFlag, suggestSubcommand } from "./subcommands.js";
 import { parseTrustArgs, runTrust } from "./trust-cmd.js";
 import { parseTryArgs, parseTryCleanupArgs, runTry, runTryCleanup } from "./try-cmd.js";
+import { parseUpdateArgs, runUpdate } from "./update-cmd.js";
 import { parseUpgradeArgs, runUpgrade } from "./upgrade-cmd.js";
 
 // The known-subcommand / flag-alias dispatch table and the did-you-mean
@@ -226,6 +228,10 @@ if (subcommand === "compliance") {
   run("completion", parseCompletionArgs(process.argv.slice(3)), runCompletion);
 } else if (subcommand === "upgrade") {
   run("upgrade", parseUpgradeArgs(process.argv.slice(3)), runUpgrade);
+} else if (subcommand === "update") {
+  run("update", parseUpdateArgs(process.argv.slice(3)), runUpdate);
+} else if (subcommand === "share") {
+  run("share", parseShareArgs(process.argv.slice(3)), runShare);
 } else if (subcommand === "try") {
   run("try", parseTryArgs(process.argv.slice(3)), runTry);
 } else if (subcommand === "try-cleanup") {
@@ -331,6 +337,9 @@ if (subcommand === "compliance") {
     add <slug>               Add an MCP server from the yaw.sh/mcp catalog to
                              your local ~/.yaw-mcp/bundles.json so yaw-mcp loads
                              it. Pass required env with --env KEY=value.
+    add --git <url>[#ref]    Build a TypeScript MCP server from a git repo you
+                             can read (private ones too) and pin its commit.
+                             npm, pnpm and yarn repos; your own git auth.
     import <client>          Adopt the MCP servers a client already has into
                              your bundles.json, so yaw-mcp serves the servers
                              you already had instead of starting empty. The
@@ -401,6 +410,16 @@ if (subcommand === "compliance") {
                              startup; this is the manual form.
     upgrade                  Show (or --run) the command that bumps
                              @yawlabs/mcp to the latest version.
+    update [<name>]          Move git servers (add --git) to the commit their
+                             branch points at now, building it beside the
+                             current one; a failed build changes nothing.
+                             --check only asks the remote. --to <sha> goes
+                             back to a kept build. Not yaw-mcp itself: that
+                             is \`upgrade\`.
+    share <name>             Print the one-line add --git command coworkers
+                             paste to install a git server you run, and the
+                             secrets they will be asked for. Never prints env
+                             values or local paths. --pin for the exact commit.
     sidecars install         Install your servers into ~/.yaw-mcp/sidecars so
                              they run from one known version. Worth doing when
                              servers run on oam: it runs the copy already on

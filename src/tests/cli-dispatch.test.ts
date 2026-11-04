@@ -127,7 +127,7 @@ describe("CLI dispatch -- help goes to stdout and exits 0", () => {
   it("prints a subcommand usage on the shared parse tail", () => {
     const r = runCli(["sidecars", "--help"]);
     expect(r.code).toBe(0);
-    expect(r.stdout).toContain("Usage: yaw-mcp sidecars install [--json]");
+    expect(r.stdout).toContain("Usage: yaw-mcp sidecars install [--yes] [--json]");
     expect(r.stderr, "usage went to stderr").toBe("");
   });
 

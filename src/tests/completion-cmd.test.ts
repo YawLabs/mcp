@@ -32,11 +32,13 @@ import { parseSetArgs, parseToggleArgs } from "../local-set-cmd.js";
 import { parseResetLearningArgs } from "../reset-learning-cmd.js";
 import { parseSearchArgs } from "../search-cmd.js";
 import { parseSecretsArgs } from "../secrets-cmd.js";
+import { parseShareArgs } from "../share-cmd.js";
 import { parseSidecarsArgs } from "../sidecars-cmd.js";
 import { parseStatusArgs } from "../status-cmd.js";
 import { FLAG_ALIASES, KNOWN_SUBCOMMANDS } from "../subcommands.js";
 import { parseTrustArgs } from "../trust-cmd.js";
 import { parseTryArgs, parseTryCleanupArgs } from "../try-cmd.js";
+import { parseUpdateArgs } from "../update-cmd.js";
 import { parseUpgradeArgs } from "../upgrade-cmd.js";
 
 const SUBCOMMAND_NAMES = SUBCOMMAND_SPEC.map((s) => s.name);
@@ -500,6 +502,8 @@ const FLAG_PARSERS: Record<string, (argv: string[]) => ProbeResult> = {
   heal: parseHealArgs,
   bundles: parseBundlesArgs,
   upgrade: parseUpgradeArgs,
+  update: parseUpdateArgs,
+  share: parseShareArgs,
   completion: parseCompletionArgs,
   secrets: parseSecretsArgs,
   audit: parseAuditArgs,
@@ -538,10 +542,12 @@ const PARSER_SOURCES = [
   "reset-learning-cmd.ts",
   "search-cmd.ts",
   "secrets-cmd.ts",
+  "share-cmd.ts",
   "sidecars-cmd.ts",
   "status-cmd.ts",
   "trust-cmd.ts",
   "try-cmd.ts",
+  "update-cmd.ts",
   "upgrade-cmd.ts",
 ];
 

@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/YawLabs/mcp/main/schemas/yaw-mcp.manifest.v1.json",
+  "title": "Yaw MCP server manifest (yaw-mcp.json)",
+  "description": "Optional file in an MCP server's git repository that tells `yaw-mcp add --git <url>` how to add it: its namespace, description, entry file, package subdirectory and the env vars it reads. Read from the repo root and, when a subdir is in effect, from <subdir>/yaw-mcp.json, whose fields override the root's key by key. Flags given to `yaw-mcp add` beat the manifest; the manifest beats what yaw-mcp infers from package.json. It can never change what runs: the launch is always `node <entry>` and the build always `<package manager> run build`, so keys like command, args or scripts are refused with a warning. Unknown keys are ignored with a warning. The file is strictly optional -- everything here has an `add` flag -- and a repo may keep it out of a public mirror. JSONC (comments) is permitted.",
+  "type": "object",
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Optional pointer to this JSON Schema, for editor autocomplete."
+    },
+    "version": {
+      "const": 1,
+      "description": "Manifest schema version. Current version: 1. A newer value is read for the fields this yaw-mcp knows, with a warning."
+    },
+    "namespace": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{0,29}$",
+      "description": "The namespace the server's tools are prefixed with. Makes the name argument to `yaw-mcp add` optional."
+    },
+    "description": {
+      "type": "string",
+      "minLength": 1,
+      "description": "What the server is for. Dispatch ranks servers on it."
+    },
+    "entry": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The built entry file, relative to the package directory (e.g. dist/index.js). Default: package.json \"bin\", then \"main\". No absolute paths, drive letters or \"..\"."
+    },
+    "subdir": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The package's directory inside the repo (e.g. packages/server). Root manifest only. No absolute paths, drive letters or \"..\"."
+    },
+    "env": {
+      "type": "object",
+      "description": "Env vars the server reads, keyed by name. Declarations only: a secret is written to bundles.json as a ${secret:NAME} reference, never as a value.",
+      "propertyNames": { "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "secret": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9_.-]+$",
+            "description": "The vault secret name this var is bound to. `yaw-mcp add` offers to store it when the vault lacks it."
+          },
+          "required": {
+            "type": "boolean",
+            "description": "The server needs this var to run."
+          },
+          "help": {
+            "type": "string",
+            "description": "Where to get the value (shown next to the secret name)."
+          },
+          "default": {
+            "type": "string",
+            "description": "A non-secret value written as-is. Ignored next to `secret`."
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  }
+}

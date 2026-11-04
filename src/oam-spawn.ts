@@ -2043,13 +2043,13 @@ export function ownNodeModules(fromUrl: string = import.meta.url): string[] {
  * parses per candidate, across every npx cache directory (well over a hundred
  * on a machine that has used npx for a while) on the connect path.
  */
-interface PackageHit {
+export interface PackageHit {
   entry: string;
   /** null when the package declares no usable `version` string. */
   version: string | null;
 }
 
-function packageEntry(pkgDir: string, pkg: string): PackageHit | null {
+export function packageEntry(pkgDir: string, pkg: string): PackageHit | null {
   const pjPath = join(pkgDir, "package.json");
   if (!existsSync(pjPath)) return null;
   // Parsed as `unknown` and narrowed by hand, because the SHAPE is as

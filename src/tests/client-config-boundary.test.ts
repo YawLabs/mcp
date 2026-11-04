@@ -105,6 +105,9 @@ const RULES: Rule[] = [
       "src/local-add-cmd.ts": "bundles.json, yaw-mcp's own server list",
       "src/local-bundles.ts": "bundles.json",
       "src/local-set-cmd.ts": "bundles.json, edited through editJsoncPath by design",
+      "src/git-source.ts":
+        "ONE parse, in readManifestFile, of a cloned repo's own yaw-mcp.json manifest (JSON with comments) -- " +
+        "a server description the repo ships, not a client config or a server list",
       "src/doctor-cmd.ts": NOT_YET_MIGRATED,
       "src/import-cmd.ts":
         "ONE parse, in readVsCodeInputs, for VS Code's document-level `inputs` ARRAY -- variable " +
