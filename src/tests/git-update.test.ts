@@ -2,11 +2,23 @@
 // a package-manager stand-in that performs the fixture's build, and an
 // injected start check, so each case is a few git calls.
 
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import {
+  chmodSync,
+  closeSync,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   buildGitSource,
+  GIT_LOCK_NAME,
   gitRefsPath,
   gitStatePath,
   newerTags,
@@ -14,16 +26,28 @@ import {
   readBuildMarker,
   readGitState,
   recordGitPin,
+  recordLoadedGitPin,
   recordRepoConsent,
+  writeGitState,
 } from "../git-source.js";
 import { parseJsonc } from "../jsonc.js";
 import { localBundlesPath } from "../local-bundles.js";
 import { CONFIG_DIRNAME, gitBuildDir, gitBuiltPath, gitRoot, userConfigDir } from "../paths.js";
 import { runShare } from "../share-cmd.js";
-import type { RunNpmOptions } from "../sidecars-cmd.js";
+import { acquireSidecarsLock, type RunNpmOptions } from "../sidecars-cmd.js";
 import { grantTrust, readTrustStore, trustStatusFor } from "../trust.js";
 import { parseUpdateArgs, runUpdate, type UpdateCommandOptions } from "../update-cmd.js";
-import { ENV, git, makeRepo, NPM_FILES, newTmp, packageJson, type Repo, SERVER_JS } from "./git-fixture.js";
+import {
+  ENV,
+  fakeFinishedBuild,
+  git,
+  makeRepo,
+  NPM_FILES,
+  newTmp,
+  packageJson,
+  type Repo,
+  SERVER_JS,
+} from "./git-fixture.js";
 
 function fakePm(calls: string[][], failBuild = false) {
   return async (args: string[], cwd: string, opts: RunNpmOptions): Promise<number> => {
@@ -826,5 +850,253 @@ describe("update --git-token-secret", () => {
     });
     expect(ssh.exitCode, err.join("")).toBe(0);
     expect((pinned(userFile(), "viassh") as { tokenSecret?: string }).tokenSecret).toBeUndefined();
+  }, 240_000);
+});
+
+// --- rollback guards, host rebuild, state and lock edges ---------------------
+
+/** Make `dir` undeletable until the returned release runs: Windows holds a
+ *  file inside it open without sharing (EBUSY); elsewhere the directory goes
+ *  read-only. Copied from git-sources-lifecycle.test.ts. */
+async function holdUndeletable(dir: string): Promise<() => Promise<void>> {
+  const held = join(dir, "held.bin");
+  writeFileSync(held, "x");
+  if (process.platform !== "win32") {
+    chmodSync(dir, 0o555);
+    return async () => chmodSync(dir, 0o755);
+  }
+  const child = spawn(
+    "powershell",
+    ["-NoProfile", "-Command", '$h=[IO.File]::Open($env:HELD,"Open","Read","None"); Start-Sleep 60'],
+    { env: { ...process.env, HELD: held }, stdio: "ignore" },
+  );
+  const deadline = Date.now() + 20_000;
+  for (;;) {
+    try {
+      closeSync(openSync(held, "r+"));
+    } catch {
+      break;
+    }
+    if (Date.now() > deadline) throw new Error("could not lock the file");
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  return async () => {
+    child.kill();
+    await new Promise((r) => setTimeout(r, 500));
+  };
+}
+
+describe("rollback guards, host rebuild, state and lock edges", () => {
+  const OTHER = "fedcba9876543210fedcba9876543210fedcba98";
+  const COMMIT_LOCK = "0123456789abcdef0123456789abcdef01234567";
+
+  it("refuses a --to prefix that matches more than one kept build", async () => {
+    // The guard against rolling back to the WRONG code: a prefix short enough
+    // to be ambiguous must stop before anything is discarded or rebuilt.
+    const repo = makeRepo(NPM_FILES);
+    const first = git(repo.work, ["rev-parse", "HEAD"]);
+    // Shares first's 7-char prefix (so the --to prefix is ambiguous) but
+    // differs INSIDE the sha12, or both builds land in one directory and the
+    // second marker silently overwrites the first. Index 7 is the first
+    // character inside the sha12, so flipping exactly that one guarantees the
+    // two directories differ however the SHA hashes out.
+    const flip = (c: string): string => (c === "a" ? "b" : "a");
+    const crafted = `${first.slice(0, 7)}${flip(first[7] as string)}${first.slice(8)}`;
+    expect(crafted).toHaveLength(40);
+    expect(crafted.startsWith(first.slice(0, 7))).toBe(true);
+    expect(gitBuildDir("fx", crafted, home)).not.toBe(gitBuildDir("fx", first, home));
+    await buildAt(repo, first);
+    await recordRepoConsent(repo.url, home);
+    writeUser(bundlesText(repo.url, first));
+    fakeFinishedBuild(gitBuildDir("fx", crafted, home), crafted);
+    const shares = [first, crafted].filter((c) => c.startsWith(first.slice(0, 7)));
+    expect(shares).toHaveLength(2); // the test is only meaningful if BOTH share 7 chars
+
+    const r = await update(["fx", "--to", first.slice(0, 7)]);
+    expect(r.exitCode).toBe(1);
+    expect(err.join("")).toContain("matches more than one kept build");
+    expect(pinned().commit).toBe(first);
+  });
+
+  it("refuses a --to build made from another repository", async () => {
+    const repo = makeRepo(NPM_FILES);
+    const first = git(repo.work, ["rev-parse", "HEAD"]);
+    await buildAt(repo, first);
+    await recordRepoConsent(repo.url, home);
+    writeUser(bundlesText(repo.url, first));
+    // A kept build whose marker was made from a different URL entirely.
+    fakeFinishedBuild(gitBuildDir("fx", OTHER, home), OTHER, {
+      marker: { url: "https://github.com/acme/other.git" },
+    });
+
+    const r = await update(["fx", "--to", OTHER.slice(0, 7)]);
+    expect(r.exitCode).toBe(1);
+    expect(err.join("")).toContain("was made from another repository");
+    expect(pinned().commit).toBe(first);
+  });
+
+  it("discards and rebuilds a --to build made for another host", async () => {
+    // buildMatchesHost has no other test: a wrongly-permissive match would
+    // hand a native-addon build to the wrong platform silently.
+    const repo = makeRepo(NPM_FILES);
+    const first = git(repo.work, ["rev-parse", "HEAD"]);
+    await buildAt(repo, first);
+    await recordRepoConsent(repo.url, home);
+    writeUser(bundlesText(repo.url, first));
+    // A REAL second commit, built for real: the rebuild path re-clones the
+    // repo, so a fabricated SHA would fail checkout, not reach the host check.
+    const foreign = repo.commit({ "README.md": "foreign\n" });
+    await buildAt(repo, foreign);
+    expect(first.startsWith(foreign.slice(0, 7)), "--to must hit exactly one build").toBe(false);
+    // Pin is already this commit -- a config restored from another machine --
+    // and its build carries that machine's platform, which is exactly what
+    // buildMatchesHost keys on. `moved` is then false, so the run must print
+    // the "rebuilt for this machine" branch (update-cmd's only rebuilt line).
+    writeUser(bundlesText(repo.url, foreign));
+    const markerPath = gitBuiltPath("fx", foreign, home);
+    const stamped = JSON.parse(readFileSync(markerPath, "utf8")) as Record<string, unknown>;
+    stamped.platform = process.platform === "win32" ? "linux" : "win32";
+    writeFileSync(markerPath, JSON.stringify(stamped));
+    expect(readBuildMarker(gitBuildDir("fx", foreign, home), foreign), "stamp must not hide the marker").not.toBeNull();
+
+    out = [];
+    const r = await update(["fx", "--to", foreign.slice(0, 7)]);
+    expect(r.exitCode, err.join()).toBe(0);
+    expect(out.join("")).toContain("rebuilt for this machine");
+    expect(pinned().commit).toBe(foreign);
+    // Rebuilt, so the marker is this host's again.
+    expect(readBuildMarker(gitBuildDir("fx", foreign, home), foreign)?.platform).toBe(process.platform);
+  });
+
+  it("a --to rebuild that fails leaves the pin and reports the failure", async () => {
+    // The one destructive-then-failing ordering: discardBuild deletes the kept
+    // build BEFORE the rebuild, so a failing rebuild must at least keep the
+    // pin and say what went wrong instead of reporting a rollback.
+    const repo = makeRepo(NPM_FILES);
+    const first = git(repo.work, ["rev-parse", "HEAD"]);
+    await buildAt(repo, first);
+    await recordRepoConsent(repo.url, home);
+    writeUser(bundlesText(repo.url, first));
+    const foreign = `${first.slice(0, 39)}f`;
+    fakeFinishedBuild(gitBuildDir("fx", foreign, home), foreign, {
+      marker: { url: repo.url, platform: process.platform === "win32" ? "linux" : "win32" },
+    });
+
+    out = [];
+    err = [];
+    const r = await update(["fx", "--to", foreign.slice(0, 7)], { runPm: fakePm(calls, true) });
+    expect(r.exitCode).toBe(1);
+    expect(err.join("")).toContain("fx:");
+    expect(pinned().commit).toBe(first);
+    expect(out.join("")).not.toContain("Rolled back");
+    // discardBuild already ran: the foreign build is gone.
+    expect(existsSync(gitBuiltPath("fx", foreign, home))).toBe(false);
+  });
+
+  it("update --json on a failing entry reports ok false, status failed and the error", async () => {
+    const repo = makeRepo(NPM_FILES);
+    const first = git(repo.work, ["rev-parse", "HEAD"]);
+    await buildAt(repo, first);
+    await recordRepoConsent(repo.url, home);
+    writeUser(bundlesText(repo.url, first));
+    const second = repo.commit({ "README.md": "2\n" });
+    expect((await update(["fx"])).exitCode, err.join("")).toBe(0);
+    expect(pinned().commit).toBe(second);
+
+    // The next build's package manager fails; the doc must let a script tell
+    // "pin did not move and why" from "pin did not move, all fine". A fresh
+    // commit is required: with pin == remote the run reports "current"
+    // without ever building.
+    repo.commit({ "README.md": "3\n" });
+    out = [];
+    err = [];
+    const r = await update(["fx"], { json: true, runPm: fakePm(calls, true) });
+    const doc = JSON.parse(out.join(""));
+    expect(r.exitCode).toBe(1);
+    expect(doc.ok).toBe(false);
+    expect(doc.entries).toHaveLength(1);
+    expect(doc.entries[0].status).toBe("failed");
+    expect(typeof doc.entries[0].error).toBe("string");
+    expect(doc.entries[0].error).toMatch(/exit 2/);
+    expect(pinned().commit).toBe(second);
+  });
+
+  it("malformed state.json reads as empty and writeGitState merges rows without dropping them", async () => {
+    mkdirSync(gitRoot(home), { recursive: true });
+    writeFileSync(gitStatePath(home), "{ not json");
+    expect(readGitState(home)).toEqual({});
+
+    await writeGitState(home, {
+      alpha: {
+        url: "git@h:a/b.git",
+        ref: null,
+        kind: "branch",
+        pinned: null,
+        remote: null,
+        newerTags: [],
+        checkedAt: "2026-01-01T00:00:00.000Z",
+      },
+    });
+    await writeGitState(home, {
+      beta: {
+        url: "https://h/b.git",
+        ref: "main",
+        kind: null,
+        pinned: null,
+        remote: null,
+        newerTags: [],
+        checkedAt: "2026-01-02T00:00:00.000Z",
+      },
+    });
+    const rows = readGitState(home);
+    expect(Object.keys(rows).sort()).toEqual(["alpha", "beta"]);
+    expect(rows.alpha?.url).toBe("git@h:a/b.git");
+    expect(rows.beta?.ref).toBe("main");
+  });
+
+  it("the activation pin record drops instead of blocking when the git lock is held", async () => {
+    // waitMs 0 by design: an activation must never stall behind a build. The
+    // test pins that choice so a future "just wait" edit is a visible change.
+    mkdirSync(gitRoot(home), { recursive: true });
+    fakeFinishedBuild(gitBuildDir("fx", COMMIT_LOCK, home), COMMIT_LOCK);
+    const file = localBundlesPath(userConfigDir(home));
+    mkdirSync(userConfigDir(home), { recursive: true });
+    writeFileSync(file, bundlesText("git@github.com:acme/fx.git", COMMIT_LOCK));
+    const release = acquireSidecarsLock(gitRoot(home), GIT_LOCK_NAME);
+    expect(release).not.toBeNull();
+    try {
+      await recordLoadedGitPin("fx", COMMIT_LOCK, { home, cwd: home, env: ENV });
+      expect(existsSync(gitRefsPath("fx", home))).toBe(false);
+    } finally {
+      release?.();
+    }
+    // Once the lock frees the next activation records it.
+    await recordLoadedGitPin("fx", COMMIT_LOCK, { home, cwd: home, env: ENV });
+    expect(JSON.parse(readFileSync(gitRefsPath("fx", home), "utf8"))).toEqual({ [file]: COMMIT_LOCK });
+  });
+
+  it("update's GC warns a build it could not remove while the others survive", async () => {
+    const repo = makeRepo(NPM_FILES);
+    const first = git(repo.work, ["rev-parse", "HEAD"]);
+    await buildAt(repo, first);
+    await recordRepoConsent(repo.url, home);
+    writeUser(bundlesText(repo.url, first));
+    const second = repo.commit({ "README.md": "2\n" });
+    expect((await update(["fx"])).exitCode, err.join("")).toBe(0);
+    // `first` is now the PREVIOUS build, so the next move's GC targets it;
+    // hold it open so the delete fails half-way through the set.
+    const release = await holdUndeletable(gitBuildDir("fx", first, home));
+    try {
+      err = [];
+      const third = repo.commit({ "README.md": "3\n" });
+      expect((await update(["fx"])).exitCode, err.join("")).toBe(0);
+      expect(err.join("")).toContain("an old build could not be removed");
+      expect(builds()).toContain(first.slice(0, 12));
+      expect(builds()).toContain(second.slice(0, 12));
+      expect(builds()).toContain(third.slice(0, 12));
+      expect(pinned().commit).toBe(third);
+    } finally {
+      await release();
+    }
   }, 240_000);
 });

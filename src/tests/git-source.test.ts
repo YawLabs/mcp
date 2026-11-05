@@ -21,6 +21,7 @@ import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  buildGitSource,
   consentLines,
   detectPackageManager,
   GIT_CREDENTIALS_REFUSAL,
@@ -423,6 +424,79 @@ describe("planBuild and lifecycleScripts", () => {
       expect(PNPM_FILTER_NAME_RE.test(bad), bad).toBe(false);
     }
     expect(PNPM_FILTER_NAME_RE.test("@scope/pkg.name-1_x~")).toBe(true);
+  });
+
+  it("refuses a pnpm workspace subdir whose package name fails PNPM_FILTER_NAME_RE", () => {
+    write("package.json", JSON.stringify({ name: "root", scripts: { prepare: "husky" } }));
+    write("pnpm-workspace.yaml", "packages: ['packages/*']\n");
+    write("packages/bad/package.json", JSON.stringify({ name: "a&b", scripts: { build: "tsc -p ." } }));
+    const plan = detectPackageManager(dir);
+    if ("error" in plan) throw new Error(plan.error);
+    const target = join(dir, "packages", "bad");
+    // The {error} half of planBuild: a build turns this into fail(2, ...) at
+    // git-source.ts's `if (build && "error" in build)` check, before anything
+    // runs -- the happy path above only ever exercises the {args} half.
+    expect(planBuild({ ...plan, pm: "pnpm" }, dir, target)).toEqual({
+      error: 'the package in the subdir has no usable name ("a&b") for pnpm --filter.',
+    });
+    // npm passes no --filter, so the same repo-chosen name is harmless there.
+    expect(planBuild({ ...plan, pm: "npm" }, dir, target)).toEqual({ args: ["run", "build"], cwd: target });
+  });
+});
+
+describe("reuse of a finished build on disk", () => {
+  const COMMIT = "0123456789abcdef0123456789abcdef01234567";
+  let home: string;
+
+  beforeEach(() => {
+    home = realpathSync(mkdtempSync(join(tmpdir(), "yaw-reuse-")));
+  });
+  afterEach(() => rmSync(home, { recursive: true, force: true }));
+
+  const spec = () => {
+    const p = parseGitSpec("https://x.example/acme/y.git");
+    if (!p.ok) throw new Error(p.error);
+    return p.spec;
+  };
+  const ctx = { env: {}, interactive: false, yes: true, progress: () => {}, warn: () => {} } as const;
+  const buildDir = (): string => join(home, ".yaw-mcp", "git", "acme", COMMIT.slice(0, 12));
+
+  // reuse() in buildLocked runs before any git child, so these need no repo:
+  // a fake URL can never be contacted on the path under test.
+  it("refuses a request whose subdir differs from the one the marker records", async () => {
+    fakeFinishedBuild(buildDir(), COMMIT);
+    const r = await buildGitSource(
+      { spec: spec(), commit: COMMIT, namespace: "acme", subdir: "packages/srv" },
+      { home, ...ctx },
+    );
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.exitCode).toBe(1);
+    expect(r.message).toBe(
+      `${COMMIT.slice(0, 7)} is already built for subdir "." under "acme"; add it under another name to build subdir "packages/srv".`,
+    );
+  });
+
+  it("refuses when the entry this request names is not in the finished build", async () => {
+    // The marker stays VALID (its own entry, index.js, is on disk) -- only the
+    // entry the request brings is missing, which is the one refusal that
+    // reaches the entry check: deleting the marker's entry would invalidate
+    // the marker and fall through to a fresh clone instead.
+    fakeFinishedBuild(buildDir(), COMMIT);
+    const r = await buildGitSource(
+      { spec: spec(), commit: COMMIT, namespace: "acme", entry: "dist/index.js" },
+      { home, ...ctx },
+    );
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.exitCode).toBe(1);
+    expect(r.message).toBe(`Built ${COMMIT.slice(0, 7)} has no dist/index.js. Pass --entry <file>.`);
+  });
+
+  it("reuses a build the request does fit, without contacting the remote", async () => {
+    fakeFinishedBuild(buildDir(), COMMIT);
+    const r = await buildGitSource({ spec: spec(), commit: COMMIT, namespace: "acme" }, { home, ...ctx });
+    expect(r).toMatchObject({ ok: true, reused: true, namespace: "acme", entry: "index.js", dir: buildDir() });
   });
 });
 

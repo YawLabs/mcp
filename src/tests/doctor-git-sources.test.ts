@@ -33,7 +33,8 @@ vi.mock("node:child_process", async (importOriginal) => {
 
 const { runDoctor } = await import("../doctor-cmd.js");
 const { gitAvailable } = await import("../git-source.js");
-const { gitBuildDir, gitFailedPath, gitRoot } = await import("../paths.js");
+const { CONFIG_DIRNAME, gitBuildDir, gitFailedPath, gitRoot } = await import("../paths.js");
+const { TRUST_BYPASS_ENV } = await import("../trust.js");
 const { fakeFinishedBuild } = await import("./git-fixture.js");
 
 const OK = "1111111111111111111111111111111111111111";
@@ -108,13 +109,16 @@ const oamNotInstalled = () => ({
   failureDetail: null,
 });
 
-async function doctor(json: boolean): Promise<{ exitCode: number; text: string; err: string }> {
+async function doctor(
+  json: boolean,
+  over: { env?: NodeJS.ProcessEnv } = {},
+): Promise<{ exitCode: number; text: string; err: string }> {
   const lines: string[] = [];
   const err: string[] = [];
   const r = await runDoctor({
     cwd,
     home,
-    env: {},
+    env: over.env ?? {},
     os: "linux",
     json,
     out: (s) => lines.push(s),
@@ -124,6 +128,18 @@ async function doctor(json: boolean): Promise<{ exitCode: number; text: string; 
     now: () => NOW,
   });
   return { exitCode: r.exitCode, text: r.lines.join("\n"), err: err.join("") };
+}
+
+/** Same run, but the servers come from a PROJECT bundles.json (the trust
+ *  bypass makes the loader honour it -- doctor threads its own env to the
+ *  loader), which is what sets the `project` flag on the git rows. */
+async function projectDoctor(
+  servers: unknown[],
+  json: boolean,
+): Promise<{ exitCode: number; text: string; err: string }> {
+  mkdirSync(join(cwd, CONFIG_DIRNAME), { recursive: true });
+  writeFileSync(join(cwd, CONFIG_DIRNAME, "bundles.json"), JSON.stringify({ version: 1, servers }));
+  return doctor(json, { env: { [TRUST_BYPASS_ENV]: "1" } });
 }
 
 function fullFixture(): void {
@@ -260,6 +276,48 @@ describe("doctor git sources", () => {
     writeBundles([{ namespace: "plain", name: "plain", command: "node", args: ["x.js"] }]);
     expect((await doctor(false)).text).not.toContain("git sources:");
     expect(JSON.parse((await doctor(true)).text).oamRuntime.git).toEqual([]);
+  });
+
+  it("a mismatch rebuild hint carries --project when the config came from a project bundles.json", async () => {
+    // The same foreign build: once as a user-file row (plain hint) and once
+    // as a project-file row (the flag appended).
+    writeBundles([entry("acme_foreign", { ref: "main", commit: FOREIGN })]);
+    writeMarker("acme_foreign", FOREIGN, { platform: "darwin", arch: "x64", node: "v20.11.1" });
+    const major = /^v(\d+)/.exec(process.version)?.[1];
+    const userRun = await doctor(true);
+    expect(userRun.text).toContain("Rebuild: yaw-mcp update acme_foreign --to 5555555");
+    expect(userRun.text).not.toContain("--to 5555555 --project");
+
+    const projectRun = await projectDoctor([entry("acme_foreign", { ref: "main", commit: FOREIGN })], true);
+    const rows = JSON.parse(projectRun.text).oamRuntime.git as Array<Record<string, unknown>>;
+    expect(rows[0].warning).toBe(
+      `acme_foreign was built on darwin-x64 node 20; this is ${process.platform}-${process.arch} node ${major}. Rebuild: yaw-mcp update acme_foreign --to 5555555 --project`,
+    );
+    expect(projectRun.text).toContain("Rebuild: yaw-mcp update acme_foreign --to 5555555 --project");
+  });
+
+  it("gitRemoteText: a sha-kind row reads pinned, checked; a branch whose remote commit is null reads not on the remote; a tag with no newer tags reads no newer tag", async () => {
+    const SHA = "7777777777777777777777777777777777777777";
+    const NULLED = "8888888888888888888888888888888888888888";
+    const NOTAG = "9999999999999999999999999999999999999999";
+    writeBundles([
+      entry("acme_sha", { ref: SHA, commit: SHA }),
+      entry("acme_gone", { ref: "main", commit: NULLED }),
+      entry("acme_tag", { ref: "v1.4.0", commit: NOTAG }),
+    ]);
+    writeMarker("acme_sha", SHA);
+    writeMarker("acme_gone", NULLED);
+    writeMarker("acme_tag", NOTAG);
+    writeState({
+      acme_sha: stateFor(SHA, { ref: SHA, kind: "sha", remote: SHA }),
+      acme_gone: stateFor(NULLED, { kind: "branch", remote: null }),
+      acme_tag: stateFor(NOTAG, { ref: "v1.4.0", kind: "tag", newerTags: [] }),
+    });
+    const r = await doctor(false);
+    expect(r.text).toContain(`${SHA.slice(0, 7)} (${SHA}; pinned, checked 2h ago)`);
+    expect(r.text).toContain(`${NULLED.slice(0, 7)} (main; not on the remote as of 2h ago)`);
+    expect(r.text).toContain(`${NOTAG.slice(0, 7)} (v1.4.0; no newer tag as of 2h ago)`);
+    expect(r.exitCode).toBe(0);
   });
 
   it("never spawns git, on either path", async () => {

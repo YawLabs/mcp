@@ -9,9 +9,18 @@ import { createServer, type Server } from "node:https";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { buildGitSource, GIT_LOCK_NAME, gitEntryBuilt, gitRefsPath, parseGitSpec } from "../git-source.js";
+import {
+  buildGitSource,
+  GIT_LOCK_NAME,
+  gitEntryBuilt,
+  gitRefsPath,
+  parseGitSpec,
+  resolveGitRef,
+} from "../git-source.js";
 import { type AddCommandOptions, parseAddArgs, runAdd } from "../local-add-cmd.js";
-import { gitBuildDir, gitBuiltPath, gitFailedPath, gitRoot } from "../paths.js";
+import { localBundlesPath } from "../local-bundles.js";
+import { CONFIG_DIRNAME, gitBuildDir, gitBuiltPath, gitFailedPath, gitRoot } from "../paths.js";
+import { grantTrust } from "../trust.js";
 import type { GitSource, UpstreamServerConfig } from "../types.js";
 import { gitBuildMissing } from "../upstream.js";
 import { BUILD_JS, ENV, git, makeRepo, NPM_FILES, newTmp, packageJson, type Repo, SERVER_JS } from "./git-fixture.js";
@@ -911,5 +920,178 @@ describe.runIf(tls !== null)(httpsTitle, () => {
     } finally {
       repo.commit({ "build.js": BUILD_JS });
     }
+  }, 180_000);
+});
+
+// --- failures the ref/clone/checkout path can produce ------------------------
+
+/** buildGitSource with the seam the real commands use: ls-remote first (so a
+ *  bad REF fails before anything is cloned), then the build itself. */
+async function buildRef(
+  url: string,
+  commit: string,
+  over: { namespace?: string; subdir?: string; entry?: string } = {},
+  env: NodeJS.ProcessEnv = ENV,
+) {
+  const spec = parseGitSpec(url);
+  if (!spec.ok) throw new Error(spec.error);
+  const ctx = { home, env, interactive: false, yes: true, progress: () => {}, warn: () => {} };
+  const resolved = await resolveGitRef(spec.spec, { run: { env, interactive: false }, secrets: {} });
+  if (!resolved.ok) return resolved;
+  return await buildGitSource({ spec: spec.spec, commit, ...over }, ctx);
+}
+
+describe("a clone that cannot happen or cannot be checked out", () => {
+  it("a clone failure leaves a redacted .failed at step clone and no namespace dir", async () => {
+    // ls-remote resolves against the real bare repo first (clean env, so no
+    // rewrite); the clone then runs under an insteadOf that rewrites the URL
+    // to a path that does not exist -- the shape of a remote that vanished
+    // between the two calls. The rewrite only reaches the BUILD's children,
+    // never the ls-remote above it.
+    const repo = makeRepo(NPM_FILES);
+    const head = git(repo.work, ["rev-parse", "HEAD"]);
+    const absent = join(newTmp("git-src-gone-"), "not-a-repo.git");
+    const env: NodeJS.ProcessEnv = {
+      ...ENV,
+      GIT_CONFIG_COUNT: "2",
+      GIT_CONFIG_KEY_0: `url.${absent}.insteadOf`,
+      GIT_CONFIG_VALUE_0: repo.url,
+      GIT_CONFIG_KEY_1: "protocol.ext.allow",
+      GIT_CONFIG_VALUE_1: "never",
+    };
+    const spec = parseGitSpec(repo.url);
+    if (!spec.ok) throw new Error(spec.error);
+    const resolved = await resolveGitRef(spec.spec, { run: { env: ENV, interactive: false }, secrets: {} });
+    if (!resolved.ok) throw new Error(resolved.message);
+    const r = await buildGitSource(
+      { spec: spec.spec, commit: head, namespace: "fx" },
+      {
+        home,
+        env,
+        interactive: false,
+        yes: true,
+        progress: () => {},
+        warn: () => {},
+      },
+    );
+    expect(r.ok, JSON.stringify(r)).toBe(false);
+    if (r.ok) return;
+    expect(r.exitCode).toBe(1);
+    expect(r.message).toContain(`git clone failed for ${repo.url}:`);
+
+    const failed = JSON.parse(readFileSync(gitFailedPath("fx", head, home), "utf8"));
+    expect(failed.step).toBe("clone");
+    expect(failed.commit).toBe(head);
+    expect(typeof failed.tail).toBe("string");
+    expect(failed.tail.length).toBeGreaterThan(0);
+    // fail() removes what the failed clone half-created -- but a root-level
+    // `.tmp-*` clone is removed into a namespace dir it never created, so the
+    // rmdir-when-empty never fires and the .failed record's own mkdir is the
+    // only thing left under the namespace (git-source.ts fail(), ~1486).
+    expect(readdirSync(gitRoot(home))).toEqual(["fx"]);
+    expect(readdirSync(join(gitRoot(home), "fx"))).toEqual([`${head.slice(0, 12)}.failed`]);
+    expect(readdirSync(gitRoot(home)).filter((n) => n.startsWith(".tmp-"))).toEqual([]);
+  }, 120_000);
+
+  it("a 40-hex SHA ls-remote accepted but the clone cannot check out is named unreachable", async () => {
+    const repo = makeRepo(NPM_FILES);
+    const bogus = "1".repeat(40);
+    // resolveRefIn accepts any full hex string as a commit (ls-remote never
+    // lists loose objects), and buildLocked then skips the rev-parse branch
+    // (fullKnown), so checkout is the first place the SHA is examined.
+    const r = await buildRef(repo.url, bogus, { namespace: "fx", entry: "dist/index.js" });
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.exitCode).toBe(1);
+    expect(r.message).toContain(`commit ${bogus.slice(0, 12)} is not reachable from any branch or tag of ${repo.url}:`);
+    // A full SHA, so the .failed record is written -- at the checkout step.
+    const failed = JSON.parse(readFileSync(gitFailedPath("fx", bogus, home), "utf8"));
+    expect(failed).toMatchObject({ commit: bogus, step: "checkout" });
+    // Written OUTSIDE the checkout, so nothing but the record is left behind
+    // (fail() rmdir's the half-created namespace only when it removed the
+    // staging dir itself -- a .tmp-* clone removed itself into a namespace
+    // dir that never existed, so "fx" was never created here).
+    expect(existsSync(gitBuildDir("fx", bogus, home))).toBe(false);
+    expect(readdirSync(gitRoot(home)).filter((n) => n.startsWith(".tmp-"))).toEqual([]);
+  }, 120_000);
+
+  it("a mistyped 4-39 hex ref fails post-clone at rev-parse, .failed at step checkout", async () => {
+    const repo = makeRepo(NPM_FILES);
+    // 39 hex chars that are NOT a prefix of any object in the clone: a real
+    // prefix (head.slice(0, 39)) resolves fine -- rev-parse completes it and
+    // the build succeeds, so only a wrong one reaches the rev-parse failure.
+    const typo = "d".repeat(39);
+    const r = await buildRef(`${repo.url}#${typo}`, typo, { namespace: "fx", entry: "dist/index.js" });
+    expect(r.ok, r.ok ? "" : r.message).toBe(false);
+    if (r.ok) return;
+    expect(r.exitCode).toBe(1);
+    expect(r.message).toContain(`commit ${typo} is not in ${repo.url} (or the short SHA is ambiguous).`);
+    // What actually happens (verified, not assumed): no `.failed` record is
+    // written for this failure -- fail() only records when commit is a FULL
+    // 40-hex string (git-source.ts fail(), `record && namespace && /^[0-9a-f]
+    // {40}$/.test(commit)`), and here the commit is still the 39-hex input
+    // when rev-parse fails. So: assert the message and the absence of a build
+    // dir, and pin the step only where a full-SHA failure does write it (the
+    // clone and unreachable-commit tests above).
+    expect(existsSync(gitFailedPath("fx", typo, home))).toBe(false);
+    expect(existsSync(gitBuildDir("fx", typo, home))).toBe(false);
+    expect(readdirSync(gitRoot(home)).filter((n) => n.startsWith(".tmp-"))).toEqual([]);
+  }, 120_000);
+});
+
+// --- add: the two remedies nothing else prints --------------------------------
+
+describe("add collisions and project trust", () => {
+  it("a nameless add whose slug-shaped namespace collides tells you to name it yourself", async () => {
+    // A pure-alnum namespace: NAMESPACE_RE (no hyphens) and CATALOG_SLUG_RE
+    // (no underscores) both take it, so the remedy can be "name it yourself".
+    const repo = makeRepo({
+      ...NPM_FILES,
+      "yaw-mcp.json": JSON.stringify({ version: 1, namespace: "fxcrm" }),
+    });
+    // An existing server with THAT namespace. Its name is deliberately not
+    // the namespace: the collision matches by namespace, and only the replace
+    // REMEDY needs the namespace to read back as a slug (deriveNamespace of
+    // the namespace itself), not the stored display name.
+    mkdirSync(join(home, ".yaw-mcp"), { recursive: true });
+    const theirs = {
+      namespace: "fxcrm",
+      name: "Their CRM",
+      command: "npx",
+      args: ["-y", "their-crm"],
+    };
+    writeFileSync(join(home, ".yaw-mcp", "bundles.json"), JSON.stringify({ version: 1, servers: [theirs] }));
+
+    const r = await add(["--git", repo.url, "--yes", "--no-start-check"]);
+    expect(r.exitCode, r.err).toBe(1);
+    expect(r.err).toContain('names this server "fxcrm"');
+    expect(r.err).toContain("already has a server by that name; nothing was written");
+    // The remedy branch CATALOG_SLUG_RE.test(ns) && deriveNamespace(ns) === ns
+    // takes: name it yourself rather than remove first (local-add-cmd.ts:1468).
+    expect(r.err).toContain(`To replace it, name it yourself: yaw-mcp add fxcrm --git ${repo.url}`);
+    expect(r.err).not.toContain("To replace it, remove it first");
+    // The refusal comes AFTER the build (local-add-cmd builds at ~1419, checks
+    // the repo-chosen name at ~1455), so the checkout is on disk -- what the
+    // refusal guarantees is that nothing was WRITTEN.
+    expect(JSON.parse(readFileSync(join(home, ".yaw-mcp", "bundles.json"), "utf8")).servers).toEqual([theirs]);
+  }, 180_000);
+
+  it("--project into a file trusted before the edit says the new contents are trusted too", async () => {
+    const repo = makeRepo(NPM_FILES);
+    // Under home, so the project walk is bounded there and needs no
+    // ownership opt-in -- and the project file must exist and be trusted
+    // BEFORE the add touches it: that is the regrant, not a first grant.
+    cwd = join(home, "proj");
+    const dir = join(cwd, CONFIG_DIRNAME);
+    mkdirSync(dir, { recursive: true });
+    const path = localBundlesPath(dir);
+    writeFileSync(path, JSON.stringify({ version: 1, servers: [] }, null, 2));
+    await grantTrust(path, readFileSync(path), { home });
+
+    const r = await add(["fx", "--git", repo.url, "--yes", "--no-start-check", "--project"]);
+    expect(r.exitCode, r.err).toBe(0);
+    expect(r.err).toContain(`Note: ${path} was trusted before this edit, so the new contents are trusted too.`);
+    expect(r.err).not.toContain("is not trusted on this machine");
+    expect(existsSync(join(home, ".yaw-mcp", "bundles.json"))).toBe(false);
   }, 180_000);
 });

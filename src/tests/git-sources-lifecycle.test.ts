@@ -20,11 +20,12 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import { PassThrough } from "node:stream";
 import { beforeEach, describe, expect, it } from "vitest";
 import { discardBuild, GIT_LOCK_NAME, gitRefsPath, recordGitPin, recordRepoConsent } from "../git-source.js";
 import { parseRemoveArgs, runRemove } from "../local-add-cmd.js";
 import { localBundlesPath } from "../local-bundles.js";
-import { CONFIG_DIRNAME, gitBuildDir, gitBuiltPath, gitRoot, userConfigDir } from "../paths.js";
+import { CONFIG_DIRNAME, gitBuildDir, gitBuiltPath, gitFailedPath, gitRoot, userConfigDir } from "../paths.js";
 import { backgroundInstallOptions } from "../sidecar-refresh.js";
 import { acquireSidecarsLock, parseSidecarsArgs, type RunNpmOptions, runSidecarsInstall } from "../sidecars-cmd.js";
 import { runTrust } from "../trust-cmd.js";
@@ -396,6 +397,49 @@ describe("trust shows git sources and offers the build after a grant", () => {
     expect(existsSync(gitRoot(home))).toBe(false);
   }, 60_000);
 
+  it("declining the BUILD offer after a grant still approves, and exits 0 with the later command", async () => {
+    const repo = makeRepo(NPM_FILES);
+    const head = git(repo.work, ["rev-parse", "HEAD"]);
+    writeProject([gitEntry(repo, "fx", head)]);
+    const calls: string[][] = [];
+    // Two keystrokes, one per prompt: y approves the file, n declines the
+    // build offer that follows the grant (the grant itself is not what is
+    // declined here -- that case is the test above this one).
+    const stdin = new PassThrough();
+    stdin.write("y\nn\n");
+    const stdout = new PassThrough();
+    stdout.on("data", () => {});
+    const res = await trust({
+      isTTY: true,
+      io: { stdin, stdout },
+      runPm: fakePm(calls),
+    });
+    expect(res.exitCode).toBe(0);
+    const text = out.join("");
+    expect(text).toContain(`Approved ${join(cwd, CONFIG_DIRNAME, "bundles.json")}`);
+    expect(text).toContain("Not built. Build later with: yaw-mcp sidecars install");
+    expect(text).not.toContain("yaw-mcp sidecars install --yes");
+    expect(calls).toEqual([]);
+    expect(existsSync(gitBuildDir("fx", head, home))).toBe(false);
+  }, 60_000);
+
+  it("shows a file:// entry's token as sent to nothing, with no approving-leaks line", async () => {
+    const repo = makeRepo(NPM_FILES);
+    const head = git(repo.work, ["rev-parse", "HEAD"]);
+    const local = {
+      ...gitEntry(repo, "fx", head),
+      git: { url: repo.url, ref: "main", commit: head, entry: "dist/index.js", tokenSecret: "AWS_KEY" },
+    };
+    writeProject([local]);
+    const res = await trust({ yes: true, isTTY: false, runPm: fakePm([]) });
+    // Not built (no consent stored here), so the run reports unfinished work.
+    expect(res.exitCode, err.join("")).toBe(1);
+    const text = out.join("");
+    expect(text).toContain("token: vault secret AWS_KEY -> sent to nothing (ignored: not an https URL)");
+    expect(text).not.toContain("send it to nothing");
+    expect(text).not.toContain("approving lets yaw-mcp read vault secret AWS_KEY");
+  }, 60_000);
+
   it("after a TTY grant, builds the not-built entry with the sidecars builder (repo consent asked once)", async () => {
     const repo = makeRepo(NPM_FILES);
     const head = git(repo.work, ["rev-parse", "HEAD"]);
@@ -495,6 +539,34 @@ describe("remove deletes a git entry's checkout", () => {
     expect(out.join("")).toContain(`Deleted its git checkout at ${dir} (build ${COMMIT.slice(0, 7)}).`);
     expect(existsSync(dir)).toBe(false);
     expect(existsSync(otherDir)).toBe(true);
+  });
+
+  it("a namespace whose only record is a <sha12>.failed file previews a 0.0 MB delete and removes it", async () => {
+    seedEntry("fx");
+    // No build dir anywhere: just the failed-build record next to where the
+    // checkout would be. The plan's size counts what it deletes (the record,
+    // tiny), so the preview rounds to 0.0 MB even though the checkout line
+    // claims to delete the whole directory.
+    const dir = join(gitRoot(home), "fx");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(gitFailedPath("fx", COMMIT, home), JSON.stringify({ step: "install", tail: "npm ERR! boom" }));
+    expect(existsSync(gitBuildDir("fx", COMMIT, home))).toBe(false);
+
+    const refused = await remove(["fx"]);
+    expect(refused.exitCode).toBe(2);
+    expect(out.join("")).toContain(`launch:    git git@github.com:acme/fx.git @ ${COMMIT.slice(0, 12)}`);
+    expect(out.join("")).toContain(`checkout:  deletes ${dir} (0.0 MB)`);
+    // The plan counts build directories only, and `<sha12>.failed` is not
+    // one: no `builds ...` line, no size beyond 0.0 MB.
+    expect(out.join("")).not.toContain("builds ");
+    expect(existsSync(dir)).toBe(true);
+
+    out = [];
+    const res = await remove(["fx", "--force"]);
+    expect(res.exitCode, err.join("")).toBe(0);
+    expect(out.join("")).toContain(`Deleted its git checkout at ${dir}.`);
+    expect(existsSync(dir)).toBe(false);
+    expect(existsSync(gitFailedPath("fx", COMMIT, home))).toBe(false);
   });
 
   it("--keep-checkout keeps it, and says so in the preview", async () => {

@@ -7,8 +7,9 @@ import { dirname, join } from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
 import { parseGitSpec } from "../git-source.js";
 import { localBundlesPath } from "../local-bundles.js";
-import { gitBuildDir, userConfigDir } from "../paths.js";
+import { CONFIG_DIRNAME, gitBuildDir, userConfigDir } from "../paths.js";
 import { otherProtocolUrl, parseShareArgs, runShare } from "../share-cmd.js";
+import { TRUST_BYPASS_ENV } from "../trust.js";
 import { ENV, git, makeRepo, NPM_FILES, newTmp } from "./git-fixture.js";
 
 const SCP = "git@github.com:acme/crm-mcp.git";
@@ -75,14 +76,14 @@ function entry(ns: string, commit: string, git: Record<string, unknown> = {}, ex
   };
 }
 
-async function share(argv: string[]) {
+async function share(argv: string[], over: { cwd?: string; env?: NodeJS.ProcessEnv } = {}) {
   const parsed = parseShareArgs(argv);
   if (!parsed.ok) throw new Error(parsed.error);
   return runShare({
     ...parsed.options,
     home,
-    cwd: home,
-    env: ENV,
+    cwd: over.cwd ?? home,
+    env: over.env ?? ENV,
     out: (s) => out.push(s),
     err: (s) => err.push(s),
   });
@@ -203,6 +204,44 @@ describe("share", () => {
     expect((await share(["crm", "--pin"])).exitCode).toBe(0);
     expect(out.join("")).toContain(`#${commit}`);
     expect(out.join("")).not.toContain("tracks the branch");
+  }, 60_000);
+
+  it("--pin on an entry with no pinned commit refuses instead of printing a command", async () => {
+    writeEntry(entry("crm", "", { ref: "main", commit: undefined }));
+    const r = await share(["crm", "--pin"]);
+    expect(r.exitCode).toBe(1);
+    expect(err.join("")).toContain('yaw-mcp share: "crm" has no pinned commit. Pin one with: yaw-mcp update crm');
+    expect(out.join("")).toBe("");
+    expect(out.join("")).not.toContain("yaw-mcp add");
+  }, 60_000);
+
+  it("a miss says no server named it, and adds the --project hint when --project was not passed", async () => {
+    // pro_only exists ONLY in a project bundles.json; the user file has no
+    // entry at all. Sharing it without --project reads the user file, misses,
+    // and gets the hint pointing at the flag. Sharing with --project reads the
+    // project file -- a name missing from THAT too still misses, with no hint
+    // (the flag was already passed) and the project file named in the message.
+    const projRoot = join(home, "proj");
+    const projDir = join(projRoot, CONFIG_DIRNAME);
+    mkdirSync(projDir, { recursive: true });
+    writeFileSync(
+      localBundlesPath(projDir),
+      JSON.stringify({ version: 1, servers: [entry("pro_only", "1111111111111111111111111111111111111111")] }),
+    );
+
+    expect((await share(["pro_only"])).exitCode).toBe(1);
+    expect(err.join("")).toContain(`no server named "pro_only" in ${localBundlesPath(userConfigDir(home))}.`);
+    expect(err.join("")).toContain("For a project entry add --project.");
+
+    out = [];
+    err = [];
+    // The bypass makes share honour the project file here (a real run would
+    // `yaw-mcp trust` it first); it exists so --project reads THAT file.
+    expect(
+      (await share(["nothere", "--project"], { cwd: projRoot, env: { ...ENV, [TRUST_BYPASS_ENV]: "1" } })).exitCode,
+    ).toBe(1);
+    expect(err.join("")).toContain(`no server named "nothere" in ${localBundlesPath(projDir)}.`);
+    expect(err.join("")).not.toContain("For a project entry add --project.");
   }, 60_000);
 
   it("puts --git-token-secret on the HTTPS line only, and --json carries no values", async () => {

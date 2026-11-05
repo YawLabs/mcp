@@ -1523,4 +1523,54 @@ describe("runSidecarsInstall", () => {
     expect(existsSync(join(gitRoot(home), GIT_LOCK_NAME)), "the git builder released its own lock").toBe(false);
     expect(existsSync(join(root, SIDECARS_LOCK_NAME)), "the CLI released its own take").toBe(false);
   }, 60_000);
+
+  it("--json reports only-skipped-specs when a git target and a version range are the only npx servers", async () => {
+    // A config whose npx half is un-installable as a MIX: a git target (path
+    // into a clone) and a version range. collectSidecarSpecs skips the git
+    // entry, so specs holds only the range -- the run flows past the git build
+    // into the skipped branch, and the reason must say "skipped" (not the
+    // pure-git "only-non-registry-specs"), because the headline keys on it.
+    writeBundles([
+      {
+        id: "1",
+        name: "G",
+        namespace: "gsrv",
+        type: "local",
+        transport: "stdio",
+        command: "npx",
+        args: ["-y", "./some/local/path"],
+        git: { url: "git@h:a/b.git", commit: "0123456789abcdef0123456789abcdef01234567", entry: "dist/index.js" },
+      },
+      {
+        id: "2",
+        name: "R",
+        namespace: "ranged",
+        type: "local",
+        transport: "stdio",
+        command: "npx",
+        args: ["-y", "@yawlabs/fetch-mcp@^1.2.3"],
+      },
+    ]);
+    let out = "";
+    const res = await runSidecarsInstall({
+      home,
+      cwd: home,
+      json: true,
+      out: (s) => {
+        out += s;
+      },
+      runNpm: async () => 0,
+    });
+    const doc = JSON.parse(out);
+    // The reason comes from the NPM half (the range is un-installable); the
+    // git entry is a git ERROR, not a skip -- its URL fails validation -- and
+    // that is what makes the run exit 1. Both halves report in one document.
+    expect(res.exitCode).toBe(1);
+    expect(doc.reason).toBe("only-skipped-specs");
+    expect(doc.skipped.map((s: { namespace: string }) => s.namespace)).toEqual(["ranged"]);
+    expect(doc.error).toContain("1 git source(s) did not build");
+    expect(doc.git).toHaveLength(1);
+    expect(doc.git[0].status).toBe("failed");
+    expect(res.lines.join("\n")).toContain("no npx server names a package this command can install");
+  });
 });
