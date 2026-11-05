@@ -18,7 +18,9 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { GIT_LOCK_NAME } from "../git-source.js";
 import { isRegistrySpec, type OamProbe } from "../oam-spawn.js";
+import { gitRoot } from "../paths.js";
 import {
   acquireSidecarsLock,
   collectNonRegistrySpecs,
@@ -420,6 +422,7 @@ const JSON_KEYS = [
   "unhosted",
   "conflicts",
   "skipped",
+  "git",
 ].sort();
 
 /** The ordinary installable server, for the tests below that are about the
@@ -1467,5 +1470,107 @@ describe("runSidecarsInstall", () => {
     await run();
     expect(npmRuns, "install and update, once the holder is gone").toBe(2);
     expect(existsSync(join(root, SIDECARS_LOCK_NAME)), "the CLI released its own take").toBe(false);
+  });
+
+  it("does no git build work at all when the sidecars lock is held", async () => {
+    // The lock used to be taken AFTER the git build, so a run that was always
+    // going to exit 1 still cloned and built every git entry first -- minutes
+    // of work thrown away, done while another npm was mid-reify on the very
+    // tree this one would run from. Both locks, both ways: the sidecars one is
+    // held and the build must not start; it is released and the build runs
+    // (and takes its OWN gitRoot/.lock, which is why the two do not contend).
+    const COMMIT = "0123456789abcdef0123456789abcdef01234567";
+    const gitServer = {
+      id: "2",
+      name: "G",
+      namespace: "fx",
+      type: "local",
+      transport: "stdio",
+      git: { url: "https://example.com/acme/fx.git", commit: COMMIT, entry: "dist/index.js" },
+    };
+    writeBundles([FETCH_SERVER, gitServer]);
+    const root = sidecarsRoot(home);
+    mkdirSync(root, { recursive: true });
+    const held = acquireSidecarsLock(root);
+    expect(held).not.toBeNull();
+    const run = () =>
+      runSidecarsInstall({
+        home,
+        cwd: home,
+        yes: true,
+        isTTY: false,
+        out: () => {},
+        runNpm: async () => 0,
+      });
+
+    try {
+      const blocked = await run();
+      // Same verdict and message as the npm half always gave a held lock: one
+      // code path, one wording, whether the run died on git or on npm.
+      expect(blocked.exitCode).toBe(1);
+      expect(blocked.lines.join("\n")).toContain("try again once it finishes");
+      // The build never even reported: a run that already knows it must exit 1
+      // produced no clone, no build dir, no report of its own.
+      expect(blocked.lines.join("\n")).not.toContain("Git sources:");
+      expect(existsSync(gitRoot(home)), "the git build ran under a lock that said stop").toBe(false);
+    } finally {
+      held?.();
+    }
+
+    // Holder gone: the build proceeds, and its lock is not left behind either.
+    const unblocked = await run();
+    expect(unblocked.exitCode, unblocked.lines.join("\n")).toBe(1);
+    expect(existsSync(join(gitRoot(home), GIT_LOCK_NAME)), "the git builder released its own lock").toBe(false);
+    expect(existsSync(join(root, SIDECARS_LOCK_NAME)), "the CLI released its own take").toBe(false);
+  }, 60_000);
+
+  it("--json reports only-skipped-specs when a git target and a version range are the only npx servers", async () => {
+    // A config whose npx half is un-installable as a MIX: a git target (path
+    // into a clone) and a version range. collectSidecarSpecs skips the git
+    // entry, so specs holds only the range -- the run flows past the git build
+    // into the skipped branch, and the reason must say "skipped" (not the
+    // pure-git "only-non-registry-specs"), because the headline keys on it.
+    writeBundles([
+      {
+        id: "1",
+        name: "G",
+        namespace: "gsrv",
+        type: "local",
+        transport: "stdio",
+        command: "npx",
+        args: ["-y", "./some/local/path"],
+        git: { url: "git@h:a/b.git", commit: "0123456789abcdef0123456789abcdef01234567", entry: "dist/index.js" },
+      },
+      {
+        id: "2",
+        name: "R",
+        namespace: "ranged",
+        type: "local",
+        transport: "stdio",
+        command: "npx",
+        args: ["-y", "@yawlabs/fetch-mcp@^1.2.3"],
+      },
+    ]);
+    let out = "";
+    const res = await runSidecarsInstall({
+      home,
+      cwd: home,
+      json: true,
+      out: (s) => {
+        out += s;
+      },
+      runNpm: async () => 0,
+    });
+    const doc = JSON.parse(out);
+    // The reason comes from the NPM half (the range is un-installable); the
+    // git entry is a git ERROR, not a skip -- its URL fails validation -- and
+    // that is what makes the run exit 1. Both halves report in one document.
+    expect(res.exitCode).toBe(1);
+    expect(doc.reason).toBe("only-skipped-specs");
+    expect(doc.skipped.map((s: { namespace: string }) => s.namespace)).toEqual(["ranged"]);
+    expect(doc.error).toContain("1 git source(s) did not build");
+    expect(doc.git).toHaveLength(1);
+    expect(doc.git[0].status).toBe("failed");
+    expect(res.lines.join("\n")).toContain("no npx server names a package this command can install");
   });
 });

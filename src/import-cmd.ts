@@ -504,6 +504,9 @@ function describeUnresolved(spans: string[], inputs: Map<string, string>): strin
  *  list prints, so the "was" line of a replacement reads like the entry above
  *  it. */
 function renderLaunch(shape: LaunchShape): string {
+  if (shape.git !== undefined) {
+    return `git ${displaySafe(shape.git.url)}${shape.git.subdir ? ` (subdir ${displayArg(shape.git.subdir)})` : ""}`;
+  }
   if (shape.command !== undefined && shape.command !== "") {
     return `$ ${[shape.command, ...(shape.args ?? [])].map(displayArg).join(" ")}`;
   }

@@ -3,6 +3,26 @@ import type { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js
 import type { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import type { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
+/** A server built from a git repository. Portable: every path is relative, so
+ *  a committed bundles.json means the same thing on every machine. The loader
+ *  turns it into `node <buildDir>/<subdir>/<entry>` with cwd `<buildDir>/<subdir>`,
+ *  where buildDir is keyed by `commit` (paths.ts gitBuildDir). */
+export interface GitSource {
+  url: string;
+  /** The branch, tag or SHA the entry tracks; `update` re-resolves it. */
+  ref?: string;
+  /** The full 40-hex commit the build is pinned to. Absent only on a
+   *  hand-written entry, which then has nothing to launch until one is pinned. */
+  commit?: string;
+  /** The package's directory inside the repo, relative to its root. */
+  subdir?: string;
+  /** The entry file, relative to `subdir` (or the repo root). */
+  entry: string;
+  /** The NAME of a vault secret holding an HTTPS token for this repo. Never a
+   *  value: git-source.ts hands it to git through GIT_ASKPASS at clone time. */
+  tokenSecret?: string;
+}
+
 export interface UpstreamServerConfig {
   id: string;
   name: string;
@@ -27,6 +47,13 @@ export interface UpstreamServerConfig {
    * is configured while sending nothing, and is dropped at load.
    */
   headers?: Record<string, string>;
+  /** The repository this server is built from. When set, `command`, `args`
+   *  and `cwd` on a LOADED entry are derived from it (local-bundles.ts
+   *  validateEntry) and never come from the file. */
+  git?: GitSource;
+  /** INTERNAL -- the working directory of the spawned child. Only ever derived
+   *  from `git`; a `cwd` written in bundles.json is dropped at load. */
+  cwd?: string;
   isActive: boolean;
   /**
    * Per-server connect timeout in milliseconds, as set in bundles.json.
@@ -118,7 +145,7 @@ export function isRemoteEntry(entry: { type?: string; command?: string; url?: st
 }
 
 /** Everything about an entry that decides WHAT a fresh activation would
- *  start: the process (command/args/env/runtime) or the endpoint (url/headers/
+ *  start: the process (command/args/cwd/env/runtime) or the endpoint (url/headers/
  *  transport), plus the connect timeout the attempt would run under. Two
  *  entries with the same launch identity produce the same upstream, so a live
  *  connection to one is a live connection to the other.
@@ -158,6 +185,7 @@ export function launchIdentity(entry: UpstreamServerConfig): string {
     entry.transport ?? null,
     entry.command ?? null,
     entry.args ?? null,
+    entry.cwd ?? null,
     stableMap(entry.env),
     entry.url ?? null,
     stableMap(entry.headers),

@@ -145,6 +145,13 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
       "--dry-run",
       "--json",
       "--catalog",
+      "--git",
+      "--git-token-secret",
+      "--subdir",
+      "--entry",
+      "--project",
+      "--yes",
+      "--no-start-check",
       "--help",
     ],
   },
@@ -169,7 +176,7 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
     name: "remove",
     description: "Remove a local server",
     positional: [["<slug-or-namespace>"]],
-    flags: ["--force", "--yes", "--help"],
+    flags: ["--force", "--yes", "--keep-checkout", "--help"],
   },
   // The shell door onto a configured server. Its flags are the only way to
   // pass a JSON argument object without fighting shell quoting, so hiding them
@@ -217,7 +224,7 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
     name: "sidecars",
     description: "Install configured MCP servers into a managed directory",
     positional: [["install"]],
-    flags: ["--json", "--help"],
+    flags: ["--yes", "--json", "--help"],
   },
   // Consent gate for a project-local .yaw-mcp/bundles.json. Flags mirror
   // parseTrustArgs in src/trust-cmd.ts -- keep them in sync.
@@ -266,6 +273,30 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
   },
   // Maintenance.
   { name: "upgrade", description: "Upgrade @yawlabs/mcp to the latest version", flags: ["--run", "--json", "--help"] },
+  // Flags mirror parseUpdateArgs in src/update-cmd.ts and parseShareArgs in
+  // src/share-cmd.ts.
+  {
+    name: "update",
+    description: "Move git servers to the commit their ref points at",
+    positional: [["<namespace>"]],
+    flags: [
+      "--check",
+      "--ref",
+      "--to",
+      "--git-token-secret",
+      "--project",
+      "--yes",
+      "--no-start-check",
+      "--json",
+      "--help",
+    ],
+  },
+  {
+    name: "share",
+    description: "Print the add command coworkers paste for a git server",
+    positional: [["<namespace>"]],
+    flags: ["--pin", "--project", "--json", "--help"],
+  },
   // Same confirmation bypass as try-cleanup: parseResetLearningArgs accepts
   // --force / -y / --yes, and off a TTY the delete refuses without one.
   {

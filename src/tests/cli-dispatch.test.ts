@@ -127,7 +127,7 @@ describe("CLI dispatch -- help goes to stdout and exits 0", () => {
   it("prints a subcommand usage on the shared parse tail", () => {
     const r = runCli(["sidecars", "--help"]);
     expect(r.code).toBe(0);
-    expect(r.stdout).toContain("Usage: yaw-mcp sidecars install [--json]");
+    expect(r.stdout).toContain("Usage: yaw-mcp sidecars install [--yes] [--json]");
     expect(r.stderr, "usage went to stderr").toBe("");
   });
 
@@ -201,6 +201,18 @@ describe("CLI dispatch -- argv errors go to stderr and exit 2", () => {
     expect(r.code).toBe(2);
     expect(r.stderr).toContain("unknown argument");
     expect(r.stdout).toBe("");
+  });
+
+  it("an argv error under --json leaves a parseable document on stdout, usage on stderr", () => {
+    // A script piping stdout to a JSON parser must not receive zero bytes on
+    // a usage failure; the human-readable usage stays on stderr as before.
+    const r = runCli(["sidecars", "--wat", "--json"]);
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain("--wat");
+    const doc = JSON.parse(r.stdout);
+    expect(doc.ok).toBe(false);
+    expect(doc.exitCode).toBe(2);
+    expect(String(doc.error)).toContain("--wat");
   });
 
   it("threads --force through the hand-rolled reset-learning branch", () => {

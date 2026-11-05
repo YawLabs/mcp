@@ -57,6 +57,34 @@ export function sidecarsNodeModules(home: string = homedir()): string {
   return path.join(sidecarsRoot(home), "node_modules");
 }
 
+/** Subdirectory of the config dir holding git-sourced server builds. Kept
+ *  apart from the sidecar tree: a git build owns its own node_modules. */
+export const GIT_DIRNAME = "git";
+
+/** Length of the commit prefix that names a build directory. */
+export const GIT_BUILD_SHA_LEN = 12;
+
+export function gitRoot(home: string = homedir()): string {
+  return path.join(userConfigDir(home), GIT_DIRNAME);
+}
+
+/** `~/.yaw-mcp/git/<namespace>/<sha12>`: one immutable build per commit. */
+export function gitBuildDir(namespace: string, commit: string, home: string = homedir()): string {
+  return path.join(gitRoot(home), namespace, commit.slice(0, GIT_BUILD_SHA_LEN));
+}
+
+/** `~/.yaw-mcp/git/<namespace>/<sha12>.built`: the marker a finished build
+ *  leaves, written last and OUTSIDE the checkout so the repo cannot ship one
+ *  (git-build-state.ts readBuildMarker). */
+export function gitBuiltPath(namespace: string, commit: string, home: string = homedir()): string {
+  return `${gitBuildDir(namespace, commit, home)}.built`;
+}
+
+/** `~/.yaw-mcp/git/<namespace>/<sha12>.failed`: the record a failed build leaves. */
+export function gitFailedPath(namespace: string, commit: string, home: string = homedir()): string {
+  return `${gitBuildDir(namespace, commit, home)}.failed`;
+}
+
 // User-global yaw-mcp config dir: `~/.yaw-mcp/`. Always this; no XDG
 // variation -- config is small, human-edited, and lives next to shell
 // dotfiles like `.gitconfig` rather than under a cache root.

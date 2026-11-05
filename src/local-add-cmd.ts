@@ -15,11 +15,33 @@
 // Terminal app use (catalog.ts), so a slug that works as an "Add to Yaw MCP"
 // button works here too.
 
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
+import { join } from "node:path";
 import { CATALOG_SLUG_RE, ENV_KEY_RE, type FetchCatalog, resolveCatalogSlug, tokenizeCommand } from "./catalog.js";
 import { readClientEnv } from "./client-config.js";
 import { probeClientsAsync } from "./doctor-cmd.js";
+import {
+  buildGitSource,
+  GIT_MISSING_MESSAGE,
+  type GitBuildContext,
+  type GitManifest,
+  type GitPinnedBuild,
+  type GitSpec,
+  gitAvailable,
+  gitCheckoutDir,
+  gitLivenessWarning,
+  normalizeRepoUrl,
+  parseGitSpec,
+  planGitRemoval,
+  prepareGit,
+  recordGitPin,
+  redactGitOutput,
+  removeGitCheckout,
+  resolveGitRef,
+  treeSizeBytes,
+} from "./git-source.js";
 import { type GradesCache, readGradesCache } from "./grades-cache.js";
 import { CURRENT_OS, resolveAppDataDir } from "./install-targets.js";
 // The removal gate must see the same files the WRITE path can modify, so it
@@ -31,6 +53,7 @@ import {
   deriveNamespace,
   findShadowingProjectBundles,
   formatBundleCollision,
+  gitNodeCommand,
   HTTP_HEADER_NAME_RE,
   isRemoteEntry,
   type LaunchChange,
@@ -42,25 +65,36 @@ import {
   removeUserBundle,
   STORED_TARGET_RE,
   type UpsertOrigin,
+  unsafeRelativePathReason,
   upsertUserBundle,
 } from "./local-bundles.js";
 import { createStreamWriter } from "./logger.js";
-import { userConfigDir } from "./paths.js";
+import { CONFIG_DIRNAME, findProjectConfigDir, userConfigDir } from "./paths.js";
 import { askYesNo, QUESTION_CANCELLED } from "./readline-question.js";
-import { collectMalformedSecretRefs, collectSecretRefNames, listKeys, loadVault, vaultPath } from "./secrets-vault.js";
+import { runSecrets, type SecretsCommandOptions } from "./secrets-cmd.js";
+import {
+  collectMalformedSecretRefs,
+  collectSecretRefNames,
+  listKeys,
+  loadVault,
+  SECRET_NAME_RE,
+  vaultPath,
+} from "./secrets-vault.js";
 // The removal preview renders command / args / url / name straight out of
 // bundles.json immediately above a [y/N] prompt, so it needs the same
 // control-byte neutering the `trust` gate uses. IMPORTED, never re-spelled:
 // a second hand-rolled copy of that escape logic would drift from the one
 // trust-cmd's tests actually cover.
 import { displayArg, displaySafe } from "./trust-cmd.js";
-import type { UpstreamServerConfig } from "./types.js";
+import type { GitSource, UpstreamServerConfig } from "./types.js";
+import { connectToUpstream, disconnectFromUpstream } from "./upstream.js";
 
 // --- add --------------------------------------------------------------------
 
 export const ADD_USAGE = `Usage: yaw-mcp add <slug> [flags]
        yaw-mcp add <name> --command "<launch line>" [flags]
        yaw-mcp add <name> --url <https://...> [flags]
+       yaw-mcp add [<name>] --git <url>[#ref] [flags] [-- <server args>]
 
   Add an MCP server to the local server set in ~/.yaw-mcp/bundles.json so
   yaw-mcp loads it. With neither --command nor --url, <slug> is resolved
@@ -85,6 +119,30 @@ export const ADD_USAGE = `Usage: yaw-mcp add <slug> [flags]
   --transport <t>   streamable-http (default) or sse, for --url.
   --description <s> Free text describing what the server is for. Worth
                     setting: dispatch ranks servers on it.
+
+  Building a server from a git repository (--git):
+
+  --git <url>[#ref] https://, ssh://, git@host:org/repo or file:// URL. The ref
+                    (branch, tag, short or full SHA; default: the default
+                    branch) is resolved to a full commit and pinned. Auth is
+                    your own git: ssh-agent, ~/.ssh/config or a credential
+                    helper. A token in the URL is refused.
+  --git-token-secret <name>
+                    HTTPS only: a vault secret holding a token, handed to git
+                    through GIT_ASKPASS. Only the name is stored.
+  --subdir <path>   The package's directory inside the repo.
+  --entry <file>    The entry file, relative to the package. Default: its
+                    package.json "bin" or "main".
+  --yes             Allow the repo's install/build scripts to run. Asked once
+                    per repo on a TTY; off one, required until the repo is
+                    allowed here. Recorded per repo in
+                    ~/.yaw-mcp/git/consent.json.
+  --project         Write <project>/.yaw-mcp/bundles.json instead.
+  --no-start-check  Skip the one real handshake after the build.
+  -- <args>         Arguments passed to the server.
+  The name is optional when the repo's yaw-mcp.json names a namespace (one
+  another server already uses is refused; give a name instead). With
+  --git, --dry-run only resolves the ref and prints the commit it would pin.
 
   --env KEY=value   Provide a required env var's value. Repeatable. Required
                     vars not given here AND not in your shell block the add.
@@ -125,6 +183,27 @@ export interface AddCommandOptions {
   transport?: "streamable-http" | "sse";
   /** `--description`: free text the BM25 ranker indexes for dispatch. */
   description?: string;
+  /** `--git <url>[#ref]`, already through parseGitSpec. */
+  git?: GitSpec;
+  gitTokenSecret?: string;
+  subdir?: string;
+  entry?: string;
+  /** `--yes`: the consent to run the repo's lifecycle scripts. */
+  yes?: boolean;
+  /** `--project`: write the project's .yaw-mcp/bundles.json. */
+  project?: boolean;
+  noStartCheck?: boolean;
+  /** Server arguments after `--`. */
+  serverArgs?: string[];
+  /** Test seams for the git path: the TTY verdict, canned prompt answers, the
+   *  package-manager runner, the token reader and the start check. */
+  isTTY?: boolean;
+  promptAnswer?: string;
+  io?: { stdin?: NodeJS.ReadableStream; stdout?: NodeJS.WritableStream };
+  runPm?: GitBuildContext["runPm"];
+  resolveToken?: GitBuildContext["resolveToken"];
+  startCheck?: (config: UpstreamServerConfig) => Promise<{ ok: true; tools: number } | { ok: false; error: string }>;
+  storeSecret?: (name: string) => Promise<boolean>;
   home?: string;
   cwd?: string;
   env?: NodeJS.ProcessEnv;
@@ -192,10 +271,55 @@ export function parseAddArgs(
   const opts: AddCommandOptions = {};
   const env: Record<string, string> = {};
   const headers: Record<string, string> = {};
+  const gitOnly: string[] = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const next = (): string | undefined => argv[++i];
+    if (a === "--") {
+      opts.serverArgs = argv.slice(i + 1);
+      gitOnly.push("--");
+      break;
+    }
     switch (a) {
+      case "--git": {
+        const v = next();
+        if (v === undefined) return { ok: false, error: "--git requires a URL" };
+        const parsed = parseGitSpec(v);
+        if (!parsed.ok) return { ok: false, error: parsed.error };
+        opts.git = parsed.spec;
+        break;
+      }
+      case "--git-token-secret": {
+        const v = next();
+        if (!v || !SECRET_NAME_RE.test(v))
+          return { ok: false, error: "--git-token-secret requires a vault secret name" };
+        opts.gitTokenSecret = v;
+        gitOnly.push(a);
+        break;
+      }
+      case "--subdir":
+      case "--entry": {
+        const v = next();
+        if (v === undefined || v.startsWith("-")) return { ok: false, error: `${a} requires a relative path` };
+        const reason = unsafeRelativePathReason(v);
+        if (reason) return { ok: false, error: `${a} ${JSON.stringify(v)} is refused: ${reason}` };
+        if (a === "--subdir") opts.subdir = v;
+        else opts.entry = v;
+        gitOnly.push(a);
+        break;
+      }
+      case "--yes":
+        opts.yes = true;
+        gitOnly.push(a);
+        break;
+      case "--project":
+        opts.project = true;
+        gitOnly.push(a);
+        break;
+      case "--no-start-check":
+        opts.noStartCheck = true;
+        gitOnly.push(a);
+        break;
       case "--env": {
         const e = parseEnvFlag(next(), env);
         if (e) return { ok: false, error: e };
@@ -264,6 +388,29 @@ export function parseAddArgs(
         if (a.startsWith("-")) return { ok: false, error: `Unknown flag: ${a}\n${ADD_USAGE}` };
         positional.push(a);
     }
+  }
+  if (opts.git !== undefined) {
+    if (
+      opts.command !== undefined ||
+      opts.url !== undefined ||
+      Object.keys(headers).length > 0 ||
+      opts.transport !== undefined ||
+      opts.catalogUrl !== undefined
+    ) {
+      return {
+        ok: false,
+        error: "--git cannot be combined with --command, --url, --header, --transport or --catalog.",
+      };
+    }
+    if (positional.length > 1) {
+      return { ok: false, error: `Expected at most one server name, got ${positional.length}.\n${ADD_USAGE}` };
+    }
+    if (Object.keys(env).length > 0) opts.envOverrides = env;
+    if (positional[0] !== undefined) opts.slug = positional[0];
+    return { ok: true, options: opts };
+  }
+  if (gitOnly.length > 0) {
+    return { ok: false, error: `${gitOnly[0]} applies to a git server: pass --git <url>.` };
   }
   const custom = opts.command !== undefined || opts.url !== undefined;
   if (positional.length !== 1) {
@@ -651,6 +798,7 @@ function renderLaunchChange(change: LaunchChange): string {
 }
 
 export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult> {
+  if (opts.git !== undefined) return runAddGit(opts, opts.git);
   const out = opts.out ?? createStreamWriter(process.stdout);
   const err = opts.err ?? createStreamWriter(process.stderr);
   const print = (s = ""): void => out(`${s}\n`);
@@ -1087,9 +1235,400 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
   return { exitCode: 0, written: [res.path] };
 }
 
+// --- add --git ----------------------------------------------------------------
+
+/** Both ends a TTY, as for `remove` -- and never under --json, whose stdout is
+ *  the document. */
+function gitInteractive(opts: AddCommandOptions): boolean {
+  if (opts.json) return false;
+  if (opts.isTTY !== undefined) return opts.isTTY;
+  return Boolean(process.stdin.isTTY) && Boolean(process.stdout.isTTY);
+}
+
+/** The env a git entry is written with: each declared secret as a
+ *  `${secret:NAME}` reference (never a value), a declared default as itself,
+ *  and --env over both. */
+function gitEntryEnv(manifest: GitManifest, overrides: Record<string, string>): Record<string, string> | undefined {
+  const env: Record<string, string> = {};
+  for (const [k, d] of Object.entries(manifest.env ?? {})) {
+    if (d.secret) env[k] = `\${secret:${d.secret}}`;
+    else if (d.default !== undefined) env[k] = d.default;
+    else if (d.required) env[k] = "";
+  }
+  for (const [k, v] of Object.entries(overrides)) {
+    const trimmed = v.trim();
+    if (trimmed !== "") env[k] = trimmed;
+  }
+  return Object.keys(env).length > 0 ? env : undefined;
+}
+
+/** One real handshake: connect, count the tools, disconnect. */
+export async function defaultStartCheck(
+  config: UpstreamServerConfig,
+): Promise<{ ok: true; tools: number } | { ok: false; error: string }> {
+  let conn: Awaited<ReturnType<typeof connectToUpstream>>;
+  try {
+    conn = await connectToUpstream(config);
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
+  }
+  const tools = conn.tools.length;
+  await disconnectFromUpstream(conn).catch(() => {});
+  return { ok: true, tools };
+}
+
+/** `yaw-mcp secrets set` for these names: the real name for one, the command
+ *  shape for several (one name in the command would store just that one). */
+function secretsSetRemedy(names: string[]): string {
+  return names.length === 1 ? `\`yaw-mcp secrets set ${names[0]}\`` : "`yaw-mcp secrets set <name>`, once per name";
+}
+
+/** What to do about a start check that failed. A locked or missing vault is
+ *  fixed in the vault, not in the entry's env. */
+function startRemedy(
+  started: { ok: false; error: string } | { ok: true } | null,
+  namespace: string,
+  missingSecrets: string[],
+): string {
+  if (missingSecrets.length > 0) {
+    return `Store ${missingSecrets.length === 1 ? "its secret" : "its secrets"} with ${secretsSetRemedy(missingSecrets)}, then check with yaw-mcp doctor.`;
+  }
+  if (started !== null && !started.ok && started.error.startsWith("vault locked:")) {
+    return "Set YAW_MCP_VAULT_PASSPHRASE where yaw-mcp runs (the passphrase that unlocks your vault), then check with yaw-mcp doctor.";
+  }
+  return `Set its env (yaw-mcp set ${namespace} env.KEY ...) and check with yaw-mcp doctor.`;
+}
+
+/** A start-check failure cut to the part a reader acts on, safe to print. */
+export function startFailureTail(error: string, secrets: Record<string, string>): string {
+  const text = redactGitOutput(error, secrets).replace(/\s+/g, " ").trim();
+  return (text.length > 400 ? `...${text.slice(-400)}` : text).replace(/[^\x20-\x7e]/g, "?").replace(/\.$/, "");
+}
+
+/** Printable ASCII and newlines: build and git output is a repo's own text,
+ *  and it can carry non-ASCII and terminal control sequences. */
+const asciiText = (s: string): string => s.replace(/\r\n/g, "\n").replace(/[^\x20-\x7e\n]/g, "?");
+
+/** The secret and env bindings a git entry is written with, one line each.
+ *  Never a literal value: it may be a credential. */
+function gitEnvBindingLines(env: Record<string, string> | undefined): string[] {
+  return Object.entries(env ?? {}).map(([k, v]) => {
+    const refs = [...collectSecretRefNames({ [k]: v })];
+    if (refs.length > 0) return `  ${k} <- vault secret ${refs.join(", ")}`;
+    return v === "" ? `  ${k} <- (required; not set)` : `  ${k} <- a value (not shown)`;
+  });
+}
+
+async function runAddGit(opts: AddCommandOptions, spec: GitSpec): Promise<AddCommandResult> {
+  const out = opts.out ?? createStreamWriter(process.stdout);
+  const err = opts.err ?? createStreamWriter(process.stderr);
+  // The --json document is data and goes out as written; everything else is
+  // text for a terminal.
+  const print = (s = ""): void => out(`${opts.json ? s : asciiText(s)}\n`);
+  const printErr = (s: string): void => err(`${asciiText(s)}\n`);
+  // Progress belongs with the result on a terminal, and off stdout under
+  // --json, where stdout is the document.
+  const progress = opts.json ? printErr : print;
+  const warn = (w: string): void => printErr(`warning: ${w}`);
+  const fail = (f: { exitCode: number; message: string }): AddCommandResult => {
+    // Under --json the failure is the result, so it leaves as a document on
+    // stdout as well as the human line on stderr -- zero bytes on stdout used
+    // to mean both "refused" and "worked quietly". Every fail() here runs
+    // BEFORE the success document is printed, so stdout carries exactly one
+    // document either way.
+    if (opts.json)
+      print(JSON.stringify({ ok: false, error: `yaw-mcp add: ${f.message}`, exitCode: f.exitCode }, null, 2));
+    printErr(`yaw-mcp add: ${f.message}`);
+    return { exitCode: f.exitCode, written: [] };
+  };
+  const env = opts.env ?? process.env;
+  const home = opts.home ?? homedir();
+  const cwd = opts.cwd ?? process.cwd();
+  const interactive = gitInteractive(opts);
+
+  if (opts.slug !== undefined && !CATALOG_SLUG_RE.test(opts.slug)) {
+    return fail({ exitCode: 2, message: `invalid name "${opts.slug}" (lowercase letters, digits, and dashes only).` });
+  }
+  const nameNamespace = opts.slug !== undefined ? deriveNamespace(opts.slug) : undefined;
+
+  const prepared = await prepareGit(spec, opts.gitTokenSecret, {
+    home,
+    env,
+    interactive,
+    warn,
+    resolveToken: opts.resolveToken,
+  });
+  if (!prepared.ok) return fail(prepared);
+  if (!(await gitAvailable(prepared.run))) return fail({ exitCode: 2, message: GIT_MISSING_MESSAGE });
+  const resolved = await resolveGitRef(spec, prepared, opts.gitTokenSecret, opts.project === true);
+  if (!resolved.ok) return fail(resolved);
+  const pin = resolved.commit ?? resolved.shortSha ?? "";
+  const kindLabel = { branch: "branch", tag: "tag", sha: "commit", head: "HEAD" }[resolved.kind];
+  progress(`Resolving ${spec.ref ?? "the default branch"} ... ${pin.slice(0, 12)} (${kindLabel})`);
+  const tracking = resolved.kind === "sha" ? "pinned" : `tracking ${resolved.ref}`;
+
+  if (opts.dryRun) {
+    if (opts.json) {
+      print(
+        JSON.stringify(
+          {
+            ok: true,
+            dryRun: true,
+            url: spec.url,
+            ref: resolved.ref,
+            kind: resolved.kind,
+            commit: resolved.commit ?? null,
+            namespace: nameNamespace ?? null,
+          },
+          null,
+          2,
+        ),
+      );
+    } else {
+      const later = resolved.commit ? "" : " (a short SHA; the clone completes it to a full commit)";
+      print(`yaw-mcp add (dry-run): would pin ${spec.url} @ ${pin} (${tracking})${later}`);
+      if (nameNamespace) print(`  as "${nameNamespace}"`);
+      else {
+        print(
+          `  name: from the repo's yaw-mcp.json if it declares a namespace (a dry run does not clone to read it); otherwise pass one: yaw-mcp add <name> --git ${spec.url}`,
+        );
+      }
+    }
+    return { exitCode: 0, written: [] };
+  }
+
+  const build = await buildGitSource(
+    {
+      spec,
+      ref: resolved.ref,
+      commit: pin,
+      ...(nameNamespace ? { namespace: nameNamespace } : {}),
+      ...(opts.subdir ? { subdir: opts.subdir } : {}),
+      ...(opts.entry ? { entry: opts.entry } : {}),
+      ...(opts.gitTokenSecret ? { tokenSecret: opts.gitTokenSecret } : {}),
+    },
+    {
+      home,
+      env,
+      interactive,
+      yes: opts.yes === true,
+      progress,
+      warn,
+      confirm: async (lines) => {
+        for (const l of lines) print(l);
+        const answer = await askYesNo(opts, "Proceed? [Y/n] ");
+        return answer === "" || answer === "y" || answer === "yes";
+      },
+      runPm: opts.runPm,
+      git: prepared,
+    },
+  );
+  if (!build.ok) return fail(build);
+  const namespace = build.namespace;
+  const manifest = build.manifest;
+
+  const entryEnv = gitEntryEnv(manifest, opts.envOverrides ?? {});
+  const git: GitSource = {
+    url: spec.url,
+    ref: resolved.ref,
+    commit: build.commit,
+    ...(build.subdir ? { subdir: build.subdir } : {}),
+    entry: build.entry,
+    ...(opts.gitTokenSecret && spec.protocol === "https" ? { tokenSecret: opts.gitTokenSecret } : {}),
+  };
+  const name = opts.slug ?? namespace;
+  const entry: Partial<UpstreamServerConfig> & { slug?: string } = {
+    id: `local-${namespace}`,
+    name,
+    namespace,
+    ...(opts.slug ? { slug: opts.slug } : {}),
+    type: "local",
+    transport: "stdio",
+    git,
+    ...(opts.serverArgs ? { args: opts.serverArgs } : {}),
+    ...(entryEnv ? { env: entryEnv } : {}),
+    isActive: true,
+    description: opts.description ?? manifest.description,
+  };
+
+  let configDir: string | undefined;
+  if (opts.project) {
+    configDir = (await findProjectConfigDir(cwd, home, env).catch(() => null)) ?? join(cwd, CONFIG_DIRNAME);
+  }
+  // A name the repo chose may not take over an entry the user already has:
+  // the merge would carry that entry's stored env (its credentials) into
+  // this repo's server. Only a name the user typed replaces one -- or the
+  // entry is this same repo and package, whose env it already had.
+  if (opts.slug === undefined) {
+    const preview = await previewUpsertUserBundle(entry, {
+      home,
+      origin: "custom",
+      ...(configDir ? { configDir } : {}),
+    });
+    const was = preview.replacing?.git;
+    const sameRepo =
+      was !== undefined &&
+      normalizeRepoUrl(was.url) === normalizeRepoUrl(spec.url) &&
+      (was.subdir ?? "") === (build.subdir ?? "");
+    if (preview.replaced && !sameRepo) {
+      // Only a typed name that derives this same namespace replaces it.
+      const replace =
+        CATALOG_SLUG_RE.test(namespace) && deriveNamespace(namespace) === namespace
+          ? `To replace it, name it yourself: yaw-mcp add ${namespace} --git ${spec.url}`
+          : `To replace it, remove it first: yaw-mcp remove ${namespace}`;
+      return fail({
+        exitCode: 1,
+        message: `the repo's yaw-mcp.json names this server "${namespace}", and ${localBundlesPath(configDir ?? userConfigDir(home))} already has a server by that name; nothing was written. ${replace}. To keep both, pick another name: yaw-mcp add <name> --git ${spec.url}`,
+      });
+    }
+  }
+
+  // Said every time, consent or --yes or not: these are what the repo's
+  // server is handed at each start.
+  const bindings = gitEnvBindingLines(entryEnv);
+  if (bindings.length > 0) {
+    progress("Env it is written with:");
+    for (const l of bindings) progress(l);
+  }
+
+  // Each secret the entry will reference and the vault lacks is offered once,
+  // through the same `secrets set` path; skipped, the server still asks at
+  // runtime. Read off the env being written, so a --env ref is offered too.
+  if (interactive) {
+    const wanted = [...collectSecretRefNames(entryEnv)];
+    let stored = new Set<string>();
+    try {
+      const vault = await loadVault(vaultPath(home));
+      stored = new Set(vault ? listKeys(vault) : []);
+    } catch {
+      // An unreadable vault offers every secret; `secrets set` reports the cause.
+    }
+    const storeSecret =
+      opts.storeSecret ??
+      (async (secretName: string): Promise<boolean> => {
+        const r = await runSecrets(
+          {
+            action: "set",
+            name: secretName,
+            home,
+            cwd,
+            referenceFollows: true,
+            io: opts.io as SecretsCommandOptions["io"],
+          },
+          { out: (s) => out(s), err: (s) => err(s) },
+        );
+        return r.exitCode === 0;
+      });
+    for (const secretName of wanted.filter((n) => !stored.has(n))) {
+      const answer = await askYesNo(opts, `${secretName} is not in your vault. Store it now? [Y/n] `);
+      if (answer === QUESTION_CANCELLED || (answer !== "" && answer !== "y" && answer !== "yes")) continue;
+      await storeSecret(secretName);
+    }
+  }
+
+  let started: { ok: true; tools: number } | { ok: false; error: string } | null = null;
+  if (!opts.noStartCheck) {
+    const pkgDir = join(build.dir, ...(build.subdir ?? "").split(/[\\/]/).filter(Boolean));
+    // Started with the args and env the write will store, not just the ones
+    // this add brought: a git-over-git re-add (a ref switch) keeps the stored
+    // server args, and the merge keeps stored env values. An unreadable file
+    // fails the write below with its own error; the check then uses this add's.
+    const willStore = await previewUpsertUserBundle(entry, {
+      home,
+      origin: "custom",
+      ...(configDir ? { configDir } : {}),
+    }).then(
+      (p) => p.entry,
+      () => entry,
+    );
+    const storedArgs = Array.isArray(willStore.args) ? willStore.args : [];
+    const checkEnv = willStore.env && Object.keys(willStore.env).length > 0 ? willStore.env : undefined;
+    // No `git` on this config: its activation preflight looks under the real
+    // home, and the build it would look for is the one just made.
+    started = await (opts.startCheck ?? defaultStartCheck)({
+      id: `local-${namespace}`,
+      name,
+      namespace,
+      type: "local",
+      transport: "stdio",
+      command: gitNodeCommand(),
+      args: [join(pkgDir, ...build.entry.split(/[\\/]/)), ...storedArgs],
+      cwd: pkgDir,
+      ...(checkEnv ? { env: checkEnv } : {}),
+      isActive: true,
+    });
+    progress(`Checking it starts ... ${started.ok ? `ok -- ${started.tools} tools` : "failed"}`);
+  }
+
+  let res: Awaited<ReturnType<typeof upsertUserBundle>>;
+  try {
+    res = await upsertUserBundle(entry, { home, origin: "custom", ...(configDir ? { configDir } : {}) });
+  } catch (e) {
+    if (e instanceof BundleCollisionError) for (const w of e.warnings) printErr(`warning: ${w}`);
+    const msg =
+      e instanceof BundleCollisionError
+        ? formatBundleCollision(e.collision, displaySafe)
+        : nameBundlesFileOnce((e as Error).message, localBundlesPath(configDir ?? userConfigDir(home)));
+    return fail({ exitCode: 1, message: msg });
+  }
+  for (const w of res.warnings) warn(w);
+  await recordGitPin(namespace, res.path, build.commit, home, warn);
+  if (res.launchChanged) {
+    printErr(`Note: the entry's launch changed:\n${renderLaunchChange(res.launchChanged)}`);
+  }
+  const written = res.entry;
+  const dangling = await danglingSecretRefs(written, home);
+  const startError = started && !started.ok ? startFailureTail(started.error, prepared.secrets) : null;
+  if (opts.json) {
+    print(
+      JSON.stringify(
+        {
+          ok: true,
+          namespace,
+          path: res.path,
+          replaced: res.replaced,
+          commit: build.commit,
+          reused: build.reused,
+          started: started === null ? null : started.ok,
+          ...(started?.ok ? { tools: started.tools } : {}),
+          ...(startError !== null ? { startError } : {}),
+          ...(res.projectTrust ? { projectTrust: res.projectTrust } : {}),
+          entry: jsonEntry(written),
+        },
+        null,
+        2,
+      ),
+    );
+  } else {
+    if (startError !== null) {
+      print(`Added, but it did not start: ${startError}. ${startRemedy(started, namespace, dangling.missing)}`);
+    } else {
+      print(`${res.replaced ? "Updated" : "Added"} "${namespace}" in ${res.path}`);
+    }
+    print(`  git ${spec.url} @ ${build.commit.slice(0, 7)} (${tracking})`);
+    print(`  Update with: yaw-mcp update ${namespace}`);
+  }
+  if (res.projectTrust === "regranted") {
+    printErr(`Note: ${res.path} was trusted before this edit, so the new contents are trusted too.`);
+  } else if (res.projectTrust === "untrusted") {
+    printErr(`Note: ${res.path} is not trusted on this machine, so it does not load until you run yaw-mcp trust.`);
+  }
+  if (dangling.missing.length > 0) {
+    const one = dangling.missing.length === 1;
+    printErr(
+      `Note: ${dangling.missing.join(", ")} ${one ? "is" : "are"} not in your vault yet; the server asks for ${one ? "it" : "them"} at runtime, or store ${one ? "it" : "each"} with ${secretsSetRemedy(dangling.missing)}.`,
+    );
+  }
+  // The entry IS written (and `written` says so) while the handshake that
+  // proves it launches failed: exit 0 told a script the add was fine when the
+  // server it just added does not start. Same shape update-cmd uses for its
+  // own failed start check -- non-zero, with the remedy already printed above.
+  return { exitCode: startError !== null ? 1 : 0, written: [res.path] };
+}
+
 // --- remove -----------------------------------------------------------------
 
-export const REMOVE_USAGE = `Usage: yaw-mcp remove <slug-or-namespace> [--force]
+export const REMOVE_USAGE = `Usage: yaw-mcp remove <slug-or-namespace> [--force] [--keep-checkout]
 
   Remove a server from your local ~/.yaw-mcp/bundles.json. Accepts the catalog
   slug it was added with (e.g. "brave-search"), its namespace as shown by
@@ -1101,13 +1640,20 @@ export const REMOVE_USAGE = `Usage: yaw-mcp remove <slug-or-namespace> [--force]
   something to remove you are shown the server -- namespace, name, and the
   command or url it launches -- and asked to confirm. A bare Enter is NO.
 
+  A git server's builds under ~/.yaw-mcp/git/<namespace> are deleted with it,
+  except a build another bundles.json on this machine still pins; the
+  confirmation names each one it keeps.
+
   --force, -y, --yes  Skip the confirmation. Required when stdin or stdout
-                      is not a TTY (there is nothing to ask on).`;
+                      is not a TTY (there is nothing to ask on).
+  --keep-checkout     Keep a git server's builds on disk.`;
 
 export interface RemoveCommandOptions {
   target?: string;
   /** Skip the destructive-action confirmation. Required off a TTY. */
   force?: boolean;
+  /** Leave a git server's ~/.yaw-mcp/git/<ns> in place. */
+  keepCheckout?: boolean;
   home?: string;
   cwd?: string;
   /** Environment the command runs under. Only the project-shadow check reads
@@ -1141,6 +1687,10 @@ export function parseRemoveArgs(
     // accepted here rather than making the user remember which verb took which.
     if (a === "--force" || a === "--yes" || a === "-y") {
       opts.force = true;
+      continue;
+    }
+    if (a === "--keep-checkout") {
+      opts.keepCheckout = true;
       continue;
     }
     // Single dash included, not just "--": now that -y is a real flag, a
@@ -1184,6 +1734,10 @@ interface RemovalTarget {
    *  The preview listed env alone, which meant removing a remote server showed
    *  nothing at all about the credential going with it. */
   headerNames: string[];
+  /** A git entry's builds on disk: the ones removal deletes (and their size),
+   *  the ones it keeps because another bundles.json still pins them, and the
+   *  files it could not read (then it deletes none). */
+  checkout?: { dir: string; deletes: string[]; bytes: number; keeps: GitPinnedBuild[]; unreadable: string[] };
 }
 
 /**
@@ -1239,7 +1793,12 @@ async function readRawServers(path: string): Promise<unknown[] | null> {
  * found/uncertain distinction in the return value: nothing ever consumed it,
  * and a flag no caller reads documents an invariant nothing enforces.
  */
-function findRemovalTarget(candidates: string[], servers: unknown[] | null): RemovalTarget | null {
+async function findRemovalTarget(
+  candidates: string[],
+  servers: unknown[] | null,
+  home: string,
+  where: { cwd: string; env: NodeJS.ProcessEnv },
+): Promise<RemovalTarget | null> {
   if (servers === null) return null;
   for (const ns of candidates) {
     // Same predicate as doRemoveUserBundle's filter (s?.namespace !== ns), so
@@ -1264,9 +1823,43 @@ function findRemovalTarget(candidates: string[], servers: unknown[] | null): Rem
       launch: renderLaunch(hit),
       envKeys: Object.keys(env),
       headerNames: Object.keys(headers),
+      ...(isGitEntry(hit) && existsSync(gitCheckoutDir(ns, home))
+        ? { checkout: await checkoutPlan(ns, home, where) }
+        : {}),
     };
   }
   return null;
+}
+
+async function checkoutPlan(
+  ns: string,
+  home: string,
+  where: { cwd: string; env: NodeJS.ProcessEnv },
+): Promise<NonNullable<RemovalTarget["checkout"]>> {
+  const plan = await planGitRemoval(ns, home, localBundlesPath(userConfigDir(home)), where);
+  return {
+    dir: gitCheckoutDir(ns, home),
+    deletes: plan.deletes.map((d) => d.sha12),
+    bytes: plan.deletes.reduce((n, d) => n + d.bytes, 0),
+    keeps: plan.keeps,
+    unreadable: plan.unreadable,
+  };
+}
+
+/** Builds by their short commit, as one list. */
+function buildNames(sha12s: string[]): string {
+  return sha12s.map((s) => s.slice(0, 7)).join(", ");
+}
+
+/** What remove keeps of a git server's builds, and which file still pins each. */
+function keptBuildLines(keeps: GitPinnedBuild[]): string[] {
+  return keeps.map((k) => `keeps ${k.sha12.slice(0, 7)}: still pinned by ${k.files.map(displaySafe).join(", ")}`);
+}
+
+/** A raw entry carrying a git block, the shape the loader launches from it. */
+function isGitEntry(entry: unknown): boolean {
+  const git = (entry as { git?: unknown } | null)?.git;
+  return git !== null && typeof git === "object" && typeof (git as { url?: unknown }).url === "string";
 }
 
 /** How the entry would be launched, as one reviewable line. Mirrors
@@ -1274,7 +1867,15 @@ function findRemovalTarget(candidates: string[], servers: unknown[] | null): Rem
  *  findRemovalTarget) so every field is type-checked before use. The
  *  parameter is typed loosely so a raw bundles.json record and a LaunchShape
  *  (see renderLaunchChange) both fit; the checks below are the contract. */
-function renderLaunch(entry: { command?: unknown; args?: unknown; url?: unknown }): string {
+function renderLaunch(entry: { command?: unknown; args?: unknown; url?: unknown; git?: unknown }): string {
+  // Git first, as the loader lets it win over a command the entry also carries.
+  const git = entry.git !== null && typeof entry.git === "object" ? (entry.git as Record<string, unknown>) : undefined;
+  if (git && typeof git.url === "string" && git.url.length > 0) {
+    const subdir = typeof git.subdir === "string" && git.subdir.length > 0 ? ` (subdir ${displayArg(git.subdir)})` : "";
+    const at =
+      typeof git.commit === "string" && git.commit.length > 0 ? ` @ ${displayArg(git.commit.slice(0, 12))}` : "";
+    return `git ${displaySafe(git.url)}${at}${subdir}`;
+  }
   const command = typeof entry.command === "string" ? entry.command : "";
   const args = Array.isArray(entry.args) ? entry.args.filter((a): a is string => typeof a === "string") : [];
   const parts = [command, ...args].filter((p) => p.length > 0);
@@ -1288,7 +1889,7 @@ function renderLaunch(entry: { command?: unknown; args?: unknown; url?: unknown 
 /** Render the doomed entry. Shared by the TTY prompt and the off-TTY refusal:
  *  a scripted run gets to see what it WOULD have removed before being told
  *  which flag to re-run with (same courtesy as `yaw-mcp trust`). */
-function printRemovalPreview(print: (s?: string) => void, path: string, t: RemovalTarget): void {
+function printRemovalPreview(print: (s?: string) => void, path: string, t: RemovalTarget, keepCheckout: boolean): void {
   print("");
   print(`  Remove from ${displaySafe(path)}:`);
   print("");
@@ -1299,6 +1900,27 @@ function printRemovalPreview(print: (s?: string) => void, path: string, t: Remov
   // NAMES only, like env -- and the line only appears when there are headers,
   // so a local entry's preview is unchanged.
   if (t.headerNames.length > 0) print(`    header names: ${t.headerNames.map(displayArg).join(", ")}`);
+  if (t.checkout) {
+    const c = t.checkout;
+    const size = `${(c.bytes / (1024 * 1024)).toFixed(1)} MB`;
+    if (keepCheckout) {
+      const all = `${(treeSizeBytes(c.dir) / (1024 * 1024)).toFixed(1)} MB`;
+      print(`    checkout:  keeps ${displaySafe(c.dir)} (${all}; --keep-checkout)`);
+    } else if (c.unreadable.length > 0) {
+      print(
+        `    checkout:  deletes nothing under ${displaySafe(c.dir)}: could not read ${c.unreadable.map(displaySafe).join(", ")}`,
+      );
+      for (const line of keptBuildLines(c.keeps)) print(`               ${line}`);
+    } else if (c.keeps.length === 0) {
+      print(`    checkout:  deletes ${displaySafe(c.dir)} (${size})`);
+      if (c.deletes.length > 0) print(`               builds ${buildNames(c.deletes)}`);
+    } else {
+      const n = `${c.deletes.length} build${c.deletes.length === 1 ? "" : "s"}`;
+      print(`    checkout:  deletes ${n} under ${displaySafe(c.dir)} (${size})`);
+      if (c.deletes.length > 0) print(`               deletes ${buildNames(c.deletes)}`);
+      for (const line of keptBuildLines(c.keeps)) print(`               ${line}`);
+    }
+  }
   print("");
   print("  yaw-mcp will stop loading it. Any env value or header stored on the");
   print("  entry goes with it -- and for a remote server the header IS the");
@@ -1380,9 +2002,9 @@ export async function runRemove(opts: RemoveCommandOptions): Promise<AddCommandR
   // user's own, the write below re-reads it anyway, and the worst case of a
   // concurrent edit is an entry `yaw-mcp add` puts straight back.
   if (!opts.force) {
-    const doomed = findRemovalTarget(candidates, rawServers);
+    const doomed = await findRemovalTarget(candidates, rawServers, home, { cwd, env });
     if (doomed) {
-      printRemovalPreview(print, path, doomed);
+      printRemovalPreview(print, path, doomed, opts.keepCheckout === true);
       if (!isInteractive(opts)) {
         // Exit 2, matching `secrets remove`'s off-TTY refusal: a required flag
         // is missing, which is this CLI's usage-error code. (A DECLINED prompt
@@ -1451,6 +2073,51 @@ export async function runRemove(opts: RemoveCommandOptions): Promise<AddCommandR
   print(
     `Removed "${matched}" from ${res.path}. A running yaw-mcp unloads it on its next mcp_connect_* call -- no client restart.`,
   );
+
+  // The raw snapshot says whether the entry was a git one; the builds are
+  // deleted only after the entry is gone, so nothing loads a half-deleted tree.
+  const removedRaw = rawServers?.find((s) => (s as { namespace?: unknown } | null)?.namespace === matched);
+  if (isGitEntry(removedRaw) && !opts.keepCheckout) {
+    const dir = gitCheckoutDir(matched, home);
+    const existed = existsSync(dir);
+    // cwd and env too: the project file found from here is one of the files
+    // whose pins are kept, which is what makes the shadow note below true.
+    const gone = await removeGitCheckout(matched, home, { cwd, env });
+    for (const n of gone.notes) printErr(`warning: ${displaySafe(n)}`);
+    const deleted = (removed: string[]): void => {
+      if (removed.length > 0)
+        print(`Deleted build${removed.length === 1 ? "" : "s"} ${buildNames(removed)} under ${displaySafe(dir)}.`);
+    };
+    if (!gone.ok) {
+      deleted(gone.removed);
+      // Only the builds that failed: the directory may hold builds another
+      // file pins, so deleting all of it is never the advice.
+      if (gone.failed.length > 0) {
+        const paths = gone.failed.map((s) => displaySafe(join(dir, s))).join(", ");
+        printErr(
+          `Note: could not delete ${paths}: ${gone.message} Delete ${gone.failed.length === 1 ? "it" : "them"} once nothing runs from ${gone.failed.length === 1 ? "it" : "them"}.`,
+        );
+      } else {
+        printErr(`Note: its git builds under ${displaySafe(dir)} were left in place: ${gone.message}`);
+      }
+      for (const line of keptBuildLines(gone.kept)) print(`  ${line}`);
+    } else if (gone.unreadable.length > 0) {
+      printErr(`Note: ${displaySafe(gitLivenessWarning(matched, gone.unreadable))}`);
+      for (const line of keptBuildLines(gone.kept)) print(`  ${line}`);
+    } else if (gone.kept.length === 0) {
+      if (existed) {
+        const which =
+          gone.removed.length > 0 ? ` (build${gone.removed.length === 1 ? "" : "s"} ${buildNames(gone.removed)})` : "";
+        print(`Deleted its git checkout at ${displaySafe(dir)}${which}.`);
+      }
+    } else {
+      deleted(gone.removed);
+      print(
+        `Kept under ${displaySafe(dir)}, because another bundles.json pins ${gone.kept.length === 1 ? "it" : "them"}:`,
+      );
+      for (const line of keptBuildLines(gone.kept)) print(`  ${line}`);
+    }
+  }
 
   // Honest warning: a project-local bundles.json shadows the user-global file,
   // so the server may keep loading from there even after this removal.

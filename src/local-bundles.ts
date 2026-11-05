@@ -39,7 +39,7 @@
 // (YAW_MCP_DEFAULT_RUNTIME env > this file's defaultRuntime > unset).
 
 import { createHash } from "node:crypto";
-import { existsSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { chmod, mkdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -49,10 +49,13 @@ import { atomicWriteFile } from "./atomic-write.js";
 // sidecar, ownership-checked release, stale steal by rename) instead of
 // growing a second copy here. See the write-path header for what it buys.
 import { acquireUpgradeLock } from "./auto-upgrade.js";
-import { parseJsonc, stripJsoncComments, stripTrailingCommas } from "./jsonc.js";
+import { editJsoncPath, parseJsonc, stripJsoncComments, stripTrailingCommas } from "./jsonc.js";
 import { log } from "./logger.js";
-import { findProjectConfigDir, userConfigDir } from "./paths.js";
+import { managedNodeBin } from "./oam-spawn.js";
+import { findProjectConfigDir, gitBuildDir, userConfigDir } from "./paths.js";
+import { SECRET_NAME_RE } from "./secrets-vault.js";
 import {
+  grantTrust,
   hashTrustContent,
   isTrustBypassEnabled,
   normalizeTrustKey,
@@ -62,7 +65,7 @@ import {
   trustStatusFor,
   trustStorePath,
 } from "./trust.js";
-import type { ConnectConfig, UpstreamServerConfig } from "./types.js";
+import type { ConnectConfig, GitSource, UpstreamServerConfig } from "./types.js";
 
 /** Canonical filename for the local bundles file. */
 export const BUNDLES_FILENAME = "bundles.json";
@@ -126,10 +129,136 @@ export const HTTP_HEADER_NAME_RE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
  *  rather than corrupted. */
 export const RESERVED_HEADER_NAMES = new Set(["mcp-session-id", "mcp-protocol-version"]);
 
+/** A full git commit id. A short SHA is refused: it names a different commit
+ *  once the repo grows a collision, and the build directory is keyed on it. */
+export const GIT_COMMIT_RE = /^[0-9a-f]{40}$/;
+
+function hasControlChar(s: string): boolean {
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 0x20 || c === 0x7f) return true;
+  }
+  return false;
+}
+
+/** Why `p` cannot be a path relative to a git checkout, or null when it can.
+ *  Both separators count, so `packages\server` written on Windows means the
+ *  same directory everywhere and `..\x` cannot slip past the `..` test. */
+export function unsafeRelativePathReason(p: string): string | null {
+  if (p.trim() === "") return "it is empty";
+  if (hasControlChar(p)) return "it contains control characters";
+  if (p.startsWith("/") || p.startsWith("\\")) return "it is absolute";
+  if (/^[A-Za-z]:/.test(p)) return "it starts with a drive letter";
+  if (p.split(/[\\/]/).includes("..")) return 'it contains a ".." segment';
+  return null;
+}
+
+function relativeSegments(p: string): string[] {
+  return p.split(/[\\/]/).filter((s) => s !== "" && s !== ".");
+}
+
+/** The launch a git entry derives on this machine, or no launch when the entry
+ *  has no pinned commit (there is no build directory to point at). */
+interface GitLaunch {
+  git: GitSource;
+  launch?: { entryPath: string; cwd: string };
+}
+
+/** Shape-check an entry's `git` block. Null means skip the whole entry: a
+ *  malformed block must never fall back to a `command` the same entry carries.
+ *  No warning ever quotes the url -- it is the one field here that can carry a
+ *  credential a hand-edit put in it. */
+function validateGitSource(raw: unknown, namespace: string, warnings: string[], home: string): GitLaunch | null {
+  const skip = (why: string): null => {
+    warnings.push(`bundles.json: skipping "${namespace}": its git ${why}`);
+    return null;
+  };
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return skip("field is not an object");
+  const g = raw as Record<string, unknown>;
+  const url = typeof g.url === "string" ? g.url.trim() : "";
+  if (url === "") return skip("url is missing");
+  if (hasControlChar(url) || url.startsWith("-")) return skip("url is not a usable git URL");
+  let ref: string | undefined;
+  if (g.ref !== undefined) {
+    if (typeof g.ref !== "string" || g.ref.trim() === "" || hasControlChar(g.ref))
+      return skip("ref is not a usable ref");
+    ref = g.ref.trim();
+  }
+  let commit: string | undefined;
+  if (g.commit !== undefined) {
+    const c = typeof g.commit === "string" ? g.commit.trim().toLowerCase() : "";
+    if (!GIT_COMMIT_RE.test(c)) return skip(`commit ${JSON.stringify(g.commit)} is not a full 40-character SHA`);
+    commit = c;
+  }
+  let subdir: string | undefined;
+  if (g.subdir !== undefined) {
+    if (typeof g.subdir !== "string") return skip("subdir is not a string");
+    const reason = unsafeRelativePathReason(g.subdir);
+    if (reason) return skip(`subdir ${JSON.stringify(g.subdir)} is refused: ${reason}`);
+    if (relativeSegments(g.subdir).length > 0) subdir = g.subdir;
+  }
+  if (typeof g.entry !== "string") return skip("entry is missing");
+  const entryReason = unsafeRelativePathReason(g.entry);
+  if (entryReason) return skip(`entry ${JSON.stringify(g.entry)} is refused: ${entryReason}`);
+  if (relativeSegments(g.entry).length === 0) return skip(`entry ${JSON.stringify(g.entry)} names no file`);
+
+  let tokenSecret: string | undefined;
+  if (g.tokenSecret !== undefined) {
+    if (typeof g.tokenSecret !== "string" || !SECRET_NAME_RE.test(g.tokenSecret))
+      return skip("tokenSecret is not a vault secret name");
+    tokenSecret = g.tokenSecret;
+  }
+
+  const git: GitSource = {
+    url,
+    ...(ref ? { ref } : {}),
+    ...(commit ? { commit } : {}),
+    ...(subdir ? { subdir } : {}),
+    entry: g.entry,
+    ...(tokenSecret ? { tokenSecret } : {}),
+  };
+  if (!commit) {
+    warnings.push(
+      `bundles.json: "${namespace}" has no git commit pinned, so it has no build to start. Pin one with: yaw-mcp update ${namespace}`,
+    );
+    return { git };
+  }
+  const cwd = join(gitBuildDir(namespace, commit, home), ...relativeSegments(subdir ?? ""));
+  return { git, launch: { entryPath: join(cwd, ...relativeSegments(g.entry)), cwd } };
+}
+
+/**
+ * The loader's own check of a raw `git` block, for the commands that read one
+ * outside the loader (update, share, the build GC). Null, with the loader's
+ * skip warning pushed, for a block the loader would refuse -- a `..` subdir, an
+ * absolute entry, a short commit. An unpinned block is returned without the
+ * loader's "no commit" note: pinning one is what `update` is for.
+ */
+export function gitSourceFromRaw(raw: unknown, namespace: string, warnings: string[]): GitSource | null {
+  if (!NAMESPACE_RE.test(namespace)) {
+    warnings.push(`bundles.json: skipping server with invalid namespace ${JSON.stringify(namespace)}`);
+    return null;
+  }
+  const scratch: string[] = [];
+  const hit = validateGitSource(raw, namespace, scratch, homedir());
+  if (hit === null) warnings.push(...scratch);
+  return hit?.git ?? null;
+}
+
+/** The node a git entry launches with: the one running yaw-mcp, which is the
+ *  node its build ran npm beside and recorded in the build marker. A bare
+ *  "node" would be whatever PATH finds at spawn time, and a native addon built
+ *  for one node's ABI or arch fails to load under another. Derived at load,
+ *  never stored, so bundles.json stays portable. */
+export function gitNodeCommand(): string {
+  return managedNodeBin() ?? "node";
+}
+
 /** Coerce a raw entry from bundles.json into a strict UpstreamServerConfig.
  *  Returns null when required fields are missing or malformed so the loader
- *  can skip the entry with a warning instead of crashing the whole load. */
-function validateEntry(entry: unknown, warnings: string[]): UpstreamServerConfig | null {
+ *  can skip the entry with a warning instead of crashing the whole load.
+ *  `home` locates the git build directories a `git` entry launches from. */
+function validateEntry(entry: unknown, warnings: string[], home: string): UpstreamServerConfig | null {
   if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
     warnings.push("bundles.json: skipping non-object server entry");
     return null;
@@ -142,6 +271,8 @@ function validateEntry(entry: unknown, warnings: string[]): UpstreamServerConfig
     return null;
   }
   const name = typeof e.name === "string" && e.name.length > 0 ? e.name : namespace;
+  const gitLaunch = e.git === undefined ? undefined : validateGitSource(e.git, namespace, warnings, home);
+  if (gitLaunch === null) return null;
   // Default type to "local" -- bundles.json is the local-mode file by
   // definition. Existing configs use "local" for stdio/spawned
   // servers and "remote" for HTTP/SSE; users can override via the field.
@@ -181,8 +312,8 @@ function validateEntry(entry: unknown, warnings: string[]): UpstreamServerConfig
     );
   }
   const inferredRemote = !typeKnown && typeof e.url === "string" && !hasCommand;
-  const type: "local" | "remote" = e.type === "remote" || inferredRemote ? "remote" : "local";
-  const transport =
+  let type: "local" | "remote" = e.type === "remote" || inferredRemote ? "remote" : "local";
+  let transport =
     e.transport === "streamable-http" || e.transport === "sse" || e.transport === "stdio"
       ? (e.transport as "stdio" | "streamable-http" | "sse")
       : undefined;
@@ -191,8 +322,27 @@ function validateEntry(entry: unknown, warnings: string[]): UpstreamServerConfig
   // here -- the upstream connector will surface a clear error if the
   // entry can't be spawned/dialed. The validator's job is shape, not
   // semantics.
-  const command = typeof e.command === "string" ? e.command : undefined;
-  const args = Array.isArray(e.args) ? e.args.filter((a): a is string => typeof a === "string") : undefined;
+  let command = typeof e.command === "string" ? e.command : undefined;
+  let args = Array.isArray(e.args) ? e.args.filter((a): a is string => typeof a === "string") : undefined;
+  // A git entry is a local stdio server whose launch is DERIVED: the file's
+  // `args` become the server's own arguments after the entry path. Git wins
+  // over a hand-added command or url, out loud, because running the stale
+  // half of a half-converted entry is the failure that would go unnoticed.
+  let cwd: string | undefined;
+  if (gitLaunch) {
+    if (hasCommand || typeof e.url === "string" || e.type === "remote") {
+      warnings.push(`bundles.json: "${namespace}" has both git and command/url/remote type; using git`);
+    }
+    type = "local";
+    if (transport !== "stdio") transport = undefined;
+    if (gitLaunch.launch) {
+      command = gitNodeCommand();
+      args = [gitLaunch.launch.entryPath, ...(args ?? [])];
+      cwd = gitLaunch.launch.cwd;
+    } else {
+      command = undefined;
+    }
+  }
   // String values only -- and DROP blank ones, in SILENCE. `yaw-mcp add` seeds
   // every required key with "" to record the requirement while deliberately
   // NOT persisting the ambient shell value ("" means "nothing stored; the
@@ -261,7 +411,7 @@ function validateEntry(entry: unknown, warnings: string[]): UpstreamServerConfig
       env = kept;
     }
   }
-  const url = typeof e.url === "string" ? e.url : undefined;
+  const url = typeof e.url === "string" && !gitLaunch ? e.url : undefined;
 
   // HTTP headers for a REMOTE server, the channel a remote upstream takes its
   // credential through (types.ts). Same fixed-whitelist rule as every field
@@ -460,6 +610,8 @@ function validateEntry(entry: unknown, warnings: string[]): UpstreamServerConfig
     env,
     url,
     headers,
+    ...(gitLaunch ? { git: gitLaunch.git } : {}),
+    ...(cwd !== undefined ? { cwd } : {}),
     isActive,
     connectTimeoutMs,
     description,
@@ -629,6 +781,34 @@ function parseBundlesContent(path: string, rawBytes: Buffer, warnings: string[])
   return { version, servers: rawServers as Array<Partial<UpstreamServerConfig>>, defaultRuntime };
 }
 
+export type BundlesServersRead =
+  | { kind: "absent" }
+  | { kind: "error"; message: string }
+  | { kind: "ok"; servers: unknown[]; warnings: string[] };
+
+/**
+ * The RAW `servers` array of any bundles.json, read with the loader's parser
+ * and its credential-safe error text (a position, never a source fragment).
+ * Synchronous for the build GC, which re-reads every file that pins a build
+ * while it holds the git lock. Trust is the caller's question: this never
+ * decides whether a project file may be honoured.
+ */
+export function readBundlesServersSync(path: string): BundlesServersRead {
+  let raw: Buffer;
+  try {
+    raw = readFileSync(path);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return { kind: "absent" };
+    if (code === "EISDIR") return { kind: "error", message: `${path}: ${IS_A_DIRECTORY_DETAIL}` };
+    return { kind: "error", message: `cannot read ${path}: ${err instanceof Error ? err.message : String(err)}` };
+  }
+  const warnings: string[] = [];
+  const file = parseBundlesContent(path, raw, warnings);
+  if (file === null) return { kind: "error", message: warnings[0] ?? `${path} could not be parsed` };
+  return { kind: "ok", servers: file.servers, warnings };
+}
+
 /** What a bundles.json would actually contribute if it loaded. Used by
  *  `yaw-mcp trust` to show the user the exact argv they are approving --
  *  it runs the SAME parse + validateEntry the loader runs, so the preview
@@ -640,13 +820,13 @@ export interface BundlePreview {
   warnings: string[];
 }
 
-export function previewBundlesContent(path: string, rawBytes: Buffer): BundlePreview {
+export function previewBundlesContent(path: string, rawBytes: Buffer, home: string = homedir()): BundlePreview {
   const warnings: string[] = [];
   const file = parseBundlesContent(path, rawBytes, warnings);
   if (!file) return { ok: false, servers: [], warnings };
   const servers: UpstreamServerConfig[] = [];
   for (const entry of file.servers) {
-    const validated = validateEntry(entry, warnings);
+    const validated = validateEntry(entry, warnings, home);
     if (validated) servers.push(validated);
   }
   return { ok: true, servers, warnings };
@@ -656,7 +836,8 @@ export function previewBundlesContent(path: string, rawBytes: Buffer): BundlePre
  *  any more -- the hosted backend whose ETag this once stood in for is gone.
  *  Its one remaining reader is server.ts, which folds it into a cache key so
  *  two loads of a byte-identical server list share an entry and any edit to
- *  the list misses. Same servers in, same version out, on every machine. */
+ *  the list misses. Same servers in, same version out, on every machine --
+ *  except a git entry, whose derived launch embeds this machine's home. */
 function hashContent(servers: UpstreamServerConfig[]): string {
   const h = createHash("sha256");
   h.update(JSON.stringify(servers));
@@ -1044,7 +1225,7 @@ export async function loadLocalBundles(
 
   const servers: UpstreamServerConfig[] = [];
   for (const raw of file.servers) {
-    const validated = validateEntry(raw, warnings);
+    const validated = validateEntry(raw, warnings, home);
     if (validated) servers.push(validated);
   }
 
@@ -1168,8 +1349,11 @@ const BUNDLES_LOCK_POLL_MS = 20;
  *  (acquireUpgradeLock probes the recorded pid), so a crashed Yaw Terminal or
  *  `serve` never blocks an add/remove; what reaches the give-up path is a
  *  live-but-stuck holder, and "delete that lock file" is advice for that. */
-export async function withBundlesLock<T>(home: string, fn: () => Promise<T>): Promise<T> {
-  const dir = userConfigDir(home);
+export async function withBundlesLock<T>(
+  home: string,
+  fn: () => Promise<T>,
+  dir: string = userConfigDir(home),
+): Promise<T> {
   // O_EXCL cannot create the sidecar in a dir that does not exist yet, and
   // acquireUpgradeLock reads that ENOENT as "no lock possible, proceed" --
   // which would leave the very first write on a fresh machine unlocked. Born
@@ -1274,8 +1458,11 @@ export function deriveNamespace(name: string): string {
  * stderr right above the "Updated ..." line: the exact shape the loader's
  * untrusted-file path avoids, for the same reason.
  */
-async function readRawUserBundles(home: string, warnings: string[]): Promise<LocalBundlesFile> {
-  const path = localBundlesPath(userConfigDir(home));
+async function readRawUserBundles(
+  home: string,
+  warnings: string[],
+  path: string = localBundlesPath(userConfigDir(home)),
+): Promise<LocalBundlesFile> {
   const r = await readBundlesAt(path, warnings);
   // readBundlesAt already tells absent (exists:false) from present-but-broken,
   // so it is the only existence check. A separate existsSync() beforehand
@@ -1421,6 +1608,23 @@ function mergeServerEntry(
     // come back into use if they ever converted the entry to remote again.
     delete merged.headers;
   }
+  // A git launch is the third exclusive shape. Converting INTO it drops the
+  // stored command (the loader would otherwise warn on every load that git
+  // wins over it), any url and headers, and the old command's args unless the
+  // add brought server args of its own. A git-over-git re-add (a ref switch)
+  // keeps the stored server args: they belong to this server, not to a
+  // replaced launch. Converting OUT of it drops the git block, which would
+  // otherwise keep winning over the new launch.
+  if (incoming.git !== undefined && incoming.command === undefined && incoming.url === undefined) {
+    delete merged.command;
+    if (incoming.args === undefined && base.git === undefined) delete merged.args;
+    delete merged.url;
+    delete merged.headers;
+    if (merged.transport !== undefined && merged.transport !== "stdio") delete merged.transport;
+    if (incoming.type === undefined && merged.type === "remote") delete merged.type;
+  } else if (typeof incoming.command === "string" || typeof incoming.url === "string") {
+    delete merged.git;
+  }
 
   const storedEnv = envStrings(base.env);
   const incomingEnv = envStrings((incoming as Record<string, unknown>).env);
@@ -1466,6 +1670,9 @@ export interface LaunchShape {
   command?: string;
   args?: string[];
   url?: string;
+  /** A git entry's repository and package directory. The commit is left out:
+   *  moving the pin is what `update` is for, not a change of server. */
+  git?: { url: string; subdir?: string };
 }
 
 /** A launch swap an upsert performed (or, from previewUpsertUserBundle,
@@ -1480,6 +1687,11 @@ export interface LaunchChange {
 }
 
 function launchShapeOf(entry: Record<string, unknown>): LaunchShape {
+  // Git first: the loader lets it win over a command the same entry carries.
+  const git = entry.git as Record<string, unknown> | undefined;
+  if (git && typeof git === "object" && typeof git.url === "string" && git.url.length > 0) {
+    return { git: { url: git.url, ...(typeof git.subdir === "string" ? { subdir: git.subdir } : {}) } };
+  }
   if (typeof entry.command === "string" && entry.command.length > 0) {
     const args = Array.isArray(entry.args) ? entry.args.filter((a): a is string => typeof a === "string") : [];
     return { command: entry.command, args };
@@ -1488,7 +1700,13 @@ function launchShapeOf(entry: Record<string, unknown>): LaunchShape {
 }
 
 function sameLaunch(a: LaunchShape, b: LaunchShape): boolean {
-  return a.command === b.command && a.url === b.url && JSON.stringify(a.args ?? []) === JSON.stringify(b.args ?? []);
+  return (
+    a.command === b.command &&
+    a.url === b.url &&
+    JSON.stringify(a.args ?? []) === JSON.stringify(b.args ?? []) &&
+    a.git?.url === b.git?.url &&
+    a.git?.subdir === b.git?.subdir
+  );
 }
 
 /** Where an incoming entry's `slug` came from. A catalog add stamps the slug
@@ -1556,6 +1774,10 @@ export interface UpsertUserBundleResult {
   launchChanged?: LaunchChange;
   /** Non-fatal read diagnostics (see readRawUserBundles); print as `warning: ...`. */
   warnings: string[];
+  /** Only for a `configDir` (project) write: "regranted" when the file was
+   *  trusted just before the edit and the written bytes were trusted in turn;
+   *  "untrusted" when it was not, so it stays unloaded until `yaw-mcp trust`. */
+  projectTrust?: "regranted" | "untrusted";
 }
 
 export interface RemoveUserBundleResult {
@@ -1630,6 +1852,11 @@ export interface UpsertOptions {
   home?: string;
   /** See upsertUserBundle. */
   origin?: UpsertOrigin;
+  /** Write `<configDir>/bundles.json` (a project's `.yaw-mcp/`) instead of the
+   *  user-global file. The write never widens trust: the new bytes are
+   *  re-granted only when the bytes they replace were trusted (see
+   *  UpsertUserBundleResult.projectTrust). */
+  configDir?: string;
 }
 
 /** How doUpsertUserBundle will treat `entry` against the given on-disk
@@ -1692,7 +1919,8 @@ function resolveUpsertTarget(
   // the exact swap this note exists to make loud, in the direction that
   // became reachable when `add --url` shipped.
   let launchChanged: LaunchChange | undefined;
-  const incomingHasLaunch = typeof incoming.command === "string" || typeof incoming.url === "string";
+  const incomingHasLaunch =
+    typeof incoming.command === "string" || typeof incoming.url === "string" || incoming.git !== undefined;
   if (incomingHasLaunch) {
     const from = launchShapeOf(stored);
     const to = launchShapeOf(incoming);
@@ -1765,7 +1993,9 @@ export async function previewUpsertUserBundle(
 }> {
   const home = opts.home ?? homedir();
   const warnings: string[] = [];
-  const file = await readRawUserBundles(home, warnings);
+  // The file the write would edit: a project file under --project.
+  const path = opts.configDir !== undefined ? localBundlesPath(opts.configDir) : undefined;
+  const file = await readRawUserBundles(home, warnings, path);
   const target = resolveUpsertTarget(file.servers, entry, opts.origin ?? "catalog");
   return {
     replaced: target.idx >= 0,
@@ -1783,30 +2013,143 @@ async function doUpsertUserBundle(
   opts: UpsertOptions,
 ): Promise<UpsertUserBundleResult> {
   const home = opts.home ?? homedir();
-  const path = localBundlesPath(userConfigDir(home));
+  const dir = opts.configDir ?? userConfigDir(home);
+  const path = localBundlesPath(dir);
   // The read is INSIDE the lock: a snapshot taken before acquiring it is the
   // stale one the lock exists to keep from being written back.
-  return withBundlesLock(home, async () => {
-    const warnings: string[] = [];
-    const file = await readRawUserBundles(home, warnings);
-    const target = resolveUpsertTarget(file.servers, entry, opts.origin ?? "catalog");
-    if (target.refusal) throw new BundleCollisionError(target.refusal, warnings);
-    const idx = target.idx;
-    const replaced = idx >= 0;
-    // The fold itself lives in mergedUpsertEntry so `add --dry-run` runs the
-    // identical merge -- see previewUpsertUserBundle.
-    const written = mergedUpsertEntry(file.servers, entry, target);
-    if (replaced) file.servers[idx] = written;
-    else file.servers.push(written);
-    // `file.version` is written back exactly as readRawUserBundles produced
-    // it: it already preserves a newer on-disk version rather than
-    // downgrading it, and already stamps CURRENT for the absent-file and
-    // version-less cases. A `?? CURRENT` here used to look like the
-    // defaulting step, but it could never fire -- both of that function's
-    // returns carry a number.
-    await writeBundlesFile(path, file);
-    return { path, replaced, entry: written, launchChanged: target.launchChanged, warnings };
-  });
+  return withBundlesLock(
+    home,
+    async () => {
+      const warnings: string[] = [];
+      // The trust verdict is taken on the bytes this write replaces, read under
+      // the same lock, so an edit made between the check and the write cannot
+      // be re-granted along with ours.
+      const trustedBefore = opts.configDir !== undefined && (await bytesAreTrusted(path, home));
+      const file = await readRawUserBundles(home, warnings, path);
+      const target = resolveUpsertTarget(file.servers, entry, opts.origin ?? "catalog");
+      if (target.refusal) throw new BundleCollisionError(target.refusal, warnings);
+      const idx = target.idx;
+      const replaced = idx >= 0;
+      // The fold itself lives in mergedUpsertEntry so `add --dry-run` runs the
+      // identical merge -- see previewUpsertUserBundle.
+      const written = mergedUpsertEntry(file.servers, entry, target);
+      if (replaced) file.servers[idx] = written;
+      else file.servers.push(written);
+      // `file.version` is written back exactly as readRawUserBundles produced
+      // it: it already preserves a newer on-disk version rather than
+      // downgrading it, and already stamps CURRENT for the absent-file and
+      // version-less cases. A `?? CURRENT` here used to look like the
+      // defaulting step, but it could never fire -- both of that function's
+      // returns carry a number.
+      const contents = await writeBundlesFile(path, file);
+      let projectTrust: UpsertUserBundleResult["projectTrust"];
+      if (opts.configDir !== undefined) {
+        projectTrust = "untrusted";
+        if (trustedBefore) {
+          await grantTrust(path, contents, { home });
+          projectTrust = "regranted";
+        }
+      }
+      return {
+        path,
+        replaced,
+        entry: written,
+        launchChanged: target.launchChanged,
+        warnings,
+        ...(projectTrust ? { projectTrust } : {}),
+      };
+    },
+    dir,
+  );
+}
+
+export interface GitPinPatch {
+  /** Absent: the pin stays, as for a new token on a tag-pinned entry. */
+  commit?: string;
+  ref?: string;
+  tokenSecret?: string;
+}
+
+export interface GitPinResult {
+  path: string;
+  /** As on UpsertUserBundleResult: set only for a `configDir` write. */
+  projectTrust?: "regranted" | "untrusted";
+}
+
+/**
+ * Move one git entry's pin: `git.commit`, and `git.ref` / `git.tokenSecret`
+ * when given, spliced in with editJsoncPath so comments and every other byte
+ * survive. Refuses (throws, nothing written) when the entry's commit is no
+ * longer `expectedCommit` -- another writer moved it since `update` read it.
+ * A project file trusted just before the edit is re-granted for the bytes
+ * written here; otherwise it stays untrusted.
+ */
+export function updateGitPin(
+  namespace: string,
+  expectedCommit: string | undefined,
+  patch: GitPinPatch,
+  opts: { home?: string; configDir?: string } = {},
+): Promise<GitPinResult> {
+  const home = opts.home ?? homedir();
+  const dir = opts.configDir ?? userConfigDir(home);
+  const path = localBundlesPath(dir);
+  return serializeBundleWrite(() =>
+    withBundlesLock(
+      home,
+      async () => {
+        const trustedBefore = opts.configDir !== undefined && (await bytesAreTrusted(path, home));
+        const raw = await readFile(path, "utf8");
+        const servers = (parseJsonc(raw) as { servers?: unknown } | null)?.servers;
+        if (!Array.isArray(servers)) throw new Error(`${path} has no "servers" array; nothing was written.`);
+        const idx = servers.findIndex((s) => (s as { namespace?: unknown } | null)?.namespace === namespace);
+        const git = (servers[idx] as { git?: unknown } | undefined)?.git;
+        if (idx < 0 || !git || typeof git !== "object" || Array.isArray(git)) {
+          throw new Error(`"${namespace}" is no longer a git server in ${path}; nothing was written.`);
+        }
+        const rawCommit = (git as { commit?: unknown }).commit;
+        // The readers hand back the loader's normalized spelling.
+        const current = typeof rawCommit === "string" ? rawCommit.trim().toLowerCase() : rawCommit;
+        if (current !== expectedCommit) {
+          throw new Error(
+            `"${namespace}" changed in ${path} since it was read; nothing was written. Re-run yaw-mcp update.`,
+          );
+        }
+        let text = raw;
+        if (patch.commit !== undefined) text = editJsoncPath(text, ["servers", idx, "git", "commit"], patch.commit);
+        if (patch.ref !== undefined) text = editJsoncPath(text, ["servers", idx, "git", "ref"], patch.ref);
+        if (patch.tokenSecret !== undefined) {
+          text = editJsoncPath(text, ["servers", idx, "git", "tokenSecret"], patch.tokenSecret);
+        }
+        await atomicWriteFile(path, text, "utf8", 0o600, 0o700);
+        let projectTrust: GitPinResult["projectTrust"];
+        if (opts.configDir !== undefined) {
+          projectTrust = "untrusted";
+          if (trustedBefore) {
+            await grantTrust(path, text, { home });
+            projectTrust = "regranted";
+          }
+        }
+        return { path, ...(projectTrust ? { projectTrust } : {}) };
+      },
+      dir,
+    ),
+  );
+}
+
+/** Do the bytes at `path` hold a current trust grant? False for a missing file,
+ *  an unreadable one, or an unusable store. */
+export async function bytesAreTrusted(path: string, home: string): Promise<boolean> {
+  let raw: Buffer;
+  try {
+    raw = await readFile(path);
+  } catch {
+    return false;
+  }
+  try {
+    return trustStatusFor(path, raw, await readTrustStore(home)) === "trusted";
+  } catch {
+    return false;
+  }
 }
 
 /** The one serialize-and-write for the user-global bundles.json, shared by
@@ -1824,8 +2167,9 @@ async function doUpsertUserBundle(
  *  from the user profile. That is also why the chmod below is POSIX-gated
  *  rather than best-effort everywhere: on Windows it is not a fallback
  *  that might work, it is a call that provably does nothing. */
-async function writeBundlesFile(path: string, file: LocalBundlesFile): Promise<void> {
-  await atomicWriteFile(path, `${JSON.stringify(file, null, 2)}\n`, "utf8", 0o600, 0o700);
+async function writeBundlesFile(path: string, file: LocalBundlesFile): Promise<string> {
+  const contents = `${JSON.stringify(file, null, 2)}\n`;
+  await atomicWriteFile(path, contents, "utf8", 0o600, 0o700);
   if (process.platform !== "win32") {
     try {
       await chmod(path, 0o600);
@@ -1833,6 +2177,7 @@ async function writeBundlesFile(path: string, file: LocalBundlesFile): Promise<v
       // chmod not supported on this filesystem; not fatal.
     }
   }
+  return contents;
 }
 
 /**

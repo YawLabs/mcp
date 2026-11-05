@@ -1,4 +1,5 @@
-import { cpus } from "node:os";
+import { readFile } from "node:fs/promises";
+import { cpus, homedir } from "node:os";
 import { StringDecoder } from "node:string_decoder";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
@@ -23,6 +24,7 @@ import {
 import { bundlesFileHint } from "./bundles-hint.js";
 import { isCredentialEnvName } from "./credentials.js";
 import { defaultRuntime } from "./default-runtime.js";
+import { gitEntryBuilt } from "./git-build-state.js";
 import {
   INTERNAL_SECRET_ENV_KEYS,
   scrubInternalSecretsFromProcessEnv,
@@ -30,6 +32,7 @@ import {
 } from "./internal-secret-env.js";
 import { log } from "./logger.js";
 import { oamHeapOomHint, probeOam, resolveManagedSpawn, resolveOamSpawn } from "./oam-spawn.js";
+import { gitFailedPath } from "./paths.js";
 import { appendAuditEvent } from "./secrets-audit.js";
 import {
   checkVaultPassphrase,
@@ -956,7 +959,7 @@ function credentialShapedParentEnv(): Record<string, string> {
  * TODO. Values are matched by exact substring either way; nothing here
  * inspects the child's stderr for credential SHAPES.
  */
-function redactSecretsInOutput(text: string, env: Record<string, string>): string {
+export function redactSecretsInOutput(text: string, env: Record<string, string>): string {
   let out = text;
   // Expand each value into its variant list (secretMatchVariants) and treat
   // every variant as a plain extra entry under the SAME key, so a hit still
@@ -1086,6 +1089,97 @@ function withConfigPointer(message: string, config: UpstreamServerConfig): strin
   // stderr log, and a `->` survives a Windows console codepage where the
   // Unicode arrow renders as mojibake and then gets pasted into bug reports.
   return `${message} -> Fix "${config.namespace}" in ${bundlesFileHint("defines-it")}, then activate it again -- the edit is picked up on the next mcp_connect_* call, with no client restart.`;
+}
+
+/** The longest failed-build tail an activation error quotes. The full record
+ *  stays in the `.failed` file; this is the part a reader acts on. */
+const GIT_FAILED_TAIL_CAP = 600;
+
+/** A quoted failed-build tail inside the cap: BOTH ends. Capping only the end
+ *  cut off the headline -- an npm ERESOLVE header or the first "error:"
+ *  line arrives before pages of dependency noise, and the trailing lines
+ *  carry the final fatal. Keeping half of each means the reason a build
+ *  failed is named whatever end a given tool reports it at. */
+function quotedFailedTail(tail: string): string {
+  const t = tail.trim();
+  if (t.length <= GIT_FAILED_TAIL_CAP) return t;
+  const half = Math.floor((GIT_FAILED_TAIL_CAP - 5) / 2); // room for "\n...\n"
+  return `${t.slice(0, half)}\n...\n${t.slice(-half)}`;
+}
+
+/** A `.failed` record's step and tail, or null when there is none or it is not
+ *  the shape a failed build writes. Printable ASCII and newlines only: the tail
+ *  is a build tool's output, and it lands in text a terminal and an LLM read. */
+export async function readGitFailedRecord(file: string): Promise<{ step: string; tail: string } | null> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await readFile(file, "utf8"));
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object") return null;
+  const { step, tail } = parsed as { step?: unknown; tail?: unknown };
+  if (typeof step !== "string" || typeof tail !== "string") return null;
+  const ascii = (s: string): string => s.replace(/[^\n\x20-\x7e]/g, "?");
+  return { step: ascii(step), tail: ascii(quotedFailedTail(tail)) };
+}
+
+/**
+ * Why a git entry has nothing to launch on this machine, or null when its build
+ * is ready (or the entry is not a git entry). A build is ready only once its
+ * `<sha12>.built` marker is valid (git-build-state.ts readBuildMarker) -- the
+ * build writes it last, outside the checkout.
+ *
+ * Reads at most two files and spawns nothing: cloning or building runs repo
+ * code, which only ever happens behind an explicit consent, never on an
+ * activate or a prewarm.
+ */
+export async function gitBuildMissing(
+  config: UpstreamServerConfig,
+  home?: string,
+  /** False when the repo has no script consent on this machine: the hint then
+   *  says a non-interactive run needs --yes. Left out where it is not known. */
+  consented?: boolean,
+): Promise<string | null> {
+  const git = config.git;
+  if (!git) return null;
+  const ns = config.namespace;
+  if (!git.commit) {
+    return `"${ns}" is a git server with no pinned commit, so there is no build to start. Pin one with: yaw-mcp update ${ns}`;
+  }
+  if (gitEntryBuilt(ns, git, home)) return null;
+  let message = `"${ns}" is not built on this machine (git ${git.commit.slice(0, 7)}). Run: yaw-mcp sidecars install`;
+  if (consented === false) {
+    message +=
+      " (off a TTY: yaw-mcp sidecars install --yes, which allows the repo's install and build scripts to run, asked once per repo)";
+  }
+  const failed = await readGitFailedRecord(gitFailedPath(ns, git.commit, home));
+  if (failed) message += `. Its last build failed at ${failed.step}: ${failed.tail}`;
+  return message;
+}
+
+/** Whether a git entry's repo may run its scripts here, for the not-built hint;
+ *  undefined for any other entry. Imported on demand: git-source.ts imports
+ *  this module, so a static import back would be a cycle. Only reached for a
+ *  git entry, and gitBuildMissing reads it only when the build is missing. */
+async function gitRepoConsented(config: UpstreamServerConfig): Promise<boolean | undefined> {
+  if (!config.git?.commit || gitEntryBuilt(config.namespace, config.git)) return undefined;
+  const { hasRepoConsent } = await import("./git-source.js");
+  return hasRepoConsent(config.git.url, homedir());
+}
+
+/** Record that the file this activation loaded from uses the build: the only
+ *  record a project honoured through YAW_MCP_TRUST_PROJECT outside the cwd
+ *  would otherwise get. A hint for GC (which derives what is live from the
+ *  files themselves), never a reason to fail the activation; it never waits
+ *  for the git lock. Imported on demand, as above. */
+async function recordActivatedGitPin(namespace: string, commit: string): Promise<void> {
+  try {
+    const { recordLoadedGitPin } = await import("./git-source.js");
+    await recordLoadedGitPin(namespace, commit, { home: homedir(), cwd: process.cwd() });
+  } catch (e) {
+    log("debug", "Could not record the git build an activation uses", { namespace, error: (e as Error).message });
+  }
 }
 
 /** The libuv code of a spawn the OS refused because of the FILE, not because
@@ -1640,6 +1734,11 @@ async function connectToUpstreamOnce(
   let spawnedCommand = config.command;
 
   if (config.type === "local") {
+    // Ahead of the command check: a git entry with no pinned commit has no
+    // derived command, and "command is required" would name the wrong fix.
+    const notBuilt = await gitBuildMissing(config, undefined, await gitRepoConsented(config));
+    if (notBuilt !== null) throw new ActivationError(withConfigPointer(notBuilt, config), "install_failure");
+    if (config.git?.commit) await recordActivatedGitPin(config.namespace, config.git.commit);
     if (!config.command) {
       throw new Error("command is required for local servers");
     }
@@ -1792,6 +1891,7 @@ async function connectToUpstreamOnce(
       args: resolved.args,
       env: { ...parentEnv, ...serverEnv } as Record<string, string>,
       stderr: "pipe",
+      ...(config.cwd !== undefined ? { cwd: config.cwd } : {}),
     });
     // Attach the stderr listener *before* the transport is started so we
     // never lose the earliest output (install errors, missing-env errors,
