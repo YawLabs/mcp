@@ -1095,3 +1095,28 @@ describe("add collisions and project trust", () => {
     expect(existsSync(join(home, ".yaw-mcp", "bundles.json"))).toBe(false);
   }, 180_000);
 });
+
+describe("add --json refusals", () => {
+  it("an off-TTY consent refusal leaves a document on stdout", async () => {
+    const repo = makeRepo(NPM_FILES);
+    const r = await add(["fx", "--git", repo.url, "--no-start-check", "--json"]);
+    expect(r.exitCode).toBe(2);
+    const doc = JSON.parse(r.out);
+    expect(doc.ok).toBe(false);
+    expect(doc.exitCode).toBe(2);
+    expect(String(doc.error)).toContain("re-run with --yes");
+    expect(r.err).toContain("Not a TTY");
+    expect(existsSync(join(gitRoot(home), "fx"))).toBe(false);
+  }, 120_000);
+
+  it("an unknown ref under --json leaves a document on stdout", async () => {
+    const repo = makeRepo(NPM_FILES);
+    const r = await add(["fx", "--git", `${repo.url}#nope`, "--yes", "--json"]);
+    expect(r.exitCode).toBe(1);
+    const doc = JSON.parse(r.out);
+    expect(doc.ok).toBe(false);
+    expect(doc.exitCode).toBe(1);
+    expect(String(doc.error)).toContain('ref "nope" not found');
+    expect(r.err).toContain("yaw-mcp add:");
+  }, 120_000);
+});

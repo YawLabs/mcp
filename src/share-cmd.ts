@@ -189,6 +189,11 @@ export async function runShare(opts: ShareCommandOptions): Promise<{ exitCode: n
   const err = opts.err ?? createStreamWriter(process.stderr);
   const print = (s = ""): void => out(`${s.replace(/[^\x20-\x7e\n]/g, "?")}\n`);
   const fail = (exitCode: number, message: string): { exitCode: number } => {
+    // Under --json the refusal is the result: stdout gets the document (same
+    // print/sanitizer path the success doc uses), stderr keeps the human
+    // line. share's refusals are selection failures, so nothing has been
+    // rendered yet and the doc is the whole stdout.
+    if (opts.json === true) print(JSON.stringify({ ok: false, error: `yaw-mcp share: ${message}`, exitCode }, null, 2));
     err(`yaw-mcp share: ${message.replace(/[^\x20-\x7e\n]/g, "?")}\n`);
     return { exitCode };
   };

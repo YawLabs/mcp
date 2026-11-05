@@ -203,6 +203,18 @@ describe("CLI dispatch -- argv errors go to stderr and exit 2", () => {
     expect(r.stdout).toBe("");
   });
 
+  it("an argv error under --json leaves a parseable document on stdout, usage on stderr", () => {
+    // A script piping stdout to a JSON parser must not receive zero bytes on
+    // a usage failure; the human-readable usage stays on stderr as before.
+    const r = runCli(["sidecars", "--wat", "--json"]);
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain("--wat");
+    const doc = JSON.parse(r.stdout);
+    expect(doc.ok).toBe(false);
+    expect(doc.exitCode).toBe(2);
+    expect(String(doc.error)).toContain("--wat");
+  });
+
   it("threads --force through the hand-rolled reset-learning branch", () => {
     // Drives the REAL dispatcher on purpose. reset-learning does not ride the
     // generic run(...) tail that threads parsed options into a runner -- its

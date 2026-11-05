@@ -118,8 +118,20 @@ function run<T>(
   runner: (options: T) => Promise<{ exitCode: number } | number>,
 ): void {
   if (!parsed.ok) {
-    (parsed.help ? process.stdout : process.stderr).write(`${parsed.error}\n`);
-    process.exitCode = parsed.help ? 0 : 2;
+    if (parsed.help || !process.argv.includes("--json")) {
+      (parsed.help ? process.stdout : process.stderr).write(`${parsed.error}\n`);
+      process.exitCode = parsed.help ? 0 : 2;
+      return;
+    }
+    // An argv error under --json still gets a DOCUMENT: a script piping stdout
+    // to a parser must not receive zero bytes on a usage failure. The usage
+    // body keeps going to stderr unchanged (the human-readable side), and the
+    // exit code stays 2. Detected from argv rather than the parsed options
+    // because a parser that rejected `--json` itself (or one that never
+    // consumes it) must still be able to report in kind.
+    process.stdout.write(`${JSON.stringify({ ok: false, error: parsed.error, exitCode: 2 }, null, 2)}\n`);
+    process.stderr.write(`${parsed.error}\n`);
+    process.exitCode = 2;
     return;
   }
   dispatch(cmd, runner(parsed.options));

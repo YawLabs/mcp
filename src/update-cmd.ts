@@ -376,6 +376,11 @@ export async function runUpdate(opts: UpdateCommandOptions = {}): Promise<{ exit
   const interactive = interactiveFor(opts);
   const now = opts.now ?? (() => new Date());
   const fail = (exitCode: number, message: string): { exitCode: number } => {
+    // Under --json the failure is the result, so it leaves as a document on
+    // stdout alongside the human line on stderr -- a caller must not have to
+    // tell an empty stdout apart from a silent success. No entry has been
+    // touched at any point fail() is reachable, so the doc stays truthful.
+    if (opts.json) print(JSON.stringify({ ok: false, error: `yaw-mcp update: ${message}`, exitCode }, null, 2));
     printErr(`yaw-mcp update: ${message}`);
     return { exitCode };
   };

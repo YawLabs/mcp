@@ -309,3 +309,19 @@ describe("otherProtocolUrl", () => {
     expect(conv("ssh://git@github.com:2222/acme/x.git")).toBeNull();
   });
 });
+
+describe("share --json refusals", () => {
+  it("a name that misses leaves a document on stdout and the message on stderr", async () => {
+    // stdout used to be zero bytes on this refusal, which a script piping to
+    // a JSON parser reads as an empty/invalid document.
+    writeEntry(entry("acme_crm", "1111111111111111111111111111111111111111"));
+    const r = await share(["nope", "--json"]);
+    expect(r.exitCode).toBe(1);
+    const doc = JSON.parse(out.join(""));
+    expect(doc.ok).toBe(false);
+    expect(doc.exitCode).toBe(1);
+    expect(String(doc.error)).toContain("yaw-mcp share:");
+    expect(String(doc.error)).toContain("no server named");
+    expect(err.join("")).toContain("yaw-mcp share:");
+  });
+});

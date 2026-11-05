@@ -28,6 +28,10 @@ Matching now folds plurals and common suffixes ("pull requests" matches "pull re
 
 A server is auto-loaded only when enough of the request's meaningful words match it. General questions ("what is the capital of France") and requests for products that are not installed no longer start a server. Dispatch is unaffected: it still loads its best match, and now says when that match is weak and names the runner-up.
 
+**Changed -- a failure under `--json` prints a document instead of an empty stdout**
+
+`add`, `update`, `share` and an argv error now emit `{"ok": false, "error": "...", "exitCode": n}` on stdout when they refuse under `--json`, where stdout used to be zero bytes -- indistinguishable from a success a script had to parse to notice. The human-readable line stays on stderr and exit codes are unchanged (2 for usage/consent, 1 for failure), and the rest of the document shapes are untouched.
+
 **Added -- dispatch falls back to a close runner-up when its pick fails to start**
 
 When the chosen server fails to start, dispatch tries the next candidate if it scored within 1.3x of the failed one and the failed one matched enough of the request's words to be a confident pick, and says which server failed and which was loaded instead. Otherwise the failure is returned as before, so a request for a product that is not installed no longer loads an unrelated server.

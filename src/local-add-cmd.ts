@@ -1331,6 +1331,13 @@ async function runAddGit(opts: AddCommandOptions, spec: GitSpec): Promise<AddCom
   const progress = opts.json ? printErr : print;
   const warn = (w: string): void => printErr(`warning: ${w}`);
   const fail = (f: { exitCode: number; message: string }): AddCommandResult => {
+    // Under --json the failure is the result, so it leaves as a document on
+    // stdout as well as the human line on stderr -- zero bytes on stdout used
+    // to mean both "refused" and "worked quietly". Every fail() here runs
+    // BEFORE the success document is printed, so stdout carries exactly one
+    // document either way.
+    if (opts.json)
+      print(JSON.stringify({ ok: false, error: `yaw-mcp add: ${f.message}`, exitCode: f.exitCode }, null, 2));
     printErr(`yaw-mcp add: ${f.message}`);
     return { exitCode: f.exitCode, written: [] };
   };

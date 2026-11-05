@@ -1100,3 +1100,17 @@ describe("rollback guards, host rebuild, state and lock edges", () => {
     }
   }, 240_000);
 });
+
+describe("update --json failures", () => {
+  it("a failure before any entry is touched leaves a document on stdout", async () => {
+    // The document is data; the human line stays on stderr. A caller must not
+    // have to tell an empty stdout apart from a silent success.
+    const r = await update(["nope", "--json"]);
+    expect(r.exitCode).toBe(1);
+    const doc = JSON.parse(out.join(""));
+    expect(doc.ok).toBe(false);
+    expect(doc.exitCode).toBe(1);
+    expect(String(doc.error)).toContain("yaw-mcp update:");
+    expect(err.join("")).toContain("yaw-mcp update:");
+  });
+});
