@@ -135,6 +135,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { atomicWriteFile } from "./atomic-write.js";
+import { gitEntryBuilt } from "./git-build-state.js";
 import { loadLocalBundles } from "./local-bundles.js";
 import { log } from "./logger.js";
 import { compareVersions } from "./oam-spawn.js";
@@ -151,7 +152,7 @@ import {
   type SidecarSpec,
   type SidecarsInstallOptions,
 } from "./sidecars-cmd.js";
-import type { UpstreamServerConfig } from "./types.js";
+import type { GitSource, UpstreamServerConfig } from "./types.js";
 
 /** How long a completed check suppresses the next one. A day: sidecar releases
  *  land on the order of days, and the cost of checking is N registry round
@@ -458,6 +459,32 @@ export function backgroundInstallOptions(home: string): SidecarsInstallOptions {
   };
 }
 
+/** What the refresh's completion log must also say when the user file holds a
+ *  git server that is not built on this machine: null when there is nothing to
+ *  add. The refresh runs with buildGit:false (a git build runs repo code, which
+ *  nothing does from `serve`), so a refresh reporting success says nothing
+ *  about git entries -- this is what stops "complete" from reading as
+ *  "everything is ready". Read-only, and it never throws: the note must not
+ *  fail the refresh it describes. */
+export async function unbuiltGitNote(home: string): Promise<{ message: string; namespaces: string[] } | null> {
+  let servers: { namespace: string; git?: GitSource }[] = [];
+  try {
+    const bundles = await loadLocalBundles({ cwd: home, home });
+    servers = (bundles.config?.servers ?? []) as { namespace: string; git?: GitSource }[];
+  } catch {
+    return null;
+  }
+  const namespaces = servers
+    .filter((s) => s.git !== undefined && !gitEntryBuilt(s.namespace, s.git, home))
+    .map((s) => s.namespace);
+  if (namespaces.length === 0) return null;
+  const one = namespaces.length === 1;
+  return {
+    message: `yaw-mcp sidecar refresh: ${one ? "1 git server is" : `${namespaces.length} git servers are`} not built on this machine; run \`yaw-mcp sidecars install\` (a git build runs repo code, so the refresh never builds one)`,
+    namespaces,
+  };
+}
+
 /** Run the refresh in the background and release the lock when it settles.
  *
  *  `stale` is here for the log line and for a test to assert on -- it is NOT a
@@ -495,6 +522,14 @@ function defaultSpawnRefresh(stale: SidecarSpec[], onDone: () => void, home: str
           refreshed: stale.map((s) => s.pkg),
           installed: result.installed.map((i) => `${i.pkg}@${i.version ?? "?"}`),
         });
+        // buildGit:false means a clean refresh is NOT a clean tree: git
+        // servers are never built from `serve`. Name them instead of letting
+        // "complete" read as "everything is ready". One log line, as designed
+        // -- a background task has no other channel, and the remedy is the
+        // command a human can run. The judgement lives in unbuiltGitNote,
+        // which is where a test can reach it; this is the logging only.
+        const note = await unbuiltGitNote(home);
+        if (note !== null) log("info", note.message, { namespaces: note.namespaces });
       } else {
         // stdio was ignored, so the underlying npm error is not recoverable
         // here. Name the manual command rather than pretending to diagnose.

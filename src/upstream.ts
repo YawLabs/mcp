@@ -1095,6 +1095,18 @@ function withConfigPointer(message: string, config: UpstreamServerConfig): strin
  *  stays in the `.failed` file; this is the part a reader acts on. */
 const GIT_FAILED_TAIL_CAP = 600;
 
+/** A quoted failed-build tail inside the cap: BOTH ends. Capping only the end
+ *  cut off the headline -- an npm ERESOLVE header or the first "error:"
+ *  line arrives before pages of dependency noise, and the trailing lines
+ *  carry the final fatal. Keeping half of each means the reason a build
+ *  failed is named whatever end a given tool reports it at. */
+function quotedFailedTail(tail: string): string {
+  const t = tail.trim();
+  if (t.length <= GIT_FAILED_TAIL_CAP) return t;
+  const half = Math.floor((GIT_FAILED_TAIL_CAP - 5) / 2); // room for "\n...\n"
+  return `${t.slice(0, half)}\n...\n${t.slice(-half)}`;
+}
+
 /** A `.failed` record's step and tail, or null when there is none or it is not
  *  the shape a failed build writes. Printable ASCII and newlines only: the tail
  *  is a build tool's output, and it lands in text a terminal and an LLM read. */
@@ -1109,7 +1121,7 @@ export async function readGitFailedRecord(file: string): Promise<{ step: string;
   const { step, tail } = parsed as { step?: unknown; tail?: unknown };
   if (typeof step !== "string" || typeof tail !== "string") return null;
   const ascii = (s: string): string => s.replace(/[^\n\x20-\x7e]/g, "?");
-  return { step: ascii(step), tail: ascii(tail.trim().slice(-GIT_FAILED_TAIL_CAP)) };
+  return { step: ascii(step), tail: ascii(quotedFailedTail(tail)) };
 }
 
 /**

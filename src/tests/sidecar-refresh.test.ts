@@ -1,8 +1,8 @@
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { sidecarsRoot } from "../paths.js";
+import { CONFIG_DIRNAME, gitBuildDir, sidecarsRoot } from "../paths.js";
 import {
   backgroundInstallOptions,
   buildRefreshPlan,
@@ -16,8 +16,10 @@ import {
   type SidecarRefreshState,
   type SidecarRefreshStatePatch,
   sidecarRefreshStatePath,
+  unbuiltGitNote,
 } from "../sidecar-refresh.js";
 import { configuredRange, type SidecarSpec, sidecarsManifest } from "../sidecars-cmd.js";
+import { fakeFinishedBuild } from "./git-fixture.js";
 
 // =====================================================================
 // sidecar-refresh -- the startup check that keeps ~/.yaw-mcp/sidecars
@@ -974,5 +976,69 @@ describe("mergeSidecarRefreshState", () => {
       lastSidecarRefreshCheck: 9,
       lastNudgeShown: 42,
     });
+  });
+});
+
+describe("unbuiltGitNote", () => {
+  const GIT = "git@github.com:acme/acme-mcp.git";
+  const COMMIT = "0123456789abcdef0123456789abcdef01234567";
+
+  function userHome(): string {
+    return tempHome();
+  }
+
+  function writeUser(home: string, servers: Record<string, unknown>[]): void {
+    const dir = join(home, CONFIG_DIRNAME);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "bundles.json"), JSON.stringify({ version: 1, servers }));
+  }
+
+  const gitEntry = (namespace: string): Record<string, unknown> => ({
+    id: `local-${namespace}`,
+    name: namespace,
+    namespace,
+    type: "local",
+    transport: "stdio",
+    command: "node",
+    args: ["dist/index.js"],
+    git: { url: GIT, ref: "main", commit: COMMIT, entry: "dist/index.js" },
+    isActive: true,
+  });
+
+  it("names an unbuilt git server, with the command a human can run", async () => {
+    const home = userHome();
+    writeUser(home, [gitEntry("acme_git")]);
+    const note = await unbuiltGitNote(home);
+    expect(note).not.toBeNull();
+    expect(note?.namespaces).toEqual(["acme_git"]);
+    // buildGit:false means "complete" would otherwise read as "all ready".
+    expect(note?.message).toContain("not built on this machine");
+    expect(note?.message).toContain("yaw-mcp sidecars install");
+    expect(note?.message).toContain("never builds one");
+  });
+
+  it("stays null when the git server IS built -- the marker is outside the checkout", async () => {
+    const home = userHome();
+    writeUser(home, [gitEntry("acme_git")]);
+    fakeFinishedBuild(gitBuildDir("acme_git", COMMIT, home), COMMIT);
+    expect(await unbuiltGitNote(home)).toBeNull();
+  });
+
+  it("stays null when there is no git entry or no config at all", async () => {
+    const plain = userHome();
+    writeUser(plain, [
+      {
+        id: "local-n",
+        name: "n",
+        namespace: "n",
+        type: "local",
+        transport: "stdio",
+        command: "node",
+        args: [],
+        isActive: true,
+      },
+    ]);
+    expect(await unbuiltGitNote(plain)).toBeNull();
+    expect(await unbuiltGitNote(userHome())).toBeNull();
   });
 });

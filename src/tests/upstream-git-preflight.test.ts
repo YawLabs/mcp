@@ -66,7 +66,7 @@ vi.mock("../default-runtime.js", () => ({ defaultRuntime: vi.fn().mockResolvedVa
 vi.mock("../secrets-audit.js", () => ({ appendAuditEvent: vi.fn().mockResolvedValue(undefined) }));
 vi.mock("../logger.js", () => ({ log: vi.fn() }));
 
-const { ActivationError, connectToUpstream, gitBuildMissing } = await import("../upstream.js");
+const { ActivationError, connectToUpstream, gitBuildMissing, readGitFailedRecord } = await import("../upstream.js");
 const { resolveUvSpawn } = await import("../uv-bootstrap.js");
 const { gitBuildDir, gitFailedPath } = await import("../paths.js");
 const { fakeFinishedBuild } = await import("./git-fixture.js");
@@ -218,5 +218,32 @@ describe("git build preflight at activation", () => {
     }).catch(() => {});
     expect(transportOpts.length).toBeGreaterThan(0);
     expect("cwd" in transportOpts[0]).toBe(false);
+  });
+});
+
+describe("failed-build tail quoting", () => {
+  it("keeps BOTH ends of a long tail, so a header at the start still shows", async () => {
+    // The cap used to keep only the tail end: pages of npm noise could bury
+    // the first "npm error" line (the actual reason) off the end. Head + tail
+    // keeps the cause and the final fatal whichever end a tool reports at.
+    const head = "npm error code ERESOLVE\nnpm error peer dep missing: react@18";
+    const tail = "npm error A complete log of this run can be found in: /tmp/npm-debug.log";
+    const middle = "npm warn ...".repeat(400); // well past the 600-char cap
+    mkdirSync(join(home, ".yaw-mcp", "git", "acme_tools"), { recursive: true });
+    writeFileSync(
+      gitFailedPath("acme_tools", COMMIT, home),
+      JSON.stringify({
+        commit: COMMIT,
+        at: "2026-11-04T00:00:00Z",
+        step: "install",
+        tail: `${head}\n${middle}\n${tail}`,
+      }),
+    );
+    const record = await readGitFailedRecord(gitFailedPath("acme_tools", COMMIT, home));
+    expect(record?.step).toBe("install");
+    expect(record?.tail).toContain("npm error code ERESOLVE");
+    expect(record?.tail).toContain("A complete log of this run");
+    expect(record?.tail).toContain("\n...\n");
+    expect(record?.tail.length).toBeLessThan(700); // 600 + the elision marker
   });
 });
