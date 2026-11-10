@@ -19,7 +19,7 @@ import { tmpdir } from "node:os";
 import nodePath from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { stripInternalSecretsFromEnv } from "../internal-secret-env.js";
-import { oamHeapOomHint, probeOam } from "../oam-spawn.js";
+import { oamHeapOomHint, probeOam, rewriteForOam } from "../oam-spawn.js";
 
 const probe = await probeOam();
 const OAM = probe.bin;
@@ -122,4 +122,87 @@ describe.skipIf(OAM === null)(`oam runtime contracts (oam ${probe.version ?? "ab
     expect(hint, `no hint for this stderr:\n${r.stderr}`).not.toBeNull();
     expect(hint).toContain("OAM_MAX_HEAP_MB");
   });
+
+  /** process.env without the heap knobs, so an outer NODE_OPTIONS or
+   *  OAM_MAX_HEAP_MB cannot decide a case meant to test another one. */
+  function heapFreeEnv(extra: Record<string, string>): NodeJS.ProcessEnv {
+    const env: NodeJS.ProcessEnv = { ...process.env, ...extra };
+    if (!("NODE_OPTIONS" in extra)) delete env.NODE_OPTIONS;
+    if (!("OAM_MAX_HEAP_MB" in extra)) delete env.OAM_MAX_HEAP_MB;
+    return env;
+  }
+
+  function oomScript(): string {
+    const script = nodePath.join(dir, "oom-flag.mjs");
+    writeFileSync(script, "const keep = [];\nfor (;;) keep.push(new Array(1e6).fill(Math.random()));\n");
+    return script;
+  }
+
+  it("a node launch's --max-old-space-size, as the rewrite emits it, caps the heap on oam (0.19.5 floor)", async () => {
+    // The exact argv rewriteForOam builds for `node --max-old-space-size=64 x`,
+    // so this proves the rewrite's shape AND oam's honoring of the flag.
+    const script = oomScript();
+    const rewritten = rewriteForOam("node", ["--max-old-space-size=64", script], {
+      oamBin: OAM as string,
+      resolveEntry: () => null,
+    });
+    expect(rewritten.args).toEqual(["run", "--max-old-space-size=64", script]);
+    const r = await runOam(rewritten.args, heapFreeEnv({}));
+    expect(r.code, r.stderr).toBe(134);
+    expect(r.stderr).toContain("error[OAM-RT-OOM]");
+    expect(r.stderr).toContain("64 MB");
+    expect(r.stdout).toBe("");
+  });
+
+  it("NODE_OPTIONS=--max-old-space-size caps the heap on oam, and beats OAM_MAX_HEAP_MB", async () => {
+    // Below 0.19.5 oam ignored this NODE_OPTIONS token. The precedence half is
+    // what oamHeapOomHint's advice rests on: with both set, NODE_OPTIONS wins,
+    // so raising OAM_MAX_HEAP_MB alone would change nothing.
+    const script = oomScript();
+    const r = await runOam(
+      ["run", script],
+      heapFreeEnv({ NODE_OPTIONS: "--max-old-space-size=64", OAM_MAX_HEAP_MB: "4096" }),
+    );
+    expect(r.code, r.stderr).toBe(134);
+    expect(r.stderr).toContain("error[OAM-RT-OOM]");
+    expect(r.stderr).toContain("64 MB");
+    expect(r.stdout).toBe("");
+  });
+
+  // Every node flag scanNodeLaunchFlags lets ride onto `oam run`, run in the
+  // shape the rewrite emits (flags before --no-check for a .ts entry, script
+  // args after --). A flag oam refuses would exit 2 with a clap error; one it
+  // accepts but drops would be missing from execArgv.
+  const hostable = [
+    "--max-old-space-size=4096",
+    "--max-http-header-size=32768",
+    "--dns-result-order=ipv4first",
+    "--disable-warning=DEP0005",
+    "--no-warnings",
+    "--no-deprecation",
+    "--trace-warnings",
+    "--trace-deprecation",
+    "--throw-deprecation",
+    "--trace-uncaught",
+    "--expose-gc",
+  ];
+  for (const flag of hostable) {
+    it(`oam takes ${flag} in the rewrite's shape, keeps it in execArgv, and hands the script its own args`, async () => {
+      const script = nodePath.join(dir, "flags.ts");
+      writeFileSync(
+        script,
+        "const out: string = JSON.stringify({ execArgv: process.execArgv, argv: process.argv.slice(2) });\nprocess.stdout.write(out);\n",
+      );
+      const rewritten = rewriteForOam("node", [flag, script, "--port", "1"], {
+        oamBin: OAM as string,
+        resolveEntry: () => null,
+      });
+      expect(rewritten.args).toEqual(["run", flag, "--no-check", script, "--", "--port", "1"]);
+      const r = await runOam(rewritten.args, heapFreeEnv({}));
+      expect(r.code, r.stderr).toBe(0);
+      const seen = JSON.parse(r.stdout) as { execArgv: string[]; argv: string[] };
+      expect(seen.execArgv).toContain(flag);
+      expect(seen.argv).toEqual(["--port", "1"]);
+    });
+  }
 });

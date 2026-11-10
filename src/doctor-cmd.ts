@@ -136,6 +136,7 @@ import {
   isOamLaunch,
   MIN_OAM_VERSION,
   nodeLaunchKind,
+  OAM_SPACED_VALUE_OPTIONS,
   type OamProbe,
   type OamProbeFailure,
   oamBuildTreeFix,
@@ -4101,10 +4102,15 @@ export function isForeignAbsoluteLaunch(command: string, platform: NodeJS.Platfo
  * broken. Anything that is not `<oam> [flags] run [flags] <entry>` returns null
  * and is simply not checked.
  *
- * Known limit: a flag taking a SEPARATE value after `run` (`run --profile x
- * entry.js`) would pick `x`. No such flag exists today -- install writes
- * `run --no-check <entry>` -- and the fallout is bounded to a spurious report
- * only if that value also looks like an absolute path that does not exist.
+ * A flag taking a SEPARATE value (`run --check warn entry.ts`, `run
+ * --max-old-space-size 4096 entry.js`, both accepted by oam 0.19.5) has its
+ * value skipped, per OAM_SPACED_VALUE_OPTIONS; without that the value read
+ * as the entry. install writes `run --no-check <entry>`, and the spawn
+ * rewrite emits node flags in the `--flag=value` form only, so neither
+ * produces a spaced value -- this is for a hand-written entry. An option oam
+ * adds later that takes a spaced value would still pick its value, and the
+ * fallout is bounded to a spurious report only if that value also looks like
+ * an absolute path that does not exist.
  */
 export function oamRunEntryPath(command: string, args: readonly string[]): string | null {
   return oamLaunchParts(command, args)?.entry ?? null;
@@ -4130,10 +4136,24 @@ export function oamLaunchParts(command: string, args: readonly string[]): { oam:
  *  so launchChecks, which needs the unwrap's oam token as well, does
  *  not unwrap the same entry twice. */
 function oamRunEntryFromTokens(tokens: readonly string[]): string | null {
-  // Leading flags belong to oam itself; the first bare token is the subcommand.
-  const sub = tokens.findIndex((t) => !t.startsWith("-"));
+  // Leading flags belong to oam itself (or are node-style flags given before
+  // the subcommand); the first bare token is the subcommand.
+  const sub = firstPositional(tokens, 0);
   if (sub < 0 || tokens[sub] !== "run") return null;
-  return tokens.slice(sub + 1).find((t) => !t.startsWith("-")) ?? null;
+  const entry = firstPositional(tokens, sub + 1);
+  return entry < 0 ? null : tokens[entry];
+}
+
+/** Index of the first token at or after `from` that is neither a flag nor
+ *  the spaced value of one (OAM_SPACED_VALUE_OPTIONS -- consumed only when it
+ *  does not itself start with "-", as oam does), or -1. */
+function firstPositional(tokens: readonly string[], from: number): number {
+  for (let i = from; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (!t.startsWith("-")) return i;
+    if (OAM_SPACED_VALUE_OPTIONS.has(t) && i + 1 < tokens.length && !tokens[i + 1].startsWith("-")) i++;
+  }
+  return -1;
 }
 
 /** Formats doctor's own JSON walk (classifyProbeContent) classifies. An

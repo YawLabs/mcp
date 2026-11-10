@@ -552,11 +552,39 @@ describe("describeServerRuntime", () => {
     const refused: Array<{ what: string; command: string; args: string[]; code: string; says: string }> = [
       { what: "node with nothing to run", command: "node", args: [], code: "node-no-entry", says: "no entry file" },
       {
-        what: "node whose first arg is a node flag",
+        what: "node whose first arg is a node flag oam refuses",
         command: "node",
         args: ["--enable-source-maps", "server.js"],
         code: "node-flag-entry",
         says: "--enable-source-maps",
+      },
+      {
+        what: "node with a flag off the allowlist after an allowlisted one",
+        command: "node",
+        args: ["--no-warnings", "--inspect", "server.js"],
+        code: "node-flag-entry",
+        says: "--inspect",
+      },
+      {
+        what: "node with a value flag given spaced",
+        command: "node",
+        args: ["--max-old-space-size", "4096", "server.js"],
+        code: "node-flag-entry",
+        says: "--max-old-space-size=<value>",
+      },
+      {
+        what: "node with a value flag whose value oam would read differently",
+        command: "node",
+        args: ["--max-old-space-size=abc", "server.js"],
+        code: "node-flag-entry",
+        says: "a value yaw-mcp does not pass to oam",
+      },
+      {
+        what: "node with an allowlisted flag and nothing to run",
+        command: "node",
+        args: ["--max-old-space-size=4096"],
+        code: "node-no-entry",
+        says: "no entry file",
       },
       { what: "npx with only -y", command: "npx", args: ["-y"], code: "npx-no-spec", says: "no package" },
       {
@@ -604,6 +632,14 @@ describe("describeServerRuntime", () => {
 
     const accepted: Array<{ what: string; command: string; args: string[] }> = [
       { what: "node with a real entry", command: "node", args: ["server.js", "--port", "0"] },
+      // oam 0.19.5 (the floor) takes node flags after `run`; the allowlisted
+      // ones ride along, so doctor must report oam for them.
+      { what: "node with a heap-size flag", command: "node", args: ["--max-old-space-size=4096", "server.js"] },
+      {
+        what: "node with several allowlisted flags and a TypeScript entry",
+        command: "node",
+        args: ["--no-warnings", "--dns-result-order=ipv4first", "server.ts", "--port", "0"],
+      },
       { what: "npx with a bare spec", command: "npx", args: ["-y", "@yawlabs/npmjs-mcp"] },
       { what: "npx with a dist-tag", command: "npx", args: ["-y", "@yawlabs/npmjs-mcp@latest"] },
       { what: "npx with an exact pin", command: "npx", args: ["-y", "server-memory@1.2.3"] },

@@ -48,6 +48,16 @@ After loading a server, dispatch lists its best-matching tools with their requir
 
 The dispatch tool description now ends with a short line (at most 800 characters) listing the installed servers and what they cover, so a client that searches tool descriptions can find dispatch for a request like "list my PRs". The server instructions now also say to answer general-knowledge questions directly, to retry with dispatch when `find_tool` misses, and to call a just-loaded tool through `mcp_connect_exec` if the client reports it missing.
 
+**Changed -- the oam floor moves to 0.19.5**
+
+`npm run verify:oam-floor` hosted a stdio `@modelcontextprotocol/server` server on oam v0.19.5 through `oam run` on 2026-11-09 -- both protocol eras, 2025-11-25 (initialize) and 2026-07-28 (server/discover), each through tools/list and tools/call -- and raised `MIN_OAM_VERSION` to it; the floor was 0.19.1. A machine whose oam is older hosts its node/npx sidecars on node instead, and logs a warning naming both versions, `oam self-update` as the fix, and that yaw-mcp needs a restart afterwards.
+
+A `node` launch with node runtime flags before its script is now hosted on oam too, where it used to stay on node whatever the flag. oam 0.19.4 accepts node flags right after `run`, and 0.19.5 adds `--max-old-space-size`. The launch moves over only when every flag is one yaw-mcp ran on oam 0.19.5 beside node and saw behave the same: `--max-old-space-size=<mb>`, `--max-http-header-size=<n>`, `--dns-result-order=<order>`, `--disable-warning=<code>`, `--no-warnings`, `--no-deprecation`, `--trace-warnings`, `--trace-deprecation`, `--throw-deprecation`, `--trace-uncaught` and `--expose-gc`. The flags are passed to `oam run` ahead of the script, and a value must be given with `=`. Any other flag keeps the server on node as before -- `--enable-source-maps` (oam refuses it), `--inspect`, `--pending-deprecation`, `--title` and `--env-file` among them -- and so does one of the listed flags with its value as a separate argument. `yaw-mcp doctor` reports which flag kept a server on node.
+
+`NODE_OPTIONS=--max-old-space-size=<mb>` in a server's `env` now sets the heap cap on oam as well as on node. oam before 0.19.5 ignored it, so a hosted server ran on oam's own cap whatever `NODE_OPTIONS` said. The out-of-memory hint now says to raise the cap where it is set: the `--max-old-space-size` flag in the server's node args first (it beats `NODE_OPTIONS`), then `NODE_OPTIONS`, which works on both runtimes and beats `OAM_MAX_HEAP_MB`. Raising `OAM_MAX_HEAP_MB` alone does nothing for a server that already sets the flag.
+
+`doctor` now finds the entry file of an `oam run` client entry that gives an option its value as a separate argument (`run --check warn <entry>`, `run --max-old-space-size 4096 <entry>`). It used to read the value as the entry, so the real entry file was never checked and a missing one went unreported.
+
 ## 1.1.7 -- a server Windows will not start is named with its likely cause, instead of a bare `spawn UNKNOWN`
 
 **Fixed -- a server whose executable Windows will not run is named, with the likely cause, instead of a bare `spawn UNKNOWN`**

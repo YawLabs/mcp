@@ -7,6 +7,7 @@ import { CURRENT_OS } from "../install-targets.js";
 import {
   compareVersions,
   createProbeCollector,
+  describeNodeFlagRefusal,
   isBuildTreePath,
   isOamCommand,
   isOamLaunch,
@@ -18,6 +19,8 @@ import {
   npxCacheNodeModules,
   npxSpec,
   npxSpecIndex,
+  OAM_HOSTABLE_NODE_BOOLEAN_FLAGS,
+  OAM_HOSTABLE_NODE_VALUE_FLAGS,
   OAM_INSTALL_PS1,
   OAM_INSTALL_SH,
   OAM_PROBE_TIMEOUT_MS,
@@ -42,6 +45,7 @@ import {
   resolveStableNpmEntry,
   rewriteForOam,
   rewriteNpmToManagedNode,
+  scanNodeLaunchFlags,
   specConstraint,
   winNormalize,
 } from "../oam-spawn.js";
@@ -831,14 +835,14 @@ describe("rewriteForOam", () => {
   });
 
   it("turns oam's concurrent type-checker off for a TypeScript entry", () => {
-    // Every oam through 0.19.0 defaults `oam run` to `--check warn`, so a
-    // rewritten `node server.ts` spawns tsgo alongside the sidecar and writes
-    // its diagnostics to the child's stderr -- which is what lands in the
-    // 500-char failure tail when a boot fails, in place of the real error.
+    // oam through 0.19.0 defaulted `oam run` to `--check warn`, so a
+    // rewritten `node server.ts` spawned tsgo alongside the sidecar and wrote
+    // its diagnostics to the child's stderr -- which is what landed in the
+    // 500-char failure tail when a boot failed, in place of the real error.
     // node ran the file unchecked; the rewrite is billed as a pure
     // optimization, so it must not add a checker the original launch never
-    // had. From 0.19.1 (#412) the default is already off; the flag stays as
-    // explicit intent and config-shape parity with install's entries.
+    // had. From 0.19.1 (#412, below the floor) the default is off; the flag
+    // stays as explicit intent and config-shape parity with install's entries.
     expect(rewriteForOam("node", ["/srv/server.ts"], oam)).toEqual({
       command: "oam",
       args: ["run", "--no-check", "/srv/server.ts"],
@@ -857,11 +861,110 @@ describe("rewriteForOam", () => {
     });
   });
 
-  it("stays on node when the first arg is a node flag, not the entry", () => {
+  it("stays on node when the first arg is a node flag oam refuses", () => {
+    // oam 0.19.5 rejects --enable-source-maps as an unexpected argument.
     expect(rewriteForOam("node", ["--enable-source-maps", "/srv/index.js"], oam)).toEqual({
       command: "node",
       args: ["--enable-source-maps", "/srv/index.js"],
     });
+  });
+
+  describe("node runtime flags ahead of the entry (oam 0.19.5 floor)", () => {
+    // Every flag scanNodeLaunchFlags accepts, each verified on oam 0.19.5
+    // beside node. One case per flag, so dropping one from the allowlist
+    // fails by name.
+    const hostable = [
+      "--max-old-space-size=4096",
+      "--max-http-header-size=32768",
+      "--dns-result-order=ipv4first",
+      "--dns-result-order=ipv6first",
+      "--dns-result-order=verbatim",
+      "--disable-warning=DEP0005",
+      "--disable-warning=ExperimentalWarning",
+      "--no-warnings",
+      "--no-deprecation",
+      "--trace-warnings",
+      "--trace-deprecation",
+      "--throw-deprecation",
+      "--trace-uncaught",
+      "--expose-gc",
+    ];
+    it("lists exactly the allowlist, so adding an unverified flag fails here", () => {
+      // An addition must land in `hostable` (and so in the real-oam contract
+      // test) or this fails; only a removal was caught before.
+      const names = new Set(hostable.map((f) => f.split("=")[0]));
+      expect([...names].sort()).toEqual(
+        [...OAM_HOSTABLE_NODE_BOOLEAN_FLAGS, ...OAM_HOSTABLE_NODE_VALUE_FLAGS.keys()].sort(),
+      );
+    });
+
+    for (const flag of hostable) {
+      it(`carries ${flag} onto oam run, ahead of the entry`, () => {
+        expect(rewriteForOam("node", [flag, "/srv/index.js"], oam)).toEqual({
+          command: "oam",
+          args: ["run", flag, "/srv/index.js"],
+        });
+      });
+    }
+
+    it("puts node flags BEFORE --no-check for a TypeScript entry", () => {
+      // oam 0.19.5 lifts node flags only from directly after `run`: `run
+      // --no-check --max-old-space-size=64 x.ts` is an unexpected-argument
+      // error, `run --max-old-space-size=64 --no-check x.ts` runs (measured).
+      expect(rewriteForOam("node", ["--max-old-space-size=4096", "--no-warnings", "/srv/server.ts"], oam)).toEqual({
+        command: "oam",
+        args: ["run", "--max-old-space-size=4096", "--no-warnings", "--no-check", "/srv/server.ts"],
+      });
+    });
+
+    it("keeps several flags in order and hands the server's own args over after --", () => {
+      expect(
+        rewriteForOam(
+          "node",
+          ["--no-warnings", "--dns-result-order=ipv4first", "/srv/index.js", "--port", "1", "--max-old-space-size=1"],
+          oam,
+        ),
+      ).toEqual({
+        command: "oam",
+        // A flag-shaped arg AFTER the entry belongs to the server, untouched.
+        args: [
+          "run",
+          "--no-warnings",
+          "--dns-result-order=ipv4first",
+          "/srv/index.js",
+          "--",
+          "--port",
+          "1",
+          "--max-old-space-size=1",
+        ],
+      });
+    });
+
+    const refused: Array<{ what: string; args: string[] }> = [
+      { what: "a flag off the allowlist", args: ["--require=./hook.js", "/srv/index.js"] },
+      { what: "--inspect", args: ["--inspect", "/srv/index.js"] },
+      { what: "--pending-deprecation (diverges: no DEP0111 on oam)", args: ["--pending-deprecation", "/srv/index.js"] },
+      { what: "--title (oam drops it from execArgv)", args: ["--title=x", "/srv/index.js"] },
+      { what: "--env-file (oam drops it from execArgv)", args: ["--env-file=.env", "/srv/index.js"] },
+      { what: "a short flag", args: ["-r", "./hook.js", "/srv/index.js"] },
+      { what: "a value flag given spaced", args: ["--max-old-space-size", "4096", "/srv/index.js"] },
+      { what: "a value flag with a non-numeric size", args: ["--max-old-space-size=abc", "/srv/index.js"] },
+      { what: "a value flag with an empty value", args: ["--max-http-header-size=", "/srv/index.js"] },
+      { what: "an unknown dns order", args: ["--dns-result-order=bogus", "/srv/index.js"] },
+      { what: "a zero header size", args: ["--max-http-header-size=0", "/srv/index.js"] },
+      { what: "an empty warning code", args: ["--disable-warning=", "/srv/index.js"] },
+      { what: "a comma list of warning codes", args: ["--disable-warning=DEP0005,DEP0006", "/srv/index.js"] },
+      { what: "a path-shaped warning code", args: ["--disable-warning=../x", "/srv/index.js"] },
+      { what: "a boolean flag given a value", args: ["--no-warnings=true", "/srv/index.js"] },
+      { what: "an allowlisted flag followed by a refused one", args: ["--no-warnings", "--inspect", "/srv/index.js"] },
+      { what: "a lone allowlisted flag with no entry", args: ["--max-old-space-size=4096"] },
+      { what: "allowlisted flags then an empty entry", args: ["--no-warnings", ""] },
+    ];
+    for (const c of refused) {
+      it(`stays on node for ${c.what}`, () => {
+        expect(rewriteForOam("node", [...c.args], oam)).toEqual({ command: "node", args: c.args });
+      });
+    }
   });
 
   it("leaves docker untouched (not Node-based)", () => {
@@ -2839,7 +2942,7 @@ describe("MIN_OAM_VERSION freshness floor", () => {
   /** The ratchet. ONE literal, and the title is built from it, so the two
    *  cannot say different numbers -- the title used to name 0.13.0 while the
    *  body asserted 0.13.1. */
-  const FLOOR = "0.19.1";
+  const FLOOR = "0.19.5";
 
   it(`is at least ${FLOOR} (bump this literal when you bump the floor)`, () => {
     // POLICY (see the constant's doc): the floor is the last oam release the
@@ -3192,6 +3295,25 @@ describe("oamHeapOomHint", () => {
     expect(hint).toContain("bundles.json");
   });
 
+  it("names node's own knob, honored by oam from the 0.19.5 floor, and its precedence", () => {
+    // oam 0.19.5 maps --max-old-space-size (NODE_OPTIONS or a `run` flag) to
+    // its heap cap, and either beats OAM_MAX_HEAP_MB (measured), so a hint
+    // naming only OAM_MAX_HEAP_MB sends someone whose NODE_OPTIONS already
+    // sets a size to a variable that changes nothing.
+    const hint = oamHeapOomHint("error[OAM-RT-OOM]: JavaScript heap out of memory -- reached the 64 MB cap");
+    expect(hint).toContain("NODE_OPTIONS=--max-old-space-size=<mb>");
+    expect(hint).toContain("precedence over OAM_MAX_HEAP_MB");
+  });
+
+  it("names the launch's own --max-old-space-size flag first, since it beats NODE_OPTIONS", () => {
+    // The rewrite now carries `node --max-old-space-size=N entry` onto `oam
+    // run` as a flag; on oam 0.19.5 an argv flag beats NODE_OPTIONS (measured),
+    // so NODE_OPTIONS advice alone changes nothing for that launch.
+    const hint = oamHeapOomHint("error[OAM-RT-OOM]: JavaScript heap out of memory -- reached the 64 MB cap") ?? "";
+    expect(hint).toContain("--max-old-space-size=<mb> flag in this server's node args");
+    expect(hint.indexOf("node args")).toBeLessThan(hint.indexOf("NODE_OPTIONS"));
+  });
+
   it("matches the stable code, not the banner's wording", () => {
     // The prose carries the resolved cap and whether it came from the env, so
     // it is the part most likely to be reworded between oam releases.
@@ -3204,6 +3326,55 @@ describe("oamHeapOomHint", () => {
     // node's abort carries no OAM code -- surfacing OAM_MAX_HEAP_MB to someone
     // not running oam would point them at a variable nothing reads.
     expect(oamHeapOomHint("FATAL ERROR: Ineffective mark-compacts near heap limit Allocation failed")).toBeNull();
+  });
+});
+
+describe("scanNodeLaunchFlags", () => {
+  it("splits allowlisted flags, the entry and the script's own args", () => {
+    expect(scanNodeLaunchFlags(["--no-warnings", "x.js", "--expose-gc"])).toEqual({
+      kind: "entry",
+      flags: ["--no-warnings"],
+      entry: "x.js",
+      rest: ["--expose-gc"],
+    });
+    expect(scanNodeLaunchFlags(["x.js"])).toEqual({ kind: "entry", flags: [], entry: "x.js", rest: [] });
+  });
+
+  it("says no-entry for an empty argv, flags alone, or an empty entry slot", () => {
+    expect(scanNodeLaunchFlags([])).toEqual({ kind: "no-entry" });
+    expect(scanNodeLaunchFlags(["--no-warnings"])).toEqual({ kind: "no-entry" });
+    expect(scanNodeLaunchFlags([""])).toEqual({ kind: "no-entry" });
+  });
+
+  it("names the refused flag WITHOUT its value, and why", () => {
+    // The value can be a path or anything else the config carries; this
+    // reaches debug logs and doctor output.
+    expect(scanNodeLaunchFlags(["--require=/secret/hook.js", "x.js"])).toEqual({
+      kind: "refused",
+      flag: "--require",
+      why: "unlisted",
+    });
+    expect(scanNodeLaunchFlags(["--max-old-space-size", "4096", "x.js"])).toEqual({
+      kind: "refused",
+      flag: "--max-old-space-size",
+      why: "spaced-value",
+    });
+    expect(scanNodeLaunchFlags(["--max-old-space-size=0", "x.js"])).toEqual({
+      kind: "refused",
+      flag: "--max-old-space-size",
+      why: "bad-value",
+    });
+    expect(scanNodeLaunchFlags(["--expose-gc=1", "x.js"])).toEqual({
+      kind: "refused",
+      flag: "--expose-gc",
+      why: "bad-value",
+    });
+  });
+
+  it("words each refusal so the reader can tell which fix applies", () => {
+    expect(describeNodeFlagRefusal("--inspect", "unlisted")).toContain("--inspect");
+    expect(describeNodeFlagRefusal("--max-old-space-size", "spaced-value")).toContain("--max-old-space-size=<value>");
+    expect(describeNodeFlagRefusal("--dns-result-order", "bad-value")).toContain("a value");
   });
 });
 
