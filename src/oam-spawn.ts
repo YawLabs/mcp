@@ -9,8 +9,11 @@
 // original node/npx command whenever oam can't host the server:
 //   * oam isn't installed (no `oam` on PATH / OAM_BIN)        -> Node
 //   * the command isn't Node-based (uv/uvx/docker/python/...) -> unchanged
-//   * a node launch's first arg is a flag (--inspect, ...)    -> Node
-//     (it is not the entry file, and oam would eat it)
+//   * a node flag ahead of the entry is off the allowlist     -> Node
+//     or spaced (--enable-source-maps, --inspect,
+//     `--max-old-space-size 4096`: see scanNodeLaunchFlags);
+//     allowlisted flags (--max-old-space-size=4096, ...) ride
+//     onto `oam run` instead, ahead of the entry
 //   * a flag other than -y/--yes comes before the npx spec    -> npx (Node)
 //     (--package, -p, --node-options, ...: yaw-mcp does not parse them)
 //   * an npx package can't be resolved on disk                -> npx (Node)
@@ -287,7 +290,7 @@ export function npxSpec(args: readonly string[]): string | null {
  * floor that is too high costs a fallback, while one that is too low hosts
  * production sidecars on a build the check never ran on.
  */
-export const MIN_OAM_VERSION = "0.19.1";
+export const MIN_OAM_VERSION = "0.19.5";
 
 /** The oam installer one-liners, as oamjs.org publishes them. Both install the
  *  current release, which always satisfies MIN_OAM_VERSION. */
@@ -442,13 +445,31 @@ export function oamBuildTreeFix(os: InstallOS, viaOamBin = false): string {
  * abort with no banner; the floor gates that oam out.)
  *
  * Matches the stable error CODE, not the prose: the banner carries the
- * resolved cap and where it came from (the env, the cgroup, or the default),
- * so matching the sentence would break on the next release that rewords it.
+ * resolved cap and a source label (the env, the cgroup, or the default), so
+ * matching the sentence would break on the next release that rewords it.
  *
  * The hint names no default cap, because the cgroup rule makes any single
  * number wrong somewhere. It does not need one: the banner is the last thing
  * oam writes before exiting, so the stderr tail that both callers in
- * upstream.ts append to the same message carries the real cap and its source.
+ * upstream.ts append to the same message carries the real cap. Its source
+ * label is NOT always right -- see the next paragraph: a cap set by
+ * --max-old-space-size is labelled OAM_MAX_HEAP_MB.
+ *
+ * node's own knob works too, from the floor (oam 0.19.5): oam reads
+ * `--max-old-space-size=<mb>` from NODE_OPTIONS and from a node flag that
+ * rides onto `oam run` (scanNodeLaunchFlags), and maps it to the same cap.
+ * Below 0.19.5 oam ignored it in NODE_OPTIONS (an unknown NODE_OPTIONS token
+ * is skipped, not fatal), so one setting did not reach both runtimes. The
+ * hint leads with NODE_OPTIONS for that reason: it is the one setting that
+ * holds whether the server ends up on oam or on node. The precedence matters
+ * to the advice, measured on 0.19.5: a `run` flag beats NODE_OPTIONS, and
+ * either beats OAM_MAX_HEAP_MB -- so raising OAM_MAX_HEAP_MB alone does
+ * nothing for a server whose NODE_OPTIONS already names a size, and raising
+ * NODE_OPTIONS does nothing for a `node --max-old-space-size=N entry` launch,
+ * which the rewrite carries onto `oam run` as a flag. The hint names the
+ * launch flag first for that reason. The banner
+ * says "set by OAM_MAX_HEAP_MB" whichever of them set the cap, so it cannot
+ * tell the reader which one to raise; the hint has to.
  *
  * Returns null for every other stderr, including a node-hosted OOM -- node's
  * abort has no equivalent code, and inventing a hint for it here would put
@@ -457,9 +478,11 @@ export function oamBuildTreeFix(os: InstallOS, viaOamBin = false): string {
 export function oamHeapOomHint(stderr: string): string | null {
   if (!stderr.includes("OAM-RT-OOM")) return null;
   return (
-    "The oam-hosted child hit its V8 heap cap. Raise it with " +
-    'OAM_MAX_HEAP_MB=<mb> in this server\'s env, or set "runtime": "node" for this ' +
-    "server in bundles.json."
+    "The oam-hosted child hit its V8 heap cap. Raise it where it is set: the " +
+    "--max-old-space-size=<mb> flag in this server's node args if it has one (that wins), else " +
+    "NODE_OPTIONS=--max-old-space-size=<mb> in its env (honored by oam and node alike, and it " +
+    "takes precedence over OAM_MAX_HEAP_MB), or OAM_MAX_HEAP_MB=<mb> when nothing sets " +
+    '--max-old-space-size; or set "runtime": "node" for this server in bundles.json.'
   );
 }
 
@@ -1455,19 +1478,186 @@ export function nodeLaunchKind(command: string): "node" | "npx" | null {
   return null;
 }
 
-/** Entry extensions oam type-checks; it never checks any other entry. Every
- *  oam through 0.19.0 defaults `oam run` to `--check warn`, so a TypeScript
- *  entry spawns tsgo alongside the server. 0.19.1 (#412, measured on the
- *  release itself) defaults to `off` -- a type-erroring entry runs and exits 0
- *  -- while still accepting `--no-check`. */
+/** Entry extensions oam type-checks; it never checks any other entry. oam
+ *  through 0.19.0 defaulted `oam run` to `--check warn`, which spawned tsgo
+ *  alongside a TypeScript server; from 0.19.1 (#412, below the floor) the
+ *  default is `off` -- a type-erroring entry runs and exits 0 -- and
+ *  `--no-check` is still accepted. */
 const TS_ENTRY_RE = /\.[mc]?ts$/i;
+
+/** A positive whole number, as a size flag's value must be. node refuses a
+ *  non-numeric `--max-old-space-size` ("illegal value ... of type size_t")
+ *  while oam 0.19.5 warns and runs on its default cap (measured), so a value
+ *  outside this shape is a divergence and keeps the launch on node. */
+const POSITIVE_INT = /^[1-9]\d*$/;
+
+/**
+ * Node runtime flags yaw-mcp carries from a `node` launch onto `oam run`, each
+ * VERIFIED against the real oam 0.19.5 (the floor) by running
+ * `oam run <flag> probe.js` beside `node <flag> probe.js` on 2026-11-09 and
+ * comparing what the flag changed. oam accepts more (its NODE_STYLE_FLAGS,
+ * crates/oam_cli/src/main.rs); this list is the subset whose behavior matched
+ * node for a sidecar, and it is deliberately conservative -- a flag missing
+ * here costs a node launch, a wrong one hosts a server that behaves
+ * differently from the launch it replaced.
+ *
+ * Boolean flags (bare only: `--no-warnings=true` is accepted by node and
+ * refused by oam's parser, measured):
+ *   --no-warnings, --no-deprecation        the warning is suppressed on both
+ *   --trace-warnings, --trace-deprecation  both print the warning with a stack
+ *                                          (oam's omits node's internal frames)
+ *   --throw-deprecation                    both throw on a deprecation, exit 1
+ *   --trace-uncaught                       both print "Thrown at:" on an
+ *                                          uncaught throw
+ *   --expose-gc                            globalThis.gc is callable on both
+ *
+ * Value flags (the `--flag=value` form only, value checked):
+ *   --max-old-space-size=N    the heap cap; oam maps it to OAM_MAX_HEAP_MB (an
+ *                             N-MB cap ends in exit 134 + error[OAM-RT-OOM])
+ *   --max-http-header-size=N  http.maxHeaderSize reads N on both
+ *   --dns-result-order=V      dns.getDefaultResultOrder() reads V on both;
+ *                             verbatim, ipv4first and ipv6first
+ *   --disable-warning=CODE    the named warning is suppressed on both
+ *
+ * Left off, and why (each measured unless noted):
+ *   --pending-deprecation      process.binding() emits DEP0111 on node, not
+ *                              on oam
+ *   --title, --env-file, --env-file-if-exists
+ *                              the effect matches, but oam drops the flag from
+ *                              process.execArgv, so a server that forks a
+ *                              worker with its own execArgv loses it
+ *   --enable-source-maps       oam refuses it (an unexpected argument)
+ *   --inspect*                 a debugger port is not a sidecar launch; also
+ *                              an oam run option, not a node-style flag
+ *   --permission, --allow-*, --expose-internals, --allow-natives-syntax,
+ *   --experimental-vm-modules, --insecure-http-parser, and everything else
+ *                              not verified here (not run)
+ *
+ * The spaced form (`--max-old-space-size 4096`) is refused even though oam
+ * 0.19.5 lifts it too: whether the next token is a value or the entry is a
+ * question about node's own flag table, and `=` makes it unambiguous.
+ */
+export const OAM_HOSTABLE_NODE_BOOLEAN_FLAGS: ReadonlySet<string> = new Set([
+  "--no-warnings",
+  "--no-deprecation",
+  "--trace-warnings",
+  "--trace-deprecation",
+  "--throw-deprecation",
+  "--trace-uncaught",
+  "--expose-gc",
+]);
+
+export const OAM_HOSTABLE_NODE_VALUE_FLAGS: ReadonlyMap<string, RegExp> = new Map([
+  ["--max-old-space-size", POSITIVE_INT],
+  ["--max-http-header-size", POSITIVE_INT],
+  ["--dns-result-order", /^(?:verbatim|ipv4first|ipv6first)$/],
+  ["--disable-warning", /^[A-Za-z0-9_]+$/],
+]);
+
+/** Why {@link scanNodeLaunchFlags} kept a node launch on node:
+ *    "unlisted"     -- a flag not on the allowlist (or a short flag)
+ *    "spaced-value" -- an allowlisted value flag given without `=value`
+ *    "bad-value"    -- an allowlisted value flag whose value fails its check,
+ *                      or a boolean flag given `=value` */
+export type NodeFlagRefusal = "unlisted" | "spaced-value" | "bad-value";
+
+/**
+ * Split a `node` launch's argv into the node runtime flags ahead of the entry,
+ * the entry, and the script's own args -- or say why oam cannot take it.
+ *
+ *   entry     every leading flag is on the allowlist above; `flags` carries
+ *             them verbatim, in order
+ *   no-entry  nothing to run: the argv is empty, holds only allowlisted flags,
+ *             or the entry slot is an empty string
+ *   refused   the first leading flag oam cannot take; `flag` is its NAME only
+ *             (the text before any `=`), because the value can be a path or
+ *             anything else the config carries, and this reaches logs
+ *
+ * ONE helper, because two callers must answer it identically: rewriteForOam
+ * (which emits the launch) and default-runtime's describeLaunchShape (which is
+ * what doctor and `sidecars install` print). Two copies of the allowlist are
+ * how doctor ends up reporting node for a server the spawn hosts on oam.
+ */
+export function scanNodeLaunchFlags(
+  args: readonly string[],
+):
+  | { kind: "entry"; flags: string[]; entry: string; rest: string[] }
+  | { kind: "no-entry" }
+  | { kind: "refused"; flag: string; why: NodeFlagRefusal } {
+  const flags: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (!a.startsWith("-")) {
+      if (a === "") return { kind: "no-entry" };
+      return { kind: "entry", flags, entry: a, rest: args.slice(i + 1) };
+    }
+    const eq = a.indexOf("=");
+    const name = eq === -1 ? a : a.slice(0, eq);
+    if (OAM_HOSTABLE_NODE_BOOLEAN_FLAGS.has(name)) {
+      if (eq !== -1) return { kind: "refused", flag: name, why: "bad-value" };
+    } else {
+      const valueRe = OAM_HOSTABLE_NODE_VALUE_FLAGS.get(name);
+      if (valueRe === undefined) return { kind: "refused", flag: name, why: "unlisted" };
+      if (eq === -1) return { kind: "refused", flag: name, why: "spaced-value" };
+      if (!valueRe.test(a.slice(eq + 1))) return { kind: "refused", flag: name, why: "bad-value" };
+    }
+    flags.push(a);
+  }
+  return { kind: "no-entry" };
+}
+
+/** The plain-English reason a node flag kept a launch on node. One wording,
+ *  shared by rewriteForOam's debug line and doctor's per-server reason. */
+export function describeNodeFlagRefusal(flag: string, why: NodeFlagRefusal): string {
+  if (why === "spaced-value") {
+    return `the node launch gives ${flag} its value as a separate argument; yaw-mcp hosts it on oam only as ${flag}=<value>`;
+  }
+  if (why === "bad-value") return `the node launch gives ${flag} a value yaw-mcp does not pass to oam`;
+  return `the node launch carries the node flag ${flag}, which yaw-mcp does not host on oam`;
+}
+
+/**
+ * `oam run` options that take their value as the NEXT argv token when given
+ * without `=`: oam's own clap options (--check, --record, --replay) and the
+ * node-style flags oam 0.19.5 lifts with a spaced value
+ * (lift_node_flags_after_subcommand in crates/oam_cli/src/main.rs, tag
+ * v0.19.5). A parser looking for the entry in an `oam [flags] run [flags]
+ * <entry>` argv has to skip the value too, or `run --check warn x.ts` reads
+ * `warn` as the entry. oam consumes the next token only when it does not
+ * start with "-"; callers mirror that.
+ */
+export const OAM_SPACED_VALUE_OPTIONS: ReadonlySet<string> = new Set([
+  "--check",
+  "--record",
+  "--replay",
+  "--env-file",
+  "--env-file-if-exists",
+  "--input-type",
+  "--max-http-header-size",
+  "--max-old-space-size",
+  "--v8-pool-size",
+  "--trace-require-module",
+  "--dns-result-order",
+  "--disable-warning",
+  "--redirect-warnings",
+  "--allow-fs-read",
+  "--allow-fs-write",
+]);
 
 /**
  * Pure rewrite of a Node-based launch to `oam run`. Returns {command,args}
  * UNCHANGED for the Node-fallback cases described in the module header.
  *   node <entry> [..rest]      -> oam run <entry> [-- ..rest]
  *   node <entry>.ts [..rest]   -> oam run --no-check <entry>.ts [-- ..rest]
+ *   node <flags> <entry> [..]  -> oam run <flags> [--no-check] <entry> [-- ..]
  *   npx [-y] <pkg> [..rest]    -> oam run <resolved> [-- ..rest]
+ *
+ * <flags> are node runtime flags, every one on scanNodeLaunchFlags'
+ * allowlist. They go right after `run` and BEFORE `--no-check`: oam 0.19.5
+ * lifts node-style flags only from the block directly after the subcommand,
+ * so `oam run --no-check --max-old-space-size=64 x.ts` is refused as an
+ * unexpected argument while `oam run --max-old-space-size=64 --no-check x.ts`
+ * runs (both measured).
  */
 export function rewriteForOam(
   command: string,
@@ -1477,21 +1667,20 @@ export function rewriteForOam(
   const bin = deps.oamBin;
   if (!bin) return { command, args };
 
-  const toOam = (entry: string, rest: string[]) => {
-    // Through 0.19.0, `oam run` type-checks a TypeScript entry concurrently by
-    // default (--check warn). That spawns tsgo beside the sidecar and writes
-    // its diagnostics to the child's stderr. On a boot failure, those
-    // diagnostics are what lands in the 500-char failure tail instead of the
-    // real error. The rewrite is billed as a pure optimization of a launch
-    // node was already going to run unchecked, so adding a check is not our
-    // call: `--no-check` keeps the hosted launch behaving like the one it
-    // replaced. From 0.19.1 (#412, now the floor) `oam run` runs unchecked by
-    // default and still accepts the flag, so it is explicit intent rather than
-    // a behavior change -- and it keeps the emitted argv in the same shape
+  const toOam = (entry: string, rest: string[], nodeFlags: readonly string[] = []) => {
+    // oam through 0.19.0 type-checked a TypeScript entry concurrently by
+    // default (--check warn), spawning tsgo beside the sidecar and writing its
+    // diagnostics into the 500-char boot-failure tail in place of the real
+    // error. The rewrite is billed as a pure optimization of a launch node was
+    // already going to run unchecked, so adding a check is not our call. From
+    // 0.19.1 (#412; the floor is past it) `oam run` runs unchecked by default
+    // and still accepts the flag, so `--no-check` is explicit intent rather
+    // than a behavior change -- and it keeps the emitted argv in the shape
     // install writes into client configs (install-targets.ts), `run
-    // --no-check <entry>`, which is the shape doctor and the heal pass parse
-    // (oamRunEntryFromTokens skips the flag and takes the entry after it).
-    const flags = TS_ENTRY_RE.test(entry) ? ["--no-check"] : [];
+    // --no-check <entry>`, which doctor and the heal pass parse
+    // (oamRunEntryFromTokens skips the flags and takes the entry after them).
+    // Node flags come first: oam lifts them only from directly after `run`.
+    const flags = [...nodeFlags, ...(TS_ENTRY_RE.test(entry) ? ["--no-check"] : [])];
     return {
       command: bin,
       args: rest.length > 0 ? ["run", ...flags, entry, "--", ...rest] : ["run", ...flags, entry],
@@ -1501,13 +1690,24 @@ export function rewriteForOam(
   const kind = nodeLaunchKind(command);
 
   if (kind === "node") {
-    const [entry, ...rest] = args;
-    if (!entry) return { command, args };
-    // A leading-dash arg is a node flag (--enable-source-maps, --inspect, ...),
-    // not the entry file; oam would eat it and mis-launch. Stay on node --
-    // mirrors the npx flag guard below.
-    if (entry.startsWith("-")) return { command, args };
-    return toOam(entry, rest);
+    // Leading node runtime flags ride along when every one of them is on the
+    // verified allowlist (scanNodeLaunchFlags); any other flag -- one oam
+    // refuses (--enable-source-maps), one that behaves differently there, or
+    // a value flag given spaced -- keeps the launch on node, because the rest
+    // of the argv cannot be split into flags and entry with confidence.
+    const scan = scanNodeLaunchFlags(args);
+    if (scan.kind === "no-entry") return { command, args };
+    if (scan.kind === "refused") {
+      // The flag NAME and the argv length, never the argv: the server's own
+      // args follow the entry and can carry a token (see the npx line below).
+      log("debug", "node launch carries a node flag yaw-mcp does not host on oam; staying on node", {
+        flag: scan.flag,
+        why: scan.why,
+        argc: args.length,
+      });
+      return { command, args };
+    }
+    return toOam(scan.entry, scan.rest, scan.flags);
   }
 
   if (kind === "npx") {

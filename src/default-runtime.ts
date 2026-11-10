@@ -36,12 +36,14 @@ import { statSync } from "node:fs";
 import { type LoadLocalBundlesResult, loadLocalBundles } from "./local-bundles.js";
 import { log } from "./logger.js";
 import {
+  describeNodeFlagRefusal,
   isRegistrySpec,
   MIN_OAM_VERSION,
   nodeLaunchKind,
   npxSpecIndex,
   type OamProbe,
   oamFailureLabel,
+  scanNodeLaunchFlags,
   specConstraint,
 } from "./oam-spawn.js";
 import type { UpstreamServerConfig } from "./types.js";
@@ -345,7 +347,10 @@ export { oamFailureLabel };
  *  The six launch-shape codes each mirror ONE `return { command, args }` in
  *  rewriteForOam (oam-spawn.ts), in that function's own order. That 1:1 mapping
  *  is the point -- it is what makes a future gate added there and not here an
- *  auditable omission rather than an invisible one. */
+ *  auditable omission rather than an invisible one. "node-flag-entry" keeps
+ *  its name for --json consumers, though since the oam 0.19.5 floor it means
+ *  a leading node flag the rewrite will not carry onto `oam run`, not any
+ *  leading flag (see scanNodeLaunchFlags). */
 export type ServerRuntimeCode =
   | "remote"
   | "per-server-node"
@@ -382,7 +387,8 @@ export interface ServerRuntimeInfo {
  * accepts.
  *
  * Split out, and expressed with oam-spawn's own exported predicates
- * (npxSpecIndex / isRegistrySpec / specConstraint) rather than re-derived here,
+ * (scanNodeLaunchFlags / npxSpecIndex / isRegistrySpec / specConstraint) rather
+ * than re-derived here,
  * for the reason the nodeLaunchKind comment below gives: doctor answering a
  * spawn-time question a SECOND way is how doctor ends up printing a runtime the
  * spawn does not produce. These gates are deterministic -- a config that trips
@@ -400,14 +406,16 @@ function describeLaunchShape(
 ): { code: ServerRuntimeCode; detail: string } | null {
   const kind = nodeLaunchKind(command);
   if (kind === "node") {
-    // `node` with nothing to run, or with a node FLAG where the entry belongs
-    // (--enable-source-maps, --inspect): oam would eat the flag and mis-launch,
-    // so the rewrite stays on node.
-    const entry = args[0];
-    if (!entry) return { code: "node-no-entry", detail: "the node launch names no entry file" };
-    if (entry.startsWith("-")) {
-      return { code: "node-flag-entry", detail: `the node launch starts with the flag ${entry}, not an entry file` };
-    }
+    // `node` with nothing to run, or with a leading node FLAG the rewrite
+    // will not carry onto `oam run` (off the verified allowlist, like
+    // --enable-source-maps or --inspect, or a value flag given spaced). The
+    // SAME scan rewriteForOam runs, so an allowlisted flag such as
+    // --max-old-space-size=4096 reports oam here exactly when the spawn hosts
+    // it there.
+    const scan = scanNodeLaunchFlags(args);
+    if (scan.kind === "no-entry") return { code: "node-no-entry", detail: "the node launch names no entry file" };
+    if (scan.kind === "refused")
+      return { code: "node-flag-entry", detail: describeNodeFlagRefusal(scan.flag, scan.why) };
     return null;
   }
   if (kind === "npx") {

@@ -2351,6 +2351,20 @@ describe("runDoctor — OAM RUNTIME section", () => {
         { namespace: "gitspec", name: "Git", command: "npx", args: ["-y", "github:owner/repo"], runtime: "oam" },
         { namespace: "ranged", name: "Ranged", command: "npx", args: ["-y", "server-memory@^1.2.3"], runtime: "oam" },
         { namespace: "flagged", name: "Flagged", command: "node", args: ["--inspect", "server.js"], runtime: "oam" },
+        {
+          namespace: "spaced",
+          name: "Spaced",
+          command: "node",
+          args: ["--max-old-space-size", "4096", "server.js"],
+          runtime: "oam",
+        },
+        {
+          namespace: "heapcap",
+          name: "Heap",
+          command: "node",
+          args: ["--max-old-space-size=4096", "server.js"],
+          runtime: "oam",
+        },
         { namespace: "hosted", name: "Hosted", command: "npx", args: ["-y", "server-memory"], runtime: "oam" },
       ],
     });
@@ -2361,6 +2375,10 @@ describe("runDoctor — OAM RUNTIME section", () => {
     expect(txt).toMatch(/gitspec\s+node\s+.*git\/path target/);
     expect(txt).toMatch(/ranged\s+node\s+.*\^1\.2\.3/);
     expect(txt).toMatch(/flagged\s+node\s+.*--inspect/);
+    expect(txt).toMatch(/spaced\s+node\s+.*--max-old-space-size=<value>/);
+    // From the oam 0.19.5 floor an allowlisted node flag rides onto `oam run`,
+    // so doctor reports oam for it, as the spawn does.
+    expect(txt).toMatch(/heapcap\s+oam\s+per-server runtime:"oam"/);
     // The accepted shape in the same file still reports oam, so the gates are
     // not just a blanket downgrade of every npx server.
     expect(txt).toMatch(/hosted\s+oam\s+per-server runtime:"oam"/);
@@ -3365,6 +3383,34 @@ describe("oamRunEntryPath", () => {
   it("handles a bare oam command and flags before the subcommand", () => {
     expect(oamRunEntryPath("oam", ["run", "--no-check", "/b/index.js"])).toBe("/b/index.js");
     expect(oamRunEntryPath("/usr/local/bin/oam", ["--quiet", "run", "/b/index.js"])).toBe("/b/index.js");
+  });
+
+  it("parses the shape the spawn rewrite emits for a flagged node launch", () => {
+    // rewriteForOam: node flags first, then --no-check, then the entry, then
+    // `--` and the server's own args.
+    expect(
+      oamRunEntryPath("oam", [
+        "run",
+        "--max-old-space-size=4096",
+        "--no-warnings",
+        "--no-check",
+        "/b/s.ts",
+        "--",
+        "-x",
+      ]),
+    ).toBe("/b/s.ts");
+  });
+
+  it("skips the value of an option oam takes spaced, instead of reading it as the entry", () => {
+    // oam 0.19.5 accepts both (measured for --max-old-space-size; --check is a
+    // clap option of `oam run`). Reading `warn` or `4096` as the entry left the
+    // real entry unchecked.
+    expect(oamRunEntryPath("oam", ["run", "--check", "warn", "/b/s.ts"])).toBe("/b/s.ts");
+    expect(oamRunEntryPath("oam", ["run", "--max-old-space-size", "4096", "/b/index.js"])).toBe("/b/index.js");
+    // Before the subcommand too: oam lifts a spaced node flag from there.
+    expect(oamRunEntryPath("oam", ["--max-old-space-size", "4096", "run", "/b/index.js"])).toBe("/b/index.js");
+    // A boolean flag consumes nothing, as before.
+    expect(oamRunEntryPath("oam", ["run", "--no-warnings", "/b/index.js"])).toBe("/b/index.js");
   });
 
   it("returns null for shapes that carry no readable `run` entry", () => {

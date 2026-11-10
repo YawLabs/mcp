@@ -655,7 +655,12 @@ if (subcommand === "compliance") {
                                Linux container). Set it in that server's \`env\`
                                in bundles.json when a hosted sidecar dies with a
                                heap out-of-memory error, or give that server
-                               \`"runtime": "node"\`.
+                               \`"runtime": "node"\`. oam (from the 0.19.5
+                               minimum) also honors node's own
+                               \`NODE_OPTIONS=--max-old-space-size=<mb>\` in
+                               that \`env\`, or the flag on a \`node\` launch, so
+                               one setting works on both runtimes; either one
+                               takes precedence over OAM_MAX_HEAP_MB.
     MCP_CONNECT_TIMEOUT           Milliseconds to wait for a server's MCP
                                handshake (default 15000). This is the FALLBACK
                                only -- a server's own \`connectTimeoutMs\` in
