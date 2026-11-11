@@ -126,6 +126,8 @@ export interface LoadConfigOptions {
  *      as warnings, with the command that sweeps them.
  *    - `doctor` and `bundles match` load config.json with `readOnly` (above):
  *      the legacy-path migration (a mkdir + rename) is reported, not run.
+ *    - `doctor` reads its 24 h registry cache (~/.yaw-mcp/registry-cache.json)
+ *      but does not write it; an ordinary run is what fills it.
  *    - `status` and `bundles list` already write nothing, flag or no flag.
  *
  *  Unset, every command behaves exactly as before. */

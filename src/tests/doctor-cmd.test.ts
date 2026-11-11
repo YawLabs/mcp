@@ -48,6 +48,7 @@ import {
 } from "../install-targets.js";
 import { isOamLaunch, MIN_OAM_VERSION, OAM_INSTALL_PS1, OAM_INSTALL_SH } from "../oam-spawn.js";
 import { STATE_FILENAME, STATE_SCHEMA_VERSION } from "../persistence.js";
+import { REGISTRY_CACHE_FILENAME } from "../registry-cache.js";
 import {
   createEmptyVault,
   isUnlocked,
@@ -1216,6 +1217,7 @@ describe("runDoctor — env table lockstep with `yaw-mcp --help`", () => {
     "YAW_MCP_VAULT_PASSPHRASE", // a credential -- SECRET VAULT reports it as a boolean
     "YAW_MCP_VAULT_PASSPHRASE_NEW", // a credential, same reason
     "YAW_MCP_READONLY_DIAGNOSTICS", // reported by the `mode: read-only` line / `readOnly`, and only when set
+    "YAW_MCP_LOG_LEVEL", // log verbosity/rendering knob, like the unprefixed LOG_LEVEL doctor does not list
   ]);
 
   it("finds the help table at all", () => {
@@ -1392,6 +1394,218 @@ describe("runDoctor — UPGRADE AVAILABLE method-aware hints", () => {
     const txt = cap.text();
     expect(txt).toContain("UPGRADE AVAILABLE");
     expect(txt).toContain("npm install -g @yawlabs/mcp@latest");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The 24 h registry cache (registry-cache.ts). Yaw Terminal's MCP panel runs
+// `doctor --json` on every refresh, and each run used to make one registry GET
+// for @yawlabs/mcp plus one per installed sidecar. The hooks stand in for the
+// request only, so counting their calls counts the GETs a real run would make.
+// ---------------------------------------------------------------------------
+
+describe("runDoctor — registry cache", () => {
+  const fixedNow = 1_000_000_000_000;
+  const HOUR = 60 * 60 * 1000;
+
+  function cacheFile(): string {
+    return join(synthHome, ".yaw-mcp", REGISTRY_CACHE_FILENAME);
+  }
+
+  function seedCache(packages: Record<string, { latest: string; at: number }>): void {
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    writeFileSync(cacheFile(), JSON.stringify({ version: 1, packages }));
+  }
+
+  function countingFetch(answer: string | null) {
+    const calls: number[] = [];
+    const fetch = async (): Promise<string | null> => {
+      calls.push(1);
+      return answer;
+    };
+    return { calls, fetch };
+  }
+
+  /** A text run in the UPGRADE AVAILABLE configuration (see the describe
+   *  above), so the latest version doctor settled on is visible in the text. */
+  async function runText(registryFetch: () => Promise<string | null>, env: NodeJS.ProcessEnv = {}) {
+    const cap = captureOut();
+    await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env,
+      os: "linux",
+      out: cap.out,
+      err: () => {},
+      now: () => fixedNow,
+      currentVersion: "0.40.0",
+      argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
+      registryFetch,
+    });
+    return cap.text();
+  }
+
+  it("a fresh cache entry answers with no GET, on the text and --json paths", async () => {
+    seedCache({ "@yawlabs/mcp": { latest: "0.45.0", at: fixedNow - HOUR } });
+    const probe = countingFetch("0.99.0");
+
+    const txt = await runText(probe.fetch);
+    expect(txt).toContain("UPGRADE AVAILABLE");
+    expect(txt).toContain("npm latest is 0.45.0");
+
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: () => {},
+      err: () => {},
+      json: true,
+      now: () => fixedNow,
+      currentVersion: "0.40.0",
+      registryFetch: probe.fetch,
+    });
+    expect(JSON.parse(r.lines[0]).upgrade).toMatchObject({ latest: "0.45.0", stale: true });
+    expect(probe.calls).toHaveLength(0);
+  });
+
+  it("a miss fetches once and stores the answer, so the next run makes no GET", async () => {
+    const probe = countingFetch("0.45.0");
+    expect(await runText(probe.fetch)).toContain("npm latest is 0.45.0");
+    expect(probe.calls).toHaveLength(1);
+    expect(JSON.parse(readFileSync(cacheFile(), "utf8"))).toEqual({
+      version: 1,
+      packages: { "@yawlabs/mcp": { latest: "0.45.0", at: fixedNow } },
+    });
+
+    expect(await runText(probe.fetch)).toContain("npm latest is 0.45.0");
+    expect(probe.calls).toHaveLength(1);
+  });
+
+  it("an entry 24 h old or older is refetched and replaced", async () => {
+    seedCache({ "@yawlabs/mcp": { latest: "0.41.0", at: fixedNow - 24 * HOUR } });
+    const probe = countingFetch("0.45.0");
+    expect(await runText(probe.fetch)).toContain("npm latest is 0.45.0");
+    expect(probe.calls).toHaveLength(1);
+    expect(JSON.parse(readFileSync(cacheFile(), "utf8")).packages["@yawlabs/mcp"]).toEqual({
+      latest: "0.45.0",
+      at: fixedNow,
+    });
+  });
+
+  it("a corrupt cache file reads as a miss: refetched, and rewritten whole", async () => {
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    writeFileSync(cacheFile(), '{"version":1,"packages":{"@yawlabs/mcp":');
+    const probe = countingFetch("0.45.0");
+    expect(await runText(probe.fetch)).toContain("npm latest is 0.45.0");
+    expect(probe.calls).toHaveLength(1);
+    expect(JSON.parse(readFileSync(cacheFile(), "utf8")).packages["@yawlabs/mcp"].latest).toBe("0.45.0");
+  });
+
+  it("an 'unknown' answer is not cached: the next run asks again", async () => {
+    const probe = countingFetch(null);
+    expect(await runText(probe.fetch)).not.toContain("UPGRADE AVAILABLE");
+    expect(await runText(probe.fetch)).not.toContain("UPGRADE AVAILABLE");
+    expect(probe.calls).toHaveLength(2);
+    expect(existsSync(cacheFile())).toBe(false);
+  });
+
+  it("caches each sidecar package too, keyed by name", async () => {
+    writeYawMcpConfig(synthHome, "bundles.json", {
+      version: 1,
+      servers: [{ namespace: "fetch", name: "Fetch", command: "npx", args: ["-y", "@yawlabs/fetch-mcp@latest"] }],
+    });
+    const pkgDir = join(synthHome, ".yaw-mcp", "sidecars", "node_modules", "@yawlabs", "fetch-mcp");
+    mkdirSync(pkgDir, { recursive: true });
+    writeFileSync(join(pkgDir, "package.json"), JSON.stringify({ name: "@yawlabs/fetch-mcp", version: "0.3.6" }));
+    const probed: string[] = [];
+    const run = () =>
+      runDoctor({
+        cwd: synthCwd,
+        home: synthHome,
+        env: {},
+        os: "linux",
+        out: () => {},
+        err: () => {},
+        json: true,
+        skipRegistryCheck: true,
+        now: () => fixedNow,
+        oamProbe: () => ({
+          bin: "/usr/local/bin/oam",
+          binPath: "/usr/local/bin/oam",
+          version: MIN_OAM_VERSION,
+          belowMin: false,
+          failure: null,
+          failureDetail: null,
+        }),
+        sidecarRegistryFetch: async (pkg) => {
+          probed.push(pkg);
+          return "0.9.9";
+        },
+      });
+
+    for (let i = 0; i < 2; i++) {
+      const parsed = JSON.parse((await run()).lines[0]);
+      expect(parsed.oamRuntime.managed.packages).toEqual([
+        { pkg: "@yawlabs/fetch-mcp", version: "0.3.6", latest: "0.9.9", stale: true },
+      ]);
+    }
+    expect(probed).toEqual(["@yawlabs/fetch-mcp"]);
+    expect(JSON.parse(readFileSync(cacheFile(), "utf8")).packages["@yawlabs/fetch-mcp"]).toEqual({
+      latest: "0.9.9",
+      at: fixedNow,
+    });
+  });
+
+  it("skipRegistryCheck with no hook still skips everything: no GET, no cache read or write", async () => {
+    seedCache({ "@yawlabs/mcp": { latest: "0.45.0", at: fixedNow - HOUR } });
+    const before = readFileSync(cacheFile(), "utf8");
+    const cap = captureOut();
+    await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      err: () => {},
+      now: () => fixedNow,
+      currentVersion: "0.40.0",
+      skipRegistryCheck: true,
+    });
+    // The gate sits in FRONT of the cache: a skipped check reports nothing,
+    // even with a fresh answer on disk.
+    expect(cap.text()).not.toContain("UPGRADE AVAILABLE");
+    expect(readFileSync(cacheFile(), "utf8")).toBe(before);
+  });
+
+  describe("under YAW_MCP_READONLY_DIAGNOSTICS", () => {
+    const READONLY_ENV = { YAW_MCP_READONLY_DIAGNOSTICS: "1" };
+
+    it("uses a fresh entry an ordinary run stored, with no GET", async () => {
+      seedCache({ "@yawlabs/mcp": { latest: "0.45.0", at: fixedNow - HOUR } });
+      const probe = countingFetch("0.99.0");
+      expect(await runText(probe.fetch, READONLY_ENV)).toContain("npm latest is 0.45.0");
+      expect(probe.calls).toHaveLength(0);
+    });
+
+    it("fetches on a miss but writes no cache file -- the run still writes nothing", async () => {
+      const probe = countingFetch("0.45.0");
+      const txt = await runText(probe.fetch, READONLY_ENV);
+      expect(txt).toContain("no registry-cache write");
+      expect(txt).toContain("npm latest is 0.45.0");
+      expect(probe.calls).toHaveLength(1);
+      expect(existsSync(cacheFile())).toBe(false);
+      expect(existsSync(join(synthHome, ".yaw-mcp"))).toBe(false);
+    });
+
+    it("leaves an expired entry on disk byte-identical while refetching past it", async () => {
+      seedCache({ "@yawlabs/mcp": { latest: "0.41.0", at: fixedNow - 25 * HOUR } });
+      const before = readFileSync(cacheFile(), "utf8");
+      const probe = countingFetch("0.45.0");
+      expect(await runText(probe.fetch, READONLY_ENV)).toContain("npm latest is 0.45.0");
+      expect(probe.calls).toHaveLength(1);
+      expect(readFileSync(cacheFile(), "utf8")).toBe(before);
+    });
   });
 });
 

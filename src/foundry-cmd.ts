@@ -172,11 +172,10 @@ async function loadServerCatalog(
   }
   // Give each server the tool list a COLD server ranks on, in the order
   // ConnectServer.rankableTools (server.ts) resolves it: the persisted learned
-  // list, else a list on the entry itself, else the bundled list
-  // fallback-tools.ts keeps for a few well-known servers. There is no live
-  // branch -- nothing is connected in a CLI run -- so a server that was
-  // connected when it was dispatched to can still snapshot a different list
-  // than the one that produced `chosen`.
+  // list, else the bundled list fallback-tools.ts keeps for a few well-known
+  // servers. There is no live branch -- nothing is connected in a CLI run --
+  // so a server that was connected when it was dispatched to can still
+  // snapshot a different list than the one that produced `chosen`.
   //
   // bundles.json's loader does not carry `toolCache` through its field
   // whitelist, so a snapshot built from the config alone gives every server
@@ -190,8 +189,7 @@ async function loadServerCatalog(
   // TOOLCACHE_TTL_MS on the way in -- so a renamed server, or a stale state
   // file, snapshots empty unless fallback-tools.ts knows the image or binary
   // it launches. runFoundryExport counts the tool-less servers so that is
-  // visible instead of silent. `s.toolCache` stays in the order in case a
-  // future bundles.json does carry the field.
+  // visible instead of silent.
   const state = await loadState(statePath(userConfigDir(home)));
   const servers = (config?.servers ?? []).map((s) => ({
     namespace: s.namespace,
@@ -203,18 +201,17 @@ async function loadServerCatalog(
 }
 
 /** The cold-server tool list for one bundles.json entry. Same order as
- *  ConnectServer.rankableTools without its live branch: a non-empty learned
- *  list wins, else a list on the entry; a learned list that is EMPTY still
- *  counts as an observation (the server was spawned and offered nothing), so
- *  only an entry with no list of either kind takes the bundled one. */
+ *  ConnectServer.rankableTools without its live branch: the learned list
+ *  wins, even EMPTY (the server was spawned and offered nothing, which is an
+ *  observation), so only an entry with no learned list takes the bundled
+ *  one. */
 function coldToolsFor(
-  server: { command?: string; args?: string[]; toolCache?: RankableServer["tools"] },
+  server: { command?: string; args?: string[] },
   learned: RankableServer["tools"] | undefined,
 ): RankableServer["tools"] {
-  const known = learned && learned.length > 0 ? learned : server.toolCache;
-  if ((known && known.length > 0) || learned !== undefined) return known ?? [];
+  if (learned !== undefined) return learned;
   const bundled = fallbackToolsFor(server);
-  return bundled ? [...bundled] : (known ?? []);
+  return bundled ? [...bundled] : [];
 }
 
 export async function runFoundryExport(opts: FoundryExportOptions): Promise<{ exitCode: number; lines: string[] }> {

@@ -89,7 +89,8 @@
 //     unless a yaw-mcp bin shim sits in the prefix root (see
 //     defaultConfirmGlobalPrefix): a project directory with that name would
 //     otherwise receive a `-g --prefix` install. A real global prefix of that
-//     name whose shim is missing is logged and left for `yaw-mcp upgrade`.
+//     name whose shim is missing is logged and skipped; `yaw-mcp upgrade`
+//     refuses the same prefix and explains the choice and the manual remedies.
 //
 // Opt-out: set YAW_MCP_AUTO_UPGRADE=0 (or =false) to suppress the check
 // entirely -- useful for pinned-version setups, sudo-installed globals
@@ -994,7 +995,7 @@ export async function maybeAutoUpgrade(deps: AutoUpgradeDeps = {}): Promise<void
   if (rawPrefix !== null && !(deps.confirmGlobalPrefixImpl ?? defaultConfirmGlobalPrefix)(argvPath, rawPrefix)) {
     log(
       "info",
-      "yaw-mcp is out of date; not upgrading in the background because this copy sits under a directory named `npm` or `bin` with no yaw-mcp bin shim beside it, which may be a project tree rather than a global npm prefix -- run `yaw-mcp upgrade` for the command that updates this install",
+      "yaw-mcp is out of date; not upgrading in the background because this copy sits under a directory named `npm` or `bin` with no yaw-mcp bin shim beside it, which may be a project tree rather than a global npm prefix -- run `yaw-mcp upgrade` to see why and how to update this copy by hand",
       { current, latest, method, prefix: rawPrefix },
     );
     return;

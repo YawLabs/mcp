@@ -11,13 +11,18 @@
 //   update --to <sha> back to a build kept on this machine
 //
 // A failed build changes nothing: the pin stays, the old build keeps running,
-// and the command exits 1. A build that SUCCEEDS but then fails its start
-// check is a different outcome and does not get that treatment: the pin still
-// moves to it, the entry reports `status: "updated"` with `started: false`
-// and the reason, and the command exits 0 with `ok: true` -- unlike
-// `add --git`, which exits 1 when the server it wrote does not start. The
-// previous build is kept, and the line naming `update <name> --to <sha>` is
-// the way back. Only `git.commit` (and `ref` / `tokenSecret` when
+// and the command exits 1. So does a build that finishes but then fails its
+// start check (the one real handshake): bundles.json is not touched (no
+// commit, ref or token change is written), the entry reports
+// `status: "failed"` with `started: false` and the reason, and the command
+// exits 1 with `ok: false`. On a move to a new commit the previous build stays
+// pinned and on disk, and the new build is left on disk unpinned (the next GC
+// takes it), so a re-run once the cause is fixed reuses it. When the commit
+// does not move (only --ref or --git-token-secret changed) the build that
+// failed is the pinned build itself, and only that change is refused.
+// --no-start-check runs no check, so there is nothing to fail. Ctrl+C at a
+// repo's script-consent prompt stops the run with exit 130.
+// Only `git.commit` (and `ref` / `tokenSecret` when
 // asked) is spliced into the file, so comments survive. Old builds are
 // collected under the git lock, keeping the current and the previous one and
 // every build any bundles.json still pins -- the user file, every trusted
@@ -28,11 +33,13 @@
 
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { scriptConsentConfirm } from "./git-consent-prompt.js";
 import {
   asciiLines,
   buildGitSource,
   buildMatchesHost,
   discardBuild,
+  forgetGitPin,
   GIT_MISSING_MESSAGE,
   type GitBuildContext,
   type GitBuildResult,
@@ -69,7 +76,7 @@ import {
 } from "./local-bundles.js";
 import { createStreamWriter } from "./logger.js";
 import { findProjectConfigDir, userConfigDir } from "./paths.js";
-import { askYesNo, type YesNoOptions } from "./readline-question.js";
+import type { YesNoOptions } from "./readline-question.js";
 import { SECRET_NAME_RE } from "./secrets-vault.js";
 import type { GitSource, UpstreamServerConfig } from "./types.js";
 
@@ -96,11 +103,14 @@ export const UPDATE_USAGE = `Usage: yaw-mcp update [<name>] [--check] [--ref <re
                     the pin changes, and comments survive; commit the file.
   --yes, -y         Allow a repo's install and build scripts to run. Asked
                     once per repo; when stdin or stdout is not a TTY, required
-                    until the repo is allowed here.
-  --no-start-check  Skip the one real handshake after the build. A build that
-                    fails that handshake is still pinned and the exit code is
-                    still 0: the output says it did not start and names the
-                    command that goes back to the previous build.
+                    until the repo is allowed here. Ctrl+C at that question
+                    stops the run (exit 130).
+  --no-start-check  Skip the one real handshake after the build. Without this
+                    flag a build that fails the handshake changes nothing in
+                    bundles.json (no new commit, --ref or token is written),
+                    the output says why it did not start, and the exit code
+                    is 1. On a move to a new commit the previous build stays
+                    pinned.
   --json            Print a JSON document.`;
 
 export interface UpdateCommandOptions {
@@ -422,6 +432,8 @@ export async function runUpdate(opts: UpdateCommandOptions = {}): Promise<{ exit
   const state: Record<string, GitStateEntry> = {};
   const reports: UpdateReport[] = [];
   let projectTrust: "regranted" | "untrusted" | undefined;
+  // Ctrl+C at a repo's consent prompt: the entries after it are not tried.
+  let cancelled = false;
   const buildCtx = (prepared?: PreparedGit): GitBuildContext => ({
     home,
     env,
@@ -429,11 +441,8 @@ export async function runUpdate(opts: UpdateCommandOptions = {}): Promise<{ exit
     yes: opts.yes === true,
     progress: (l) => progress(`  ${l}`),
     warn,
-    confirm: async (lines) => {
-      for (const l of lines) print(l);
-      const answer = await askYesNo(opts, "Proceed? [Y/n] ");
-      return answer === "" || answer === "y" || answer === "yes";
-    },
+    // Ctrl+C there fails the build with `cancelled`, and the loop stops.
+    confirm: scriptConsentConfirm(opts, print),
     runPm: opts.runPm,
     resolveToken: opts.resolveToken,
     ...(prepared ? { git: prepared } : {}),
@@ -468,7 +477,8 @@ export async function runUpdate(opts: UpdateCommandOptions = {}): Promise<{ exit
         projectTrust = w.projectTrust ?? projectTrust;
         return true;
       } catch (x) {
-        failed((x as Error).message);
+        // updateGitPin writes nothing when it throws.
+        failed(`${(x as Error).message}\nThe pin did not move.`);
         return false;
       }
     };
@@ -498,6 +508,10 @@ export async function runUpdate(opts: UpdateCommandOptions = {}): Promise<{ exit
         // reported yet -- and `--to` names one server, so none has.
         if (r.gitMissing && reports.length === 0) return fail(2, GIT_MISSING_MESSAGE);
         failed(r.message);
+        if (r.cancelled) {
+          cancelled = true;
+          break;
+        }
         continue;
       }
       const moved = r.commit !== e.git.commit;
@@ -600,10 +614,50 @@ export async function runUpdate(opts: UpdateCommandOptions = {}): Promise<{ exit
     );
     if (!build.ok) {
       failed(build.message);
+      if (build.cancelled) {
+        cancelled = true;
+        break;
+      }
       continue;
     }
     const started = opts.noStartCheck ? null : await startCheck(e, build, opts);
     if (started) progress(`  Checking it starts ... ${started.ok ? `ok -- ${started.tools} tools` : "failed"}`);
+    if (started && !started.ok) {
+      // The build finished but does not start. Not one byte of bundles.json
+      // is written -- no commit, and no ref or token change either, since they
+      // are part of the same update -- and nothing is collected. Three cases:
+      //  - a real move (a new commit over a pinned one): the pinned build
+      //    stays, and the new build stays on disk unpinned for a re-run to
+      //    reuse once the cause is fixed (the next GC removes it otherwise);
+      //  - the same commit under a new --ref or --git-token-secret: the build
+      //    that failed IS the pinned one, so nothing "keeps running" -- only
+      //    the ref or token change is refused;
+      //  - an entry with no commit pinned: there is no previous build.
+      // buildGitSource recorded this file in refs.json as using the new build:
+      // put the record back on the pin the file still holds, or drop it when
+      // the file pins no commit, so GC does not keep a build nothing pins.
+      if (e.git.commit) await recordGitPin(e.namespace, file.path, e.git.commit, home, warn);
+      else await forgetGitPin(e.namespace, file.path, build.commit, home, warn);
+      const startError = startFailureTail(started.error, prepared.secrets);
+      const rerun = [
+        `yaw-mcp update ${e.namespace}`,
+        ...(refChanged ? [`--ref ${resolved.ref}`] : []),
+        ...(tokenChanged ? [`--git-token-secret ${opts.gitTokenSecret}`] : []),
+        ...(file.configDir !== undefined ? ["--project"] : []),
+      ].join(" ");
+      const changes = [...(refChanged ? ["--ref"] : []), ...(tokenChanged ? ["--git-token-secret"] : [])].join(" and ");
+      const samePin = !!e.git.commit && build.commit === e.git.commit;
+      const error = asciiLines(
+        samePin
+          ? `the pinned build ${sha7(build.commit)} itself did not start: ${startError}\nThe ${changes || "update"} change was not written to bundles.json. Fix the cause and run ${rerun} again, or write it without the check: ${rerun} --no-start-check`
+          : e.git.commit
+            ? `${sha7(build.commit)} built but did not start: ${startError}\nNothing was changed: "${e.namespace}" stays on ${sha7(e.git.commit)}, which keeps running. Fix the cause and run ${rerun} again (the new build stays on disk until the next cleanup, so a re-run of the same commit does not rebuild it), or pin it without the check: ${rerun} --no-start-check`
+            : `${sha7(build.commit)} built but did not start: ${startError}\nNothing was changed: "${e.namespace}" has no commit pinned, and bundles.json was not written. Fix the cause and run ${rerun} again (the new build stays on disk until the next cleanup, so a re-run of the same commit does not rebuild it), or pin it without the check: ${rerun} --no-start-check`,
+      );
+      reports.push({ ...report, status: "failed", commits: build.ahead ?? null, error, started: false, startError });
+      printErr(`yaw-mcp update: ${e.namespace}: ${error}`);
+      continue;
+    }
     if (!(await writePin({ commit: build.commit, ...(refChanged ? { ref: resolved.ref } : {}), ...tokenPatch }))) {
       continue;
     }
@@ -612,22 +666,16 @@ export async function runUpdate(opts: UpdateCommandOptions = {}): Promise<{ exit
     if (build.commit !== e.git.commit)
       await collect(e.namespace, [build.commit, e.git.commit], home, warn, { cwd, env });
     const commits = build.ahead ?? null;
-    const startError = started && !started.ok ? startFailureTail(started.error, prepared.secrets) : null;
     reports.push({
       ...report,
       to: build.commit,
       status: "updated",
       commits,
-      started: started === null ? null : started.ok,
-      startError,
+      started: started === null ? null : true,
     });
     if (!opts.json) {
       const count = commits !== null ? ` (${commits} commit${commits === 1 ? "" : "s"})` : "";
-      if (startError !== null) {
-        print(`Updated "${e.namespace}" to ${sha7(build.commit)}${count}, but it did not start: ${startError}.`);
-      } else {
-        print(`Updated "${e.namespace}" to ${sha7(build.commit)}${count}.`);
-      }
+      print(`Updated "${e.namespace}" to ${sha7(build.commit)}${count}.`);
       if (e.git.commit && e.git.commit !== build.commit) {
         print(`  Previous build kept: yaw-mcp update ${e.namespace} --to ${sha7(e.git.commit)}`);
       }
@@ -665,6 +713,9 @@ export async function runUpdate(opts: UpdateCommandOptions = {}): Promise<{ exit
   } else if (projectTrust === "untrusted") {
     printErr(`Note: ${file.path} is not trusted on this machine, so it does not load until you run yaw-mcp trust.`);
   }
+  // 130 (128 + SIGINT), as every prompt in the CLI exits for Ctrl+C. Only a
+  // TTY run asks, so no --json document ever carries it.
+  if (cancelled) return { exitCode: 130 };
   return { exitCode: bad ? 1 : 0 };
 }
 
@@ -693,24 +744,33 @@ async function startCheck(
   opts: UpdateCommandOptions,
 ): Promise<{ ok: true; tools: number } | { ok: false; error: string }> {
   const pkgDir = join(build.dir, ...(build.subdir ?? "").split(/[\\/]/).filter(Boolean));
-  return (opts.startCheck ?? defaultStartCheck)({
-    id: `local-${e.namespace}`,
-    name: e.namespace,
-    namespace: e.namespace,
-    type: "local",
-    transport: "stdio",
-    command: gitNodeCommand(),
-    args: [join(pkgDir, ...build.entry.split(/[\\/]/)), ...e.args],
-    cwd: pkgDir,
-    ...(Object.keys(e.env).length > 0 ? { env: e.env } : {}),
-    isActive: true,
-  });
+  // A check that throws is a check that failed: escaping here would end the
+  // run half-way, with later entries untried and state.json unwritten.
+  try {
+    return await (opts.startCheck ?? defaultStartCheck)({
+      id: `local-${e.namespace}`,
+      name: e.namespace,
+      namespace: e.namespace,
+      type: "local",
+      transport: "stdio",
+      command: gitNodeCommand(),
+      args: [join(pkgDir, ...build.entry.split(/[\\/]/)), ...e.args],
+      cwd: pkgDir,
+      ...(Object.keys(e.env).length > 0 ? { env: e.env } : {}),
+      isActive: true,
+    });
+  } catch (x) {
+    return { ok: false, error: x instanceof Error ? x.message : String(x) };
+  }
 }
 
 /** `--to`: the kept build whose commit starts with `prefix`. One made for
  *  another platform, arch or node major is rebuilt first, and that rebuild is
  *  the only step here that runs git: it is checked for BEFORE the kept build
- *  is discarded, so a machine without git keeps the build it has. */
+ *  is discarded, so a machine without git keeps the build it has. The discard
+ *  has to come first (the builder would otherwise reuse the foreign build), so
+ *  a rebuild that then fails says the foreign build is gone, instead of the
+ *  builder's own "Nothing was changed". */
 async function rollBack(
   e: RawGitEntry,
   spec: GitSpec,
@@ -719,7 +779,9 @@ async function rollBack(
   ctx: GitBuildContext,
   pinFile: string,
   where: { cwd: string; env: NodeJS.ProcessEnv },
-): Promise<{ ok: true; commit: string; rebuilt: boolean } | { ok: false; message: string; gitMissing?: true }> {
+): Promise<
+  { ok: true; commit: string; rebuilt: boolean } | { ok: false; message: string; gitMissing?: true; cancelled?: true }
+> {
   const kept = keptBuilds(e.namespace, ctx.home);
   const hits = kept.filter((k) => k.marker.commit.startsWith(prefix));
   if (hits.length === 0) {
@@ -740,20 +802,32 @@ async function rollBack(
   }
   const discarded = await discardBuild(e.namespace, hit.marker.commit, ctx.home, where);
   if (!discarded.ok) return { ok: false, message: discarded.message };
+  const target = hit.marker.commit;
+  const pinStays =
+    e.git.commit === target
+      ? `"${e.namespace}" still pins ${sha7(target)}, which now has no build here; once the cause is fixed, build it with: yaw-mcp sidecars install`
+      : `The pin did not move${e.git.commit ? ` (${sha7(e.git.commit)})` : ""}.`;
+  const gone = `The kept build of ${sha7(target)} was made for another machine and was deleted to rebuild it. ${pinStays}`;
   const build = await buildGitSource(
     {
       spec,
       ...(e.git.ref ? { ref: e.git.ref } : {}),
-      commit: hit.marker.commit,
+      commit: target,
       namespace: e.namespace,
       subdir: e.git.subdir ?? "",
       entry: e.git.entry,
       ...(tokenSecret ? { tokenSecret } : {}),
       pinFile,
+      unchanged: gone,
     },
     ctx,
   );
-  if (!build.ok) return { ok: false, message: build.message };
+  if (!build.ok) {
+    // `unchanged` reaches only an install or build failure; every other
+    // failure (clone, checkout, a declined consent) gets the line here.
+    const message = build.message.includes(gone) ? build.message : `${build.message}\n${gone}`;
+    return { ok: false, message, ...(build.cancelled ? { cancelled: true as const } : {}) };
+  }
   return { ok: true, commit: build.commit, rebuilt: true };
 }
 

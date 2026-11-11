@@ -20,11 +20,14 @@ describe("loadUserGuide", () => {
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), "yaw-mcp-guide-home-"));
     // Two tests below assert a WARN-level line captured off process.stderr.
-    // logger.ts resolves LOG_LEVEL per call (deliberately, so a host can flip
-    // it mid-session), so a developer shell or CI job exporting LOG_LEVEL=error
-    // suppresses those lines and fails the tests for a reason that has nothing
-    // to do with guide.ts. Pin the threshold the assertions depend on.
+    // logger.ts resolves the level per call (deliberately, so a host can flip
+    // it mid-session) from YAW_MCP_LOG_LEVEL, else LOG_LEVEL, so a developer
+    // shell or CI job exporting either as `error` suppresses those lines and
+    // fails the tests for a reason that has nothing to do with guide.ts. Pin
+    // the threshold the assertions depend on, and clear the variable that
+    // would win over the pin.
     vi.stubEnv("LOG_LEVEL", "warn");
+    vi.stubEnv("YAW_MCP_LOG_LEVEL", undefined);
   });
 
   afterEach(() => {

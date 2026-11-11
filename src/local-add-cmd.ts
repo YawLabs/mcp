@@ -22,6 +22,7 @@ import { join } from "node:path";
 import { CATALOG_SLUG_RE, ENV_KEY_RE, type FetchCatalog, resolveCatalogSlug, tokenizeCommand } from "./catalog.js";
 import { readClientEnv } from "./client-config.js";
 import { probeClientsAsync } from "./doctor-cmd.js";
+import { scriptConsentConfirm } from "./git-consent-prompt.js";
 import {
   asciiLines,
   buildGitSource,
@@ -142,7 +143,8 @@ export const ADD_USAGE = `Usage: yaw-mcp add <slug> [flags]
   --yes             Allow the repo's install/build scripts to run. Asked once
                     per repo on a TTY; off one, required until the repo is
                     allowed here. Recorded per repo in
-                    ~/.yaw-mcp/git/consent.json.
+                    ~/.yaw-mcp/git/consent.json. Ctrl+C at that question
+                    exits 130 with nothing built or written.
   --project         Write <project>/.yaw-mcp/bundles.json instead.
   --no-start-check  Skip the one real handshake after the build.
   -- <args>         Arguments passed to the server.
@@ -167,9 +169,14 @@ export const ADD_USAGE = `Usage: yaw-mcp add <slug> [flags]
                     out to keep a shell-resident secret off disk entirely --
                     the server inherits it at launch.
   --dry-run         Print what would be written without writing.
-  --json            Emit the written entry as JSON (implies success on stdout).
+  --json            Emit the written entry as JSON.
                     Env vars appear as \`envKeys\` -- key NAMES only, never the
-                    stored values.
+                    stored values. An add that writes nothing prints one
+                    {"ok":false,"error":...,"exitCode":...} document on
+                    stdout instead; the message is also on stderr. (An
+                    --git add that was written but failed its start check
+                    prints the ok:true document with "started":false and
+                    a "startError", and exits 1.)
   --catalog <url>   Override the catalog URL. Precedence: --catalog, then
                     $YAW_MCP_CATALOG_URL, then the public catalog.`;
 
@@ -205,7 +212,9 @@ export interface AddCommandOptions {
    *  package-manager runner, the token reader and the start check. */
   isTTY?: boolean;
   promptAnswer?: string;
-  io?: { stdin?: NodeJS.ReadableStream; stdout?: NodeJS.WritableStream };
+  /** `terminal` forces readline's keypress mode, so a test can deliver
+   *  Ctrl+C at the consent prompt the way a terminal does. */
+  io?: { stdin?: NodeJS.ReadableStream; stdout?: NodeJS.WritableStream; terminal?: boolean };
   runPm?: GitBuildContext["runPm"];
   resolveToken?: GitBuildContext["resolveToken"];
   startCheck?: (config: UpstreamServerConfig) => Promise<{ ok: true; tools: number } | { ok: false; error: string }>;
@@ -803,16 +812,59 @@ function renderLaunchChange(change: LaunchChange): string {
   return `  from: ${renderLaunch(change.from)}\n    to: ${renderLaunch(change.to)}`;
 }
 
+/** The `add --json` failure document, one layout for every add path (catalog,
+ *  --command, --url and --git): `{ok:false,error,exitCode}`, pretty-printed
+ *  like the success document, with `error` the stderr line's text,
+ *  `yaw-mcp add:` prefix included. */
+function addJsonFailure(error: string, exitCode: number): string {
+  return JSON.stringify({ ok: false, error, exitCode }, null, 2);
+}
+
 export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult> {
-  if (opts.git !== undefined) return runAddGit(opts, opts.git);
+  const rawOut = opts.out ?? createStreamWriter(process.stdout);
+  // Whether stdout has carried anything yet. Under --json every failure is
+  // ONE {ok:false} document, so a rejection that escapes after the success
+  // document (or a failure document) is already out must not add a second.
+  let stdoutUsed = false;
+  const out = (s: string): void => {
+    stdoutUsed = true;
+    rawOut(s);
+  };
+  const scoped = { ...opts, out };
+  try {
+    return opts.git !== undefined ? await runAddGit(scoped, opts.git) : await runAddDirect(scoped);
+  } catch (e) {
+    // The dispatcher prints `yaw-mcp add: <message>` on stderr and exits 1;
+    // under --json stdout gets the matching document first.
+    if (opts.json && !stdoutUsed) {
+      out(`${addJsonFailure(`yaw-mcp add: ${e instanceof Error ? e.message : String(e)}`, 1)}\n`);
+    }
+    throw e;
+  }
+}
+
+/** A catalog, --command or --url add. `opts.out` is set (runAdd wraps it). */
+async function runAddDirect(opts: AddCommandOptions): Promise<AddCommandResult> {
   const out = opts.out ?? createStreamWriter(process.stdout);
   const err = opts.err ?? createStreamWriter(process.stderr);
   const print = (s = ""): void => out(`${s}\n`);
   const printErr = (s: string): void => err(`${s}\n`);
+  // Every refusal of this path: the stderr text is unchanged (the callers
+  // print their own lines first, some of them several), and under --json
+  // stdout gets ONE {ok:false} document -- the same one runAddGit's fail()
+  // prints. `error` is the one-line summary of what stderr said.
+  const failed = (exitCode: number, error: string): AddCommandResult => {
+    if (opts.json) print(addJsonFailure(error, exitCode));
+    return { exitCode, written: [] };
+  };
+  const refuse = (exitCode: number, error: string): AddCommandResult => {
+    printErr(error);
+    return failed(exitCode, error);
+  };
 
   if (!opts.slug) {
     printErr(ADD_USAGE);
-    return { exitCode: 2, written: [] };
+    return failed(2, "yaw-mcp add: a server slug (or a name with --command or --url) is required.");
   }
   const slug = opts.slug;
   // The same shape gates both modes: it is a catalog slug in one and the name
@@ -823,8 +875,7 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
   const origin: UpsertOrigin = custom ? "custom" : "catalog";
   if (!CATALOG_SLUG_RE.test(slug)) {
     const what = custom ? "name" : "slug";
-    printErr(`yaw-mcp add: invalid ${what} "${slug}" (lowercase letters, digits, and dashes only).`);
-    return { exitCode: 2, written: [] };
+    return refuse(2, `yaw-mcp add: invalid ${what} "${slug}" (lowercase letters, digits, and dashes only).`);
   }
 
   const env = opts.env ?? process.env;
@@ -854,12 +905,13 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
       try {
         parsed = new URL(opts.url);
       } catch {
-        printErr(`yaw-mcp add: invalid url ${JSON.stringify(opts.url)} -- include the scheme, e.g. https://host/mcp`);
-        return { exitCode: 2, written: [] };
+        return refuse(
+          2,
+          `yaw-mcp add: invalid url ${JSON.stringify(opts.url)} -- include the scheme, e.g. https://host/mcp`,
+        );
       }
       if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-        printErr(`yaw-mcp add: url must be http or https, got ${JSON.stringify(parsed.protocol)}`);
-        return { exitCode: 2, written: [] };
+        return refuse(2, `yaw-mcp add: url must be http or https, got ${JSON.stringify(parsed.protocol)}`);
       }
     }
     let command = "";
@@ -871,14 +923,10 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
       try {
         tokens = tokenizeCommand(opts.command);
       } catch (e) {
-        printErr(`yaw-mcp add: ${(e as Error).message}`);
-        return { exitCode: 2, written: [] };
+        return refuse(2, `yaw-mcp add: ${(e as Error).message}`);
       }
       [command = "", ...args] = tokens;
-      if (!command) {
-        printErr(`yaw-mcp add: --command had no executable in it.`);
-        return { exitCode: 2, written: [] };
-      }
+      if (!command) return refuse(2, "yaw-mcp add: --command had no executable in it.");
     }
     server = {
       slug,
@@ -906,8 +954,7 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
         warn: printErr,
       });
     } catch (e) {
-      printErr(`yaw-mcp add: ${(e as Error).message}`);
-      return { exitCode: 1, written: [] };
+      return refuse(1, `yaw-mcp add: ${(e as Error).message}`);
     }
   }
 
@@ -951,7 +998,10 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
     printErr("Provide them with --env KEY=value (repeatable) or your shell, then re-run:");
     printErr(`  yaw-mcp add ${slug} ${missing.map((k) => `--env ${k}=...`).join(" ")}`);
     if (server.docUrl) printErr(`Docs: ${server.docUrl}`);
-    return { exitCode: 1, written: [] };
+    return failed(
+      1,
+      `yaw-mcp add: ${server.name} needs the following env var(s) before it can run: ${missing.join(", ")}. Provide them with --env KEY=value or your shell, then re-run.`,
+    );
   }
 
   // Seed required keys EMPTY and persist a VALUE only when the user passed it
@@ -1047,23 +1097,21 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
     } catch (e) {
       // Same unreadable-file failure the real run surfaces -- including its
       // de-duplicated path (see nameBundlesFileOnce).
-      printErr(`yaw-mcp add: ${nameBundlesFileOnce((e as Error).message, localBundlesPath(userConfigDir(home)))}`);
-      return { exitCode: 1, written: [] };
+      return refuse(
+        1,
+        `yaw-mcp add: ${nameBundlesFileOnce((e as Error).message, localBundlesPath(userConfigDir(home)))}`,
+      );
     }
     // The same read diagnostics the real run prints (see readRawUserBundles):
     // a preview that hid them described a quieter run than the real one.
     for (const w of preview.warnings) printErr(`warning: ${w}`);
     if (preview.refusal) {
-      // stderr text under --json too: that is what the REAL refusal (the
-      // catch around upsertUserBundle below) emits, and every other error
-      // exit of runAdd itself. A {ok:false} body on stdout here would be the
-      // one place the preview's channel differed from the run it previews.
-      // (`add --git` is the exception in this file: runAddGit's fail() ALSO
-      // prints an {ok:false} document on stdout under --json.)
+      // The same channels as the REAL refusal (the catch around
+      // upsertUserBundle below) and every other error exit of an add: the
+      // text on stderr, and under --json one {ok:false} document on stdout.
       // Rendered through displaySafe: the stored half of the collision (name,
       // slug) comes straight out of bundles.json.
-      printErr(`yaw-mcp add (dry-run): would refuse: ${formatBundleCollision(preview.refusal, displaySafe)}`);
-      return { exitCode: 1, written: [] };
+      return refuse(1, `yaw-mcp add (dry-run): would refuse: ${formatBundleCollision(preview.refusal, displaySafe)}`);
     }
     const previewNamespace = preview.namespace ?? namespace;
     // Render the entry the run would WRITE, never the pre-merge object built
@@ -1165,8 +1213,7 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
       e instanceof BundleCollisionError
         ? formatBundleCollision(e.collision, displaySafe)
         : nameBundlesFileOnce((e as Error).message, localBundlesPath(userConfigDir(home)));
-    printErr(`yaw-mcp add: ${msg}`);
-    return { exitCode: 1, written: [] };
+    return refuse(1, `yaw-mcp add: ${msg}`);
   }
   // Read diagnostics first, before the success line they qualify -- an
   // invalid `defaultRuntime` this write just dropped from the file is the
@@ -1343,11 +1390,9 @@ async function runAddGit(opts: AddCommandOptions, spec: GitSpec): Promise<AddCom
     // stdout as well as the human line on stderr -- zero bytes on stdout used
     // to mean both "refused" and "worked quietly". Every fail() here runs
     // BEFORE the success document is printed, so stdout carries exactly one
-    // document either way. Only `add --git` does this: a catalog, --command
-    // or --url add that fails under --json prints stderr text and leaves
-    // stdout empty (see runAdd).
-    if (opts.json)
-      print(JSON.stringify({ ok: false, error: `yaw-mcp add: ${f.message}`, exitCode: f.exitCode }, null, 2));
+    // document either way. A catalog, --command or --url add prints the same
+    // document on its failures (runAddDirect), and runAdd covers a rejection.
+    if (opts.json) print(addJsonFailure(`yaw-mcp add: ${f.message}`, f.exitCode));
     printErr(`yaw-mcp add: ${f.message}`);
     return { exitCode: f.exitCode, written: [] };
   };
@@ -1424,11 +1469,8 @@ async function runAddGit(opts: AddCommandOptions, spec: GitSpec): Promise<AddCom
       yes: opts.yes === true,
       progress,
       warn,
-      confirm: async (lines) => {
-        for (const l of lines) print(l);
-        const answer = await askYesNo(opts, "Proceed? [Y/n] ");
-        return answer === "" || answer === "y" || answer === "yes";
-      },
+      // Ctrl+C there fails the build with exit 130, which fail() passes on.
+      confirm: scriptConsentConfirm(opts, print),
       runPm: opts.runPm,
       git: prepared,
     },
@@ -1651,10 +1693,10 @@ async function runAddGit(opts: AddCommandOptions, spec: GitSpec): Promise<AddCom
   }
   // The entry IS written (and `written` says so) while the handshake that
   // proves it launches failed: exit 0 told a script the add was fine when the
-  // server it just added does not start. `update` does NOT do this -- it pins
-  // a build that fails its start check and exits 0 (see the header of
-  // update-cmd.ts); `add` exits non-zero because the entry it just wrote is
-  // the only build there is.
+  // server it just added does not start. `update` exits 1 for the same
+  // failure too, but WITHOUT writing: it keeps the previous pin, which still
+  // runs (see the header of update-cmd.ts). `add` has no previous build to
+  // keep, so the entry stays written and the exit code carries the failure.
   return { exitCode: startError !== null ? 1 : 0, written: [res.path] };
 }
 

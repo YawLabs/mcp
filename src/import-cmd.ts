@@ -246,8 +246,14 @@ interface ImportCandidate {
   /** env / header key NAMES for the transcript. Never their values. */
   credentialKeys: string[];
   /** Loader-worded notes about what a malformed `env` / `headers` lost, key
-   *  NAMES only. Empty for the overwhelmingly common well-formed case. */
+   *  NAMES only, plus one per key the target's `forImport` hook reported in
+   *  `discardedKeys` (discardedKeyNotes). Empty for the overwhelmingly common
+   *  well-formed case. */
   discarded: string[];
+  /** The client stores this server switched off (`ImportView.disabled`), so
+   *  its entry is written `"isActive": false` and the transcript says how to
+   *  turn it on. */
+  inactive: boolean;
   /** The namespace upsertUserBundle would actually write, from
    *  previewUpsertUserBundle: a stored entry matched by NAME keeps its own
    *  namespace, so this is not always `namespace`. Falls back to the derived
@@ -312,6 +318,18 @@ function discardNotes(field: "env" | "headers", key: string, f: RawMapField): st
     );
   }
   return notes;
+}
+
+/** One note per key a target's `forImport` hook reported it could not carry
+ *  into the entry (`ImportView.discardedKeys` -- Codex CLI's `cwd`,
+ *  `startup_timeout_sec`, `enabled_tools` and the rest), in the voice of
+ *  discardNotes so the run prints them beside the env/headers notes. Key
+ *  NAMES only. */
+function discardedKeyNotes(key: string, keys: string[] | undefined, label: string): string[] {
+  return (keys ?? []).map(
+    (k) =>
+      `ignoring '${displaySafe(k)}' on "${displaySafe(key)}" (a ${label} setting bundles.json has no field for) -- it was not carried over`,
+  );
 }
 
 /** The values a `${...}` span can be resolved against at import time. */
@@ -426,6 +444,8 @@ function toEntry(key: string, value: unknown, vars: ClientVars | null): BuiltEnt
   }
 
   const namespace = deriveNamespace(key);
+  // Active by default; the caller turns this off for a server its client
+  // stores switched off (ImportView.disabled).
   const base: Partial<UpstreamServerConfig> = {
     id: `local-${namespace}`,
     name: key,
@@ -1239,6 +1259,10 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
   /** Servers refused over a `${...}` this importer cannot resolve, already
    *  rendered as "  <key>: <spans>" lines. */
   const unresolvable: string[] = [];
+  /** Servers the target's `forImport` hook says cannot be imported at all
+   *  (`ImportView.skipReason`), already rendered as "  <key>: <reason>"
+   *  lines. */
+  const notImportable: string[] = [];
   for (const { key, value } of source.entries()) {
     if (isSelfEntry(key)) {
       skippedSelf.push(key);
@@ -1258,13 +1282,17 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
     // transport key (Cline) import as a launchable server rather than as an
     // opaque object with no command in it.
     //
-    // Only `entry` is read today, and that is the whole of what the importer
-    // asks for: `disabled`, `skipReason` and `discardedKeys` arrive on an
-    // ImportView only from a `forImport` hook. Codex CLI's row declares one
-    // (target-codex-cli.ts), so a TOML entry reaches this line through it, but
-    // the importer does not act on those three fields yet -- wiring them is
-    // separate work, with its own tests, not a side effect of reading TOML.
-    const built = toEntry(key, importViewOf(value as Record<string, unknown>, target.entry).entry, vars);
+    // The view's other three fields arrive only from a `forImport` hook (Codex
+    // CLI's row declares one, target-codex-cli.ts), and each is acted on here:
+    // a `skipReason` skips the server by name with the client's own reason,
+    // `disabled` writes it `"isActive": false`, and every `discardedKeys`
+    // entry is named beside the env/headers notes.
+    const importView = importViewOf(value as Record<string, unknown>, target.entry);
+    if (importView.skipReason !== undefined) {
+      notImportable.push(`  ${displayArg(key)}: ${displaySafe(importView.skipReason)}`);
+      continue;
+    }
+    const built = toEntry(key, importView.entry, vars);
     if (!built) {
       unusable.push(key);
       continue;
@@ -1273,12 +1301,15 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
       unresolvable.push(`  ${displayArg(key)}: ${describeUnresolved(built.unresolved, inputs)}`);
       continue;
     }
+    const inactive = importView.disabled === true;
+    if (inactive) built.entry.isActive = false;
     candidates.push({
       key,
       namespace: built.entry.namespace as string,
       entry: built.entry,
       credentialKeys: built.credentialKeys,
-      discarded: built.discarded,
+      discarded: [...built.discarded, ...discardedKeyNotes(key, importView.discardedKeys, target.label)],
+      inactive,
       plannedNamespace: built.entry.namespace as string,
     });
   }
@@ -1288,6 +1319,9 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
   const reportSkips = (): void => {
     if (unusable.length > 0) {
       printErr(`Skipped (no command or url to launch): ${unusable.map(displayArg).join(", ")}`);
+    }
+    if (notImportable.length > 0) {
+      printErr(`Skipped (${target.label} says these cannot be imported):\n${notImportable.join("\n")}`);
     }
     if (unresolvable.length > 0) {
       printErr(
@@ -1352,6 +1386,11 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
   for (const c of candidates) {
     print(`  ${displayArg(c.key)} -> ${c.plannedNamespace}`);
     print(`    ${renderLaunch(c.entry)}`);
+    if (c.inactive) {
+      print(
+        `    inactive: ${target.label} has it switched off, so it lands "isActive": false and does not load -- \`yaw-mcp enable ${c.plannedNamespace}\` turns it on`,
+      );
+    }
     // Key NAMES only. A client config is where the credentials are, and this
     // transcript goes on a terminal and into bug reports.
     if (c.credentialKeys.length > 0) {
@@ -1591,6 +1630,13 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
   print(
     `Imported ${imported.length} server${imported.length === 1 ? "" : "s"} into ${displaySafe(written[0] ?? "bundles.json")}${updated > 0 ? ` (${updated} updated, ${imported.length - updated} added)` : ""}.`,
   );
+  const inactive = imported.filter((r) => r.candidate.inactive);
+  if (inactive.length > 0) {
+    const one = inactive.length === 1;
+    print(
+      `Imported inactive, because ${target.label} has ${one ? "it" : "them"} switched off: ${inactive.map((r) => r.landed).join(", ")}. ${one ? "It does" : "They do"} not load until turned on with \`yaw-mcp enable <namespace>\`.`,
+    );
+  }
   if (overwritten.length > 0) {
     const lost = overwritten
       .map((r) => {
@@ -1622,13 +1668,24 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
 
   // ----- the duplicate-run trap -----------------------------------------
   //
-  // The client is STILL launching every one of these directly. Nothing about
-  // the import changed that, so without this step the user now runs each
-  // imported server twice: once from the client, once from yaw-mcp.
+  // The client is STILL launching every active one of these directly. Nothing
+  // about the import changed that, so without this step the user now runs each
+  // of those twice: once from the client, once from yaw-mcp. A server the
+  // client has switched off was imported inactive, so it runs in neither place;
+  // its original is only config clutter, and the removal offer below still
+  // covers it.
   print("");
-  print(
-    `${target.label} still launches ${imported.length === 1 ? "that server" : "those servers"} itself, so ${imported.length === 1 ? "it" : "they"} would now run twice -- once directly, once through yaw-mcp.`,
-  );
+  const running = imported.filter((r) => !r.candidate.inactive);
+  if (running.length > 0) {
+    const one = running.length === 1;
+    print(
+      `${target.label} still launches ${one ? "that server" : "those servers"} itself${running.length < imported.length ? ` (${running.map((r) => r.landed).join(", ")})` : ""}, so ${one ? "it" : "they"} would now run twice -- once directly, once through yaw-mcp.`,
+    );
+  } else {
+    print(
+      `${target.label} has ${imported.length === 1 ? "that server" : "those servers"} switched off, so ${imported.length === 1 ? "it does" : "they do"} not run from there either; removing the ${imported.length === 1 ? "original" : "originals"} only tidies its config.`,
+    );
+  }
 
   if (opts.keepOriginals) {
     print(`Left ${displaySafe(resolved.absolute)} alone (--keep-originals).`);

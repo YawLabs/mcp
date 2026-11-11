@@ -232,7 +232,7 @@ let releaseBundle: () => Promise<void> = async () => {};
 async function runEntry(
   env: Record<string, string>,
   args: string[] = [],
-): Promise<{ code: number | null; stderr: string }> {
+): Promise<{ code: number | null; stderr: string; stdout: string }> {
   // Scrub inherited YAW_MCP_* so a developer's own token / URL cannot
   // change which branch the child takes.
   const childEnv: NodeJS.ProcessEnv = { ...process.env };
@@ -275,7 +275,11 @@ async function runEntry(
     child.stderr.on("data", (chunk: string) => {
       stderr += chunk;
     });
-    child.stdout.resume();
+    let stdout = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
+    });
     // If the fix regresses into a hang (server started despite a fatal
     // config), do not wedge the suite -- kill and let the assertion fail.
     //
@@ -319,7 +323,7 @@ async function runEntry(
     });
     child.on("close", (code) => {
       clearTimeout(guard);
-      resolvePromise({ code, stderr });
+      resolvePromise({ code, stderr, stdout });
     });
   });
 }
@@ -407,6 +411,29 @@ describe("index.ts entry, run as a real process", () => {
     // slow first call followed by a hung second one would hit vitest's
     // timeout before the guard, the illegible shape runEntry's note warns of.
   }, 200_000);
+
+  it("a secrets argv error under --json is ONE compact stdout line with the plain message", async () => {
+    // run() used to put parseSecretsArgs' whole stderr envelope -- a JSON
+    // string -- into the pretty document's `error`, so a script got the
+    // message double-encoded across several lines. Now stdout is exactly one
+    // line, and stderr keeps its envelope unchanged.
+    const r = await runEntry({}, ["secrets", "get", "--json"]);
+    expect(r.code).toBe(2);
+    expect(r.stdout).toBe(`${JSON.stringify({ ok: false, error: "<name> is required", exitCode: 2 })}\n`);
+    expect(r.stderr).toContain(`${JSON.stringify({ ok: false, error: "<name> is required" })}\n`);
+  }, 120_000);
+
+  it("every other command's argv error under --json keeps run()'s pretty document", async () => {
+    // The shared default stays pretty -- the layout add/call/update use for
+    // their runtime {ok:false} documents. One document, plain message.
+    const r = await runEntry({}, ["call", "--bogus", "--json"]);
+    expect(r.code).toBe(2);
+    const doc = JSON.parse(r.stdout) as { ok: boolean; error: string; exitCode: number };
+    expect(r.stdout).toBe(`${JSON.stringify(doc, null, 2)}\n`);
+    expect(doc.ok).toBe(false);
+    expect(doc.exitCode).toBe(2);
+    expect(doc.error).toContain('unknown flag "--bogus"');
+  }, 120_000);
 
   it("keeps runServer()'s rejection on a real catch, not the last-resort handler", async () => {
     // The regression this block used to be NAMED for and never tested. A

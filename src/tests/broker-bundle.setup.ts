@@ -10,6 +10,15 @@ import type { TestProject } from "vitest/node";
 import { buildBrokerBundle, runNeedsBrokerBundle } from "./broker-bundle.js";
 
 export default async function setup(project: TestProject): Promise<(() => Promise<void>) | undefined> {
+  // Clear an ambient YAW_MCP_LOG_LEVEL before any worker starts, so every
+  // worker and every child it spawns starts with it unset. logger.ts lets a
+  // recognized YAW_MCP_LOG_LEVEL win over LOG_LEVEL (and switches the CLI
+  // surface to JSON lines), so a developer shell that exports it for support
+  // would override every test's vi.stubEnv("LOG_LEVEL", ...) pin: =error mutes
+  // the warn lines a "warns" test asserts and makes a "does NOT warn" test pass
+  // vacuously. A test that wants the variable stubs it itself. Done before the
+  // early returns below so every run gets it, bundle or not.
+  delete process.env.YAW_MCP_LOG_LEVEL;
   // Both projects inherit this file through `extends: true`. vitest runs the
   // ROOT project's global setup on every run and merges what the root provides
   // into each project's context, so the root builds and the projects return --

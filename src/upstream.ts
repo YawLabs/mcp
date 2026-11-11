@@ -861,9 +861,39 @@ function localRedactionMap(
  *  MONGODB_URI are not credential-shaped NAMES, yet a literal DSN under one
  *  holds the password inline, and a driver that echoes its DSN on a failed
  *  connect would put it in the stderr tail. A URL with no userinfo, or a user
- *  without a password, stays readable like any other configuration. */
+ *  without a password, stays readable like any other configuration.
+ *
+ *  The userinfo is read up to the LAST `@` (splitUserinfo, shared with
+ *  displayRemoteUrl), because an UNENCODED password can hold `/`, `?`, `#` or
+ *  a space (a base64 key does), and a matcher that stopped at the first `/`
+ *  or space let `postgres://user:abc/def==@host/db` through as config. The
+ *  user half still stops at the first `:` and holds no `/` or space, so a
+ *  path or query `@` with no colon ahead of it (`https://host/@org/mcp`,
+ *  `https://host/mcp?user=a@b.example`) stays readable. What over-matches is
+ *  any `:` that comes before the first `/` or space, with an `@` somewhere
+ *  after it -- the user half stops only at `/`, whitespace or `:`, not at `?`
+ *  or `#`. In practice that is a port (`https://host:8443/mcp?user=a@b.example`
+ *  reads as user `host`, password `8443/mcp?user=a`) or a colon in the query
+ *  of a path-less URL (`https://host?t=12:00&u=a@b.example` reads as user
+ *  `host?t=12`), and the whole value is redacted. Redacting a config value
+ *  the reader could have seen costs less than printing a key. */
 function hasUrlPassword(value: string): boolean {
-  return /^[a-z][a-z0-9+.-]*:\/\/[^/@\s:]*:[^/@\s]+@/i.test(value.trim());
+  const { scheme, userinfo } = splitUserinfo(value.trim());
+  return scheme !== "" && userinfo !== null && /^[^/\s:]*:[\s\S]/.test(userinfo);
+}
+
+/** Splits a url string at the userinfo boundary: the scheme (`https://`, or
+ *  "" when there is none), everything before the LAST `@` after it (null when
+ *  there is no `@`), and what follows that `@`. The last `@`, not the first,
+ *  because an unencoded credential can itself hold `/`, `?`, `#`, a space or
+ *  an `@`; see displayRemoteUrl and hasUrlPassword for the over-trim this
+ *  accepts when a path or query holds an `@`. */
+function splitUserinfo(raw: string): { scheme: string; userinfo: string | null; rest: string } {
+  const scheme = /^[a-z][a-z0-9+.-]*:\/\//i.exec(raw)?.[0] ?? "";
+  const tail = raw.slice(scheme.length);
+  const at = tail.lastIndexOf("@");
+  if (at === -1) return { scheme, userinfo: null, rest: tail };
+  return { scheme, userinfo: tail.slice(0, at), rest: tail.slice(at + 1) };
 }
 
 /** A remote entry's url as an error message may quote it: scheme, host and
@@ -904,15 +934,12 @@ export function displayRemoteUrl(raw: string): string {
   } catch {
     // Not parseable: scrubbed textually below.
   }
-  const scheme = /^[a-z][a-z0-9+.-]*:\/\//i.exec(raw)?.[0] ?? "";
-  const rest = raw.slice(scheme.length);
   const withoutQuery = (s: string) => s.replace(/[?#][\s\S]*$/, "?...");
   // The userinfo is cut BEFORE the query: cutting the query first would stop
   // at a `?` or `#` inside the credential and leave what precedes it.
-  const at = rest.lastIndexOf("@");
-  if (at === -1) return `${scheme}${withoutQuery(rest)}`;
-  const dropped = rest.slice(0, at);
-  return `${scheme}${/[/?#\s]/.test(dropped) ? "...@" : ""}${withoutQuery(rest.slice(at + 1))}`;
+  const { scheme, userinfo: dropped, rest } = splitUserinfo(raw);
+  if (dropped === null) return `${scheme}${withoutQuery(rest)}`;
+  return `${scheme}${/[/?#\s]/.test(dropped) ? "...@" : ""}${withoutQuery(rest)}`;
 }
 
 /** The credential-shaped slice of the PARENT env -- the half of the child's

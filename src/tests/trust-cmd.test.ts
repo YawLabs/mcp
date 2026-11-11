@@ -1224,6 +1224,35 @@ describe("the preview says which entries execute content the hash does not cover
     expect(io.text()).toContain("mcp-server-time@latest is not pinned to an exact version");
   });
 
+  it("checks a runner whatever case or Windows extension its command carries", async () => {
+    // Windows runs NPX.cmd, Uvx.exe and a capitalised Npx as npx / uvx; the
+    // check used to match the basename case-sensitively, so those entries
+    // skipped it and their floating specs went unreported.
+    writeBundles(synthCwd, {
+      version: 1,
+      servers: [
+        { namespace: "upper", name: "Upper", command: "NPX.cmd", args: ["-y", "pkg-upper"] },
+        { namespace: "uvexe", name: "UvExe", command: "Uvx.exe", args: ["pkg-uvexe@latest"] },
+        { namespace: "cap", name: "Cap", command: "Npx", args: ["-y", "pkg-cap@^2"] },
+        {
+          namespace: "abspath",
+          name: "AbsPath",
+          command: String.raw`C:\Program Files\nodejs\NPX.CMD`,
+          args: ["-y", "pkg-abs"],
+        },
+        { namespace: "pnpmdlx", name: "PnpmDlx", command: "PNPM.exe", args: ["dlx", "pkg-dlx"] },
+        // ...and the same runner spelled oddly still stays quiet on a real pin.
+        { namespace: "upinned", name: "UPinned", command: "NPX.CMD", args: ["-y", "pkg-pinned@1.2.3"] },
+      ],
+    });
+    const io = captureIO();
+    await runTrust({ home: synthHome, cwd: synthCwd, env: {}, yes: true, out: io.push, err: io.pushErr });
+    for (const spec of ["pkg-upper", "pkg-uvexe@latest", "pkg-cap@^2", "pkg-abs", "pkg-dlx"]) {
+      expect(io.text()).toContain(`${spec} is not pinned to an exact version`);
+    }
+    expect(io.text()).not.toContain("pkg-pinned@1.2.3 is not pinned");
+  });
+
   it("renders an empty argv token instead of silently dropping it", async () => {
     // `sh -c ""` and `sh -c` are different commands, and the preview is meant
     // to be the exact argv that gets spawned.

@@ -6,7 +6,8 @@
 # verify:oam-floor, which hosts a stdio SDK server on this machine's oam and
 # never moves the floor), build, the client matrix (npm run verify:clients,
 # which installs that build into every supported client and launches it), bump
-# package.json + server.json in lockstep, commit + tag + push, publish to npm
+# package.json + server.json in lockstep and retitle CHANGELOG.md's
+# `## Unreleased` heading to the version, commit + tag + push, publish to npm
 # via ~/.npmrc, publish server.json to the MCP registry via mcp-publisher.
 # No GitHub release creation, no per-platform build orchestration, no
 # SEA binaries. Install story is `npm install -g @yawlabs/mcp` (or
@@ -18,7 +19,8 @@
 # scripts/build-platforms-all.sh (removed in v0.70.3). The script is
 # the single source of truth: it runs the pre-flight gates (lint,
 # typecheck, tests, oam floor, build, client matrix), bumps package.json + server.json in
-# lockstep, commits and tags, publishes to npm via the ~/.npmrc
+# lockstep, heads CHANGELOG.md's Unreleased notes with the version (in the
+# same bump commit), commits and tags, publishes to npm via the ~/.npmrc
 # automation token, publishes server.json to the MCP registry via
 # mcp-publisher, and exits.
 #
@@ -805,6 +807,72 @@ write_server_version() {
   node -e "const fs=require('fs'); const j=JSON.parse(fs.readFileSync('server.json','utf-8')); j.version=process.argv[1]; if(j.packages&&j.packages[0]) j.packages[0].version=process.argv[1]; fs.writeFileSync('server.json', JSON.stringify(j, null, 2) + '\n');" "$1"
 }
 
+# >>> changelog helpers
+# Step 3 heads CHANGELOG.md's release notes with the version, in the bump
+# commit: `## Unreleased -- <summary>` becomes `## <version> -- <summary>`
+# (a bare `## Unreleased` becomes a bare `## <version>`), and a fresh, empty
+# `## Unreleased` goes in above it, since scripts/verify-oam-floor.mjs --raise
+# requires that heading to be the first section.
+#
+# Exit 0 when CHANGELOG.md has a heading for $1 -- `## $1` alone or with a
+# ` -- <summary>` suffix -- which is what a retitle (or a hand edit) leaves.
+changelog_version_heading() {
+  awk -v h="## $1" '$0 == h || index($0, h " -- ") == 1 { found = 1; exit } END { exit !found }' CHANGELOG.md 2>/dev/null
+}
+
+# The body of the section that holds v$1's notes: the `## $1` section once it
+# exists, the `## Unreleased` section until then. The behaviour-change gate
+# reads this, so it reads the right notes both before the retitle (a fresh
+# run) and after it (a resume whose bump commit is made but not tagged).
+changelog_notes_body() {
+  if changelog_version_heading "$1"; then
+    awk -v h="## $1" 'inside && /^## / { exit } $0 == h || index($0, h " -- ") == 1 { inside = 1; next } inside { print }' CHANGELOG.md 2>/dev/null || true
+  else
+    awk '/^## [Uu]nreleased/ { inside = 1; next } inside && /^## / { exit } inside { print }' CHANGELOG.md 2>/dev/null || true
+  fi
+}
+
+# `changelog_retitle check <version>` validates, `changelog_retitle write
+# <version>` retitles. Exit 3: the first `## ` heading outside a code fence
+# is not `## Unreleased` (or there is no CHANGELOG.md), so there is nothing to
+# retitle. Exit 4: the Unreleased section is empty -- blank lines only --
+# which is a release with no notes, refused rather than shipped under an
+# empty version heading. Exit 5: a code fence never closes, so every heading
+# after it would read as fenced (verify-oam-floor.mjs refuses the same file).
+# Fences are skipped the way verify-oam-floor.mjs skips them, and CRLF line
+# endings are kept.
+changelog_retitle() {
+  node -e '
+    const fs = require("fs");
+    const [mode, v] = process.argv.slice(1);
+    let text;
+    try { text = fs.readFileSync("CHANGELOG.md", "utf8"); } catch { process.exit(3); }
+    const eol = text.includes("\r\n") ? "\r\n" : "\n";
+    const lines = text.split(/\r?\n/);
+    const heads = [];
+    let fence = null;
+    lines.forEach((l, i) => {
+      const m = /^ {0,3}(`{3,}|~{3,})/.exec(l);
+      if (fence !== null) {
+        if (m && m[1][0] === fence[0] && m[1].length >= fence.length && l.trim() === m[1]) fence = null;
+        return;
+      }
+      if (m) { fence = m[1]; return; }
+      if (l.startsWith("## ")) heads.push(i);
+    });
+    if (fence !== null) process.exit(5);
+    const first = heads.length > 0 ? heads[0] : -1;
+    const head = first === -1 ? null : /^## [Uu]nreleased(.*)$/.exec(lines[first]);
+    if (!head) process.exit(3);
+    const end = heads.length > 1 ? heads[1] : lines.length;
+    if (lines.slice(first + 1, end).every((l) => l.trim() === "")) process.exit(4);
+    if (mode !== "write") process.exit(0);
+    lines.splice(first, 1, "## Unreleased", "", `## ${v}${head[1]}`);
+    fs.writeFileSync("CHANGELOG.md", lines.join(eol));
+  ' "$1" "$2"
+}
+# <<< changelog helpers
+
 # ---------- Main path: full release -------------------------------------------
 # 5 steps. The build is just `npm run build` (tsup -> dist/index.js); npm
 # publish ships the tarball directly. Install method is
@@ -821,8 +889,8 @@ if [ "$CURRENT_VERSION" = "$VERSION" ]; then
   RESUMING=true
   # A resume is not a licence to publish a dirty tree. The legitimate resume
   # case -- died between the bump and the commit -- dirties exactly
-  # package.json, package-lock.json and server.json, so gate on everything
-  # ELSE. Without this, a re-run packed and published whatever happened to be
+  # package.json, package-lock.json, server.json and CHANGELOG.md, so gate on
+  # everything ELSE. Without this, a re-run packed and published whatever happened to be
   # in the working tree while the tag pointed at a commit that did not contain
   # it, and step 5 then attested that version to the MCP registry. npm forbids
   # overwriting a published version, so the irreproducible tarball is permanent.
@@ -834,8 +902,17 @@ if [ "$CURRENT_VERSION" = "$VERSION" ]; then
   # untracked scratch file from hard-failing the resume; it is warned about
   # below instead, because pressuring the operator toward `git stash -u`
   # mid-release is its own way to lose work.
-  RESUME_DIRT=$(git status --porcelain -uno -- . \
-    ':(exclude)package.json' ':(exclude)package-lock.json' ':(exclude)server.json')
+  #
+  # CHANGELOG.md is tolerated too, but only while package.json still differs
+  # from HEAD -- the bump commit is not made yet, so a dirty CHANGELOG.md is
+  # step 3's retitle (or a fix to the notes) and goes into that commit with
+  # the bump. Once the bump is committed, a dirty CHANGELOG.md is a change the
+  # tag would not contain and the tarball would, like any other file.
+  RESUME_DIRT_EXCLUDE=(':(exclude)package.json' ':(exclude)package-lock.json' ':(exclude)server.json')
+  if ! git diff --quiet HEAD -- package.json 2>/dev/null; then
+    RESUME_DIRT_EXCLUDE+=(':(exclude)CHANGELOG.md')
+  fi
+  RESUME_DIRT=$(git status --porcelain -uno -- . "${RESUME_DIRT_EXCLUDE[@]}")
   if [ -n "$RESUME_DIRT" ]; then
     printf '%s\n' "$RESUME_DIRT" >&2
     fail "Working directory has changes outside the version bump (listed above) -- commit or stash them before resuming. The tag would not contain them; the published tarball would."
@@ -1087,6 +1164,27 @@ if [ "$RESUMING" != true ] && git rev-parse -q --verify "refs/tags/v${VERSION}" 
   fail "Tag v${VERSION} already exists (at ${EXISTING_TAG_COMMIT:0:9}) -- refusing to reuse an existing release number on a new commit. Pick an unused version, or delete the stale tag if it is wrong."
 fi
 
+# --- Guard: step 3 retitles CHANGELOG.md's `## Unreleased` heading to
+# v${VERSION} in the bump commit, so check here, before any gate runs, that
+# it can: the first section must be `## Unreleased` and must hold notes. A
+# release with an empty Unreleased section is REFUSED, not shipped under an
+# empty version heading -- write the notes (or one line saying there are no
+# user-facing changes) and re-run. Skipped when there is nothing to retitle:
+# a `## ${VERSION}` heading already exists (step 3 retitled it on an earlier
+# run, or it was headed by hand), or the v${VERSION} tag does (the bump commit
+# is made; step 3 will not commit again).
+if ! changelog_version_heading "$VERSION" && ! git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null 2>&1; then
+  CHANGELOG_RC=0
+  changelog_retitle check "$VERSION" || CHANGELOG_RC=$?
+  case "$CHANGELOG_RC" in
+    0) info "CHANGELOG.md: the Unreleased section will be headed ## ${VERSION} in the bump commit" ;;
+    3) fail "CHANGELOG.md's first section is not '## Unreleased' (or CHANGELOG.md is missing) -- step 3 retitles that heading to ${VERSION} in the bump commit, so it has to be there. Put this release's notes under a '## Unreleased' heading at the top and re-run ./release.sh ${VERSION}." ;;
+    4) fail "CHANGELOG.md's Unreleased section is empty -- step 3 would head an empty section ## ${VERSION}. Write this release's notes under '## Unreleased' (a line saying there are no user-facing changes will do) and re-run ./release.sh ${VERSION}." ;;
+    5) fail "CHANGELOG.md has a code fence (\`\`\` or ~~~) that never closes, so every heading after it reads as code. Close the fence and re-run ./release.sh ${VERSION}." ;;
+    *) fail "Could not read CHANGELOG.md to check its Unreleased section (exit ${CHANGELOG_RC})." ;;
+  esac
+fi
+
 # >>> resume evidence
 # RESUMING only says package.json already reads v${VERSION}. That is what an
 # interrupted run leaves, and equally what a merged bump commit or a hand-run
@@ -1117,7 +1215,7 @@ if [ "$SKIP_CONFIRM" != "true" ] && [ "$RESUME_PROVEN" != "true" ]; then
   echo -e "${YELLOW}About to release v${VERSION}. This will:${NC}"
   echo "  1. Run lint + typecheck + tests, and verify the oam floor on this machine's oam"
   echo "  2. Build the bundled CLI (npm run build), then install it into every supported client and launch it (npm run verify:clients, about 100 s)"
-  echo "  3. Bump version in package.json + server.json, commit, tag, push"
+  echo "  3. Bump version in package.json + server.json, head CHANGELOG.md's Unreleased notes ## ${VERSION}, commit, tag, push"
   echo "  4. Publish to npm (using ~/.npmrc automation token)"
   echo "  5. Publish server.json to the MCP registry (mcp-publisher)"
   echo ""
@@ -1180,37 +1278,36 @@ if [ "$SKIP_CONFIRM" != "true" ] && [ "$RESUME_PROVEN" != "true" ]; then
       ABORTED=1
       exit 1
     fi
-    # Scoped to the UNRELEASED section, not the whole file. The point of the
+    # Scoped to THIS release's section, not the whole file. The point of the
     # gate is that THIS release documents the switch; an unscoped grep is
     # satisfied by a name mentioned three releases ago, which is exactly the
     # case where the operator most needs to be stopped.
     #
-    # CONVENTION this depends on, and does NOT enforce: CHANGELOG.md keeps a
-    # `## Unreleased` heading that holds this release's notes, and only this
-    # release's, at the moment this prompt runs. This script never renames
-    # the heading -- nothing in steps 3-5 touches the changelog -- so heading
-    # the notes with the version is a hand edit, and both ways of getting it
-    # wrong have happened. Headed BEFORE the release (1.1.6 and 1.1.7 were),
-    # the awk below finds an empty Unreleased section or none, the grep
-    # misses, and the gate aborts on a switch that IS documented. Never
-    # headed (1.1.8 to 1.1.10 shipped that way), earlier releases' notes are
-    # still under Unreleased and a switch documented releases ago satisfies
-    # the grep, which is the case the scoping exists to stop. Until the
-    # script owns the retitle, the working order is: release with the notes
-    # under Unreleased, then head them with the version and leave an empty
-    # `## Unreleased` above (scripts/verify-oam-floor.mjs --raise requires
-    # that heading to be the first section).
-    UNRELEASED_BODY=$(awk '/^## [Uu]nreleased/ { inside = 1; next } inside && /^## / { exit } inside { print }' CHANGELOG.md 2>/dev/null || true)
+    # Which section that is depends on when this prompt runs. On a fresh run
+    # the notes are under `## Unreleased`: step 3 heads them with the version
+    # (in the bump commit) only after this gate. On a resume with no
+    # v${VERSION} tag yet -- the resumes that are asked again, see the resume
+    # evidence above -- step 3 may already have run its retitle (the bump
+    # commit is made, or the run died just before it), so the notes are under
+    # `## ${VERSION}` and the Unreleased section above them is the fresh,
+    # empty one. changelog_notes_body
+    # reads the `## ${VERSION}` section when it exists, Unreleased otherwise.
+    if changelog_version_heading "$VERSION"; then
+      NOTES_SECTION="## ${VERSION}"
+    else
+      NOTES_SECTION="Unreleased"
+    fi
+    NOTES_BODY=$(changelog_notes_body "$VERSION")
     # `-e` so a flag-shaped switch is a PATTERN, not an option. Without it
     # `grep -qF "--no-cap"` exits 2 with "unknown option", and the message
     # below then told the operator the name was absent from a file that
     # contains it -- an abort on the answer the prompt above asks for.
-    if ! grep -qF -e "$OFF_SWITCH" <<<"$UNRELEASED_BODY"; then
-      echo "Aborted: '${OFF_SWITCH}' does not appear in CHANGELOG.md's Unreleased section -- document it there first."
+    if ! grep -qF -e "$OFF_SWITCH" <<<"$NOTES_BODY"; then
+      echo "Aborted: '${OFF_SWITCH}' does not appear in CHANGELOG.md's ${NOTES_SECTION} section -- document it there first."
       ABORTED=1
       exit 1
     fi
-    echo -e "  ${CYAN}${OFF_SWITCH}${NC} found in the Unreleased section."
+    echo -e "  ${CYAN}${OFF_SWITCH}${NC} found in the ${NOTES_SECTION} section."
   fi
   echo ""
   # Non-interactive stdin (piped, nohup, an agent harness) gets EOF from
@@ -1374,8 +1471,34 @@ else
   info "server.json bumped"
 fi
 
-if [ -n "$(git status --porcelain package.json package-lock.json server.json 2>/dev/null)" ]; then
-  git add package.json package-lock.json server.json
+# >>> changelog retitle
+# Head CHANGELOG.md's release notes with the version, in the bump commit
+# below (see the changelog helpers). Re-read here rather than trusting the
+# pre-flight check: the file can change while steps 1-2 run. Not when a
+# `## ${VERSION}` heading already exists -- an earlier run's retitle, kept
+# uncommitted or in its bump commit, or a hand edit -- and not when the
+# v${VERSION} tag does: the bump commit is then made, and a retitle would put
+# a second commit on top of the tag.
+if changelog_version_heading "$VERSION"; then
+  info "CHANGELOG.md already has a ## ${VERSION} heading -- leaving its headings as they are"
+elif git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null 2>&1; then
+  warn "CHANGELOG.md has no ## ${VERSION} heading, but tag v${VERSION} already exists, so its commit is made -- not retitling. Head the notes by hand after the release."
+else
+  RETITLE_RC=0
+  changelog_retitle write "$VERSION" || RETITLE_RC=$?
+  case "$RETITLE_RC" in
+    0) info "CHANGELOG.md: ## Unreleased retitled ## ${VERSION}, fresh ## Unreleased added above it" ;;
+    3) fail "CHANGELOG.md's first section is no longer '## Unreleased' -- nothing to retitle to ${VERSION}. Put the notes back under '## Unreleased' and re-run ./release.sh ${VERSION}: the version bump is not committed yet, and the re-run resumes from it." ;;
+    4) fail "CHANGELOG.md's Unreleased section is empty now -- refusing to head an empty section ## ${VERSION}. Write the notes and re-run ./release.sh ${VERSION}: the version bump is not committed yet, and the re-run resumes from it." ;;
+    5) fail "CHANGELOG.md now has a code fence (\`\`\` or ~~~) that never closes, so every heading after it reads as code. Close the fence and re-run ./release.sh ${VERSION}: the version bump is not committed yet, and the re-run resumes from it." ;;
+    *) fail "Could not retitle CHANGELOG.md's Unreleased heading (exit ${RETITLE_RC}). The version bump is not committed yet; fix the file and re-run ./release.sh ${VERSION}." ;;
+  esac
+fi
+# <<< changelog retitle
+
+# CHANGELOG.md rides in the same commit as the bump: one commit per release.
+if [ -n "$(git status --porcelain package.json package-lock.json server.json CHANGELOG.md 2>/dev/null)" ]; then
+  git add package.json package-lock.json server.json CHANGELOG.md
   # core.hooksPath is pointed at a path with no hooks in it, so the bump commit
   # cannot be rewritten or rejected by a local hook (the gates it would re-run
   # are step 1's, already green). MSYS_NO_PATHCONV=1 is load-bearing on this
@@ -1541,18 +1664,16 @@ if [ "$PUBLISHED_VERSION" = "$VERSION" ]; then
   info "@yawlabs/mcp@${VERSION} already on npm -- skipping"
 else
   # >>> step-4 npm publish
-  # Retry up to 3 times, 30 s apart, on EOTP/EAUTH/OTP; fail fast on everything
-  # else so a packaging error or duplicate-version doesn't waste 60s spinning.
-  # The retry dates from when a fresh `npm login --auth-type=web` session was
-  # how this publish authenticated (such a session could take ~30s to
-  # propagate), and it is at odds with the header above: with the automation
-  # token this step now requires, an OTP challenge means ~/.npmrc holds a web
-  # session or the wrong token, and waiting does not fix that. The retry is
-  # kept because release-sh.test.ts pins it; the messages below say which of
-  # the two cases waiting can help.
+  # ONE attempt. An OTP-class refusal (EOTP / EAUTH on npm's code line, or a
+  # one-time-password prompt) fails on the first try, like every other
+  # refusal. This step used to retry it three times, 30 s apart, a leftover
+  # from when a fresh `npm login --auth-type=web` session was how it
+  # authenticated (such a session could take ~30 s to propagate). With the
+  # automation token this step requires, an OTP challenge means ~/.npmrc
+  # holds a web session or the wrong token, and waiting does not fix that.
+  # The `while true` is a single pass: every path through its body ends in
+  # `break` (step 4 goes on) or `fail`.
   NPM_ALREADY_THERE=false
-  ATTEMPT=1
-  MAX_ATTEMPTS=3
   while true; do
     PUBLISH_LOG=$(mktemp)
     # `|| PUBLISH_RC=$?` rather than `if npm publish ...; then`: the exit code
@@ -1592,7 +1713,7 @@ else
     # refusal -- an OTP challenge, an auth error, any 4xx -- matched on npm's
     # own "code" line so a stray E4 in the tarball's integrity string cannot
     # match: that is npm's answer, and waiting out the budget would only delay
-    # it, three times over on the OTP retries. A transport error or a 5xx
+    # it. A transport error or a 5xx
     # still probes: a PUT the registry accepted may have landed before the
     # connection dropped.
     if [ "$IS_MINGW_ARM64" = true ] && { [ "$PUBLISH_RC" -eq 139 ] || [ "$PUBLISH_RC" -eq 134 ]; } \
@@ -1622,18 +1743,14 @@ else
     # Anchored on npm's own "code" line, the way the ARM64 branch above is: a
     # bare EOTP|OTP matched any of those letters anywhere in the log -- an
     # "OTP" inside the tarball's integrity string, say -- and read a packaging
-    # error as an OTP challenge worth two more attempts and 60 s of sleep.
+    # error as an OTP challenge, which got its own message (and, while this
+    # step still retried, two more attempts and 60 s of sleep).
     if ! grep -qE 'npm (error|ERR!) code (EOTP|EAUTH)|one-time password' "$PUBLISH_LOG"; then
       rm -f "$PUBLISH_LOG"
       fail "npm publish failed (non-OTP error -- see output above). If E401/E404, your ~/.npmrc session is stale: restore the automation token line (//registry.npmjs.org/:_authToken=<token>), confirm with 'npm whoami', and re-run ./release.sh ${VERSION}."
     fi
     rm -f "$PUBLISH_LOG"
-    if [ $ATTEMPT -ge $MAX_ATTEMPTS ]; then
-      fail "npm publish failed after $MAX_ATTEMPTS OTP-class attempts. npm asked for a one-time password or refused the credentials each time, which the automation token this step expects never causes: ~/.npmrc most likely holds a web-login session or the wrong token. Restore the automation token line (//registry.npmjs.org/:_authToken=<token>), confirm with 'npm whoami', and re-run ./release.sh ${VERSION} -- v${VERSION} is already committed, tagged and pushed, so steps 1-2 repeat their gates and build, step 3 skips what is done, and step 4 publishes."
-    fi
-    warn "npm publish attempt $ATTEMPT EOTPed -- retrying in 30s (only a fresh web-login session gets better with waiting; with the automation token this step expects, an OTP challenge means the token in ~/.npmrc is missing or wrong)"
-    ATTEMPT=$((ATTEMPT + 1))
-    sleep 30
+    fail "npm publish failed on an OTP-class refusal (not retried). npm asked for a one-time password or refused the credentials, which the automation token this step expects never causes: an OTP challenge means the token in ~/.npmrc is missing or wrong. Restore the automation token line (//registry.npmjs.org/:_authToken=<token>) and confirm with 'npm whoami'; do NOT run 'npm login --auth-type=web' -- it overwrites the automation token. Then re-run ./release.sh ${VERSION} -- v${VERSION} is already committed, tagged and pushed, so steps 1-2 repeat their gates and build, step 3 skips what is done, and step 4 publishes."
   done
   if [ "$NPM_ALREADY_THERE" = true ]; then
     warn "npm already holds @yawlabs/mcp@${VERSION} (its E403 said so) though the pre-publish read did not show it yet -- treating step 4 as skipped; npm's read path is lagging, or this host cannot read it, and step 5 waits for it unless the MCP registry already lists the version"

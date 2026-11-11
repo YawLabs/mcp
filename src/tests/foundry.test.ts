@@ -290,9 +290,12 @@ describe("appendFoundryTrace", () => {
   let home: string;
   const orig = process.env.YAW_MCP_FOUNDRY;
 
+  // A rescued dispatch: the ranker picked gh, gh failed to start, and the
+  // runner-up gitlab served the call.
   const trace = {
     tokens: ["create", "issue"],
     chosen: "gh",
+    loaded: "gitlab",
     redactedCount: 1,
   };
 
@@ -324,15 +327,23 @@ describe("appendFoundryTrace", () => {
     const lines = contents.trim().split("\n");
     expect(lines).toHaveLength(1);
     const parsed = JSON.parse(lines[0]);
-    // The candidate shortlist is accepted from the caller but NOT persisted:
-    // nothing ever read it back, and it only ate into the 5 MiB cap. The
-    // written line is the redacted bag plus the routing decision, nothing else.
+    // The written line is the redacted bag plus the routing decision --
+    // the ranked pick AND the server that served it -- nothing else (no
+    // candidate shortlist: nothing ever read it back).
     expect(parsed).toEqual({
       tokens: trace.tokens,
-      chosen: trace.chosen,
+      chosen: "gh",
+      loaded: "gitlab",
       redactedCount: trace.redactedCount,
     });
-    expect(contents).not.toContain("gitlab");
+  });
+
+  it("writes loaded: null when nothing loaded, not an absent key", async () => {
+    process.env.YAW_MCP_FOUNDRY = "1";
+    await appendFoundryTrace({ ...trace, loaded: null }, home);
+    const parsed = JSON.parse(readFileSync(join(userConfigDir(home), FOUNDRY_FILENAME), "utf8").trim());
+    expect(parsed).toHaveProperty("loaded", null);
+    expect(parsed.chosen).toBe("gh");
   });
 
   it("appends additional lines on repeat calls", async () => {

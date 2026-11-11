@@ -2349,45 +2349,44 @@ export class ConnectServer {
     return out;
   }
 
-  // Return `server` with its in-memory toolCache applied. The in-memory
-  // entry (this.toolCache) wins over server.toolCache when both exist —
-  // the persisted copy can be stale relative to a fresh activation, and
-  // the in-memory map is what tools/list and formatShadowLine should
-  // actually see. An EMPTY learned list does not win: it is a real
-  // observation for hasKnownTools, but as a tool list it has nothing to
-  // show, so a list already on the entry is still worth rendering over it.
-  // (No production loader puts one there -- see the identity note below --
-  // so that arm serves an already-merged clone passed in again, which is
-  // what makes this idempotent, and configs built by hand in tests.)
+  // Return `server` with its LEARNED tool list (this.toolCache: hydrated from
+  // state.json at startup, replaced on every activation) attached as
+  // `toolCache`. That field on the returned object is the only meaning
+  // `UpstreamServerConfig.toolCache` has: the merged view readers such as
+  // formatShadowLine, buildToolList and buildCandidates consume. A config
+  // entry never supplies one -- bundles.json cannot carry it (validateEntry in
+  // local-bundles.ts keeps a fixed field list without it) -- so whatever
+  // `toolCache` the input already holds is IGNORED and replaced. That is also
+  // what makes this idempotent: merging an already-merged clone reads the
+  // same map and gives the same answer, and a clone made before the learned
+  // entry was dropped loses the list it no longer has.
   //
-  // This is the ONE precedence rule for a cold server's tool list. Every
+  // An EMPTY learned list attaches nothing: it is a real observation for
+  // hasKnownTools, but as a tool list it has nothing to show.
+  //
+  // This is the ONE place a cold server's tool list is resolved. Every
   // reader of the LIST goes through it: getProfiledActiveServers merges once,
   // and what reads its result (the discover body, getDeferredServers and so
   // the deferred routes and tools/list, dispatch's sampling tiebreak) sees the
   // merged `server.toolCache`; rankableFor (the BM25 corpus),
   // estimateTokensFor, coldStartHint and unmatchedFilterNames call it
-  // directly. Copies of the resolution used to live in readers with `??`
-  // semantics (empty learned list WINS), so discover could rank a server on
-  // an empty list while listing its curated tools. hasKnownTools and
-  // learnedCacheStaleReason read this.toolCache raw on purpose: they ask whether
-  // a list was OBSERVED, and an empty one was.
+  // directly. hasKnownTools and learnedCacheStaleReason read this.toolCache
+  // raw on purpose: they ask whether a list was OBSERVED, and an empty one was.
   //
-  // Identity preservation: when both sides resolve to the same array
-  // reference — which in practice means BOTH are undefined (server.ts
-  // has no toolCache and this.toolCache has no entry for this namespace)
-  // — we return `server` unchanged. The `===` guard pins that, so
-  // downstream consumers keyed on reference equality (the identity-
-  // preservation tests in server.test.ts) keep working. In production,
-  // server.toolCache is almost always undefined: bundles.json validation
-  // drops the field (local-bundles.ts), and hydrateToolCache (below)
-  // writes the persisted array into this.toolCache rather than back into
-  // server.toolCache. So the commonly-fired path is the
-  // "spread a clone" branch — the identity guard mostly catches the
+  // Identity preservation: when the input already carries exactly what this
+  // would attach -- in practice, no learned list and no `toolCache` key --
+  // `server` comes back unchanged, so consumers keyed on reference equality
+  // (the identity-preservation tests in server.test.ts) keep working. The
+  // commonly-fired path in production is the "spread a clone" branch for a
+  // server with a learned list; the identity guard catches the
   // dormant-namespace case.
   private mergeToolCache(server: UpstreamServerConfig): UpstreamServerConfig {
-    const sessionCache = this.toolCache.get(server.namespace);
-    const cache = sessionCache && sessionCache.length > 0 ? sessionCache : server.toolCache;
-    return cache === server.toolCache ? server : { ...server, toolCache: cache };
+    const learned = this.toolCache.get(server.namespace);
+    const cache = learned && learned.length > 0 ? learned : undefined;
+    if (cache === server.toolCache) return server;
+    if (cache !== undefined) return { ...server, toolCache: cache };
+    const { toolCache: _ignored, ...rest } = server;
+    return rest;
   }
 
   // Do we already hold this server's tool list -- learned this session, or
@@ -2401,15 +2400,10 @@ export class ConnectServer {
   // answer was never trusted, so pre-warm spawned such a server every
   // session forever.
   //
-  // The first branch reads a non-empty `toolCache` on the entry itself. No
-  // production loader sets one on a config entry: validateEntry
-  // (local-bundles.ts) has no toolCache field, so bundles.json cannot ship a
-  // list, and the only writer is mergeToolCache's clone, whose list came from
-  // this.toolCache anyway. It fires for configs built by hand (the tests) and
-  // would for a curated list if bundles.json ever accepted one; an EMPTY list
-  // on the entry is treated as absent, not as an observation.
+  // Only the learned map counts. A `toolCache` on the entry object is
+  // either mergeToolCache's clone of this same map or nothing a loader can
+  // produce (bundles.json cannot carry the field), so it is not consulted.
   private hasKnownTools(server: UpstreamServerConfig): boolean {
-    if (server.toolCache && server.toolCache.length > 0) return true;
     return this.toolCache.get(server.namespace) !== undefined;
   }
 
@@ -2426,12 +2420,11 @@ export class ConnectServer {
   // Why the list hasKnownTools trusts, which came from a PREVIOUS session's
   // learning, should be re-learned -- "age" when it is old enough to
   // re-verify, "config-changed" when the entry it was learned under moved
-  // (below), null when it is current. Scoped to learned entries on
-  // purpose: a toolCache set on the config entry itself (hand-built configs
-  // only today; bundles.json cannot carry one) has no learnedAt and is never
-  // refreshed here -- refreshing it every session is exactly the per-session
-  // `npx -y <pkg>@latest` resolve pre-warm exists to avoid. runActivateOne stamps a fresh learnedAt on every
-  // activation, so a server in actual use never looks stale.
+  // (below), null when it is current. A learned entry with no learnedAt is
+  // judged current: refreshing it every session would be exactly the
+  // per-session `npx -y <pkg>@latest` resolve pre-warm exists to avoid.
+  // runActivateOne stamps a fresh learnedAt on every activation, so a server
+  // in actual use never looks stale.
   //
   // A learned list is ALSO stale, at any age, when it was learned under a
   // launch config that no longer matches the configured entry (configKey,
@@ -2543,7 +2536,8 @@ export class ConnectServer {
       // Own keys only -- defence in depth. readGradesCache already hands back
       // a prototype-less map (the only plain object here is the empty catch
       // fallback above, which has returned by now), so this guard matters
-      // only if that ever changes. A namespace is free to be `constructor`
+      // only if that ever changes; server.test.ts stubs the reader to return
+      // a plain object to keep it pinned. A namespace is free to be `constructor`
       // or `valueOf`: on a plain object a bare index would return the
       // inherited Object.prototype member, which is truthy and has no
       // `.grade`, and the spread below would replace the entry's own grade
@@ -4384,18 +4378,15 @@ export class ConnectServer {
   }
 
   // The BM25 view of one server. A LIVE tool list wins outright; a cold
-  // server's list comes from mergeToolCache, which is the ONE precedence rule
-  // between the learned (this.toolCache) and curated (server.toolCache)
-  // lists. This used to carry its own `sessionCache ?? persistedCache` chain,
-  // under which an EMPTY learned list beat a curated one -- the opposite of
-  // what discover's `known tools:` line and getDeferredServers showed for the
-  // same server. mergeToolCache is idempotent, so callers that already pass a
-  // merged server (every current one does) pay one small clone and nothing
-  // else.
+  // server's list comes from mergeToolCache, the ONE place the learned list
+  // (this.toolCache) is resolved, so it matches what discover's `known
+  // tools:` line and getDeferredServers show for the same server.
+  // mergeToolCache is idempotent, so callers that already pass a merged
+  // server (every current one does) pay one small clone and nothing else.
   //
-  // Only when there is no real list at all -- no connection, no learned
+  // Only when there is no real list at all -- no connection and no learned
   // entry (an EMPTY learned list counts: the server was spawned and offered
-  // nothing), no non-empty curated list -- does it fall back to the bundled
+  // nothing) -- does it fall back to the bundled
   // list fallback-tools.ts keeps for a few well-known servers, matched by
   // the image or binary the entry launches. That fallback lives here and
   // nowhere else: it feeds ranking (dispatch, discover, find_tool) but never
@@ -4411,8 +4402,8 @@ export class ConnectServer {
   }
 
   // The tool list rankableFor ranks a server on, and where it came from:
-  // "live" (connected), "known" (learned or curated -- possibly an empty
-  // learned list), "bundled" (fallback-tools.ts, never confirmed on this
+  // "live" (connected), "known" (learned -- possibly an empty list),
+  // "bundled" (fallback-tools.ts, never confirmed on this
   // machine) or "none" (nothing at all; the server ranks on its name and
   // description only, and find_tool cannot see it).
   private rankableTools(server: UpstreamServerConfig): {
@@ -4423,13 +4414,12 @@ export class ConnectServer {
     if (connection) {
       return { tools: connection.tools.map((t) => ({ name: t.name, description: t.description })), source: "live" };
     }
-    const merged = this.mergeToolCache(server).toolCache;
-    if ((merged && merged.length > 0) || this.toolCache.has(server.namespace)) {
-      return { tools: merged ?? [], source: "known" };
+    if (this.toolCache.has(server.namespace)) {
+      return { tools: this.mergeToolCache(server).toolCache ?? [], source: "known" };
     }
     const bundled = fallbackToolsFor(server);
     if (bundled) return { tools: [...bundled], source: "bundled" };
-    return { tools: merged ?? [], source: "none" };
+    return { tools: [], source: "none" };
   }
 
   // BM25 shortlist cap — wider than the budget so downstream re-sorts
@@ -5649,13 +5639,11 @@ export class ConnectServer {
   }
 
   /** The tool list known for a namespace WITHOUT a live connection: the
-   *  merged cache (this session's learned list over a list set on the config
-   *  entry itself -- hand-built configs only, bundles.json cannot carry one)
-   *  while the config still defines the server, else whatever
-   *  this session learned about it. The one lookup estimateTokensFor and
-   *  unmatchedFilterNames both need, kept in one place so neither can drift
-   *  to the raw this.toolCache and pick an empty learned list over a curated
-   *  one. */
+   *  learned list (this.toolCache), as mergeToolCache resolves it while the
+   *  config still defines the server -- an empty list reads as undefined --
+   *  else whatever this session learned about it. The one lookup
+   *  estimateTokensFor and unmatchedFilterNames both need, kept in one place
+   *  so the two cannot drift apart. */
   private cachedToolsFor(namespace: string): Array<{ name: string; description?: string }> | undefined {
     const config = this.config?.servers.find((s) => s.namespace === namespace);
     return config ? this.mergeToolCache(config).toolCache : this.toolCache.get(namespace);
@@ -7514,9 +7502,8 @@ export class ConnectServer {
       progress?.("Top candidates close — asking LLM to pick…");
       const serversByNamespace = new Map(activeServers.map((s) => [s.namespace, s]));
       // activeServers came through getProfiledActiveServers, so each one's
-      // toolCache is already mergeToolCache's answer. Handing the raw
-      // this.toolCache here instead let buildCandidates' `??` pick an EMPTY
-      // learned list over a curated one.
+      // toolCache is already mergeToolCache's answer (the learned list, or
+      // undefined for none or an empty one).
       const mergedTools = new Map(activeServers.map((s) => [s.namespace, s.toolCache ?? []]));
       const candidates = buildCandidates(ranked.slice(0, 3), serversByNamespace, mergedTools);
       const samples = sampleCountForEffort(effort);
@@ -7550,22 +7537,6 @@ export class ConnectServer {
       // Remember the intent each activated server was routed for, so the
       // optional LLM reward grader can judge later tool calls against the goal.
       for (const w of winners) this.lastIntentByNamespace.set(w.namespace, trimmed);
-      // Privacy-safe, opt-in routing-eval harvest (the "environment foundry").
-      // Disabled unless YAW_MCP_FOUNDRY is set; only a REDACTED token bag plus
-      // the chosen namespace is ever written -- never the raw intent string,
-      // and not the ranker's shortlist either (it was accepted and dropped on
-      // the floor for a release; see FoundryTrace in foundry.ts). `chosen` is
-      // the RANKED pick, written before the load: a winner that then fails to
-      // start is still the row's namespace, even when a runner-up was loaded
-      // in its place.
-      if (isFoundryEnabled()) {
-        const redacted = redactIntent(trimmed);
-        void appendFoundryTrace({
-          tokens: redacted.tokens,
-          redactedCount: redacted.redactedCount,
-          chosen: primary,
-        });
-      }
     }
 
     const results: string[] = [];
@@ -7654,6 +7625,25 @@ export class ConnectServer {
     }
     // No trailing "Dispatch complete" progress — see handleActivate for
     // the client-side race this avoids.
+
+    // Privacy-safe, opt-in routing-eval harvest (the "environment foundry").
+    // Disabled unless YAW_MCP_FOUNDRY is set; only a REDACTED token bag plus
+    // two namespaces is ever written -- never the raw intent string, and not
+    // the ranker's shortlist either (it was accepted and dropped on the floor
+    // for a release; see FoundryTrace in foundry.ts). `chosen` is the RANKED
+    // pick, unchanged by what happened next; `loaded` is the first server
+    // this call left loaded (the runner-up when the pick failed to start),
+    // null when nothing loaded. Written after the load loop so `loaded` is
+    // known.
+    if (primary && isFoundryEnabled()) {
+      const redacted = redactIntent(trimmed);
+      void appendFoundryTrace({
+        tokens: redacted.tokens,
+        redactedCount: redacted.redactedCount,
+        chosen: primary,
+        loaded: dispatchedOk[0] ?? null,
+      });
+    }
 
     // Re-dispatch routing-miss. Keyed on the server this dispatch actually
     // routed to: the first one it left loaded (a lower-ranked winner or a

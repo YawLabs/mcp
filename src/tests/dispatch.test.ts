@@ -720,9 +720,9 @@ describe("handleDiscoverWithAutoWarm", () => {
       namespace: "gh",
       name: "GitHub",
       description: "Repos, issues, and pull requests on GitHub",
-      toolCache: [{ name: "create_issue", description: "Open an issue" }],
     });
     priv.config = { configVersion: "v1", servers: [ghConfig] };
+    priv.toolCache.set("gh", [{ name: "create_issue", description: "Open an issue" }]);
     // Cold-start shape: routes built from the cache, so gh_create_issue is
     // present but deferred.
     priv.rebuildRoutes();

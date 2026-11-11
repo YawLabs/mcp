@@ -90,7 +90,7 @@ describe("ranking a server whose tool list was never learned", () => {
     expect(p.getDeferredServers()).toEqual([]);
   });
 
-  it("lets every real list win: learned, learned-but-empty, curated and live", () => {
+  it("lets every real list win: learned, learned-but-empty and live", () => {
     const p = priv();
     p.toolCache.set("gh", [{ name: "real_tool", description: "learned" }]);
     expect(p.rankableTools(gh())).toEqual({ tools: [{ name: "real_tool", description: "learned" }], source: "known" });
@@ -98,10 +98,12 @@ describe("ranking a server whose tool list was never learned", () => {
     p.toolCache.set("gh", []);
     expect(p.rankableTools(gh())).toEqual({ tools: [], source: "known" });
 
+    // A list on the config entry object is not a real list: bundles.json
+    // cannot carry one, so it neither ranks nor blocks the bundled fallback.
     p.toolCache.delete("gh");
-    const curated = { ...gh(), toolCache: [{ name: "curated_tool" }] };
-    expect(p.rankableTools(curated).source).toBe("known");
-    expect(p.rankableFor(curated).tools).toEqual([{ name: "curated_tool" }]);
+    const onEntry = { ...gh(), toolCache: [{ name: "entry_tool" }] };
+    expect(p.rankableTools(onEntry).source).toBe("bundled");
+    expect(p.rankableFor(onEntry).tools).not.toContainEqual({ name: "entry_tool" });
 
     p.connections.set("gh", connection(gh(), [{ name: "live_tool" }]));
     expect(p.rankableTools(gh())).toEqual({ tools: [{ name: "live_tool", description: undefined }], source: "live" });

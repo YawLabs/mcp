@@ -52,6 +52,7 @@ import { dirname, join } from "node:path";
 import { atomicWriteFile } from "./atomic-write.js";
 import { acquireUpgradeLock } from "./auto-upgrade.js";
 import { describeDefaultRuntime, describeServerRuntime } from "./default-runtime.js";
+import { scriptConsentConfirm } from "./git-consent-prompt.js";
 import { buildPinnedGitEntries, type GitBuildContext, type GitEntryReport } from "./git-source.js";
 import { stripInternalSecretsFromEnv } from "./internal-secret-env.js";
 import { type LoadLocalBundlesResult, loadLocalBundles, localBundlesPath } from "./local-bundles.js";
@@ -66,7 +67,7 @@ import {
   specConstraint,
 } from "./oam-spawn.js";
 import { sidecarsNodeModules, sidecarsRoot, userConfigDir } from "./paths.js";
-import { askYesNo, type YesNoOptions } from "./readline-question.js";
+import type { YesNoOptions } from "./readline-question.js";
 import type { UpstreamServerConfig } from "./types.js";
 
 // paths.ts owns these; they are re-exported for the callers that think of them
@@ -737,7 +738,8 @@ export const SIDECARS_USAGE = `Usage: yaw-mcp sidecars install [--yes] [--json]
   --yes, -y  Allow a git repo's install and build scripts to run. Asked once
              per repo; when stdin or stdout is not a TTY, required until the
              repo is allowed here. Recorded per repo in
-             ~/.yaw-mcp/git/consent.json.
+             ~/.yaw-mcp/git/consent.json. Ctrl+C at that question ends the
+             run with exit 130; nothing after it is built or installed.
   --json     Print one JSON document on stdout instead of the text report,
              with the same keys on every run: root, installed, reason, error,
              updateError, markerError, unhosted, conflicts, skipped, git.
@@ -862,11 +864,8 @@ function buildGitEntriesFor(
       platform: opts.platform,
       progress: (l) => print(l),
       warn: (w) => printErr(`warning: ${w}`),
-      confirm: async (lines) => {
-        for (const l of lines) print(l);
-        const answer = await askYesNo(opts, "Proceed? [Y/n] ");
-        return answer === "" || answer === "y" || answer === "yes";
-      },
+      // Ctrl+C there ends the run with exit 130 (runSidecarsInstall).
+      confirm: scriptConsentConfirm(opts, print),
       runPm: opts.runPm,
     },
     bundlesPath !== null && bundlesPath !== localBundlesPath(userConfigDir(home)),
@@ -1025,6 +1024,25 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
   // from this stretch releases before it propagates.
   try {
     git = opts.buildGit === false ? [] : await buildGitEntriesFor(servers, bundles.path, opts, home, print, printErr);
+    // Listed before a cancel returns too: entries built or failed earlier in
+    // the run are still reported.
+    if (git.length > 0) {
+      print("Git sources:");
+      for (const g of git) {
+        print(`  ${g.namespace}  ${g.commit ? g.commit.slice(0, 12) : "(no commit)"}  ${g.status}`);
+        if (g.error) for (const l of g.error.split("\n")) print(`    ${l}`);
+      }
+      print();
+    }
+    if (git.some((g) => g.status === "cancelled")) {
+      // Ctrl+C at a repo's consent prompt: the user left, so the run ends here
+      // -- no further git entry was attempted and the npm half does not run.
+      // 130 (128 + SIGINT), as every prompt in the CLI exits for that key.
+      // Only a TTY asks, so there is never a --json document to write.
+      release?.();
+      printErr("yaw-mcp sidecars: Cancelled. Nothing more was built or installed.");
+      return { exitCode: 130, installed: [], lines, updateError: null };
+    }
     gitBad = git.filter((g) => g.status === "failed" || g.status === "refused").length;
     gitUnconsented = git.filter((g) => g.status === "needs-consent").length;
     // Both counts, when a run has both: the consent one names its own remedy.
@@ -1035,14 +1053,6 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
         : []),
     ];
     gitError = gitProblems.length > 0 ? gitProblems.join("; ") : null;
-    if (git.length > 0) {
-      print("Git sources:");
-      for (const g of git) {
-        print(`  ${g.namespace}  ${g.commit ? g.commit.slice(0, 12) : "(no commit)"}  ${g.status}`);
-        if (g.error) for (const l of g.error.split("\n")) print(`    ${l}`);
-      }
-      print();
-    }
   } catch (err) {
     release?.();
     throw err;

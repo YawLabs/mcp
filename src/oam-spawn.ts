@@ -2745,14 +2745,13 @@ export async function resolveOamSpawn(
  * Keyed by package name only: the everyday lookup this exists for is the
  * no-pin one, and a pinned lookup is rare enough to stay unmemoized.
  *
- * Accepted tradeoff: a durable install UNINSTALLED while the broker runs
- * leaves its dead path memoized until restart: a memo hit is returned without
- * checking the file is still there. The next connect of each server that
- * launches it boots from the dead path, fails, and takes the one-shot npx
- * downgrade (upstream.ts). That respawn working pins the server's launch
- * identity to raw npx for the rest of the session, so the cost is ONE failed
- * boot per server, not one per connect -- and after it the server runs on
- * npx until restart rather than re-scanning to a cache copy.
+ * A memo hit is only trusted while its file still exists: one existsSync per
+ * connect, far cheaper than the walk it replaces. A copy UNINSTALLED while
+ * the broker runs drops its entry and re-resolves on the spot -- to another
+ * stable copy, an npx-cache copy, or a miss that stays on npx -- instead of
+ * booting from the dead path. A boot failure there would take the one-shot
+ * npx downgrade in upstream.ts, and an npx respawn that boots pins that
+ * server to raw npx until restart.
  */
 const managedEntryMemo = new Map<string, string>();
 
@@ -2800,7 +2799,11 @@ export function resolveManagedSpawn(
     resolveEntry: (pkg, wantVersion) => {
       if (wantVersion !== null) return resolveNpmEntry(pkg, fromUrl, npmCache, managedRoot, wantVersion);
       const memoed = managedEntryMemo.get(pkg);
-      if (memoed !== undefined) return memoed;
+      if (memoed !== undefined) {
+        if (existsSync(memoed)) return memoed;
+        // The memoized copy was removed: forget it and rescan below.
+        managedEntryMemo.delete(pkg);
+      }
       const hit = resolveNpmEntry(pkg, fromUrl, npmCache, managedRoot, null);
       // The marker check is what makes memoizing safe: a hit FROM an npx
       // cache directory carries the fragment in its own path.

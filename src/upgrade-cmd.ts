@@ -132,6 +132,11 @@ export interface UpgradeCommandOptions {
   /** Test hook: replace the running-install prefix walk behind the
    *  `--prefix` a global-npm upgrade passes (see defaultRunningPrefix). */
   runningPrefix?: (argvPath: string | undefined) => string | null | Promise<string | null>;
+  /** Test hook: replace the check that a global-npm prefix matched on a
+   *  directory NAME alone (`npm` / `bin`) really is a global prefix and not a
+   *  project tree (see defaultConfirmGlobalPrefix in auto-upgrade.ts). False
+   *  drops `--prefix` from the printed command and from the --run spawn. */
+  confirmGlobalPrefix?: (argvPath: string | undefined, prefix: string) => boolean | Promise<boolean>;
   /** Test hook: override the platform the `--prefix` quoting decides against.
    *  Both quoters take it, so a POSIX runner can exercise the win32-only
    *  unquotable-prefix fallback (the branch that drops `--prefix` from the
@@ -233,10 +238,12 @@ const WIN32_DEFAULT_NPM_PREFIX = /\/AppData\/Roaming\/npm\/node_modules\/@yawlab
  *  holding node_modules/@yawlabs/mcp classifies as a global install, and the
  *  prefix derived from it is that project directory. The classification
  *  itself is left alone -- real scoop and custom-prefix installs depend on it
- *  -- so this predicate exists for the one caller that acts on it without
- *  asking: auto-upgrade's background `npm install -g --prefix <dir>`, which
- *  requires a global bin shim beside the prefix before it spawns for such a
- *  path. Pass the RESOLVED entrypoint (the path the prefix is derived from). */
+ *  -- so this predicate gates the `--prefix` instead: both the background
+ *  upgrade (auto-upgrade's `npm install -g --prefix <dir>`) and `yaw-mcp
+ *  upgrade` (its printed command and its --run spawn) require a yaw-mcp bin
+ *  shim in the prefix root before they pass `--prefix` for such a path (via
+ *  auto-upgrade's defaultConfirmGlobalPrefix). Pass the RESOLVED entrypoint
+ *  (the path the prefix is derived from). */
 export function globalNpmMarkerIsUnanchored(entryPath: string): boolean {
   const normalized = entryPath.replace(/\\/g, "/");
   if (WIN32_DEFAULT_NPM_PREFIX.test(normalized)) return false;
@@ -388,11 +395,11 @@ function classifyEntrypoint(argvPath: string): InstallMethod {
   //
   // UNANCHORED, unlike the lib markers below: any directory named `npm` that
   // holds node_modules/@yawlabs/mcp matches, a project tree included. The
-  // classification is kept: plain `upgrade` only prints the command, and
-  // nothing is spawned unless the user passes --run. `upgrade` never asks, so
-  // `--run` DOES install into a prefix matched on the name alone. The
-  // unprompted background upgrade does not act on the name alone -- see
-  // globalNpmMarkerIsUnanchored.
+  // classification is kept (real custom prefixes depend on it), but neither
+  // `upgrade` nor the background upgrade acts on the name alone: both require
+  // the yaw-mcp bin shim in the prefix root before they pass `--prefix <dir>`
+  // (globalNpmMarkerIsUnanchored, defaultConfirmGlobalPrefix). Without it
+  // `upgrade` prints and `--run` spawns the plain `npm install -g` instead.
   if (NPM_DIR_GLOBAL_MARKER.test(normalized)) return "global-npm";
   // `<prefix>/lib/node_modules` -- anchored on real Node-root shapes; see the
   // two regex definitions above for why a bare `/lib/` marker was unsafe.
@@ -413,8 +420,9 @@ function classifyEntrypoint(argvPath: string): InstallMethod {
   // <prefix> itself named `bin`. Misclassifying these as local-node-modules
   // made `upgrade --run` npm-install into the node prefix instead of
   // upgrading the global. Unanchored like the `npm` marker above -- a project
-  // directory literally named `bin` matches too -- so the background upgrade
-  // asks for a second signal before acting on it (globalNpmMarkerIsUnanchored).
+  // directory literally named `bin` matches too -- so both `upgrade` and the
+  // background upgrade ask for a second signal before passing it as `--prefix`
+  // (globalNpmMarkerIsUnanchored).
   if (BIN_DIR_GLOBAL_MARKER.test(normalized)) return "global-npm";
   // pnpm / bun global stores look like local node_modules trees but are
   // internally managed -- running plain `npm install` inside them writes
@@ -891,17 +899,27 @@ export async function fetchLatestVersion(opts: FetchLatestVersionOptions = {}): 
  *  `upgrade` the prose note below already says the same thing in the shape a
  *  human reads, so the warn is a second, uglier copy of one advisory landing on
  *  the same terminal. Raise the logger threshold for the duration of the probe
- *  and no longer: logger.ts resolves LOG_LEVEL per call rather than latching it
- *  at import, so this is a scoped mute, and the restore runs in a `finally` so a
- *  throwing probe cannot leave the process silent. */
+ *  and no longer: logger.ts resolves YAW_MCP_LOG_LEVEL / LOG_LEVEL per call
+ *  rather than latching them at import, so this is a scoped mute, and the
+ *  restore runs in a `finally` so a throwing probe cannot leave the process
+ *  silent.
+ *
+ *  BOTH names are pinned. A recognized YAW_MCP_LOG_LEVEL wins over LOG_LEVEL in
+ *  logger.ts, so muting LOG_LEVEL alone left a user with YAW_MCP_LOG_LEVEL=debug
+ *  (the support path `--help` advertises) seeing the warn -- as a raw JSON line,
+ *  since that same variable switches the CLI to the structured stream. */
 async function probeOamQuietly(): Promise<OamProbe> {
-  const prev = process.env.LOG_LEVEL;
-  process.env.LOG_LEVEL = "error";
+  const names = ["YAW_MCP_LOG_LEVEL", "LOG_LEVEL"] as const;
+  const prev = names.map((name) => process.env[name]);
+  for (const name of names) process.env[name] = "error";
   try {
     return await probeOam();
   } finally {
-    if (prev === undefined) delete process.env.LOG_LEVEL;
-    else process.env.LOG_LEVEL = prev;
+    names.forEach((name, i) => {
+      const value = prev[i];
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    });
   }
 }
 
@@ -960,6 +978,18 @@ async function defaultRunningPrefix(argvPath: string | undefined): Promise<strin
   if (isTestSandbox()) return null;
   const { detectRunningInstallPrefix } = await import("./auto-upgrade.js");
   return detectRunningInstallPrefix(argvPath);
+}
+
+/** May `upgrade` pin `--prefix <prefix>`? auto-upgrade's
+ *  defaultConfirmGlobalPrefix, the gate the background upgrade applies before
+ *  it spawns: false only when the RESOLVED entrypoint earned global-npm from
+ *  the unanchored `npm` / `bin` directory-name markers and no yaw-mcp bin shim
+ *  sits in the prefix root. Dynamic import for the same cycle reason as
+ *  defaultRunningPrefix. Not skipped under a test harness: it only reads the
+ *  filesystem, and fixture paths that do not resolve answer true. */
+async function defaultConfirmGlobalPrefix(argvPath: string | undefined, prefix: string): Promise<boolean> {
+  const { defaultConfirmGlobalPrefix: confirm } = await import("./auto-upgrade.js");
+  return confirm(argvPath, prefix);
 }
 
 /** The lock a global-npm `--run` takes in the running install's prefix before
@@ -1091,8 +1121,33 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
   let suggestedCommand = plan.command;
   // The RAW prefix outlives this block: the --run path below locks it.
   let rawPrefix: string | null = null;
+  // Set when the running prefix was refused as a possible project tree; the
+  // prose paths print it so the user knows why the command has no --prefix.
+  let prefixRefusedNote: string | null = null;
   if (method === "global-npm") {
     rawPrefix = await (opts.runningPrefix ?? defaultRunningPrefix)(argvPath);
+    // The `npm` and `bin` markers classify on a directory NAME alone, so a
+    // project directory called `npm` or `bin` holding
+    // node_modules/@yawlabs/mcp reads as global-npm and rawPrefix is that
+    // project directory. Same gate as the background upgrade
+    // (maybeAutoUpgrade): require the bin shim npm writes into a real global
+    // prefix root. Without it, drop the prefix -- the printed command and the
+    // --run spawn both fall back to the plain `npm install -g`, the same
+    // command an unresolvable prefix already gets, which installs into npm's
+    // own global prefix and never into the project tree.
+    if (rawPrefix !== null && !(await (opts.confirmGlobalPrefix ?? defaultConfirmGlobalPrefix)(argvPath, rawPrefix))) {
+      // The command printed below does NOT update this copy, so the note has
+      // to carry the two manual remedies: which one applies is something only
+      // the user knows (is <dir> a global prefix or a project?).
+      const { quoteArgForDisplay } = await import("./auto-upgrade.js");
+      const shownDir = quoteArgForDisplay(rawPrefix, opts.platform) ?? rawPrefix;
+      prefixRefusedNote =
+        `Note: not pinning --prefix ${rawPrefix}: this copy sits under a directory named \`npm\` or \`bin\` with no yaw-mcp bin shim beside it, so it may be a project tree rather than a global npm prefix. ` +
+        `The command below installs into npm's own global prefix and does NOT update the copy at ${rawPrefix}. ` +
+        `If that directory really is a global npm prefix, run \`npm install -g --prefix ${shownDir} @yawlabs/mcp@latest\` instead; ` +
+        `if it is a project, run \`npm install @yawlabs/mcp@latest\` in its project root (${rawPrefix}).`;
+      rawPrefix = null;
+    }
     if (rawPrefix !== null) {
       const { quoteArgForDisplay, quoteShellArgIfNeeded } = await import("./auto-upgrade.js");
       // opts.platform threads through to BOTH quoters: only win32 can refuse a
@@ -1125,9 +1180,12 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
   const installRoot = method === "local-node-modules" ? localInstallRoot(argvPath, realpath) : null;
 
   if (opts.json) {
-    // The snapshot's command is the paste-safe prefixed form: scripts and
-    // humans both act on it, and a bare `-g` would promise a different
-    // install than `--run` performs (see the pinning note above). `cwd` is the
+    // The snapshot's command is the same one `--run` would spawn: the
+    // prefixed form when the running copy's prefix was confirmed, so scripts
+    // and humans act on what `--run` performs (see the pinning note above).
+    // When that prefix was REFUSED it is the plain `npm install -g ...`, which
+    // may not update the running copy, and prefixRefusedNote -- printed on the
+    // prose paths only -- does not reach this snapshot. `cwd` is the
     // other half of that promise for local installs -- a script that runs
     // `command` from its own working directory needs to be told it must chdir.
     print(JSON.stringify({ ...plan, command: suggestedCommand, cwd: installRoot }, null, 2));
@@ -1145,6 +1203,7 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
   if (latest === null) {
     print("yaw-mcp upgrade: couldn't reach the npm registry (offline? firewall?).");
     if (suggestedCommand) {
+      if (prefixRefusedNote) print(prefixRefusedNote);
       print("When you're back online, run:");
       print("");
       // Same `in <root>:` header the online exit-1 path prints: the command is
@@ -1250,6 +1309,11 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
   // plan.command, no arg of which ever needs quoting.
   const commandLine =
     method === "global-npm" ? suggestedCommand : runSpec ? [runSpec.cmd, ...runSpec.args].join(" ") : plan.command;
+
+  if (prefixRefusedNote) {
+    print(prefixRefusedNote);
+    print("");
+  }
 
   if (!opts.run) {
     if (runSpec) {

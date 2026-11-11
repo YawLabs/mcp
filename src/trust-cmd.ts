@@ -17,19 +17,22 @@
 //   yaw-mcp trust --revoke [p]   withdraw approval
 //
 // Exit codes: 0 success, 1 refused / aborted / nothing to approve,
-// 2 argv error (matching the sibling subcommands), 130 Ctrl+C at the
-// approval prompt (128 + SIGINT, as every `secrets` prompt exits).
+// 2 argv error (matching the sibling subcommands), 130 Ctrl+C at any of the
+// three prompts (128 + SIGINT, as every `secrets` prompt exits): at the
+// approval prompt nothing is approved; at the "Build it now?" prompt and at a
+// repo's script-consent "Proceed?" prompt the approval is already RECORDED
+// and the message names `yaw-mcp sidecars install` to build later.
 // A grant can also exit 1 with the approval RECORDED: the file pins a git
 // server that has no build on this machine and either nobody was asked
 // (--yes, which a run with no TTY requires -- without it such a run is
 // refused before anything is recorded) or the build that was started did
 // not finish -- it failed, or the repo's script consent was declined (offerGitBuild).
-// Declining the "Build it now?" prompt exits 0, and so does Ctrl+C there --
-// the 130 is the approval prompt's only.
+// Declining the "Build it now?" prompt (n, or ^D) exits 0.
 
 import { readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
+import { scriptConsentConfirm } from "./git-consent-prompt.js";
 import {
   buildPinnedGitEntries,
   type GitBuildContext,
@@ -40,7 +43,7 @@ import {
 } from "./git-source.js";
 import { localBundlesPath, previewBundlesContent, probeProjectTrust } from "./local-bundles.js";
 import { createStreamWriter } from "./logger.js";
-import { isRegistrySpec, specConstraint } from "./oam-spawn.js";
+import { isRegistrySpec, launcherBasename, specConstraint } from "./oam-spawn.js";
 import { ALLOW_UNOWNED_ENV, CONFIG_DIRNAME } from "./paths.js";
 import {
   askYesNo,
@@ -88,6 +91,9 @@ export const TRUST_USAGE = `Usage: yaw-mcp trust [--yes]
   no TTY requires), the approval is recorded, the build command is printed,
   and the exit code is 1 (approved, but not runnable yet). A build that is
   started and does not finish exits 1 too; declining the offer exits 0.
+  Ctrl+C at any prompt exits 130. At the approval prompt nothing is
+  approved; at the build offer or a repo's script consent the approval is
+  kept and nothing more is built (build later with yaw-mcp sidecars install).
 
   --yes, -y         Skip the confirmation prompt. Required when stdin or
                     stdout is not a TTY (there is nothing to ask on).
@@ -500,8 +506,16 @@ async function offerGitBuild(
     readTrustAnswer,
   );
   // [Y/n]: a bare Enter builds. ^D and ^C are not strings (QUESTION_EOF,
-  // QUESTION_CANCELLED), so neither matches "" and both decline -- leaving the
-  // prompt must never be what runs a repo's install/build scripts.
+  // QUESTION_CANCELLED), so neither matches "" and neither builds -- leaving
+  // the prompt must never be what runs a repo's install/build scripts. ^C is
+  // the user leaving, not answering: exit 130 like the approval prompt. The
+  // approval above is recorded either way.
+  if (answer === QUESTION_CANCELLED) {
+    printErr(
+      "yaw-mcp trust: Cancelled. The file is approved but not built; build it later with: yaw-mcp sidecars install",
+    );
+    return 130;
+  }
   if (answer !== "" && answer !== "y" && answer !== "yes") {
     print("Not built. Build later with: yaw-mcp sidecars install");
     return 0;
@@ -515,18 +529,21 @@ async function offerGitBuild(
       yes: false,
       progress: (l) => print(l),
       warn: (w) => printErr(`warning: ${w}`),
-      confirm: async (lines) => {
-        for (const l of lines) print(l);
-        const a = await askYesNo(opts, "Proceed? [Y/n] ", readTrustAnswer);
-        return a === "" || a === "y" || a === "yes";
-      },
+      confirm: scriptConsentConfirm(opts, print, readTrustAnswer),
       runPm: opts.runPm,
     },
     true,
     file,
   );
+  // A failure before a later ^C is still reported: the cancel only stops the
+  // entries after it.
   const failed = reports.filter((r) => r.status === "failed" || r.status === "refused" || r.status === "needs-consent");
   for (const r of failed) printErr(`yaw-mcp trust: ${r.error ?? `${r.namespace} did not build`}`);
+  if (reports.some((r) => r.status === "cancelled")) {
+    // Ctrl+C at a repo's consent prompt: the builder stopped there.
+    printErr("yaw-mcp trust: Cancelled. The file is approved; build it later with: yaw-mcp sidecars install");
+    return 130;
+  }
   if (failed.length === 0) return 0;
   printErr("The file is approved; retry the build with: yaw-mcp sidecars install");
   return 1;
@@ -750,11 +767,11 @@ const PEP440_EXACT_RE = /^\d+(?:\.\d+)*(?:(?:a|b|rc)\d+)?(?:\.post\d+)?(?:\.dev\
 
 /** The registry spec this entry would fetch, when it has no version pin. */
 function unversionedRegistrySpec(s: UpstreamServerConfig): string | null {
-  const base =
-    (s.command ?? "")
-      .split(/[\\/]/)
-      .pop()
-      ?.replace(/\.(?:exe|cmd|bat)$/i, "") ?? "";
+  // oam-spawn's launcherBasename, the one its nodeLaunchKind classifies with:
+  // lowercased, minus .exe/.cmd/.bat, so `NPX.cmd`, `Uvx.exe` and
+  // `C:\...\npx.CMD` are the runners they launch (Windows matches names
+  // case-insensitively) rather than unknown commands that skip this check.
+  const base = launcherBasename(s.command ?? "");
   const runner = REGISTRY_RUNNERS.find((r) => r.cmd === base);
   if (!runner) return null;
   let rest = s.args ?? [];

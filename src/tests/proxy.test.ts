@@ -73,9 +73,9 @@ function makeConnection(
  *
  *  Assertions belong AFTER the call, not inside `fn`: a failing expect while
  *  stderr is monkey-patched swallows the diff vitest would otherwise print.
- *  Pair it with a pinned LOG_LEVEL -- log() consults the env var per call, so
- *  an ambient LOG_LEVEL=error makes a "warns" assertion fail and a "does NOT
- *  warn" assertion pass for the wrong reason. */
+ *  Pair it with pinLogLevel -- log() consults YAW_MCP_LOG_LEVEL, else
+ *  LOG_LEVEL, per call, so an ambient `error` in either makes a "warns"
+ *  assertion fail and a "does NOT warn" assertion pass for the wrong reason. */
 function withCapturedStderr<T>(fn: () => T): { writes: string[]; value: T } {
   const writes: string[] = [];
   const original = process.stderr.write.bind(process.stderr);
@@ -107,10 +107,12 @@ async function withCapturedStderrAsync<T>(fn: () => Promise<T>): Promise<{ write
   }
 }
 
-/** Pin LOG_LEVEL for a describe whose assertions read captured stderr. */
+/** Pin the log level for a describe whose assertions read captured stderr:
+ *  LOG_LEVEL set, and YAW_MCP_LOG_LEVEL (which wins over it) cleared. */
 function pinLogLevel(): void {
   beforeEach(() => {
     vi.stubEnv("LOG_LEVEL", "warn");
+    vi.stubEnv("YAW_MCP_LOG_LEVEL", undefined);
   });
   afterEach(() => {
     vi.unstubAllEnvs();

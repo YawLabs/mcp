@@ -136,9 +136,11 @@ describe("createProgressReporter", () => {
   it("swallows a notify rejection and reports it as a warn line", async () => {
     // The rejection must not reach the caller -- and it must not vanish
     // silently either: the reporter's .catch() logs it. An operator running
-    // the suite with LOG_LEVEL=error exported would mute that line, so pin
-    // the threshold instead of inheriting it.
+    // the suite with LOG_LEVEL=error (or YAW_MCP_LOG_LEVEL=error, which wins
+    // over it) exported would mute that line, so pin the threshold instead of
+    // inheriting it.
     vi.stubEnv("LOG_LEVEL", "warn");
+    vi.stubEnv("YAW_MCP_LOG_LEVEL", undefined);
     const stderrWrites: string[] = [];
     vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => {
       if (typeof chunk === "string") stderrWrites.push(chunk);

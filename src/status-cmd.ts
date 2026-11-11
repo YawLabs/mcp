@@ -317,7 +317,11 @@ export async function collectStatus(opts: StatusCommandOptions = {}): Promise<St
     // rejecting this whole Promise.all and taking the panel's poll down over
     // disposable derived data. `list` wraps the same call the same way.
     readGradesCache(home).catch(() => ({}) as GradesCache),
-    loadStateClassified(learningPath),
+    // quiet, as doctor's STATE section passes it: the loader's own warn is
+    // worded for the server ("starting fresh"), and on the cli surface it went
+    // straight to stderr. status reports a bad file itself, as
+    // learning.readable false ("learning: unreadable" in text mode).
+    loadStateClassified(learningPath, { quiet: true }),
   ]);
   const vaultFile = vaultPath(home);
   const vaultExists = existsSync(vaultFile);

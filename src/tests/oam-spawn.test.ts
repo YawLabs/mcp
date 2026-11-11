@@ -1241,9 +1241,12 @@ describe("rewriteNpmToManagedNode", () => {
   it("does not claim an npx fallback for a non-npx launch when no node bin is located", () => {
     // The launch kind is checked before nodeBin: a docker command with no
     // locatable node used to log "staying on npx" for a launch that was never
-    // npx. logger.ts resolves LOG_LEVEL per call, so raising it here is enough.
+    // npx. logger.ts resolves the level per call, so raising LOG_LEVEL here is
+    // enough once YAW_MCP_LOG_LEVEL, which wins over it, is cleared too.
     const prior = process.env.LOG_LEVEL;
+    const priorYaw = process.env.YAW_MCP_LOG_LEVEL;
     process.env.LOG_LEVEL = "debug";
+    delete process.env.YAW_MCP_LOG_LEVEL;
     const chunks: string[] = [];
     const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown): boolean => {
       chunks.push(String(chunk));
@@ -1263,6 +1266,7 @@ describe("rewriteNpmToManagedNode", () => {
       spy.mockRestore();
       if (prior === undefined) delete process.env.LOG_LEVEL;
       else process.env.LOG_LEVEL = prior;
+      if (priorYaw !== undefined) process.env.YAW_MCP_LOG_LEVEL = priorYaw;
     }
   });
 
@@ -1395,7 +1399,7 @@ describe("resolveManagedSpawn entry memo", () => {
     resetManagedEntryMemo();
   });
 
-  it("memoizes a stable managed-tree hit: the entry survives deleting the copy", () => {
+  it("memoizes a stable managed-tree hit: a memo hit on an existing file does not rescan", () => {
     const { managedRoot, brokerUrl, cleanup } = fixture();
     const pkgDir = join(managedRoot, "some-mcp");
     writePkg(pkgDir, { name: "some-mcp", version: "1.0.0", bin: { "some-mcp": "dist/index.js" } });
@@ -1403,10 +1407,32 @@ describe("resolveManagedSpawn entry memo", () => {
     const spawn = spawnWith(brokerUrl, managedRoot);
     try {
       expect(spawn(["-y", "some-mcp"])).toEqual({ command: NODE, args: [entry] });
-      // The memo is the only thing that can answer the second call: the disk
-      // copy is gone, and a miss would fall through to npx.
-      rmSync(pkgDir, { recursive: true, force: true });
+      // Repoint the bin at a new file while the memoized one stays on disk: a
+      // rescan would answer dist/other.js, so only the memo answers dist/index.js.
+      writePkg(pkgDir, { name: "some-mcp", version: "1.0.0", bin: { "some-mcp": "dist/other.js" } });
       expect(spawn(["-y", "some-mcp"])).toEqual({ command: NODE, args: [entry] });
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("drops a memo hit whose file was deleted and rescans instead of booting the dead path", () => {
+    const { npx, managedRoot, brokerUrl, cleanup } = fixture();
+    const pkgDir = join(managedRoot, "some-mcp");
+    writePkg(pkgDir, { name: "some-mcp", version: "1.0.0", bin: { "some-mcp": "dist/index.js" } });
+    const spawn = spawnWith(brokerUrl, managedRoot);
+    try {
+      expect(spawn(["-y", "some-mcp"])).toEqual({ command: NODE, args: [join(pkgDir, "dist", "index.js")] });
+      // The managed copy is uninstalled while the broker runs; an npx-cache
+      // copy is still there. The rescan finds it rather than returning the
+      // memoized dead path.
+      rmSync(pkgDir, { recursive: true, force: true });
+      const cacheDir = join(npx, "bbb", "node_modules", "some-mcp");
+      writePkg(cacheDir, { name: "some-mcp", version: "1.0.0", bin: { "some-mcp": "dist/index.js" } });
+      expect(spawn(["-y", "some-mcp"])).toEqual({ command: NODE, args: [join(cacheDir, "dist", "index.js")] });
+      // With no copy left at all, the launch stays on npx.
+      rmSync(cacheDir, { recursive: true, force: true });
+      expect(spawn(["-y", "some-mcp"])).toEqual({ command: "npx", args: ["-y", "some-mcp"] });
     } finally {
       cleanup();
     }

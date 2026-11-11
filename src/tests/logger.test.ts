@@ -20,8 +20,10 @@ describe("log() spread-order: envelope fields win over data keys", () => {
     // log() resolves LOG_LEVEL per call, so a developer shell or CI runner
     // exporting LOG_LEVEL=warn (or error) would suppress the info lines these
     // tests read back -- two would fail and the warn-level one would pass
-    // vacuously. Pin the threshold below every level used here.
+    // vacuously. Pin the threshold below every level used here, and unset
+    // YAW_MCP_LOG_LEVEL, which would win over the pin.
     vi.stubEnv("LOG_LEVEL", "debug");
+    vi.stubEnv("YAW_MCP_LOG_LEVEL", undefined);
     vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => {
       if (typeof chunk === "string") stderrWrites.push(chunk);
       else if (Buffer.isBuffer(chunk)) stderrWrites.push(chunk.toString("utf8"));
@@ -89,6 +91,7 @@ describe("log() failure containment", () => {
     // warn / error / info, so an inherited LOG_LEVEL must not decide the
     // threshold.
     vi.stubEnv("LOG_LEVEL", "debug");
+    vi.stubEnv("YAW_MCP_LOG_LEVEL", undefined);
     vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => {
       if (typeof chunk === "string") stderrWrites.push(chunk);
       else if (Buffer.isBuffer(chunk)) stderrWrites.push(chunk.toString("utf8"));
@@ -153,6 +156,9 @@ describe("log() reads LOG_LEVEL per call, not once at import", () => {
 
   beforeEach(() => {
     stderrWrites = [];
+    // A recognized YAW_MCP_LOG_LEVEL wins over LOG_LEVEL, so an ambient one
+    // would decide every LOG_LEVEL case below.
+    vi.stubEnv("YAW_MCP_LOG_LEVEL", undefined);
     vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => {
       if (typeof chunk === "string") stderrWrites.push(chunk);
       return true;
@@ -162,6 +168,29 @@ describe("log() reads LOG_LEVEL per call, not once at import", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     vi.unstubAllEnvs();
+  });
+
+  it("YAW_MCP_LOG_LEVEL sets the level on its own", () => {
+    vi.stubEnv("LOG_LEVEL", undefined);
+    vi.stubEnv("YAW_MCP_LOG_LEVEL", " DEBUG ");
+    log("debug", "prefixed-debug");
+    expect(stderrWrites.map((w) => JSON.parse(w.trim()).msg)).toEqual(["prefixed-debug"]);
+  });
+
+  it("a recognized YAW_MCP_LOG_LEVEL wins over LOG_LEVEL", () => {
+    vi.stubEnv("LOG_LEVEL", "debug");
+    vi.stubEnv("YAW_MCP_LOG_LEVEL", "error");
+    log("debug", "muted-debug");
+    log("warn", "muted-warn");
+    log("error", "kept-error");
+    expect(stderrWrites.map((w) => JSON.parse(w.trim()).msg)).toEqual(["kept-error"]);
+  });
+
+  it("an unrecognized YAW_MCP_LOG_LEVEL counts as unset and leaves LOG_LEVEL in charge", () => {
+    vi.stubEnv("LOG_LEVEL", "debug");
+    vi.stubEnv("YAW_MCP_LOG_LEVEL", "constructor");
+    log("debug", "log-level-debug");
+    expect(stderrWrites.map((w) => JSON.parse(w.trim()).msg)).toEqual(["log-level-debug"]);
   });
 
   it("suppresses an info line when LOG_LEVEL is raised after import", () => {
@@ -218,9 +247,10 @@ describe("log() on the CLI surface", () => {
   beforeEach(() => {
     stderrWrites = [];
     // Deliberately UNSET, not "debug": the whole gate is "did the operator
-    // ask for the structured stream", and stubbing a level would answer yes
-    // for every case below.
+    // ask for the structured stream", and stubbing YAW_MCP_LOG_LEVEL would
+    // answer yes for every case below (LOG_LEVEL would set the threshold).
     vi.stubEnv("LOG_LEVEL", undefined);
+    vi.stubEnv("YAW_MCP_LOG_LEVEL", undefined);
     vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => {
       if (typeof chunk === "string") stderrWrites.push(chunk);
       return true;
@@ -261,27 +291,43 @@ describe("log() on the CLI surface", () => {
     expect(stderrWrites).toEqual(["yaw-mcp: error: Failed to save yaw-mcp state\n"]);
   });
 
-  it("restores the structured stream when LOG_LEVEL asks for it", () => {
-    // The documented support path: LOG_LEVEL=debug is what --help tells a
-    // user to set when asking why a server did not load.
-    vi.stubEnv("LOG_LEVEL", "debug");
+  it("restores the structured stream when YAW_MCP_LOG_LEVEL asks for it", () => {
+    // The documented support path: YAW_MCP_LOG_LEVEL=debug is what --help
+    // tells a user to set to get a subcommand's JSON log lines.
+    vi.stubEnv("YAW_MCP_LOG_LEVEL", "debug");
     log("info", "yaw-mcp startup");
     expect(stderrWrites).toHaveLength(1);
     expect(JSON.parse(stderrWrites[0].trim()).msg).toBe("yaw-mcp startup");
   });
 
-  it("does not treat an unrecognized LOG_LEVEL as an opt-in", () => {
-    // minLevel() already falls back to info for a typo, so honoring it as
-    // "the operator asked for JSON" would turn `LOG_LEVEL=chatty` into a
+  it("keeps the plain rendering under LOG_LEVEL alone, while still honoring its level", () => {
+    // LOG_LEVEL is unprefixed and other tools export it, so it no longer
+    // switches a subcommand to JSON. It still sets the threshold: debug lets
+    // nothing extra through on the CLI (info stays dropped here), and error
+    // silences a warning.
+    vi.stubEnv("LOG_LEVEL", "debug");
+    log("info", "still-dropped");
+    log("warn", "plain-under-log-level");
+    expect(stderrWrites).toEqual(["yaw-mcp: warning: plain-under-log-level\n"]);
+    stderrWrites.length = 0;
+    vi.stubEnv("LOG_LEVEL", "error");
+    log("warn", "muted-by-level");
+    log("error", "kept-by-level");
+    expect(stderrWrites).toEqual(["yaw-mcp: error: kept-by-level\n"]);
+  });
+
+  it("does not treat an unrecognized YAW_MCP_LOG_LEVEL as an opt-in", () => {
+    // minLevel() already treats a typo as unset, so honoring it as "the
+    // operator asked for JSON" would turn `YAW_MCP_LOG_LEVEL=chatty` into a
     // wall of envelopes.
-    vi.stubEnv("LOG_LEVEL", "chatty");
+    vi.stubEnv("YAW_MCP_LOG_LEVEL", "chatty");
     log("info", "still-dropped");
     log("warn", "still-plain");
     expect(stderrWrites).toEqual(["yaw-mcp: warning: still-plain\n"]);
   });
 
   it("does not treat an Object.prototype key as an opt-in", () => {
-    vi.stubEnv("LOG_LEVEL", "constructor");
+    vi.stubEnv("YAW_MCP_LOG_LEVEL", "constructor");
     log("info", "proto-dropped");
     log("warn", "proto-plain");
     expect(stderrWrites).toEqual(["yaw-mcp: warning: proto-plain\n"]);

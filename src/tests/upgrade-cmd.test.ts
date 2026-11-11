@@ -1,4 +1,6 @@
 import type { EventEmitter } from "node:events";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { quoteArgForDisplay, quoteShellArgIfNeeded } from "../auto-upgrade.js";
@@ -52,6 +54,22 @@ vi.mock("node:child_process", async (importOriginal) => {
       cp.children.push(child);
       return child;
     },
+  };
+});
+
+/** Override for oam-spawn's probeOam on the UN-injected path (runUpgrade with
+ *  no `oamProbe`), which is the only path that goes through probeOamQuietly.
+ *  Null means the real probeOam, so every other test is unaffected. */
+const oamSpawnMock = vi.hoisted(() => ({
+  probeOam: null as null | (() => Promise<import("../oam-spawn.js").OamProbe>),
+}));
+
+vi.mock("../oam-spawn.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../oam-spawn.js")>();
+  return {
+    ...actual,
+    probeOam: (...args: Parameters<typeof actual.probeOam>) =>
+      oamSpawnMock.probeOam ? oamSpawnMock.probeOam() : actual.probeOam(...args),
   };
 });
 
@@ -204,7 +222,9 @@ describe("detectInstallMethod", () => {
 
   it("globalNpmMarkerIsUnanchored: true only for the name-only `npm` and `bin` markers", () => {
     // These two classify on a directory NAME, so a project tree matches them
-    // too; the background upgrade wants a second signal for exactly this set.
+    // too; both the background upgrade and `yaw-mcp upgrade` (print and
+    // --run) want a bin shim in the prefix before passing `--prefix` for
+    // exactly this set.
     expect(globalNpmMarkerIsUnanchored("/home/u/proj/bin/node_modules/@yawlabs/mcp/dist/index.js")).toBe(true);
     expect(globalNpmMarkerIsUnanchored("/home/u/proj/npm/node_modules/@yawlabs/mcp/dist/index.js")).toBe(true);
     expect(
@@ -1598,6 +1618,127 @@ describe("runUpgrade", () => {
       expect(r.exitCode).toBe(1);
       expect(JSON.parse(io.out.join("\n")).command).toBe("npm install -g @yawlabs/mcp@latest");
     });
+
+    // The `npm` / `bin` markers classify on a directory NAME alone, so a
+    // project directory named `npm` holding node_modules/@yawlabs/mcp reads as
+    // global-npm and the running-install walk returns that project directory.
+    // These use a REAL tree on disk and the un-injected confirm gate (auto-
+    // upgrade's defaultConfirmGlobalPrefix), so they pin the production check.
+    describe("a project directory named `npm` is not pinned as a global prefix", () => {
+      const made: string[] = [];
+      afterEach(() => {
+        for (const d of made.splice(0)) rmSync(d, { recursive: true, force: true });
+      });
+      function projectNamedNpm(withShim: boolean): { prefix: string; entry: string } {
+        const root = mkdtempSync(join(tmpdir(), "yaw-upgrade-prefix-"));
+        made.push(root);
+        const prefix = join(root, "proj", "npm");
+        const dist = join(prefix, "node_modules", "@yawlabs", "mcp", "dist");
+        mkdirSync(dist, { recursive: true });
+        const entry = join(dist, "index.js");
+        writeFileSync(entry, "");
+        if (withShim) writeFileSync(join(prefix, "yaw-mcp.cmd"), "");
+        return { prefix, entry };
+      }
+
+      it("--run spawns the plain `npm install -g` and says why, never -g --prefix <project dir>", async () => {
+        const { prefix, entry } = projectNamedNpm(false);
+        const io = captureIO();
+        const spawned: Array<{ cmd: string; args: string[] }> = [];
+        const locked: string[] = [];
+        const r = await runUpgrade({
+          run: true,
+          currentVersion: "0.40.0",
+          argvPath: entry,
+          fetchLatest: async () => "0.45.0",
+          runningPrefix: async () => prefix,
+          acquireLock: (dir) => {
+            locked.push(dir);
+            return () => {};
+          },
+          installedVersion: async () => null,
+          spawnImpl: async (cmd, args) => {
+            spawned.push({ cmd, args });
+            return 0;
+          },
+          out: io.push,
+          err: io.pushErr,
+        });
+        expect(r.exitCode).toBe(0);
+        expect(spawned).toEqual([{ cmd: "npm", args: ["install", "-g", "@yawlabs/mcp@latest"] }]);
+        // No lock is taken in the refused directory either: nothing writes there.
+        expect(locked).toEqual([]);
+        const commandLines = io.out.flatMap((s) => s.split("\n")).filter((l) => l.startsWith("  npm "));
+        expect(commandLines).toEqual(["  npm install -g @yawlabs/mcp@latest"]);
+        expect(io.out.join("\n")).toContain("may be a project tree rather than a global npm prefix");
+        // The plain command does not update this copy: the note must say so
+        // and give both manual remedies, pointed at the refused directory.
+        const out = io.out.join("\n");
+        expect(out).toContain(`does NOT update the copy at ${prefix}`);
+        expect(out).toContain("npm install -g --prefix ");
+        expect(out).toContain("@yawlabs/mcp@latest` instead");
+        expect(out).toContain(`run \`npm install @yawlabs/mcp@latest\` in its project root (${prefix})`);
+      });
+
+      it("plain upgrade and --json print the command without --prefix <project dir>", async () => {
+        const { prefix, entry } = projectNamedNpm(false);
+        const io = captureIO();
+        const r = await runUpgrade({
+          currentVersion: "0.40.0",
+          argvPath: entry,
+          fetchLatest: async () => "0.45.0",
+          runningPrefix: async () => prefix,
+          out: io.push,
+          err: io.pushErr,
+        });
+        expect(r.exitCode).toBe(1);
+        const commandLines = io.out.flatMap((s) => s.split("\n")).filter((l) => l.startsWith("  npm "));
+        expect(commandLines).toEqual(["  npm install -g @yawlabs/mcp@latest"]);
+
+        const jio = captureIO();
+        const jr = await runUpgrade({
+          json: true,
+          currentVersion: "0.40.0",
+          argvPath: entry,
+          fetchLatest: async () => "0.45.0",
+          runningPrefix: async () => prefix,
+          out: jio.push,
+          err: jio.pushErr,
+        });
+        expect(jr.exitCode).toBe(1);
+        expect(JSON.parse(jio.out.join("\n")).command).toBe("npm install -g @yawlabs/mcp@latest");
+      });
+
+      it("keeps --prefix when the yaw-mcp bin shim sits in the prefix root (a real custom global prefix)", async () => {
+        const { prefix, entry } = projectNamedNpm(true);
+        const spawned: Array<{ cmd: string; args: string[] }> = [];
+        const io = captureIO();
+        await runUpgrade({
+          run: true,
+          currentVersion: "0.40.0",
+          argvPath: entry,
+          fetchLatest: async () => "0.45.0",
+          runningPrefix: async () => prefix,
+          acquireLock: () => () => {},
+          installedVersion: async () => null,
+          spawnImpl: async (cmd, args) => {
+            spawned.push({ cmd, args });
+            return 0;
+          },
+          out: io.push,
+          err: io.pushErr,
+        });
+        expect(spawned).toHaveLength(1);
+        expect(spawned[0].args).toEqual([
+          "install",
+          "-g",
+          "--prefix",
+          quoteShellArgIfNeeded(prefix),
+          "@yawlabs/mcp@latest",
+        ]);
+        expect(io.out.join("\n")).not.toContain("may be a project tree");
+      });
+    });
   });
 
   it("with --run, propagates the child exit code as 3 on failure", async () => {
@@ -2174,6 +2315,85 @@ describe("runUpgrade", () => {
     });
     expect(r.exitCode).toBe(0);
     expect(io.out.join("\n")).toContain("nothing to do");
+  });
+
+  it("mutes the probe's own warn even under an ambient YAW_MCP_LOG_LEVEL=debug, then restores both level vars [J-json review]", async () => {
+    // logger.ts resolves a recognized YAW_MCP_LOG_LEVEL ahead of LOG_LEVEL, and
+    // that variable also switches the CLI to JSON lines. A mute that pinned
+    // only LOG_LEVEL let the below-floor warn through as a raw JSON line next
+    // to the prose note that says the same thing.
+    const { log } = await import("../logger.js");
+    // oamFloorLines skips the un-injected probe under a test harness
+    // (isTestSandbox reads VITEST); the probe is mocked here, so lift that.
+    vi.stubEnv("VITEST", "");
+    vi.stubEnv("YAW_MCP_LOG_LEVEL", "debug");
+    vi.stubEnv("LOG_LEVEL", "info");
+    const seen: Array<{ yaw: string | undefined; plain: string | undefined }> = [];
+    oamSpawnMock.probeOam = async () => {
+      seen.push({ yaw: process.env.YAW_MCP_LOG_LEVEL, plain: process.env.LOG_LEVEL });
+      // The real below-floor branch's warn, through the real logger.
+      log("warn", "oam is installed but below the minimum supported version");
+      return oamProbe(true, BELOW_FLOOR_OAM)();
+    };
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    try {
+      const io = captureIO();
+      const r = await runUpgrade({
+        currentVersion: "0.45.0",
+        argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
+        fetchLatest: async () => "0.45.0",
+        // VITEST="" lifts every isTestSandbox gate, not just the probe's:
+        // inject the prefix and SEA checks so they do not read this machine.
+        runningPrefix: async () => null,
+        isSea: () => false,
+        out: io.push,
+        err: io.pushErr,
+      });
+      expect(r.exitCode).toBe(0);
+      // The probe really ran on the un-injected (quiet) path...
+      expect(seen).toEqual([{ yaw: "error", plain: "error" }]);
+      // ...its warn was dropped...
+      const written = stderr.mock.calls.map((c) => String(c[0])).join("");
+      expect(written).not.toContain("below the minimum supported version");
+      // ...the prose note still carries the advisory...
+      expect(io.out.join("\n")).toContain(`below the v${MIN_OAM_VERSION} floor`);
+      // ...and both variables are back to what the user exported.
+      expect(process.env.YAW_MCP_LOG_LEVEL).toBe("debug");
+      expect(process.env.LOG_LEVEL).toBe("info");
+    } finally {
+      stderr.mockRestore();
+      oamSpawnMock.probeOam = null;
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("the quiet probe deletes a level var that was unset before it, rather than leaving it at error [J-json review]", async () => {
+    vi.stubEnv("VITEST", "");
+    vi.stubEnv("YAW_MCP_LOG_LEVEL", undefined);
+    vi.stubEnv("LOG_LEVEL", undefined);
+    let probed = 0;
+    oamSpawnMock.probeOam = async () => {
+      probed++;
+      return oamProbe(false, bumpPatch(MIN_OAM_VERSION))();
+    };
+    try {
+      await runUpgrade({
+        currentVersion: "0.45.0",
+        argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
+        fetchLatest: async () => "0.45.0",
+        // Same as above: keep the lifted sandbox gates off this machine.
+        runningPrefix: async () => null,
+        isSea: () => false,
+        out: () => {},
+        err: () => {},
+      });
+      expect(probed).toBe(1);
+      expect(Object.hasOwn(process.env, "YAW_MCP_LOG_LEVEL")).toBe(false);
+      expect(Object.hasOwn(process.env, "LOG_LEVEL")).toBe(false);
+    } finally {
+      oamSpawnMock.probeOam = null;
+      vi.unstubAllEnvs();
+    }
   });
 
   it("offline + binary says the track was retired, not the npx restart message", async () => {

@@ -3202,10 +3202,10 @@ describe("upsertUserBundle round-trip", () => {
   });
 
   it("add --dry-run --json refuses on the SAME channel and shape as the real --json run [#1]", async () => {
-    // Both must exit 1 with text on stderr and NOTHING on stdout: a
-    // {ok:false} JSON body on the dry-run's stdout would be the one place
-    // the preview's channel differed from the run it previews (every other
-    // add error, --json or not, is stderr text).
+    // Both must exit 1 with the text on stderr AND one {ok:false} document on
+    // stdout -- the shape `add --git` always used. Until this changed, a
+    // catalog add's --json failure left stdout empty, which a script could
+    // not tell from a quiet success.
     await upsertUserBundle(
       {
         namespace: "github",
@@ -3237,8 +3237,17 @@ describe("upsertUserBundle round-trip", () => {
     const real = await run(false);
     expect(preview.exitCode).toBe(1);
     expect(real.exitCode).toBe(1);
-    expect(preview.out).toBe("");
-    expect(real.out).toBe("");
+    for (const r of [preview, real]) {
+      const doc = JSON.parse(r.out) as { ok: boolean; error: string; exitCode: number };
+      // ONE document, pretty-printed like add --git's and the success one.
+      expect(r.out).toBe(`${JSON.stringify(doc, null, 2)}\n`);
+      expect(Object.keys(doc)).toEqual(["ok", "error", "exitCode"]);
+      expect(doc.ok).toBe(false);
+      expect(doc.exitCode).toBe(1);
+      expect(doc.error).toContain('added as "github-enterprise"');
+      // The document's message is the stderr line, not a different wording.
+      expect(r.err).toContain(doc.error);
+    }
     expect(preview.err).toContain('added as "github-enterprise"');
     expect(real.err).toContain('added as "github-enterprise"');
   });
@@ -4231,5 +4240,159 @@ describe("runAdd -- a custom add over a stored entry [full-pass 2026-10-03]", ()
     });
     expect(r.exitCode).toBe(1);
     expect(io.errText()).toMatch(/needs the following env var/);
+  });
+});
+
+// Every --json failure of a catalog, --command or --url add leaves ONE
+// {ok:false,error,exitCode} document on stdout -- the document `add --git`'s
+// fail() always printed, pretty-printed the same way. Until this changed
+// these paths printed stderr text only and left stdout EMPTY, which a script
+// piping `add --json` into a parser could not tell from a quiet success.
+describe("runAdd --json failures print one {ok:false} document [J-json]", () => {
+  type Doc = { ok: boolean; error: string; exitCode: number };
+
+  async function addJson(
+    opts: Partial<Parameters<typeof runAdd>[0]>,
+  ): Promise<{ exitCode: number; out: string; err: string; doc: Doc }> {
+    const io = captureIO();
+    const r = await runAdd({
+      json: true,
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      fetchCatalog,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+      ...opts,
+    });
+    const out = io.text();
+    const doc = JSON.parse(out) as Doc;
+    // Exactly one document, in add --git's (and the success document's)
+    // pretty layout, with exactly these three fields.
+    expect(out).toBe(`${JSON.stringify(doc, null, 2)}\n`);
+    expect(Object.keys(doc)).toEqual(["ok", "error", "exitCode"]);
+    expect(doc.ok).toBe(false);
+    expect(doc.exitCode).toBe(r.exitCode);
+    return { exitCode: r.exitCode, out, err: io.errText(), doc };
+  }
+
+  it.each([
+    ["an invalid catalog slug", { slug: "Bad_Slug" }, 2, 'invalid slug "Bad_Slug"'],
+    ["an invalid custom name", { slug: "Bad_Name", command: "node x.js" }, 2, 'invalid name "Bad_Name"'],
+    ["a --url with no scheme", { slug: "rem", url: "example.com/mcp" }, 2, "include the scheme"],
+    ["a non-http --url", { slug: "rem", url: "ftp://example.com/mcp" }, 2, 'url must be http or https, got "ftp:"'],
+    ["a --command with no executable", { slug: "loc", command: "   " }, 2, "--command had no executable in it."],
+    ["an unknown catalog slug", { slug: "no-such-server" }, 1, "no-such-server"],
+  ] as const)("%s", async (_label, opts, exitCode, fragment) => {
+    const r = await addJson(opts);
+    expect(r.exitCode).toBe(exitCode);
+    expect(r.doc.error.startsWith("yaw-mcp add: ")).toBe(true);
+    expect(r.doc.error).toContain(fragment);
+    // The stderr text is unchanged: the same line the document carries.
+    expect(r.err).toContain(r.doc.error);
+  });
+
+  it("a catalog fetch failure", async () => {
+    const r = await addJson({
+      slug: "fetch",
+      fetchCatalog: async () => {
+        throw new Error("catalog offline");
+      },
+    });
+    expect(r.exitCode).toBe(1);
+    expect(r.doc.error).toContain("yaw-mcp add: ");
+    expect(r.err).toContain(r.doc.error);
+  });
+
+  it("the required-env gate: one document summing up the multi-line stderr refusal", async () => {
+    const r = await addJson({ slug: "tailscale" });
+    expect(r.exitCode).toBe(1);
+    expect(r.doc.error).toMatch(
+      /^yaw-mcp add: Tailscale needs the following env var\(s\) before it can run: TAILSCALE_API_KEY\./,
+    );
+    // stderr keeps its own multi-line form, re-run hint included.
+    expect(r.err).toContain("Provide them with --env KEY=value (repeatable) or your shell, then re-run:");
+    expect(r.err).toContain("yaw-mcp add tailscale --env TAILSCALE_API_KEY=...");
+  });
+
+  it("an unreadable bundles.json on the real write", async () => {
+    writeUserBundlesRaw("{ this is not json");
+    const r = await addJson({ slug: "fetch" });
+    expect(r.exitCode).toBe(1);
+    expect(r.doc.error).toContain("could not be parsed");
+    expect(r.err).toContain(r.doc.error);
+  });
+
+  it("an unreadable bundles.json on a dry run", async () => {
+    writeUserBundlesRaw("{ this is not json");
+    const r = await addJson({ slug: "fetch", dryRun: true });
+    expect(r.exitCode).toBe(1);
+    expect(r.doc.error).toContain("could not be parsed");
+  });
+
+  it("without --json a failure still leaves stdout empty", async () => {
+    const io = captureIO();
+    const r = await runAdd({
+      slug: "Bad_Slug",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      fetchCatalog,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(2);
+    expect(io.text()).toBe("");
+    expect(io.errText()).toContain('invalid slug "Bad_Slug"');
+  });
+
+  it("a rejection before anything reached stdout still leaves one document, then rejects", async () => {
+    // index.ts's dispatcher turns the rejection into `yaw-mcp add: <msg>` on
+    // stderr and exit 1; stdout must carry the matching document first.
+    const out: string[] = [];
+    await expect(
+      runAdd({
+        slug: "Bad_Slug",
+        json: true,
+        home: synthHome,
+        cwd: synthCwd,
+        env: {},
+        fetchCatalog,
+        out: (s) => out.push(s),
+        err: () => {
+          throw new Error("stderr is gone");
+        },
+      }),
+    ).rejects.toThrow("stderr is gone");
+    const doc = JSON.parse(out.join("")) as Doc;
+    expect(doc).toEqual({ ok: false, error: "yaw-mcp add: stderr is gone", exitCode: 1 });
+  });
+
+  it("a rejection AFTER the success document adds no second document", async () => {
+    // Success prints its document, then post-write notes on stderr; a throw
+    // there must not append an {ok:false} document to the {ok:true} one.
+    const out: string[] = [];
+    let errCalls = 0;
+    const settled = await runAdd({
+      slug: "fetch",
+      json: true,
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      fetchCatalog,
+      out: (s) => out.push(s),
+      err: () => {
+        errCalls++;
+        throw new Error("stderr is gone");
+      },
+    }).then(
+      () => "resolved",
+      () => "rejected",
+    );
+    const doc = JSON.parse(out.join("")) as { ok: boolean };
+    expect(doc.ok).toBe(true);
+    // Only meaningful if stderr was actually written after the document.
+    expect(errCalls).toBeGreaterThan(0);
+    expect(settled).toBe("rejected");
   });
 });

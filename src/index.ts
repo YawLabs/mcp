@@ -95,8 +95,17 @@ function dispatch(cmd: string, p: Promise<{ exitCode: number } | number>): void 
 }
 
 /** Parse result shape shared by every subcommand parser below. `help` is
- *  absent on the parsers that have no --help of their own. */
-type ParseResult<T> = { ok: true; options: T } | { ok: false; error: string; help?: boolean };
+ *  absent on the parsers that have no --help of their own. `jsonError` is the
+ *  plain message for the --json stdout document, for a parser whose `error`
+ *  is itself already JSON (secrets): without it the document would carry a
+ *  JSON string inside its `error` field. */
+type ParseResult<T> = { ok: true; options: T } | { ok: false; error: string; help?: boolean; jsonError?: string };
+
+/** How run() lays out the --json argv-error document. "pretty" (2-space
+ *  indent) is the shared default and matches the {ok:false} document `add`,
+ *  `call` and `update` print for their runtime failures; "compact" is for a
+ *  command whose every other --json envelope is one line (secrets). */
+type JsonDocumentStyle = "pretty" | "compact";
 
 /**
  * The parse-then-dispatch tail every `{ok}`-shaped subcommand shares: a
@@ -116,6 +125,7 @@ function run<T>(
   cmd: string,
   parsed: ParseResult<T>,
   runner: (options: T) => Promise<{ exitCode: number } | number>,
+  jsonStyle: JsonDocumentStyle = "pretty",
 ): void {
   if (!parsed.ok) {
     if (parsed.help || !process.argv.includes("--json")) {
@@ -129,7 +139,8 @@ function run<T>(
     // exit code stays 2. Detected from argv rather than the parsed options
     // because a parser that rejected `--json` itself (or one that never
     // consumes it) must still be able to report in kind.
-    process.stdout.write(`${JSON.stringify({ ok: false, error: parsed.error, exitCode: 2 }, null, 2)}\n`);
+    const doc = { ok: false, error: parsed.jsonError ?? parsed.error, exitCode: 2 };
+    process.stdout.write(`${jsonStyle === "compact" ? JSON.stringify(doc) : JSON.stringify(doc, null, 2)}\n`);
     process.stderr.write(`${parsed.error}\n`);
     process.exitCode = 2;
     return;
@@ -172,7 +183,8 @@ const clientEnvForVerb = (): ReturnType<typeof readClientEnv> => readClientEnv(p
 // logger.ts, because only the dispatcher knows which of the two this process
 // is. Structured records stop being written as raw JSON envelopes over the
 // command's own report; warnings and errors survive as plain sentences, and
-// LOG_LEVEL still restores the exact structured stream for support.
+// YAW_MCP_LOG_LEVEL (not the unprefixed LOG_LEVEL, which only sets the level)
+// restores the exact structured stream for support.
 if (subcommand !== undefined) setLogSurface("cli");
 
 if (subcommand === "compliance") {
@@ -267,13 +279,12 @@ if (subcommand === "compliance") {
     runImport({ ...options, claudeConfigDir: clientEnv.claudeConfigDir, clientEnv }),
   );
 } else if (subcommand === "call") {
-  // KNOWN INCONSISTENCY, left as is: `call --json` has two stdout contracts.
-  // run() above writes an {ok:false,error,exitCode} document for an ARGV
-  // error under --json, while runCall keeps stdout for the tool's result only
-  // -- its own failures (bad JSON arguments, unknown server or tool, a policy
-  // refusal, a connect failure) are stderr-only with zero stdout bytes, and
-  // success is the raw MCP envelope, which has no `ok` field. Making them one
-  // contract changes a JSON shape either way, so it is the owner's call.
+  // Under --json every failure leaves ONE {ok:false,error,exitCode} document
+  // on stdout, in run()'s pretty layout: run() above writes it for an argv
+  // error, and runCall writes it for its own (bad JSON arguments, unknown
+  // server or tool, a policy refusal, a connect failure, a rejection). A tool
+  // that answers with isError is not one of those: its stdout is the raw MCP
+  // envelope, as on success (no `ok` field; isError:true, exit 1).
   run("call", parseCallArgs(process.argv.slice(3)), runCall);
 } else if (subcommand === "search") {
   run("search", parseSearchArgs(process.argv.slice(3)), runSearch);
@@ -294,7 +305,10 @@ if (subcommand === "compliance") {
   // contract at the top of status-cmd.ts.
   run("status", parseStatusArgs(process.argv.slice(3)), runStatus);
 } else if (subcommand === "secrets") {
-  run("secrets", parseSecretsArgs(process.argv.slice(3)), runSecrets);
+  // Compact: every other `secrets --json` envelope is one line, and the parser
+  // hands the plain message over as `jsonError` (its `error` is the stderr
+  // envelope), so stdout reads {"ok":false,"error":"<message>","exitCode":2}.
+  run("secrets", parseSecretsArgs(process.argv.slice(3)), runSecrets, "compact");
 } else if (subcommand === "trust") {
   run("trust", parseTrustArgs(process.argv.slice(3)), runTrust);
 } else if (subcommand === "--help" || subcommand === "-h" || subcommand === "help") {
@@ -652,10 +666,11 @@ if (subcommand === "compliance") {
     YAW_MCP_FOUNDRY               Set to \`1\` to OPT IN to harvesting dispatch
                                traces to ~/.yaw-mcp/foundry.jsonl for routing
                                evals (default: off). Only a redacted, SORTED
-                               token bag plus the candidate/chosen namespaces
-                               are written -- never the raw intent -- but
-                               ordinary words survive, so do not enable it on
-                               intents that carry names or other PII.
+                               token bag plus the chosen (ranked) and loaded
+                               (served) namespaces are written -- never the
+                               raw intent -- but ordinary words survive, so
+                               do not enable it on intents that carry names
+                               or other PII.
     YAW_MCP_READONLY_DIAGNOSTICS  Set to \`1\` to make \`doctor\` and \`bundles\`
                                write nothing, for a caller that runs them in
                                the background: expired \`yaw-mcp try\` trials
@@ -665,6 +680,12 @@ if (subcommand === "compliance") {
                                (default: off; \`status\` never writes).
     YAW_MCP_CATALOG_URL          Override the catalog \`add\`/\`try\` resolve slugs
                                against (default https://yaw.sh/data/mcp-catalog.json).
+    YAW_MCP_LOG_LEVEL             Same values as LOG_LEVEL (below), and wins
+                               over it when both are set. Also makes
+                               subcommands (\`list\`, \`doctor\`, ...) print the
+                               server's JSON log lines on stderr instead of
+                               plain warnings. An unrecognized value is
+                               ignored, as for LOG_LEVEL.
 
   Environment variables without the YAW_MCP_ prefix (they name things yaw-mcp
   does not own):
@@ -784,10 +805,15 @@ if (subcommand === "compliance") {
                                handled as outside Yaw.
     LOG_LEVEL                     Verbosity of yaw-mcp's own JSON log lines on
                                stderr: \`debug\` | \`info\` | \`warn\` | \`error\`
-                               (default info). \`debug\` is what to set when
-                               asking why a server did not load. Setting it
-                               also makes subcommands print these JSON lines
-                               instead of plain warnings.
+                               (default info). For the server (the client's
+                               log), \`debug\` is what to set when asking why
+                               a server did not load. Subcommands drop debug
+                               and info lines under LOG_LEVEL alone and keep
+                               printing plain \`yaw-mcp: warning:\` lines, so
+                               there it can only raise the threshold (warn,
+                               error); for a subcommand's debug lines (\`call\`,
+                               \`add --git\`, \`try\` start failures) set
+                               YAW_MCP_LOG_LEVEL=debug.
     npm_config_prefix             npm's own global prefix, as npm exports it
                                into every \`npm run\` / \`npx\` child. When set,
                                a copy of yaw-mcp running under

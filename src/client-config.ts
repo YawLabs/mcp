@@ -453,19 +453,17 @@ export interface ImportView {
    *  headers, type, description. A client-specific key belongs in
    *  `discardedKeys`, not here. */
   entry: Record<string, unknown>;
-  // The three below are REPORTED by a `forImport` hook and NOT YET ACTED ON:
-  // `import` reads `entry` alone (the `importViewOf(...).entry` call in
-  // import-cmd.ts). So today a server its client stores switched off imports
-  // ACTIVE, a `skipReason` skips nothing, and a discarded key is dropped
-  // without being named. Each doc says what the field is for, not what
-  // happens.
-  /** The client stores this server switched OFF. Meant to import inactive. */
+  // The three below are reported by a `forImport` hook and acted on by
+  // `import` (runImport in import-cmd.ts).
+  /** The client stores this server switched OFF. `import` writes it with
+   *  `"isActive": false` and says how to turn it on. */
   disabled?: boolean;
   /** Not importable at all, in the client's own terms ("Zed resolves it
-   *  through an extension"). Meant for the importer's skipped list. */
+   *  through an extension"). `import` skips the server by name with this
+   *  reason, on its skipped list. */
   skipReason?: string;
-  /** Keys the destination cannot hold, named so the importer CAN say what it
-   *  dropped. */
+  /** Keys the destination cannot hold. `import` names each one in a warning
+   *  beside its env/headers discard notes. */
   discardedKeys?: string[];
 }
 

@@ -9,12 +9,18 @@
 // covered server with the default namespace gets the hint with no
 // configuration -- but it does NOT cover the whole catalog. Measured
 // 2026-11-11 against https://yaw.sh/data/mcp-catalog.json (generated
-// 2026-10-16, 85 servers): 35 rows derive a namespace with no key here.
-// Some of those name a real CLI (terraform, vault, consul, docker, mysql,
-// redis, azure, digitalocean, ansible) and get no hint from this table; the
-// rest (datadog, zendesk, salesforce, pagerduty, ...) lack the EMPTY entry
-// described below. An unregistered namespace falls through to the tool-name
-// heuristic, which can only ever answer with a prefix in KNOWN_CLI_PREFIXES.
+// 2026-10-16, 85 servers): 24 rows derive a namespace with no key here (35
+// before the rows for docker, mysql, redis x2, bigquery, azure, digitalocean,
+// vault, consul, terraform-cwd and ansible). The 24 are left out on purpose:
+// none clearly wraps one well-known CLI. Most are API services with no CLI to
+// prefer over (datadog, zendesk, asana, pinecone, ...); a few have a CLI the
+// server does not clearly stand in for (HashiCorp's terraform server works
+// against the Registry and HCP, not a working directory; clickhouse's client
+// binary has two spellings; databricks, snowflake, salesforce, auth0 and
+// huggingface overlap their vendor CLI only in part). None carries the EMPTY
+// entry described below either. An unregistered namespace falls through to
+// the tool-name heuristic, which can only ever answer with a prefix in
+// KNOWN_CLI_PREFIXES.
 // Nothing ENFORCES coverage either: the catalog is generated outside this
 // repo, no slug list is vendored here, and no test diffs the two -- so
 // re-measure against the live catalog before relying on any count here.
@@ -84,6 +90,7 @@ const NAMESPACE_REGISTRY: Record<string, readonly CliShadow[]> = {
   puppeteer: EMPTY,
   electron: EMPTY,
   sentry: [{ cli: "sentry-cli" }],
+  docker: [{ cli: "docker" }],
 
   // —— npm / package registries ——————————————————————————————————
   npmjs: [
@@ -106,6 +113,13 @@ const NAMESPACE_REGISTRY: Record<string, readonly CliShadow[]> = {
   mongodb: [{ cli: "mongosh" }, { cli: "mongodump" }],
   mongo: [{ cli: "mongosh" }],
   supabase: [{ cli: "supabase" }],
+  mysql: [{ cli: "mysql" }],
+  // Two catalog servers derive `redis` (Redis's own and @yawlabs/redis-mcp,
+  // both named "Redis"); `redis-yawlabs` is the second one's slug.
+  redis: [{ cli: "redis-cli" }],
+  "redis-yawlabs": [{ cli: "redis-cli" }],
+  bigquery: [{ cli: "bq", subcommands: ["query", "ls", "show"] }],
+  bq: [{ cli: "bq", subcommands: ["query", "ls", "show"] }],
 
   // —— Infra / ops ————————————————————————————————————————————
   tailscale: [{ cli: "tailscale" }],
@@ -122,6 +136,20 @@ const NAMESPACE_REGISTRY: Record<string, readonly CliShadow[]> = {
   awsknowledge: EMPTY,
   awspricing: EMPTY,
   grafana: EMPTY,
+  azure: [{ cli: "az" }],
+  az: [{ cli: "az" }],
+  digitalocean: [{ cli: "doctl" }],
+  doctl: [{ cli: "doctl" }],
+  vault: [{ cli: "vault" }],
+  consul: [{ cli: "consul" }],
+  // terraform-cwd answers what these read-only subcommands would (`state
+  // list`, `show -json`, `providers schema -json`); it never plans or applies. HashiCorp's own `terraform`
+  // server is deliberately absent: per its catalog entry it searches the
+  // Registry and drives HCP Terraform workspaces and runs over the API, not a
+  // local working directory, so which `terraform` call it replaces is unclear.
+  "terraform-cwd": [{ cli: "terraform", subcommands: ["state", "show", "providers"] }],
+  terraformcwd: [{ cli: "terraform", subcommands: ["state", "show", "providers"] }],
+  ansible: [{ cli: "ansible-doc" }, { cli: "ansible-inventory" }, { cli: "ansible-config" }],
 
   // —— YawLabs tools —————————————————————————————————————————
   ctxlint: [{ cli: "ctxlint" }],
@@ -276,7 +304,7 @@ export function resolveShadowedClis(server: Pick<UpstreamServerConfig, "namespac
  *  into `ShadowHit.namespaces` (doctor-cmd.ts), so a single `.sort()` on a
  *  hit would reorder the shared array in place for the rest of the process.
  *  Copying keeps the build-once cache (the actual win) and drops the
- *  aliasing (the hazard); the index is ~30 keys of short arrays, so the
+ *  aliasing (the hazard); the index is ~40 keys of short arrays, so the
  *  per-call copy is noise. Deliberately still a mutable `Map<string,
  *  string[]>` rather than a ReadonlyMap: callers do their own sorting, and
  *  the copy protects the cache without pushing `readonly` through them.
@@ -318,10 +346,13 @@ export function cliToNamespaces(): Map<string, string[]> {
  *  decision; do not derive this table from NAMESPACE_REGISTRY.
  *
  *  Note the two tiers, easy to conflate: NAMESPACE_REGISTRY is the only one
- *  the doctor reverse index (cliToNamespaces) can report from. docker, redis,
- *  heroku and flyctl appear ONLY in KNOWN_CLI_PREFIXES, which feeds the
- *  tool-name-prefix heuristic -- they have no registry entry, so they can
- *  never surface as a shadow hit and are not candidates here either. */
+ *  the doctor reverse index (cliToNamespaces) can report from. heroku, flyctl
+ *  and the bare `redis` prefix appear ONLY in KNOWN_CLI_PREFIXES, which feeds
+ *  the tool-name-prefix heuristic -- no registry entry names them as a CLI
+ *  (the redis rows name `redis-cli`), so they can never surface as a shadow
+ *  hit and are not candidates here either. docker, redis-cli, terraform and
+ *  the ansible-* CLIs DO have registry rows now, and still no entry here:
+ *  being shadowed does not make a CLI an install target. */
 export const SHADOW_INSTALL_TARGETS: Record<string, { package: string; namespace: string; name: string }> = {
   aws: { package: "@yawlabs/aws-mcp", namespace: "aws", name: "AWS" },
   caddy: { package: "@yawlabs/caddy-mcp", namespace: "caddy", name: "Caddy" },

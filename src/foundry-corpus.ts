@@ -6,7 +6,9 @@
 //   It is a BM25-FLOOR REGRESSION gate, not a correctness oracle. Each entry
 //   is a real (redacted token bag -> chosen server) pair, where `chosen` is
 //   the server the FULL pipeline (BM25 + health + learning + sampling
-//   tiebreak) actually routed to. The gate asserts that the BM25-only floor still ranks
+//   tiebreak) ranked first -- its pick, even when that server then failed to
+//   start and a runner-up served the call (the trace's `loaded` names that
+//   one; the corpus does not use it). The gate asserts that the BM25-only floor still ranks
 //   `chosen` in its top-K on those real intents -- i.e. a change to BM25
 //   weights/tokenization doesn't drop real-world choices out of contention.
 //   It does NOT claim `chosen` was the objectively correct server; richer
@@ -42,16 +44,24 @@ export const FOUNDRY_TOP3_FLOOR = 0.7;
 // state), but nothing ever read it back, so it was dropped from the write.
 // A line left over from an older harvest may still carry the key -- parsing
 // ignores unknown keys, so such a file folds into a corpus unchanged.
+//
+// `loaded` (the namespace that actually served the dispatch, null when
+// nothing loaded) is newer than `chosen`: a line harvested before it existed
+// has no such key and parses with `loaded` undefined, meaning "not
+// recorded". The corpus still folds on `chosen` -- the ranker's pick is what
+// the BM25 floor is measured against -- so an old harvest folds exactly as
+// it always did.
 export interface HarvestedTrace {
   tokens: string[];
   chosen: string;
+  loaded?: string | null;
   redactedCount?: number;
 }
 
 export interface FoundryCorpusEntry {
   // Redacted, sorted token bag (order already destroyed at harvest time).
   tokens: string[];
-  // The namespace the full pipeline routed this intent to.
+  // The namespace the full pipeline ranked first for this intent.
   chosen: string;
   // How many harvested traces collapsed into this entry (same tokens+chosen).
   weight: number;
@@ -66,6 +76,9 @@ export interface FoundryCorpus {
 
 // Parse a foundry.jsonl blob into traces. Skips blank/garbage lines (the file
 // is append-only telemetry; a torn final line must not abort the whole parse).
+// A row without `loaded` (written before the field existed) is accepted with
+// `loaded` left undefined; a `loaded` that is neither a string nor null is
+// dropped from the row rather than costing the row.
 export function parseTraceLines(text: string): HarvestedTrace[] {
   const out: HarvestedTrace[] = [];
   for (const line of text.split("\n")) {
@@ -74,7 +87,11 @@ export function parseTraceLines(text: string): HarvestedTrace[] {
     try {
       const obj = JSON.parse(trimmed);
       if (obj && Array.isArray(obj.tokens) && typeof obj.chosen === "string") {
-        out.push(obj as HarvestedTrace);
+        const trace = obj as HarvestedTrace;
+        if (trace.loaded !== undefined && trace.loaded !== null && typeof trace.loaded !== "string") {
+          delete trace.loaded;
+        }
+        out.push(trace);
       }
     } catch {
       // Skip an unparseable line rather than fail the export.

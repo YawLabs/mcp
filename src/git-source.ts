@@ -425,8 +425,15 @@ export interface ResolvedRef {
 }
 
 /** `needsConsent`: refused only because nothing could ask to run the repo's
- *  scripts; --yes is the remedy, not a fix to the repo. */
-export type GitFailure = { ok: false; exitCode: 1 | 2; message: string; needsConsent?: true };
+ *  scripts; --yes is the remedy, not a fix to the repo. `cancelled`: the user
+ *  pressed Ctrl+C at the consent prompt (exit code 130); the command stops. */
+export type GitFailure = {
+  ok: false;
+  exitCode: 1 | 2 | 130;
+  message: string;
+  needsConsent?: true;
+  cancelled?: true;
+};
 
 /** What one `git ls-remote --symref` advertises: every head and tag (an
  *  annotated tag also under `<tag>^{}`, naming its commit) and HEAD's target. */
@@ -1223,6 +1230,11 @@ export interface GitBuildRequest {
   /** The bundles.json that will pin the result, recorded in refs.json so GC
    *  and remove keep the build while that file still pins it. */
   pinFile?: string;
+  /** What a failed install or build says it left behind, in place of the
+   *  default "Nothing was changed[; the previous build still runs]." -- for a
+   *  caller that already changed something first (update --to deletes a build
+   *  made for another machine before rebuilding it). */
+  unchanged?: string;
 }
 
 export interface GitBuildContext {
@@ -1239,8 +1251,11 @@ export interface GitBuildContext {
   platform?: NodeJS.Platform;
   progress: (line: string) => void;
   warn: (line: string) => void;
-  /** Ask the consent question (TTY only). The lines are the screen to show. */
-  confirm?: (lines: string[]) => Promise<boolean>;
+  /** Ask the consent question (TTY only). The lines are the screen to show.
+   *  true runs the scripts; false declines (exit 1, nothing built);
+   *  "cancelled" is Ctrl+C (exit 130, `cancelled: true`). Every command passes
+   *  git-consent-prompt.ts's scriptConsentConfirm. */
+  confirm?: (lines: string[]) => Promise<boolean | "cancelled">;
   runPm?: (args: string[], cwd: string, opts: RunNpmOptions) => Promise<number>;
   resolveToken?: (name: string) => Promise<string>;
   /** A context prepareGit already built (the caller ran ls-remote with it). */
@@ -1516,7 +1531,13 @@ async function buildLocked(
   let work = directDir ?? join(root, `.tmp-${randomBytes(6).toString("hex")}`);
   let step = "clone";
   // `record` is off for a refusal: nothing failed to build, so no `.failed`.
-  const fail = async (exitCode: 1 | 2, message: string, tail = "", suffix = "", record = true): Promise<GitFailure> => {
+  const fail = async (
+    exitCode: 1 | 2 | 130,
+    message: string,
+    tail = "",
+    suffix = "",
+    record = true,
+  ): Promise<GitFailure> => {
     if (tryRemoveTree(work, warn) && dirname(work) !== root) {
       try {
         // The namespace directory this build created, if nothing else is in it.
@@ -1696,7 +1717,11 @@ async function buildLocked(
         );
         return { ...refused, needsConsent: true };
       }
-      if (!(await ctx.confirm(lines))) return fail(1, "Aborted; nothing was built.", "", "", false);
+      const consent = await ctx.confirm(lines);
+      if (consent === "cancelled") {
+        return { ...(await fail(130, "Cancelled; nothing was built.", "", "", false)), cancelled: true };
+      }
+      if (!consent) return fail(1, "Aborted; nothing was built.", "", "", false);
     }
     await recordRepoConsent(req.spec.url, ctx.home, ctx.now?.());
   }
@@ -1723,9 +1748,11 @@ async function buildLocked(
     `${pmCmd.label} ${args.filter((a) => a !== "--no-audit" && a !== "--no-fund").join(" ")}`;
   const sha7 = commit.slice(0, 7);
   const built = commit;
-  const unchanged = keptBuilds(namespace, ctx.home).some((k) => k.marker.commit !== built)
-    ? "Nothing was changed; the previous build still runs."
-    : "Nothing was changed.";
+  const unchanged =
+    req.unchanged ??
+    (keptBuilds(namespace, ctx.home).some((k) => k.marker.commit !== built)
+      ? "Nothing was changed; the previous build still runs."
+      : "Nothing was changed.");
 
   step = "install";
   t = Date.now();
@@ -1816,8 +1843,11 @@ async function buildLocked(
 // --- building pinned entries (sidecars install, trust) ------------------------
 
 /** "needs-consent": not built because the repo's scripts were never allowed
- *  to run here and nothing could ask; a build that ran and broke is "failed". */
-export type GitEntryStatus = "built" | "ready" | "failed" | "refused" | "needs-consent";
+ *  to run here and nothing could ask; a build that ran and broke is "failed".
+ *  "cancelled": Ctrl+C at the consent prompt -- always the LAST report, since
+ *  the entries after it are not attempted, and only on a TTY (so never in a
+ *  --json document, which nothing is asked under). */
+export type GitEntryStatus = "built" | "ready" | "failed" | "refused" | "needs-consent" | "cancelled";
 
 export interface GitEntryReport {
   namespace: string;
@@ -1883,6 +1913,10 @@ export async function buildPinnedGitEntries(
     if (res.ok) {
       ctx.progress(`${ns} ready (${commit.slice(0, 7)}).`);
       reports.push({ namespace: ns, commit, status: res.reused ? "ready" : "built", error: null });
+    } else if (res.cancelled) {
+      // The user left: build nothing more.
+      reports.push({ namespace: ns, commit, status: "cancelled", error: asciiLines(res.message) });
+      break;
     } else {
       reports.push({
         namespace: ns,
@@ -2068,6 +2102,47 @@ export async function recordGitPin(
   }
   try {
     await writePinRecord(namespace, file, commit, home, warn);
+  } finally {
+    release();
+  }
+}
+
+/**
+ * Drop the record that `file` pins `commit` of `namespace`, when refs.json
+ * still says exactly that: a build recorded for a file that then did not pin
+ * it (an update whose new build failed its start check, for an entry with no
+ * commit pinned). Under the git lock, like recordGitPin; a busy lock, an
+ * unreadable or corrupt refs.json, or a record naming another commit leaves
+ * the file as it is -- the record is a hint, and GC derives what is live from
+ * the files themselves.
+ */
+export async function forgetGitPin(
+  namespace: string,
+  file: string,
+  commit: string,
+  home: string,
+  warn: (line: string) => void = () => {},
+  opts: { waitMs?: number } = {},
+): Promise<void> {
+  if (!NAMESPACE_RE.test(namespace) || !GIT_COMMIT_RE.test(commit)) return;
+  if (!existsSync(gitCheckoutDir(namespace, home))) return;
+  const key = resolve(file);
+  const known = readRefs(namespace, home);
+  if (known.kind !== "ok" || known.refs[key] !== commit) return;
+  const release = await acquireGitLockWithin(gitRoot(home), opts.waitMs ?? GIT_PIN_LOCK_WAIT_MS);
+  if (release === null) {
+    log("debug", "Skipped dropping a git pin record: the git lock stayed busy", { namespace, file, commit });
+    return;
+  }
+  try {
+    const read = readRefs(namespace, home);
+    if (read.kind !== "ok" || read.refs[key] !== commit) return;
+    const { [key]: _dropped, ...rest } = read.refs;
+    await writeRefs(namespace, home, rest);
+  } catch (e) {
+    warn(
+      `could not drop the record that ${file} uses build ${commit.slice(0, 7)} of ${namespace}: ${(e as Error).message}`,
+    );
   } finally {
     release();
   }

@@ -117,9 +117,12 @@ describe("runFoundryExport", () => {
 
   it("writes a corpus from injected traces + server catalog", async () => {
     const out = join(dir, "corpus.json");
+    // A mixed harvest: rows written before `loaded` existed, and a current row
+    // whose pick (github) failed to start and was served by slack. The
+    // corpus folds on `chosen` either way.
     const blob = [
       JSON.stringify({ tokens: ["issue", "pull"], chosen: "github" }),
-      JSON.stringify({ tokens: ["pull", "issue"], chosen: "github" }), // dedups -> weight 2
+      JSON.stringify({ tokens: ["pull", "issue"], chosen: "github", loaded: "slack" }), // dedups -> weight 2
       JSON.stringify({ tokens: ["message", "channels"], chosen: "slack" }),
     ].join("\n");
     const r = await runFoundryExport({

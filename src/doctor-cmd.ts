@@ -17,25 +17,35 @@
 // no lock around that write, so it carries the same TOCTOU class as any
 // other config mutation. The sweep is best-effort: any failure is swallowed
 // and never aborts the diagnostic. The config load also runs the pre-0.12
-// legacy-path migration (a mkdir + rename; see migrate.ts).
+// legacy-path migration (a mkdir + rename; see migrate.ts). And each registry
+// answer doctor fetches is stored in ~/.yaw-mcp/registry-cache.json (see
+// Network below).
 //
-// YAW_MCP_READONLY_DIAGNOSTICS=1 turns BOTH writes off, for a caller that runs
-// doctor in the background (Yaw Terminal's MCP panel, on every refresh): the
-// trials are still scanned, and each expired one is reported as not swept --
-// a warning, with the command that sweeps it -- and a legacy config file the
-// migration would have moved is reported the same way instead of moved. See
-// isReadOnlyDiagnostics (config-loader.ts). Unset, nothing here changes.
+// YAW_MCP_READONLY_DIAGNOSTICS=1 turns ALL THREE writes off, for a caller that
+// runs doctor in the background (Yaw Terminal's MCP panel, on every refresh):
+// the trials are still scanned, and each expired one is reported as not swept
+// -- a warning, with the command that sweeps it -- a legacy config file the
+// migration would have moved is reported the same way instead of moved, and
+// the registry cache is read but never written. See isReadOnlyDiagnostics
+// (config-loader.ts). Unset, nothing here changes.
 //
-// Network: doctor is NOT offline. Every run, text or --json, read-only or
-// not, makes unauthenticated GETs to the public npm registry
+// Network: doctor is NOT offline. A run, text or --json, read-only or not,
+// may make unauthenticated GETs to the public npm registry
 // (registry.npmjs.org): one for @yawlabs/mcp's latest version, and one per
 // sidecar package that bundles.json names AND that is installed in the
 // managed tree (fetchSidecarLatest) -- so those package NAMES, a privately
 // scoped one included, are sent there, and a registry configured in .npmrc is
-// not consulted. Each is bounded by DOCTOR_REGISTRY_TIMEOUT_MS and a failure
-// reads as "unknown". The only gate is registrySkipCheck, which no CLI flag or
-// environment variable sets outside a test run; YAW_MCP_READONLY_DIAGNOSTICS
-// governs the two WRITES above and does not touch these requests.
+// not consulted. Each answer is cached for 24 hours in
+// ~/.yaw-mcp/registry-cache.json (registry-cache.ts), one entry per package:
+// a fresh entry answers with no request at all, so a repeated run inside that
+// window sends nothing, and a newly published version can go unreported for
+// up to a day. A missing, corrupt or expired entry falls through to the GET.
+// "Unknown" is never cached. A read-only run uses the cache but does not
+// write it, so it only saves requests for entries an ordinary run stored --
+// on a machine where only the panel runs doctor, every panel refresh still
+// makes these GETs. Each GET is bounded by DOCTOR_REGISTRY_TIMEOUT_MS and a
+// failure reads as "unknown". The only gate is registrySkipCheck, which no
+// CLI flag or environment variable sets outside a test run.
 //
 // Exit codes:
 //   0  healthy — every config file parsed cleanly and raised no warnings
@@ -173,6 +183,7 @@ import {
   STATE_FILENAME,
   STATE_SCHEMA_VERSION,
 } from "./persistence.js";
+import { cachedRegistryLatest, type RegistryCacheOptions } from "./registry-cache.js";
 import {
   checkVaultPassphrase,
   collectMalformedSecretRefs,
@@ -299,13 +310,16 @@ export interface DoctorOptions {
   err?: (s: string) => void;
   /** Disable the npm registry freshness check (tests, offline use). */
   skipRegistryCheck?: boolean;
-  /** Test hook: return the latest-version string for @yawlabs/mcp. */
+  /** Test hook: return the latest-version string for @yawlabs/mcp. Stands in
+   *  for the request only: the 24 h registry cache under `home` is still
+   *  consulted first and written after (registry-cache.ts), as for the real
+   *  probe, so a fresh cache entry means the hook is never called. */
   registryFetch?: () => Promise<string | null>;
   /** Test hook: return the latest-version string for a managed sidecar
    *  package. Same contract as registryFetch (null = unknown), but keyed by
    *  package -- the managed tree holds several. Like registryFetch, an
    *  explicit hook bypasses the VITEST auto-skip so the stale branches are
-   *  reachable under tests. */
+   *  reachable under tests, and like it, it sits behind the registry cache. */
   sidecarRegistryFetch?: (pkg: string) => Promise<string | null>;
   /** Emit a single JSON blob instead of the human-readable text report. */
   json?: boolean;
@@ -1275,8 +1289,13 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   print(`platform: ${os}`);
   // Only on a read-only run, so an ordinary report is unchanged -- the text
   // counterpart of the --json `readOnly` field.
-  if (readOnly) print(`mode: read-only (${READONLY_DIAGNOSTICS_ENV} is set) -- no trial sweep, no config migration`);
+  if (readOnly) {
+    print(
+      `mode: read-only (${READONLY_DIAGNOSTICS_ENV} is set) -- no trial sweep, no config migration, no registry-cache write`,
+    );
+  }
   print("");
+  const registryCache = registryCacheFor(opts, home, readOnly);
 
   print("CONFIG FILES");
   if (config.loadedFiles.length === 0) {
@@ -1310,7 +1329,7 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
     cwd,
     home,
     probeFn: opts.oamProbe ?? probeOam,
-    sidecarLatest: sidecarLatestFetcher(opts),
+    sidecarLatest: sidecarLatestFetcher(opts, registryCache),
     platform: opts.platform,
   });
   // bundles.json diagnostics (unparseable file, bad schema version, invalid
@@ -1432,11 +1451,9 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   // stale-version warning that depends on an external service must not
   // block the diagnostic. Times out after DOCTOR_REGISTRY_TIMEOUT_MS to keep
   // doctor snappy -- see that constant for why doctor's budget is shorter than
-  // upgrade's. The skip rule itself lives in registrySkipCheck (below).
-  const skipCheck = registrySkipCheck(opts, opts.registryFetch);
-  const latest = skipCheck
-    ? null
-    : await fetchLatestVersion({ timeoutMs: DOCTOR_REGISTRY_TIMEOUT_MS, override: opts.registryFetch });
+  // upgrade's. The skip rule itself lives in registrySkipCheck (below), and a
+  // fresh answer from the 24 h registry cache skips the request (selfLatest).
+  const latest = await selfLatest(opts, registryCache);
   const effectiveVersion = opts.currentVersion ?? VERSION;
   const staleHint = latest && effectiveVersion !== "dev" && compareSemver(effectiveVersion, latest) < 0 ? latest : null;
   if (staleHint) {
@@ -1536,6 +1553,7 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
   // gate in `.warnings` and exits 2 identically. See collectDoctorBase.
   const { cwd, home, appData, os, env, readOnly, timestamp, config, trustProbe, claudeConfigDir, clientEnv } =
     await collectDoctorBase(opts);
+  const registryCache = registryCacheFor(opts, home, readOnly);
 
   // Trial GC + readout, through the same collector as the text path's TRIALS
   // section (collectTrialStatus). On an ordinary run the --json path MUST run
@@ -1720,7 +1738,7 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
     cwd,
     home,
     probeFn: opts.oamProbe ?? probeOam,
-    sidecarLatest: sidecarLatestFetcher(opts),
+    sidecarLatest: sidecarLatestFetcher(opts, registryCache),
     platform: opts.platform,
   });
   // Identical fold to the text path -- a malformed bundles.json must reach
@@ -1782,11 +1800,8 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
   // registrySkipCheck): an explicit registryFetch bypasses the VITEST guard,
   // and currentVersion overrides the build-time VERSION. opts.argvPath is
   // intentionally unused here -- the JSON snapshot's upgrade block carries no
-  // install method.
-  const skipCheck = registrySkipCheck(opts, opts.registryFetch);
-  const latest = skipCheck
-    ? null
-    : await fetchLatestVersion({ timeoutMs: DOCTOR_REGISTRY_TIMEOUT_MS, override: opts.registryFetch });
+  // install method. Same registry cache as the text path (selfLatest).
+  const latest = await selfLatest(opts, registryCache);
   const effectiveVersion = opts.currentVersion ?? VERSION;
   const stale = latest !== null && effectiveVersion !== "dev" && compareSemver(effectiveVersion, latest) < 0;
 
@@ -1880,7 +1895,9 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
 // `mode: read-only` header line and the --json `readOnly` field), and a row
 // here would change every ordinary report: its name is the longest in the
 // table, so it would re-pad every line of the section, and add a key to the
-// --json `env` block, for a run that never set it.
+// --json `env` block, for a run that never set it. YAW_MCP_LOG_LEVEL is a log
+// verbosity/rendering knob, like the unprefixed LOG_LEVEL that this list has
+// never carried, so it stays out too.
 //
 // The lockstep is PINNED, not just asked for: the "env table lockstep with
 // `yaw-mcp --help`" suite in doctor-cmd.test.ts reads the help table straight
@@ -2654,10 +2671,39 @@ export function registrySkipCheck(opts: DoctorOptions, override: unknown): boole
 }
 
 // The gate for the per-sidecar freshness probe, shared by the text and --json
-// paths so the two cannot disagree about whether the check ran.
-function sidecarLatestFetcher(opts: DoctorOptions): ((pkg: string) => Promise<string | null>) | null {
-  const skip = registrySkipCheck(opts, opts.sidecarRegistryFetch);
-  return skip ? null : (opts.sidecarRegistryFetch ?? fetchSidecarLatest);
+// paths so the two cannot disagree about whether the check ran. Behind the
+// gate every package goes through the 24 h registry cache (registry-cache.ts),
+// the test hook included, so a fresh entry answers without a GET.
+function sidecarLatestFetcher(
+  opts: DoctorOptions,
+  cache: RegistryCacheOptions,
+): ((pkg: string) => Promise<string | null>) | null {
+  if (registrySkipCheck(opts, opts.sidecarRegistryFetch)) return null;
+  const fetchOne = opts.sidecarRegistryFetch ?? fetchSidecarLatest;
+  return (pkg) => cachedRegistryLatest(pkg, () => fetchOne(pkg), cache);
+}
+
+/** The npm package doctor checks its own freshness against; the cache key for
+ *  that answer. fetchLatestVersion (upgrade-cmd.ts) hard-codes the same name. */
+const SELF_PACKAGE = "@yawlabs/mcp";
+
+/** The @yawlabs/mcp freshness probe, shared by the text and --json paths: null
+ *  when registrySkipCheck says skip, else the cached answer or, on a miss,
+ *  fetchLatestVersion at doctor's budget. */
+async function selfLatest(opts: DoctorOptions, cache: RegistryCacheOptions): Promise<string | null> {
+  if (registrySkipCheck(opts, opts.registryFetch)) return null;
+  return cachedRegistryLatest(
+    SELF_PACKAGE,
+    () => fetchLatestVersion({ timeoutMs: DOCTOR_REGISTRY_TIMEOUT_MS, override: opts.registryFetch }),
+    cache,
+  );
+}
+
+/** Where and whether the registry cache is used on this run: under the run's
+ *  home, on the run's clock, and written only when the run is not read-only
+ *  (YAW_MCP_READONLY_DIAGNOSTICS promises the diagnostics write nothing). */
+function registryCacheFor(opts: DoctorOptions, home: string, readOnly: boolean): RegistryCacheOptions {
+  return { home, now: opts.now ?? Date.now, write: !readOnly };
 }
 
 /** One git-sourced server as doctor reports it. */

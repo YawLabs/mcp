@@ -523,14 +523,14 @@ const IMPORT_MAPPED = ["enabled", "http_headers"];
  *  importer: HTTP headers are `http_headers` (D1), and a server switched off
  *  is `enabled = false` (D1) rather than the `disabled: true` other clients
  *  use. Every other key that is not one of IMPORT_FIELDS is NAMED in
- *  `discardedKeys`, in the order the entry holds them, so `import` CAN say
- *  what it dropped. The two mapped keys are the exception (see
+ *  `discardedKeys`, in the order the entry holds them, and `import` prints a
+ *  warning for each. The two mapped keys are the exception (see
  *  IMPORT_MAPPED): a non-table `http_headers` is dropped unnamed, and a table
  *  one replaces a stored `headers` key without naming it.
  *
- *  The header mapping takes effect; `disabled` and `discardedKeys` do not yet:
- *  the importer reads `entry` alone, so an `enabled = false` server is
- *  imported active and the discarded keys are not printed. */
+ *  All three take effect: the headers land in the entry, an `enabled = false`
+ *  server is imported `"isActive": false`, and the discarded keys are
+ *  printed. This view never sets `skipReason`. */
 function codexImportView(stored: Record<string, unknown>): ImportView {
   const entry: Record<string, unknown> = {};
   const discarded: string[] = [];

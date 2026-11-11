@@ -1337,6 +1337,79 @@ describe("redactSecretsInOutput", () => {
     expect(err!.stderrTail).not.toContain("***BASE_URL***");
   });
 
+  it("maps a literal DSN whose unencoded password holds a slash or a space", async () => {
+    // An unencoded base64 key holds `/`, and a matcher that stopped the
+    // password at the first `/` or space left both of these readable.
+    const slashDsn = "postgres://app_user:abc/def+ghi==@db.internal:5432/app";
+    const spaceDsn = "redis://cache_user:pass word-9@cache.internal:6379/0";
+    const config = makeLocalConfig({ env: { DATABASE_URL: slashDsn, REDIS_URL: spaceDsn } });
+
+    _sdkBehavior.clientConnect = () => {
+      _sdkBehavior.stderrEmitter?.emit("data", Buffer.from(`connect ${slashDsn} failed; cache ${spaceDsn}`));
+      return Promise.reject(new Error("handshake failed"));
+    };
+
+    let err: ActivationError | undefined;
+    try {
+      await connectToUpstream(config);
+    } catch (e) {
+      err = e as ActivationError;
+    }
+
+    expect(err).toBeInstanceOf(ActivationError);
+    expect(err!.stderrTail).not.toContain("abc/def+ghi==");
+    expect(err!.stderrTail).not.toContain("pass word-9");
+    expect(err!.stderrTail).toContain("***DATABASE_URL***");
+    expect(err!.stderrTail).toContain("***REDIS_URL***");
+  });
+
+  it("keeps a url whose path or query holds an @ readable unless a colon precedes the first slash", async () => {
+    // The password now runs to the LAST `@`, so an `@` in the path or query
+    // is read as a userinfo end. The user half stops at `/`, whitespace or
+    // `:` (not at `?`), so with no `:` before the first `/` there is no
+    // password and the value stays readable. A `:` before the first `/` --
+    // a port, or a colon in the query of a path-less URL -- makes the value
+    // read as `user:PASSWORD@...` and it is redacted: the accepted over-match.
+    const scoped = "https://registry.example.test/@org/mcp";
+    const query = "https://api.example.test/mcp?user=a@b.example";
+    const ported = "https://api.example.test:8443/mcp?user=a@b.example";
+    // The same query colon behind a path is past the first `/`: readable.
+    const pathedColon = "https://api.example.test/mcp?t=12:00&u=a@b.example";
+    const pathless = "https://api.example.test?t=12:00&u=a@b.example";
+    const config = makeLocalConfig({
+      env: {
+        SCOPE_URL: scoped,
+        QUERY_URL: query,
+        PORTED_URL: ported,
+        PATHED_URL: pathedColon,
+        PATHLESS_URL: pathless,
+      },
+    });
+
+    _sdkBehavior.clientConnect = () => {
+      _sdkBehavior.stderrEmitter?.emit(
+        "data",
+        Buffer.from(`a ${scoped} b ${query} d ${pathedColon} c ${ported} e ${pathless}`),
+      );
+      return Promise.reject(new Error("handshake failed"));
+    };
+
+    let err: ActivationError | undefined;
+    try {
+      await connectToUpstream(config);
+    } catch (e) {
+      err = e as ActivationError;
+    }
+
+    expect(err).toBeInstanceOf(ActivationError);
+    expect(err!.stderrTail).toContain(`a ${scoped} b ${query} d ${pathedColon} c `);
+    expect(err!.stderrTail).not.toContain("***SCOPE_URL***");
+    expect(err!.stderrTail).not.toContain("***QUERY_URL***");
+    expect(err!.stderrTail).not.toContain("***PATHED_URL***");
+    expect(err!.stderrTail).toContain("***PORTED_URL***");
+    expect(err!.stderrTail).toContain("***PATHLESS_URL***");
+  });
+
   it("maps a resolved ${secret:} value whatever its env NAME", async () => {
     // The other half of the rule: a vault-sourced value under a bland name
     // (ENDPOINT holding a connection string with the password inline) is a

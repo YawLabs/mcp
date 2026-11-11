@@ -692,7 +692,10 @@ export function installMovedTheTree(result: Pick<SidecarsInstallResult, "exitCod
  *  needed two handlers and a `released` flag to get the same guarantee out of a
  *  child process; one promise gets it for free. It is told whether BOTH npm
  *  steps succeeded (installMovedTheTree): only then is "this package did not
- *  move" a fact about the registry and not about a failed npm run. */
+ *  move" a fact about the registry and not about a failed npm run. The
+ *  judgement and the logging live in runBackgroundRefresh, where a test can
+ *  reach them with the install injected; this is the test-sandbox gate and
+ *  the `finally` only. */
 function defaultSpawnRefresh(stale: SidecarSpec[], onDone: (ok?: boolean) => void, home: string): void {
   if (inUnitTest()) {
     onDone();
@@ -701,56 +704,74 @@ function defaultSpawnRefresh(stale: SidecarSpec[], onDone: (ok?: boolean) => voi
   void (async () => {
     let ok = false;
     try {
-      // The whole `sidecars install` command, run INSIDE the serve process.
-      // backgroundInstallOptions mutes the command's own writers (`out` /
-      // `err`), so its report never reaches the stdio transport -- but the
-      // helpers it calls log through logger.ts (`log(...)`) directly, and
-      // those lines DO reach serve's stderr as ordinary broker records. That
-      // is intended (stderr is the broker's log, not the JSON-RPC stream),
-      // just not obvious from "muted": a line about the sidecars tree that
-      // appears mid-session comes from here.
-      const result = await runSidecarsInstall(backgroundInstallOptions(home));
-      if (result.exitCode === 0 && result.updateError !== null) {
-        // Exit 0 with a failed `npm update`: the tree is usable and nothing in
-        // it moved. NOT `ok` -- see installMovedTheTree -- so nothing is
-        // recorded as unmoved and the next daily check tries again.
-        log(
-          "warn",
-          "yaw-mcp sidecar refresh: npm install succeeded but npm update failed, so no package was moved forward; the next daily check retries. Run `yaw-mcp sidecars install` to see why",
-          { updateError: result.updateError },
-        );
-      } else if (installMovedTheTree(result)) {
-        ok = true;
-        // NOT "restart your MCP client": this writes into the very tree this
-        // process re-spawns servers from, so the next ACTIVATION of a refreshed
-        // server -- which the idle reaper makes a routine mid-session event --
-        // already picks up the new version. Only a server that is loaded right
-        // now keeps the copy it started on, until it is next re-spawned.
-        log("info", "yaw-mcp sidecar refresh complete; the next activation of each server spawns the new version", {
-          refreshed: stale.map((s) => s.pkg),
-          installed: result.installed.map((i) => `${i.pkg}@${i.version ?? "?"}`),
-        });
-        // buildGit:false means a clean refresh is NOT a clean tree: git
-        // servers are never built from `serve`. Name them instead of letting
-        // "complete" read as "everything is ready". One log line, as designed
-        // -- a background task has no other channel, and the remedy is the
-        // command a human can run. The judgement lives in unbuiltGitNote,
-        // which is where a test can reach it; this is the logging only.
-        const note = await unbuiltGitNote(home);
-        if (note !== null) log("info", note.message, { namespaces: note.namespaces });
-      } else {
-        // stdio was ignored, so the underlying npm error is not recoverable
-        // here. Name the manual command rather than pretending to diagnose.
-        log("warn", "yaw-mcp sidecar refresh did not complete; run `yaw-mcp sidecars install` to see why", {
-          exitCode: result.exitCode,
-        });
-      }
-    } catch (err) {
-      log("warn", "yaw-mcp sidecar refresh failed", { error: err instanceof Error ? err.message : String(err) });
+      ok = await runBackgroundRefresh(stale, home);
     } finally {
       onDone(ok);
     }
   })();
+}
+
+/** The body of the background refresh: run `sidecars install` muted and
+ *  decide whether it MOVED the tree (installMovedTheTree), logging the
+ *  outcome. Resolves true only for exit 0 with a successful `npm update`;
+ *  never rejects -- a throw from the install is logged and reads as false.
+ *  `install` is the seam a test injects so this runs without spawning npm;
+ *  production always takes the default. */
+export async function runBackgroundRefresh(
+  stale: SidecarSpec[],
+  home: string,
+  install: (opts: SidecarsInstallOptions) => Promise<SidecarsInstallResult> = runSidecarsInstall,
+): Promise<boolean> {
+  let ok = false;
+  try {
+    // The whole `sidecars install` command, run INSIDE the serve process.
+    // backgroundInstallOptions mutes the command's own writers (`out` /
+    // `err`), so its report never reaches the stdio transport -- but the
+    // helpers it calls log through logger.ts (`log(...)`) directly, and
+    // those lines DO reach serve's stderr as ordinary broker records. That
+    // is intended (stderr is the broker's log, not the JSON-RPC stream),
+    // just not obvious from "muted": a line about the sidecars tree that
+    // appears mid-session comes from here.
+    const result = await install(backgroundInstallOptions(home));
+    if (result.exitCode === 0 && result.updateError !== null) {
+      // Exit 0 with a failed `npm update`: the tree is usable and nothing in
+      // it moved. NOT `ok` -- see installMovedTheTree -- so nothing is
+      // recorded as unmoved and the next daily check tries again.
+      log(
+        "warn",
+        "yaw-mcp sidecar refresh: npm install succeeded but npm update failed, so no package was moved forward; the next daily check retries. Run `yaw-mcp sidecars install` to see why",
+        { updateError: result.updateError },
+      );
+    } else if (installMovedTheTree(result)) {
+      ok = true;
+      // NOT "restart your MCP client": this writes into the very tree this
+      // process re-spawns servers from, so the next ACTIVATION of a refreshed
+      // server -- which the idle reaper makes a routine mid-session event --
+      // already picks up the new version. Only a server that is loaded right
+      // now keeps the copy it started on, until it is next re-spawned.
+      log("info", "yaw-mcp sidecar refresh complete; the next activation of each server spawns the new version", {
+        refreshed: stale.map((s) => s.pkg),
+        installed: result.installed.map((i) => `${i.pkg}@${i.version ?? "?"}`),
+      });
+      // buildGit:false means a clean refresh is NOT a clean tree: git
+      // servers are never built from `serve`. Name them instead of letting
+      // "complete" read as "everything is ready". One log line, as designed
+      // -- a background task has no other channel, and the remedy is the
+      // command a human can run. The judgement lives in unbuiltGitNote,
+      // which is where a test can reach it; this is the logging only.
+      const note = await unbuiltGitNote(home);
+      if (note !== null) log("info", note.message, { namespaces: note.namespaces });
+    } else {
+      // stdio was ignored, so the underlying npm error is not recoverable
+      // here. Name the manual command rather than pretending to diagnose.
+      log("warn", "yaw-mcp sidecar refresh did not complete; run `yaw-mcp sidecars install` to see why", {
+        exitCode: result.exitCode,
+      });
+    }
+  } catch (err) {
+    log("warn", "yaw-mcp sidecar refresh failed", { error: err instanceof Error ? err.message : String(err) });
+  }
+  return ok;
 }
 
 /**

@@ -504,11 +504,14 @@ describe("findProjectConfigDir outside $HOME", () => {
     const cfgDir = join(project, CONFIG_DIRNAME);
     mkdirSync(cfgDir);
     stubGeteuid(999_999_999);
-    // The logger resolves LOG_LEVEL per call, so an operator running the suite
-    // with LOG_LEVEL=error exported emitted zero lines here and failed the
-    // assertion below on an environment setting that has nothing to do with
-    // the dedupe. Pin it. (The describe's afterEach unstubs.)
+    // The logger resolves the level per call (YAW_MCP_LOG_LEVEL, else
+    // LOG_LEVEL), so an operator running the suite with LOG_LEVEL=error
+    // exported emitted zero lines here and failed the assertion below on an
+    // environment setting that has nothing to do with the dedupe. Pin it, and
+    // clear the variable that would win over the pin. (The describe's
+    // afterEach unstubs.)
     vi.stubEnv("LOG_LEVEL", "warn");
+    vi.stubEnv("YAW_MCP_LOG_LEVEL", undefined);
     const written: string[] = [];
     const orig = process.stderr.write.bind(process.stderr);
     process.stderr.write = ((chunk: unknown): boolean => {

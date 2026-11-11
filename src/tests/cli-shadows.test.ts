@@ -7,6 +7,7 @@ import {
   resolveShadowedClis,
   SHADOW_INSTALL_TARGETS,
 } from "../cli-shadows.js";
+import { deriveNamespace } from "../local-bundles.js";
 
 describe("resolveShadowedClis", () => {
   it("returns the registered shadow for a catalog slug", () => {
@@ -52,6 +53,62 @@ describe("resolveShadowedClis", () => {
       expect(resolveShadowedClis({ namespace })).toEqual([]);
       expect(formatShadowLine({ namespace })).toBeNull();
     }
+  });
+
+  it("hints the wrapped CLI for the catalog servers that wrap one, under the namespace an import lands on", () => {
+    // Keyed by the catalog DISPLAY NAME (yaw.sh/data/mcp-catalog.json,
+    // generated 2026-10-16): `yaw-mcp add` and the app both derive the
+    // namespace from the name, so deriveNamespace(name) is the key that has to
+    // be registered for the hint to fire with no configuration. These eleven
+    // catalog servers derived a namespace with no row before.
+    const byCatalogName: Array<[string, string[]]> = [
+      ["Docker", ["docker"]],
+      ["MySQL", ["mysql"]],
+      ["Redis", ["redis-cli"]], // both Redis's own server and @yawlabs/redis-mcp
+      ["BigQuery", ["bq"]],
+      ["Azure", ["az"]],
+      ["DigitalOcean", ["doctl"]],
+      ["Vault", ["vault"]],
+      ["Consul", ["consul"]],
+      ["Terraform CWD", ["terraform"]],
+      ["Ansible", ["ansible-doc", "ansible-inventory", "ansible-config"]],
+    ];
+    for (const [name, clis] of byCatalogName) {
+      const namespace = deriveNamespace(name);
+      expect(
+        resolveShadowedClis({ namespace }).map((s) => s.cli),
+        `${name} -> ${namespace}`,
+      ).toEqual(clis);
+    }
+    // A hyphenated catalog slug that shadows something keeps its own key too
+    // (see the two-keys note in the header), and resolves the same way.
+    expect(resolveShadowedClis({ namespace: "redis-yawlabs" })).toEqual(resolveShadowedClis({ namespace: "redis" }));
+    expect(resolveShadowedClis({ namespace: "terraform-cwd" })).toEqual(
+      resolveShadowedClis({ namespace: "terraformcwd" }),
+    );
+    // CLI-name aliases, for a server renamed on import.
+    expect(resolveShadowedClis({ namespace: "az" })).toEqual([{ cli: "az" }]);
+    expect(resolveShadowedClis({ namespace: "doctl" })).toEqual([{ cli: "doctl" }]);
+    expect(resolveShadowedClis({ namespace: "bq" })).toEqual(resolveShadowedClis({ namespace: "bigquery" }));
+  });
+
+  it("restricts the subcommand hint where the server covers only part of the CLI", () => {
+    // terraform-cwd runs `terraform state list`, `terraform show -json` and
+    // `terraform providers schema -json` and nothing that plans or applies;
+    // the BigQuery server queries and inspects, it does not load or delete.
+    expect(formatShadowLine({ namespace: "terraformcwd" })).toBe(
+      "prefer over local CLI: `terraform` (state, show, providers)",
+    );
+    expect(formatShadowLine({ namespace: "bigquery" })).toBe("prefer over local CLI: `bq` (query, ls, show)");
+    expect(formatShadowLine({ namespace: "docker" })).toBe("prefer over local CLI: `docker`");
+  });
+
+  it("leaves HashiCorp's terraform server unregistered", () => {
+    // It searches the Terraform Registry and drives HCP Terraform over the
+    // API, so "prefer over `terraform`" would send the model away from the
+    // local CLI for work this server cannot do (init, plan, validate).
+    expect(resolveShadowedClis({ namespace: "terraform" })).toEqual([]);
+    expect(formatShadowLine({ namespace: "terraform" })).toBeNull();
   });
 
   it("returns [] for a registered no-CLI service", () => {
@@ -266,8 +323,21 @@ describe("SHADOW_INSTALL_TARGETS / installTargetForCli", () => {
   it("returns undefined for CLIs with no first-party target", () => {
     // These are in NAMESPACE_REGISTRY (so they shadow installed servers)
     // but are deliberately NOT install-nudge targets — we never push
-    // npm/ssh/gh/kubectl/docker unprompted.
-    for (const cli of ["npm", "ssh", "gh", "kubectl", "docker", "scp", "wrangler", "stripe"]) {
+    // npm/ssh/gh/kubectl/docker unprompted. redis-cli and terraform gained
+    // registry rows backed by @yawlabs servers, and are still not targets:
+    // adding one here is its own decision.
+    for (const cli of [
+      "npm",
+      "ssh",
+      "gh",
+      "kubectl",
+      "docker",
+      "scp",
+      "wrangler",
+      "stripe",
+      "redis-cli",
+      "terraform",
+    ]) {
       expect(installTargetForCli(cli)).toBeUndefined();
     }
   });
@@ -312,6 +382,17 @@ describe("cliToNamespaces", () => {
     // returned reference; the leak is fixed, but sorting the copy keeps this
     // assertion from depending on the isolation it isn't testing.
     expect([...namespaces].sort()).toEqual(["k8s", "kubectl", "kubernetes"]);
+  });
+
+  it("points doctor's shadow rows for the newer CLIs back at both namespace spellings", () => {
+    // A shell history full of `redis-cli` / `terraform state` lines should name
+    // the catalog slug the user types into `yaw-mcp add` as well as the
+    // namespace an import lands on.
+    const reverse = cliToNamespaces();
+    expect([...(reverse.get("redis-cli") ?? [])].sort()).toEqual(["redis", "redis-yawlabs"]);
+    expect([...(reverse.get("terraform") ?? [])].sort()).toEqual(["terraform-cwd", "terraformcwd"]);
+    expect([...(reverse.get("az") ?? [])].sort()).toEqual(["az", "azure"]);
+    expect(reverse.get("ansible-doc")).toEqual(["ansible"]);
   });
 
   it("never lists a namespace twice for one CLI", () => {

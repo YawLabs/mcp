@@ -3265,10 +3265,69 @@ describe("runInstall --all", () => {
     expect(cap.stdout()).not.toContain("-- cursor");
     expect(existsSync(join(synthHome, ".cursor", "mcp.json"))).toBe(false);
     expect(r.written).toEqual([]);
-    // The documented --all code for a cancel; see runInstallAll's contract.
+    // 130, the code a single-client cancel returns; see runInstallAll's
+    // contract. It used to be flattened to the run's failure code, 1.
+    expect(r.exitCode).toBe(130);
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(client.mcpServers[ENTRY_NAME]).toEqual({ command: "old" });
+  });
+
+  it("[a]bort at one client's collision prompt ends the run with exit 1: later clients are not attempted", async () => {
+    // [a]bort used to fail only that client, and the run went on to the next
+    // one -- here, writing cursor's config after the user had said abort.
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "old" } } }, null, 2),
+    );
+    const twoClients = INSTALL_TARGETS.filter((t) => t.clientId === "claude-code" || t.clientId === "cursor");
+    expect(twoClients.map((t) => t.clientId)).toEqual(["claude-code", "cursor"]);
+    const cap = captureIo();
+    const r = await runInstall({
+      os: "linux",
+      home: synthHome,
+      cwd: synthCwd,
+      all: true,
+      targets: twoClients,
+      io: { ...cap.io, isTTY: true },
+      promptAnswer: "abort",
+      oamProbe: OAM_ABSENT,
+    });
+    expect(cap.stderr()).toMatch(/Aborted\./);
+    expect(cap.stderr()).toContain("yaw-mcp install --all: aborted at claude-code; not attempted: cursor.");
+    expect(cap.stdout()).not.toContain("-- cursor");
+    expect(existsSync(join(synthHome, ".cursor", "mcp.json"))).toBe(false);
+    expect(r.written).toEqual([]);
+    // 1, as a single-client abort exits -- not the cancel's 130.
     expect(r.exitCode).toBe(1);
     const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
     expect(client.mcpServers[ENTRY_NAME]).toEqual({ command: "old" });
+  });
+
+  it("an abort at the last planned client says none was left unattempted", async () => {
+    // cursor is planned after claude-code, so a differing entry there alone
+    // makes the abort land on the final client, after one success.
+    mkdirSync(join(synthHome, ".cursor"), { recursive: true });
+    writeFileSync(
+      join(synthHome, ".cursor", "mcp.json"),
+      JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "old" } } }, null, 2),
+    );
+    const twoClients = INSTALL_TARGETS.filter((t) => t.clientId === "claude-code" || t.clientId === "cursor");
+    const cap = captureIo();
+    const r = await runInstall({
+      os: "linux",
+      home: synthHome,
+      cwd: synthCwd,
+      all: true,
+      targets: twoClients,
+      io: { ...cap.io, isTTY: true },
+      promptAnswer: "abort",
+      oamProbe: OAM_ABSENT,
+    });
+    expect(cap.stderr()).toContain(
+      "yaw-mcp install --all: aborted at cursor; it was the last client planned, so none was left unattempted.",
+    );
+    expect(existsSync(join(synthHome, ".claude.json"))).toBe(true);
+    expect(r.exitCode).toBe(1);
   });
 
   it("--project-dir is refused rather than silently dropped", async () => {
@@ -7775,6 +7834,72 @@ describe.each(CLINE_PLATFORMS)("runInstall / runUninstall -- a target whose one 
       expect(cap.stdout()).toContain(NO_ENTRY_LINE);
       expect(cap.stdout()).not.toContain("Not unwired");
       expect(cap.stdout()).not.toContain("no longer launches yaw-mcp");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // The closing line when SOME entries left and one copy could not be edited.
+  // -------------------------------------------------------------------------
+
+  it("names the failed copy, not the all-clear, when the shared file and one copy were cleared", async () => {
+    const home = mkdtempSync(join(tmpdir(), "yaw-cline-"));
+    try {
+      // Two editors with Cline storage: VS Code and Cursor, siblings under the
+      // same per-platform root.
+      const copy = seedEditorStorage(home);
+      const cursorCopy = join(
+        dirname(editorRoot(home)),
+        "Cursor",
+        "User",
+        "globalStorage",
+        "saoudrizwan.claude-dev",
+        "settings",
+        "cline_mcp_settings.json",
+      );
+      mkdirSync(dirname(cursorCopy), { recursive: true });
+      const installed = await runInstall({ ...clineOpts(home), io: captureIo().io });
+      expect(installed.written).toContain(copy);
+      expect(installed.written).toContain(cursorCopy);
+      const cursorBefore = readFileSync(cursorCopy, "utf8");
+      // Only the Cursor copy's write throws, as it does on a read-only file.
+      atomicWriteSeam.beforeWrite = (path) => {
+        if (path === cursorCopy) throw new Error("EPERM: operation not permitted");
+      };
+
+      const cap = captureIo();
+      const r = await runUninstall({ ...clineOpts(home), force: true, io: cap.io });
+      // Best-effort, like every copy: warned, exit 0.
+      expect(r.exitCode).toBe(0);
+      expect(r.written).toEqual([sharedPath(home), copy]);
+      expect(cap.stderr()).toContain(`failed to remove the "${ENTRY_NAME}" entry from ${cursorCopy}`);
+      expect(readFileSync(cursorCopy, "utf8")).toBe(cursorBefore);
+      // Measured before this line existed: the ordinary "Cline no longer
+      // launches yaw-mcp. Restart it ..." all-clear, with the Cursor copy
+      // still keyed "mcp".
+      expect(cap.stdout()).not.toContain("no longer launches yaw-mcp");
+      expect(cap.stdout()).toContain(
+        `Not fully unwired: Cline (user) -- the yaw-mcp entry was removed elsewhere, but nothing was removed from ` +
+          `${cursorCopy} (see the warning above), so any yaw-mcp entry there is still wired. Restart it to drop the ` +
+          "server. Fix that file and run uninstall again to clear it. Your servers in ~/.yaw-mcp/bundles.json are untouched.",
+      );
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the ordinary all-clear when every copy was cleared", async () => {
+    const home = mkdtempSync(join(tmpdir(), "yaw-cline-"));
+    try {
+      const copy = seedEditorStorage(home);
+      await runInstall({ ...clineOpts(home), io: captureIo().io });
+      const cap = captureIo();
+      const r = await runUninstall({ ...clineOpts(home), force: true, io: cap.io });
+      expect(r.exitCode).toBe(0);
+      expect(r.written).toEqual([sharedPath(home), copy]);
+      expect(cap.stdout()).toContain("\nDone: Cline no longer launches yaw-mcp.");
+      expect(cap.stdout()).not.toContain("unwired");
     } finally {
       rmSync(home, { recursive: true, force: true });
     }

@@ -888,45 +888,60 @@ describe("ConnectServer", () => {
       expect(merged[0]).toBe(serverConfig);
     });
 
-    it("prefers the in-memory sessionCache over the server's own toolCache on collision", () => {
-      // When both `server.toolCache` (the path bundles.json / state.json
-      // hydration would have taken) and `this.toolCache.get(namespace)`
-      // (the live in-memory map, updated as servers activate) have entries,
-      // the in-memory one wins. Pin the precedence so a regression that
-      // flips the ternary can't silently let a stale persisted list
-      // shadow fresh learning.
+    it("ignores a toolCache written on the config entry: only the learned list is merged", () => {
+      // bundles.json cannot carry `toolCache` (validateEntry drops it), so a
+      // list on the entry object is never something the user configured. The
+      // merge used to let one stand in when no learned list existed, which
+      // only hand-built test configs could reach. Now the learned map is the
+      // sole source, and a list already on the input is replaced or dropped.
       const priv = getPrivate(server);
       const serverConfig = makeServerConfig({
         namespace: "my-npm-proxy",
         name: "npm proxy",
-        toolCache: [{ name: "persisted_old" }, { name: "persisted_stale" }, { name: "persisted_gone" }],
+        toolCache: [{ name: "entry_old" }, { name: "entry_stale" }, { name: "entry_gone" }],
       });
       priv.config = makeConfig([serverConfig]);
-      priv.toolCache.set("my-npm-proxy", [{ name: "npm_search" }, { name: "npm_audit" }, { name: "npm_view" }]);
 
+      // No learned list: the entry's own list does NOT show through.
+      expect(priv.getProfiledActiveServers()[0].toolCache).toBeUndefined();
+      expect(priv.hasKnownTools(serverConfig)).toBe(false);
+
+      // A learned list replaces it.
+      priv.toolCache.set("my-npm-proxy", [{ name: "npm_search" }, { name: "npm_audit" }, { name: "npm_view" }]);
       const merged = priv.getProfiledActiveServers();
       expect(merged[0].toolCache).toEqual([{ name: "npm_search" }, { name: "npm_audit" }, { name: "npm_view" }]);
+      // Idempotent: merging the merged clone gives the same list.
+      expect(priv.mergeToolCache(merged[0]).toolCache).toEqual(merged[0].toolCache);
+
+      // And once the learned entry is gone, a clone carrying the old list
+      // loses it rather than keeping it alive.
+      priv.toolCache.delete("my-npm-proxy");
+      expect(priv.mergeToolCache(merged[0]).toolCache).toBeUndefined();
     });
 
-    it("discover's known-tools line and the BM25 corpus read the SAME merged list", () => {
+    it("discover's known-tools line and the BM25 corpus read the SAME learned list", () => {
       // rankableFor and the discover body used to re-resolve the cold tool
-      // list on their own with `this.toolCache.get(ns) ?? server.toolCache`,
-      // under which an EMPTY learned list beat a curated one -- while
-      // mergeToolCache (what getDeferredServers and formatShadowLine see) let
-      // the curated list win. Four copies, two empty-list semantics. Pin the
-      // one rule: mergeToolCache's.
+      // list on their own; pin that both read what mergeToolCache resolves
+      // from the learned map, and that a list on the entry feeds neither.
       const priv = getPrivate(server);
       const serverConfig = makeServerConfig({
         namespace: "gh",
         name: "GitHub",
-        toolCache: [{ name: "create_issue", description: "open an issue" }],
+        toolCache: [{ name: "entry_only_tool", description: "never configured" }],
       });
       priv.config = makeConfig([serverConfig]);
-      priv.toolCache.set("gh", []); // learned "zero tools", curated list present
+      priv.toolCache.set("gh", [{ name: "create_issue", description: "open an issue" }]);
 
       const text = priv.handleDiscover().content[0].text;
       expect(text).toContain("known tools: create_issue");
+      expect(text).not.toContain("entry_only_tool");
       expect(priv.rankableFor(serverConfig).tools).toEqual([{ name: "create_issue", description: "open an issue" }]);
+
+      // Learned "zero tools": both agree there is nothing to show.
+      priv.toolCache.set("gh", []);
+      priv.invalidateDiscoverCache();
+      expect(priv.handleDiscover().content[0].text).not.toContain("known tools:");
+      expect(priv.rankableTools(serverConfig)).toEqual({ tools: [], source: "known" });
     });
 
     it("exposes the merged cache to the guide auto-section via getBuiltinResources", () => {
@@ -3792,9 +3807,8 @@ describe("ConnectServer", () => {
       // calls it, we activate gh, rebuild routes, notify list_changed,
       // then re-dispatch through the fresh (non-deferred) route.
       const priv = getPrivate(server);
-      priv.config = makeConfig([
-        makeServerConfig({ namespace: "gh", toolCache: [{ name: "create_issue", description: "cached" }] }),
-      ]);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      priv.toolCache.set("gh", [{ name: "create_issue", description: "cached" }]);
       priv.rebuildRoutes();
       // Pre-call sanity: the route is a deferred placeholder.
       expect(priv.toolRoutes.get("gh_create_issue")?.deferred).toBe(true);
@@ -3814,7 +3828,8 @@ describe("ConnectServer", () => {
 
     it("surfaces activation failure when a deferred tool can't connect", async () => {
       const priv = getPrivate(server);
-      priv.config = makeConfig([makeServerConfig({ namespace: "gh", toolCache: [{ name: "create_issue" }] })]);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      priv.toolCache.set("gh", [{ name: "create_issue" }]);
       priv.rebuildRoutes();
 
       vi.mocked(connectToUpstream)
@@ -5037,15 +5052,13 @@ describe("prewarmDormantServers", () => {
     priv.config = {
       configVersion: "v1",
       servers: [
-        makeServerConfig({
-          id: "gh-id",
-          namespace: "gh",
-          name: "GitHub",
-          toolCache: [{ name: "list_issues", description: "List issues" }],
-        }),
+        makeServerConfig({ id: "gh-id", namespace: "gh", name: "GitHub" }),
         makeServerConfig({ id: "slack-id", namespace: "slack", name: "Slack" }),
       ],
     };
+    // Learned in an earlier session and hydrated from state.json; no
+    // learnedAt, so the age check leaves it alone.
+    priv.toolCache.set("gh", [{ name: "list_issues", description: "List issues" }]);
     vi.mocked(connectToUpstream).mockImplementation(async (cfg: UpstreamServerConfig) =>
       makeConnection(cfg.namespace, [`${cfg.namespace}_tool`]),
     );
@@ -5081,7 +5094,7 @@ describe("prewarmDormantServers", () => {
     expect(Date.now() - priv.toolCacheLearnedAt.get("gh")).toBeLessThan(60_000);
   });
 
-  it("does not re-warm a fresh learned list or a list set on the config entry itself", async () => {
+  it("does not re-warm a fresh learned list, but does warm a server whose only list sits on the config entry", async () => {
     const priv = getPrivate(server);
     priv.config = {
       configVersion: "v1",
@@ -5095,32 +5108,31 @@ describe("prewarmDormantServers", () => {
         }),
       ],
     };
+    vi.mocked(connectToUpstream).mockImplementation(async (cfg: UpstreamServerConfig) =>
+      makeConnection(cfg.namespace, [`${cfg.namespace}_tool`]),
+    );
     // gh: learned yesterday -- inside the refresh window.
     priv.toolCache.set("gh", [{ name: "list_issues" }]);
     priv.toolCacheLearnedAt.set("gh", Date.now() - 24 * 60 * 60 * 1000);
-    // slack: a list set on the config entry itself (hand-built configs only;
-    // bundles.json cannot carry one) -- carries no learnedAt and is
-    // never refreshed here (that would reintroduce the per-session
-    // `npx -y <pkg>@latest` resolve pre-warm exists to avoid).
+    // slack: a list on the config entry object only. bundles.json cannot
+    // carry one and the broker no longer reads it, so slack's tools are
+    // UNKNOWN and pre-warm learns them. (It used to count as known, which
+    // only hand-built configs could ever reach.)
 
     await priv.prewarmDormantServers();
 
-    expect(vi.mocked(connectToUpstream)).not.toHaveBeenCalled();
+    expect(vi.mocked(connectToUpstream)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(connectToUpstream).mock.calls[0][0].namespace).toBe("slack");
+    expect(priv.toolCache.get("slack")).toEqual([{ name: "slack_tool", description: undefined }]);
   });
 
   it("is a no-op when every server already has a toolCache", async () => {
     const priv = getPrivate(server);
     priv.config = {
       configVersion: "v1",
-      servers: [
-        makeServerConfig({
-          id: "gh-id",
-          namespace: "gh",
-          name: "GitHub",
-          toolCache: [{ name: "list_issues" }],
-        }),
-      ],
+      servers: [makeServerConfig({ id: "gh-id", namespace: "gh", name: "GitHub" })],
     };
+    priv.toolCache.set("gh", [{ name: "list_issues" }]);
 
     await priv.prewarmDormantServers();
 
@@ -5655,9 +5667,11 @@ describe("idle threshold env knob", () => {
       return true;
     }) as never);
     try {
-      // Pinned so a developer running with LOG_LEVEL=error does not silence
-      // the very line under test.
+      // Pinned so a developer running with LOG_LEVEL=error (or
+      // YAW_MCP_LOG_LEVEL=error, which wins over it) does not silence the very
+      // line under test.
       vi.stubEnv("LOG_LEVEL", "");
+      vi.stubEnv("YAW_MCP_LOG_LEVEL", undefined);
       // 2 is not used by any sibling case here: the warn dedups on the VALUE,
       // and the module-level slot outlives a single test.
       vi.stubEnv("YAW_MCP_IDLE_THRESHOLD", "2");
@@ -6956,7 +6970,8 @@ describe("gateway activation contract (what a client observes)", () => {
     // at all -- under which tools/list could not have contained the tool
     // under ANY exposure, so the negative half proved nothing.
     const priv = getPrivate(server);
-    priv.config = makeConfig([{ ...makeServerConfig({ namespace: "tailscale" }), toolCache: [{ name: "status" }] }]);
+    priv.config = makeConfig([makeServerConfig({ namespace: "tailscale" })]);
+    priv.toolCache.set("tailscale", [{ name: "status" }]);
     priv.rebuildRoutes();
     expect(priv.toolRoutes.has("tailscale_status")).toBe(true);
     expect((await listTools(priv)).some((t) => t.name === "tailscale_status")).toBe(false);
@@ -7062,10 +7077,12 @@ describe("resolveIdleThreshold strict parse + clamp notice", () => {
   });
 
   it("warns that a baseline above the adaptive ceiling will be clamped", () => {
-    // log() drops warn-level lines before they reach stderr when LOG_LEVEL is
-    // `error`, so an operator shell exporting that turns this red for reasons
-    // that have nothing to do with the clamp. Pin the level the assertion needs.
+    // log() drops warn-level lines before they reach stderr when the level
+    // (YAW_MCP_LOG_LEVEL, else LOG_LEVEL) is `error`, so an operator shell
+    // exporting that turns this red for reasons that have nothing to do with
+    // the clamp. Pin the level the assertion needs.
     vi.stubEnv("LOG_LEVEL", "warn");
+    vi.stubEnv("YAW_MCP_LOG_LEVEL", undefined);
     const writes: string[] = [];
     vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => {
       if (typeof chunk === "string") writes.push(chunk);
@@ -9614,9 +9631,8 @@ describe("concurrent deferred first calls", () => {
 
   it("sends ONE list_changed triplet for one deferred load, however many callers raced for it", async () => {
     const priv = getPrivate(server);
-    priv.config = makeConfig([
-      { ...makeServerConfig({ namespace: "gh" }), toolCache: [{ name: "foo" }, { name: "bar" }] },
-    ]);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+    priv.toolCache.set("gh", [{ name: "foo" }, { name: "bar" }]);
     priv.rebuildRoutes();
     // Both routes are placeholders: neither caller has a live connection yet.
     expect(priv.toolRoutes.get("gh_foo")?.deferred).toBe(true);
@@ -10037,10 +10053,13 @@ describe("find_tool", () => {
     server = new ConnectServer();
   });
 
-  // A cold server whose tool list is known only from the persisted cache --
-  // the case find_tool exists for. Nothing here is connected.
-  const cold = (namespace: string, tools: Array<{ name: string; description?: string }>) =>
-    makeServerConfig({ namespace, name: namespace, toolCache: tools });
+  // A cold server whose tool list is known only from the learned cache --
+  // the case find_tool exists for. Nothing here is connected. Seeds the
+  // learned map of the test's server as a side effect and returns the entry.
+  const cold = (namespace: string, tools: Array<{ name: string; description?: string }>) => {
+    getPrivate(server).toolCache.set(namespace, tools);
+    return makeServerConfig({ namespace, name: namespace });
+  };
 
   it("refuses an empty query instead of returning the whole catalog", async () => {
     const priv = getPrivate(server);
@@ -10238,13 +10257,14 @@ describe("find_tool", () => {
     expect(text).not.toContain("linear_issue_create");
   });
 
-  it("prefers the in-session tool cache over the persisted one", async () => {
+  it("never searches a tool list written on the config entry itself", async () => {
+    // bundles.json cannot carry `toolCache`; only the learned list counts.
     const priv = getPrivate(server);
-    priv.config = makeConfig([cold("gh", [{ name: "stale_tool", description: "old" }])]);
-    priv.toolCache.set("gh", [{ name: "create_issue", description: "Open a new issue" }]);
-    const text = (await priv.handleToolCall("mcp_connect_find_tool", { query: "create issue" })).content[0].text;
-    expect(text).toContain("gh_create_issue");
-    expect(text).not.toContain("stale_tool");
+    priv.config = makeConfig([
+      makeServerConfig({ namespace: "gh", name: "gh", toolCache: [{ name: "entry_tool", description: "issue" }] }),
+    ]);
+    const text = (await priv.handleToolCall("mcp_connect_find_tool", { query: "entry tool issue" })).content[0].text;
+    expect(text).not.toContain("gh_entry_tool");
   });
 });
 
@@ -10653,9 +10673,11 @@ describe("the result cap's warning and the health counter describe one call", ()
     // another for the same call, two bytes apart, and nothing in either
     // module's own suite could see it.
     //
-    // log() drops warn-level lines when LOG_LEVEL is `error`, so an operator
-    // shell exporting that would turn this red for reasons unrelated to bytes.
+    // log() drops warn-level lines when the level (YAW_MCP_LOG_LEVEL, else
+    // LOG_LEVEL) is `error`, so an operator shell exporting that would turn
+    // this red for reasons unrelated to bytes.
     vi.stubEnv("LOG_LEVEL", "warn");
+    vi.stubEnv("YAW_MCP_LOG_LEVEL", undefined);
     const writes: string[] = [];
     vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => {
       if (typeof chunk === "string") writes.push(chunk);
@@ -10809,8 +10831,9 @@ describe("exec preflights the spawn gate on deferred steps", () => {
     priv.connections.set("gh", gh);
     priv.config = makeConfig([
       makeServerConfig({ namespace: "gh" }),
-      makeServerConfig({ namespace: "slack", toolCache: [{ name: "post" }], ...slack }),
+      makeServerConfig({ namespace: "slack", ...slack }),
     ]);
+    priv.toolCache.set("slack", [{ name: "post" }]);
     priv.rebuildRoutes();
     return gh;
   }
@@ -11189,10 +11212,10 @@ describe("activation progress names the cold start", () => {
     expect(call[4]).toBe(reporter);
   });
 
-  it("reads the tool list through mergeToolCache: an empty learned list does not hide a curated one", async () => {
-    // mergeToolCache is the one precedence rule for a cold server's tool list.
-    // coldStartHint used to resolve it with `??`, so an empty learned list won
-    // over a curated one and the hint fired for a server with known tools.
+  it("does not take a tool list on the config entry as proof of an earlier load", async () => {
+    // coldStartHint reads the learned list through mergeToolCache. A list on
+    // the entry object was never learned on this machine (bundles.json cannot
+    // carry one), so it says nothing about the launcher's cache being warm.
     const priv = getPrivate(server);
     priv.config = makeConfig([
       makeServerConfig({
@@ -11202,13 +11225,12 @@ describe("activation progress names the cold start", () => {
         toolCache: [{ name: "create_issue" }],
       }),
     ]);
-    priv.toolCache.set("gh", []);
     const messages = await activateWithProgress(priv, "gh");
-    expect(messages[0]).toBe('Spawning "gh" upstream…');
+    expect(messages[0]).toContain("first load on this machine");
   });
 });
 
-describe("cold tool-list readers share mergeToolCache's precedence", () => {
+describe("cold tool-list readers share mergeToolCache's resolution", () => {
   let server: ConnectServer;
 
   beforeEach(() => {
@@ -11221,31 +11243,19 @@ describe("cold tool-list readers share mergeToolCache's precedence", () => {
     await server.shutdown();
   });
 
-  it("gives dispatch's sampling tiebreak the curated tools, not an empty learned list", async () => {
-    // handleDispatch used to hand the raw learned map to buildCandidates,
-    // whose `??` then picked an EMPTY learned list over a curated one, so the
-    // client LLM was asked to choose between servers with "(no tool metadata
-    // yet)". Two servers with identical descriptions tie the ranker, so the
-    // tiebreak fires.
+  it("gives dispatch's sampling tiebreak the learned tools of each candidate", async () => {
+    // handleDispatch hands buildCandidates the merged list from
+    // getProfiledActiveServers, so the client LLM is shown each cold
+    // server's learned tools rather than "(no tool metadata yet)". Two
+    // servers with identical descriptions tie the ranker, so the tiebreak
+    // fires.
     const priv = getPrivate(server);
     priv.config = makeConfig([
-      makeServerConfig({
-        id: "a",
-        namespace: "alpha",
-        name: "Alpha",
-        description: "manage github issues",
-        toolCache: [{ name: "zz_alpha_tool" }],
-      }),
-      makeServerConfig({
-        id: "b",
-        namespace: "beta",
-        name: "Beta",
-        description: "manage github issues",
-        toolCache: [{ name: "zz_beta_tool" }],
-      }),
+      makeServerConfig({ id: "a", namespace: "alpha", name: "Alpha", description: "manage github issues" }),
+      makeServerConfig({ id: "b", namespace: "beta", name: "Beta", description: "manage github issues" }),
     ]);
-    priv.toolCache.set("alpha", []);
-    priv.toolCache.set("beta", []);
+    priv.toolCache.set("alpha", [{ name: "zz_alpha_tool" }]);
+    priv.toolCache.set("beta", [{ name: "zz_beta_tool" }]);
     priv.server.getClientCapabilities = () => ({ sampling: {} });
     const createMessage = vi
       .fn()
@@ -11326,11 +11336,10 @@ describe("cold tool-list readers share mergeToolCache's precedence", () => {
     }
   });
 
-  it("checks an activate filter against the curated list of a server with no learned one", () => {
-    // unmatchedFilterNames read only the learned map, so a curated list was
-    // invisible to it and a misspelled filter name went unreported.
+  it("checks an activate filter against the learned list of a cold server", () => {
     const priv = getPrivate(server);
-    priv.config = makeConfig([makeServerConfig({ namespace: "gh", toolCache: [{ name: "create_issue" }] })]);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+    priv.toolCache.set("gh", [{ name: "create_issue" }]);
     priv.toolFilters.set("gh", new Set(["create_issue", "crate_issue"]));
     expect(priv.unmatchedFilterNames("gh")).toEqual(["crate_issue"]);
   });

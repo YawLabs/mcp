@@ -141,9 +141,9 @@ Flags:
                           {"ok":false,"error":...} envelope last -- an
                           argument error too (exit 2, no usage text). Key
                           on "warning" vs "ok", never on line position. An
-                          argument error also puts a multi-line
-                          {"ok":false,...,"exitCode":2} document on stdout;
-                          read the message from the stderr envelope.
+                          argument error also puts one line on stdout,
+                          {"ok":false,"error":...,"exitCode":2}, carrying
+                          the same message as the stderr envelope.
   --value <v>             Inline secret value (set only). The value sits in
                           this process's argv, so it is visible to every
                           other local user via ps / /proc/<pid>/cmdline for
@@ -255,15 +255,15 @@ export interface SecretsIo {
 
 export function parseSecretsArgs(
   argv: string[],
-): { ok: true; options: SecretsCommandOptions } | { ok: false; error: string; help?: boolean } {
+): { ok: true; options: SecretsCommandOptions } | { ok: false; error: string; help?: boolean; jsonError?: string } {
   // An argv error under --json is the same one-line {"ok":false,"error":...}
   // envelope every runtime failure emits (the promise SECRETS_USAGE makes for
   // stderr), not the prose-plus-usage dump: index.ts's shared run() writes
   // `error` to stderr verbatim with exit 2, so the JSON is spelled here. That
-  // run() ALSO writes a stdout document on a --json argv error -- pretty-
-  // printed {ok:false, error, exitCode:2} with this whole envelope string as
-  // its `error` field, so the message is double-encoded there; SECRETS_USAGE
-  // points callers at the stderr envelope instead. The
+  // run() ALSO writes a stdout document on a --json argv error, and takes its
+  // `error` from `jsonError` -- the plain message, not this envelope string,
+  // which would land double-encoded inside it -- as one compact line,
+  // {"ok":false,"error":"<message>","exitCode":2}. The
   // flag is looked for anywhere in argv, not just before the bad token:
   // `secrets get --bogus --json` asked for JSON as surely as
   // `--json get --bogus` did. That matches what the loop below would find --
@@ -278,12 +278,10 @@ export function parseSecretsArgs(
   // the action) read `yaw-mcp secrets:`. `secrets set X --bogus` used to say
   // `yaw-mcp secrets:` while `secrets set X --value ""` said
   // `yaw-mcp secrets set:`.
-  const refuse = (msg: string): { ok: false; error: string } => ({
-    ok: false,
-    error: json
-      ? JSON.stringify({ ok: false, error: msg })
-      : `yaw-mcp secrets${opts.action ? ` ${opts.action}` : ""}: ${msg}\n\n${SECRETS_USAGE}`,
-  });
+  const refuse = (msg: string): { ok: false; error: string; jsonError?: string } =>
+    json
+      ? { ok: false, error: JSON.stringify({ ok: false, error: msg }), jsonError: msg }
+      : { ok: false, error: `yaw-mcp secrets${opts.action ? ` ${opts.action}` : ""}: ${msg}\n\n${SECRETS_USAGE}` };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--help" || a === "-h") return { ok: false, error: SECRETS_USAGE, help: true };

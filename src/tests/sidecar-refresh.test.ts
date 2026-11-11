@@ -14,6 +14,7 @@ import {
   mergeSidecarRefreshState,
   parseManagedDependencies,
   parseSidecarRefreshState,
+  runBackgroundRefresh,
   SIDECAR_REFRESH_START_DELAY_MS,
   SIDECAR_REFRESH_THROTTLE_MS,
   SIDECAR_REFRESH_UNMOVED_BACKOFF_MS,
@@ -1044,6 +1045,83 @@ describe("a refresh that cannot move a package", () => {
     expect(result?.exitCode, "a usable tree is not a failure").toBe(0);
     expect(result?.updateError).toContain("npm update exited 7");
     expect(unmovedWrites(h)).toHaveLength(0);
+  });
+
+  // The production background body (runBackgroundRefresh, which
+  // defaultSpawnRefresh awaits) with only the install injected, wired to
+  // onDone exactly as defaultSpawnRefresh wires it. These pin the `ok` it
+  // hands back, which the tests above reach only through a hand-written
+  // spawnRefreshImpl that calls installMovedTheTree itself.
+  const viaBackgroundRefresh =
+    (home: string, result: { exitCode: number; updateError: string | null }) =>
+    (stale: SidecarSpec[], onDone: (ok?: boolean) => void): void => {
+      void (async () => {
+        let ok = false;
+        try {
+          ok = await runBackgroundRefresh(stale, home, async () => ({
+            exitCode: result.exitCode,
+            installed: stale.map((s) => ({ pkg: s.pkg, version: "1.0.0", namespaces: [] })),
+            lines: [],
+            updateError: result.updateError,
+          }));
+        } finally {
+          onDone(ok);
+        }
+      })();
+    };
+
+  it("runBackgroundRefresh: install exit 0 with a failed update step is not ok, and records nothing", async () => {
+    // Reddens if the background refresh's `ok` goes back to exitCode === 0
+    // alone: a-mcp would be recorded as unmoved and backed off for a week.
+    const home = tempHome();
+    const install = vi.fn(async () => ({
+      exitCode: 0,
+      installed: [],
+      lines: [],
+      updateError: "npm update exited 1",
+    }));
+    expect(await runBackgroundRefresh([spec("a-mcp")], home, install)).toBe(false);
+    expect(install).toHaveBeenCalledTimes(1);
+
+    const h = harness({
+      home,
+      spawnRefreshImpl: viaBackgroundRefresh(home, { exitCode: 0, updateError: "npm update exited 1" }),
+    });
+    await maybeRefreshSidecars(h.deps);
+    await vi.waitFor(() => expect(h.release).toHaveBeenCalledTimes(1));
+    await new Promise((r) => setImmediate(r));
+    expect(unmovedWrites(h)).toHaveLength(0);
+  });
+
+  it("runBackgroundRefresh: install exit 0 with a clean update step is ok, so an unmoved package is recorded", async () => {
+    const home = tempHome();
+    expect(
+      await runBackgroundRefresh([spec("a-mcp")], home, async () => ({
+        exitCode: 0,
+        installed: [],
+        lines: [],
+        updateError: null,
+      })),
+    ).toBe(true);
+    // A non-zero exit, and a throw, are not ok either.
+    expect(
+      await runBackgroundRefresh([spec("a-mcp")], home, async () => ({
+        exitCode: 1,
+        installed: [],
+        lines: [],
+        updateError: null,
+      })),
+    ).toBe(false);
+    expect(
+      await runBackgroundRefresh([spec("a-mcp")], home, async () => {
+        throw new Error("boom");
+      }),
+    ).toBe(false);
+
+    const h = harness({ home, spawnRefreshImpl: viaBackgroundRefresh(home, { exitCode: 0, updateError: null }) });
+    await maybeRefreshSidecars(h.deps);
+    await vi.waitFor(() => expect(unmovedWrites(h)).toHaveLength(1));
+    expect(unmovedWrites(h)[0].unmoved).toEqual({ "a-mcp": { latest: "1.1.0", at: NOW } });
   });
 
   it("records nothing when the install did not complete -- a failed npm run is retried as before", async () => {

@@ -90,12 +90,15 @@ beforeEach(() => {
   // INSIDE the resolved root, so it inherits the physical spelling.
   synthHome = realpathSync.native(mkdtempSync(join(tmpdir(), "yaw-mcp-trust-")));
   synthCwd = mkdtempSync(join(synthHome, "cwd-"));
-  // captureStderr below asserts WARN-level lines. logger.ts resolves LOG_LEVEL
-  // per call (deliberately, so a host can flip it mid-session), so a developer
-  // shell or CI job exporting LOG_LEVEL=error emits nothing and the assertion
-  // compares undefined to the key it wanted -- a green-to-red flip with
-  // nothing to do with trust.ts. Pin the threshold those assertions depend on.
+  // captureStderr below asserts WARN-level lines. logger.ts resolves the level
+  // per call (deliberately, so a host can flip it mid-session) from
+  // YAW_MCP_LOG_LEVEL, else LOG_LEVEL, so a developer shell or CI job
+  // exporting either as `error` emits nothing and the assertion compares
+  // undefined to the key it wanted -- a green-to-red flip with nothing to do
+  // with trust.ts. Pin the threshold those assertions depend on, and clear the
+  // variable that would win over the pin.
   vi.stubEnv("LOG_LEVEL", "warn");
+  vi.stubEnv("YAW_MCP_LOG_LEVEL", undefined);
 });
 
 afterEach(() => {

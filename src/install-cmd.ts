@@ -515,6 +515,11 @@ export interface InstallResult {
    *  matching the refusal's prose, which is how it once swallowed the diff
    *  with it. */
   collisionRefused?: boolean;
+  /** True when the user answered [a]bort at the collision prompt (exit 1).
+   *  `install --all` reads it to end the whole run there, as it does on the
+   *  Ctrl+C cancel (exit 130): exit 1 alone cannot tell an abort from a
+   *  failure the run should carry on past. */
+  collisionAborted?: boolean;
 }
 
 /** Every row's top-level defaults as USAGE names them, one row per entry:
@@ -605,6 +610,8 @@ const USAGE =
   "  and refuses without one, showing what differs (exit 2; a real failure, such\n" +
   "  as a malformed config, exits 1). Under --all the run exits 2 when every\n" +
   "  client that did not succeed was refused this way, and 1 if any one failed.\n" +
+  "  At a prompt, [a]bort (exit 1) or Ctrl+C (exit 130) ends an --all run and\n" +
+  "  names the clients it did not attempt.\n" +
   "  Answer up front with:\n" +
   "  --force     Overwrite whatever is there, env included: the new entry keeps\n" +
   "              none of the old entry's env, and install names each key it drops.\n" +
@@ -1577,7 +1584,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     }
     if (decision === "abort") {
       err("Aborted.");
-      return { written: [], wouldWrite: [], messages, exitCode: 1 };
+      return { written: [], wouldWrite: [], messages, exitCode: 1, collisionAborted: true };
     }
     if (decision === "cancelled") {
       // Ctrl+C at the prompt. Exit 130, the convention every other prompt in
@@ -3402,13 +3409,14 @@ function displayPath(abs: string, home: string, os: InstallOS): string {
  *       reason: a script can tell "re-run with a flag" from "the write failed"
  *       without parsing prose.
  *    1  at least one client failed outright (an unreadable or malformed
- *       config, a refused write, an abort or cancel at the prompt), refused
- *       clients or not -- a flag alone will not make that run succeed.
+ *       config, a refused write, an [a]bort at the prompt), refused clients
+ *       or not -- a flag alone will not make that run succeed.
+ *  130  the user pressed Ctrl+C at a client's collision prompt -- the code a
+ *       single-client cancel returns, whatever the clients before it did.
  *
- *  A cancel (Ctrl+C at a client's collision prompt) also ENDS the run: the
- *  clients after it are not attempted and are named on stderr. The exit code
- *  stays 1, not the single-client run's 130. An [a]bort answer fails that
- *  client only, and the run goes on to the next one. */
+ *  An [a]bort answer and a Ctrl+C cancel at a client's collision prompt both
+ *  END the run: the clients after it are not attempted and are named on
+ *  stderr. Abort exits 1, as a single-client abort does; cancel exits 130. */
 async function runInstallAll(
   opts: InstallCommandOptions,
   log: (s: string) => void,
@@ -3486,9 +3494,10 @@ async function runInstallAll(
   // (deferCollisionHint); the part they all share -- no TTY, and the flags
   // that answer it -- prints ONCE below instead of N identical times.
   const refusedClients: string[] = [];
-  /** The client whose prompt was cancelled with Ctrl+C, and the planned
-   *  clients the run therefore never reached. */
-  let cancelledAt: string | null = null;
+  /** The client whose collision prompt ended the run -- answered [a]bort or
+   *  cancelled with Ctrl+C -- and the planned clients it therefore never
+   *  reached. */
+  let stoppedAt: { clientId: string; how: "aborted" | "cancelled" } | null = null;
   let notAttempted: string[] = [];
   for (const plan of plans) {
     log(`-- ${plan.clientId} (${plan.scope}) --`);
@@ -3532,12 +3541,13 @@ async function runInstallAll(
     else failed += 1;
     log("");
     // Ctrl+C at a client's collision prompt (the one path that returns 130)
-    // cancels the RUN, not just that client. Carrying on opened the next
-    // client's prompt -- or, with no collision there, wrote its config -- after
-    // the user had pressed Ctrl+C. The cancelled client is counted in `failed`
-    // above; the ones after it are named below as not attempted.
-    if (result.exitCode === 130) {
-      cancelledAt = plan.clientId;
+    // and an [a]bort answer there (`collisionAborted`) both stop the RUN, not
+    // just that client. Carrying on opened the next client's prompt -- or,
+    // with no collision there, wrote its config -- after the user had said
+    // stop. The stopping client is counted in `failed` above; the ones after
+    // it are named below as not attempted.
+    if (result.exitCode === 130 || result.collisionAborted) {
+      stoppedAt = { clientId: plan.clientId, how: result.exitCode === 130 ? "cancelled" : "aborted" };
       notAttempted = plans.slice(plans.indexOf(plan) + 1).map((p) => p.clientId);
       break;
     }
@@ -3597,9 +3607,9 @@ async function runInstallAll(
     );
   }
 
-  if (cancelledAt !== null) {
+  if (stoppedAt !== null) {
     err(
-      `yaw-mcp install --all: cancelled at ${cancelledAt}; ` +
+      `yaw-mcp install --all: ${stoppedAt.how} at ${stoppedAt.clientId}; ` +
         (notAttempted.length > 0
           ? `not attempted: ${notAttempted.join(", ")}.`
           : "it was the last client planned, so none was left unattempted."),
@@ -3637,7 +3647,9 @@ async function runInstallAll(
     written: aggregateWritten,
     wouldWrite: aggregateWouldWrite,
     messages,
-    exitCode: failed > 0 ? 1 : 2,
+    // A cancel exits 130 whatever else the run did, like a single-client
+    // cancel; an abort is counted in `failed`, so it lands on 1.
+    exitCode: stoppedAt?.how === "cancelled" ? 130 : failed > 0 ? 1 : 2,
   };
 }
 
@@ -4726,7 +4738,7 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
   });
   const extraRemoved = extraLive.touched;
   /** Copies the live pass warned about and left as they were (see `failed` on
-   *  applyToExtraSites). Read by the closing line alone. */
+   *  applyToExtraSites). Read by the closing lines alone. */
   const extraFailed = extraLive.failed;
   written.push(...extraRemoved);
 
@@ -4826,9 +4838,29 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
     return { written, wouldWrite: [], messages, exitCode: 0 };
   }
 
+  // Something was removed, but an editor copy could not be edited: the mixed
+  // case of 3 above. uninstallDoneLine's "no longer launches yaw-mcp" would be
+  // the same false all-clear there, so the line names each copy left as it was
+  // instead. The reload clause stays: the files that WERE cleared still need
+  // the client restarted (or its next session) before it drops the server.
+  // Exit 0 still -- the copies are best-effort, and each has warned.
+  if (extraFailed.length > 0) {
+    log(
+      `\nNot fully unwired: ${target.label} (${scope}) -- the yaw-mcp entry was removed elsewhere, but nothing ` +
+        `was removed from ${extraFailed.join(" or ")} (see the warning above), so any yaw-mcp entry there is ` +
+        `still wired. ${reloadRemovalClause(target.reload, target.label)} ` +
+        (extraFailed.length === 1
+          ? "Fix that file and run uninstall again to clear it. "
+          : "Fix those files and run uninstall again to clear them. ") +
+        "Your servers in ~/.yaw-mcp/bundles.json are untouched.",
+    );
+    return { written, wouldWrite: [], messages, exitCode: 0 };
+  }
+
   // Names what was NOT touched on purpose: `uninstall` unwires a client, it
   // does not delete the user's servers. Without this line the obvious reading
-  // of "uninstall" is that bundles.json went with it.
+  // of "uninstall" is that bundles.json went with it. Reached only when every
+  // site this scope reads came clean, so its all-clear is true.
   log(uninstallDoneLine(target, resolved.display, scope, projectDir));
   return { written, wouldWrite: [], messages, exitCode: 0 };
 }

@@ -8,6 +8,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync
 import { createServer, type Server } from "node:https";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PassThrough } from "node:stream";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
   buildGitSource,
@@ -142,6 +143,25 @@ describe("add --git builds and pins a repo", () => {
     expect(r.err).toContain("re-run with --yes");
     expect(r.err).toMatch(/build: +node build\.js/);
     expect(existsSync(join(gitRoot(home), "fx"))).toBe(false);
+    expect(existsSync(join(home, ".yaw-mcp", "bundles.json"))).toBe(false);
+  }, 120_000);
+
+  it("Ctrl+C at the 'Proceed? [Y/n]' consent prompt exits 130, builds nothing and writes nothing", async () => {
+    const repo = makeRepo(NPM_FILES);
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    stdout.resume();
+    // ETX, built from its code so no control byte sits in this source.
+    stdin.write(String.fromCharCode(3));
+    const r = await add(["fx", "--git", repo.url, "--no-start-check"], {
+      isTTY: true,
+      io: { stdin, stdout, terminal: true },
+    });
+    expect(r.exitCode, r.err).toBe(130);
+    expect(r.out).toContain("This will run code from the repo on this machine:");
+    expect(r.err).toContain("yaw-mcp add: Cancelled; nothing was built.");
+    expect(r.err).not.toContain("Aborted");
+    expect(existsSync(gitBuiltPath("fx", git(repo.work, ["rev-parse", "HEAD"]), home))).toBe(false);
     expect(existsSync(join(home, ".yaw-mcp", "bundles.json"))).toBe(false);
   }, 120_000);
 

@@ -335,6 +335,58 @@ describe("status", () => {
     expect(payload.ok).toBe(true);
   });
 
+  // The state loader's own warnings are worded for the server ("starting
+  // fresh") and, on the cli surface, go straight to process.stderr. status
+  // reports a bad state.json itself (learning.readable false / "learning:
+  // unreadable"), so the loader must stay quiet here, as it does for doctor.
+  describe.each([
+    {
+      label: "malformed",
+      stage: (dir: string) => writeFileSync(join(dir, STATE_FILENAME), "{ not json", "utf8"),
+    },
+    {
+      label: "unreadable",
+      stage: (dir: string) => mkdirSync(join(dir, STATE_FILENAME)),
+    },
+  ])("with a $label state.json", ({ stage }) => {
+    // Pin the level low enough that the loader's warn WOULD print: an ambient
+    // LOG_LEVEL=error (or YAW_MCP_LOG_LEVEL=error, which wins over it) mutes
+    // it with or without `quiet`, and the absence checks below would then
+    // pass vacuously.
+    beforeEach(() => {
+      vi.stubEnv("LOG_LEVEL", "debug");
+      vi.stubEnv("YAW_MCP_LOG_LEVEL", undefined);
+    });
+    afterEach(() => {
+      vi.unstubAllEnvs();
+    });
+    for (const json of [false, true]) {
+      it(`reports it without the state loader's warning on stderr (${json ? "--json" : "text"})`, async () => {
+        mkdirSync(yawMcpDir, { recursive: true });
+        stage(yawMcpDir);
+        const io = captureIO();
+        const spy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+        let result: Awaited<ReturnType<typeof runStatus>>;
+        let processErr: string;
+        try {
+          result = await runStatus({ home, cwd: home, env: {}, json, out: io.push, err: io.pushErr });
+          processErr = spy.mock.calls.map((c) => String(c[0])).join("");
+        } finally {
+          spy.mockRestore();
+        }
+        expect(processErr).not.toContain("yaw-mcp state");
+        expect(io.err.join("")).not.toContain("yaw-mcp state");
+        expect(result.exitCode).toBe(0);
+        const stdout = io.out.join("");
+        if (json) {
+          expect(JSON.parse(stdout).learning.readable).toBe(false);
+        } else {
+          expect(stdout).toContain("learning: unreadable");
+        }
+      });
+    }
+  });
+
   // --- side-effect freedom ------------------------------------------------
 
   it("writes nothing at all -- not one byte under the config dir", async () => {
