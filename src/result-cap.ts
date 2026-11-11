@@ -53,9 +53,10 @@ export const DEFAULT_MAX_RESULT_BYTES = 100_000;
 
 /** 0 disables the cap. Invalid values fall back to the default rather than
  *  erroring -- the same strict digit-run parse, and the same reasoning, as
- *  resolveServerCap: parseInt's prefix parsing turns "0x1000" and "100_000"
- *  into 0, which is the DISABLE sentinel, so a typo would silently remove the
- *  ceiling instead of falling back to it. */
+ *  resolveServerCap: parseInt's prefix parsing turns "0x1000" and "0abc" into
+ *  0, which is the DISABLE sentinel, so a typo would silently remove the
+ *  ceiling instead of falling back to it -- and turns "100_000" into 100, a
+ *  ceiling a thousand times smaller than the one asked for. */
 export function resolveMaxResultBytes(env: NodeJS.ProcessEnv = process.env): number {
   return resolveNonNegativeIntEnv("YAW_MCP_MAX_RESULT_BYTES", DEFAULT_MAX_RESULT_BYTES, env);
 }
@@ -94,7 +95,14 @@ export interface CapResult {
  *  duplicate that stays right in one copy and rots in the other. */
 export function cutToBytes(text: string, maxBytes: number): string {
   if (maxBytes <= 0) return "";
-  const buf = Buffer.from(text, "utf8");
+  return cutEncodedToBytes(text, Buffer.from(text, "utf8"), maxBytes);
+}
+
+/** cutToBytes for a caller that already holds `text`'s UTF-8 encoding in
+ *  `buf` -- fitTextBlock, which cuts the same text a couple of dozen times and
+ *  must not re-encode a multi-megabyte string on each one. */
+function cutEncodedToBytes(text: string, buf: Buffer, maxBytes: number): string {
+  if (maxBytes <= 0) return "";
   if (buf.byteLength <= maxBytes) return text;
   const cut = buf.subarray(0, maxBytes).toString("utf8");
   // Only a cut that actually severed a sequence ends in U+FFFD, and the
@@ -130,18 +138,26 @@ export function cutToBytes(text: string, maxBytes: number): string {
  *
  *  A fixed envelope allowance cannot bound a multiplicative expansion, so the
  *  only honest answer is to measure the real block. Binary search on the raw
- *  byte offset: O(log n) serializations, each of a string already in memory,
- *  against a payload that is by definition oversized. The alternative -- cut,
- *  measure, shrink by a guess, repeat -- has no bound at all on text that
- *  escapes heavily. */
+ *  byte offset: O(log budget) serializations, each of a cut no longer than
+ *  `budget` bytes. The alternative -- cut, measure, shrink by a guess, repeat
+ *  -- has no bound at all on text that escapes heavily.
+ *
+ *  The work per step is bounded by the BUDGET, not by the payload, and that
+ *  takes two things. The text is encoded once, outside the loop: cutToBytes
+ *  encodes its whole argument, so calling it per step re-encoded the entire
+ *  oversized text every time. And the search starts at `budget` rather than at
+ *  the text's full length: a serialized block is never smaller than the raw
+ *  bytes of its text, so no cut longer than `budget` can fit and the steps
+ *  spent above it only serialized megabytes to learn that. */
 function fitTextBlock(item: CapContent, budget: number): { block: CapContent; size: number } | null {
   if (typeof item.text !== "string" || budget <= 0) return null;
+  const encoded = Buffer.from(item.text, "utf8");
   let lo = 0;
-  let hi = Buffer.byteLength(item.text, "utf8");
+  let hi = Math.min(encoded.byteLength, budget);
   let best: { block: CapContent; size: number } | null = null;
   while (lo <= hi) {
     const mid = Math.floor((lo + hi) / 2);
-    const cut = cutToBytes(item.text, mid);
+    const cut = cutEncodedToBytes(item.text, encoded, mid);
     if (cut.length === 0) {
       lo = mid + 1;
       continue;
@@ -257,8 +273,18 @@ export function capContent(content: CapContent[], maxBytes: number): CapResult {
   // and reserving the actual value needs the count, which is not known until
   // the loop below has run. Over-reserving by a few dozen bytes keeps the
   // ceiling honest; under-reserving would put it back over.
+  //
+  // The array's own framing comes out of the budget too: the two brackets
+  // here, and one comma per kept block in the loop (every kept block is
+  // followed by something, the notice at the latest). The gate above measures
+  // the ARRAY, so a loop that budgeted bare block sizes disagreed with it by
+  // N+1 bytes on N blocks. With more blocks than the notice reserve has bytes
+  // that gap let every block "fit": nothing was dropped, the notice still said
+  // CUT, and the returned array was over the ceiling it had just been measured
+  // against. Charged the same way on both sides, an array over the ceiling
+  // can no longer have all of its blocks fit under it.
   const noticeReserve = MAX_NOTICE_BYTES;
-  const contentBudget = maxBytes - noticeReserve;
+  const contentBudget = maxBytes - noticeReserve - ARRAY_BRACKET_BYTES;
 
   // Indexed, not `for..of`: the dropped-block arithmetic below needs this
   // block's position, and `content.indexOf(item)` is an identity search that
@@ -267,13 +293,15 @@ export function capContent(content: CapContent[], maxBytes: number): CapResult {
   for (let i = 0; i < content.length; i++) {
     const item = content[i];
     const size = serializedBytes(item);
-    if (Number.isFinite(size) && used + size <= contentBudget) {
+    // Commas already owed by the kept blocks, plus this block's own.
+    const separators = kept.length + 1;
+    if (Number.isFinite(size) && used + size + separators <= contentBudget) {
       kept.push(item);
       used += size;
       continue;
     }
     // This block crosses the ceiling.
-    const remaining = contentBudget - used;
+    const remaining = contentBudget - used - separators;
     if (item.type === "text" && typeof item.text === "string" && remaining > MIN_USEFUL_TAIL_BYTES) {
       // Measured, not estimated. fitTextBlock returns a block whose SERIALIZED
       // size is known to fit `remaining` -- including the JSON envelope and any
@@ -299,6 +327,9 @@ export function capContent(content: CapContent[], maxBytes: number): CapResult {
 // Below this, a truncated tail is not worth keeping -- a few dozen bytes of a
 // log tells the model nothing and still reads as content.
 const MIN_USEFUL_TAIL_BYTES = 512;
+
+// The `[` and `]` JSON.stringify puts around a content array.
+const ARRAY_BRACKET_BYTES = 2;
 
 /** Upper bound on the serialized size of the notice block, reserved from the
  *  budget before any content is kept.

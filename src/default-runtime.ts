@@ -202,8 +202,10 @@ export async function describeDefaultRuntime(
 }
 
 /**
- * The config-level default runtime, or null when nothing is configured
- * (today's behavior: node/npx untouched). Env is checked on every call
+ * The config-level default runtime, or null when nothing is configured. Null
+ * is not "node": the connect path resolves it to oam when oam is installed and
+ * at or above MIN_OAM_VERSION, and to node otherwise (step 4 in the header).
+ * Env is checked on every call
  * (cheap, and lets a respawned broker pick up a change); the bundles.json
  * top-level `defaultRuntime` is read once and cached -- this sits on the
  * upstream connect path. Once really means once: a concurrent burst (prewarm

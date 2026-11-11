@@ -14,6 +14,7 @@ import {
   connectToUpstream,
   type DownstreamClientBridge,
   disconnectFromUpstream,
+  displayRemoteUrl,
   fetchPromptsFromUpstream,
   fetchResourcesFromUpstream,
   fetchToolsFromUpstream,
@@ -29,6 +30,7 @@ import {
   scrubInternalSecretsFromProcessEnv,
   setCpuTimesReaderForTests,
   setSessionVaultPassphrase,
+  shellActivationMessage,
   stripInternalSecretsFromEnv,
   VaultPassphraseRequiredError,
   vaultPassphrase,
@@ -360,6 +362,28 @@ describe("fetchResourcesFromUpstream size cap", () => {
     const out = await fetchResourcesFromUpstream(client, "ns");
     expect(out).toEqual([]);
   });
+
+  it("stays silent for -32601 and warns for any other swallowed error", async () => {
+    // -32601 is the expected answer from a server without the capability. A
+    // timeout or transport error still yields [], but must leave a trace:
+    // otherwise a server whose resources vanished gives no hint of why.
+    const missing = Object.assign(new Error("Method not found"), { code: -32601 });
+    vi.mocked(log).mockClear();
+    expect(
+      await fetchResourcesFromUpstream(makeClient({ listResources: vi.fn().mockRejectedValue(missing) }), "ns"),
+    ).toEqual([]);
+    expect(vi.mocked(log)).not.toHaveBeenCalled();
+
+    const timeout = Object.assign(new Error("Request timed out"), { code: -32001 });
+    expect(
+      await fetchResourcesFromUpstream(makeClient({ listResources: vi.fn().mockRejectedValue(timeout) }), "ns"),
+    ).toEqual([]);
+    expect(vi.mocked(log)).toHaveBeenCalledWith(
+      "warn",
+      "Upstream list failed at connect; continuing with an empty inventory",
+      { namespace: "ns", endpoint: "resources/list", error: "Request timed out" },
+    );
+  });
 });
 
 describe("fetchPromptsFromUpstream size cap", () => {
@@ -388,6 +412,27 @@ describe("fetchPromptsFromUpstream size cap", () => {
     const client = makeClient({ listPrompts: vi.fn().mockRejectedValue(new Error("not supported")) });
     const out = await fetchPromptsFromUpstream(client, "ns");
     expect(out).toEqual([]);
+  });
+
+  it("stays silent for -32601 and warns for any other swallowed error", async () => {
+    const missing = Object.assign(new Error("Method not found"), { code: -32601 });
+    vi.mocked(log).mockClear();
+    expect(
+      await fetchPromptsFromUpstream(makeClient({ listPrompts: vi.fn().mockRejectedValue(missing) }), "ns"),
+    ).toEqual([]);
+    expect(vi.mocked(log)).not.toHaveBeenCalled();
+
+    expect(
+      await fetchPromptsFromUpstream(
+        makeClient({ listPrompts: vi.fn().mockRejectedValue(new Error("socket hang up")) }),
+        "ns",
+      ),
+    ).toEqual([]);
+    expect(vi.mocked(log)).toHaveBeenCalledWith(
+      "warn",
+      "Upstream list failed at connect; continuing with an empty inventory",
+      { namespace: "ns", endpoint: "prompts/list", error: "socket hang up" },
+    );
   });
 });
 
@@ -1290,6 +1335,79 @@ describe("redactSecretsInOutput", () => {
     expect(err!.stderrTail).toContain("***REDIS_URL***");
     expect(err!.stderrTail).toContain(baseUrl);
     expect(err!.stderrTail).not.toContain("***BASE_URL***");
+  });
+
+  it("maps a literal DSN whose unencoded password holds a slash or a space", async () => {
+    // An unencoded base64 key holds `/`, and a matcher that stopped the
+    // password at the first `/` or space left both of these readable.
+    const slashDsn = "postgres://app_user:abc/def+ghi==@db.internal:5432/app";
+    const spaceDsn = "redis://cache_user:pass word-9@cache.internal:6379/0";
+    const config = makeLocalConfig({ env: { DATABASE_URL: slashDsn, REDIS_URL: spaceDsn } });
+
+    _sdkBehavior.clientConnect = () => {
+      _sdkBehavior.stderrEmitter?.emit("data", Buffer.from(`connect ${slashDsn} failed; cache ${spaceDsn}`));
+      return Promise.reject(new Error("handshake failed"));
+    };
+
+    let err: ActivationError | undefined;
+    try {
+      await connectToUpstream(config);
+    } catch (e) {
+      err = e as ActivationError;
+    }
+
+    expect(err).toBeInstanceOf(ActivationError);
+    expect(err!.stderrTail).not.toContain("abc/def+ghi==");
+    expect(err!.stderrTail).not.toContain("pass word-9");
+    expect(err!.stderrTail).toContain("***DATABASE_URL***");
+    expect(err!.stderrTail).toContain("***REDIS_URL***");
+  });
+
+  it("keeps a url whose path or query holds an @ readable unless a colon precedes the first slash", async () => {
+    // The password now runs to the LAST `@`, so an `@` in the path or query
+    // is read as a userinfo end. The user half stops at `/`, whitespace or
+    // `:` (not at `?`), so with no `:` before the first `/` there is no
+    // password and the value stays readable. A `:` before the first `/` --
+    // a port, or a colon in the query of a path-less URL -- makes the value
+    // read as `user:PASSWORD@...` and it is redacted: the accepted over-match.
+    const scoped = "https://registry.example.test/@org/mcp";
+    const query = "https://api.example.test/mcp?user=a@b.example";
+    const ported = "https://api.example.test:8443/mcp?user=a@b.example";
+    // The same query colon behind a path is past the first `/`: readable.
+    const pathedColon = "https://api.example.test/mcp?t=12:00&u=a@b.example";
+    const pathless = "https://api.example.test?t=12:00&u=a@b.example";
+    const config = makeLocalConfig({
+      env: {
+        SCOPE_URL: scoped,
+        QUERY_URL: query,
+        PORTED_URL: ported,
+        PATHED_URL: pathedColon,
+        PATHLESS_URL: pathless,
+      },
+    });
+
+    _sdkBehavior.clientConnect = () => {
+      _sdkBehavior.stderrEmitter?.emit(
+        "data",
+        Buffer.from(`a ${scoped} b ${query} d ${pathedColon} c ${ported} e ${pathless}`),
+      );
+      return Promise.reject(new Error("handshake failed"));
+    };
+
+    let err: ActivationError | undefined;
+    try {
+      await connectToUpstream(config);
+    } catch (e) {
+      err = e as ActivationError;
+    }
+
+    expect(err).toBeInstanceOf(ActivationError);
+    expect(err!.stderrTail).toContain(`a ${scoped} b ${query} d ${pathedColon} c `);
+    expect(err!.stderrTail).not.toContain("***SCOPE_URL***");
+    expect(err!.stderrTail).not.toContain("***QUERY_URL***");
+    expect(err!.stderrTail).not.toContain("***PATHED_URL***");
+    expect(err!.stderrTail).toContain("***PORTED_URL***");
+    expect(err!.stderrTail).toContain("***PATHLESS_URL***");
   });
 
   it("maps a resolved ${secret:} value whatever its env NAME", async () => {
@@ -2750,6 +2868,37 @@ describe("connectToUpstream managed-sidecar default spawn", () => {
     });
   });
 
+  it("keeps the oam pin on the connect line when the pinned launch boots from the managed tree", async () => {
+    // The usual life of an oam-pinned npx server: the oam gate is skipped and
+    // the managed rewrite takes the launch. That arm used to win the chain
+    // outright, so the line read {runtime:"node", managedSpawn:true} -- a
+    // server that had apparently never been on oam.
+    vi.mocked(resolveOamSpawn).mockResolvedValue({ command: "/usr/bin/oam", args: ["run", "/e.js"] });
+    let connects = 0;
+    _sdkBehavior.clientConnect = () => {
+      connects++;
+      return connects === 1 ? Promise.reject(new Error("oam child crashed")) : Promise.resolve();
+    };
+    const config = makeLocalConfig({ runtime: "oam", command: "npx", args: ["-y", "x"] });
+    expect((await connectToUpstream(config)).status).toBe("connected");
+    expect(_sdkBehavior.stdioConstructions.map((c) => c.command)).toEqual(["/usr/bin/oam", "npx"]);
+
+    vi.mocked(resolveManagedSpawn).mockReturnValue({ command: "/opt/node/bin/node", args: ["/sidecars/x.js"] });
+    _sdkBehavior.stdioConstructions = [];
+    vi.mocked(log).mockClear();
+    expect((await connectToUpstream(config)).status).toBe("connected");
+    expect(_sdkBehavior.stdioConstructions.map((c) => c.command)).toEqual(["/opt/node/bin/node"]);
+    expect(vi.mocked(log)).toHaveBeenCalledWith("info", "Connected to upstream", {
+      name: "Test Server",
+      namespace: "test",
+      type: "local",
+      runtime: "node",
+      managedSpawn: true,
+      downgradedFromOam: true,
+      oamPinned: true,
+    });
+  });
+
   it("does NOT pin the namespace to npx when the npx respawn fails the SAME way", async () => {
     vi.mocked(resolveManagedSpawn).mockReturnValue({ command: "/opt/node/bin/node", args: ["/sidecars/x.js"] });
     const config = makeLocalConfig({ runtime: "node", command: "npx", args: ["-y", "x"] });
@@ -3840,6 +3989,42 @@ describe("connectToUpstream activation failure categories", () => {
     expect(err.message).toContain("Command './server.sh' is not on PATH or is not executable.");
   });
 
+  it("buckets EPERM as spawn_failure, read off the error code", async () => {
+    const eperm = Object.assign(new Error("spawn ./server.sh EPERM"), { code: "EPERM", syscall: "spawn ./server.sh" });
+    _sdkBehavior.clientConnect = () => Promise.reject(eperm);
+
+    const err = await failedConnect(makeLocalConfig({ command: "./server.sh" }));
+
+    expect(err.category).toBe("spawn_failure");
+    expect(err.message).toContain("Command './server.sh' is not on PATH or is not executable.");
+    // A bare errno adds nothing, so it is not repeated in the message.
+    expect(err.message).not.toContain("Underlying error");
+  });
+
+  it("does not read a JSON-RPC error that says 'not found' as a missing binary", async () => {
+    // The child started and ANSWERED initialize with an error. The numeric
+    // code is what marks it as a protocol answer; the text is the server's.
+    const rpc = Object.assign(new Error("MCP error -32601: Method not found"), { code: -32601 });
+    _sdkBehavior.clientConnect = () => Promise.reject(rpc);
+
+    const err = await failedConnect(makeLocalConfig({ command: "npx" }));
+
+    expect(err.category).toBe("unknown");
+    expect(err.message).toContain("MCP error -32601: Method not found");
+    expect(err.message).not.toContain("is not on PATH");
+  });
+
+  it("keeps the original text when a code-less error is bucketed on its wording", async () => {
+    _sdkBehavior.clientConnect = () => Promise.reject(new Error("launcher: helper binary not found in bundle"));
+
+    const err = await failedConnect(makeLocalConfig({ command: "npx" }));
+
+    expect(err.category).toBe("spawn_failure");
+    expect(err.message).toContain("Command 'npx' is not on PATH or is not executable.");
+    expect(err.message).toContain("Underlying error: launcher: helper binary not found in bundle");
+    expect(err.message).toContain(CONFIG_POINTER);
+  });
+
   /** A spawn error shaped as libuv builds it: the message names no file. */
   function spawnError(code: string, winError?: number): Error {
     const err = Object.assign(new Error(`spawn ${code}`), { code, errno: -4094, syscall: "spawn" });
@@ -4069,6 +4254,102 @@ describe("connectToUpstream activation failure categories", () => {
     expect(err.message).toContain("Remote server at https://mcp.example.test/mcp refused the connection.");
     // A remote entry can live in a trusted project-local bundles.json too.
     expect(err.message).toContain(CONFIG_POINTER);
+  });
+
+  it("keeps a credential written into a remote url out of the refusal and timeout messages", async () => {
+    // The remote redaction map holds resolved headers only, so a key in the
+    // url's userinfo or query was quoted verbatim into an error that is
+    // logged and returned to the model.
+    const url = "https://svc-user:hunter2-password@mcp.example.test/mcp?api_key=sk-live-0123456789abcdef";
+    _sdkBehavior.clientConnect = () => Promise.reject(new Error("fetch failed"));
+    const refused = await failedConnect(makeRemoteConfig({ url }));
+    _sdkBehavior.clientConnect = () => new Promise<void>(() => {});
+    const timedOut = await failedConnect(makeRemoteConfig({ url, connectTimeoutMs: 5 }));
+
+    for (const err of [refused, timedOut]) {
+      expect(err.message).toContain("Remote server at https://mcp.example.test/mcp?... ");
+      expect(err.message).not.toContain("hunter2-password");
+      expect(err.message).not.toContain("sk-live-0123456789abcdef");
+      expect(err.configPointer?.summary).not.toContain("sk-live-0123456789abcdef");
+    }
+  });
+
+  it("keeps a credential out of the invalid-url message, which quotes a string that did not parse", async () => {
+    const err = await failedConnect(
+      makeRemoteConfig({
+        url: "https://svc-user:hunter2-password@mcp example.test/mcp?api_key=sk-live-0123456789abcdef",
+      }),
+    );
+
+    expect(err.message).toContain('has an invalid url "https://mcp example.test/mcp?..."');
+    expect(err.message).not.toContain("hunter2-password");
+    expect(err.message).not.toContain("sk-live-0123456789abcdef");
+    expect(_sdkBehavior.remoteConstructions).toHaveLength(0);
+  });
+
+  it("displayRemoteUrl leaves a credential-free url as written", () => {
+    expect(displayRemoteUrl("https://mcp.example.test/mcp")).toBe("https://mcp.example.test/mcp");
+    expect(displayRemoteUrl("http://localhost:3000/sse")).toBe("http://localhost:3000/sse");
+    // Not a url at all: shown as typed, since the message is about the typo.
+    expect(displayRemoteUrl("localhost:3000 /mcp")).toBe("localhost:3000 /mcp");
+    expect(displayRemoteUrl("user:pass-word-1@host name/mcp")).toBe("host name/mcp");
+  });
+
+  it("displayRemoteUrl drops an unencoded credential that holds a slash, a space, a ? or a #", () => {
+    // A userinfo matcher that stops at the first `/` or space handed all of
+    // these back unchanged. The first does not parse (a bogus port); the
+    // token-only ones DO parse, with the key split across host and path.
+    for (const [raw, shown] of [
+      ["https://user:abc/def==@host.example/mcp", "https://...@host.example/mcp"],
+      ["https://abc/def==@host.example/mcp", "https://...@host.example/mcp"],
+      ["https://user:1234/abcd@host.example/mcp?k=v", "https://...@host.example/mcp?..."],
+      ["https://user:p w@ho st/mcp", "https://...@ho st/mcp"],
+      ["https://tok en@ho st/mcp", "https://...@ho st/mcp"],
+      // Cutting the query before the userinfo would leave "user:p".
+      ["https://user:p?ss@ho st/mcp", "https://...@ho st/mcp"],
+      ["https://user:p#ss@host.example/mcp", "https://...@host.example/mcp"],
+      ["https://tok?en@host.example/mcp", "https://...@host.example/mcp"],
+    ]) {
+      expect(displayRemoteUrl(raw), raw).toBe(shown);
+    }
+  });
+
+  it("displayRemoteUrl over-trims a url whose path or query holds an @ rather than guess", () => {
+    expect(displayRemoteUrl("https://host.example/@org/mcp")).toBe("https://...@org/mcp");
+    expect(displayRemoteUrl("https://host.example/mcp?user=a@b.example")).toBe("https://...@b.example");
+  });
+
+  it("keeps a slash-bearing credential out of the invalid-url message", async () => {
+    const err = await failedConnect(
+      makeRemoteConfig({ url: "https://svc-user:hunter2/password==@mcp.example.test/mcp" }),
+    );
+
+    expect(err.message).toContain('has an invalid url "https://...@mcp.example.test/mcp"');
+    expect(err.message).not.toContain("hunter2");
+    expect(err.message).not.toContain("password==");
+    expect(_sdkBehavior.remoteConstructions).toHaveLength(0);
+  });
+
+  it("carries the config pointer as data so a shell caller can word its own remediation", async () => {
+    // `message` ends in the broker's remediation. `yaw-mcp call` and the
+    // `add` start check print this failure from a shell, where there is
+    // nothing to "activate again" and no mcp_connect_* call to wait for.
+    _sdkBehavior.clientConnect = () => Promise.reject(new Error("fetch failed"));
+
+    const err = await failedConnect(makeRemoteConfig());
+
+    expect(err.message).toContain("then activate it again");
+    expect(err.configPointer).toEqual({
+      summary: "Remote server at https://mcp.example.test/mcp refused the connection. fetch failed",
+      fix: 'Fix "test" in the bundles.json that defines it (~/.yaw-mcp/bundles.json, or a trusted project-local .yaw-mcp/bundles.json)',
+    });
+    const shell = shellActivationMessage(err);
+    expect(shell).toBe(`${err.configPointer?.summary} -> ${err.configPointer?.fix}, then run the command again.`);
+    expect(shell).not.toContain("mcp_connect_");
+    expect(shell).not.toContain("activate it again");
+    // Anything without a pointer comes back as its own message.
+    expect(shellActivationMessage(new ActivationError("plain", "unknown"))).toBe("plain");
+    expect(shellActivationMessage(new Error("vault locked: x"))).toBe("vault locked: x");
   });
 
   it("selects the SSE transport only when transport is 'sse'", async () => {

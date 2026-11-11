@@ -64,19 +64,23 @@ export interface UpstreamServerConfig {
   // Free-text summary used by the BM25 ranker for dispatch + context-aware
   // discover. Optional in bundles.json; absent on most entries.
   description?: string;
-  // Tools yaw-mcp reported back after the first activation in some earlier
-  // session — used to rank servers that aren't currently connected, so
-  // the ranker doesn't need to cold-start every dispatch by activating
-  // every candidate.
+  // NOT a bundles.json field: validateEntry (local-bundles.ts) never carries
+  // it, and the broker ignores one on a config entry. It is the slot
+  // ConnectServer.mergeToolCache (server.ts) fills with the LEARNED tool list
+  // -- what this server offered on an earlier activation, kept in state.json
+  // -- so the readers handed that merged view (proxy.ts buildToolList and
+  // buildToolRoutes, cli-shadows.ts, installed-summary.ts, guide.ts,
+  // sampling-rank.ts) can rank and route a server that is not connected
+  // without spawning it.
   toolCache?: Array<{ name: string; description?: string }>;
   /**
-   * A–F grade for this server, overlaid from the LOCAL grades cache that
-   * `yaw-mcp audit <namespace>` writes to ~/.yaw-mcp/grades.json --
+   * A–F grade for this server. A bundles.json entry may carry the catalog
+   * grade recorded by `yaw-mcp add` (validateEntry in local-bundles.ts
+   * keeps it). The LOCAL grades cache that `yaw-mcp audit <namespace>`
+   * writes to ~/.yaw-mcp/grades.json is applied on top and wins --
    * hydrateComplianceGrades (server.ts) and runList (local-add-cmd.ts)
-   * apply it. It never rides along in bundles.json: validateEntry drops
-   * unknown fields, so the cache is the only supplier. Absent on any
-   * server that has not been audited; absent means "ungraded" and passes
-   * filters by default (we don't punish unknown). See compliance.ts.
+   * apply it. Absent on a server with neither; absent means "ungraded" and
+   * passes filters by default (we don't punish unknown). See compliance.ts.
    */
   complianceGrade?: "A" | "B" | "C" | "D" | "F";
   /**

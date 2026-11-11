@@ -8,6 +8,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync
 import { createServer, type Server } from "node:https";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PassThrough } from "node:stream";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
   buildGitSource,
@@ -142,6 +143,25 @@ describe("add --git builds and pins a repo", () => {
     expect(r.err).toContain("re-run with --yes");
     expect(r.err).toMatch(/build: +node build\.js/);
     expect(existsSync(join(gitRoot(home), "fx"))).toBe(false);
+    expect(existsSync(join(home, ".yaw-mcp", "bundles.json"))).toBe(false);
+  }, 120_000);
+
+  it("Ctrl+C at the 'Proceed? [Y/n]' consent prompt exits 130, builds nothing and writes nothing", async () => {
+    const repo = makeRepo(NPM_FILES);
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    stdout.resume();
+    // ETX, built from its code so no control byte sits in this source.
+    stdin.write(String.fromCharCode(3));
+    const r = await add(["fx", "--git", repo.url, "--no-start-check"], {
+      isTTY: true,
+      io: { stdin, stdout, terminal: true },
+    });
+    expect(r.exitCode, r.err).toBe(130);
+    expect(r.out).toContain("This will run code from the repo on this machine:");
+    expect(r.err).toContain("yaw-mcp add: Cancelled; nothing was built.");
+    expect(r.err).not.toContain("Aborted");
+    expect(existsSync(gitBuiltPath("fx", git(repo.work, ["rev-parse", "HEAD"]), home))).toBe(false);
     expect(existsSync(join(home, ".yaw-mcp", "bundles.json"))).toBe(false);
   }, 120_000);
 
@@ -313,9 +333,10 @@ describe("add --git builds and pins a repo", () => {
     const plain = await add(["fx", "--git", repo.url, "--yes"], failWith("✖ boom → see \u001b[31mlog\u001b[0m"));
     expect(plain.exitCode, plain.err).toBe(1);
     // Written but not launching is NOT success: the remedy printed above is
-    // the only thing the user can act on, so the add exits 1 the way update's
-    // own failed start check does (the --json document still carries
-    // started/startError, and the entry is still in `written`).
+    // the only thing the user can act on, so the add exits 1 (update, by
+    // contrast, exits 0 on its own failed start check -- git-update.test.ts).
+    // The --json document still carries started/startError, and the entry is
+    // still in `written`.
     expect(commands).toEqual([process.execPath]);
     expect(plain.out).toContain(
       "Added, but it did not start: ? boom ? see ?[31mlog?[0m. Set its env (yaw-mcp set fx env.KEY",
@@ -592,6 +613,30 @@ describe("the build directory is the one it runs from", () => {
     const head = git(repo.work, ["rev-parse", "HEAD"]);
     expect(existsSync(gitBuildDir("fx", head, home))).toBe(false);
   }, 180_000);
+
+  it("refuses an --entry that is a directory instead of writing a marker that never reads as built", async () => {
+    const repo = makeRepo(NPM_FILES);
+    const head = git(repo.work, ["rev-parse", "HEAD"]);
+    const r = await add(["fx", "--git", repo.url, "--yes", "--no-start-check", "--entry", "dist"]);
+    expect(r.exitCode).toBe(1);
+    expect(r.err).toContain(`Built ${head.slice(0, 7)} but its entry dist is not a file. Pass --entry <file>.`);
+    expect(existsSync(gitBuiltPath("fx", head, home))).toBe(false);
+    expect(existsSync(join(home, ".yaw-mcp", "bundles.json"))).toBe(false);
+  }, 180_000);
+
+  it("stores a subdir typed as ./path/ in its tidy form, and a re-add under another spelling reuses the build", async () => {
+    const files = Object.fromEntries(Object.entries(NPM_FILES).map(([k, v]) => [`server/${k}`, v]));
+    const repo = makeRepo(files);
+    const head = git(repo.work, ["rev-parse", "HEAD"]);
+    const first = await add(["fx", "--git", repo.url, "--subdir", "./server/", "--yes", "--no-start-check"]);
+    expect(first.exitCode, first.err).toBe(0);
+    expect(bundles().servers[0].git).toMatchObject({ subdir: "server", commit: head });
+    expect(JSON.parse(readFileSync(gitBuiltPath("fx", head, home), "utf8")).subdir).toBe("server");
+    out = [];
+    const again = await add(["fx", "--git", repo.url, "--subdir", "server", "--yes", "--no-start-check"]);
+    expect(again.exitCode, again.err).toBe(0);
+    expect(again.out).toContain("Using the existing build of");
+  }, 240_000);
 
   it("wipes a build directory a killed build left without a marker, then builds there", async () => {
     const repo = makeRepo(NPM_FILES);
@@ -1070,10 +1115,96 @@ describe("add collisions and project trust", () => {
     // takes: name it yourself rather than remove first (local-add-cmd.ts:1468).
     expect(r.err).toContain(`To replace it, name it yourself: yaw-mcp add fxcrm --git ${repo.url}`);
     expect(r.err).not.toContain("To replace it, remove it first");
-    // The refusal comes AFTER the build (local-add-cmd builds at ~1419, checks
-    // the repo-chosen name at ~1455), so the checkout is on disk -- what the
-    // refusal guarantees is that nothing was WRITTEN.
+    // The refusal comes AFTER the build (the name is the repo's, read from the
+    // clone), so nothing was WRITTEN -- and the build no entry pins is deleted
+    // again: "their-crm" is not a git server, so nothing else ever would.
     expect(JSON.parse(readFileSync(join(home, ".yaw-mcp", "bundles.json"), "utf8")).servers).toEqual([theirs]);
+    expect(existsSync(join(gitRoot(home), "fxcrm"))).toBe(false);
+  }, 180_000);
+
+  it("refuses a typed name the write would keep under another namespace, and deletes the build", async () => {
+    const repo = makeRepo(NPM_FILES);
+    // Matched by NAME only: the write keeps the stored namespace, and the
+    // loader would look for the build under git/legacy_fx, where there is none.
+    mkdirSync(join(home, ".yaw-mcp"), { recursive: true });
+    const theirs = { namespace: "legacy_fx", name: "fx", command: "npx", args: ["-y", "legacy-fx"] };
+    writeFileSync(join(home, ".yaw-mcp", "bundles.json"), JSON.stringify({ version: 1, servers: [theirs] }));
+
+    const r = await add(["fx", "--git", repo.url, "--yes", "--no-start-check"]);
+    expect(r.exitCode, r.err).toBe(1);
+    expect(r.err).toContain('already has a server named "fx" under the namespace "legacy_fx"');
+    expect(r.err).toContain("nothing was written");
+    expect(r.err).toContain("yaw-mcp remove legacy_fx");
+    expect(r.out).not.toContain("Added");
+    expect(bundles().servers).toEqual([theirs]);
+    expect(existsSync(join(gitRoot(home), "fx"))).toBe(false);
+  }, 180_000);
+
+  it("a refusal leaves a build that was already there", async () => {
+    const repo = makeRepo({ ...NPM_FILES, "yaw-mcp.json": JSON.stringify({ version: 1, namespace: "fxcrm" }) });
+    const head = git(repo.work, ["rev-parse", "HEAD"]);
+    const first = await add(["--git", repo.url, "--yes", "--no-start-check"]);
+    expect(first.exitCode, first.err).toBe(0);
+    // The entry is replaced by an unrelated server of the same namespace; the
+    // build of that commit stays on disk, and a refused re-add only reuses it.
+    const theirs = { namespace: "fxcrm", name: "Their CRM", command: "npx", args: ["-y", "their-crm"] };
+    writeFileSync(join(home, ".yaw-mcp", "bundles.json"), JSON.stringify({ version: 1, servers: [theirs] }));
+    out = [];
+    err = [];
+    const r = await add(["--git", repo.url, "--yes", "--no-start-check"]);
+    expect(r.exitCode, r.err).toBe(1);
+    expect(r.err).toContain("already has a server by that name; nothing was written");
+    expect(existsSync(gitBuildDir("fxcrm", head, home))).toBe(true);
+  }, 180_000);
+
+  /** A project bundles.json under `cwd` (found by the walk from there) and a
+   *  user file whose "fx" sits under another namespace, so `add fx --git` is
+   *  refused after it has built. */
+  function refusedAddOverProjectFile(projectFile: string): string {
+    cwd = join(home, "proj");
+    const dir = join(cwd, CONFIG_DIRNAME);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(localBundlesPath(dir), projectFile);
+    mkdirSync(join(home, ".yaw-mcp"), { recursive: true });
+    const theirs = { namespace: "legacy_fx", name: "fx", command: "npx", args: ["-y", "legacy-fx"] };
+    writeFileSync(join(home, ".yaw-mcp", "bundles.json"), JSON.stringify({ version: 1, servers: [theirs] }));
+    return localBundlesPath(dir);
+  }
+
+  it("a refusal keeps a fresh build that another bundles.json pins", async () => {
+    const repo = makeRepo(NPM_FILES);
+    const head = git(repo.work, ["rev-parse", "HEAD"]);
+    // The project file pins fx @ head, and no build of it is on disk yet: the
+    // add below makes it, so it is this add's build and not a reused one.
+    const pin = { namespace: "fx", name: "fx", git: { url: repo.url, commit: head, entry: "dist/index.js" } };
+    refusedAddOverProjectFile(JSON.stringify({ version: 1, servers: [pin] }));
+    expect(existsSync(gitBuildDir("fx", head, home))).toBe(false);
+
+    const r = await add(["fx", "--git", repo.url, "--yes", "--no-start-check"]);
+    expect(r.exitCode, r.err).toBe(1);
+    expect(r.err).toContain('already has a server named "fx" under the namespace "legacy_fx"');
+    expect(r.out).not.toContain("Using the existing build");
+    // Pinned, so kept -- and silently: "not deleted" is for a build that could
+    // not be judged.
+    expect(existsSync(join(gitBuildDir("fx", head, home), "dist", "index.js"))).toBe(true);
+    expect(existsSync(gitBuiltPath("fx", head, home))).toBe(true);
+    expect(r.err).not.toContain("was not deleted");
+  }, 180_000);
+
+  it("a refusal keeps a fresh build, and says so, when a file that may pin it cannot be read", async () => {
+    const repo = makeRepo(NPM_FILES);
+    const head = git(repo.work, ["rev-parse", "HEAD"]);
+    const projectFile = refusedAddOverProjectFile("{ this is not json");
+
+    const r = await add(["fx", "--git", repo.url, "--yes", "--no-start-check"]);
+    expect(r.exitCode, r.err).toBe(1);
+    expect(r.err).toContain('already has a server named "fx" under the namespace "legacy_fx"');
+    const dir = gitBuildDir("fx", head, home);
+    expect(r.err).toContain(
+      `the build at ${dir} was not deleted: yaw-mcp could not read ${projectFile}, which may pin it.`,
+    );
+    expect(existsSync(join(dir, "dist", "index.js"))).toBe(true);
+    expect(existsSync(gitBuiltPath("fx", head, home))).toBe(true);
   }, 180_000);
 
   it("--project into a file trusted before the edit says the new contents are trusted too", async () => {

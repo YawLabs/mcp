@@ -810,6 +810,41 @@ describe("cmd.exe metacharacter gate", () => {
       expect(await readGradesCache(home)).toEqual({});
     });
 
+    it("redacts a credential in the offending token before naming it", async () => {
+      // `&` is the commonest trigger, so the offender is typically a URL with
+      // a query string or a secret flag's value -- exactly the args that carry
+      // a credential. The refusal has to name the token without printing it.
+      home = makeHome([
+        {
+          namespace: "ctxlint",
+          type: "local",
+          command: "node",
+          args: ["x.js", "https://host.example/sse?api_key=SUPERSECRETVALUE123&v=1"],
+        },
+        { namespace: "flagged", type: "local", command: "node", args: ["x.js", "--token", "TOPSECRET&MORE"] },
+      ]);
+      for (const namespace of ["ctxlint", "flagged"]) {
+        const io = captureIO();
+        const r = await runAudit({
+          namespace,
+          home,
+          cwd: home,
+          platform: "win32",
+          out: io.push,
+          err: io.pushErr,
+          runner: async () => ({ grade: "A", score: 100 }),
+        });
+        expect(r.exitCode).toBe(2);
+        const err = io.err.join("\n");
+        expect(err).toContain("cmd.exe metacharacter");
+        expect(err).not.toContain("SUPERSECRETVALUE123");
+        expect(err).not.toContain("TOPSECRET");
+        expect(err).toContain("<redacted>");
+        // Still says WHERE: the URL's host, or the flag whose value it was.
+        expect(err).toContain(namespace === "ctxlint" ? "host.example" : "--token");
+      }
+    });
+
     it("refuses a metacharacter in the COMMAND, not just the args", async () => {
       home = makeHome([{ namespace: "ctxlint", type: "local", command: "srv&calc", args: [] }]);
       const io = captureIO();

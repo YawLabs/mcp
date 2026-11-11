@@ -76,10 +76,11 @@
 // the notes point at `yaw-mcp install mcp` instead.
 //
 // VERSION FLOOR: THIS ROW NEEDS A TYPED CLI NEWER THAN 1.5.0. Released typed
-// 1.5.0 -- the newest release as of 2026-09-13 -- does not read this file, so
-// with it an entry here loads nothing. The notes, README and CHANGELOG say
-// "newer than 1.5.0" rather than naming the next version, which has not
-// shipped.
+// 1.5.0 -- the newest release when this row was written, 2026-09-13 -- does
+// not read this file, so with it an entry here loads nothing. A release that
+// does read it is live now (see the `typed update` paragraph below). The
+// row's notes say "newer than 1.5.0" rather than naming the first version
+// that reads the file, which was not recorded here.
 //
 // AND A PROBE FOR IT, because a typed CLI too old for this file ignores it
 // without a word. `programProbe` reads the typed CLI bundle typed's launcher
@@ -100,14 +101,15 @@
 //
 // The warning names `typed update`, the launcher's own command that re-runs
 // typed's installer and replaces the default bundle (tools/typed, `update)`).
-// That installs the newest RELEASED bundle, so it clears the warning only once
-// a typed release newer than 1.5.0 is live: measured 2026-09-13, the bundle it
-// downloads (app.typed.cloud/typed-cli/cli.mjs) is 1.5.0 and carries no
-// "mcp.json". Naming it is correct only because this row does not ship before
-// that release -- the floor above -- and a release of yaw-mcp carrying this row
-// ahead of it would make the advice a loop. With TYPED_CLI_BUNDLE set that
-// command does not touch the bundle actually run, so that case says so
-// instead.
+// That installs the newest RELEASED bundle, so the advice is right only while
+// the released bundle reads this file. It does: measured 2026-11-11, the
+// bundle it downloads (app.typed.cloud/typed-cli/cli.mjs) carries `"mcp.json"`
+// exactly once, where the 1.5.0 one measured 2026-09-13 carried it zero times.
+// Nothing in this repo re-checks that -- the probe reads the LOCAL bundle
+// only, and whenever it fires for the default bundle the warning advises
+// `typed update` -- so a typed release that dropped the file again would turn
+// the advice into a loop. With TYPED_CLI_BUNDLE set that command does not
+// touch the bundle actually run, so that case says so instead.
 
 import { isAbsolute, join, resolve } from "node:path";
 import { defineTarget, type PathBase, type ResolvedPath } from "./install-target-model.js";

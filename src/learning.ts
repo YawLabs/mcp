@@ -12,10 +12,7 @@
 //
 // Recorded on the proxy path in handleToolCall through recordOutcome:
 // ONE call per routed tool call, banking the dispatch (denominator) and
-// the graded reward (numerator) together. The older binary pair
-// (recordDispatch + a conditional recordSuccess) is retired -- it has no
-// production caller left and survives only for tests; see the
-// @deprecated notes on those two methods. Activation success is
+// the graded reward (numerator) together. Activation success is
 // deliberately NOT recorded -- otherwise a server that activates fine
 // but every tool call 500s would still look 100% reliable in the
 // cross-session signal.
@@ -84,54 +81,11 @@ export class LearningStore {
   // cannot today).
   private usage = new Map<string, NamespaceUsage>();
 
-  /**
-   * @deprecated Test-only. The binary recordDispatch + recordSuccess pair was
-   * replaced on the proxy path by the graded recordOutcome; no production
-   * caller remains (grep src/ outside tests). Kept because existing tests still
-   * seed stores through it: learning.test.ts is by far the heaviest user, with
-   * persistence.test.ts and server.test.ts behind it -- delete both methods
-   * together with all three sets of call sites, not before. Do NOT
-   * reach for it in new code: it records a denominator with no numerator,
-   * which recordMiss already expresses with an accurate name.
-   */
-  recordDispatch(namespace: string): void {
-    const prev = this.usage.get(namespace);
-    this.usage.set(namespace, {
-      dispatched: (prev?.dispatched ?? 0) + 1,
-      succeeded: prev?.succeeded ?? 0,
-      lastUsedAt: Date.now(),
-    });
-  }
-
-  /**
-   * @deprecated Test-only -- see recordDispatch. Use recordOutcome, which banks
-   * the dispatch and the graded credit in one call and therefore cannot produce
-   * the succeeded > dispatched state this method can.
-   */
-  recordSuccess(namespace: string): void {
-    const prev = this.usage.get(namespace);
-    // Symmetric with recordDispatch (which leaves succeeded at 0): a bare
-    // success leaves dispatched at 0 rather than seeding it to 1, so it never
-    // fabricates a dispatch the caller never recorded (which would imply a
-    // 100% rate from a call that recorded no dispatch). boostFactor coerces
-    // dispatched up to succeeded (Math.max), so the rate still lands in [0, 1]
-    // -- see the coerce comment there. Note that this in-memory-only shape does
-    // NOT survive a save/load cycle: both loadSnapshot and persistence.ts's
-    // sanitizeLearning clamp succeeded back down to dispatched.
-    this.usage.set(namespace, {
-      dispatched: prev?.dispatched ?? 0,
-      succeeded: (prev?.succeeded ?? 0) + 1,
-      lastUsedAt: Date.now(),
-    });
-  }
-
-  // Graded outcome in [0,1] for a single dispatched proxy call. This is
-  // the SOUND replacement for the binary recordDispatch + recordSuccess
-  // pair on the proxy path: a 200/empty/error-shaped reply no longer banks
-  // full credit (the reward is computed by reward.ts/computeOutcomeReward).
-  // One call records BOTH the dispatch (denominator) and the graded credit
-  // (numerator), so callers no longer pair recordDispatch with a
-  // conditional recordSuccess. reward is clamped to [0,1].
+  // Graded outcome in [0,1] for a single dispatched proxy call: a
+  // 200/empty/error-shaped reply does not bank full credit (the reward is
+  // computed by reward.ts/computeOutcomeReward). One call records BOTH the
+  // dispatch (denominator) and the graded credit (numerator), so the store
+  // can never hold more credit than dispatches. reward is clamped to [0,1].
   recordOutcome(namespace: string, reward: number): void {
     const r = Number.isFinite(reward) ? Math.min(1, Math.max(0, reward)) : 0;
     const prev = this.usage.get(namespace);
@@ -146,8 +100,8 @@ export class LearningStore {
   // re-dispatch routing-miss detector in server.ts (handleDispatch): when
   // the model abandons server A and re-routes a similar intent to B, A's
   // earlier "clean" reply was useless in hindsight, so we depress A's success
-  // rate by one failed observation. Denominator-only — same shape as a
-  // recordDispatch that never sees a matching success.
+  // rate by one failed observation. Denominator-only: the same row
+  // recordOutcome(namespace, 0) would write.
   recordMiss(namespace: string): void {
     const prev = this.usage.get(namespace);
     this.usage.set(namespace, {
@@ -197,15 +151,11 @@ export class LearningStore {
     const u = this.usage.get(namespace);
     if (!u) return 1.0;
 
-    // Defensive coerce. No production recorder can produce succeeded >
-    // dispatched (recordOutcome banks at most 1.0 of credit per dispatch,
-    // recordMiss banks none, adjustSucceeded clamps to [0, dispatched]) and
-    // neither loading path lets that shape in from disk -- but the deprecated
-    // recordSuccess still can in-memory. Treat dispatched as at least succeeded
-    // so the rate computation stays in [0, 1] and the penalty branch is not
-    // triggered by a perfectly-successful namespace that happened to bypass the
-    // dispatch counter.
-    const dispatched = Math.max(u.dispatched, u.succeeded);
+    // succeeded <= dispatched always holds here, so the rate below is in
+    // [0, 1] without a coerce: recordOutcome banks at most 1.0 of credit per
+    // dispatch, recordMiss banks none, adjustSucceeded clamps to
+    // [0, dispatched], and loadSnapshot clamps succeeded down to dispatched.
+    const dispatched = u.dispatched;
 
     // Penalty branch — flaky history shrinks the score so dispatch
     // prefers an equivalent healthy alternative. Rate-based signal;

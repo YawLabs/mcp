@@ -106,6 +106,18 @@ describe("redactIntent", () => {
     expect(r.redactedCount).toBe(1);
   });
 
+  it("KNOWN GAP: a key cut into short groups by punctuation survives as its groups", () => {
+    // Pins the gap foundry.ts's privacy scope note documents, so the note
+    // cannot go stale in either direction: every group is under the 12-char
+    // mixed floor, and no raw-string rule covers the shape.
+    const key = redactIntent("activate AB12C-DE34F-GH56I-JK78L");
+    expect(key.tokens).toEqual(expect.arrayContaining(["ab12c", "de34f", "gh56i", "jk78l"]));
+    // A UUID keeps its short groups; only the 12-digit tail goes (phone shape).
+    const uuid = redactIntent("lookup 550e8400-e29b-41d4-a716-446655440000");
+    expect(uuid.tokens).toEqual(expect.arrayContaining(["550e8400", "e29b", "41d4", "a716"]));
+    expect(uuid.tokens).not.toContain("446655440000");
+  });
+
   it("drops a 12-19 char mixed letter+digit key (below the old 20 floor)", () => {
     const r = redactIntent("key a1b2c3d4e5f6g7 here");
     expect(r.tokens).not.toContain("a1b2c3d4e5f6g7");
@@ -278,9 +290,12 @@ describe("appendFoundryTrace", () => {
   let home: string;
   const orig = process.env.YAW_MCP_FOUNDRY;
 
+  // A rescued dispatch: the ranker picked gh, gh failed to start, and the
+  // runner-up gitlab served the call.
   const trace = {
     tokens: ["create", "issue"],
     chosen: "gh",
+    loaded: "gitlab",
     redactedCount: 1,
   };
 
@@ -312,15 +327,23 @@ describe("appendFoundryTrace", () => {
     const lines = contents.trim().split("\n");
     expect(lines).toHaveLength(1);
     const parsed = JSON.parse(lines[0]);
-    // The candidate shortlist is accepted from the caller but NOT persisted:
-    // nothing ever read it back, and it only ate into the 5 MiB cap. The
-    // written line is the redacted bag plus the routing decision, nothing else.
+    // The written line is the redacted bag plus the routing decision --
+    // the ranked pick AND the server that served it -- nothing else (no
+    // candidate shortlist: nothing ever read it back).
     expect(parsed).toEqual({
       tokens: trace.tokens,
-      chosen: trace.chosen,
+      chosen: "gh",
+      loaded: "gitlab",
       redactedCount: trace.redactedCount,
     });
-    expect(contents).not.toContain("gitlab");
+  });
+
+  it("writes loaded: null when nothing loaded, not an absent key", async () => {
+    process.env.YAW_MCP_FOUNDRY = "1";
+    await appendFoundryTrace({ ...trace, loaded: null }, home);
+    const parsed = JSON.parse(readFileSync(join(userConfigDir(home), FOUNDRY_FILENAME), "utf8").trim());
+    expect(parsed).toHaveProperty("loaded", null);
+    expect(parsed.chosen).toBe("gh");
   });
 
   it("appends additional lines on repeat calls", async () => {

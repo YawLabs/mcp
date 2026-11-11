@@ -73,8 +73,9 @@
 //     `config.format` is "json" and not "jsonc".
 //   • Continue's file is one yaw-mcp CREATES and owns
 //     (`mcpServers/yaw-mcp.json`), not a user config we splice into. That is
-//     `config.ownership: "dedicated"`, and it changes the uninstall wording
-//     rather than any path.
+//     `config.ownership: "dedicated"`: data the row carries, which nothing
+//     in src/ reads yet -- Continue's uninstall says exactly what a shared
+//     client's does (pinned in target-continue.test.ts).
 //   • typed gets a file of its own, `<home>/.config/typed/mcp.json` on every
 //     OS, rather than one of Claude Code's: CLAUDE_CONFIG_DIR can be a
 //     disposable overlay, Yaw Terminal rewrites a `@yawlabs/mcp@latest` entry
@@ -337,12 +338,15 @@ export interface ResolvePathOptions {
    *  user/local scope writes to `<dir>/.claude.json` instead of
    *  `<home>/.claude.json`, matching Claude Code's actual read path.
    *  The resolver never reads this one from the environment on its own:
-   *  callers (install-cmd, doctor-cmd, index.ts) read
-   *  `process.env.CLAUDE_CONFIG_DIR` and pass it in. Same for `appData` above
-   *  -- this function reads NO environment at all. */
+   *  `readClientEnv` (client-config.ts) is the one reader of
+   *  CLAUDE_CONFIG_DIR, and whoever calls it -- the dispatcher in index.ts
+   *  for install and uninstall, doctor's probe for itself -- passes the
+   *  result in. Same for `appData` above -- this function reads NO
+   *  environment at all. */
   claudeConfigDir?: string;
-  /** Every client env var, as `readClientEnv` reported it. Only a MODULAR row
-   *  reads it (through `PathBase.env`); the six inline rows take their one
+  /** Every client env var, as `readClientEnv` reported it. A MODULAR row
+   *  reads it through `PathBase.env`; of the six inline rows, VS Code's Linux
+   *  user path takes `xdgConfigHome` from it and the rest take their one
    *  variable from `claudeConfigDir` above. Verbatim values, so each row
    *  applies its own resolution policy -- they differ per client, and one
    *  policy applied here would be wrong for somebody. */
@@ -361,6 +365,7 @@ export function resolveInstallPath(opts: ResolvePathOptions): ResolvedPath {
     appData: base.appData,
     projectDir: base.projectDir,
     claudeConfigDir: base.env.claudeConfigDir,
+    xdgConfigHome: base.env.xdgConfigHome,
   });
 }
 
@@ -765,9 +770,15 @@ function pathFor(
   client: InlineClientId,
   scope: InstallScope,
   os: InstallOS,
-  base: { home: string; appData: string; projectDir: string; claudeConfigDir: string | undefined },
+  base: {
+    home: string;
+    appData: string;
+    projectDir: string;
+    claudeConfigDir: string | undefined;
+    xdgConfigHome: string | undefined;
+  },
 ): ResolvedPath {
-  const { home, appData, projectDir, claudeConfigDir } = base;
+  const { home, appData, projectDir, claudeConfigDir, xdgConfigHome } = base;
   const sep = os === "windows" ? "\\" : "/";
   const joinPath = (...parts: string[]): string => parts.join(sep);
 
@@ -859,12 +870,29 @@ function pathFor(
           containerPath: ["servers"],
         };
       }
-      // Linux. Hardcoded ~/.config rather than honouring $XDG_CONFIG_HOME:
-      // this function reads no environment, and resolveInstallPath does not
-      // hand it the value. The value IS already caller-resolved and threaded
-      // as base.env.xdgConfigHome (the Zed row reads it); on a box that sets
-      // it this path is wrong -- pass it into pathFor and apply Zed's
-      // absolute-only rule (zedConfigDir) if that ever bites.
+      // Linux. VS Code keeps its user data under `$XDG_CONFIG_HOME/Code` when
+      // that variable is set and under ~/.config/Code otherwise (its
+      // userDataPath.ts: `process.env['XDG_CONFIG_HOME'] || join(homedir(),
+      // '.config')`). The value is caller-resolved and handed in, like
+      // claudeConfigDir -- this function still reads no environment.
+      //
+      // Honoured only when ABSOLUTE, the same test the Zed row applies
+      // (zedConfigDir), though for a different reason: VS Code resolves a
+      // relative value against the cwd it was launched from, which nothing
+      // here can know, so a relative value keeps the ~/.config default
+      // rather than resolve against OUR cwd and name a file VS Code would
+      // only read if started from the same directory.
+      //
+      // Not modelled: VSCODE_PORTABLE, VSCODE_APPDATA and --user-data-dir,
+      // which VS Code consults before any of this on every OS.
+      const xdg = xdgConfigHome?.trim();
+      if (xdg && isAbsolute(xdg)) {
+        return {
+          absolute: join(xdg, "Code", "User", "mcp.json"),
+          display: "$XDG_CONFIG_HOME/Code/User/mcp.json",
+          containerPath: ["servers"],
+        };
+      }
       return {
         absolute: join(home, ".config", "Code", "User", "mcp.json"),
         display: "~/.config/Code/User/mcp.json",
@@ -1109,8 +1137,24 @@ export function isCmdShimLauncher(command: string): boolean {
  *       `%*` which cmd RE-PARSES, so the element crosses TWO parses and needs a
  *       caret that survives both (`^^^&` -> `^&` -> `&`). The single-caret form
  *       that shipped before was a no-op against the shim: cmd stripped the one
- *       caret on the outer parse and the bare `&` split inside the shim. */
+ *       caret on the outer parse and the bare `&` split inside the shim.
+ *
+ *  Before any of the four: a CR or LF anywhere in the element -> REFUSE
+ *  (throw). cmd.exe reads its command line up to the first line break, so the
+ *  child got a different argv with no error: measured, `a\nver` arrived as
+ *  `a` and everything after it was dropped, `a\rver` arrived as `aver`. The
+ *  tail was not run as a second command (`x\n&echo INJ` did not echo), so this
+ *  is corruption rather than injection, but no quoting or caret carries a
+ *  line break through cmd, so the shape is refused like shape 1 instead of
+ *  written as an entry that launches something other than what it names. */
 export function escapeCmdArg(arg: string, opts: { shim: boolean }): string {
+  if (/[\r\n]/.test(arg)) {
+    throw new Error(
+      `Cannot encode an argument that contains a line break (CR or LF) for the Windows cmd /c launcher: ` +
+        `${JSON.stringify(arg)} -- cmd.exe stops reading its command line at a line break, so the server ` +
+        `would be started with a truncated argument. Rework the server's args to drop the line break.`,
+    );
+  }
   if (arg.includes('"')) {
     if (HAS_CMD_METACHAR.test(arg)) {
       throw new Error(
@@ -1162,7 +1206,8 @@ export function buildLaunchEntry(opts: BuildLaunchEntryOptions): LaunchEntry {
       // escapes at the single-parse depth. The ARG tokens, when `command` is a
       // `.cmd`/`.bat` shim (npx/npm/yarn), cross a SECOND cmd parse via that
       // shim's `%*`, so they escape at the deeper shim depth. escapeCmdArg
-      // throws on a genuinely unsafe shape (quote + metachar); that rejection
+      // throws on a shape it cannot carry (quote + metachar, or a line break
+      // in the command or any arg); that rejection
       // propagates to the caller's dispatch and surfaces as a clean error.
       const shim = isCmdShimLauncher(command);
       const wrapped: LaunchEntry = {
@@ -1272,80 +1317,6 @@ export function findLegacyEntry(container: Record<string, unknown>): string | nu
   return LEGACY_ENTRY_NAMES.find((n) => n in container) ?? null;
 }
 
-/** A key along the container path whose existing value is not an object, and so
- *  cannot have the launch entry spliced into it. */
-export interface BlockedContainerSegment {
-  /** Full key path to the offending key, for naming it in a message. */
-  path: string[];
-  /** What is there instead of an object. */
-  value: unknown;
-  /** Whether replacing it with `{}` throws nothing away -- see
-   *  `findBlockedContainerSegment`. */
-  reparable: boolean;
-}
-
-/**
- * First key along `containerPath` that holds a non-object, or null when the
- * chain is spliceable as-is.
- *
- * editJsoncEntry materializes MISSING intermediate keys, but a key that exists
- * and holds a non-object is left to jsonc-parser's `modify`, which throws
- * "Can not add index to parent of type null" -- an internal message naming
- * neither the file nor the key. The
- * pre-existing top-level check catches only a non-object ROOT, so `"mcpServers":
- * null` (hand-edited, or written by a tool that emptied it) reached the splice
- * and failed the whole install. Walking the chain here is what lets the caller
- * either repair the key or refuse while naming it.
- *
- * `reparable` splits the two shapes deliberately. null, a scalar, and an empty
- * array hold no server definitions, so replacing them with `{}` loses nothing
- * and restores the behaviour of the pre-splice merge path (which overwrote any
- * non-object container). A NON-EMPTY array can hold real entries in the wrong
- * shape, and silently dropping those to write ours is not a repair -- that case
- * is the caller's refusal.
- *
- * Lives here, not in install-cmd.ts, because doctor asks the same question of
- * the same file: install-cmd imports doctor-cmd, so doctor could not import it
- * from there without a cycle. Doctor asks it for JSON-family files only; a
- * non-JSON file's blocked container comes from its adapter's `blocked` read.
- */
-export function findBlockedContainerSegment(
-  root: Record<string, unknown>,
-  containerPath: string[],
-): BlockedContainerSegment | null {
-  // EXACT, never folded through claudeCodeContainerPaths: this is the
-  // pre-flight for a WRITE, and a write goes to the canonical path only. A
-  // drive-case sibling's shape cannot block it and must not be reported as if
-  // it did. Registered as such in the source-shape scan in
-  // src/tests/source-hygiene.test.ts.
-  let node: Record<string, unknown> = root;
-  for (let i = 0; i < containerPath.length; i++) {
-    const value = node[containerPath[i]];
-    // Absent from here down: editJsoncEntry builds the rest of the chain itself.
-    if (value === undefined) return null;
-    if (typeof value === "object" && value !== null && !Array.isArray(value)) {
-      node = value as Record<string, unknown>;
-      continue;
-    }
-    return {
-      path: containerPath.slice(0, i + 1),
-      value,
-      reparable: value === null || !Array.isArray(value) || value.length === 0,
-    };
-  }
-  return null;
-}
-
-/** How to name a non-object container value in a message. Shape, not contents:
- *  a `~/.claude.json` value can be arbitrarily large and the user needs to know
- *  WHICH key is wrong, not to have it echoed back. Used by install's messages
- *  and by doctor's CLIENTS line, so both name the key the same way. */
-export function describeJsonShape(value: unknown): string {
-  if (value === null) return "null";
-  if (Array.isArray(value)) return value.length === 0 ? "an empty array" : `an array of ${value.length}`;
-  return `a ${typeof value}`;
-}
-
 /** The by-hand fix for a client config that exists but does not parse as a
  *  JSON object: invalid JSON, or valid JSON whose root is an array, a scalar or
  *  null. `yaw-mcp install` refuses such a file with exit 1 and writes nothing,
@@ -1369,8 +1340,9 @@ export function unparseableConfigFix(then: string, syntax: SyntaxName = "JSON"):
 }
 
 /** The by-hand fix for a container key install cannot splice its entry into:
- *  one findBlockedContainerSegment reports as NOT reparable (a non-empty
- *  array -- null, a scalar and an empty array are replaced with `{}` instead).
+ *  one the site's adapter reports as blocked and NOT reparable (JSON: a
+ *  non-empty array -- null, a scalar and an empty array are replaced with `{}`
+ *  instead; TOML: every non-table shape).
  *  Shared by install's refusal, doctor's CLIENTS line and import's refusal to
  *  remove originals, for the same reason as unparseableConfigFix.
  *

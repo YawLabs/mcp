@@ -9,6 +9,7 @@
 import { describe, expect, it } from "vitest";
 import {
   addJsoncArrayElement,
+  duplicateJsoncKeyOnPath,
   editJsoncEntry,
   editJsoncPath,
   parseJsonc,
@@ -655,5 +656,48 @@ describe("addJsoncArrayElement / removeJsoncArrayElements over non-scalar elemen
   it("returns the input when a removal's path names no array", () => {
     const src = lf("{", '  "rules": 1', "}", "");
     expect(removeJsoncArrayElements(src, ["rules"], () => true)).toBe(src);
+  });
+});
+
+describe("a key written twice -- the splicer and the reader disagree, and duplicateJsoncKeyOnPath says so", () => {
+  const src = lf("{", '  "s": {', '    "mcp": {"command": "A"},', '    "mcp": {"command": "B"}', "  }", "}", "");
+
+  it("pins the disagreement itself: the reader takes the last definition, the splice edits the first", () => {
+    // Not a behaviour anyone wants -- recorded so that a change to either
+    // half (a splice that targets the last, a reader that takes the first)
+    // shows up here and the guard below is re-thought with it.
+    expect(parseJsonc(src)).toEqual({ s: { mcp: { command: "B" } } });
+    const edited = editJsoncEntry(src, ["s"], "mcp", { command: "C" });
+    expect(edited).toContain('"mcp": {"command": "B"}');
+    expect(edited).not.toContain('"command": "A"');
+    expect(parseJsonc(edited)).toEqual({ s: { mcp: { command: "B" } } });
+  });
+
+  it("names the first duplicated key on a path, and how many times it is written", () => {
+    expect(duplicateJsoncKeyOnPath(src, ["s", "mcp"])).toEqual({ path: ["s", "mcp"], count: 2 });
+    expect(duplicateJsoncKeyOnPath(`${String.fromCharCode(0xfeff)}${src}`, ["s", "mcp"])).toEqual({
+      path: ["s", "mcp"],
+      count: 2,
+    });
+    // A container written three times is reported before anything under it.
+    expect(duplicateJsoncKeyOnPath('{"s": {}, "s": {"mcp": 1, "mcp": 2}, "s": 3}', ["s", "mcp"])).toEqual({
+      path: ["s"],
+      count: 3,
+    });
+    // An escaped spelling is the same key.
+    const escaped = `{"mcp": 1, "${String.fromCharCode(92)}u006dcp": 2}`;
+    expect(parseJsonc(escaped)).toEqual({ mcp: 2 });
+    expect(duplicateJsoncKeyOnPath(escaped, ["mcp"])).toEqual({ path: ["mcp"], count: 2 });
+  });
+
+  it("returns null when every key on the path is written at most once", () => {
+    expect(duplicateJsoncKeyOnPath(src, ["s"])).toBeNull();
+    expect(duplicateJsoncKeyOnPath(src, ["s", "other"])).toBeNull();
+    expect(duplicateJsoncKeyOnPath(src, ["absent", "mcp"])).toBeNull();
+    // A duplicate that is not on the path, a non-object on the way, and text
+    // with no tree at all.
+    expect(duplicateJsoncKeyOnPath('{"a": 1, "a": 2, "s": {"mcp": 1}}', ["s", "mcp"])).toBeNull();
+    expect(duplicateJsoncKeyOnPath('{"s": [1, 2]}', ["s", "mcp"])).toBeNull();
+    expect(duplicateJsoncKeyOnPath("", ["s"])).toBeNull();
   });
 });

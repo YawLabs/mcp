@@ -1,13 +1,29 @@
 import { mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { GRADES_FILENAME } from "../grades-cache.js";
 import { BUNDLES_FILENAME } from "../local-bundles.js";
 import { CONFIG_DIRNAME } from "../paths.js";
 import { STATE_FILENAME, STATE_SCHEMA_VERSION } from "../persistence.js";
 import { SECRETS_FILENAME } from "../secrets-vault.js";
 import { collectStatus, parseStatusArgs, runStatus, STATUS_SCHEMA_VERSION, STATUS_USAGE } from "../status-cmd.js";
+
+// A loader that THROWS has no on-disk shape: every read failure it can meet is
+// caught inside it and reported in `warnings`. The throw is injected at the
+// module boundary, only while `loaderFault.error` is set; every other call
+// passes straight through to the real loader (doctor-cmd.test.ts stages the
+// same fault the same way).
+const { loaderFault } = vi.hoisted(() => ({ loaderFault: { error: null as Error | null } }));
+
+vi.mock("../local-bundles.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../local-bundles.js")>();
+  const loadLocalBundles: typeof actual.loadLocalBundles = (...args) => {
+    if (loaderFault.error !== null) return Promise.reject(loaderFault.error);
+    return actual.loadLocalBundles(...args);
+  };
+  return { ...actual, loadLocalBundles };
+});
 
 // Every test runs against an isolated fake home so the developer's real
 // ~/.yaw-mcp is never read (and, per the no-writes test below, never
@@ -63,6 +79,43 @@ describe("status", () => {
   }
 
   const collect = (env: NodeJS.ProcessEnv = {}) => collectStatus({ home, cwd: home, env });
+
+  // --- loader throw -------------------------------------------------------
+
+  describe("when the bundles loader itself throws", () => {
+    beforeEach(() => {
+      loaderFault.error = new Error("EPERM: trust probe failed, api_key=abc123def456");
+    });
+    afterEach(() => {
+      loaderFault.error = null;
+    });
+
+    it("still prints a payload under --json: exit 1, readable false, the scrubbed message in warnings", async () => {
+      // Uncaught, the rejection reached index.ts's dispatch: a stderr line,
+      // exit 1 and ZERO bytes on stdout, where exit 1 is documented as a
+      // payload with config.readable false.
+      const io = captureIO();
+      const r = await runStatus({ home, cwd: home, env: {}, json: true, out: io.push, err: io.pushErr });
+      expect(r.exitCode).toBe(1);
+      const payload = JSON.parse(io.out.join(""));
+      expect(payload.ok).toBe(false);
+      expect(payload.config.readable).toBe(false);
+      expect(payload.config.path).toBeNull();
+      expect(payload.config.warnings).toHaveLength(1);
+      expect(payload.config.warnings[0]).toContain("EPERM: trust probe failed");
+      expect(payload.config.warnings[0]).not.toContain("abc123def456");
+      expect(payload.serverCount).toBe(0);
+      expect(io.err.join("")).toContain("warning: could not load bundles.json");
+    });
+
+    it("does not call the config 'none yet' in the text view", async () => {
+      const io = captureIO();
+      const r = await runStatus({ home, cwd: home, env: {}, out: io.push, err: io.pushErr });
+      expect(r.exitCode).toBe(1);
+      expect(io.out.join("")).toContain("config:   UNREADABLE");
+      expect(io.out.join("")).not.toContain("none yet -- add a server");
+    });
+  });
 
   // --- fresh machine ------------------------------------------------------
 
@@ -167,6 +220,24 @@ describe("status", () => {
     expect(unlocked.vault).toMatchObject({ exists: true, locked: false, passphraseInEnv: true });
   });
 
+  it("never prints 'unlocked' in the text view: a passphrase in env is not a verified unlock", async () => {
+    // status never opens the vault, so the most it can say about a passphrase
+    // is that one is set. A stale one read "unlocked" here while every
+    // vault-backed server refused to start; doctor is the command that tries it.
+    mkdirSync(yawMcpDir, { recursive: true });
+    writeFileSync(join(yawMcpDir, SECRETS_FILENAME), "{}", "utf8");
+    const text = async (env: NodeJS.ProcessEnv): Promise<string> => {
+      const io = captureIO();
+      await runStatus({ home, cwd: home, env, out: io.push, err: io.pushErr });
+      return io.out.join("");
+    };
+    const withPass = await text({ YAW_MCP_VAULT_PASSPHRASE: "not-the-real-one" });
+    expect(withPass).toMatch(/^vault: +present, passphrase set \(not verified/m);
+    expect(withPass).not.toMatch(/unlocked/);
+    expect(withPass).not.toContain("not-the-real-one");
+    expect(await text({})).toMatch(/^vault: +present, no passphrase in this env \(locked\)$/m);
+  });
+
   it("does not call a vault that was never created locked", async () => {
     // "No vault" is not "locked vault": a panel badge saying locked on a
     // machine with no secrets at all sends the user to unlock nothing.
@@ -262,6 +333,58 @@ describe("status", () => {
     // Still exit-0 material: learning is disposable derived data, so a
     // garbled state file is a degraded reading, not an unreadable machine.
     expect(payload.ok).toBe(true);
+  });
+
+  // The state loader's own warnings are worded for the server ("starting
+  // fresh") and, on the cli surface, go straight to process.stderr. status
+  // reports a bad state.json itself (learning.readable false / "learning:
+  // unreadable"), so the loader must stay quiet here, as it does for doctor.
+  describe.each([
+    {
+      label: "malformed",
+      stage: (dir: string) => writeFileSync(join(dir, STATE_FILENAME), "{ not json", "utf8"),
+    },
+    {
+      label: "unreadable",
+      stage: (dir: string) => mkdirSync(join(dir, STATE_FILENAME)),
+    },
+  ])("with a $label state.json", ({ stage }) => {
+    // Pin the level low enough that the loader's warn WOULD print: an ambient
+    // LOG_LEVEL=error (or YAW_MCP_LOG_LEVEL=error, which wins over it) mutes
+    // it with or without `quiet`, and the absence checks below would then
+    // pass vacuously.
+    beforeEach(() => {
+      vi.stubEnv("LOG_LEVEL", "debug");
+      vi.stubEnv("YAW_MCP_LOG_LEVEL", undefined);
+    });
+    afterEach(() => {
+      vi.unstubAllEnvs();
+    });
+    for (const json of [false, true]) {
+      it(`reports it without the state loader's warning on stderr (${json ? "--json" : "text"})`, async () => {
+        mkdirSync(yawMcpDir, { recursive: true });
+        stage(yawMcpDir);
+        const io = captureIO();
+        const spy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+        let result: Awaited<ReturnType<typeof runStatus>>;
+        let processErr: string;
+        try {
+          result = await runStatus({ home, cwd: home, env: {}, json, out: io.push, err: io.pushErr });
+          processErr = spy.mock.calls.map((c) => String(c[0])).join("");
+        } finally {
+          spy.mockRestore();
+        }
+        expect(processErr).not.toContain("yaw-mcp state");
+        expect(io.err.join("")).not.toContain("yaw-mcp state");
+        expect(result.exitCode).toBe(0);
+        const stdout = io.out.join("");
+        if (json) {
+          expect(JSON.parse(stdout).learning.readable).toBe(false);
+        } else {
+          expect(stdout).toContain("learning: unreadable");
+        }
+      });
+    }
   });
 
   // --- side-effect freedom ------------------------------------------------

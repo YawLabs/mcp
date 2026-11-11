@@ -17,7 +17,8 @@
 // the cached version at read time, so raising the floor needs no invalidation.
 //
 // Best-effort in both directions. A missing, unreadable or malformed file is a
-// miss; a failed write is silent beyond a debug line. Concurrent writers (N
+// miss, and so is a malformed entry inside a readable one (the next write
+// drops it); a failed write is silent beyond a debug line. Concurrent writers (N
 // brokers sharing a home) race read-modify-write on the whole file; the loser
 // at worst drops another binary's entry, which costs one re-probe.
 
@@ -69,13 +70,36 @@ export function oamBinaryIdentity(absPath: string): OamBinaryIdentity | null {
   }
 }
 
+/** A stored entry with every field the reader and the writer rely on. */
+function isStoredEntry(value: unknown): value is StoredEntry {
+  if (typeof value !== "object" || value === null) return false;
+  const e = value as Record<string, unknown>;
+  return (
+    typeof e.size === "number" &&
+    typeof e.mtimeMs === "number" &&
+    (e.version === null || typeof e.version === "string") &&
+    typeof e.probedAt === "string"
+  );
+}
+
+/** The file's well-shaped entries. Anything else in it -- a null, a number, an
+ *  entry missing a field, an `entries` that is an array -- is DROPPED rather
+ *  than returned: the writer sorts on each entry's fields, so one damaged
+ *  value used to throw there, and since the write is what replaces the file,
+ *  the damage then outlived every later write and each process re-ran the
+ *  probe. Dropping it here means the next write heals the file. */
 function readFileEntries(): Record<string, StoredEntry> {
   try {
     const parsed = JSON.parse(readFileSync(verdictFile(), "utf8")) as Partial<StoredFile> | null;
     if (!parsed || parsed.schema !== SCHEMA || typeof parsed.entries !== "object" || parsed.entries === null) {
       return {};
     }
-    return parsed.entries as Record<string, StoredEntry>;
+    if (Array.isArray(parsed.entries)) return {};
+    const entries: Record<string, StoredEntry> = {};
+    for (const [key, value] of Object.entries(parsed.entries as Record<string, unknown>)) {
+      if (isStoredEntry(value)) entries[key] = value;
+    }
+    return entries;
   } catch {
     return {};
   }
@@ -94,7 +118,6 @@ export function readOamVerdict(id: OamBinaryIdentity): string | null | undefined
   if (isPersistenceDisabled()) return undefined;
   const entry = readFileEntries()[keyOf(id.path)];
   if (!entry || entry.size !== id.size || entry.mtimeMs !== id.mtimeMs) return undefined;
-  if (entry.version !== null && typeof entry.version !== "string") return undefined;
   return entry.version;
 }
 

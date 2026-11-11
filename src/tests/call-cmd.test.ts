@@ -8,6 +8,7 @@ import { parseCallArgs, runCall } from "../call-cmd.js";
 import { CONFIG_DIRNAME } from "../paths.js";
 import { TransientConnectError } from "../transient-upstream.js";
 import type { UpstreamConnection, UpstreamServerConfig } from "../types.js";
+import { ActivationError } from "../upstream.js";
 
 const homes: string[] = [];
 
@@ -704,6 +705,37 @@ describe("runCall -- upstream text cannot inject control bytes into stderr", () 
     expect(rawControls(cap.errText())).toEqual([]);
   });
 
+  it("words a connect failure's config pointer for a shell, not for an MCP session", async () => {
+    // ActivationError.message ends in the broker's remediation ("activate it
+    // again ... on the next mcp_connect_* call"); a one-shot CLI has neither,
+    // so the line is rebuilt from the pointer's two halves.
+    const home = makeHome([GH]);
+    const pointer = { summary: 'Failed to start "gh": spawn nope ENOENT', fix: 'Fix "gh" in the bundles.json' };
+    const brokerMessage = `${pointer.summary} -> ${pointer.fix}, then activate it again -- picked up on the next mcp_connect_* call.`;
+    const fake = fakeConnect({
+      connectError: new ActivationError(brokerMessage, "spawn_failure", undefined, undefined, pointer),
+    });
+    const cap = capture();
+    const r = await runCall({ namespace: "gh", tool: "search", home, connect: fake.connect, ...cap });
+    expect(r.exitCode).toBe(1);
+    expect(cap.errText()).toContain(
+      `yaw-mcp call: Could not connect to "gh": ${pointer.summary} -> ${pointer.fix}, then run the command again.`,
+    );
+    expect(cap.errText()).not.toContain("activate it again");
+    expect(cap.errText()).not.toContain("mcp_connect_");
+  });
+
+  it("prints a pointer-less connect failure's own message unchanged", async () => {
+    const home = makeHome([GH]);
+    const fake = fakeConnect({ connectError: new Error("vault locked: set YAW_MCP_VAULT_PASSPHRASE") });
+    const cap = capture();
+    const r = await runCall({ namespace: "gh", tool: "search", home, connect: fake.connect, ...cap });
+    expect(r.exitCode).toBe(1);
+    expect(cap.errText()).toContain(
+      'yaw-mcp call: Could not connect to "gh": vault locked: set YAW_MCP_VAULT_PASSPHRASE',
+    );
+  });
+
   it("escapes the resolved tool name in the post-connect deny", async () => {
     // Reached only when the pre-spawn wire name differs from the resolved one
     // -- a server whose OWN tool name embeds the namespace, the same shape the
@@ -778,5 +810,152 @@ describe("runCall -- an early-exiting stdout consumer", () => {
     } finally {
       Object.defineProperty(process, "stdout", realStdout);
     }
+  });
+});
+
+// Every --json failure of `call` leaves ONE {ok:false,error,exitCode}
+// document on stdout, pretty-printed like `add`'s and index.ts's argv-error
+// one. Until this changed, runCall's own failures were stderr-only under
+// --json, so a script parsing stdout read zero bytes for "it failed".
+describe("runCall --json failures print one {ok:false} document [J-json]", () => {
+  type Doc = { ok: boolean; error: string; exitCode: number };
+
+  async function callJson(
+    opts: Partial<Parameters<typeof runCall>[0]>,
+    fake: ReturnType<typeof fakeConnect> = fakeConnect({}),
+  ): Promise<{ exitCode: number; doc: Doc; err: string }> {
+    const cap = capture();
+    const r = await runCall({ namespace: "gh", tool: "search", json: true, connect: fake.connect, ...cap, ...opts });
+    const out = cap.text();
+    const doc = JSON.parse(out) as Doc;
+    expect(out).toBe(`${JSON.stringify(doc, null, 2)}\n`);
+    expect(Object.keys(doc)).toEqual(["ok", "error", "exitCode"]);
+    expect(doc.ok).toBe(false);
+    expect(doc.exitCode).toBe(r.exitCode);
+    expect(doc.error.startsWith("yaw-mcp call: ")).toBe(true);
+    // stderr keeps the same human line it always printed.
+    expect(cap.errText()).toContain(doc.error);
+    return { exitCode: r.exitCode, doc, err: cap.errText() };
+  }
+
+  it("missing namespace or tool (programmatic caller)", async () => {
+    const r = await callJson({ namespace: "", home: makeHome([GH]) });
+    expect(r.exitCode).toBe(2);
+    expect(r.doc.error).toBe("yaw-mcp call: <namespace> and <tool> are both required.");
+    // The usage body stays on stderr only.
+    expect(r.err).toContain("Usage: yaw-mcp call");
+    expect(r.doc.error).not.toContain("Usage:");
+  });
+
+  it("arguments that are not a JSON object", async () => {
+    const r = await callJson({ argsJson: "[1]", home: makeHome([GH]) });
+    expect(r.exitCode).toBe(2);
+    expect(r.doc.error).toContain("must be a JSON object");
+  });
+
+  it("an unreadable --args-stdin", async () => {
+    const stdin = new PassThrough();
+    setImmediate(() => stdin.destroy(new Error("stdin broke")));
+    const r = await callJson({ argsStdin: true, stdin, home: makeHome([GH]) });
+    expect(r.exitCode).toBe(2);
+    expect(r.doc.error).toContain("could not read the arguments from stdin");
+  });
+
+  it("an unknown server", async () => {
+    const r = await callJson({ namespace: "nope", home: makeHome([GH]) });
+    expect(r.exitCode).toBe(1);
+    expect(r.doc.error).toContain('no server named "nope"');
+  });
+
+  it.each([
+    ["a disabled server", [{ ...GH, isActive: false }], undefined, {}, "disabled"],
+    ["a profile block", [GH], { blocked: ["gh"] }, {}, "not allowed"],
+    [
+      "the compliance floor",
+      [{ ...GH, complianceGrade: "D" }],
+      undefined,
+      { YAW_MCP_MIN_COMPLIANCE: "B" },
+      "YAW_MCP_MIN_COMPLIANCE",
+    ],
+    ["a pre-spawn blockedTools deny", [GH], { blockedTools: ["gh_search"] }, {}, "Nothing was started."],
+  ] as const)("%s", async (_label, servers, config, env, fragment) => {
+    const home = makeHome([...servers], config as Record<string, unknown> | undefined);
+    const fake = fakeConnect({});
+    const r = await callJson({ home, cwd: home, env: { ...env } }, fake);
+    expect(r.exitCode).toBe(2);
+    expect(r.doc.error).toContain(fragment);
+    expect(fake.connected).toEqual([]);
+  });
+
+  it("a post-connect blockedTools deny", async () => {
+    const home = makeHome([GH], { blockedTools: ["gh_gh_status"] });
+    const r = await callJson({ tool: "gh_status", home, cwd: home }, fakeConnect({ tools: ["gh_status"] }));
+    expect(r.exitCode).toBe(2);
+    expect(r.doc.error).toContain("gh_gh_status");
+  });
+
+  it("an unknown tool", async () => {
+    const r = await callJson({ tool: "nope", home: makeHome([GH]) });
+    expect(r.exitCode).toBe(1);
+    expect(r.doc.error).toContain("nope");
+  });
+
+  it("a transport failure during the call", async () => {
+    const r = await callJson({ home: makeHome([GH]) }, fakeConnect({ throwOnCall: new Error("timed out") }));
+    expect(r.exitCode).toBe(1);
+    expect(r.doc.error).toContain("gh_search failed: timed out");
+  });
+
+  it("a connect failure", async () => {
+    const r = await callJson({ home: makeHome([GH]) }, fakeConnect({ connectError: new Error("spawn ENOENT") }));
+    expect(r.exitCode).toBe(1);
+    expect(r.doc.error).toContain('Could not connect to "gh"');
+  });
+
+  it("an isError answer is the raw envelope only -- no second, {ok:false} document", async () => {
+    const result = { content: [{ type: "text", text: "rate limited" }], isError: true };
+    const cap = capture();
+    const r = await runCall({
+      namespace: "gh",
+      tool: "search",
+      home: makeHome([GH]),
+      json: true,
+      connect: fakeConnect({ result }).connect,
+      ...cap,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(cap.text()).toBe(`${JSON.stringify(result)}\n`);
+  });
+
+  it("without --json a failure still leaves stdout empty", async () => {
+    const cap = capture();
+    const r = await runCall({ namespace: "nope", tool: "search", home: makeHome([GH]), ...cap });
+    expect(r.exitCode).toBe(1);
+    expect(cap.text()).toBe("");
+  });
+
+  it("a rejection (a bug, not an upstream failure) leaves one document, then rejects", async () => {
+    const cap = capture();
+    const connect: NonNullable<Parameters<typeof runCall>[0]["connect"]> = async () => {
+      throw new Error("internal bug");
+    };
+    await expect(
+      runCall({ namespace: "gh", tool: "search", home: makeHome([GH]), json: true, connect, ...cap }),
+    ).rejects.toThrow("internal bug");
+    expect(JSON.parse(cap.text())).toEqual({ ok: false, error: "yaw-mcp call: internal bug", exitCode: 1 });
+  });
+
+  it("a rejection after the result is out adds no second document", async () => {
+    const result = { content: [{ type: "text", text: "hi" }] };
+    const cap = capture();
+    const base = fakeConnect({ result });
+    const connect: NonNullable<Parameters<typeof runCall>[0]["connect"]> = async (config, use) => {
+      await base.connect(config, use);
+      throw new Error("teardown bug");
+    };
+    await expect(
+      runCall({ namespace: "gh", tool: "search", home: makeHome([GH]), json: true, connect, ...cap }),
+    ).rejects.toThrow("teardown bug");
+    expect(cap.text()).toBe(`${JSON.stringify(result)}\n`);
   });
 });

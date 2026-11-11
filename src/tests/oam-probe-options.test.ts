@@ -20,7 +20,7 @@
 import { EventEmitter } from "node:events";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, relative } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 interface SpawnCall {
@@ -363,6 +363,49 @@ describe("probeOam default runner", () => {
     }
   });
 
+  it("refuses a build-tree OAM_BIN spelled RELATIVELY, which has no persistable absolute form", async () => {
+    // resolveBinAbsolute answers null for a relative path with a separator
+    // (it is not a PATH lookup and not fit to persist), and the gate used to
+    // require that answer to be non-null -- so `OAM_BIN=./target/release/oam`
+    // was spawned and published as usable. The OS runs it against the cwd, so
+    // the gate has to look there too.
+    const root = join(tmpdir(), `yaw-mcp-buildtree-rel-${process.pid}`);
+    const dir = join(root, "target", "release");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "oam.exe"), "", { mode: 0o755 });
+    const rel = relative(process.cwd(), join(dir, "oam.exe"));
+    // A temp dir on another drive has no relative spelling; nothing to pin.
+    if (isAbsolute(rel)) return;
+    process.env.OAM_BIN = rel;
+    try {
+      const probe = await probeOam();
+      expect(probe.failure).toBe("build-tree");
+      expect(probe.failureDetail).toContain(join(dir, "oam.exe"));
+      expect(probe.viaOamBin).toBe(true);
+      expect(spawnCalls, "build-tree binary reached the spawn").toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.runIf(process.platform === "win32")(
+    "refuses a build-tree OAM_BIN written without its .exe, which Windows still runs",
+    async () => {
+      const root = join(tmpdir(), `yaw-mcp-buildtree-noext-${process.pid}`);
+      const dir = join(root, "target", "release");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "oam.exe"), "");
+      process.env.OAM_BIN = join(dir, "oam");
+      try {
+        const probe = await probeOam();
+        expect(probe.failure).toBe("build-tree");
+        expect(spawnCalls).toEqual([]);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+
   it("refuses a bare `oam` whose PATH lookup lands in a build tree, and names the PATH fix", async () => {
     // The shape this machine actually has: a dev checkout's target/release
     // oam sits EARLIER on PATH than ~/.oam/bin. OAM_BIN is cleared so the
@@ -455,8 +498,8 @@ describe("probeOam default runner", () => {
 
   it("an explicit-but-ABSENT OAM_BIN never reaches the build-tree gate", async () => {
     // Which branch owns which user error: the build-tree refusal is for a
-    // binary that EXISTS (absResolved non-null). A named-and-missing path
-    // makes resolveBinAbsolute return null, so the gate cannot fire -- the
+    // binary that EXISTS. A named-and-missing path makes resolveBinAbsolute
+    // (and explicitBinOnDisk) return null, so the gate cannot fire -- the
     // probe answers as an ordinary success whose binPath is null. (The
     // broken-config classification of a FAILING spawn is
     // oam-spawn-probe-log.test.ts's territory; the mocked child here

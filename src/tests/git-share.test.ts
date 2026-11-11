@@ -142,6 +142,28 @@ describe("share", () => {
     expect(text).toContain("also passes 2 server arguments, not shown here");
   }, 60_000);
 
+  it("treats a malformed secret reference as a plain value, as the vault does", async () => {
+    // `${secret:gh token}` is not a reference to the vault (a space is outside
+    // its name class), so it resolves to nothing there. share must not print
+    // it as one or tell coworkers they will be asked for "gh token".
+    const commit = builtRepo("crm", FILES);
+    writeEntry(
+      entry(
+        "crm",
+        commit,
+        { entry: "src/server.js", subdir: undefined },
+        { env: { BAD: "${secret:gh token}", GOOD: "${secret:crm_token}" } },
+      ),
+    );
+    const r = await share(["crm"]);
+    expect(r.exitCode, err.join("")).toBe(0);
+    const text = out.join("");
+    expect(text).toContain("'BAD=<set this>'");
+    expect(text).not.toContain("gh token");
+    expect(text).toContain("'GOOD=${secret:crm_token}'");
+    expect(text).toContain("They will be asked for: crm_token (GOOD)");
+  }, 60_000);
+
   it("with no manifest, prints the full-flag form as the primary command with no drift note", async () => {
     const commit = builtRepo("crm", FILES);
     writeEntry(
@@ -191,6 +213,188 @@ describe("share", () => {
     expect(out.join("")).toContain(
       "Coworkers' command includes --description because this entry sets it differently from the repo's yaw-mcp.json.",
     );
+  }, 60_000);
+
+  it("says how to run an apostrophe word in PowerShell, and only then", async () => {
+    // REGRESSION: the quoting was documented as serving PowerShell too, but an
+    // apostrophe is written '"'"' -- which PowerShell 5.1 splits into three
+    // arguments. No single spelling serves both shells, so the POSIX one stays
+    // on the line and a note carries the PowerShell rewrite. No build needed:
+    // an unbuilt entry spells out every flag.
+    const commit = "a".repeat(40);
+    writeEntry(entry("crm", commit, {}, { description: "it's a tool" }));
+    expect((await share(["crm"])).exitCode, err.join("")).toBe(0);
+    expect(out.join("")).toContain(`--description 'it'"'"'s a tool'`);
+    expect(out.join("")).toContain(
+      `Note: The command is quoted for bash and zsh. It contains an apostrophe, written '"'"'; in PowerShell replace each '"'"' with two single quotes ('').`,
+    );
+
+    out = [];
+    expect((await share(["crm", "--json"])).exitCode).toBe(0);
+    expect((JSON.parse(out.join("")).notes as string[]).some((n) => n.includes("in PowerShell replace"))).toBe(true);
+
+    writeEntry(entry("crm", commit, {}, { description: "a plain tool" }));
+    out = [];
+    expect((await share(["crm"])).exitCode).toBe(0);
+    expect(out.join("")).toContain("--description 'a plain tool'");
+    expect(out.join("")).not.toContain("PowerShell");
+  }, 60_000);
+
+  it("never leaves a word starting with @ bare, since PowerShell would splat it", async () => {
+    const commit = "a".repeat(40);
+    writeEntry(entry("crm", commit, {}, { description: "@acme" }));
+    expect((await share(["crm"])).exitCode, err.join("")).toBe(0);
+    expect(out.join("")).toContain("--description '@acme'");
+    // An @ past the first character is inert in both shells and stays bare.
+    expect(out.join("")).toContain(`--git ${SCP}#v1.4.0`);
+  }, 60_000);
+
+  it("says so when a non-ASCII character was replaced, and --json carries it exactly", async () => {
+    // REGRESSION: the terminal sanitizer turned the paste line's "café"
+    // into "caf?" with no note, and did the same to the --json document, so a
+    // script read corrupted data.
+    const commit = "a".repeat(40);
+    const description = "café tools \u{1f600}";
+    writeEntry(entry("crm", commit, {}, { description }));
+    expect((await share(["crm"])).exitCode, err.join("")).toBe(0);
+    expect(out.join("")).toContain("--description 'caf? tools ??'");
+    expect(out.join("")).toContain('Note: The command holds characters outside printable ASCII, shown here as "?".');
+    expect(out.join("")).toContain("yaw-mcp share crm --json prints the command exactly");
+
+    out = [];
+    expect((await share(["crm", "--json"])).exitCode).toBe(0);
+    const raw = out.join("");
+    // Still pure ASCII on the wire: escaped, not replaced.
+    expect(/^[\x20-\x7e\n]*$/.test(raw)).toBe(true);
+    const doc = JSON.parse(raw);
+    expect(doc.command).toContain(`--description '${description}'`);
+    expect((doc.notes as string[]).some((n) => n.includes("printable ASCII"))).toBe(false);
+
+    // An all-ASCII command earns no note.
+    writeEntry(entry("crm", commit, {}, { description: "a plain tool" }));
+    out = [];
+    expect((await share(["crm"])).exitCode).toBe(0);
+    expect(out.join("")).not.toContain("printable ASCII");
+  }, 60_000);
+
+  it("drops the sharer's https username and names a non-git ssh one", async () => {
+    // REGRESSION: the stored URL went out verbatim, so coworkers pasted a
+    // command that authenticated as the sharer's account.
+    const commit = "a".repeat(40);
+    writeEntry(entry("crm", commit, { url: "https://jeff@gitea.example/org/repo.git" }));
+    expect((await share(["crm", "--json"])).exitCode, err.join("")).toBe(0);
+    let doc = JSON.parse(out.join(""));
+    expect(doc.command).toContain("--git https://gitea.example/org/repo.git#v1.4.0");
+    expect(doc.commands.https).toContain("--git https://gitea.example/org/repo.git#v1.4.0");
+    expect(JSON.stringify(doc)).not.toContain("jeff");
+
+    // An ssh username can be the account the host requires, so it stays on
+    // the line and a note names it.
+    writeEntry(entry("crm", commit, { url: "jeff@gitea.example:org/repo.git" }));
+    out = [];
+    expect((await share(["crm", "--json"])).exitCode).toBe(0);
+    doc = JSON.parse(out.join(""));
+    expect(doc.command).toContain("--git jeff@gitea.example:org/repo.git#v1.4.0");
+    expect((doc.notes as string[]).some((n) => n.startsWith('The SSH URL logs in as "jeff".'))).toBe(true);
+
+    // The conventional "git" user earns no note.
+    writeEntry(entry("crm", commit));
+    out = [];
+    expect((await share(["crm", "--json"])).exitCode).toBe(0);
+    expect((JSON.parse(out.join("")).notes as string[]).some((n) => n.includes("logs in as"))).toBe(false);
+  }, 60_000);
+
+  it("keeps an https username that git sends beside the vault token, and says so", async () => {
+    // REGRESSION: every https username was stripped. With --git-token-secret
+    // the URL username is what git sends with the token on any host but
+    // github.com / gitlab.* (tokenUsername), so Bitbucket's x-token-auth went
+    // out as a command that authenticates as "git".
+    const commit = "a".repeat(40);
+    const url = "https://x-token-auth@bitbucket.org/ws/repo.git";
+    writeEntry(entry("crm", commit, { url, tokenSecret: "bb_read" }));
+    expect((await share(["crm", "--json"])).exitCode, err.join("")).toBe(0);
+    let doc = JSON.parse(out.join(""));
+    expect(doc.command).toContain(`--git ${url}#v1.4.0`);
+    expect(doc.command).toContain("--git-token-secret bb_read");
+    expect(doc.commands.https).toContain(`--git ${url}#v1.4.0`);
+    expect(doc.notes as string[]).toContain(
+      'The HTTPS URL keeps the username "x-token-auth": git sends it with the token on this host. Coworkers whose token needs a different username replace it.',
+    );
+
+    // No token secret: the username is the sharer's own login, still dropped.
+    writeEntry(entry("crm", commit, { url }));
+    out = [];
+    expect((await share(["crm", "--json"])).exitCode).toBe(0);
+    doc = JSON.parse(out.join(""));
+    expect(doc.command).toContain("--git https://bitbucket.org/ws/repo.git#v1.4.0");
+    expect(JSON.stringify(doc)).not.toContain("x-token-auth");
+
+    // github.com sends a fixed token username whatever the URL says, so a
+    // username there is dropped even with a token secret.
+    writeEntry(entry("crm", commit, { url: "https://jeff@github.com/acme/crm-mcp.git", tokenSecret: "gh_read" }));
+    out = [];
+    expect((await share(["crm", "--json"])).exitCode).toBe(0);
+    doc = JSON.parse(out.join(""));
+    expect(doc.command).toContain("--git https://github.com/acme/crm-mcp.git#v1.4.0");
+    expect(JSON.stringify(doc)).not.toContain("jeff");
+  }, 60_000);
+
+  it("never leaves a word starting with # bare, since both shells would read a comment", async () => {
+    // REGRESSION: `--description #crm` went out bare; bash and PowerShell both
+    // drop it and every word after it.
+    const commit = "a".repeat(40);
+    writeEntry(entry("crm", commit, {}, { description: "#crm" }));
+    expect((await share(["crm"])).exitCode, err.join("")).toBe(0);
+    expect(out.join("")).toContain("--description '#crm'");
+    // A # past the first character is inert and stays bare (the ref).
+    expect(out.join("")).toContain(`--git ${SCP}#v1.4.0`);
+  }, 60_000);
+
+  it("says a double quote is dropped by Windows PowerShell 5.1, and only then", async () => {
+    const commit = "a".repeat(40);
+    writeEntry(entry("crm", commit, {}, { description: 'say "hi" now' }));
+    expect((await share(["crm"])).exitCode, err.join("")).toBe(0);
+    expect(out.join("")).toContain(`--description 'say "hi" now'`);
+    expect(out.join("")).toContain(
+      'Note: The command is quoted for bash and zsh. It contains a double quote ("), which Windows PowerShell 5.1 drops when it runs the command; there, write each one as \\".',
+    );
+    expect(out.join("")).not.toContain("apostrophe");
+  }, 60_000);
+
+  it("reads a manifest subdir as a directory, so ./server and server are not a difference", async () => {
+    // REGRESSION: the stored subdir is the tidy spelling while the manifest's
+    // is read as typed, so a string compare printed a redundant --subdir and a
+    // note that the entry departs from the repo's yaw-mcp.json.
+    const manifest = JSON.stringify({ version: 1, namespace: "acme_crm", entry: "dist/index.js", subdir: "./server" });
+    const commit = builtRepo("acme_crm", { ...FILES, "yaw-mcp.json": manifest });
+    writeEntry(entry("acme_crm", commit, { subdir: "server" }));
+    expect((await share(["acme_crm"])).exitCode, err.join("")).toBe(0);
+    expect(out.join("")).not.toContain("--subdir");
+    expect(out.join("")).not.toContain("differently from the repo's yaw-mcp.json");
+
+    // A subdir that really is another directory is still spelled out.
+    writeEntry(entry("acme_crm", commit, { subdir: "other" }));
+    out = [];
+    expect((await share(["acme_crm"])).exitCode).toBe(0);
+    expect(out.join("")).toContain("--subdir other");
+    expect(out.join("")).toContain(
+      "Coworkers' command includes --subdir because this entry sets it differently from the repo's yaw-mcp.json.",
+    );
+  }, 60_000);
+
+  it("names --project in the non-ASCII note's re-run hint when the entry is a project one", async () => {
+    const proj = join(home, "proj");
+    mkdirSync(join(proj, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(
+      localBundlesPath(join(proj, CONFIG_DIRNAME)),
+      JSON.stringify({
+        version: 1,
+        servers: [entry("crm", "a".repeat(40), {}, { description: `caf${String.fromCharCode(0xe9)}` })],
+      }),
+    );
+    const r = await share(["crm", "--project"], { cwd: proj, env: { ...ENV, [TRUST_BYPASS_ENV]: "1" } });
+    expect(r.exitCode, err.join("")).toBe(0);
+    expect(out.join("")).toContain("yaw-mcp share crm --project --json prints the command exactly");
   }, 60_000);
 
   it("warns when the entry tracks a branch, and --pin prints the exact commit instead", async () => {

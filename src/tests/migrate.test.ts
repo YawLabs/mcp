@@ -78,10 +78,12 @@ describe("migrateLegacyConfigPaths", () => {
     home = mkdtempSync(join(tmpdir(), "yaw-mcp-migrate-home-"));
     cwd = mkdtempSync(join(home, "proj-"));
     // The stderr-spy cases below assert on WARN lines, and logger.ts resolves
-    // LOG_LEVEL per call from the ambient env. A runner shell carrying
-    // LOG_LEVEL=error would suppress exactly the lines they assert on, so the
-    // threshold is pinned here rather than inherited.
+    // the level per call from the ambient YAW_MCP_LOG_LEVEL, else LOG_LEVEL. A
+    // runner shell carrying either as `error` would suppress exactly the lines
+    // they assert on, so the threshold is pinned here rather than inherited,
+    // and the variable that would win over the pin is cleared.
     vi.stubEnv("LOG_LEVEL", "warn");
+    vi.stubEnv("YAW_MCP_LOG_LEVEL", undefined);
   });
 
   afterEach(() => {

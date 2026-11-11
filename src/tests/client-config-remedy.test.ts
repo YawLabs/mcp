@@ -237,7 +237,7 @@ describe("a container key install cannot splice into -- doctor no longer says 'r
     );
   });
 
-  // The other half of findBlockedContainerSegment's split: install REPAIRS these
+  // The other half of the JSON adapter's `reparable` split: install REPAIRS these
   // shapes, so doctor's plain "run install" is true for them and must stay.
   it.each([
     ["null", "null"],

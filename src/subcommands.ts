@@ -109,10 +109,10 @@ export function suggestSubcommand(input: string, limit = 3): string[] {
  * (e.g. `--versionn` -> `--version`, `--hepl` -> `--help`). A wrong-case
  * spelling counts as a typo too (`--HELP` -> `--help`): index.ts dispatches
  * only the exact raw spellings, so without a suggestion here the mis-cased
- * flag falls through to runServer and hangs. Restricted to inputs longer
- * than a single-letter flag (length > 2) so a genuine short flag like a
- * server's own lowercase `-v` is NOT hijacked by a case-only match against
- * `-V` -- that gate is what keeps case-insensitive matching safe here.
+ * flag gets the generic "--help" hint instead of a did-you-mean. Restricted
+ * to inputs longer than a single-letter flag (length > 2), so a lowercase
+ * `-v` is not answered with "did you mean -V" on a case-only match; it gets
+ * the generic hint.
  *
  * Uses pure levenshtein distance <= 2 (without the prefix/substring tiers
  * that closestNames adds). Prefix matching would over-trigger: `--vers`

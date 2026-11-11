@@ -28,8 +28,10 @@
 // default-runtime.ts), not an opt-in tier -- that changed in #99, and this note
 // described the opt-in model for two releases after it.
 //
-// MEASURED: the SDK-hosting mechanism check -- a stdio @modelcontextprotocol/sdk
-// server completes initialize + tools/list + tools/call hosted on `oam run` --
+// MEASURED: the SDK-hosting mechanism check -- a stdio
+// @modelcontextprotocol/server server, hosted on `oam run`, completes both
+// protocol eras, each on a fresh process: 2025-11-25 (initialize + tools/list +
+// tools/call) and 2026-07-28 (server/discover + tools/list + tools/call) --
 // is now `npm run verify:oam-floor` (scripts/verify-oam-floor.mjs): release.sh
 // runs it in step 1 against this machine's oam, and `--raise` is the only
 // thing that moves MIN_OAM_VERSION, so every floor from here on has that
@@ -108,7 +110,7 @@
 import { spawn } from "node:child_process";
 import { accessSync, constants, existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, sep } from "node:path";
+import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { CURRENT_OS, type InstallOS } from "./install-targets.js";
 import { stripInternalSecretsFromEnv } from "./internal-secret-env.js";
@@ -139,12 +141,25 @@ function specSuffix(spec: string): string | null {
   return at === -1 ? null : spec.slice(at + 1);
 }
 
+/** The version grammar, written ONCE: x.y.z, an optional `-prerelease` and an
+ *  optional `+build`, each a dot-separated list of non-empty identifiers.
+ *  Groups 1-3 are the release triple and group 4 the prerelease. Three
+ *  patterns are derived from it and differ only in anchoring -- they used to
+ *  be three hand-written copies, and the capturing one had drifted to a looser
+ *  prerelease class that took `rc..1` as a prerelease. */
+const SEMVER_IDENTIFIERS = "[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*";
+const SEMVER_SOURCE = `(\\d+)\\.(\\d+)\\.(\\d+)(?:-(${SEMVER_IDENTIFIERS}))?(?:\\+${SEMVER_IDENTIFIERS})?`;
+
 /** A single exact version, anchored -- `1.2.3`, `1.2.3-rc.1`, `1.2.3+build`.
  *  Deliberately NOT tolerant of a leading "v": npm accepts `pkg@v1.2.3`, but
  *  the version a package.json DECLARES never carries one, so treating it as
  *  exact would mean normalising before comparing. It falls into "range" below,
  *  which stays on npx -- the safe answer for a spec we can't verify. */
-const EXACT_VERSION = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+const EXACT_VERSION = new RegExp(`^${SEMVER_SOURCE}$`);
+/** The first version anywhere in free text (parseOamVersion). */
+const VERSION_IN_TEXT = new RegExp(SEMVER_SOURCE);
+/** A version the string OPENS with, whatever follows it (parseSemver). */
+const LEADING_VERSION = new RegExp(`^${SEMVER_SOURCE}`);
 
 /**
  * What an npx spec's version suffix asks for. Three answers, because the
@@ -230,11 +245,14 @@ export function isRegistrySpec(spec: string): boolean {
  * element is the spec -- the first survivor of a filter is the first non-flag
  * element -- so the copies drifted apart silently rather than loudly.
  *
- * Shared because three callers must answer this identically: rewriteForOam
- * (which also needs the index, to slice the server's own args off the tail) and
- * both collectors in sidecars-cmd.ts, which PARTITION the same server set into
- * "installed" and "skipped". A one-sided edit there drops a server from both
- * reports with nothing to say why.
+ * Shared because every reader of an npx launch must answer this identically.
+ * rewriteForOam and rewriteNpmToManagedNode call it directly (they also need
+ * the index, to slice the server's own args off the tail), as does
+ * default-runtime.ts when it describes a server's runtime; npxSpec below wraps
+ * it for callers that want only the spec, which is how the collectors in
+ * sidecars-cmd.ts reach it. Those collectors PARTITION the same server set
+ * into "installed" and "skipped", so a one-sided edit there drops a server
+ * from both reports with nothing to say why.
  */
 export function npxSpecIndex(args: readonly string[]): number {
   return args.findIndex((a) => a !== "-y" && a !== "--yes");
@@ -262,8 +280,10 @@ export function npxSpec(args: readonly string[]): string | null {
  *
  * POLICY: this is the last oam release the hosting mechanism was VERIFIED on
  * -- `npm run verify:oam-floor` (scripts/verify-oam-floor.mjs) hosted a stdio
- * @modelcontextprotocol/sdk server on that oam through `oam run` and completed
- * initialize + tools/list + tools/call. It moves only by `npm run
+ * @modelcontextprotocol/server server on that oam through `oam run` and
+ * completed both protocol eras (2025-11-25: initialize + tools/list +
+ * tools/call; 2026-07-28: server/discover + tools/list + tools/call). It
+ * moves only by `npm run
  * verify:oam-floor -- --raise`, which runs that check against the oam on the
  * machine and then rewrites this constant, the ratchet literal in
  * oam-spawn.test.ts and a CHANGELOG block together; the operator commits the
@@ -486,14 +506,19 @@ export function oamHeapOomHint(stderr: string): string | null {
   );
 }
 
-/** One "your oam opt-in landed on node" warning per process, not one per
- *  opted-in server -- whether the reason was an absent oam or a broken one.
- *  Both are the same event to the user (they asked for oam and did not get it),
- *  the probe result is cached for the process lifetime so only one of them can
- *  ever be the reason, and a broker hosting a dozen opted-in servers must not
- *  print either line a dozen times on every boot.
+/** One "your oam opt-in landed on node" warning per REASON per process, not
+ *  one per opted-in server: a broker hosting a dozen opted-in servers must not
+ *  print the line a dozen times on every boot. The reason is the probe's
+ *  failure kind, or "absent" for an oam that is not installed.
+ *
+ *  Keyed by reason rather than a single flag because the reason can change
+ *  within a process: every verdict stands for the process lifetime EXCEPT a
+ *  timeout, which lapses after OAM_PROBE_TIMEOUT_RECHECK_MS and is probed
+ *  again. A single flag spent on the timeout warn then swallowed the line for
+ *  whatever the re-probe found (absent, non-executable, a build-tree binary),
+ *  which is a different fix. Repeated timeouts still warn once.
  *  Cleared by resetOamBinCache so tests do not leak it across cases. */
-let warnedOamUnavailable = false;
+const warnedOamUnavailable = new Set<OamProbeFailure | "absent">();
 
 /** Why the probe produced no usable binary even though oam was present on
  *  disk. `null` is BOTH "oam is usable" and "oam is absent" -- absence is the
@@ -545,7 +570,13 @@ export interface OamProbe {
    *
    * `bin` is what to SPAWN -- a bare name is correct there, because this
    * process already resolved it against its own PATH by successfully running
-   * it. `binPath` is what to PERSIST into someone else's config, which is a
+   * it. That holds for a child spawned with this process's PATH, which is
+   * every server but one kind: upstream.ts spawns with the server's own `env`
+   * merged OVER the broker's, so an entry that sets PATH has the bare name
+   * looked up again on ITS path -- not found there (the launch fails and the
+   * oam downgrade respawns it on the original command), or found as a
+   * different oam that this probe never ran and MIN_OAM_VERSION never gated.
+   * Nothing here detects that case. `binPath` is what to PERSIST into someone else's config, which is a
    * different question for the same reason resolveNpmEntry and
    * resolveStableNpmEntry are two functions: a GUI-launched MCP client does
    * not inherit the shell PATH that made the bare name work here, so a bare
@@ -592,7 +623,7 @@ let oamProbeCacheExpiresAt: number | undefined;
  * captured for the same reporting reason; comparison ignores it, per semver.
  */
 export function parseOamVersion(out: string): string | null {
-  const m = /\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?/.exec(out);
+  const m = VERSION_IN_TEXT.exec(out);
   return m ? m[0] : null;
 }
 
@@ -606,10 +637,16 @@ interface Semver {
 }
 
 /** Parse a LEADING x.y.z[-pre][+build], or null when the string does not open
- *  with one. Anchored: this reads a version it was handed, it does not search
- *  for one in free text -- that is parseOamVersion's job. */
-function parseSemver(s: string): Semver | null {
-  const m = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z-.]+))?/.exec(s);
+ *  with one. Anchored at the start: this reads a version it was handed, it does
+ *  not search for one in free text -- that is parseOamVersion's job.
+ *
+ *  Text after the version is ignored unless `whole` is set, in which case the
+ *  string must be a version and nothing else. compareVersions keeps the
+ *  lenient form (its callers in other modules hand it tag- and CLI-shaped
+ *  strings); satisfiesExactPin asks for the whole string, because "this copy
+ *  IS the pinned build" cannot be concluded from a matching prefix. */
+function parseSemver(s: string, whole = false): Semver | null {
+  const m = (whole ? EXACT_VERSION : LEADING_VERSION).exec(s);
   if (!m) return null;
   const pre = m[4] === undefined ? [] : m[4].split(".").map((id) => (/^\d+$/.test(id) ? Number(id) : id));
   return { release: [Number(m[1]), Number(m[2]), Number(m[3])], pre };
@@ -675,8 +712,8 @@ export function compareVersions(a: string, b: string): number {
  *  point of the check is that "probably right" is what it replaces. */
 function satisfiesExactPin(declared: string | null, want: string): boolean {
   if (declared === null) return false;
-  const d = parseSemver(declared);
-  const w = parseSemver(want);
+  const d = parseSemver(declared, true);
+  const w = parseSemver(want, true);
   if (d && w) return compareSemver(d, w) === 0;
   return declared === want;
 }
@@ -749,8 +786,9 @@ const BUILD_TREE_PREFIXES = ["cmake-build-"];
 
 /**
  * True when a resolved binary path sits in a compiler output tree. Pure path
- * test, any separator, any case: resolved through the caller (resolveBinAbsolute
- * or an OAM_BIN spelling) before this runs, and deliberately NOT through
+ * test, any separator, any case: resolved through the caller (resolveBinAbsolute,
+ * or explicitBinOnDisk for an OAM_BIN spelling that one declines) before this
+ * runs, and deliberately NOT through
  * realpath -- Yaw's hook runtime applies the same rule to PATH candidates by
  * path text, so the two projects reject the same builds, and a realpath round
  * trip adds an fs call to the connect path for a case the path test already
@@ -770,6 +808,32 @@ const BUILD_TREE_PREFIXES = ["cmake-build-"];
 export function isBuildTreePath(p: string): boolean {
   const parts = p.toLowerCase().split(/[\\/]+/);
   return parts.some((seg) => BUILD_TREE_SEGMENTS.has(seg) || BUILD_TREE_PREFIXES.some((pre) => seg.startsWith(pre)));
+}
+
+/**
+ * The file an explicit OAM_BIN would SPAWN, for the two spellings
+ * resolveBinAbsolute answers null to although the OS runs them: a relative
+ * path with a separator (`./target/release/oam`, spawned against the cwd) and,
+ * on Windows, an absolute path written without its extension (spawn appends
+ * `.exe`). Null for a bare name (a PATH lookup, which resolveBinAbsolute owns)
+ * and when no such file exists.
+ *
+ * It exists for the build-tree gate alone. resolveBinAbsolute's null for these
+ * is right for what IT promises -- a path fit to persist into another
+ * program's config -- but the gate asks a different question, "which file is
+ * about to run", and a null there let a dev build be spawned, trusted and
+ * published as usable simply because OAM_BIN was spelled relatively.
+ *
+ * Existence is required, as it is on the resolveBinAbsolute side: the refusal
+ * is for a binary that is there. A named-and-missing path stays the probe's
+ * "OAM_BIN points at a path that does not exist".
+ */
+function explicitBinOnDisk(bin: string, platform: NodeJS.Platform = process.platform): string | null {
+  const pathLike = isAbsolute(bin) || bin.includes("/") || (platform === "win32" && bin.includes("\\"));
+  if (!pathLike) return null;
+  const abs = resolve(bin);
+  const candidates = platform === "win32" ? [abs, `${abs}.exe`, `${abs}.com`] : [abs];
+  return candidates.find((c) => isExecutableFile(c, platform)) ?? null;
 }
 
 /**
@@ -873,7 +937,7 @@ function classifyProbeFailure(err: unknown): OamProbeFailure {
  *  falls back to node only if the retry fails as well, so a wedged binary
  *  costs two of these windows.
  *
- *  10s, up from the 3s uv-bootstrap's onPath() probe uses. The probe now runs
+ *  10s, up from the 3s uv-bootstrap's probePath() uses. The probe now runs
  *  once per oam BINARY rather than once per process -- a clean answer is
  *  remembered across processes (oam-verdict-cache.ts) -- so the window is paid
  *  on the first launch after an install or update, not on every pane. And the
@@ -1193,7 +1257,12 @@ async function probeOamUncached(run: (bin: string) => Promise<string>, generatio
   // identity gate below already applies -- and gating it keeps the suite
   // host-independent on a machine whose agent shell has a build-tree oam first
   // on PATH (the exact condition this rule exists to refuse).
-  if (run === spawnVersionProbe && absResolved !== null && isBuildTreePath(absResolved)) {
+  //
+  // The path tested is the file that would SPAWN, which is not always
+  // `absResolved`: an OAM_BIN spelled relatively, or without its .exe, has no
+  // persistable absolute form yet runs all the same (see explicitBinOnDisk).
+  const spawnTarget = absResolved ?? (explicit ? explicitBinOnDisk(bin) : null);
+  if (run === spawnVersionProbe && spawnTarget !== null && isBuildTreePath(spawnTarget)) {
     // A build-tree binary is refused by PATH TEXT, before any spawn: `run` is
     // never called, so a dev build cannot even answer --version here. Same
     // rule typed applies to its own runtime manifest (gen-runtime-manifest.mjs)
@@ -1207,7 +1276,7 @@ async function probeOamUncached(run: (bin: string) => Promise<string>, generatio
     // wording); a bare name landing here means a build dir sits EARLIER on PATH
     // than the install, fixed by PATH order.
     log("warn", "oam resolves to a local build-tree binary; falling back to node for this process", {
-      bin: absResolved,
+      bin: spawnTarget,
       fix: oamBuildTreeFix(CURRENT_OS, explicit),
       thenRestart: "restart yaw-mcp; this probe is cached for the process lifetime",
     });
@@ -1217,7 +1286,7 @@ async function probeOamUncached(run: (bin: string) => Promise<string>, generatio
       version: null,
       belowMin: false,
       failure: "build-tree",
-      failureDetail: `${absResolved} is a compiler output binary (build-tree), not a release`,
+      failureDetail: `${spawnTarget} is a compiler output binary (build-tree), not a release`,
       viaOamBin: explicit,
     });
   }
@@ -1421,7 +1490,7 @@ async function probeOamUncached(run: (bin: string) => Promise<string>, generatio
 /** Reset the cached oam-binary probe (test hook). Bumps the generation so a
  *  probe still in flight cannot publish its result afterwards. */
 export function resetOamBinCache(): void {
-  warnedOamUnavailable = false;
+  warnedOamUnavailable.clear();
   oamProbeCache = undefined;
   oamProbeCacheExpiresAt = undefined;
   oamProbeInFlight = undefined;
@@ -1455,6 +1524,13 @@ export interface OamRewriteDeps {
  *  nothing anywhere to explain why the opt-in did nothing. */
 const WIN_EXE_EXT = /\.(?:exe|cmd|bat)$/i;
 
+/** A command's launcher name: the basename (either separator), minus a
+ *  trailing Windows executable extension (WIN_EXE_EXT: exe, cmd, bat --
+ *  not ps1), lowercased. `C:\Program Files\nodejs\NODE.EXE` -> `node`. */
+export function launcherBasename(command: string): string {
+  return (command.split(/[\\/]/).pop() ?? command).replace(WIN_EXE_EXT, "").toLowerCase();
+}
+
 /**
  * Which Node launcher a command names, or null for anything else.
  *
@@ -1472,7 +1548,7 @@ const WIN_EXE_EXT = /\.(?:exe|cmd|bat)$/i;
  * either behaviour on its own.
  */
 export function nodeLaunchKind(command: string): "node" | "npx" | null {
-  const base = (command.split(/[\\/]/).pop() ?? command).replace(WIN_EXE_EXT, "").toLowerCase();
+  const base = launcherBasename(command);
   if (base === "node") return "node";
   if (base === "npx") return "npx";
   return null;
@@ -2601,8 +2677,15 @@ export async function resolveOamSpawn(
   // those, "opted in to oam but oam is not installed; running it on node
   // instead" told the user to install oam (doctor reports the same server
   // as `not-node-command`) and claimed a node fallback that never happens.
-  if (optedIn && probe.bin === null && !probe.belowMin && !warnedOamUnavailable && nodeLaunchKind(command) !== null) {
-    warnedOamUnavailable = true;
+  const unavailableReason = probe.failure ?? "absent";
+  if (
+    optedIn &&
+    probe.bin === null &&
+    !probe.belowMin &&
+    !warnedOamUnavailable.has(unavailableReason) &&
+    nodeLaunchKind(command) !== null
+  ) {
+    warnedOamUnavailable.add(unavailableReason);
     // A BROKEN oam and an ABSENT one both arrive here with bin=null and send
     // the user to OPPOSITE fixes, so they get opposite messages. Telling
     // someone whose oam timed out or is non-executable to "install oam" -- with
@@ -2662,11 +2745,13 @@ export async function resolveOamSpawn(
  * Keyed by package name only: the everyday lookup this exists for is the
  * no-pin one, and a pinned lookup is rare enough to stay unmemoized.
  *
- * Accepted tradeoff: a durable install UNINSTALLED while the broker runs
- * leaves its dead path memoized until restart -- each connect then burns the
- * one-shot npx downgrade instead of re-scanning to a cache copy. The server
- * still serves (the respawn works); only the per-connect cost of a decision
- * npm has already made is paid.
+ * A memo hit is only trusted while its file still exists: one existsSync per
+ * connect, far cheaper than the walk it replaces. A copy UNINSTALLED while
+ * the broker runs drops its entry and re-resolves on the spot -- to another
+ * stable copy, an npx-cache copy, or a miss that stays on npx -- instead of
+ * booting from the dead path. A boot failure there would take the one-shot
+ * npx downgrade in upstream.ts, and an npx respawn that boots pins that
+ * server to raw npx until restart.
  */
 const managedEntryMemo = new Map<string, string>();
 
@@ -2714,7 +2799,11 @@ export function resolveManagedSpawn(
     resolveEntry: (pkg, wantVersion) => {
       if (wantVersion !== null) return resolveNpmEntry(pkg, fromUrl, npmCache, managedRoot, wantVersion);
       const memoed = managedEntryMemo.get(pkg);
-      if (memoed !== undefined) return memoed;
+      if (memoed !== undefined) {
+        if (existsSync(memoed)) return memoed;
+        // The memoized copy was removed: forget it and rescan below.
+        managedEntryMemo.delete(pkg);
+      }
       const hit = resolveNpmEntry(pkg, fromUrl, npmCache, managedRoot, null);
       // The marker check is what makes memoizing safe: a hit FROM an npx
       // cache directory carries the fragment in its own path.

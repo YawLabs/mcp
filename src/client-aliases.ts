@@ -29,8 +29,8 @@ export type ClientVerb = "install" | "uninstall" | "import" | "try";
 
 export interface ClientAlias {
   /** The id a user types, e.g. `mcp`. Must not collide with a canonical
-   *  clientId -- `aliasesAreDistinct` below is the check, and the boundary
-   *  test runs it. */
+   *  clientId -- `aliasTableProblems` below is the check, and
+   *  client-aliases.test.ts runs it. */
   id: string;
   /** The canonical row this name resolves to. */
   clientId: InstallClientId;
@@ -98,7 +98,7 @@ export interface ResolvedClientArg {
 }
 
 /** Resolve a `<client>` argument for `verb`, or null when it is not one this
- *  verb accepts. Canonical ids win over aliases, which `aliasesAreDistinct`
+ *  verb accepts. Canonical ids win over aliases, which `aliasTableProblems`
  *  makes moot -- but the order is stated rather than assumed, so an alias that
  *  slipped past that check could never shadow a real client. */
 export function resolveClientArg(verb: ClientVerb, arg: string): ResolvedClientArg | null {
@@ -112,8 +112,8 @@ export function resolveClientArg(verb: ClientVerb, arg: string): ResolvedClientA
 
 /** Every alias id that collides with a canonical clientId or with another
  *  alias, and every alias whose `clientId` names no row. Empty means the table
- *  is well formed. Exported so the boundary test can assert it stays empty
- *  once the table is filled, rather than re-deriving the rule there. */
+ *  is well formed. Exported so client-aliases.test.ts can assert it stays
+ *  empty, rather than re-deriving the rule there. */
 export function aliasTableProblems(): string[] {
   const problems: string[] = [];
   const canonical = new Set(INSTALL_TARGETS.map((t) => t.clientId as string));

@@ -152,8 +152,12 @@ interface Exported {
 async function harvestAndExport(home: string): Promise<Exported> {
   for (const { intent, chosen } of INTENTS) {
     const redacted = redactIntent(intent);
-    // Exactly the shape server.ts writes: tokens + redactedCount + chosen.
-    await appendFoundryTrace({ tokens: redacted.tokens, redactedCount: redacted.redactedCount, chosen }, home);
+    // Exactly the shape server.ts writes: tokens + redactedCount + chosen +
+    // loaded (here the pick itself loaded).
+    await appendFoundryTrace(
+      { tokens: redacted.tokens, redactedCount: redacted.redactedCount, chosen, loaded: chosen },
+      home,
+    );
   }
   const outPath = join(home, "out", "corpus.json");
   const stdout: string[] = [];

@@ -71,6 +71,37 @@ describe("oam verdict cache", () => {
     expect(readOamVerdict(id)).toBeUndefined();
   });
 
+  it("a damaged entry does not stop later writes: the next write replaces the file without it", async () => {
+    // The writer sorts on each entry's probedAt, so a null entry made it throw
+    // (caught, debug-logged) and nothing was written -- and since the write is
+    // what replaces the file, the damage stayed and every process re-probed.
+    const id = oamBinaryIdentity(bin);
+    if (!id) throw new Error("no identity");
+    await writeOamVerdict(id, "0.18.0");
+    const good = { size: 1, mtimeMs: 2, version: "0.17.0", probedAt: "2026-01-01T00:00:00.000Z" };
+    writeFileSync(
+      file(),
+      JSON.stringify({
+        schema: 1,
+        entries: { "/a/null": null, "/a/number": 7, "/a/partial": { size: 1 }, "/a/good": good },
+      }),
+    );
+    expect(readOamVerdict(id)).toBeUndefined();
+
+    await writeOamVerdict(id, "0.19.5");
+
+    expect(readOamVerdict(id)).toBe("0.19.5");
+    const written = JSON.parse(readFileSync(file(), "utf8")) as { entries: Record<string, unknown> };
+    // The well-shaped neighbour survives; the damaged values are gone.
+    expect(Object.keys(written.entries)).toHaveLength(2);
+    expect(written.entries["/a/good"]).toEqual(good);
+
+    // An `entries` that is an array is not a map of anything.
+    writeFileSync(file(), JSON.stringify({ schema: 1, entries: [null] }));
+    await writeOamVerdict(id, "0.19.5");
+    expect(readOamVerdict(id)).toBe("0.19.5");
+  });
+
   it("reads and writes nothing under YAW_MCP_DISABLE_PERSISTENCE", async () => {
     const id = oamBinaryIdentity(bin);
     if (!id) throw new Error("no identity");

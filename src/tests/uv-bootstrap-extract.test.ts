@@ -24,7 +24,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 //
 // Own file (like the sibling uv-bootstrap-*.test.ts) because it needs a
 // module-level vi.mock for node:child_process whose spawn distinguishes the
-// onPath("uv") probe (must fail) from the extractArchive powershell.exe call
+// probePath("uv") probe (must fail) from the extractArchive powershell.exe call
 // (must resolve so we can capture the -Command string), plus a *controllable*
 // cacheDir() mock so each test can inject an apostrophe- or smart-quote-bearing
 // root. The sibling files' mocks are fixed and would not fit.
@@ -45,8 +45,8 @@ vi.mock("undici", () => ({
   request: vi.fn(),
 }));
 
-// spawn mock records every call. The onPath("uv") probe (cmd "uv") emits
-// "error" so onPath returns false and resolveUv proceeds to the download +
+// spawn mock records every call. The probePath("uv") probe (cmd "uv") emits
+// "error" so probePath answers "absent" and resolveUv proceeds to the download +
 // extract path. The extractArchive runCommand (cmd "powershell.exe") emits
 // "close" 0 so runCommand resolves and we can assert the captured -Command.
 //
@@ -82,7 +82,7 @@ vi.mock("node:child_process", () => {
         // runCommand success: exit 0.
         setImmediate(() => fake.emit("close", 0));
       } else {
-        // onPath probe: ENOENT -> onPath returns false.
+        // probePath probe: ENOENT -> "absent".
         setImmediate(() => fake.emit("error", new Error("ENOENT (mocked)")));
       }
       return fake;

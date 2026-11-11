@@ -1001,6 +1001,24 @@ describe("runSet -- overwriting a stored env value", () => {
     expect(read().servers[0].env).toMatchObject({ BRAND_NEW: "x" });
   });
 
+  it("does not ask when the stored value is the blank seed add writes -- filling or removing it loses nothing", async () => {
+    // `add` seeds every declared key as "" and tells the user to fill it with
+    // `yaw-mcp set <ns> env.KEY=...`; off a TTY that command must just work.
+    const seeded = SAMPLE.replace('"GITHUB_TOKEN": "t"', '"GITHUB_TOKEN": "", "BLANK": "  "');
+    writeBundles(seeded);
+    const fill = capture();
+    const filled = await runSet({
+      target: "gh",
+      assignments: ["env.GITHUB_TOKEN=new", "env.BLANK="],
+      home: synthHome,
+      isTTY: false,
+      ...fill,
+    });
+    expect(filled.exitCode, fill.errText()).toBe(0);
+    expect(fill.errText()).not.toMatch(/stored value|refusing/);
+    expect(read().servers[0].env).toEqual({ GITHUB_TOKEN: "new", OTHER: "o" });
+  });
+
   it("does not ask when the value is unchanged -- that write never happens", async () => {
     writeBundles(SAMPLE);
     const r = await runSet({

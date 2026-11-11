@@ -41,10 +41,11 @@
 //   of them land on stubs and the bare repo.
 //
 // Step 4's publish-segfault probe is covered by forcing IS_MINGW_ARM64=true in
-// its extracted block. Still not covered: the other IS_MINGW_ARM64 139/134
-// tolerance paths -- run_npm_check, the build and the bump. The fixture and
-// full-run shapes reach them only when uname reports ARM64, though an
-// extracted-block case could force the variable the same way.
+// its extracted block, and so is run_npm_check's direct re-run path. Still not
+// covered: the other IS_MINGW_ARM64 139/134 tolerance paths -- run_npm_check's
+// done_re one, the build and the bump. The fixture and full-run shapes reach
+// them only when uname reports ARM64, though an extracted-block case could
+// force the variable the same way.
 
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -226,6 +227,16 @@ const STUB_HELPERS = [
   'warn() { echo "WARN $1"; }',
   'fail() { echo "FAIL $1"; exit 1; }',
 ].join("\n");
+
+/**
+ * Git for Windows' gawk reads files in text mode and drops the CR of a CRLF
+ * line before a rule sees it (measured: `printf 'ab\r\n'` reads as length 2),
+ * so a CRLF test passes there whether or not the script strips the CR. Every
+ * other awk keeps it. BINMODE=3 makes gawk on Windows keep it too, as the awk
+ * on a Linux or macOS release host does; elsewhere it is just an unused
+ * variable. Prepend this to a harness that tests CRLF handling.
+ */
+const CR_KEEPING_AWK = 'awk() { command awk -v BINMODE=3 "$@"; }';
 
 // ---------------------------------------------------------------------------
 // FIXTURE RUN
@@ -834,8 +845,69 @@ describe("release.sh tag-at-HEAD guard", () => {
 });
 
 describe("release.sh non-interactive confirm brake", () => {
-  const block = extractBlock('if [ "$SKIP_CONFIRM" != "true" ] && [ "$RESUMING" != "true" ]; then', "fi");
+  const block = extractBlock('if [ "$SKIP_CONFIRM" != "true" ] && [ "$RESUME_PROVEN" != "true" ]; then', "fi");
   const dir = newTmp("release-tty-");
+
+  // What decides RESUME_PROVEN. RESUMING alone only says package.json already
+  // reads the version, which a merged bump commit leaves too; the prompts are
+  // skipped only when a local tag for the version, or the version on npm, is
+  // there. The tag counts whatever made it: these cases build it with
+  // `git tag -a`, and a hand-run `npm version` (which tags by default) would
+  // skip the prompts the same way.
+  const evidence = extractBlock("# >>> resume evidence", "# <<< resume evidence");
+
+  function resume(opts: { resuming: boolean; tag: boolean; published: boolean }): RunResult {
+    const repo = newTmp("release-resume-");
+    git(repo, ["init", "-q", "-b", "main"]);
+    writeFileSync(join(repo, "a.txt"), "a\n");
+    git(repo, ["add", "a.txt"]);
+    git(repo, ["commit", "-q", "-m", "base"]);
+    if (opts.tag) {
+      git(repo, ["tag", "-a", "v9.9.9", "-m", "v9.9.9"]);
+    }
+    const body = [
+      STUB_HELPERS,
+      'VERSION="9.9.9"',
+      'SKIP_CONFIRM="false"',
+      `RESUMING=${opts.resuming}`,
+      `ALREADY_PUBLISHED="${opts.published ? "9.9.9" : ""}"`,
+      "CYAN=''; YELLOW=''; NC=''",
+      evidence,
+      block,
+      'echo "REACHED_STEP_1"',
+    ].join("\n");
+    return runOutside(repo, body);
+  }
+
+  it("still confirms a 'resume' that no earlier run left a tag or a publish for", () => {
+    const r = resume({ resuming: true, tag: false, published: false });
+    expect(r.out).toContain("no sign of an earlier run");
+    // stdin is not a terminal here, so reaching the prompt block is the abort.
+    expect(r.out).toContain("Aborted: stdin is not a terminal");
+    expect(r.out).not.toContain("REACHED_STEP_1");
+    expect(r.status).toBe(1);
+  });
+
+  it("skips the prompts on a resume the tag or the npm version proves", () => {
+    for (const proof of [
+      { tag: true, published: false },
+      { tag: false, published: true },
+    ]) {
+      const r = resume({ resuming: true, ...proof });
+      expect(r.out).not.toContain("no sign of an earlier run");
+      expect(r.out).not.toContain("About to release");
+      expect(r.out).toContain("REACHED_STEP_1");
+      expect(r.status).toBe(0);
+    }
+  });
+
+  it("does not read a pre-existing tag as proof on a fresh bump", () => {
+    // RESUMING=false with the tag present is the tag-collision guard's case,
+    // not a resume; the evidence block must leave the prompts on.
+    const r = resume({ resuming: false, tag: true, published: false });
+    expect(r.out).toContain("Aborted: stdin is not a terminal");
+    expect(r.out).not.toContain("REACHED_STEP_1");
+  });
 
   it("aborts with exit 1 before any mutation when stdin is not a terminal", () => {
     // Every fixture test in this file relies on this brake: if it ever reads
@@ -847,7 +919,7 @@ describe("release.sh non-interactive confirm brake", () => {
       STUB_HELPERS,
       'VERSION="9.9.9"',
       'SKIP_CONFIRM="false"',
-      'RESUMING="false"',
+      'RESUME_PROVEN="false"',
       "CYAN=''; YELLOW=''; NC=''",
       block,
       'echo "REACHED_STEP_1"',
@@ -870,7 +942,7 @@ describe("release.sh non-interactive confirm brake", () => {
       STUB_HELPERS,
       'VERSION="9.9.9"',
       'SKIP_CONFIRM="false"',
-      'RESUMING="false"',
+      'RESUME_PROVEN="false"',
       "CYAN=''; YELLOW=''; NC=''",
       'if [ "${FORCE_FAIL:-}" = "1" ]; then exit 1; fi',
       block,
@@ -1439,23 +1511,34 @@ describe("release.sh step-4 npm publish", () => {
     expect(r.out).not.toContain("CONTINUED");
   });
 
-  it("still retries an OTP-class failure three times, then fails", () => {
+  it("fails an OTP-class failure on the first attempt, with the token-restore instruction", () => {
     const r = run({ out: "npm error code EOTP\nnpm error This operation requires a one-time password", rc: 1 });
-    expect(r.calls).toBe(3);
-    expect(r.out).toContain("WARN npm publish attempt 1 EOTPed");
-    expect(r.out).toContain("WARN npm publish attempt 2 EOTPed");
-    expect(r.out).toContain("FAIL npm publish failed after 3 OTP-class attempts");
+    // One publish and no sleep: waiting never fixes a missing automation
+    // token, so the old three attempts 30 s apart only delayed the failure.
+    expect(r.calls).toBe(1);
+    expect(r.out).toContain("FAILED reads=0 now=1000");
+    expect(r.out).not.toContain("EOTPed");
+    expect(r.out).not.toContain("retrying");
+    expect(r.out).toContain("FAIL npm publish failed on an OTP-class refusal (not retried)");
     expect(r.out).not.toContain("CONTINUED");
+    // Step 4 requires the automation token, which an OTP challenge means is
+    // missing: the message names the token to restore and warns off the web
+    // login that would overwrite it.
+    expect(r.out).toContain("Restore the automation token line (//registry.npmjs.org/:_authToken=<token>)");
+    expect(r.out).toContain("an OTP challenge means the token in ~/.npmrc is missing or wrong");
+    expect(r.out).toContain("do NOT run 'npm login --auth-type=web'");
+    expect(r.out).not.toContain("WebAuthn");
     // EAUTH on npm's code line is OTP-class too, in either of npm's spellings.
     const eauth = run({ out: "npm ERR! code EAUTH\nnpm ERR! Unable to authenticate", rc: 1 });
-    expect(eauth.calls).toBe(3);
-    expect(eauth.out).toContain("FAIL npm publish failed after 3 OTP-class attempts");
+    expect(eauth.calls).toBe(1);
+    expect(eauth.out).toContain("FAIL npm publish failed on an OTP-class refusal (not retried)");
   });
 
   it("reads OTP-class only off npm's own code line, not off letters elsewhere in the log", () => {
     // The old pattern was a bare `EOTP|EAUTH|one-time password|OTP`: "OTP"
-    // inside the tarball's integrity string turned a packaging error into
-    // three attempts and a minute of sleeping on a challenge npm never sent.
+    // inside the tarball's integrity string turned a packaging error into an
+    // OTP challenge npm never sent (three attempts and a minute of sleeping,
+    // while step 4 still retried those).
     const r = run({
       out: "npm notice integrity: sha512-aaOTPbbEOTPcc==\nnpm error code E409\nnpm error 409 Conflict - PUT https://registry.npmjs.org/@yawlabs%2fmcp",
       rc: 1,
@@ -1520,15 +1603,15 @@ describe("release.sh step-4 npm publish", () => {
   });
 
   it("on ARM64, does not wait out the budget when npm's log already refused the publish", () => {
-    // An OTP challenge: straight to the three OTP-class attempts, 30 s apart.
+    // An OTP challenge: straight to the OTP-class failure, on the one attempt.
     const otp = run({
       out: "npm error code EOTP\nnpm error This operation requires a one-time password\nSegmentation fault",
       rc: 139,
       arm64: true,
     });
-    expect(otp.calls).toBe(3);
-    expect(otp.out).toContain("FAIL npm publish failed after 3 OTP-class attempts");
-    expect(otp.out).toContain("FAILED reads=0 now=1060");
+    expect(otp.calls).toBe(1);
+    expect(otp.out).toContain("FAIL npm publish failed on an OTP-class refusal (not retried)");
+    expect(otp.out).toContain("FAILED reads=0 now=1000");
     // A stale token: straight to the non-OTP failure and its hint.
     const auth = run({
       out: "npm error code E401\nnpm error Incorrect or missing password\nSegmentation fault",
@@ -2032,26 +2115,36 @@ describe("release.sh mcp-publisher download and sha256 check", () => {
   const goarch = process.arch === "arm64" ? "arm64" : "amd64";
   const tarball = `mcp-publisher_${goos}_${goarch}.tar.gz`;
   const STUB = ["#!/bin/bash", 'echo "ran $*" >> "$FAKE_STATE/publisher.log"', ""].join("\n");
-  // curl serves the two assets to its -o path, and nothing else.
+  // curl serves the two assets to its -o path, and nothing else. It logs its
+  // arguments, and a `stall-tarball` / `stall-checksums` state file makes that
+  // download answer 28, curl's exit code for a --max-time that ran out.
   const CURL = [
     "curl() {",
     '  local out="" prev="" a',
+    '  echo "curl $*" >> "$FAKE_STATE/curl.log"',
     '  for a in "$@"; do if [ "$prev" = "-o" ]; then out="$a"; fi; prev="$a"; done',
     '  case "$*" in',
-    '    *registry_*_checksums.txt*) cp "$FAKE_FIXTURES/checksums.txt" "$out" ;;',
-    '    *mcp-publisher_*.tar.gz*) cp "$FAKE_FIXTURES/mcp-publisher.tar.gz" "$out" ;;',
+    "    *registry_*_checksums.txt*)",
+    '      if [ -e "$FAKE_STATE/stall-checksums" ]; then return 28; fi',
+    '      cp "$FAKE_FIXTURES/checksums.txt" "$out" ;;',
+    "    *mcp-publisher_*.tar.gz*)",
+    '      if [ -e "$FAKE_STATE/stall-tarball" ]; then return 28; fi',
+    '      cp "$FAKE_FIXTURES/mcp-publisher.tar.gz" "$out" ;;',
     "    *) return 22 ;;",
     "  esac",
     "}",
   ].join("\n");
 
-  function run(opts: { digest?: string; names?: string[] } = {}): RunResult & { ran: string[] } {
+  function run(
+    opts: { digest?: string; names?: string[]; stall?: "tarball" | "checksums" } = {},
+  ): RunResult & { ran: string[]; curls: string[] } {
     const root = newTmp("release-dl-");
     const fixtures = join(root, "fixtures");
     const state = join(root, "state");
     mkdirSync(fixtures);
     mkdirSync(state);
     makePublisherFixture(fixtures, STUB, opts);
+    if (opts.stall) writeFileSync(join(state, `stall-${opts.stall}`), "");
     const body = [
       "set -o pipefail",
       STUB_HELPERS,
@@ -2062,18 +2155,21 @@ describe("release.sh mcp-publisher download and sha256 check", () => {
       `GOOS=${goos}`,
       `GOARCH=${goarch}`,
       'MCP_PUBLISHER_VERSION="v9.9.9"',
+      'VERSION="1.0.2"',
       CURL,
       block,
       'echo "CONTINUED"',
     ].join("\n");
     const r = runBash(body, root, { FAKE_FIXTURES: shPath(fixtures), FAKE_STATE: shPath(state) });
-    let ran: string[] = [];
-    try {
-      ran = readFileSync(join(state, "publisher.log"), "utf8").split("\n").filter(Boolean);
-    } catch {
-      // Never ran, which the refusal cases assert on.
-    }
-    return { ...r, ran };
+    const logLines = (name: string) => {
+      try {
+        return readFileSync(join(state, name), "utf8").split("\n").filter(Boolean);
+      } catch {
+        // Never ran, which the refusal cases assert on.
+        return [];
+      }
+    };
+    return { ...r, ran: logLines("publisher.log"), curls: logLines("curl.log") };
   }
 
   it("extracts and runs the binary when its digest matches", () => {
@@ -2081,6 +2177,30 @@ describe("release.sh mcp-publisher download and sha256 check", () => {
     expect(r.out).toContain("INFO mcp-publisher v9.9.9 ready (sha256 verified)");
     expect(r.ran).toEqual(["ran --help"]);
     expect(r.out).toContain("CONTINUED");
+  });
+
+  it("bounds both downloads, which run after the npm publish", () => {
+    // Bare `curl -fsSL -o` waits for ever on a download that stalls, and by
+    // this point the version is live on npm and not yet registered.
+    const r = run();
+    expect(r.curls).toHaveLength(2);
+    for (const line of r.curls) {
+      expect(line).toMatch(/--connect-timeout \d+/);
+      expect(line).toMatch(/--max-time \d+/);
+    }
+  });
+
+  it.each([
+    ["tarball", `Could not download mcp-publisher v9.9.9 (${tarball}) from its GitHub release (curl exit 28`],
+    ["checksums", "Could not download mcp-publisher v9.9.9's checksums file from its GitHub release (curl exit 28"],
+  ] as const)("fails a %s download that runs out of time by naming the re-run, and runs nothing", (stall, message) => {
+    const r = run({ stall });
+    expect(r.out).toContain(`FAIL ${message}`);
+    expect(r.out).toContain("npm already serves @yawlabs/mcp@1.0.2");
+    expect(r.out).toContain("Re-run ./release.sh 1.0.2 once github.com answers");
+    expect(r.ran).toEqual([]);
+    expect(r.out).not.toContain("ready (sha256 verified)");
+    expect(r.out).not.toContain("CONTINUED");
   });
 
   it("refuses to run a tarball whose digest does not match", () => {
@@ -2102,6 +2222,266 @@ describe("release.sh mcp-publisher download and sha256 check", () => {
   });
 });
 
+describe("release.sh final banner", () => {
+  // The banner names a channel only when the final verification read it back.
+  // It used to branch on the MCP registry alone, so both arms said "released
+  // to npm" under a warning that npm does not serve the version -- reachable
+  // on a resume where step 5 skips (the registry lists the version) and the
+  // last read of npm's per-version document fails.
+  const block = extractBlock('if [ -n "$NPM_FINAL_MANIFEST" ] && [ "$REGISTRY_FINAL" = true ]; then', "fi");
+  const dir = newTmp("release-banner-");
+  const banner = (manifest: string, registry: boolean) =>
+    runBash(
+      [
+        'GREEN=""; YELLOW=""; NC=""',
+        'VERSION="1.0.2"',
+        `NPM_FINAL_MANIFEST='${manifest}'`,
+        `REGISTRY_FINAL=${registry}`,
+        block,
+      ].join("\n"),
+      dir,
+    ).out.trim();
+  const MANIFEST = '{"version":"1.0.2"}';
+
+  it("says released to npm + MCP registry only when both were read back", () => {
+    expect(banner(MANIFEST, true)).toBe("v1.0.2 released to npm + MCP registry.");
+  });
+
+  it("names npm alone when the registry did not confirm", () => {
+    expect(banner(MANIFEST, false)).toBe(
+      "v1.0.2 released to npm; the MCP registry did not confirm the listing (see above).",
+    );
+  });
+
+  it("does not claim npm when the final npm read came back empty", () => {
+    expect(banner("", true)).toBe(
+      "v1.0.2 is listed on the MCP registry; npm did not confirm @yawlabs/mcp@1.0.2 on the final read (see above).",
+    );
+    expect(banner("", false)).toBe(
+      "v1.0.2: neither npm nor the MCP registry confirmed the release on the final read (see above).",
+    );
+  });
+});
+
+// Step 3 heads CHANGELOG.md's Unreleased notes with the version in the bump
+// commit. Until it did, that was a hand edit made before the release (so the
+// behaviour-change gate read an empty section) or never made at all (so it
+// read every earlier release's notes too).
+describe("release.sh changelog retitle", () => {
+  const helpers = extractBlock("# >>> changelog helpers", "# <<< changelog helpers");
+  const retitle = extractBlock("# >>> changelog retitle", "# <<< changelog retitle");
+
+  function retitleFile(text: string, mode = "write", version = "1.2.0"): RunResult & { after: string } {
+    const dir = newTmp("release-retitle-");
+    writeFileSync(join(dir, "CHANGELOG.md"), text);
+    const r = runBash([helpers, `changelog_retitle ${mode} ${version}; echo "RC=$?"`].join("\n"), dir);
+    return { ...r, after: readFileSync(join(dir, "CHANGELOG.md"), "utf8") };
+  }
+
+  it("retitles Unreleased to the version, keeps its suffix, and adds a fresh Unreleased above", () => {
+    const r = retitleFile(
+      "# Changelog\n\nIntro.\n\n## Unreleased -- the summary\n\nThe notes.\n\n## 1.1.10 -- older\n\nOld notes.\n",
+    );
+    expect(r.out).toContain("RC=0");
+    expect(r.after).toBe(
+      "# Changelog\n\nIntro.\n\n## Unreleased\n\n## 1.2.0 -- the summary\n\nThe notes.\n\n## 1.1.10 -- older\n\nOld notes.\n",
+    );
+  });
+
+  it("retitles a bare Unreleased heading to a bare version heading", () => {
+    const r = retitleFile("# Changelog\n\n## Unreleased\n\nThe notes.\n");
+    expect(r.out).toContain("RC=0");
+    expect(r.after).toBe("# Changelog\n\n## Unreleased\n\n## 1.2.0\n\nThe notes.\n");
+  });
+
+  it("keeps CRLF line endings", () => {
+    const r = retitleFile("# Changelog\r\n\r\n## Unreleased -- s\r\n\r\nThe notes.\r\n");
+    expect(r.after).toBe("# Changelog\r\n\r\n## Unreleased\r\n\r\n## 1.2.0 -- s\r\n\r\nThe notes.\r\n");
+  });
+
+  it("refuses an empty Unreleased section (exit 4) and leaves the file alone", () => {
+    const text = "# Changelog\n\n## Unreleased -- s\n\n   \n\n## 1.1.10 -- older\n\nOld notes.\n";
+    const r = retitleFile(text);
+    expect(r.out).toContain("RC=4");
+    expect(r.after).toBe(text);
+    // The check mode answers the same, without writing.
+    expect(retitleFile(text, "check").out).toContain("RC=4");
+  });
+
+  it("refuses a changelog whose first section is not Unreleased (exit 3)", () => {
+    const text = "# Changelog\n\n## 1.1.10 -- older\n\nOld notes.\n\n## Unreleased\n\nx\n";
+    const r = retitleFile(text);
+    expect(r.out).toContain("RC=3");
+    expect(r.after).toBe(text);
+  });
+
+  it("skips a ## line inside a code fence when finding the first section", () => {
+    const text = "# Changelog\n\n```\n## 1.0.0 example\n```\n\n## Unreleased\n\nThe notes.\n";
+    const r = retitleFile(text);
+    expect(r.out).toContain("RC=0");
+    expect(r.after).toBe("# Changelog\n\n```\n## 1.0.0 example\n```\n\n## Unreleased\n\n## 1.2.0\n\nThe notes.\n");
+  });
+
+  it("refuses a code fence that never closes (exit 5) rather than reporting a missing Unreleased", () => {
+    // Without its own code the unclosed fence read every later heading as
+    // fenced and exited 3, which told the operator Unreleased was missing.
+    const text = "# Changelog\n\n```\n## 1.0.0 example\n\n## Unreleased\n\nThe notes.\n";
+    const r = retitleFile(text);
+    expect(r.out).toContain("RC=5");
+    expect(r.after).toBe(text);
+    expect(retitleFile(text, "check").out).toContain("RC=5");
+  });
+
+  it("check mode passes a changelog with notes and writes nothing", () => {
+    const text = "# Changelog\n\n## Unreleased\n\nThe notes.\n";
+    const r = retitleFile(text, "check");
+    expect(r.out).toContain("RC=0");
+    expect(r.after).toBe(text);
+  });
+
+  it("finds a bare version heading in a CRLF changelog, and reads that section's notes", () => {
+    // The awk helpers compared `$0 == "## 1.2.0"` exactly, and on a CRLF file
+    // awk sees `## 1.2.0\r`: the heading read as absent, so the notes body
+    // fell back to the (empty) Unreleased section.
+    const dir = newTmp("release-crlf-helpers-");
+    writeFileSync(
+      join(dir, "CHANGELOG.md"),
+      "# Changelog\r\n\r\n## Unreleased\r\n\r\n## 1.2.0\r\n\r\nThe notes.\r\n\r\n## 1.1.0\r\n\r\nOld.\r\n",
+    );
+    const r = runBash(
+      [
+        CR_KEEPING_AWK,
+        helpers,
+        'changelog_version_heading 1.2.0; echo "HEADING=$?"',
+        "echo \"BODY=[$(changelog_notes_body 1.2.0 | tr '\\n' '|')]\"",
+      ].join("\n"),
+      dir,
+    );
+    expect(r.out).toContain("HEADING=0");
+    expect(r.out).toContain("BODY=[|The notes.||]");
+  });
+
+  it("reads a CRLF Unreleased section without its carriage returns", () => {
+    const dir = newTmp("release-crlf-unreleased-");
+    writeFileSync(
+      join(dir, "CHANGELOG.md"),
+      "# Changelog\r\n\r\n## Unreleased\r\n\r\nThe notes.\r\n\r\n## 1.1.0\r\n\r\nOld.\r\n",
+    );
+    const r = runBash(
+      [CR_KEEPING_AWK, helpers, "echo \"BODY=[$(changelog_notes_body 1.2.0 | tr '\\n' '|')]\""].join("\n"),
+      dir,
+    );
+    expect(r.out).toContain("BODY=[|The notes.||]");
+  });
+
+  // Step 3's block, in a repo, so the tag check is real. `pkg` commits a
+  // package.json at that version in the base commit, titled `subject` (default
+  // "base"; "v1.2.0" is this script's own bump commit); `onTop` adds an
+  // unrelated commit after it; `pkgDirty` then rewrites package.json
+  // uncommitted (the bump is not).
+  function step3(opts: {
+    changelog: string;
+    tag: boolean;
+    pkg?: string;
+    subject?: string;
+    onTop?: boolean;
+    pkgDirty?: string;
+  }): RunResult & { after: string } {
+    const repo = newTmp("release-retitle-step3-");
+    git(repo, ["init", "-q", "-b", "main"]);
+    writeFileSync(join(repo, "CHANGELOG.md"), opts.changelog);
+    git(repo, ["add", "CHANGELOG.md"]);
+    if (opts.pkg !== undefined) {
+      writeFileSync(join(repo, "package.json"), `${JSON.stringify({ version: opts.pkg })}\n`);
+      git(repo, ["add", "package.json"]);
+    }
+    git(repo, ["commit", "-q", "-m", opts.subject ?? "base"]);
+    if (opts.onTop) {
+      writeFileSync(join(repo, "other.txt"), "x\n");
+      git(repo, ["add", "other.txt"]);
+      git(repo, ["commit", "-q", "-m", "docs: unrelated"]);
+    }
+    if (opts.pkgDirty !== undefined) {
+      writeFileSync(join(repo, "package.json"), `${JSON.stringify({ version: opts.pkgDirty })}\n`);
+    }
+    if (opts.tag) {
+      git(repo, ["tag", "-a", "v1.2.0", "-m", "v1.2.0"]);
+    }
+    const r = runOutside(repo, [STUB_HELPERS, helpers, 'VERSION="1.2.0"', retitle, 'echo "CONTINUED"'].join("\n"));
+    return { ...r, after: readFileSync(join(repo, "CHANGELOG.md"), "utf8") };
+  }
+
+  it("step 3 does not retitle when the bump commit is already made with no tag, since that would be a second commit", () => {
+    // A `v1.2.0` bump commit from a release.sh that predates the retitle:
+    // HEAD's package.json reads the version, CHANGELOG.md still says
+    // Unreleased. Also with a commit on top of it.
+    const text = "# Changelog\n\n## Unreleased -- s\n\nThe notes.\n";
+    const warning =
+      "WARN CHANGELOG.md has no ## 1.2.0 heading, but the v1.2.0 bump commit is already made (HEAD's package.json reads 1.2.0) -- not retitling";
+    for (const onTop of [false, true]) {
+      const r = step3({ changelog: text, tag: false, pkg: "1.2.0", subject: "v1.2.0", onTop });
+      expect(r.out).toContain(warning);
+      expect(r.out).toContain("CONTINUED");
+      expect(r.after).toBe(text);
+    }
+  });
+
+  it("step 3 still retitles when package.json is bumped but not committed, or committed at another version", () => {
+    const text = "# Changelog\n\n## Unreleased -- s\n\nThe notes.\n";
+    const retitled = "# Changelog\n\n## Unreleased\n\n## 1.2.0 -- s\n\nThe notes.\n";
+    const uncommitted = step3({ changelog: text, tag: false, pkg: "1.1.0", pkgDirty: "1.2.0" });
+    expect(uncommitted.out).toContain("INFO CHANGELOG.md: ## Unreleased retitled ## 1.2.0");
+    expect(uncommitted.after).toBe(retitled);
+    const other = step3({ changelog: text, tag: false, pkg: "1.1.0", subject: "v1.1.0" });
+    expect(other.out).toContain("INFO CHANGELOG.md: ## Unreleased retitled ## 1.2.0");
+    expect(other.after).toBe(retitled);
+    // A `v1.2.0` subject over a package.json at 1.1.0: only HEAD's version
+    // compare tells this apart from the bump commit.
+    const subjectOnly = step3({ changelog: text, tag: false, pkg: "1.1.0", subject: "v1.2.0" });
+    expect(subjectOnly.out).toContain("INFO CHANGELOG.md: ## Unreleased retitled ## 1.2.0");
+    expect(subjectOnly.after).toBe(retitled);
+  });
+
+  it("step 3 still retitles a bump committed under another subject, such as a merged release PR", () => {
+    // No `v1.2.0` commit exists yet, so the retitle's commit is the release's
+    // only one: skipping it would tag a CHANGELOG.md still headed Unreleased.
+    const text = "# Changelog\n\n## Unreleased -- s\n\nThe notes.\n";
+    const r = step3({ changelog: text, tag: false, pkg: "1.2.0", subject: "chore: release 1.2.0" });
+    expect(r.out).toContain("INFO CHANGELOG.md: ## Unreleased retitled ## 1.2.0");
+    expect(r.out).not.toContain("not retitling");
+    expect(r.after).toBe("# Changelog\n\n## Unreleased\n\n## 1.2.0 -- s\n\nThe notes.\n");
+  });
+
+  it("step 3 retitles when there is no version heading and no tag", () => {
+    const r = step3({ changelog: "# Changelog\n\n## Unreleased -- s\n\nThe notes.\n", tag: false });
+    expect(r.out).toContain("INFO CHANGELOG.md: ## Unreleased retitled ## 1.2.0, fresh ## Unreleased added above it");
+    expect(r.out).toContain("CONTINUED");
+    expect(r.after).toBe("# Changelog\n\n## Unreleased\n\n## 1.2.0 -- s\n\nThe notes.\n");
+  });
+
+  it("step 3 leaves an existing version heading alone, so a resume does not retitle twice", () => {
+    const text = "# Changelog\n\n## Unreleased\n\n## 1.2.0 -- s\n\nThe notes.\n";
+    const r = step3({ changelog: text, tag: false });
+    expect(r.out).toContain("INFO CHANGELOG.md already has a ## 1.2.0 heading");
+    expect(r.after).toBe(text);
+  });
+
+  it("step 3 does not retitle once the tag exists, since that would put a commit on top of it", () => {
+    const text = "# Changelog\n\n## Unreleased -- s\n\nThe notes.\n";
+    const r = step3({ changelog: text, tag: true });
+    expect(r.out).toContain("WARN CHANGELOG.md has no ## 1.2.0 heading, but tag v1.2.0 already exists");
+    expect(r.out).toContain("CONTINUED");
+    expect(r.after).toBe(text);
+  });
+
+  it("step 3 fails, before the commit, on an Unreleased section emptied since the pre-flight", () => {
+    const r = step3({ changelog: "# Changelog\n\n## Unreleased\n\n## 1.1.10\n\nOld.\n", tag: false });
+    expect(r.out).toContain("FAIL CHANGELOG.md's Unreleased section is empty now");
+    expect(r.out).not.toContain("CONTINUED");
+    expect(r.status).toBe(1);
+  });
+});
+
 // The behaviour-change gate: a default that changes without an opt-in is the
 // one release hazard nothing in the diff can reveal, so the only check is a
 // human answering out loud. Both defects below were found by an adversarial
@@ -2111,6 +2491,8 @@ describe("release.sh behaviour-change gate (fixture run)", () => {
     '  read -p "Behaviour change with no opt-in? (y/N) " -r BEHAVIOUR_REPLY || BEHAVIOUR_REPLY=""',
     "  fi",
   );
+  // The gate reads its section through these.
+  const helpers = extractBlock("# >>> changelog helpers", "# <<< changelog helpers");
   const dir = newTmp("release-behaviour-");
 
   // A CHANGELOG shaped like the real one: an Unreleased section naming this
@@ -2128,9 +2510,18 @@ describe("release.sh behaviour-change gate (fixture run)", () => {
     "",
   ].join("\n");
 
-  function run(answers: string[]): RunResult {
-    writeFileSync(join(dir, "CHANGELOG.md"), CHANGELOG);
-    const body = [STUB_HELPERS, 'VERSION="0.81.0"', "CYAN=''", "NC=''", block, 'echo "CONTINUED"'].join("\n");
+  function run(answers: string[], changelog = CHANGELOG, prelude = ""): RunResult {
+    writeFileSync(join(dir, "CHANGELOG.md"), changelog);
+    const body = [
+      prelude,
+      STUB_HELPERS,
+      helpers,
+      'VERSION="0.81.0"',
+      "CYAN=''",
+      "NC=''",
+      block,
+      'echo "CONTINUED"',
+    ].join("\n");
     const file = join(dir, "behaviour-harness.sh");
     writeFileSync(file, body);
     const r = spawnSync("bash", [file], {
@@ -2181,7 +2572,7 @@ describe("release.sh behaviour-change gate (fixture run)", () => {
 
   it("accepts a flag-shaped switch that IS documented", () => {
     writeFileSync(join(dir, "CHANGELOG.md"), CHANGELOG.replace("YAW_MCP_NEW_THING=0", "--no-new-thing"));
-    const body = [STUB_HELPERS, 'VERSION="0.81.0"', "CYAN=''", "NC=''", block, 'echo "CONTINUED"'].join("\n");
+    const body = [STUB_HELPERS, helpers, 'VERSION="0.81.0"', "CYAN=''", "NC=''", block, 'echo "CONTINUED"'].join("\n");
     const file = join(dir, "behaviour-harness-flag.sh");
     writeFileSync(file, body);
     const r = spawnSync("bash", [file], {
@@ -2200,6 +2591,50 @@ describe("release.sh behaviour-change gate (fixture run)", () => {
     expect(r.out).toContain("does not appear");
     expect(r.out).not.toContain("CONTINUED");
     expect(r.status).toBe(1);
+  });
+
+  // What step 3's retitle leaves, and what a resume that has the bump commit
+  // but no tag yet (so it is asked again) reads: the notes under the version,
+  // and an empty Unreleased above them.
+  const RETITLED = [
+    "# Changelog",
+    "",
+    "## Unreleased",
+    "",
+    "## 0.81.0 -- something",
+    "",
+    "Set `YAW_MCP_NEW_THING=0` to disable it.",
+    "",
+    "## 0.79.0 -- older",
+    "",
+    "Set `YAW_MCP_OLD_THING=0` to disable it.",
+    "",
+  ].join("\n");
+
+  it("on a resume after the retitle, reads the version's section, not the empty Unreleased one", () => {
+    const r = run(["y", "YAW_MCP_NEW_THING"], RETITLED);
+    expect(r.out).toContain("found in the ## 0.81.0 section");
+    expect(r.out).toContain("CONTINUED");
+    expect(r.status).toBe(0);
+    // Still scoped: an older release's switch does not pass it.
+    const old = run(["y", "YAW_MCP_OLD_THING"], RETITLED);
+    expect(old.out).toContain("does not appear in CHANGELOG.md's ## 0.81.0 section");
+    expect(old.out).not.toContain("CONTINUED");
+    expect(old.status).toBe(1);
+    // Only this version's heading switches the section: 0.81.0 is not 0.81.01.
+    const other = run(["y", "YAW_MCP_NEW_THING"], RETITLED.replace("## 0.81.0 --", "## 0.81.01 --"));
+    expect(other.out).toContain("does not appear in CHANGELOG.md's Unreleased section");
+    expect(other.status).toBe(1);
+  });
+
+  it("reads a bare version heading's section in a CRLF changelog", () => {
+    // A bare `## 0.81.0` (no ` -- summary`) on CRLF was `## 0.81.0\r` to the
+    // awk helpers, so the gate read the empty Unreleased section instead.
+    const crlf = RETITLED.replace("## 0.81.0 -- something", "## 0.81.0").split("\n").join("\r\n");
+    const r = run(["y", "YAW_MCP_NEW_THING"], crlf, CR_KEEPING_AWK);
+    expect(r.out).toContain("found in the ## 0.81.0 section");
+    expect(r.out).toContain("CONTINUED");
+    expect(r.status).toBe(0);
   });
 
   it("refuses a blank switch", () => {
@@ -2227,6 +2662,7 @@ describe("release.sh behaviour-change gate (fixture run)", () => {
         "set -Eeuo pipefail",
         trapBlock,
         STUB_HELPERS,
+        helpers,
         'VERSION="0.81.0"',
         "CYAN=''; YELLOW=''; NC=''",
         ...extra,
@@ -2377,9 +2813,9 @@ describe("release.sh oam floor gate placement", () => {
     // slowest gate, so a missing oam is reported in seconds, not minutes) --
     // and inside step 1, so it runs before the bump, the tag and the push.
     const order = [
-      at('if [ "$SKIP_CONFIRM" != "true" ] && [ "$RESUMING" != "true" ]; then'),
+      at('if [ "$SKIP_CONFIRM" != "true" ] && [ "$RESUME_PROVEN" != "true" ]; then'),
       at('step 1 "Lint + typecheck + tests + oam floor"'),
-      at(`run_npm_check "Type check" typecheck 'error TS[0-9]' '' 'npx tsc --noEmit'`),
+      at(`run_npm_check "Type check" typecheck 'error TS[0-9]' '' 'node node_modules/typescript/bin/tsc --noEmit'`),
       at("# >>> oam floor gate"),
       at(`  run_npm_check "oam floor" verify:oam-floor '^\\[verify:oam-floor\\] FAIL' '^\\[verify:oam-floor\\] OK'`),
       at("# <<< oam floor gate"),
@@ -2527,10 +2963,130 @@ describe("release.sh origin/main sync guard", () => {
     }
   });
 
-  it("proceeds on a resume, where a prior push already moved main", () => {
+  it("proceeds on a resume that is ahead, where the prior run died before its push", () => {
     const r = run("ahead", true);
     expect(r.out).toContain("resuming a prior run");
     expect(r.out).toContain("CONTINUED");
+  });
+
+  it("refuses a resume that is behind or diverged, before the gates rather than at step 3's push", () => {
+    for (const shape of ["behind", "diverged"] as const) {
+      const r = run(shape, true);
+      expect(r.out).toContain("Pull first: git pull --ff-only origin main");
+      expect(r.out).not.toContain("resuming a prior run");
+      expect(r.out).not.toContain("CONTINUED");
+      expect(r.status).toBe(1);
+    }
+  });
+});
+
+describe("release.sh run_npm_check", () => {
+  const fn = extractBlock("run_npm_check() {", "}");
+
+  /**
+   * Run the gate wrapper over an `npm` shell function. The wrapper's output
+   * goes to a file the stub can read back while it runs; `out` is that file
+   * followed by whatever the harness printed after it.
+   */
+  function run(npmBody: string, args: string, env: Record<string, string> = {}): RunResult & { seen: string } {
+    const dir = newTmp("release-check-");
+    const body = [
+      "set -Eeuo pipefail",
+      STUB_HELPERS,
+      'VERSION="9.9.9"',
+      'IS_MINGW_ARM64="${FORCE_ARM64:-false}"',
+      `npm() {\n${npmBody}\n}`,
+      fn,
+      `run_npm_check ${args} > gate-stdout.log 2>&1`,
+      'echo "PASSED"',
+    ].join("\n");
+    const r = runBash(body, dir, env);
+    let seen = "";
+    try {
+      seen = readFileSync(join(dir, "gate-stdout.log"), "utf8");
+    } catch {
+      // The harness died before the redirect opened the file.
+    }
+    return { status: r.status, out: `${seen}${r.out}`, seen };
+  }
+
+  it("shows a gate's output while it runs, not after it exits", () => {
+    // The stub prints a line, then looks for that line in the gate's own
+    // stdout before it exits. Captured-then-printed output is not there yet.
+    const r = run(
+      [
+        '  echo "EARLY LINE"',
+        "  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do",
+        '    if grep -q "EARLY LINE" gate-stdout.log 2>/dev/null; then echo "STREAMED"; break; fi',
+        "    sleep 0.25",
+        "  done",
+        '  echo "ALL DONE"',
+      ].join("\n"),
+      `"Slow gate" slow '^NEVER' '^ALL DONE'`,
+    );
+    expect(r.seen).toContain("STREAMED");
+    expect(r.out).toContain("PASSED");
+    expect(r.status).toBe(0);
+  });
+
+  it("leaves no gate log in the temp dir when the run is interrupted mid-gate", () => {
+    // The log is removed after the pipeline returns, which an interrupt never
+    // reaches; the EXIT trap has to take it. mktemp is pointed at a directory
+    // of its own so the leftover, if any, is the only thing in it.
+    const dir = newTmp("release-check-int-");
+    mkdirSync(join(dir, "tmp"));
+    const body = (npmBody: string): string =>
+      [
+        "set -Eeuo pipefail",
+        extractBlock('WORKDIR=""', "trap cleanup EXIT"),
+        STUB_HELPERS,
+        'IS_MINGW_ARM64="false"',
+        `npm() {\n${npmBody}\n}`,
+        fn,
+        `run_npm_check "Slow gate" slow '^NEVER' '^ALL DONE'`,
+        'echo "PASSED"',
+      ].join("\n");
+    // The stub signals the script itself ($$ is the script's pid inside the
+    // pipeline's subshell too), as Ctrl+C would.
+    const interrupted = runBash(body('  echo "EARLY LINE"\n  kill -s INT $$\n  sleep 2'), dir, {
+      TMPDIR: join(dir, "tmp"),
+    });
+    expect(interrupted.out).toContain("EARLY LINE");
+    expect(interrupted.out).not.toContain("PASSED");
+    expect(readdirSync(join(dir, "tmp"))).toEqual([]);
+    // The same harness run to completion: the gate passes and removes its own
+    // log, so the empty directory above is not an mktemp that went elsewhere.
+    const finished = runBash(body('  ls "$TMPDIR" | wc -l | tr -d " "\n  echo "ALL DONE"'), dir, {
+      TMPDIR: join(dir, "tmp"),
+    });
+    expect(finished.out).toMatch(/^1$/m);
+    expect(finished.out).toContain("PASSED");
+    expect(readdirSync(join(dir, "tmp"))).toEqual([]);
+  });
+
+  it("still reads the verdict from the streamed output, and carries npm's exit code past tee", () => {
+    const failed = run('  echo "Found 3 errors"', `"Lint" lint 'Found [0-9]+ error' 'Checked [1-9][0-9]* files'`);
+    expect(failed.out).toContain("FAIL Lint failed");
+    expect(failed.out).not.toContain("PASSED");
+    const silent = run("  true", `"Lint" lint 'Found [0-9]+ error' 'Checked [1-9][0-9]* files'`);
+    expect(silent.out).toContain("exited 0 but printed no verdict");
+    const nonZero = run('  echo "something else"; return 7', `"Type check" typecheck 'error TS[0-9]'`);
+    expect(nonZero.out).toContain("FAIL Type check failed (exit 7)");
+  });
+
+  it("re-runs the type check without the npm CLI when npm segfaults on ARM64", () => {
+    // The direct command is word-split and run as is, so `npx tsc` there was
+    // npm again -- the CLI whose exit cleanup is the segfault being tolerated.
+    const call = releaseSh.split("\n").find((l) => l.startsWith('run_npm_check "Type check" '));
+    expect(call).toBeDefined();
+    const verify = /'([^']*)'$/.exec(call ?? "")?.[1] ?? "";
+    expect(verify).toBe("node node_modules/typescript/bin/tsc --noEmit");
+    expect(verify).not.toMatch(/\bnp[mx]\b/);
+    const tolerated = run("  return 139", `"Type check" typecheck 'error TS[0-9]' '' 'true'`, { FORCE_ARM64: "true" });
+    expect(tolerated.out).toContain("a direct re-run is clean -- tolerating");
+    expect(tolerated.out).toContain("PASSED");
+    const red = run("  return 139", `"Type check" typecheck 'error TS[0-9]' '' 'false'`, { FORCE_ARM64: "true" });
+    expect(red.out).toContain("FAIL Type check failed (exit 139)");
   });
 });
 
@@ -3064,6 +3620,116 @@ describe("release.sh oam floor gate (stubbed full run)", () => {
     // No commit but the bump.
     expect(subjects(f.bare, "main")).toEqual(["v1.0.2", "fixture"]);
     expect(git(f.bare, ["tag", "-l"]).trim()).toBe("v1.0.2");
+    // ...and the bump commit carries the CHANGELOG retitle: the Unreleased
+    // heading now names the version, its suffix kept, under a fresh, empty
+    // Unreleased -- in the tag, on origin, and in the working tree.
+    expect(r.out).toContain("CHANGELOG.md: ## Unreleased retitled ## 1.0.2, fresh ## Unreleased added above it");
+    const retitled = "# Changelog\n\n## Unreleased\n\n## 1.0.2 -- things\n\nA paragraph.\n";
+    expect(git(f.bare, ["show", "v1.0.2:CHANGELOG.md"])).toBe(retitled);
+    expect(
+      git(f.bare, ["diff-tree", "--no-commit-id", "--name-only", "-r", "v1.0.2^{commit}"]).trim().split("\n").sort(),
+    ).toEqual(["CHANGELOG.md", "package.json", "server.json"]);
+    expect(readFileSync(join(f.work, "CHANGELOG.md"), "utf8")).toBe(retitled);
+    expect(git(f.work, ["status", "--porcelain"]).trim()).toBe("");
+  });
+
+  it("refuses an empty Unreleased section in the pre-flight, before any gate, bump or tag", () => {
+    const f = setup();
+    writeFileSync(join(f.work, "CHANGELOG.md"), "# Changelog\n\n## Unreleased -- things\n\n## 1.0.1\n\nOld.\n");
+    git(f.work, ["commit", "-q", "-am", "empty notes"]);
+    git(f.work, ["push", "-q", "origin", "main"]);
+    const r = release(f);
+    expect(r.out).toContain("CHANGELOG.md's Unreleased section is empty");
+    expect(r.status).toBe(1);
+    expect(npmLog(f)).not.toContain("npm run lint");
+    expect(subjects(f.bare, "main")).toEqual(["empty notes", "fixture"]);
+    expect(git(f.bare, ["tag", "-l"]).trim()).toBe("");
+  });
+
+  it("refuses an empty Unreleased section in the pre-flight when the bump was merged under another subject", () => {
+    // A merged release PR: package.json already reads 1.0.2 at HEAD, but the
+    // commit is not this script's `v1.0.2`, so step 3 would retitle it and
+    // the pre-flight still has to check the notes.
+    const f = setup();
+    const pkg = JSON.parse(readFileSync(join(f.work, "package.json"), "utf8"));
+    writeFileSync(join(f.work, "package.json"), `${JSON.stringify({ ...pkg, version: "1.0.2" }, null, 2)}\n`);
+    writeFileSync(join(f.work, "CHANGELOG.md"), "# Changelog\n\n## Unreleased -- things\n\n## 1.0.1\n\nOld.\n");
+    git(f.work, ["commit", "-q", "-am", "chore: release 1.0.2"]);
+    git(f.work, ["push", "-q", "origin", "main"]);
+    const r = release(f);
+    expect(r.out).toContain("CHANGELOG.md's Unreleased section is empty");
+    expect(r.status).toBe(1);
+    expect(npmLog(f)).not.toContain("npm run lint");
+    expect(subjects(f.bare, "main")).toEqual(["chore: release 1.0.2", "fixture"]);
+    expect(git(f.bare, ["tag", "-l"]).trim()).toBe("");
+  });
+
+  it("resumes a run that died after the retitle and before the commit, in one bump commit", () => {
+    // The tree a run killed between step 3's retitle and its commit leaves:
+    // package.json, server.json and CHANGELOG.md all rewritten, none committed.
+    // The resume's dirt check tolerates CHANGELOG.md here (the bump is not
+    // committed), step 3 does not retitle a second time, and the one commit
+    // carries all three.
+    const f = setup();
+    const pkg = JSON.parse(readFileSync(join(f.work, "package.json"), "utf8"));
+    writeFileSync(join(f.work, "package.json"), `${JSON.stringify({ ...pkg, version: "1.0.2" }, null, 2)}\n`);
+    const server = JSON.parse(readFileSync(join(f.work, "server.json"), "utf8"));
+    writeFileSync(
+      join(f.work, "server.json"),
+      `${JSON.stringify({ ...server, version: "1.0.2", packages: [{ version: "1.0.2" }] }, null, 2)}\n`,
+    );
+    const retitled = "# Changelog\n\n## Unreleased\n\n## 1.0.2 -- things\n\nA paragraph.\n";
+    writeFileSync(join(f.work, "CHANGELOG.md"), retitled);
+    const r = release(f);
+    expect(r.out).not.toContain("Working directory has changes outside the version bump");
+    expect(r.out).toContain("CHANGELOG.md already has a ## 1.0.2 heading");
+    expect(r.out).toContain("v1.0.2 released to npm + MCP registry.");
+    expect(r.status).toBe(0);
+    expect(subjects(f.bare, "main")).toEqual(["v1.0.2", "fixture"]);
+    expect(git(f.bare, ["show", "v1.0.2:CHANGELOG.md"])).toBe(retitled);
+  });
+
+  it("still refuses a dirty CHANGELOG.md on a resume whose bump is committed", () => {
+    // Committed bump, no tag: a CHANGELOG.md change now is one the bump commit
+    // does not hold, so it is dirt like any other file.
+    const f = setup();
+    const pkg = JSON.parse(readFileSync(join(f.work, "package.json"), "utf8"));
+    writeFileSync(join(f.work, "package.json"), `${JSON.stringify({ ...pkg, version: "1.0.2" }, null, 2)}\n`);
+    git(f.work, ["commit", "-q", "-am", "v1.0.2"]);
+    writeFileSync(join(f.work, "CHANGELOG.md"), "# Changelog\n\n## Unreleased -- things\n\nEdited.\n");
+    const r = release(f);
+    expect(r.out).toContain("Working directory has changes outside the version bump");
+    expect(r.out).toContain("CHANGELOG.md");
+    expect(r.status).toBe(1);
+    expect(git(f.bare, ["tag", "-l"]).trim()).toBe("");
+  });
+
+  it("resumes a bump commit made by a release.sh that did not retitle without making a second v<version> commit", () => {
+    // An older release.sh committed `v1.0.2` (package.json + server.json only)
+    // and died before tagging; CHANGELOG.md still heads the notes Unreleased.
+    // Step 3 used to retitle here and commit a SECOND `v1.0.2` on top of the
+    // first, then tag that. It warns instead, and tags the one bump commit.
+    const f = setup();
+    const pkg = JSON.parse(readFileSync(join(f.work, "package.json"), "utf8"));
+    writeFileSync(join(f.work, "package.json"), `${JSON.stringify({ ...pkg, version: "1.0.2" }, null, 2)}\n`);
+    const server = JSON.parse(readFileSync(join(f.work, "server.json"), "utf8"));
+    writeFileSync(
+      join(f.work, "server.json"),
+      `${JSON.stringify({ ...server, version: "1.0.2", packages: [{ version: "1.0.2" }] }, null, 2)}\n`,
+    );
+    git(f.work, ["commit", "-q", "-am", "v1.0.2"]);
+    const r = release(f);
+    expect(r.out).toContain(
+      "CHANGELOG.md has no ## 1.0.2 heading, but the v1.0.2 bump commit is already made (HEAD's package.json reads 1.0.2) -- not retitling",
+    );
+    expect(r.out).not.toContain("the Unreleased section will be headed ## 1.0.2 in the bump commit");
+    expect(r.out).toContain("v1.0.2 released to npm + MCP registry.");
+    expect(r.status).toBe(0);
+    expect(subjects(f.bare, "main")).toEqual(["v1.0.2", "fixture"]);
+    expect(git(f.bare, ["show", "v1.0.2:CHANGELOG.md"])).toBe(
+      "# Changelog\n\n## Unreleased -- things\n\nA paragraph.\n",
+    );
+    expect(git(f.work, ["status", "--porcelain"]).trim()).toBe("");
   });
 
   it("waits out npm's lag and the registry's, then publishes in the same run", () => {

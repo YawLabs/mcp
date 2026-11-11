@@ -42,7 +42,7 @@ describe("LearningStore", () => {
   it("returns 1.0 boost below the observation floor", () => {
     const store = new LearningStore();
     for (let i = 0; i < LEARNING_MIN_OBSERVATIONS - 1; i++) {
-      store.recordSuccess("gh");
+      store.recordOutcome("gh", 1);
     }
     expect(store.boostFactor("gh")).toBe(1.0);
   });
@@ -50,7 +50,7 @@ describe("LearningStore", () => {
   it("returns a boost between 1.0 and MAX once the floor is hit", () => {
     const store = new LearningStore();
     for (let i = 0; i < LEARNING_MIN_OBSERVATIONS; i++) {
-      store.recordSuccess("gh");
+      store.recordOutcome("gh", 1);
     }
     const factor = store.boostFactor("gh");
     expect(factor).toBeGreaterThan(1.0);
@@ -60,31 +60,25 @@ describe("LearningStore", () => {
   it("caps boost at LEARNING_MAX_BOOST even with many successes", () => {
     const store = new LearningStore();
     for (let i = 0; i < 1000; i++) {
-      store.recordSuccess("gh");
+      store.recordOutcome("gh", 1);
     }
     expect(store.boostFactor("gh")).toBe(LEARNING_MAX_BOOST);
   });
 
-  it("records dispatches separately from successes", () => {
-    const store = new LearningStore();
-    store.recordDispatch("gh");
-    const u = store.get("gh");
-    expect(u?.dispatched).toBe(1);
-    expect(u?.succeeded).toBe(0);
-  });
-
-  it("increments succeeded and sets lastUsedAt on recordSuccess", () => {
+  it("recordOutcome banks one dispatch plus the graded credit and sets lastUsedAt", () => {
     const store = new LearningStore();
     const before = Date.now();
-    store.recordSuccess("gh");
+    store.recordOutcome("gh", 1);
+    store.recordOutcome("gh", 0);
     const u = store.get("gh");
+    expect(u?.dispatched).toBe(2);
     expect(u?.succeeded).toBe(1);
     expect(u?.lastUsedAt).toBeGreaterThanOrEqual(before);
   });
 
   it("reset clears all state", () => {
     const store = new LearningStore();
-    store.recordSuccess("gh");
+    store.recordOutcome("gh", 1);
     store.reset();
     expect(store.get("gh")).toBeUndefined();
   });
@@ -134,25 +128,16 @@ describe("LearningStore", () => {
     });
   });
 
-  describe("recordSuccess without prior recordDispatch (fix 11)", () => {
-    it("boostFactor coerces dispatched up to succeeded when only successes were recorded", () => {
+  describe("succeeded never exceeds dispatched", () => {
+    it("every recorder keeps the rate in [0, 1], so boostFactor needs no coerce", () => {
       const store = new LearningStore();
-      // Record 5 successes without any recordDispatch call. The coerce in
-      // boostFactor must treat dispatched = max(0, 5) = 5, not 0 -- a 0
-      // dispatched count would produce a 0/0 rate (NaN) or a 5/0 rate
-      // (Infinity), both of which would corrupt the penalty/boost logic.
-      for (let i = 0; i < 5; i++) {
-        store.recordSuccess("solo");
-      }
+      // An over-range reward is clamped to 1.0 of credit per dispatch, and an
+      // over-sized delta is clamped to the dispatch count.
+      for (let i = 0; i < 5; i++) store.recordOutcome("solo", 7);
+      store.adjustSucceeded("solo", 100);
       const u = store.get("solo");
-      // recordSuccess leaves dispatched at 0 (symmetric with recordDispatch,
-      // which leaves succeeded at 0), so after 5 pure successes dispatched is
-      // 0 and succeeded is 5. The coerce in boostFactor must treat dispatched
-      // as at least succeeded (i.e. max(0, 5) = 5) so the rate stays in [0, 1]
-      // and no penalty fires.
-      expect(u?.dispatched).toBe(0);
+      expect(u?.dispatched).toBe(5);
       expect(u?.succeeded).toBe(5);
-      // boostFactor must be >= 1.0, not NaN or penalty.
       const factor = store.boostFactor("solo");
       expect(Number.isFinite(factor)).toBe(true);
       expect(factor).toBeGreaterThanOrEqual(1.0);
@@ -258,18 +243,15 @@ describe("LearningStore", () => {
     });
 
     it("clamps succeeded down to dispatched on load, matching the persistence path", () => {
-      // The deprecated recordSuccess can still produce succeeded > dispatched
-      // in memory, but that shape is NOT persistable: persistence.ts's
-      // sanitizeLearning clamps succeeded to dispatched on every real
-      // cross-session load, so loadSnapshot resolves it the same way.
-      // Coercing dispatched UP here instead would make export -> load look
-      // lossless in-process while the disk path quietly reshaped the record.
-      const store = new LearningStore();
-      for (let i = 0; i < 5; i++) store.recordSuccess("solo");
-      expect(store.get("solo")).toMatchObject({ dispatched: 0, succeeded: 5 });
-
+      // No recorder can produce succeeded > dispatched, so the shape can only
+      // arrive in a snapshot (a hand-edited or corrupt state.json).
+      // persistence.ts's sanitizeLearning clamps succeeded to dispatched on
+      // every real cross-session load, so loadSnapshot resolves it the same
+      // way. Coercing dispatched UP here instead would make export -> load
+      // look lossless in-process while the disk path quietly reshaped the
+      // record.
       const store2 = new LearningStore();
-      store2.loadSnapshot(store.exportSnapshot());
+      store2.loadSnapshot({ solo: { dispatched: 0, succeeded: 5, lastUsedAt: 1 } });
       expect(store2.get("solo")).toMatchObject({ dispatched: 0, succeeded: 0 });
 
       // Loading the loaded snapshot is a fixed point -- no further drift.

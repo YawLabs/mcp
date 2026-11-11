@@ -1,6 +1,6 @@
 // Chain detection. Watches tool-call sequences across namespaces and
 // surfaces recurring multi-server patterns as suggested "packs" the
-// LLM/user could dispatch in one step via mcp_connect_dispatch.
+// LLM/user could load in one step via mcp_connect_activate.
 //
 // Scope is intentionally small:
 //   - Snapshots persist across restarts via exportSnapshot/loadSnapshot
@@ -189,10 +189,6 @@ export class PackDetector {
   // Exposed for tests.
   getHistory(): ReadonlyArray<PackCall> {
     return this.history;
-  }
-
-  reset(): void {
-    this.history = [];
   }
 
   // Return a defensive copy of history for persistence. Each entry is a

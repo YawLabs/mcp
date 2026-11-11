@@ -2,10 +2,13 @@
 // routing-eval corpus.
 //
 // The goal is to let a user OPT IN to collecting a corpus of "intent ->
-// chosen namespace" decisions that a future eval could replay to measure
-// routing quality -- WITHOUT ever persisting the raw English intent the user
-// typed. (The ranker's candidate shortlist is NOT part of a trace: see the
-// note on FoundryTrace below.) Two layers keep it privacy-safe:
+// namespace" decisions that a future eval could replay to measure routing
+// quality -- WITHOUT ever persisting the raw English intent the user typed.
+// Each trace names two namespaces: `chosen`, the ranker's top pick, and
+// `loaded`, the namespace that actually served the dispatch (a runner-up
+// when the pick failed to start, null when nothing loaded). (The ranker's
+// candidate shortlist is NOT part of a trace: see the note on FoundryTrace
+// below.) Two layers keep it privacy-safe:
 //
 //   1. Path-splitting in `tokenizeQuery` (src/relevance.ts) already shreds
 //      most structure: it lowercases and splits on every non-alphanumeric run,
@@ -32,9 +35,20 @@
 // redactor and survive (un-ordered) in the bag. Do not enable YAW_MCP_FOUNDRY
 // on intents that routinely carry such PII.
 //
+// It also does NOT catch a secret or identifier that punctuation cuts into
+// SHORT groups, unless it starts with one of SECRET_PREFIXES. tokenizeQuery
+// splits on the '-' / '.' / '_' first, and every token-level rule below has a
+// length floor (12 for mixed letters+digits, 16 for hex or pure alpha), so a
+// license key such as `AB12C-DE34F-GH56I-JK78L` persists as four 5-char
+// tokens, and a UUID keeps its 8- and 4-char groups (its 12-digit tail is
+// usually dropped by one of those floors or by the phone-shape rule). Sorting
+// loses only the order of the groups. No raw-string rule covers this shape:
+// short digit-bearing groups joined by '-' are also ordinary identifiers
+// (model and package names), which the corpus needs.
+//
 // Default is privacy-safe: harvesting is DISABLED unless YAW_MCP_FOUNDRY is
 // explicitly "1" / "true". When enabled, only the redacted+sorted token bag
-// and the chosen namespace are written -- never the raw intent string, and
+// and the chosen and loaded namespaces are written -- never the raw intent string, and
 // never the candidate shortlist or its scores (the FoundryTrace shape no
 // longer carries one; see the note on the interface).
 
@@ -103,14 +117,6 @@ function looksSensitive(token: string): boolean {
   return false;
 }
 
-// Tokenize an intent (via relevance `tokenizeQuery`) THEN drop any surviving
-// token that looks like a secret/PII. Returns the kept tokens plus the
-// number dropped. Note on "email / IPv4 / @" rules from the spec:
-// tokenizeQuery splits on `@` and `.`, so an email or IPv4 never reaches here
-// as a single token -- its alphanumeric pieces ("user", "gmail", "com", "192",
-// "168") pass through as ordinary tokens, which is acceptable since the
-// identifying structure (the @ and dots) is already destroyed. We document
-// this rather than re-detect a structure tokenizeQuery has already removed.
 // A raw-string scrub rule. `re` NOMINATES a match; `applies`, when present,
 // decides whether it is really PII. The two are split because the phone and
 // ticket-ref shapes are ambiguous with ordinary technical vocabulary, and the
@@ -304,7 +310,13 @@ export interface FoundryTrace {
   // release and never persisted (nothing read it back, and a ns-only list no
   // consumer opens was pure weight against the 5 MiB harvest cap). The
   // dispatch call site (server.ts) no longer passes it.
+  /** The ranker's top pick, whether or not it started. */
   chosen: string;
+  /** The namespace that actually served the dispatch: `chosen` when it
+   *  loaded, the runner-up (or lower-ranked winner) that loaded in its place
+   *  when it did not, null when nothing loaded. Harvests written before this
+   *  field existed have no `loaded` key; readers treat that as unknown. */
+  loaded: string | null;
   redactedCount: number;
 }
 
@@ -365,6 +377,7 @@ export async function appendFoundryTrace(trace: FoundryTrace, home: string = hom
     const line = `${JSON.stringify({
       tokens: trace.tokens,
       chosen: trace.chosen,
+      loaded: trace.loaded,
       redactedCount: trace.redactedCount,
     })}\n`;
 

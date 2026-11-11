@@ -69,6 +69,7 @@ import { parse as parseTomlText, TomlDate, TomlError } from "smol-toml";
 // The one syntax-agnostic line-ending reader. Not a cycle: client-config.ts
 // never imports this module (the codex-cli row registers it).
 import { detectLineEnding } from "./client-config.js";
+import { setJsonKey } from "./json-key.js";
 
 /** The syntax word for user-facing messages ("is not valid TOML"). */
 export const TOML_SYNTAX = "TOML" as const;
@@ -884,17 +885,25 @@ function tomlArrayItem(item: unknown, key: string): string {
 
 // DECISION -- what happens to a field this renderer cannot spell (2026-09-11).
 //
-// `--repair` re-renders our entry from the fields read back off disk, so
-// anything the renderer cannot spell is a field the re-render would DROP. The
-// two that matter are Codex's own `oauth` and `tools` tables: a user who hand
-// wrote `[mcp_servers.mcp.tools.echo]` on OUR entry has a table we can read and
-// cannot write.
+// The two that matter are Codex's own `oauth` and `tools` tables: a user who
+// hand wrote `[mcp_servers.mcp.tools.echo]` on OUR entry has a table we can
+// read and cannot write.
 //
-// CHOSEN: refuse, naming the field. `renderTomlEntry` throws `TomlRenderError`
-// for any table-valued field outside `SUBTABLE_FIELDS`, the message names the
-// field and says the re-render would drop it, and because every write verifies
-// its own output there is no path that drops it quietly. The user keeps the
-// table; the write is what fails.
+// CHOSEN, for the RENDERER: refuse, naming the field. `renderTomlEntry` throws
+// `TomlRenderError` for any table-valued field outside `SUBTABLE_FIELDS`, and
+// the message names the field and says the rewrite would drop it. So an entry
+// HANDED to this writer with such a field is never written without it.
+//
+// WHAT THAT DOES NOT COVER, and it is the path install takes: `upsertTomlEntry`
+// replaces the entry's first table and deletes every other section under the
+// entry path, whatever the new entry holds. Install and `--repair` compose the
+// new entry from the row's carry hook, and the Codex row carries only
+// `env_vars` and `enabled` (the core adds `env`), so `tools` and `oauth` never
+// reach the renderer, the refusal never fires, and a hand-written
+// `[mcp_servers.mcp.tools.echo]` goes with the entry it sits under -- with no
+// message naming it. The g08 fixture pins that removal. The refusal is reached
+// only by a caller that passes the stored fields back in whole, which nothing
+// in this package does today.
 //
 // REJECTED: carry both through the re-render. It is the nicer outcome and it
 // is a bigger change than it looks -- `tools` is an IMPLICIT parent with
@@ -959,10 +968,11 @@ function tomlArrayItem(item: unknown, key: string): string {
  *  so treat a mismatch in a name as a stale label and the measured behaviour
  *  as the claim.
  *
- *  A table-valued `oauth` or `tools` is therefore a `TomlRenderError` naming
- *  the field. That refusal is the deliberate choice: our entry never carries
- *  either, and a user who hand-wrote one keeps it (the write fails, loudly)
- *  instead of having it dropped or re-rendered into a guessed layout. */
+ *  A table-valued `oauth` or `tools` handed to the renderer is therefore a
+ *  `TomlRenderError` naming the field, instead of a guessed layout. Our entry
+ *  never carries either, so install does not reach that refusal: a table the
+ *  user hand-wrote under our entry is removed with it on a rewrite (see the
+ *  decision note above). */
 const FIELD_ORDER = [
   "command",
   "args",
@@ -1009,10 +1019,11 @@ const FIELD_ORDER = [
  *
  *  The last two are deliberately absent here. Neither is a flat string map,
  *  `tools` needs a layout this writer does not produce at all, and our own
- *  entry never carries either. A table-valued `oauth` or `tools` is therefore
- *  a `TomlRenderError` that names the field -- the write fails and the user's
- *  hand-written table survives untouched, which beats dropping it or guessing
- *  a layout. See the decision note above `FIELD_ORDER`. */
+ *  entry never carries either. A table-valued `oauth` or `tools` in the entry
+ *  being RENDERED is therefore a `TomlRenderError` that names the field, which
+ *  beats guessing a layout. That protects only an entry passed in with the
+ *  table; the splice itself deletes every section under the entry it
+ *  replaces. See the decision note above `FIELD_ORDER`. */
 const SUBTABLE_FIELDS = new Set(["env", "http_headers", "env_http_headers"]);
 
 /** Order two sub-table keys the way Codex's `entries.sort_by_key` does:
@@ -1088,9 +1099,10 @@ export function renderTomlEntry(
       continue;
     }
     if (isTomlTable(value)) {
-      // Name the field AND the loss. This is the refusal the decision note
-      // above `FIELD_ORDER` chose over dropping the table silently, so the
-      // message has to say what would have been dropped.
+      // Name the field AND the loss. This is the renderer's refusal from the
+      // decision note above `FIELD_ORDER`: an entry handed in with a table
+      // this writer cannot spell is not written without it, so the message
+      // has to say what would have been dropped.
       throw new TomlRenderError(
         `cannot write the "${key}" field of the "${name}" entry: only ${[...SUBTABLE_FIELDS].map((k) => `"${k}"`).join(", ")} are written as sub-tables, so rewriting this entry would drop your "${key}" table -- move it to another server or delete it, then re-run`,
       );
@@ -1111,10 +1123,11 @@ export function entryAsWritten(entry: Record<string, unknown>): Record<string, u
     if (SUBTABLE_FIELDS.has(key) && isTomlTable(value)) {
       const pairs = Object.entries(value).filter(([, v]) => v !== undefined);
       if (pairs.length === 0) continue;
-      out[key] = Object.fromEntries(pairs);
+      setJsonKey(out, key, Object.fromEntries(pairs));
       continue;
     }
-    out[key] = value;
+    // An own `__proto__` field survives the copy (see json-key.ts).
+    setJsonKey(out, key, value);
   }
   return out;
 }
@@ -1131,10 +1144,9 @@ export interface TomlEntryView {
 export type TomlConfigRead =
   /** No file, or nothing but whitespace (Codex reads both as an empty table). */
   | { kind: "absent" }
-  /** Does not parse. `detail` is the parser's reason WITHOUT the position --
-   *  the same field, meaning the same thing, as the core's
-   *  `ConfigRead.malformed.detail`, so the adapter copies it across and the
-   *  core's refusal adds " at line L column C" from `line` and `column`.
+  /** Does not parse. `detail` is the parser's reason WITHOUT the position; the
+   *  adapter (target-codex-cli.ts) builds the core's
+   *  `ConfigRead.malformed.detail` from it plus `line` and `column`.
    *  `positioned` is "line L, column C: <detail>" for a message that prints on
    *  its own (`verifyTomlSplice`). */
   | {
@@ -1689,10 +1701,13 @@ function canonValue(value: unknown): unknown {
   if (value instanceof TomlDate) return { $date: value.toISOString() };
   if (Array.isArray(value)) return value.map(canonValue);
   if (isTomlTable(value)) {
+    // `setJsonKey`, not `out[key] = ...`: smol-toml returns a table named
+    // `__proto__` as an OWN key, and a plain assignment would drop it (see
+    // json-key.ts), leaving this check blind to that table.
     const out: Record<string, unknown> = {};
     for (const key of Object.keys(value).sort()) {
       if (value[key] === undefined) continue;
-      out[key] = canonValue(value[key]);
+      setJsonKey(out, key, canonValue(value[key]));
     }
     return out;
   }

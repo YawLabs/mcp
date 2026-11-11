@@ -17,21 +17,35 @@
 const LOG_LEVELS = { debug: 0, info: 1, warn: 2, error: 3 } as const;
 type LogLevel = keyof typeof LOG_LEVELS;
 
-// LOG_LEVEL is resolved per call instead of latched at import. The module is
+// The level (LOG_LEVEL / YAW_MCP_LOG_LEVEL) is resolved per call instead of
+// latched at import. The module is
 // imported once per process, so a latched threshold makes the env var
 // unchangeable for the life of that process -- tests cannot vary it, and an
 // embedding host that flips it mid-session is silently ignored. The lookup is
 // one env read plus an object index, far cheaper than the JSON.stringify it
 // gates.
 //
-// The ONE reader of LOG_LEVEL: minLevel and logLevelRequested both go through
-// it, so they cannot disagree. Trimmed (cmd.exe's `set LOG_LEVEL=debug && ...`
-// keeps the space before `&&`) and own-property-checked, so `constructor` or
-// `toString` is an unrecognized value rather than an Object.prototype member.
-// Null for unset or unrecognized.
-function resolveLogLevel(): LogLevel | null {
-  const raw = process.env.LOG_LEVEL?.trim().toLowerCase();
+// TWO names set the level. LOG_LEVEL is the unprefixed one a host or a server
+// wrapper usually already exports; YAW_MCP_LOG_LEVEL is yaw-mcp's own, and a
+// recognized value of it wins over LOG_LEVEL. Only YAW_MCP_LOG_LEVEL also
+// switches a subcommand to the structured stream (see logLevelRequested).
+//
+// The ONE parser of both: each is trimmed (cmd.exe's `set LOG_LEVEL=debug &&
+// ...` keeps the space before `&&`) and own-property-checked, so `constructor`
+// or `toString` is an unrecognized value rather than an Object.prototype
+// member. Null for unset or unrecognized.
+function readLevelVar(name: "LOG_LEVEL" | "YAW_MCP_LOG_LEVEL"): LogLevel | null {
+  const raw = process.env[name]?.trim().toLowerCase();
   return raw !== undefined && Object.hasOwn(LOG_LEVELS, raw) ? (raw as LogLevel) : null;
+}
+
+// The level in force: a recognized YAW_MCP_LOG_LEVEL, else a recognized
+// LOG_LEVEL, else null (minLevel's info default). An unrecognized
+// YAW_MCP_LOG_LEVEL counts as unset, exactly as an unrecognized LOG_LEVEL
+// does, so a typo in the prefixed name falls through to LOG_LEVEL rather than
+// overriding it with nothing.
+function resolveLogLevel(): LogLevel | null {
+  return readLevelVar("YAW_MCP_LOG_LEVEL") ?? readLevelVar("LOG_LEVEL");
 }
 
 function minLevel(): number {
@@ -91,12 +105,21 @@ export function setLogSurface(next: LogSurface): void {
   surface = next;
 }
 
-/** Whether the operator explicitly asked for the structured stream. An
- *  unrecognized value is NOT "explicit": minLevel already falls back to info
- *  for it, so treating `LOG_LEVEL=chatty` as an opt-in would turn a typo into
- *  a wall of JSON. */
+/** Whether the operator explicitly asked for the structured stream: a
+ *  RECOGNIZED YAW_MCP_LOG_LEVEL, and nothing else. An unrecognized value is
+ *  not "explicit": minLevel already treats it as unset, so honoring
+ *  `YAW_MCP_LOG_LEVEL=chatty` as an opt-in would turn a typo into a wall of
+ *  JSON.
+ *
+ *  LOG_LEVEL deliberately does NOT count. It is an unprefixed name other
+ *  tools read too, so a value exported for one of them (a shell profile, a CI
+ *  job) used to switch every yaw-mcp subcommand to JSON lines nobody asked
+ *  for. It still sets the level -- a subcommand under LOG_LEVEL=error drops
+ *  its plain warnings -- but the rendering stays plain. Pinned by
+ *  logger.test.ts ("restores the structured stream when YAW_MCP_LOG_LEVEL asks
+ *  for it", "keeps the plain rendering under LOG_LEVEL alone"). */
 function logLevelRequested(): boolean {
-  return resolveLogLevel() !== null;
+  return readLevelVar("YAW_MCP_LOG_LEVEL") !== null;
 }
 
 /** One `key=value` tail for the plain-text CLI rendering. Never throws: `data`

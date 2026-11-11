@@ -27,6 +27,11 @@
 //     an int64 id like 12345678901234567890 (ordinary in SQL and REST MCP
 //     servers) would reach the model as 12345678901234567000. Losing a
 //     couple of percent of savings beats handing the model a wrong id.
+//   * JSON mode is likewise SKIPPED when re-serializing would reorder or
+//     merge an object's keys: a JS object lists integer-like keys first, in
+//     ascending order, and keeps one value per key, so `{"1532":..,"87":..}`
+//     (ids in rank order) would come back sorted by id and `{"a":1,"a":2}`
+//     as `{"a":2}`. See jsonKeysAreFaithful.
 //   * If pruning doesn't save at least MIN_SAVINGS_RATIO of the total
 //     serialized bytes across the entire content array, we return the
 //     original untouched — the re-serialization cost isn't worth a
@@ -73,7 +78,7 @@ export interface PruneResult {
 }
 
 /** On unless YAW_MCP_PRUNE_RESPONSES is an off spelling. The shared parser
- *  trims, so cmd.exe's `set VAR=0 && yaw-mcp serve` (which delivers "0 ")
+ *  trims, so cmd.exe's `set VAR=0 && yaw-mcp` (which delivers "0 ")
  *  turns pruning off like every other YAW_MCP_* opt-out, instead of reading
  *  as "not an opt-out" and pruning anyway. */
 export function isPruneEnabled(): boolean {
@@ -110,9 +115,12 @@ function pruneText(text: string): string {
     try {
       const parsed = JSON.parse(text);
       // Only re-serialize when every number survives the round-trip. A
-      // response carrying one oversized id keeps its original bytes rather
-      // than reaching the model with that id silently rewritten.
-      if (jsonNumbersAreFaithful(text)) {
+      // response carrying one oversized id keeps its original JSON text
+      // (whitespace cleanup aside, see below) rather than reaching the model
+      // with that id silently rewritten. Same for key order and duplicate
+      // keys, checked second because the number scan is the one that usually
+      // bails early.
+      if (jsonNumbersAreFaithful(text) && jsonKeysAreFaithful(text, parsed)) {
         const cleaned = pruneJson(parsed);
         if (cleaned !== undefined) return JSON.stringify(cleaned);
       }
@@ -121,7 +129,7 @@ function pruneText(text: string): string {
     }
   }
   // Reached by non-JSON text AND by valid JSON that was skipped above (an
-  // unfaithful number, or a document that pruned to nothing). Running the
+  // unfaithful number or key order, or a document that pruned to nothing). Running the
   // whitespace rules over raw JSON text is safe only because a JSON string
   // literal cannot contain a raw newline (or any raw control character): every
   // line boundary therefore lies OUTSIDE every string, the trailing-whitespace
@@ -248,6 +256,151 @@ function canonicalDecimal(s: string): string | null {
   return `${sign === "-" ? "-" : ""}${significant}e${pow}`;
 }
 
+// --- key fidelity -----------------------------------------------------
+//
+// The other thing JSON.parse + JSON.stringify does not round-trip is an
+// object's KEYS. A JS object enumerates its integer-like keys first, in
+// ascending numeric order, and only then the rest in insertion order; and it
+// holds one value per key, the last one written:
+//
+//   {"1532":"first","87":"second","b":1,"3":"x"}
+//     ->  {"3":"x","87":"second","1532":"first","b":1}
+//   {"a":1,"a":2}  ->  {"a":2}
+//
+// JSON calls objects unordered, but the model reads the text top to bottom, so
+// a result keyed by numeric id and sent in rank order would arrive re-sorted
+// by id. Neither loss is visible in the parsed value -- the order and the
+// duplicate are already gone -- so this reads the keys off the source text.
+// When either is found, JSON mode is skipped for the whole document, as for
+// an unfaithful number.
+
+/** A key JS may order as an integer: a canonical decimal, no leading zero.
+ *  Deliberately WIDER than the engine's own rule (V8 stops at 4294967294, the
+ *  largest array index, and leaves a longer digit run in insertion order): a
+ *  key this calls integer-like that the engine does not costs one document its
+ *  JSON-mode savings, while the opposite mistake is the reorder this exists to
+ *  prevent. */
+const INTEGER_LIKE_KEY_RE = /^(?:0|[1-9]\d*)$/;
+
+const CH_QUOTE = 34;
+const CH_BACKSLASH = 92;
+const CH_COMMA = 44;
+const CH_OPEN_BRACE = 123;
+const CH_CLOSE_BRACE = 125;
+const CH_OPEN_BRACKET = 91;
+const CH_CLOSE_BRACKET = 93;
+const CH_ZERO = 48;
+const CH_NINE = 57;
+
+interface ObjectKeyFrame {
+  /** The last integer-like key, for the ascending check. */
+  lastIntegerKey: string | null;
+  sawOtherKey: boolean;
+  /** The next string token is a key (just after `{` or a `,`), not a value. */
+  atKey: boolean;
+}
+
+/** Numeric `a < b` for two canonical decimal strings of any length. */
+function integerKeyLess(a: string, b: string): boolean {
+  return a.length !== b.length ? a.length < b.length : a < b;
+}
+
+/** Does every object in `text` keep its keys, in their order, through
+ *  JSON.parse + JSON.stringify? False when any object repeats a key, or has an
+ *  integer-like key that is not where JS would enumerate it: after a
+ *  non-integer key, or not above the integer-like key before it. `parsed` is
+ *  what JSON.parse made of `text`; callers only ask after that succeeded, so
+ *  the text is well-formed and the scan does not re-validate it.
+ *
+ *  A hand-rolled character scan rather than a tokenizing regex like
+ *  JSON_STRING_OR_NUMBER_RE, and no per-object Set for the duplicate check:
+ *  this runs on every JSON result, synchronously, next to the JSON.parse.
+ *  Measured on a 1.8 MB array of 12,000 rows, on a machine busy with other
+ *  work (so read the ratios, not the milliseconds): a regex `exec` loop with
+ *  a Set per object took 115-395 ms beside a 45-240 ms parse, about 2.5x the
+ *  parse; this shape took 16-54 ms beside a 32-72 ms parse, about half of
+ *  it. Duplicates are found by COUNTING instead -- the keys written in the
+ *  text against the keys the parsed value holds. A repeated key is the only
+ *  way the two can differ. */
+function jsonKeysAreFaithful(text: string, parsed: unknown): boolean {
+  // One entry per open container; null for an array, whose strings are values.
+  const frames: Array<ObjectKeyFrame | null> = [];
+  let top: ObjectKeyFrame | null = null;
+  let keysInText = 0;
+  const n = text.length;
+  let i = 0;
+  while (i < n) {
+    const c = text.charCodeAt(i);
+    if (c !== CH_QUOTE) {
+      if (c === CH_OPEN_BRACE) {
+        top = { lastIntegerKey: null, sawOtherKey: false, atKey: true };
+        frames.push(top);
+      } else if (c === CH_OPEN_BRACKET) {
+        top = null;
+        frames.push(null);
+      } else if (c === CH_CLOSE_BRACE || c === CH_CLOSE_BRACKET) {
+        frames.pop();
+        top = frames.length > 0 ? frames[frames.length - 1] : null;
+      } else if (c === CH_COMMA && top !== null) {
+        top.atKey = true;
+      }
+      i++;
+      continue;
+    }
+    // A string: skip to its closing quote, so structural characters inside it
+    // are never read as structure. An escape is two characters as far as
+    // finding that quote goes (the four hex digits of a unicode escape are
+    // ordinary characters to this loop).
+    const start = i;
+    let escaped = false;
+    i++;
+    while (i < n) {
+      const d = text.charCodeAt(i);
+      if (d === CH_QUOTE) break;
+      if (d === CH_BACKSLASH) {
+        escaped = true;
+        i += 2;
+      } else {
+        i++;
+      }
+    }
+    const end = i; // the closing quote
+    i++;
+    if (top === null || !top.atKey) continue;
+    top.atKey = false;
+    keysInText++;
+    // Only a key that could be integer-like is worth materializing: one that
+    // starts with a digit, or one carrying an escape, which has to be decoded
+    // before it can be judged (an escaped digit spells the same key as the
+    // digit itself).
+    const first = text.charCodeAt(start + 1);
+    let key: string | null = null;
+    if (escaped) key = JSON.parse(text.slice(start, end + 1)) as string;
+    else if (first >= CH_ZERO && first <= CH_NINE) key = text.slice(start + 1, end);
+    if (key !== null && INTEGER_LIKE_KEY_RE.test(key)) {
+      if (top.sawOtherKey) return false;
+      if (top.lastIntegerKey !== null && !integerKeyLess(top.lastIntegerKey, key)) return false;
+      top.lastIntegerKey = key;
+    } else {
+      top.sawOtherKey = true;
+    }
+  }
+  return keysInText === countJsonKeys(parsed);
+}
+
+/** How many object keys a parsed JSON value holds, at every depth. */
+function countJsonKeys(value: unknown): number {
+  if (value === null || typeof value !== "object") return 0;
+  let count = 0;
+  if (Array.isArray(value)) {
+    for (const el of value) count += countJsonKeys(el);
+    return count;
+  }
+  const obj = value as Record<string, unknown>;
+  for (const k of Object.keys(obj)) count += 1 + countJsonKeys(obj[k]);
+  return count;
+}
+
 // --- block classification ---------------------------------------------
 //
 // A per-line decision cannot answer a block-level question, and both text
@@ -288,6 +441,16 @@ function canonicalDecimal(s: string): string | null {
 //     corrupts a README. A false POSITIVE on the gate costs savings only.
 //   * Trailing TABS, and a SINGLE trailing space. Neither is a CommonMark
 //     hard break, so both still prune everywhere.
+//   * RAW FILE CONTENT that is neither a diff nor fenced. A file-reading
+//     tool returns the file as plain text, and nothing in that text says it
+//     is a file rather than a log, so both rules apply to it whenever the
+//     savings gate in pruneContent passes: trailing whitespace goes (a TSV
+//     row with an empty last field loses its trailing tab), and a run of
+//     blank lines collapses, which shifts every line number after it. The
+//     argument made for fences above holds here just as well and is NOT
+//     acted on. A caller that builds an exact-match edit from the pruned
+//     view can therefore miss the file's real bytes; the byte-faithful
+//     route is YAW_MCP_PRUNE_RESPONSES=0.
 
 /** Per line: is it inside a fenced code block (fence lines included)?
  *

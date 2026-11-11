@@ -142,7 +142,10 @@ export const TRY_USAGE = `Usage: yaw-mcp try <slug> [flags]
 
   --client <name>      ${wrapToUsageColumn(clientChoices("try"))}
                        (default: auto-detect, prefers the first installed
-                       client in the order probed by \`yaw-mcp install --list\`)
+                       client in the order probed by \`yaw-mcp install --list\`.
+                       Only a client with a JSON config is auto-detected: one
+                       with a TOML config -- Codex CLI -- is skipped, so name
+                       it with --client codex-cli)
   --ttl <duration>     How long the trial lives before doctor GCs it
                        (default: 1h; accepts e.g. 30m, 2h, 7d)
   --env KEY=value      Set an env var on the trial entry. Repeatable.
@@ -572,7 +575,10 @@ function assertTrialMarkerShape(parsed: unknown): asserts parsed is TrialMarker 
     typeof m !== "object" ||
     typeof m.clientPath !== "string" ||
     typeof m.entryName !== "string" ||
-    !Array.isArray(m.containerPath)
+    !Array.isArray(m.containerPath) ||
+    // The ELEMENTS too: the path is walked key by key, and an array holding a
+    // number or an object is not an address in any config file.
+    !m.containerPath.every((seg) => typeof seg === "string")
   ) {
     throw new Error("marker is missing required fields");
   }
@@ -838,8 +844,9 @@ async function defaultResolveServer(
  *  There is no writability probe: availability is decided by OS, not by
  *  whether the config directory can be written. A client whose directory is
  *  read-only is still selected here and fails later, at the write, with a
- *  path in the message. */
-/** The (client, scope) slot `try` should write into. Returning the SCOPE as
+ *  path in the message.
+ *
+ *  Returns the (client, scope) slot `try` should write into. Returning the SCOPE as
  *  well as the id is what keeps the write in the file the probe actually
  *  found: a user with only a committed `.vscode/mcp.json` is detected on the
  *  workspace slot, and answering with the id alone left the caller to guess
@@ -1494,9 +1501,9 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
     // file with secrets exists between rename and the post-hoc chmod.
     await atomicWriteFile(resolved.absolute, clientJson, "utf8", tightenPerms ? 0o600 : undefined);
     written.push(resolved.absolute);
-    // Belt-and-suspenders chmod normalizes any umask masking applied to the
-    // born mode above (e.g. a umask that widened 0600 -> nothing extra, but
-    // this pins it exactly to owner-only).
+    // Belt-and-suspenders chmod: the mode passed to open() is masked by the
+    // umask (which can only clear bits); chmod is not, so this pins the file
+    // to exactly owner-only whatever the born mode came out as.
     if (tightenPerms) {
       try {
         await chmod(resolved.absolute, 0o600);
@@ -1756,10 +1763,7 @@ export function formatTtl(ms: number): string {
   return `${Math.floor(clamped / 86_400_000)}d`;
 }
 
-/** Doctor-side: list every trial marker on disk and classify expired vs live.
- *  Returns a structured summary so doctor can render it inline. Sweeping the
- *  expired ones is gcExpiredTrials' job, not this function's -- scanTrials
- *  takes no GC flag and has no side effects. */
+/** One marker scanTrials read and accepted, with its expiry worked out. */
 export interface TrialScanEntry {
   marker: TrialMarker;
   /** Absolute path of the scanned marker file. GC must unlink THIS path --
@@ -1779,6 +1783,10 @@ export interface TrialScanResult {
   malformed: string[];
 }
 
+/** Doctor-side: list every trial marker on disk and classify expired vs live.
+ *  Returns a structured summary so doctor can render it inline. Sweeping the
+ *  expired ones is gcExpiredTrials' job, not this function's -- scanTrials
+ *  takes no GC flag and has no side effects. */
 export async function scanTrials(opts: { home?: string; now?: () => number } = {}): Promise<TrialScanResult> {
   const home = opts.home ?? homedir();
   const now = opts.now ? opts.now() : Date.now();
@@ -1796,20 +1804,19 @@ export async function scanTrials(opts: { home?: string; now?: () => number } = {
     const path = join(dir, filename);
     try {
       const raw = await readFile(path, "utf8");
-      const parsed = JSON.parse(raw) as TrialMarker;
+      const parsed: unknown = JSON.parse(raw);
+      // The peel fields, through the ONE check every reader of a marker shares
+      // (it throws; the catch below files the marker as malformed). Only the
+      // fields this scan reads on top of them are spelled here.
+      assertTrialMarkerShape(parsed);
       if (
-        !parsed ||
-        typeof parsed !== "object" ||
         typeof parsed.slug !== "string" ||
         typeof parsed.expiresAt !== "number" ||
-        typeof parsed.clientPath !== "string" ||
         // Not consumed by the peel, but doctor PRINTS it verbatim ("demo ->
         // claude-code (expires in 42m)"), so a hand-rolled marker without it
         // renders as "demo -> undefined". Malformed is the honest reading of a
         // marker missing a field every writer of ours fills in.
         typeof parsed.clientName !== "string" ||
-        !Array.isArray(parsed.containerPath) ||
-        typeof parsed.entryName !== "string" ||
         // Same trust check runTryCleanup applies: the GC deletes these three
         // fields' worth of state from a file named by the marker itself, so a
         // marker naming a non-trial entry -- or written by a schema we don't
@@ -1852,7 +1859,8 @@ export async function gcExpiredTrials(opts: {
   for (const { marker, path } of scan.expired) {
     // Which step blew up decides what the user is told: a failed PEEL means
     // the entry is still wired into the client config; a failed UNLINK means
-    // the config is already clean and only the marker lingers.
+    // the trial's entry is not in the config (peeled, or already absent) and
+    // only the marker lingers.
     let stage: TrialGcFailure["stage"] = "peel";
     try {
       // Routed through the client-config core (inside the shared peel) so user
@@ -1874,10 +1882,10 @@ export async function gcExpiredTrials(opts: {
         stage = "replaced";
         // Unlinked in its OWN catch, not the loop's: a failure here leaves the
         // marker on disk, and the surrounding catch would then report the
-        // errno under stage "replaced" -- whose wording promises the marker
-        // WAS removed. Falling back to stage "unlink" is no better (that line
-        // says the entry was removed, and it deliberately was not), so this
-        // one keeps its own message.
+        // errno under stage "replaced" with nothing saying the marker is
+        // still there. Falling back to stage "unlink" is no better (that line
+        // says the entry is no longer in the file, and an entry of that name
+        // deliberately still is), so this one keeps its own message.
         let markerRemoved = true;
         try {
           await unlink(path);
@@ -1928,11 +1936,18 @@ export interface TrialGcFailure {
   slug: string;
   clientPath: string;
   markerPath: string;
-  /** "peel": the entry is STILL in the client config. "unlink": the config
-   *  is clean; only the marker file could not be deleted. "replaced": the
-   *  entry at that name is not the one the trial wrote, so it was deliberately
-   *  left alone (the marker WAS removed) -- not a failure of the sweep so much
-   *  as a thing the user needs told once. */
+  /** "peel": the entry is STILL in the client config -- or, on the rows
+   *  doctor builds itself when the whole sweep rejected (one per expired
+   *  trial, in collectTrialStatus), MAY still be: how far the sweep got is
+   *  unknown there, and `error` starts "the sweep stopped before finishing".
+   *  "unlink": the trial's
+   *  entry is not in the client config (peeled just now, or already gone --
+   *  no file, no entry, or a container that cannot hold one); only the marker
+   *  file could not be deleted. "replaced": the entry at that name is not the
+   *  one the trial wrote, so it was deliberately left alone. The marker is
+   *  deleted when it can be, and `error` says which happened -- not a failure
+   *  of the sweep so much as a thing the user needs told (once, unless the
+   *  marker could not be deleted, in which case every sweep repeats it). */
   stage: "peel" | "unlink" | "replaced";
   error: string;
 }
@@ -1945,6 +1960,6 @@ export function trialGcFailureWarning(f: TrialGcFailure): string {
   // not), and a tail appended here could only be right for one of them.
   if (f.stage === "replaced") return `trial "${f.slug}": ${f.error}`;
   return f.stage === "unlink"
-    ? `trial "${f.slug}": its entry was removed from ${f.clientPath}, but the marker ${f.markerPath} could not be deleted (${f.error}) -- delete that marker by hand`
+    ? `trial "${f.slug}": its entry is no longer in ${f.clientPath}, but the marker ${f.markerPath} could not be deleted (${f.error}) -- delete that marker by hand`
     : `trial "${f.slug}": expired but could not be removed from ${f.clientPath} (${f.error}) -- still wired in; run \`yaw-mcp try-cleanup ${f.slug}\` or edit that file by hand`;
 }

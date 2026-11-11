@@ -2168,6 +2168,26 @@ describe("runRemove confirmation gate", () => {
     expect(io.text()).not.toContain("tskey-super-secret");
   });
 
+  // The previewed entry is RAW: an `env` that is an array has no keys, and
+  // Object.keys on it rendered its indices as key names.
+  it("the preview does not render the indices of an env that is an array", async () => {
+    writeUserBundles({
+      version: 1,
+      servers: [{ namespace: "arr", name: "Arr", command: "npx", env: ["A=b", "C=d"], isActive: true }],
+    });
+    const io = captureIO();
+    await runRemove({
+      target: "arr",
+      home: synthHome,
+      cwd: synthCwd,
+      promptAnswer: "n",
+      out: (s) => io.out.push(s),
+      err: () => {},
+    });
+    expect(io.text()).toMatch(/namespace: arr/);
+    expect(io.text()).not.toContain("env keys:");
+  });
+
   it("renders the url for a remote-shaped entry instead of an empty command", async () => {
     await upsertUserBundle(
       { namespace: "remotey", name: "Remote Thing", type: "remote", url: "https://example.test/mcp", isActive: true },
@@ -2352,7 +2372,10 @@ describe("runRemove confirmation gate", () => {
     // An unparseable file is "uncertain", so the gate steps aside and the write
     // path reports it -- the pre-existing exit 1 + message, not a bogus refusal.
     expect(r.exitCode).toBe(1);
-    expect(io.errText()).toMatch(/could not be parsed/);
+    expect(io.errText()).toMatch(/could not be parsed -- fix the JSON .* first\./);
+    // The read is shared with `add`, and its advice used to end "before
+    // adding servers" on a remove.
+    expect(io.errText()).not.toMatch(/adding/);
   });
 });
 
@@ -2502,6 +2525,32 @@ describe("runList", () => {
     expect(parsed.servers[0].envKeys).toEqual(["FIRST_KEY"]);
     expect(parsed.servers[1].envKeys).toEqual(["SECOND_KEY"]);
     expect(io.text()).not.toContain("s3cret");
+  });
+
+  // The loader also skips an entry whose `git` block is malformed, namespace
+  // valid or not. Queueing every raw object then paired the surviving
+  // duplicate with the SKIPPED entry's keys.
+  it("--json does not hand a skipped duplicate's env keys to the entry that loaded", async () => {
+    writeUserBundles({
+      version: 1,
+      servers: [
+        { namespace: "dupe", name: "Bad git", git: "not-an-object", env: { SKIPPED_KEY: "" }, isActive: true },
+        { namespace: "dupe", name: "Loads", command: "npx", env: { LOADED_KEY: "" }, isActive: true },
+      ],
+    });
+    const io = captureIO();
+    await runList({
+      json: true,
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    const parsed = JSON.parse(io.out.join(""));
+    expect(parsed.servers).toHaveLength(1);
+    expect(parsed.servers[0].name).toBe("Loads");
+    expect(parsed.servers[0].envKeys).toEqual(["LOADED_KEY"]);
   });
 
   // `list` used to call loadLocalBundles with no env at all, so the trust gate
@@ -3153,10 +3202,10 @@ describe("upsertUserBundle round-trip", () => {
   });
 
   it("add --dry-run --json refuses on the SAME channel and shape as the real --json run [#1]", async () => {
-    // Both must exit 1 with text on stderr and NOTHING on stdout: a
-    // {ok:false} JSON body on the dry-run's stdout would be the one place
-    // the preview's channel differed from the run it previews (every other
-    // add error, --json or not, is stderr text).
+    // Both must exit 1 with the text on stderr AND one {ok:false} document on
+    // stdout -- the shape `add --git` always used. Until this changed, a
+    // catalog add's --json failure left stdout empty, which a script could
+    // not tell from a quiet success.
     await upsertUserBundle(
       {
         namespace: "github",
@@ -3188,8 +3237,17 @@ describe("upsertUserBundle round-trip", () => {
     const real = await run(false);
     expect(preview.exitCode).toBe(1);
     expect(real.exitCode).toBe(1);
-    expect(preview.out).toBe("");
-    expect(real.out).toBe("");
+    for (const r of [preview, real]) {
+      const doc = JSON.parse(r.out) as { ok: boolean; error: string; exitCode: number };
+      // ONE document, pretty-printed like add --git's and the success one.
+      expect(r.out).toBe(`${JSON.stringify(doc, null, 2)}\n`);
+      expect(Object.keys(doc)).toEqual(["ok", "error", "exitCode"]);
+      expect(doc.ok).toBe(false);
+      expect(doc.exitCode).toBe(1);
+      expect(doc.error).toContain('added as "github-enterprise"');
+      // The document's message is the stderr line, not a different wording.
+      expect(r.err).toContain(doc.error);
+    }
     expect(preview.err).toContain('added as "github-enterprise"');
     expect(real.err).toContain('added as "github-enterprise"');
   });
@@ -3898,6 +3956,27 @@ describe("runAdd optional env", () => {
     expect(rawEntry("terraform")).not.toHaveProperty("optionalEnvKeys");
   });
 
+  // The merge dropped an empty marker while a FRESH add, which merges onto
+  // nothing, wrote `"optionalEnvKeys": []` for every server without optional
+  // vars -- every --command add among them.
+  it("a fresh add stores no empty marker, and --json reports the entry as written", async () => {
+    const io = captureIO();
+    const r = await runAdd({
+      slug: "plain",
+      command: "npx -y plain-mcp",
+      json: true,
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s) => io.out.push(s),
+      err: () => {},
+    });
+    expect(r.exitCode).toBe(0);
+    expect(rawEntry("plain")).toMatchObject({ namespace: "plain", command: "npx" });
+    expect(rawEntry("plain")).not.toHaveProperty("optionalEnvKeys");
+    expect(JSON.parse(io.text()).entry).not.toHaveProperty("optionalEnvKeys");
+  });
+
   it("adds an all-optional server with nothing set, seeding the key EMPTY for a later fill", async () => {
     const io = captureIO();
     const r = await runAdd({
@@ -4161,5 +4240,159 @@ describe("runAdd -- a custom add over a stored entry [full-pass 2026-10-03]", ()
     });
     expect(r.exitCode).toBe(1);
     expect(io.errText()).toMatch(/needs the following env var/);
+  });
+});
+
+// Every --json failure of a catalog, --command or --url add leaves ONE
+// {ok:false,error,exitCode} document on stdout -- the document `add --git`'s
+// fail() always printed, pretty-printed the same way. Until this changed
+// these paths printed stderr text only and left stdout EMPTY, which a script
+// piping `add --json` into a parser could not tell from a quiet success.
+describe("runAdd --json failures print one {ok:false} document [J-json]", () => {
+  type Doc = { ok: boolean; error: string; exitCode: number };
+
+  async function addJson(
+    opts: Partial<Parameters<typeof runAdd>[0]>,
+  ): Promise<{ exitCode: number; out: string; err: string; doc: Doc }> {
+    const io = captureIO();
+    const r = await runAdd({
+      json: true,
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      fetchCatalog,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+      ...opts,
+    });
+    const out = io.text();
+    const doc = JSON.parse(out) as Doc;
+    // Exactly one document, in add --git's (and the success document's)
+    // pretty layout, with exactly these three fields.
+    expect(out).toBe(`${JSON.stringify(doc, null, 2)}\n`);
+    expect(Object.keys(doc)).toEqual(["ok", "error", "exitCode"]);
+    expect(doc.ok).toBe(false);
+    expect(doc.exitCode).toBe(r.exitCode);
+    return { exitCode: r.exitCode, out, err: io.errText(), doc };
+  }
+
+  it.each([
+    ["an invalid catalog slug", { slug: "Bad_Slug" }, 2, 'invalid slug "Bad_Slug"'],
+    ["an invalid custom name", { slug: "Bad_Name", command: "node x.js" }, 2, 'invalid name "Bad_Name"'],
+    ["a --url with no scheme", { slug: "rem", url: "example.com/mcp" }, 2, "include the scheme"],
+    ["a non-http --url", { slug: "rem", url: "ftp://example.com/mcp" }, 2, 'url must be http or https, got "ftp:"'],
+    ["a --command with no executable", { slug: "loc", command: "   " }, 2, "--command had no executable in it."],
+    ["an unknown catalog slug", { slug: "no-such-server" }, 1, "no-such-server"],
+  ] as const)("%s", async (_label, opts, exitCode, fragment) => {
+    const r = await addJson(opts);
+    expect(r.exitCode).toBe(exitCode);
+    expect(r.doc.error.startsWith("yaw-mcp add: ")).toBe(true);
+    expect(r.doc.error).toContain(fragment);
+    // The stderr text is unchanged: the same line the document carries.
+    expect(r.err).toContain(r.doc.error);
+  });
+
+  it("a catalog fetch failure", async () => {
+    const r = await addJson({
+      slug: "fetch",
+      fetchCatalog: async () => {
+        throw new Error("catalog offline");
+      },
+    });
+    expect(r.exitCode).toBe(1);
+    expect(r.doc.error).toContain("yaw-mcp add: ");
+    expect(r.err).toContain(r.doc.error);
+  });
+
+  it("the required-env gate: one document summing up the multi-line stderr refusal", async () => {
+    const r = await addJson({ slug: "tailscale" });
+    expect(r.exitCode).toBe(1);
+    expect(r.doc.error).toMatch(
+      /^yaw-mcp add: Tailscale needs the following env var\(s\) before it can run: TAILSCALE_API_KEY\./,
+    );
+    // stderr keeps its own multi-line form, re-run hint included.
+    expect(r.err).toContain("Provide them with --env KEY=value (repeatable) or your shell, then re-run:");
+    expect(r.err).toContain("yaw-mcp add tailscale --env TAILSCALE_API_KEY=...");
+  });
+
+  it("an unreadable bundles.json on the real write", async () => {
+    writeUserBundlesRaw("{ this is not json");
+    const r = await addJson({ slug: "fetch" });
+    expect(r.exitCode).toBe(1);
+    expect(r.doc.error).toContain("could not be parsed");
+    expect(r.err).toContain(r.doc.error);
+  });
+
+  it("an unreadable bundles.json on a dry run", async () => {
+    writeUserBundlesRaw("{ this is not json");
+    const r = await addJson({ slug: "fetch", dryRun: true });
+    expect(r.exitCode).toBe(1);
+    expect(r.doc.error).toContain("could not be parsed");
+  });
+
+  it("without --json a failure still leaves stdout empty", async () => {
+    const io = captureIO();
+    const r = await runAdd({
+      slug: "Bad_Slug",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      fetchCatalog,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(2);
+    expect(io.text()).toBe("");
+    expect(io.errText()).toContain('invalid slug "Bad_Slug"');
+  });
+
+  it("a rejection before anything reached stdout still leaves one document, then rejects", async () => {
+    // index.ts's dispatcher turns the rejection into `yaw-mcp add: <msg>` on
+    // stderr and exit 1; stdout must carry the matching document first.
+    const out: string[] = [];
+    await expect(
+      runAdd({
+        slug: "Bad_Slug",
+        json: true,
+        home: synthHome,
+        cwd: synthCwd,
+        env: {},
+        fetchCatalog,
+        out: (s) => out.push(s),
+        err: () => {
+          throw new Error("stderr is gone");
+        },
+      }),
+    ).rejects.toThrow("stderr is gone");
+    const doc = JSON.parse(out.join("")) as Doc;
+    expect(doc).toEqual({ ok: false, error: "yaw-mcp add: stderr is gone", exitCode: 1 });
+  });
+
+  it("a rejection AFTER the success document adds no second document", async () => {
+    // Success prints its document, then post-write notes on stderr; a throw
+    // there must not append an {ok:false} document to the {ok:true} one.
+    const out: string[] = [];
+    let errCalls = 0;
+    const settled = await runAdd({
+      slug: "fetch",
+      json: true,
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      fetchCatalog,
+      out: (s) => out.push(s),
+      err: () => {
+        errCalls++;
+        throw new Error("stderr is gone");
+      },
+    }).then(
+      () => "resolved",
+      () => "rejected",
+    );
+    const doc = JSON.parse(out.join("")) as { ok: boolean };
+    expect(doc.ok).toBe(true);
+    // Only meaningful if stderr was actually written after the document.
+    expect(errCalls).toBeGreaterThan(0);
+    expect(settled).toBe("rejected");
   });
 });

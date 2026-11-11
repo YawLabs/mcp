@@ -30,10 +30,12 @@ describe("readGuide -- the read timeout", () => {
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), "yaw-mcp-guide-timeout-"));
     // The assertion below reads a warn line off stderr; logger.ts resolves
-    // LOG_LEVEL per call, so an operator shell that exports LOG_LEVEL=error
-    // would silence the line and fail the test for a reason unrelated to the
-    // code under test (paths.test.ts pins it the same way).
+    // the level per call (YAW_MCP_LOG_LEVEL, else LOG_LEVEL), so an operator
+    // shell that exports either as `error` would silence the line and fail the
+    // test for a reason unrelated to the code under test (paths.test.ts pins
+    // it the same way).
     vi.stubEnv("LOG_LEVEL", "warn");
+    vi.stubEnv("YAW_MCP_LOG_LEVEL", undefined);
     vi.useFakeTimers();
   });
 

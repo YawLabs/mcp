@@ -125,9 +125,9 @@ export interface ConfigShape {
   root: string;
   /** Who owns the file. `"shared"` (the default, and every existing target)
    *  is a user config yaw-mcp splices into. `"dedicated"` is a file yaw-mcp
-   *  creates for itself. Nothing in this module behaves differently on it: it
-   *  is carried so the Done and uninstall wording can say whether the file
-   *  stays behind. */
+   *  creates for itself. Nothing in src/ reads it yet: it is carried data, and
+   *  uninstall says exactly what it says for a shared file (pinned in
+   *  target-continue.test.ts). */
   ownership?: "shared" | "dedicated";
   /** Settings OUTSIDE the server map that install adds at the top level of
    *  the file when they are missing, because the client's own default for
@@ -453,13 +453,17 @@ export interface ImportView {
    *  headers, type, description. A client-specific key belongs in
    *  `discardedKeys`, not here. */
   entry: Record<string, unknown>;
-  /** The client stores this server switched OFF. Imported, but inactive. */
+  // The three below are reported by a `forImport` hook and acted on by
+  // `import` (runImport in import-cmd.ts).
+  /** The client stores this server switched OFF. `import` writes it with
+   *  `"isActive": false` and says how to turn it on. */
   disabled?: boolean;
   /** Not importable at all, in the client's own terms ("Zed resolves it
-   *  through an extension"). Printed beside the entry in the skipped list. */
+   *  through an extension"). `import` skips the server by name with this
+   *  reason, on its skipped list. */
   skipReason?: string;
-  /** Keys the destination cannot hold, named so the importer can say what it
-   *  dropped instead of dropping them silently. */
+  /** Keys the destination cannot hold. `import` names each one in a warning
+   *  beside its env/headers discard notes. */
   discardedKeys?: string[];
 }
 
@@ -484,7 +488,12 @@ export interface EntryTransform {
    *
    *  `env` is NOT carried here: the core carries it, with its own string-only
    *  filter and its own `--force` drop line, so returning it would mean two
-   *  owners for one field. `carriedFieldsOf` drops the key. */
+   *  owners for one field. `carriedFieldsOf` drops the key.
+   *
+   *  The hook is handed the STORED value, not the `normalize`d one -- unlike
+   *  the env, which `carryableEnvOf` reads off the normalised entry. So a
+   *  field that lives only inside a wrapper `normalize` unfolds (the `type`
+   *  inside Cline's nested `transport`) is not carried. */
   carry?: (stored: Record<string, unknown>) => Record<string, unknown>;
   /** Fields install WRITES beyond command/args/env, and therefore compares
    *  like them (a startup timeout the client requires). Part of the entry, so
@@ -515,10 +524,20 @@ export interface EntryTransform {
 }
 
 /** The env a rewrite carries forward from a stored entry: string values only,
- *  undefined when there is nothing to carry. */
-export function carryableEnvOf(stored: unknown): Record<string, string> | undefined {
-  if (!isRecord(stored)) return undefined;
-  return stringMap(stored.env);
+ *  undefined when there is nothing to carry.
+ *
+ *  Read off the entry as the target's `normalize` hook folds it, when a
+ *  `transform` is passed: a client that stores the launch under a nested key
+ *  (Cline's `{ transport: { command, args, env } }`) keeps its env there, and
+ *  the stored value's own top level has none -- so a rewrite reading the
+ *  stored value dropped an env the drift comparison could see. A hook that
+ *  returns a non-object leaves the stored value as the one read, the rule
+ *  `importViewOf` applies. */
+export function carryableEnvOf(stored: unknown, transform?: EntryTransform): Record<string, string> | undefined {
+  const normalized = normalizeEntry(stored, transform);
+  const from = isRecord(normalized) ? normalized : stored;
+  if (!isRecord(from)) return undefined;
+  return stringMap(from.env);
 }
 
 /** The client-owned fields a rewrite carries forward, per the target's own
@@ -996,7 +1015,7 @@ function makeView(
       return entries.filter((e) => !skip.has(e.key) && isRecord(e.value)).map((e) => e.key);
     },
     count: () => entries.length,
-    carryableEnv: (key?: string) => carryableEnvOf(at(key)?.value),
+    carryableEnv: (key?: string) => carryableEnvOf(at(key)?.value, opts.transform),
     carried: (key?: string) => carriedFieldsOf(at(key)?.value, opts.transform),
     unloadable: () => (read.kind === "ok" || read.kind === "blocked" ? read.unloadable : null),
   };
@@ -1197,6 +1216,13 @@ export async function readClientConfigFile(
   opts: ClassifyOptions & ReadSeam = {},
 ): Promise<ClientConfigView> {
   const load = opts.readFile ?? ((path: string) => readFile(path));
+  // The two reads this function makes WITHOUT `classifyClientConfig` (bytes it
+  // could not load, bytes that are not UTF-8) are addressed the way that
+  // function addresses an absent file: the first candidate container, index 0.
+  const firstAddress: EntryAddress = {
+    format: site.format,
+    containerPath: opts.containerPaths?.[0] ?? site.resolved.containerPath,
+  };
   let loaded: string | Uint8Array;
   try {
     loaded = await load(site.resolved.absolute);
@@ -1208,18 +1234,12 @@ export async function readClientConfigFile(
       code: typeof code === "string" ? code : null,
       message: err instanceof Error ? err.message : String(err),
     };
-    return makeView(read, null, addressOf(site), 0, adapterFor(site.format), opts);
+    return makeView(read, null, firstAddress, 0, adapterFor(site.format), opts);
   }
   if (typeof loaded === "string") return classifyClientConfig(loaded, site, opts);
   const decoded = decodeClientConfigBytes(loaded, site.format);
   if (decoded.malformed === null) return classifyClientConfig(decoded.text, site, opts);
-  // Addressed the way `classifyClientConfig` addresses a read it cannot
-  // classify further: the first candidate container, index 0.
-  const address: EntryAddress = {
-    format: site.format,
-    containerPath: opts.containerPaths?.[0] ?? site.resolved.containerPath,
-  };
-  return makeView(decoded.malformed, decoded.text, address, 0, adapterFor(site.format), opts);
+  return makeView(decoded.malformed, decoded.text, firstAddress, 0, adapterFor(site.format), opts);
 }
 
 // ---------------------------------------------------------------------------
@@ -1405,13 +1425,27 @@ export function applyClientConfigEdits(
   return text;
 }
 
+/** " at line L column C", or "" with no position: the clause the write
+ *  facade's refusal puts after "is not valid <syntax>".
+ *
+ *  Exported for an adapter whose parser reason names no place of its own (the
+ *  TOML one): it ends its `detail` with this same clause, so the commands that
+ *  print the detail alone still say where the file broke, and `refusalFor`
+ *  below recognises the clause and does not print the position twice. */
+export function configPositionClause(position: ConfigPosition | null): string {
+  return position === null ? "" : ` at line ${position.line} column ${position.column}`;
+}
+
 function refusalFor(read: ConfigRead, where: string, edits: readonly ClientConfigEdit[]): string {
   if (read.kind === "unreadable") return `${where} could not be read (${read.message})`;
   if (read.kind === "malformed") {
-    const at = read.position === null ? "" : ` at line ${read.position.line} column ${read.position.column}`;
+    const at = configPositionClause(read.position);
+    // A detail that already ENDS with this clause (see configPositionClause)
+    // gives it up here, so the position is printed once, in its usual place.
+    const detail = at !== "" && read.detail.endsWith(at) ? read.detail.slice(0, -at.length) : read.detail;
     return read.reason === "root"
       ? `${where} is not a ${read.syntax} object (it is ${read.detail})`
-      : `${where} is not valid ${read.syntax}${at} (${read.detail})`;
+      : `${where} is not valid ${read.syntax}${at} (${detail})`;
   }
   if (read.kind === "unspliceable") {
     // The by-hand step rides along when the adapter gave one, the way the

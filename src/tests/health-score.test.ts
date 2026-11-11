@@ -358,6 +358,23 @@ describe("formatHealthWarning -- credential scrubbing", () => {
     }
   });
 
+  it("redacts a credential-shaped token echoed AFTER an absence word", () => {
+    // The safe-list used to hand back the whole clause once its first token
+    // matched, so an upstream that says what was wrong and then echoes the
+    // value ("token: invalid <value>") leaked the value whole.
+    expect(scrubForWarning("token: invalid abc123secretvalue")).toBe("token: invalid <redacted>");
+    expect(scrubForWarning("API_KEY: invalid 9f8e7d6c5b4a")).toBe("API_KEY: invalid <redacted>");
+    expect(scrubForWarning("AUTH_TOKEN: expected abcdefghijklmnopqrstuvwx")).toBe("AUTH_TOKEN: expected <redacted>");
+    // The diagnostic's own words are not credential-shaped and stay: short
+    // numbers, and prose with no digit under 16 letters.
+    expect(scrubForWarning("API_KEY: must be at least 32 characters")).toBe("API_KEY: must be at least 32 characters");
+    expect(scrubForWarning("GITHUB_TOKEN: not set -- upstream returned 502")).toBe(
+      "GITHUB_TOKEN: not set -- upstream returned 502",
+    );
+    // Stated in the header as accepted: a value that IS a listed word.
+    expect(scrubForWarning("password=required")).toBe("password=required");
+  });
+
   it("cannot be used to smuggle a value past the scrubber", () => {
     // ABSENCE_VALUE is anchored, so prefixing a real value with "not" / "none"
     // does not satisfy it, and nothing about the value's SHAPE buys an

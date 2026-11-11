@@ -341,6 +341,44 @@ export function withWarnSink(warn: ((line: string) => void) | undefined): FetchC
   return (url) => defaultFetchCatalog(url, warn ? { warn } : {});
 }
 
+/** True for an entry `add` and `try` refuse as remote (HTTP): one with an
+ *  install URL, `"type": "remote"`, or a runtime that names a transport
+ *  instead of a launcher. One definition, shared with `yaw-mcp search`, whose
+ *  "remote -- add by hand" tag is a promise about what the resolver below
+ *  will do with the same entry. */
+export function isRemoteCatalogEntry(entry: CatalogServer): boolean {
+  const install = entry.install ?? {};
+  const runtime = typeof install.runtime === "string" ? install.runtime.toLowerCase() : "";
+  return Boolean(install.url) || install.type === "remote" || /^(remote|https?|sse|url)$/.test(runtime);
+}
+
+/** The env var NAMES an entry declares, split by the `optional` flag:
+ *  `required` is what the resolver below gates on, `optional` is declared and
+ *  never gated on. Shared with `yaw-mcp search` so the listing and the add
+ *  cannot disagree about one entry.
+ *
+ *  One pass over `requiredEnv`. The key filter is the same for both halves
+ *  (only a well-formed shell identifier can be written into an env map), and
+ *  the flag is read as `=== true`: this is remote data, and a truthy test
+ *  would let `"false"` -- a string a hand edit of the catalog could plausibly
+ *  leave -- lift a var out of the gate. A key listed twice with the flag
+ *  disagreeing is a catalog bug; required wins, so the key is gated on AND
+ *  never printed as both at once. An element that is not an object (a bare
+ *  string, null) is skipped. */
+export function catalogEnvKeys(entry: CatalogServer): { required: string[]; optional: string[] } {
+  const required: string[] = [];
+  const optional: string[] = [];
+  const raw: unknown = entry.requiredEnv;
+  if (Array.isArray(raw)) {
+    for (const e of raw as unknown[]) {
+      const key = e && typeof e === "object" ? (e as { key?: unknown }).key : undefined;
+      if (typeof key !== "string" || !ENV_KEY_RE.test(key)) continue;
+      ((e as { optional?: unknown }).optional === true ? optional : required).push(key);
+    }
+  }
+  return { required, optional: optional.filter((k) => !required.includes(k)) };
+}
+
 /**
  * Resolve a catalog slug to a concrete launch shape. Refuses remote/HTTP
  * servers (they have no stdio spawn command) the same way the app's
@@ -379,10 +417,9 @@ export async function resolveCatalogSlug(
   }
 
   const install = entry.install ?? {};
-  const runtime = typeof install.runtime === "string" ? install.runtime.toLowerCase() : "";
   // A remote/HTTP server has no stdio spawn command; refuse rather than
   // tokenize a URL into a broken entry. Matches the app's resolveSlug.
-  if (install.url || install.type === "remote" || /^(remote|https?|sse|url)$/.test(runtime)) {
+  if (isRemoteCatalogEntry(entry)) {
     throw new Error(
       `"${slug}" is a remote (HTTP) server, which has no stdio command to spawn. Add it by hand to ~/.yaw-mcp/bundles.json with "type": "remote", its "url", and a "headers" block for any auth token (values may use \${secret:NAME}).`,
     );
@@ -403,23 +440,7 @@ export async function resolveCatalogSlug(
     throw new Error(`catalog entry "${slug}" install command was empty.`);
   }
 
-  // One pass over `requiredEnv`, split by the `optional` flag. The key filter
-  // is the same for both halves (only a well-formed shell identifier can be
-  // written into an env map), and the flag is read as `=== true`: this is
-  // remote data, and a truthy test would let `"false"` -- a string a hand
-  // edit of the catalog could plausibly leave -- lift a var out of the gate.
-  const requiredEnvKeys: string[] = [];
-  const optionalEnvKeys: string[] = [];
-  if (Array.isArray(entry.requiredEnv)) {
-    for (const e of entry.requiredEnv) {
-      const key = e && typeof e === "object" ? e.key : undefined;
-      if (typeof key !== "string" || !ENV_KEY_RE.test(key)) continue;
-      (e.optional === true ? optionalEnvKeys : requiredEnvKeys).push(key);
-    }
-  }
-  // A key listed twice with the flag disagreeing is a catalog bug; required
-  // wins, so the key is gated on AND never printed as both at once.
-  const optionalOnly = optionalEnvKeys.filter((k) => !requiredEnvKeys.includes(k));
+  const { required: requiredEnvKeys, optional: optionalOnly } = catalogEnvKeys(entry);
 
   const source =
     typeof entry.repo === "string" ? entry.repo : typeof entry.homepage === "string" ? entry.homepage : undefined;

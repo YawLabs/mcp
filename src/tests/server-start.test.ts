@@ -666,8 +666,8 @@ describe("ConnectServer.start() — compliance grade hydration", () => {
     const { priv, prewarmed } = await startServer();
     await prewarmed;
 
-    // The grade reached this.config.servers (nothing else supplies it —
-    // validateEntry strips complianceGrade from bundles.json).
+    // The grade reached this.config.servers (this entry carries none of its
+    // own, so only the grades.json overlay can have supplied it).
     const shaky = priv.config.servers.find((s: UpstreamServerConfig) => s.namespace === "shaky");
     expect(shaky.complianceGrade).toBe("D");
 
@@ -1729,8 +1729,8 @@ describe("ConnectServer -- live bundles.json reload", () => {
 
   it("keeps compliance grades on the servers a reload re-read", async () => {
     // Grades come from ~/.yaw-mcp/grades.json and are OVERLAID onto the parsed
-    // entries -- validateEntry drops complianceGrade, so a freshly-parsed entry
-    // always arrives ungraded. Without re-overlaying them the reload would
+    // entries -- an entry with no grade of its own in bundles.json arrives
+    // ungraded from the parse. Without re-overlaying them the reload would
     // blank the [A]-[F] badge on every server it re-read and, worse, silently
     // stop YAW_MCP_MIN_COMPLIANCE filtering (ungraded passes by default).
     writeGrades({ gh: { grade: "A", score: 95 } });

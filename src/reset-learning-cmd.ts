@@ -7,8 +7,13 @@
 // the upstream, rotated its credentials) the history is now stale and
 // that penalty has overstayed its welcome — this command wipes it.
 //
+// The file is the whole persisted state, not only learning: the per-namespace
+// tool caches, pack history and pre-warm failures go with it. The usage text
+// says so and the preview and the success report count each section.
+//
 // IMPORTANT: this deletes the file on disk, it does NOT reach into a
-// running session. `yaw-mcp serve` holds the learning store in memory and
+// running session. A running yaw-mcp server (a bare `yaw-mcp`; there is no
+// `serve` verb) holds the learning store in memory and
 // saves on a ~1s debounce after every recorded outcome/miss/exec step, plus
 // once on shutdown (server.ts flushStateSave). That save re-reads the file
 // under a lock and merges only what the process recorded since its last
@@ -57,7 +62,12 @@ export const RESET_LEARNING_USAGE = `Usage: yaw-mcp reset-learning
   rotated, account swapped, server replaced) so the routing penalty
   doesn't keep suppressing it.
 
-  Restart your MCP client afterwards: a running "yaw-mcp serve" keeps
+  The file holds more than learning, and all of it goes: each server's
+  cached tool list (re-learned on its next connect), pack history, and
+  the record of servers whose pre-warm failed (they are tried again).
+  The report lists a count for each.
+
+  Restart your MCP client afterwards: a running yaw-mcp server keeps
   routing on the learning it has in memory until its next save (and one
   from an older yaw-mcp release re-saves it over the deleted file).
 
@@ -76,9 +86,9 @@ export const RESET_LEARNING_USAGE = `Usage: yaw-mcp reset-learning
 // keeps getting the exact routing penalty they just cleared, with nothing on
 // screen connecting the two.
 const RUNNING_SERVE_NOTE = [
-  "  note: a running yaw-mcp serve process still holds this learning in",
+  "  note: a running yaw-mcp server process still holds this learning in",
   "        memory and keeps routing on it (an older release re-saves it over",
-  "        the deleted file). Restart your MCP client (or stop that serve",
+  "        the deleted file). Restart your MCP client (or stop that server",
   "        process) for the reset to take effect.",
 ];
 

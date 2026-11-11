@@ -110,9 +110,12 @@ export type ToolExposure = "gateway" | "lite" | "full";
  *  locale). Two things hang off it. A list is byte-identical for the same set
  *  of loaded servers whatever order they were activated in, which is what a
  *  client caching it by content needs. And when two namespaces flatten onto
- *  one wire name (`gh` + `actions_list` vs `gh_actions` + `list`), the list
- *  and the routes pick the same winner -- the lexically first namespace --
- *  because both are built in this order. Within a namespace the upstream's own
+ *  one wire name (`gh` + `actions_list` vs `gh_actions` + `list`), the route
+ *  tables pick the lexically first namespace as the winner. Walking the same
+ *  order is NOT what makes a list agree with them: a list skips namespaces
+ *  (gateway/lite exposure) and tools (a per-namespace filter) that the routes
+ *  still carry, so each list asks its route table who owns a name and
+ *  advertises only the owner's entry. Within a namespace the upstream's own
  *  order is kept: re-sorting would reorder tools against their own server. */
 export function compareNamespaces(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
@@ -190,8 +193,19 @@ export function buildToolList(
   // `gh_actions_list`. Without the check the SAME name would be emitted
   // twice in tools/list (MCP names must be unique; clients dedupe
   // arbitrarily or error). First writer wins here, matching the meta-tool
-  // precedence above, and "first" is namespace order (compareNamespaces),
-  // the same order buildToolRoutes picks its winner in; it logs the collision.
+  // precedence above.
+  //
+  // `seen` alone does not pick the right winner, though. This loop skips a
+  // namespace gateway/lite has not exposed and a tool a filter hides, and
+  // neither reaches `seen` -- so with `gh` connected but unadvertised, the
+  // NEXT namespace's `gh_actions_list` would be listed while buildToolRoutes
+  // (which sees every connection) still sends the call to `gh`: one
+  // upstream's schema, another upstream's tool. So ownership is asked of the
+  // route table itself, built quiet from the same inputs, and a tool is
+  // advertised only by the namespace its wire name routes to. A name whose
+  // owner is hidden is simply not listed; the route builder logs the
+  // collision when the real table is built.
+  const owners = buildToolRoutes(activeConnections, inactiveWithCache, true);
   for (const conn of connectionsInOrder(activeConnections)) {
     // Gateway (and lite, which is gateway with fewer meta-tools) advertises
     // a namespace only once the client has asked for it. A server that is
@@ -206,6 +220,7 @@ export function buildToolList(
       if (filter && !filter.has(tool.name)) continue;
       if (isDenied?.(tool.namespacedName)) continue;
       if (seen.has(tool.namespacedName)) continue;
+      if (owners.get(tool.namespacedName)?.namespace !== conn.config.namespace) continue;
       // title / outputSchema / _meta ride along so the structured-output
       // contract and display name survive the proxy (deferred placeholders
       // below stay minimal on purpose — their schema is a placeholder too).
@@ -245,6 +260,10 @@ export function buildToolList(
       const namespacedName = `${server.namespace}_${cached.name}`;
       if (isDenied?.(namespacedName)) continue;
       if (seen.has(namespacedName)) continue;
+      // Same ownership rule as the active branch: a filter can hide the
+      // cached tool that owns this name, and the next server's must not be
+      // listed in its place.
+      if (owners.get(namespacedName)?.namespace !== server.namespace) continue;
       tools.push({
         name: namespacedName,
         description: deferredDescription(server, cached.description),
@@ -282,13 +301,12 @@ export function buildToolRoutes(
       const existing = routes.get(tool.namespacedName);
       if (existing && existing.namespace !== conn.config.namespace) {
         // FIRST writer wins, and the `continue` below is load-bearing.
-        // buildToolList skips a duplicate namespacedName (see the `seen`
-        // guard), so the schema the model is shown belongs to the FIRST
-        // upstream in namespace order. Letting routes.set fall through here
-        // made dispatch last-writer-wins, so a collision meant the client
-        // validated against one upstream's inputSchema and the call executed
-        // a DIFFERENT upstream's tool. The two surfaces must agree on the
-        // winner, and both walk compareNamespaces order, so they do.
+        // Letting routes.set fall through here made dispatch
+        // last-writer-wins, so a collision meant the client validated
+        // against one upstream's inputSchema and the call executed a
+        // DIFFERENT upstream's tool. The two surfaces must agree on the
+        // winner, and they do because buildToolList asks THIS function who
+        // owns a name (its `owners` table) instead of deciding separately.
         if (!quiet) {
           log("warn", "Tool route collision; keeping the first upstream, ignoring the later one", {
             tool: tool.namespacedName,
@@ -370,18 +388,23 @@ export function buildResourceList(
   // that (so is a `connect://${namespace}/${uri}` pair that flattens to one
   // string), and clients then dedupe arbitrarily or error. Builtins seed the
   // set so a builtin SHADOWS an upstream uri here exactly as it does in
-  // routeResourceRead — one winner on both surfaces. First writer in
-  // namespace order wins, and buildResourceRoutes agrees on that winner.
+  // routeResourceRead — one winner on both surfaces. Among upstreams the
+  // winner is whoever buildResourceRoutes routes the uri to, asked of it
+  // directly (see the `owners` note in buildToolList): under gateway/lite
+  // this loop skips namespaces the route table still carries, so walking the
+  // same order would not be enough to agree.
   const seen = new Set<string>();
   for (const b of builtins) {
     if (seen.has(b.uri)) continue;
     resources.push({ uri: b.uri, name: b.name, description: b.description, mimeType: b.mimeType });
     seen.add(b.uri);
   }
+  const owners = buildResourceRoutes(activeConnections, true);
   for (const conn of connectionsInOrder(activeConnections)) {
     if (exposure !== "full" && !exposedNamespaces?.has(conn.config.namespace)) continue;
     for (const r of conn.resources) {
       if (seen.has(r.namespacedUri)) continue;
+      if (owners.get(r.namespacedUri)?.namespace !== conn.config.namespace) continue;
       // title / _meta ride along, same as buildToolList: an upstream that
       // published a display name or a metadata convention must reach the
       // client with both intact (MCP 2025-06-18). Builtins above set
@@ -400,7 +423,13 @@ export function buildResourceList(
   return resources;
 }
 
-export function buildResourceRoutes(activeConnections: Map<string, UpstreamConnection>): Map<string, ResourceRoute> {
+export function buildResourceRoutes(
+  activeConnections: Map<string, UpstreamConnection>,
+  // Suppress the collision warning, for a caller that builds a throwaway
+  // table to ask who owns a uri (buildResourceList) -- same contract as
+  // buildToolRoutes' `quiet`.
+  quiet = false,
+): Map<string, ResourceRoute> {
   const routes = new Map<string, ResourceRoute>();
   for (const conn of connectionsInOrder(activeConnections)) {
     for (const r of conn.resources) {
@@ -408,13 +437,14 @@ export function buildResourceRoutes(activeConnections: Map<string, UpstreamConne
       if (existing) {
         // FIRST writer wins, mirroring buildToolRoutes / buildPromptRoutes,
         // and the `continue` is load-bearing for the same reason:
-        // buildResourceList skips a duplicate namespacedUri, so the entry the
-        // client was shown belongs to the FIRST writer. Last-writer-wins here
+        // buildResourceList lists a uri only for the namespace this table
+        // routes it to, so the entry the client was shown belongs to the
+        // FIRST writer. Last-writer-wins here
         // meant resources/read fetched a DIFFERENT resource than the one
         // advertised under that uri. Warn only when a SECOND namespace is
         // involved -- one upstream repeating its own uri is not an
         // operator-fixable collision, there is no other server to rename.
-        if (existing.namespace !== conn.config.namespace) {
+        if (!quiet && existing.namespace !== conn.config.namespace) {
           log("warn", "Resource route collision; keeping the first upstream, ignoring the later one", {
             uri: r.namespacedUri,
             keptNamespace: existing.namespace,
@@ -449,14 +479,16 @@ export function buildPromptList(
   // flatten to `${namespace}_${prompt}` too, so (ns=`gh`, prompt=`review_pr`)
   // and (ns=`gh_review`, prompt=`pr`) both render as `gh_review_pr`. MCP
   // prompt names must be unique; without the check the SAME name is emitted
-  // twice in prompts/list and clients dedupe arbitrarily or error. First
-  // writer in namespace order wins, and buildPromptRoutes agrees on that
-  // winner.
+  // twice in prompts/list and clients dedupe arbitrarily or error. The
+  // winner is whoever buildPromptRoutes routes the name to, asked of it
+  // directly (see the `owners` note in buildToolList).
   const seen = new Set<string>();
+  const owners = buildPromptRoutes(activeConnections, true);
   for (const conn of connectionsInOrder(activeConnections)) {
     if (exposure !== "full" && !exposedNamespaces?.has(conn.config.namespace)) continue;
     for (const p of conn.prompts) {
       if (seen.has(p.namespacedName)) continue;
+      if (owners.get(p.namespacedName)?.namespace !== conn.config.namespace) continue;
       // title / _meta forwarded, same rationale as buildResourceList.
       prompts.push({
         name: p.namespacedName,
@@ -471,25 +503,30 @@ export function buildPromptList(
   return prompts;
 }
 
-export function buildPromptRoutes(activeConnections: Map<string, UpstreamConnection>): Map<string, PromptRoute> {
+export function buildPromptRoutes(
+  activeConnections: Map<string, UpstreamConnection>,
+  // Suppress the collision warning for a throwaway ownership table
+  // (buildPromptList) -- same contract as buildToolRoutes' `quiet`.
+  quiet = false,
+): Map<string, PromptRoute> {
   const routes = new Map<string, PromptRoute>();
   for (const conn of connectionsInOrder(activeConnections)) {
     for (const p of conn.prompts) {
       const existing = routes.get(p.namespacedName);
       if (existing && existing.namespace !== conn.config.namespace) {
         // FIRST writer wins, mirroring buildToolRoutes -- and the `continue`
-        // is load-bearing for the same reason. buildPromptList skips a
-        // duplicate namespacedName, so the prompt (description + argument
-        // list) the client was shown belongs to the FIRST upstream in
-        // namespace order. Letting routes.set fall through made prompts/get
-        // last-writer-wins, so a collision meant the client picked one
-        // upstream's prompt and got a DIFFERENT upstream's. Both surfaces
-        // walk compareNamespaces order, so they agree on the winner.
-        log("warn", "Prompt route collision; keeping the first upstream, ignoring the later one", {
-          prompt: p.namespacedName,
-          keptNamespace: existing.namespace,
-          ignoredNamespace: conn.config.namespace,
-        });
+        // is load-bearing for the same reason. Letting routes.set fall
+        // through made prompts/get last-writer-wins, so a collision meant
+        // the client picked one upstream's prompt (description + argument
+        // list) and got a DIFFERENT upstream's. buildPromptList lists a name
+        // only for the namespace this table routes it to, so the two agree.
+        if (!quiet) {
+          log("warn", "Prompt route collision; keeping the first upstream, ignoring the later one", {
+            prompt: p.namespacedName,
+            keptNamespace: existing.namespace,
+            ignoredNamespace: conn.config.namespace,
+          });
+        }
         continue;
       }
       routes.set(p.namespacedName, { namespace: conn.config.namespace, originalName: p.name });

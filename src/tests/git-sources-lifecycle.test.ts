@@ -22,10 +22,26 @@ import {
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { beforeEach, describe, expect, it } from "vitest";
-import { discardBuild, GIT_LOCK_NAME, gitRefsPath, recordGitPin, recordRepoConsent } from "../git-source.js";
+import {
+  buildPinnedGitEntries,
+  discardBuild,
+  discardUnpinnedBuild,
+  GIT_LOCK_NAME,
+  gitRefsPath,
+  recordGitPin,
+  recordRepoConsent,
+} from "../git-source.js";
 import { parseRemoveArgs, runRemove } from "../local-add-cmd.js";
 import { localBundlesPath } from "../local-bundles.js";
-import { CONFIG_DIRNAME, gitBuildDir, gitBuiltPath, gitFailedPath, gitRoot, userConfigDir } from "../paths.js";
+import {
+  CONFIG_DIRNAME,
+  gitBuildDir,
+  gitBuiltPath,
+  gitFailedPath,
+  gitRoot,
+  sidecarsRoot,
+  userConfigDir,
+} from "../paths.js";
 import { backgroundInstallOptions } from "../sidecar-refresh.js";
 import { acquireSidecarsLock, parseSidecarsArgs, type RunNpmOptions, runSidecarsInstall } from "../sidecars-cmd.js";
 import { runTrust } from "../trust-cmd.js";
@@ -246,6 +262,109 @@ describe("sidecars install builds pinned git entries", () => {
     );
   }, 60_000);
 
+  it("Ctrl+C at a repo's consent prompt ends the run with exit 130: nothing built, no npm step, the lock released", async () => {
+    const repo = makeRepo(NPM_FILES);
+    const head = git(repo.work, ["rev-parse", "HEAD"]);
+    // An npx server too, so the sidecars lock is held across the git build and
+    // there is an npm half the cancel must not reach.
+    writeUserBundles(home, [
+      gitEntry(repo, "fx", head),
+      { namespace: "np", name: "np", type: "local", command: "npx", args: ["-y", "some-pkg@1.0.0"] },
+    ]);
+    const calls: string[][] = [];
+    const npm: string[][] = [];
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    stdout.resume();
+    // ETX, built from its code so no control byte sits in this source.
+    stdin.write(String.fromCharCode(3));
+    const res = await install({
+      isTTY: true,
+      io: { stdin, stdout, terminal: true },
+      runPm: fakePm(calls),
+      runNpm: async (args) => {
+        npm.push(args);
+        return 0;
+      },
+    });
+    expect(res.exitCode, err.join("")).toBe(130);
+    expect(out.join("")).toContain("This will run code from the repo on this machine:");
+    expect(err.join("")).toContain("yaw-mcp sidecars: Cancelled. Nothing more was built or installed.");
+    expect(calls).toEqual([]);
+    expect(npm).toEqual([]);
+    expect(existsSync(gitBuiltPath("fx", head, home))).toBe(false);
+    const release = acquireSidecarsLock(sidecarsRoot(home));
+    expect(release, "the cancel must release the sidecars lock").not.toBeNull();
+    release?.();
+  }, 120_000);
+
+  it("Ctrl+C at a later repo's consent prompt still lists the git entry that failed before it", async () => {
+    const repo = makeRepo(NPM_FILES);
+    const head = git(repo.work, ["rev-parse", "HEAD"]);
+    const other = makeRepo(NPM_FILES);
+    const otherHead = git(other.work, ["rev-parse", "HEAD"]);
+    writeUserBundles(home, [gitEntry(repo, "fx", head), gitEntry(other, "fy", otherHead)]);
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    // Enter consents to the first repo (whose build then fails), ETX leaves
+    // the second repo's prompt. Each keystroke is typed when its prompt shows:
+    // node:readline takes everything buffered on the first question, so both
+    // written upfront would leave the second prompt waiting forever.
+    let asked = 0;
+    stdout.on("data", (chunk: Buffer) => {
+      if (!chunk.toString().includes("Proceed?")) return;
+      asked++;
+      stdin.write(asked === 1 ? "\n" : String.fromCharCode(3));
+    });
+    const res = await install({
+      isTTY: true,
+      io: { stdin, stdout, terminal: true },
+      runPm: async (args, _cwd, opts) => {
+        if (args.includes("--version")) {
+          opts.output?.("10.9.0\n");
+          return 0;
+        }
+        return args.includes("build") ? 2 : 0;
+      },
+    });
+    expect(res.exitCode, err.join("")).toBe(130);
+    const text = out.join("");
+    expect(text).toContain("Git sources:");
+    expect(text).toMatch(new RegExp(`  fx  ${head.slice(0, 12)}  failed`));
+    expect(text).toMatch(new RegExp(`  fy  ${otherHead.slice(0, 12)}  cancelled`));
+    expect(err.join("")).toContain("yaw-mcp sidecars: Cancelled. Nothing more was built or installed.");
+  }, 120_000);
+
+  it("a cancelled consent stops the builder: the entries after it are not attempted", async () => {
+    const repo = makeRepo(NPM_FILES);
+    const head = git(repo.work, ["rev-parse", "HEAD"]);
+    const other = makeRepo(NPM_FILES);
+    const otherHead = git(other.work, ["rev-parse", "HEAD"]);
+    let asked = 0;
+    const reports = await buildPinnedGitEntries(
+      [gitEntry(repo, "fx", head), gitEntry(other, "fy", otherHead)] as Parameters<typeof buildPinnedGitEntries>[0],
+      {
+        home,
+        env: ENV,
+        interactive: true,
+        yes: false,
+        progress: () => {},
+        warn: () => {},
+        confirm: async () => {
+          asked++;
+          return "cancelled";
+        },
+        runPm: fakePm([]),
+      },
+      false,
+    );
+    expect(asked).toBe(1);
+    expect(reports).toEqual([
+      { namespace: "fx", commit: head, status: "cancelled", error: "Cancelled; nothing was built." },
+    ]);
+    expect(existsSync(gitBuiltPath("fx", head, home))).toBe(false);
+  }, 120_000);
+
   it("off a TTY asks for --yes once per repo, and a stored repo grant is enough", async () => {
     const repo = makeRepo(NPM_FILES);
     const head = git(repo.work, ["rev-parse", "HEAD"]);
@@ -422,6 +541,129 @@ describe("trust shows git sources and offers the build after a grant", () => {
     expect(calls).toEqual([]);
     expect(existsSync(gitBuildDir("fx", head, home))).toBe(false);
   }, 60_000);
+
+  // Both build prompts are [Y/n], where a bare Enter means yes. ^D (byte 4)
+  // came back from the reader as the same "" and so ran the repo's
+  // install/build scripts; it has to decline at each of them.
+  const typeAtTrustPrompts = async (typed: string, calls: string[][]) => {
+    const stdin = new PassThrough();
+    stdin.write(typed);
+    const stdout = new PassThrough();
+    stdout.on("data", () => {});
+    return trust({ isTTY: true, io: { stdin, stdout }, runPm: fakePm(calls) });
+  };
+  const EOT = String.fromCharCode(4);
+
+  it("^D at the 'Build it now? [Y/n]' prompt declines the build", async () => {
+    const repo = makeRepo(NPM_FILES);
+    const head = git(repo.work, ["rev-parse", "HEAD"]);
+    writeProject([gitEntry(repo, "fx", head)]);
+    const calls: string[][] = [];
+    const res = await typeAtTrustPrompts(`y\n${EOT}`, calls);
+    expect(res.exitCode).toBe(0);
+    expect(out.join("")).toContain("Not built. Build later with: yaw-mcp sidecars install");
+    expect(calls).toEqual([]);
+    expect(existsSync(gitBuiltPath("fx", head, home))).toBe(false);
+  }, 60_000);
+
+  it("^D at the repo-consent 'Proceed? [Y/n]' prompt is not consent", async () => {
+    const repo = makeRepo(NPM_FILES);
+    const head = git(repo.work, ["rev-parse", "HEAD"]);
+    writeProject([gitEntry(repo, "fx", head)]);
+    const calls: string[][] = [];
+    // y approves the file, a bare Enter takes the build offer, ^D leaves the
+    // consent prompt.
+    const res = await typeAtTrustPrompts(`y\n\n${EOT}`, calls);
+    expect(res.exitCode).toBe(1);
+    expect(out.join("")).toContain("This will run code from the repo on this machine:");
+    expect(calls).toEqual([]);
+    expect(existsSync(gitBuiltPath("fx", head, home))).toBe(false);
+  }, 60_000);
+
+  // ^C is the user leaving, not a decline: 130 at both [Y/n] prompts, as at
+  // the approval prompt. The approval typed before it stays recorded.
+  const ETX = String.fromCharCode(3);
+
+  it("^C at the 'Build it now? [Y/n]' prompt exits 130, keeps the approval and names the later build", async () => {
+    const repo = makeRepo(NPM_FILES);
+    const head = git(repo.work, ["rev-parse", "HEAD"]);
+    writeProject([gitEntry(repo, "fx", head)]);
+    const calls: string[][] = [];
+    const res = await typeAtTrustPrompts(`y\n${ETX}`, calls);
+    expect(res.exitCode).toBe(130);
+    expect(out.join("")).toContain(`Approved ${join(cwd, CONFIG_DIRNAME, "bundles.json")}`);
+    expect(err.join("")).toContain(
+      "yaw-mcp trust: Cancelled. The file is approved but not built; build it later with: yaw-mcp sidecars install",
+    );
+    expect(out.join("")).not.toContain("Not built.");
+    expect(calls).toEqual([]);
+    expect(existsSync(gitBuiltPath("fx", head, home))).toBe(false);
+    // Still approved: a second run has nothing to ask.
+    out = [];
+    expect((await trust({ isTTY: false })).exitCode).toBe(0);
+    expect(out.join("")).toContain("Already approved:");
+  }, 60_000);
+
+  it("^C at the repo-consent 'Proceed? [Y/n]' prompt exits 130 with the approval kept", async () => {
+    const repo = makeRepo(NPM_FILES);
+    const head = git(repo.work, ["rev-parse", "HEAD"]);
+    writeProject([gitEntry(repo, "fx", head)]);
+    const calls: string[][] = [];
+    const res = await typeAtTrustPrompts(`y\n\n${ETX}`, calls);
+    expect(res.exitCode).toBe(130);
+    expect(out.join("")).toContain("This will run code from the repo on this machine:");
+    expect(err.join("")).toContain(
+      "yaw-mcp trust: Cancelled. The file is approved; build it later with: yaw-mcp sidecars install",
+    );
+    expect(err.join("")).not.toContain("retry the build");
+    expect(calls).toEqual([]);
+    expect(existsSync(gitBuiltPath("fx", head, home))).toBe(false);
+  }, 60_000);
+
+  it("^C at a later repo's consent prompt still reports the build that failed before it, then exits 130", async () => {
+    const repo = makeRepo(NPM_FILES);
+    const head = git(repo.work, ["rev-parse", "HEAD"]);
+    const other = makeRepo(NPM_FILES);
+    const otherHead = git(other.work, ["rev-parse", "HEAD"]);
+    writeProject([gitEntry(repo, "fx", head), gitEntry(other, "fy", otherHead)]);
+    const stdin = new PassThrough();
+    // y approves, Enter takes the build offer, Enter consents to the first
+    // repo (whose build fails), ^C leaves the second repo's prompt.
+    stdin.write(`y\n\n\n${ETX}`);
+    const stdout = new PassThrough();
+    stdout.on("data", () => {});
+    const res = await trust({
+      isTTY: true,
+      io: { stdin, stdout },
+      runPm: async (args, _cwd, opts) => {
+        if (args.includes("--version")) {
+          opts.output?.("10.9.0\n");
+          return 0;
+        }
+        return args.includes("build") ? 2 : 0;
+      },
+    });
+    expect(res.exitCode, err.join("")).toBe(130);
+    const shown = err.join("");
+    const failedAt = shown.indexOf("yaw-mcp trust: ");
+    const cancelAt = shown.indexOf("yaw-mcp trust: Cancelled.");
+    expect(failedAt).toBeGreaterThanOrEqual(0);
+    expect(failedAt, "the failure is reported before the Cancelled line").toBeLessThan(cancelAt);
+    expect(shown.slice(failedAt, cancelAt)).toContain("fx");
+    expect(shown).toContain(
+      "yaw-mcp trust: Cancelled. The file is approved; build it later with: yaw-mcp sidecars install",
+    );
+    expect(existsSync(gitBuiltPath("fy", otherHead, home))).toBe(false);
+  }, 180_000);
+
+  it("a bare Enter at both [Y/n] prompts still builds (the control for the two ^D cases)", async () => {
+    const repo = makeRepo(NPM_FILES);
+    const head = git(repo.work, ["rev-parse", "HEAD"]);
+    writeProject([gitEntry(repo, "fx", head)]);
+    const res = await typeAtTrustPrompts("y\n\n\n", []);
+    expect(res.exitCode, err.join("")).toBe(0);
+    expect(existsSync(gitBuiltPath("fx", head, home))).toBe(true);
+  }, 120_000);
 
   it("shows a file:// entry's token as sent to nothing, with no approving-leaks line", async () => {
     const repo = makeRepo(NPM_FILES);
@@ -945,5 +1187,35 @@ describe("recordGitPin and the git lock", () => {
     const gone = await discardBuild("fx", COMMIT, home);
     expect(gone.ok).toBe(true);
     expect(existsSync(gitBuildDir("fx", COMMIT, home))).toBe(false);
+  });
+
+  it("leaves an unpinned build and its .built marker in place while the git lock is held, and says why", async () => {
+    // `add` cannot reach this branch in a test: its build takes the same lock
+    // and releases it before the refusal discards. Holding the lock here is
+    // another yaw-mcp mid-build; the discard must not delete under it.
+    mkdirSync(join(gitRoot(home), "fx"), { recursive: true });
+    const dir = gitBuildDir("fx", COMMIT, home);
+    fakeFinishedBuild(dir, COMMIT, { entry: "dist/index.js" });
+    expect(existsSync(gitBuiltPath("fx", COMMIT, home))).toBe(true);
+
+    const release = acquireSidecarsLock(gitRoot(home), GIT_LOCK_NAME);
+    expect(release).not.toBeNull();
+    try {
+      const held = await discardUnpinnedBuild("fx", COMMIT, home, { cwd: home, env: ENV });
+      expect(held.removed).toBe(false);
+      expect(held.reason).toBe(
+        `another yaw-mcp is building git sources (pid ${process.pid}); the build was left in place.`,
+      );
+      expect(existsSync(dir), "the build directory survives a held lock").toBe(true);
+      expect(existsSync(gitBuiltPath("fx", COMMIT, home)), "the .built marker survives a held lock").toBe(true);
+    } finally {
+      release?.();
+    }
+
+    // Once the lock frees, the same unpinned build goes.
+    const gone = await discardUnpinnedBuild("fx", COMMIT, home, { cwd: home, env: ENV });
+    expect(gone).toEqual({ removed: true });
+    expect(existsSync(dir)).toBe(false);
+    expect(existsSync(gitBuiltPath("fx", COMMIT, home))).toBe(false);
   });
 });

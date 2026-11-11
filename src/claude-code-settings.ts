@@ -30,8 +30,10 @@ import type { InstallScope } from "./install-target-model.js";
 import { addJsoncArrayElement, parseJsonc, removeJsoncArrayElements } from "./jsonc.js";
 
 /** Pattern added to Claude Code's `permissions.allow` on install so the
- *  user isn't re-prompted for each yaw-mcp MCP tool call. Only matters for
- *  Claude Code (Claude Desktop / Cursor / VS Code have their own models).
+ *  user isn't re-prompted for each yaw-mcp MCP tool call. It matters for every
+ *  row that declares `hooks.permissionsPatch: "claude-code"` -- Claude Code,
+ *  and typed, which reads the same settings.json (Claude Desktop / Cursor /
+ *  VS Code have their own models).
  *  Keep in sync with the tool-name prefix our proxy exposes -- Claude Code
  *  derives the prefix from ENTRY_NAME by replacing non-alphanumeric chars
  *  with underscores, so "mcp" becomes "mcp__mcp__". */

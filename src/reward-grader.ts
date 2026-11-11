@@ -197,25 +197,44 @@ export function parseGrade(text: string): number | null {
   }
 }
 
+/** A once-per-process "the client cannot be sampled" notice for ONE feature.
+ *  The grader below and sampling-rank.ts's routing tiebreak each hold their
+ *  own instance: the flag is per feature on purpose, because the two are
+ *  switched on by different env vars and a user who set both needs to be told
+ *  about both. `consequence` is the feature's half of the sentence -- which
+ *  setting is inert and what stands in its place. */
+export function createNoSamplingNotice(consequence: string): {
+  note(era?: ProtocolEra): void;
+  reset(): void;
+} {
+  let logged = false;
+  return {
+    note(era) {
+      if (logged) return;
+      logged = true;
+      log(
+        "info",
+        era === "modern"
+          ? `The client is on MCP 2026-07-28, where a server cannot ask it for sampling; ${consequence}`
+          : `Client does not advertise the sampling capability; ${consequence}`,
+      );
+    },
+    reset() {
+      logged = false;
+    },
+  };
+}
+
 /** Logged once per process, not per graded call: with the grader opted in
  *  and a client that does not advertise sampling, every uncertain outcome
  *  returns null here, and nothing else tells the user the opt-in is inert. */
-let noSamplingNoticeLogged = false;
+const graderNotice = createNoSamplingNotice("YAW_MCP_REWARD_GRADER has no effect and the heuristic reward stands");
 
-/** Test hook: let the one-time notice fire again. */
+/** Test hook: let the grader's one-time notice fire again. The routing
+ *  tiebreak's notice is a separate flag with its own hook of the same name in
+ *  sampling-rank.ts. */
 export function resetNoSamplingNotice(): void {
-  noSamplingNoticeLogged = false;
-}
-
-function noteNoSamplingCapability(era: ProtocolEra | undefined): void {
-  if (noSamplingNoticeLogged) return;
-  noSamplingNoticeLogged = true;
-  log(
-    "info",
-    era === "modern"
-      ? "The client is on MCP 2026-07-28, where a server cannot ask it for sampling; YAW_MCP_REWARD_GRADER has no effect and the heuristic reward stands"
-      : "Client does not advertise the sampling capability; YAW_MCP_REWARD_GRADER has no effect and the heuristic reward stands",
-  );
+  graderNotice.reset();
 }
 
 /** The slice of the downstream client a sampling helper uses. server.ts
@@ -237,7 +256,7 @@ export interface SamplingPeer {
 export async function gradeOutcomeViaSampling(server: SamplingPeer, ctx: GraderContext): Promise<number | null> {
   const caps = server.getClientCapabilities();
   if (server.era === "modern" || !caps?.sampling) {
-    noteNoSamplingCapability(server.era);
+    graderNotice.note(server.era);
     return null;
   }
 

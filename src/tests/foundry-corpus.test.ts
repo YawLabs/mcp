@@ -49,6 +49,30 @@ describe("parseTraceLines", () => {
     expect(traces).toHaveLength(2);
     expect(traces.map((t) => t.chosen)).toEqual(["github", "slack"]);
   });
+
+  it("reads `loaded` beside `chosen`, and accepts an old row that has no `loaded`", () => {
+    const text = [
+      // Rescued dispatch: the pick failed to start, a runner-up served it.
+      JSON.stringify({ tokens: ["issue"], chosen: "github", loaded: "gitlab", redactedCount: 0 }),
+      // Nothing loaded at all.
+      JSON.stringify({ tokens: ["issue"], chosen: "github", loaded: null, redactedCount: 0 }),
+      // A row harvested before `loaded` existed.
+      JSON.stringify({ tokens: ["issue"], chosen: "github", redactedCount: 0 }),
+      // A garbage `loaded` costs the field, not the row.
+      JSON.stringify({ tokens: ["issue"], chosen: "github", loaded: 7 }),
+    ].join("\n");
+    const traces = parseTraceLines(text);
+    expect(traces).toHaveLength(4);
+    expect(traces.map((t) => t.chosen)).toEqual(["github", "github", "github", "github"]);
+    expect(traces[0].loaded).toBe("gitlab");
+    expect(traces[1].loaded).toBeNull();
+    expect(traces[2]).not.toHaveProperty("loaded");
+    expect(traces[3]).not.toHaveProperty("loaded");
+    // The corpus folds on `chosen` whatever `loaded` says: all four rows are
+    // the same entry.
+    const c = buildCorpusFromTraces(traces, SERVERS);
+    expect(c.entries).toEqual([{ tokens: ["issue"], chosen: "github", weight: 4 }]);
+  });
 });
 
 describe("buildCorpusFromTraces", () => {

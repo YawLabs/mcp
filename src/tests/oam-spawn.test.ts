@@ -12,6 +12,7 @@ import {
   isOamCommand,
   isOamLaunch,
   isRegistrySpec,
+  launcherBasename,
   MIN_OAM_VERSION,
   managedNodeBin,
   nodeLaunchKind,
@@ -229,6 +230,15 @@ describe("parseOamVersion", () => {
   });
   it("returns null when no version is present", () => {
     expect(parseOamVersion("oam dev build")).toBeNull();
+  });
+  it("agrees with compareVersions on where a prerelease ends (one grammar, not three)", () => {
+    // The comparing parser used to carry its own looser prerelease class, which
+    // read "rc..1" as the identifiers rc, "" and 1 -- ranking it ABOVE the
+    // "rc" this function extracts from the same text.
+    expect(parseOamVersion("oam 1.2.3-rc..1")).toBe("1.2.3-rc");
+    expect(compareVersions("1.2.3-rc..1", "1.2.3-rc")).toBe(0);
+    // Still a leading parse: text after the version does not unparse it.
+    expect(compareVersions("1.2.4 (abc123)", "1.2.3")).toBeGreaterThan(0);
   });
   it("keeps a prerelease suffix, which an x.y.z-only capture silently dropped", () => {
     // Dropping it went wrong twice at once: the rc compared EQUAL to a 0.8.3
@@ -804,6 +814,24 @@ describe("nodeLaunchKind", () => {
   });
 });
 
+// The basename half of nodeLaunchKind, exported so uvLaunchKind (and any other
+// launcher match) strips the same extensions.
+describe("launcherBasename", () => {
+  it("takes the basename through either separator, drops exe/cmd/bat, lowercases", () => {
+    expect(launcherBasename("node")).toBe("node");
+    expect(launcherBasename("/usr/local/bin/Node")).toBe("node");
+    expect(launcherBasename(String.raw`C:\Program Files\nodejs\NODE.EXE`)).toBe("node");
+    expect(launcherBasename("UVX.CMD")).toBe("uvx");
+    expect(launcherBasename("run.Bat")).toBe("run");
+  });
+
+  it("leaves any other extension, .ps1 included, and strips only the last one", () => {
+    expect(launcherBasename("tool.ps1")).toBe("tool.ps1");
+    expect(launcherBasename("server.js")).toBe("server.js");
+    expect(launcherBasename("node.exe.exe")).toBe("node.exe");
+  });
+});
+
 describe("rewriteForOam", () => {
   const oam = { oamBin: "oam", resolveEntry: (p: string) => `/pkgs/${p}/dist/index.js` };
   /** An oam whose only on-disk copy of any package declares `version`, which is
@@ -1213,9 +1241,12 @@ describe("rewriteNpmToManagedNode", () => {
   it("does not claim an npx fallback for a non-npx launch when no node bin is located", () => {
     // The launch kind is checked before nodeBin: a docker command with no
     // locatable node used to log "staying on npx" for a launch that was never
-    // npx. logger.ts resolves LOG_LEVEL per call, so raising it here is enough.
+    // npx. logger.ts resolves the level per call, so raising LOG_LEVEL here is
+    // enough once YAW_MCP_LOG_LEVEL, which wins over it, is cleared too.
     const prior = process.env.LOG_LEVEL;
+    const priorYaw = process.env.YAW_MCP_LOG_LEVEL;
     process.env.LOG_LEVEL = "debug";
+    delete process.env.YAW_MCP_LOG_LEVEL;
     const chunks: string[] = [];
     const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown): boolean => {
       chunks.push(String(chunk));
@@ -1235,6 +1266,7 @@ describe("rewriteNpmToManagedNode", () => {
       spy.mockRestore();
       if (prior === undefined) delete process.env.LOG_LEVEL;
       else process.env.LOG_LEVEL = prior;
+      if (priorYaw !== undefined) process.env.YAW_MCP_LOG_LEVEL = priorYaw;
     }
   });
 
@@ -1367,7 +1399,7 @@ describe("resolveManagedSpawn entry memo", () => {
     resetManagedEntryMemo();
   });
 
-  it("memoizes a stable managed-tree hit: the entry survives deleting the copy", () => {
+  it("memoizes a stable managed-tree hit: a memo hit on an existing file does not rescan", () => {
     const { managedRoot, brokerUrl, cleanup } = fixture();
     const pkgDir = join(managedRoot, "some-mcp");
     writePkg(pkgDir, { name: "some-mcp", version: "1.0.0", bin: { "some-mcp": "dist/index.js" } });
@@ -1375,10 +1407,32 @@ describe("resolveManagedSpawn entry memo", () => {
     const spawn = spawnWith(brokerUrl, managedRoot);
     try {
       expect(spawn(["-y", "some-mcp"])).toEqual({ command: NODE, args: [entry] });
-      // The memo is the only thing that can answer the second call: the disk
-      // copy is gone, and a miss would fall through to npx.
-      rmSync(pkgDir, { recursive: true, force: true });
+      // Repoint the bin at a new file while the memoized one stays on disk: a
+      // rescan would answer dist/other.js, so only the memo answers dist/index.js.
+      writePkg(pkgDir, { name: "some-mcp", version: "1.0.0", bin: { "some-mcp": "dist/other.js" } });
       expect(spawn(["-y", "some-mcp"])).toEqual({ command: NODE, args: [entry] });
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("drops a memo hit whose file was deleted and rescans instead of booting the dead path", () => {
+    const { npx, managedRoot, brokerUrl, cleanup } = fixture();
+    const pkgDir = join(managedRoot, "some-mcp");
+    writePkg(pkgDir, { name: "some-mcp", version: "1.0.0", bin: { "some-mcp": "dist/index.js" } });
+    const spawn = spawnWith(brokerUrl, managedRoot);
+    try {
+      expect(spawn(["-y", "some-mcp"])).toEqual({ command: NODE, args: [join(pkgDir, "dist", "index.js")] });
+      // The managed copy is uninstalled while the broker runs; an npx-cache
+      // copy is still there. The rescan finds it rather than returning the
+      // memoized dead path.
+      rmSync(pkgDir, { recursive: true, force: true });
+      const cacheDir = join(npx, "bbb", "node_modules", "some-mcp");
+      writePkg(cacheDir, { name: "some-mcp", version: "1.0.0", bin: { "some-mcp": "dist/index.js" } });
+      expect(spawn(["-y", "some-mcp"])).toEqual({ command: NODE, args: [join(cacheDir, "dist", "index.js")] });
+      // With no copy left at all, the launch stays on npx.
+      rmSync(cacheDir, { recursive: true, force: true });
+      expect(spawn(["-y", "some-mcp"])).toEqual({ command: "npx", args: ["-y", "some-mcp"] });
     } finally {
       cleanup();
     }
@@ -1438,6 +1492,36 @@ describe("resolveManagedSpawn entry memo", () => {
         args: [join(managedRoot, "some-mcp", "dist", "index.js")],
       });
       expect(spawn(["-y", "some-mcp@2.0.0"])).toEqual({ command: "npx", args: ["-y", "some-mcp@2.0.0"] });
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("an exact pin is not satisfied by a copy whose declared version merely STARTS with it", () => {
+    // The pin comparison used a parser anchored only at the start, so a
+    // declared "1.0.0 anything" compared equal to a pinned 1.0.0 and the copy
+    // was hosted as the requested build. A declared version that is not a
+    // version as a whole proves nothing; it falls to string equality, fails,
+    // and the launch stays on npx.
+    const { managedRoot, brokerUrl, cleanup } = fixture();
+    writePkg(join(managedRoot, "some-mcp"), {
+      name: "some-mcp",
+      version: "1.0.0 local-patch",
+      bin: { "some-mcp": "dist/index.js" },
+    });
+    writePkg(join(managedRoot, "other-mcp"), {
+      name: "other-mcp",
+      version: "1.0.0+build.7",
+      bin: { "other-mcp": "dist/index.js" },
+    });
+    const spawn = spawnWith(brokerUrl, managedRoot);
+    try {
+      expect(spawn(["-y", "some-mcp@1.0.0"])).toEqual({ command: "npx", args: ["-y", "some-mcp@1.0.0"] });
+      // Build metadata still carries no precedence: a whole, valid version.
+      expect(spawn(["-y", "other-mcp@1.0.0"])).toEqual({
+        command: NODE,
+        args: [join(managedRoot, "other-mcp", "dist", "index.js")],
+      });
     } finally {
       cleanup();
     }
@@ -3106,6 +3190,44 @@ describe("resolveOamSpawn -- unavailable-oam warning", () => {
     expect(warnings).toHaveLength(1);
     expect(warnings[0]).toContain(oamFailureLabel("timeout"));
     expect(warnings[0]).not.toContain(oamFailureLabel("spawn"));
+  });
+
+  it("warns again when a lapsed timeout is followed by a DIFFERENT reason, and not for a repeat", async () => {
+    // A timeout is the one verdict that lapses, so it is the one case where
+    // the reason can change inside a process. A single once-per-process flag
+    // spent on the timeout warn swallowed the line for what the re-probe then
+    // found -- here an absent oam, whose fix (install it) is the opposite of
+    // the timeout's (nothing, or OAM_BIN).
+    vi.useFakeTimers();
+    try {
+      const timeout = async (): Promise<string> => {
+        const e: NodeJS.ErrnoException = new Error("oam --version exceeded 10000ms");
+        e.code = "ETIMEDOUT";
+        throw e;
+      };
+      await probeOam(timeout);
+      const lines = captureStderrLines();
+      const optInWarns = () => lines.filter((l) => l.includes("a server opted in to oam but"));
+      await resolveOamSpawn("node", ["a.js"]);
+      expect(optInWarns()).toHaveLength(1);
+
+      // The verdict lapses and the re-probe times out again: same reason, no
+      // second line.
+      vi.setSystemTime(Date.now() + OAM_PROBE_TIMEOUT_RECHECK_MS);
+      await probeOam(timeout);
+      await resolveOamSpawn("node", ["b.js"]);
+      expect(optInWarns()).toHaveLength(1);
+
+      // It lapses again and this time oam is gone.
+      vi.setSystemTime(Date.now() + OAM_PROBE_TIMEOUT_RECHECK_MS);
+      await primeAbsent();
+      await resolveOamSpawn("node", ["c.js"]);
+      await resolveOamSpawn("node", ["d.js"]);
+      expect(optInWarns()).toHaveLength(2);
+      expect(optInWarns()[1]).toContain("oam is not installed");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("stays silent for a below-min install, which warns in the probe instead", async () => {

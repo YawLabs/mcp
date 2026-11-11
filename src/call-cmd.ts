@@ -40,7 +40,9 @@
 // itself, go to stderr and DO get their control bytes neutered (upstream tool
 // names and upstream error text included: see every displaySafe below).
 // Anything the caller needs to branch on is in the exit code, never in the
-// text.
+// text. The one exception to "stdout is the result" is a --json FAILURE: then
+// stdout carries one {ok:false,error,exitCode} document (see fail() in
+// callOnce), so a script parsing stdout never reads zero bytes as an answer.
 //
 // A CONSUMER THAT LEAVES EARLY IS NORMAL. `yaw-mcp call ... | head -1` closes
 // stdout mid-answer. The remaining output is dropped and the exit code stands:
@@ -53,7 +55,11 @@
 //   0  the tool ran and returned a result
 //   1  the call did not produce one -- unknown server or tool, the connect
 //      failed, the transport errored -- or the tool answered with isError
-//   2  usage error, or a policy gate refused before anything was spawned
+//   2  usage error, or a policy gate refused. Every gate but one answers
+//      before anything is spawned; the exception is a `blockedTools` deny
+//      that only matches once the server's real tool list is known (a tool
+//      whose own name embeds the namespace), which refuses after the connect
+//      and before the tool is called
 
 import { homedir } from "node:os";
 import { loadYawMcpConfig, toProfile } from "./config-loader.js";
@@ -72,7 +78,7 @@ import {
 import { TransientConnectError, withTransientUpstream } from "./transient-upstream.js";
 import { displaySafe } from "./trust-cmd.js";
 import type { UpstreamConnection, UpstreamServerConfig } from "./types.js";
-import { resolveTimeoutEnv } from "./upstream.js";
+import { resolveTimeoutEnv, shellActivationMessage } from "./upstream.js";
 
 export const CALL_USAGE = `Usage: yaw-mcp call <namespace> <tool> [<json>] [flags]
 
@@ -96,7 +102,10 @@ Flags:
                    rather than fighting your shell's quoting.
   --json           Print the raw MCP result envelope instead of its text
                    content -- structuredContent, isError and non-text blocks
-                   included.
+                   included. When the call fails (any exit 1 or 2 that is
+                   not the tool's own isError answer) stdout is instead one
+                   {"ok":false,"error":...,"exitCode":...} document; the
+                   message is also on stderr.
 
 Exit codes:
   0  the tool ran and returned a result
@@ -105,8 +114,10 @@ Exit codes:
   2  a usage error, or your config refuses this call
 
   The same policy a proxied call gets applies here: a disabled server, one your
-  project profile blocks, one below YAW_MCP_MIN_COMPLIANCE, and any tool on the
-  \`blockedTools\` deny list are all refused -- before the server is spawned.`;
+  project profile blocks and one below YAW_MCP_MIN_COMPLIANCE are refused before
+  the server is spawned, and a tool on the \`blockedTools\` deny list is refused
+  before it is called (also before the spawn, unless the deny only matches the
+  tool's name as the server itself lists it).`;
 
 /** Default bound on the single tools/call this command makes, under the same
  *  operator knob the proxy's calls use (MCP_CALL_TIMEOUT, the SDK's 60s). The
@@ -274,6 +285,15 @@ function renderContentBlock(block: { type?: unknown; text?: unknown }): string {
   return `[${displaySafe(type)} content -- re-run with --json to see it]`;
 }
 
+/** The --json failure document: `{ok:false,error,exitCode}`, pretty-printed
+ *  like the one `add` (local-add-cmd.ts) and index.ts's argv-error tail
+ *  print, so a script reads every failure of the commands that take --json
+ *  the same way. `error` is the stderr line, `yaw-mcp call:` prefix included,
+ *  as `add`'s is. */
+function jsonFailure(error: string, exitCode: number): string {
+  return JSON.stringify({ ok: false, error, exitCode }, null, 2);
+}
+
 export async function runCall(opts: CallCommandOptions): Promise<CallCommandResult> {
   // Guarded writers, not bare `stream.write`. A script consuming this command
   // is entitled to stop reading -- `yaw-mcp call ... | head -1` is the shape
@@ -284,10 +304,45 @@ export async function runCall(opts: CallCommandOptions): Promise<CallCommandResu
   // error"). createStreamWriter drops the rest of the output instead, so the
   // teardown runs and the exit code stays the one this command computed. See
   // logger.ts for why a try/catch alone does not cover it.
-  const out = opts.out ?? createStreamWriter(process.stdout);
+  const rawOut = opts.out ?? createStreamWriter(process.stdout);
   const err = opts.err ?? createStreamWriter(process.stderr);
+  // Whether stdout has carried anything yet. Under --json a failure prints
+  // ONE {ok:false} document; a rejection that escapes after the result (or a
+  // failure document) is already out must not add a second.
+  let stdoutUsed = false;
+  const out = (s: string): void => {
+    stdoutUsed = true;
+    rawOut(s);
+  };
+  try {
+    return await callOnce(opts, out, err);
+  } catch (e) {
+    // A bug here rather than an upstream problem (see the end of callOnce).
+    // The dispatcher prints `yaw-mcp call: <message>` on stderr and exits 1;
+    // under --json stdout gets the matching document first.
+    if (opts.json && !stdoutUsed) {
+      out(`${jsonFailure(`yaw-mcp call: ${e instanceof Error ? e.message : String(e)}`, 1)}\n`);
+    }
+    throw e;
+  }
+}
+
+async function callOnce(
+  opts: CallCommandOptions,
+  out: (s: string) => void,
+  err: (s: string) => void,
+): Promise<CallCommandResult> {
   const print = (s = ""): void => out(`${s}\n`);
   const printErr = (s: string): void => err(`${s}\n`);
+  // Every failure that is not the tool's own answer: the human line on stderr
+  // (unchanged with or without --json), and under --json ONE {ok:false}
+  // document on stdout, which carries nothing else on these paths. `detail`
+  // is stderr-only text after the line (the usage body).
+  const fail = (exitCode: number, message: string, detail?: string): CallCommandResult => {
+    if (opts.json) print(jsonFailure(message, exitCode));
+    printErr(detail === undefined ? message : `${message}\n${detail}`);
+    return { exitCode };
+  };
   // Resolved per call, from the env this call was handed (see the constant's
   // note above). `opts.env` undefined means the resolver's own process.env
   // default, which is what the CLI path gets.
@@ -298,8 +353,7 @@ export async function runCall(opts: CallCommandOptions): Promise<CallCommandResu
   if (!namespace || !toolArg) {
     // Unreachable from the CLI (parseCallArgs requires both), so this only
     // catches a programmatic caller. Exit 2 matches the parse layer.
-    printErr(`yaw-mcp call: <namespace> and <tool> are both required.\n${CALL_USAGE}`);
-    return { exitCode: 2 };
+    return fail(2, "yaw-mcp call: <namespace> and <tool> are both required.", CALL_USAGE);
   }
 
   const home = opts.home ?? homedir();
@@ -314,15 +368,11 @@ export async function runCall(opts: CallCommandOptions): Promise<CallCommandResu
     try {
       argsText = await readAll(opts.stdin ?? process.stdin);
     } catch (e) {
-      printErr(`yaw-mcp call: could not read the arguments from stdin (${(e as Error).message}).`);
-      return { exitCode: 2 };
+      return fail(2, `yaw-mcp call: could not read the arguments from stdin (${(e as Error).message}).`);
     }
   }
   const parsedArgs = parseArgumentsObject(argsText);
-  if (!parsedArgs.ok) {
-    printErr(parsedArgs.error);
-    return { exitCode: 2 };
-  }
+  if (!parsedArgs.ok) return fail(2, parsedArgs.error);
 
   const loaded = await loadLocalBundles({ home, cwd, env });
   // Same posture as `list` and `audit`: a malformed entry the loader skipped
@@ -338,10 +388,10 @@ export async function runCall(opts: CallCommandOptions): Promise<CallCommandResu
       3,
     );
     const hint = suggestions.length > 0 ? ` Did you mean: ${suggestions.join(", ")}?` : "";
-    printErr(
+    return fail(
+      1,
       `yaw-mcp call: no server named "${displaySafe(namespace)}" in your bundles.json.${hint} Run \`yaw-mcp list\` to see what is configured.`,
     );
-    return { exitCode: 1 };
   }
 
   // Two independent reads, issued together: neither needs the other's result.
@@ -380,16 +430,13 @@ export async function runCall(opts: CallCommandOptions): Promise<CallCommandResu
     // The CLI's rendering of the shared verdict. The remediation is what
     // differs from the broker's wording: there is no mcp_connect_* call to
     // wait for out here, so the fix is named as the command that makes it.
+    let message: string;
     switch (refusal.kind) {
       case "disabled":
-        printErr(
-          `yaw-mcp call: "${refusal.namespace}" is configured but disabled, so it was not started. Run \`yaw-mcp enable ${refusal.namespace}\` to turn it back on.`,
-        );
+        message = `yaw-mcp call: "${refusal.namespace}" is configured but disabled, so it was not started. Run \`yaw-mcp enable ${refusal.namespace}\` to turn it back on.`;
         break;
       case "profile":
-        printErr(
-          `yaw-mcp call: "${refusal.namespace}" is not allowed by the project profile at ${displaySafe(refusal.profilePath ?? "your yaw-mcp config")}, so it was not started.`,
-        );
+        message = `yaw-mcp call: "${refusal.namespace}" is not allowed by the project profile at ${displaySafe(refusal.profilePath ?? "your yaw-mcp config")}, so it was not started.`;
         break;
       case "compliance":
         // displaySafe around the whole reason, not around the grade: the
@@ -398,14 +445,12 @@ export async function runCall(opts: CallCommandOptions): Promise<CallCommandResu
         // load, never checked against A-F -- so an unrecognized one is echoed
         // back verbatim. Quoting the sentence is the only lever this caller
         // has, and it fires only when a control byte is actually present.
-        printErr(
-          `yaw-mcp call: refusing to start "${refusal.namespace}": ${displaySafe(
-            complianceRefusalReason(refusal.grade, refusal.min),
-          )}. Unset YAW_MCP_MIN_COMPLIANCE (or lower it) to override.`,
-        );
+        message = `yaw-mcp call: refusing to start "${refusal.namespace}": ${displaySafe(
+          complianceRefusalReason(refusal.grade, refusal.min),
+        )}. Unset YAW_MCP_MIN_COMPLIANCE (or lower it) to override.`;
         break;
     }
-    return { exitCode: 2 };
+    return fail(2, message);
   }
 
   // The deny list, checked BEFORE the spawn. The wire name is
@@ -421,12 +466,12 @@ export async function runCall(opts: CallCommandOptions): Promise<CallCommandResu
   // (a server whose own tool is genuinely called `gh_search`).
   const preSpawnWire = `${namespace}_${normalizeToolName(namespace, toolArg)}`;
   if (isToolDenied(preSpawnWire, profile?.blockedTools)) {
-    printErr(
+    return fail(
+      2,
       `yaw-mcp call: tool "${displaySafe(preSpawnWire)}" is blocked by the "blockedTools" list in ${displaySafe(
         blockedToolsSource(profile),
       )}. Nothing was started.`,
     );
-    return { exitCode: 2 };
   }
 
   const connect: ConnectSeam = opts.connect ?? ((config, use) => withTransientUpstream(config, use));
@@ -449,8 +494,7 @@ export async function runCall(opts: CallCommandOptions): Promise<CallCommandResu
         // that reach the terminal -- an erase-line escape in a tool name
         // rewrites the diagnostic yaw-mcp had just drawn. The header two
         // screens up promises the opposite for everything on stderr.
-        printErr(`yaw-mcp call: ${displaySafe(formatToolNotFound(graded, toolName, connection.tools))}`);
-        return { exitCode: 1 };
+        return fail(1, `yaw-mcp call: ${displaySafe(formatToolNotFound(graded, toolName, connection.tools))}`);
       }
       // The deny, again, against the name that was actually resolved. The
       // pre-spawn check above cannot see the tool list, so this is the one
@@ -461,12 +505,12 @@ export async function runCall(opts: CallCommandOptions): Promise<CallCommandResu
         // server advertised>`, and a wildcard deny matches one carrying
         // control bytes even though a literal entry could not (TOOL_ENTRY_RE
         // in config-loader.ts refuses those).
-        printErr(
+        return fail(
+          2,
           `yaw-mcp call: tool "${displaySafe(tool.namespacedName)}" is blocked by the "blockedTools" list in ${displaySafe(
             blockedToolsSource(profile),
           )}.`,
         );
-        return { exitCode: 2 };
       }
 
       let result: { content?: unknown; isError?: unknown; structuredContent?: unknown };
@@ -486,11 +530,16 @@ export async function runCall(opts: CallCommandOptions): Promise<CallCommandResu
         // server answering.
         // Both halves are the upstream's: the name it advertised, and the
         // JSON-RPC error text it chose.
-        printErr(`yaw-mcp call: ${displaySafe(tool.namespacedName)} failed: ${displaySafe((e as Error).message)}`);
-        return { exitCode: 1 };
+        return fail(
+          1,
+          `yaw-mcp call: ${displaySafe(tool.namespacedName)} failed: ${displaySafe((e as Error).message)}`,
+        );
       }
 
       if (opts.json) {
+        // The raw envelope, success and isError alike: an isError answer is
+        // the server's own reply, not one of the failures fail() documents,
+        // so it gets no {ok:false} document beside it.
         print(JSON.stringify(result));
       } else {
         const blocks = Array.isArray(result.content) ? result.content : [];
@@ -519,12 +568,21 @@ export async function runCall(opts: CallCommandOptions): Promise<CallCommandResu
       // server that fails to boot gets to write bytes onto this line. The
       // namespace is quoted too, for the same reason it is at the unknown-
       // server branch above -- it is an argument this process was handed.
-      printErr(`yaw-mcp call: Could not connect to "${displaySafe(namespace)}": ${displaySafe(e.message)}`);
-      return { exitCode: 1 };
+      //
+      // shellActivationMessage, not e.message: an ActivationError that carries
+      // a config pointer ends "then activate it again", which is the wording
+      // for an MCP session. There is nothing to activate from a shell, so the
+      // helper swaps in "then run the command again."; any other cause (a
+      // locked vault, a pointer-less failure) comes back as its own message.
+      return fail(
+        1,
+        `yaw-mcp call: Could not connect to "${displaySafe(namespace)}": ${displaySafe(shellActivationMessage(e.cause))}`,
+      );
     }
     // Anything else escaping the body is a bug here rather than an upstream
     // problem, and reporting it as "could not connect" would send the user to
-    // check a server that started perfectly well.
+    // check a server that started perfectly well. runCall writes the --json
+    // document for it on the way out.
     throw e;
   }
 }

@@ -37,8 +37,21 @@ describe("classifyError", () => {
       'MCP error -32602: Input validation error: Invalid arguments for tool http_get: [{"expected":"number","code":"invalid_type","path":["timeout"]}]',
       "validation_error",
     ],
+    // Kebab-case is the shape \b does NOT cover (`-` is a non-word char): a
+    // flag in a usage line, a key in a config dump and a header name in prose
+    // all read as a timeout from a successful reply, and reward.ts then banked
+    // the call at 0.2.
+    [
+      "hyphenated flag in a usage line is not a timeout",
+      "usage: tool [--timeout SECONDS] [--retries N]",
+      "upstream_error",
+    ],
+    ["hyphenated config key is not a timeout", "connect-timeout: 30s (default)", "upstream_error"],
+    ["hyphenated header name is not a timeout", "The request-timeout header was set to 30", "upstream_error"],
+    ["hyphen on the trailing side is not a timeout", "set timeout-ms to 5000 in the config", "upstream_error"],
     // ...and the tightening must not lose an unquoted prose timeout.
     ["unquoted prose timeout still classifies", "Error: gateway timeout while contacting upstream", "timeout"],
+    ["a spaced dash before the word is still prose", "request failed - timeout after 30s", "timeout"],
     [
       "zod validation -32602 with missing array",
       'MCP error -32602: Input validation error: Invalid arguments for tool aws_metrics_query: [{"expected":"array","code":"invalid_type","path":["queries"]}]',
@@ -243,8 +256,9 @@ describe("classifyError", () => {
   it("does not backtrack quadratically on a long run of intro/bridge tokens", () => {
     // "status" used to sit in BOTH the intro and the bridge alternation, so
     // a whitespace-separated run of it re-entered the bridge from every
-    // intro position: 11 s on a 98 KB reply (measured). Every proxied
-    // result is classified by reward.ts, so this must stay linear-ish.
+    // intro position: 11 s on a 98 KB reply (measured). reward.ts now hands
+    // classifyError only a 1000-char head, but the function is exported and
+    // takes any length, so this must stay linear-ish.
     //
     // The suffix keeps the tripwire honest: classifyError now short-circuits
     // each status regex on `t.includes("<code>")`, so a digit-free body

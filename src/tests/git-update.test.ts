@@ -15,6 +15,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import { PassThrough } from "node:stream";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   buildGitSource,
@@ -352,12 +353,13 @@ describe("update moves a branch forward", () => {
     expect(existsSync(join(dir, "dist", "index.js"))).toBe(true);
   }, 120_000);
 
-  it("--json reports a new build that did not start, with the reason; the start check runs yaw-mcp's node", async () => {
+  it("a new build that fails its start check is NOT pinned: --json ok false, exit 1, the old build kept; yaw-mcp's node runs the check", async () => {
     const repo = makeRepo(NPM_FILES);
     const old = git(repo.work, ["rev-parse", "HEAD"]);
     await buildAt(repo, old);
     await recordRepoConsent(repo.url, home);
     writeUser(bundlesText(repo.url, old));
+    const before = readFileSync(userFile(), "utf8");
     const next = repo.commit({ "README.md": "v2\n" });
     const commands: string[] = [];
     const r = await update(["fx", "--json"], {
@@ -366,16 +368,248 @@ describe("update moves a branch forward", () => {
         return { ok: false, error: "vault locked: the passphrase does not unlock the vault" };
       },
     });
-    expect(r.exitCode, err.join("")).toBe(0);
+    expect(r.exitCode, err.join("")).toBe(1);
     expect(commands).toEqual([process.execPath]);
     const doc = JSON.parse(out.join(""));
+    expect(doc.ok).toBe(false);
     expect(doc.entries[0]).toMatchObject({
-      status: "updated",
-      to: next,
+      status: "failed",
+      from: old,
+      to: null,
       started: false,
       startError: "vault locked: the passphrase does not unlock the vault",
     });
+    expect(doc.entries[0].error).toContain(`${next.slice(0, 7)} built but did not start`);
+    expect(doc.entries[0].error).toContain(`Nothing was changed: "fx" stays on ${old.slice(0, 7)}`);
+    expect(doc.entries[0].error).toContain("yaw-mcp update fx --no-start-check");
+    // Not one byte written; the working build is still pinned and on disk,
+    // and the new one is kept for a re-run to reuse.
+    expect(readFileSync(userFile(), "utf8")).toBe(before);
+    expect(existsSync(gitBuiltPath("fx", old, home))).toBe(true);
+    expect(existsSync(gitBuiltPath("fx", next, home))).toBe(true);
+    // refs.json names the pin the file still holds, not the build it refused.
+    expect(Object.values(JSON.parse(readFileSync(gitRefsPath("fx", home), "utf8")))).toEqual([old]);
+    expect(readGitState(home).fx).toMatchObject({ pinned: old, remote: next });
+
+    // Once the cause is fixed a re-run takes the kept build without building.
+    out = [];
+    err = [];
+    calls.length = 0;
+    const again = await update(["fx"]);
+    expect(again.exitCode, err.join("")).toBe(0);
+    expect(pinned().commit).toBe(next);
+    expect(calls).toEqual([]);
+  }, 180_000);
+
+  it("prints the start failure and the remedy, with --ref carried into the re-run", async () => {
+    const repo = makeRepo(NPM_FILES);
+    const old = git(repo.work, ["rev-parse", "HEAD"]);
+    await buildAt(repo, old);
+    await recordRepoConsent(repo.url, home);
+    writeUser(bundlesText(repo.url, old));
+    const next = repo.commit({ "README.md": "v2\n" });
+    git(repo.work, ["push", "-q", "origin", "HEAD:refs/heads/next"]);
+    const r = await update(["fx", "--ref", "next"], {
+      startCheck: async () => ({ ok: false, error: "exited with code 1" }),
+    });
+    expect(r.exitCode).toBe(1);
+    expect(pinned()).toMatchObject({ commit: old, ref: "main" });
+    const shown = err.join("");
+    expect(shown).toContain(`yaw-mcp update: fx: ${next.slice(0, 7)} built but did not start: exited with code 1`);
+    expect(shown).toContain("yaw-mcp update fx --ref next --no-start-check");
+    expect(out.join("")).not.toContain("Updated");
   }, 120_000);
+
+  it("a --ref change on the same commit whose pinned build fails the check is WRITTEN, and still fails: exit 1, ok false, the message says both", async () => {
+    const repo = makeRepo(NPM_FILES);
+    const old = git(repo.work, ["rev-parse", "HEAD"]);
+    await buildAt(repo, old);
+    await recordRepoConsent(repo.url, home);
+    // Another kept build on disk, so the remedy can name it.
+    const other = repo.commit({ "README.md": "other\n" });
+    await buildAt(repo, other);
+    // A kept build made from another repository URL: `--to` refuses it, so
+    // the remedy must not offer it.
+    const foreign = "fedcba9876543210fedcba9876543210fedcba98";
+    fakeFinishedBuild(gitBuildDir("fx", foreign, home), foreign, {
+      marker: { url: "https://github.com/acme/other.git" },
+    });
+    git(repo.work, ["push", "-q", "--force", "origin", `${old}:refs/heads/main`]);
+    writeUser(bundlesText(repo.url, old));
+    // `next` points at the commit already pinned: the commit does not move.
+    git(repo.work, ["push", "-q", "origin", `${old}:refs/heads/next`]);
+    const r = await update(["fx", "--ref", "next", "--json"], {
+      startCheck: async () => ({ ok: false, error: "exited with code 1" }),
+    });
+    expect(r.exitCode).toBe(1);
+    const doc = JSON.parse(out.join(""));
+    expect(doc.ok).toBe(false);
+    expect(doc.entries[0]).toMatchObject({
+      status: "failed",
+      from: old,
+      to: old,
+      ref: "next",
+      started: false,
+      startError: "exited with code 1",
+    });
+    const error: string = doc.entries[0].error;
+    expect(error).toContain(`the pinned build ${old.slice(0, 7)} itself does not start: exited with code 1`);
+    expect(error).toContain('The change was written to bundles.json anyway ("fx" now tracks next)');
+    expect(error).toContain('the commit did not move, so "fx" still does not start.');
+    expect(error).toContain(`yaw-mcp update fx --to <sha> (kept: ${other.slice(0, 7)})`);
+    expect(error).not.toContain("not written");
+    expect(error).not.toContain("--no-start-check");
+    expect(error).not.toContain("keeps running");
+    // The ref change is in the file, the pin did not move, comments survive.
+    expect(pinned()).toMatchObject({ commit: old, ref: "next" });
+    const text = readFileSync(userFile(), "utf8");
+    expect(text).toContain("// hand-written: keep me");
+    expect(text).toContain("/* the git block */");
+    expect(Object.values(JSON.parse(readFileSync(gitRefsPath("fx", home), "utf8")))).toEqual([old]);
+    // The human line on stderr carries the same truth.
+    expect(err.join("")).toContain("yaw-mcp update: fx: the pinned build");
+  }, 180_000);
+
+  it("the same-commit remedy for a project file carries --project", async () => {
+    const repo = makeRepo(NPM_FILES);
+    const old = git(repo.work, ["rev-parse", "HEAD"]);
+    await buildAt(repo, old);
+    await recordRepoConsent(repo.url, home);
+    const other = repo.commit({ "README.md": "other\n" });
+    await buildAt(repo, other);
+    git(repo.work, ["push", "-q", "--force", "origin", `${old}:refs/heads/main`]);
+    git(repo.work, ["push", "-q", "origin", `${old}:refs/heads/next`]);
+    const { cwd, path } = projectFile("proj");
+    writeFileSync(path, bundlesText(repo.url, old));
+    await grantTrust(path, readFileSync(path), { home });
+    const r = await update(["fx", "--ref", "next", "--project", "--json"], {
+      cwd,
+      startCheck: async () => ({ ok: false, error: "exited with code 1" }),
+    });
+    expect(r.exitCode).toBe(1);
+    const error: string = JSON.parse(out.join("")).entries[0].error;
+    expect(error).toContain(`yaw-mcp update fx --to <sha> --project (kept: ${other.slice(0, 7)})`);
+    expect(pinned(path)).toMatchObject({ commit: old, ref: "next" });
+  }, 180_000);
+
+  it("the same commit with nothing to change, whose pinned build fails the check, says nothing was written", async () => {
+    // A short-SHA ref is not on ls-remote, so update rebuilds (reuses) the
+    // pinned commit to resolve it, with no ref or token change to write.
+    const repo = makeRepo(NPM_FILES);
+    const old = git(repo.work, ["rev-parse", "HEAD"]);
+    await buildAt(repo, old);
+    await recordRepoConsent(repo.url, home);
+    const short = old.slice(0, 7);
+    writeUser(bundlesText(repo.url, old, short));
+    const before = readFileSync(userFile(), "utf8");
+    const r = await update(["fx", "--ref", short, "--json"], {
+      startCheck: async () => ({ ok: false, error: "exited with code 1" }),
+    });
+    expect(r.exitCode).toBe(1);
+    const doc = JSON.parse(out.join(""));
+    expect(doc.entries[0]).toMatchObject({ status: "failed", from: old, to: old, ref: short, started: false });
+    const error: string = doc.entries[0].error;
+    expect(error).toContain(`the pinned build ${short} itself does not start: exited with code 1`);
+    expect(error).toContain('Nothing was written to bundles.json; "fx" still does not start. Fix the cause.');
+    expect(error).not.toContain("anyway");
+    expect(readFileSync(userFile(), "utf8")).toBe(before);
+  }, 180_000);
+
+  it("an entry with no commit pinned whose new build fails the check: no pin claimed, and refs.json drops the record of the refused build", async () => {
+    const repo = makeRepo(NPM_FILES);
+    const head = git(repo.work, ["rev-parse", "HEAD"]);
+    await recordRepoConsent(repo.url, home);
+    writeUser(bundlesText(repo.url, head).replace(`, "commit": "${head}"`, ""));
+    const before = readFileSync(userFile(), "utf8");
+    expect(before).not.toContain(head);
+    const r = await update(["fx", "--json"], {
+      startCheck: async () => ({ ok: false, error: "exited with code 1" }),
+    });
+    expect(r.exitCode, err.join("")).toBe(1);
+    const doc = JSON.parse(out.join(""));
+    expect(doc.ok).toBe(false);
+    const error: string = doc.entries[0].error;
+    expect(error).toContain(`${head.slice(0, 7)} built but did not start`);
+    expect(error).toContain('"fx" has no commit pinned, and bundles.json was not written.');
+    expect(error).not.toContain("keeps its current pin");
+    expect(readFileSync(userFile(), "utf8")).toBe(before);
+    // The build stays on disk for a re-run, but no file is recorded as using it.
+    expect(existsSync(gitBuiltPath("fx", head, home))).toBe(true);
+    const refsPath = gitRefsPath("fx", home);
+    const refs = existsSync(refsPath) ? JSON.parse(readFileSync(refsPath, "utf8")) : {};
+    expect(Object.values(refs)).toEqual([]);
+  }, 120_000);
+
+  it("a pin another writer moved meanwhile is refused, and the failure says the pin did not move", async () => {
+    const repo = makeRepo(NPM_FILES);
+    const old = git(repo.work, ["rev-parse", "HEAD"]);
+    await buildAt(repo, old);
+    await recordRepoConsent(repo.url, home);
+    writeUser(bundlesText(repo.url, old));
+    repo.commit({ "README.md": "v2\n" });
+    const elsewhere = "ab".repeat(20);
+    const r = await update(["fx"], {
+      // Runs between the build and the pin write: another writer edits the file.
+      startCheck: async () => {
+        writeUser(bundlesText(repo.url, elsewhere));
+        return { ok: true, tools: 1 };
+      },
+    });
+    expect(r.exitCode).toBe(1);
+    expect(pinned().commit).toBe(elsewhere);
+    expect(err.join("")).toContain("The pin did not move.");
+    expect(out.join("")).not.toContain("Updated");
+  }, 120_000);
+
+  it("--no-start-check runs no check, so nothing can fail it: the new build is pinned, exit 0", async () => {
+    const repo = makeRepo(NPM_FILES);
+    const old = git(repo.work, ["rev-parse", "HEAD"]);
+    await buildAt(repo, old);
+    await recordRepoConsent(repo.url, home);
+    writeUser(bundlesText(repo.url, old));
+    const next = repo.commit({ "README.md": "v2\n" });
+    let checked = 0;
+    const r = await update(["fx", "--no-start-check", "--json"], {
+      startCheck: async () => {
+        checked++;
+        return { ok: false, error: "never asked" };
+      },
+    });
+    expect(r.exitCode, err.join("")).toBe(0);
+    expect(checked).toBe(0);
+    expect(pinned().commit).toBe(next);
+    expect(JSON.parse(out.join("")).entries[0]).toMatchObject({ status: "updated", to: next, started: null });
+  }, 120_000);
+
+  it("a start check that throws counts as a failed start: no pin moves, and the later entries are still updated", async () => {
+    const repo = makeRepo(NPM_FILES);
+    const old = git(repo.work, ["rev-parse", "HEAD"]);
+    await buildAt(repo, old);
+    await buildAt(repo, old, "fy");
+    await recordRepoConsent(repo.url, home);
+    const two = bundlesText(repo.url, old).replace(
+      '    { "namespace": "other"',
+      `    { "namespace": "fy", "name": "fy", "type": "local", "transport": "stdio", "git": { "url": ${JSON.stringify(repo.url)}, "ref": "main", "commit": "${old}", "entry": "dist/index.js" } },\n    { "namespace": "other"`,
+    );
+    writeUser(two);
+    const next = repo.commit({ "README.md": "v2\n" });
+    const r = await update([], {
+      json: true,
+      startCheck: async (cfg) => {
+        if (cfg.namespace === "fx") throw new Error("spawn EACCES");
+        return { ok: true, tools: 1 };
+      },
+    });
+    expect(r.exitCode).toBe(1);
+    const doc = JSON.parse(out.join(""));
+    expect(doc.entries.map((x: { namespace: string; status: string }) => [x.namespace, x.status])).toEqual([
+      ["fx", "failed"],
+      ["fy", "updated"],
+    ]);
+    expect(doc.entries[0].startError).toBe("spawn EACCES");
+    expect(pinned(userFile(), "fx").commit).toBe(old);
+    expect(pinned(userFile(), "fy").commit).toBe(next);
+  }, 180_000);
 
   it("gives a reused build the same forward-slash entry a fresh one gets", async () => {
     const repo = makeRepo(NPM_FILES);
@@ -420,7 +654,75 @@ describe("update moves a branch forward", () => {
   }, 180_000);
 });
 
+describe("update's repo-consent prompt", () => {
+  it("Ctrl+C there stops the run with exit 130: nothing built, the pin and the file untouched", async () => {
+    const repo = makeRepo(NPM_FILES);
+    const old = git(repo.work, ["rev-parse", "HEAD"]);
+    writeUser(bundlesText(repo.url, old));
+    const before = readFileSync(userFile(), "utf8");
+    const next = repo.commit({ "README.md": "v2\n" });
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    stdout.resume();
+    // ETX, built from its code so no control byte sits in this source.
+    stdin.write(String.fromCharCode(3));
+    const r = await update(["fx"], { isTTY: true, io: { stdin, stdout, terminal: true } });
+    expect(r.exitCode, err.join("")).toBe(130);
+    expect(out.join("")).toContain("This will run code from the repo on this machine:");
+    expect(err.join("")).toContain("yaw-mcp update: fx: Cancelled; nothing was built.");
+    expect(calls).toEqual([]);
+    expect(readFileSync(userFile(), "utf8")).toBe(before);
+    expect(existsSync(gitBuiltPath("fx", next, home))).toBe(false);
+  }, 120_000);
+
+  it("Ctrl+C there leaves the entries after it untried", async () => {
+    // fx needs a build (and so the consent); fy, a different repo already at
+    // its tip, needs no prompt -- so without the stop it would be reported.
+    const repo = makeRepo(NPM_FILES);
+    const old = git(repo.work, ["rev-parse", "HEAD"]);
+    const other = makeRepo(NPM_FILES);
+    const otherHead = git(other.work, ["rev-parse", "HEAD"]);
+    await buildAt(other, otherHead, "fy");
+    const two = bundlesText(repo.url, old).replace(
+      '    { "namespace": "other"',
+      `    { "namespace": "fy", "name": "fy", "type": "local", "transport": "stdio", "git": { "url": ${JSON.stringify(other.url)}, "ref": "main", "commit": "${otherHead}", "entry": "dist/index.js" } },\n    { "namespace": "other"`,
+    );
+    writeUser(two);
+    repo.commit({ "README.md": "v2\n" });
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    stdout.resume();
+    stdin.write(String.fromCharCode(3));
+    const r = await update([], { isTTY: true, io: { stdin, stdout, terminal: true } });
+    expect(r.exitCode, err.join("")).toBe(130);
+    // The line fy would print as `fy  main  <sha7>  up to date`.
+    expect(out.join("")).not.toContain("fy  main");
+  }, 120_000);
+
+  it("a bare Enter there is consent (the control for the Ctrl+C case)", async () => {
+    const repo = makeRepo(NPM_FILES);
+    const old = git(repo.work, ["rev-parse", "HEAD"]);
+    writeUser(bundlesText(repo.url, old));
+    const next = repo.commit({ "README.md": "v2\n" });
+    const r = await update(["fx"], { isTTY: true, promptAnswer: "" });
+    expect(r.exitCode, err.join("")).toBe(0);
+    expect(pinned().commit).toBe(next);
+  }, 120_000);
+});
+
 describe("update --check", () => {
+  it("records a url with a port and an @ later in its path byte for byte, so state.json keeps its host", async () => {
+    // The free-text scrubber ran `git.corp:8443/` to the path's `@` and stored
+    // `https://***@team/mcp.git`, which normalizes to host `team`.
+    const port = "https://git.corp:8443/@team/mcp.git";
+    const repo = makeRepo(NPM_FILES);
+    const head = git(repo.work, ["rev-parse", "HEAD"]);
+    writeUser(bundlesText(port, head));
+    const r = await update(["--check"], { env: aliased(repo, port) });
+    expect(r.exitCode, err.join("")).toBe(0);
+    expect(readGitState(home).fx?.url).toBe(port);
+  }, 120_000);
+
   it("reports behind and pinned-with-newer-tags, writes state.json, and builds nothing", async () => {
     const repo = makeRepo(NPM_FILES);
     const old = git(repo.work, ["rev-parse", "HEAD"]);
@@ -851,6 +1153,138 @@ describe("update --git-token-secret", () => {
     expect(ssh.exitCode, err.join("")).toBe(0);
     expect((pinned(userFile(), "viassh") as { tokenSecret?: string }).tokenSecret).toBeUndefined();
   }, 240_000);
+
+  it("on the same commit is written even when the pinned build fails its start check, and the run still fails", async () => {
+    const repo = makeRepo(NPM_FILES);
+    const first = git(repo.work, ["rev-parse", "HEAD"]);
+    await buildFrom(HTTPS, repo, first);
+    writeUser(withToken(bundlesText(HTTPS, first), "old_tok"));
+    const r = await update(["fx", "--git-token-secret", "new_tok", "--json"], {
+      env: aliased(repo, HTTPS),
+      resolveToken: async () => "tok",
+      startCheck: async () => ({ ok: false, error: "exited with code 1" }),
+    });
+    expect(r.exitCode).toBe(1);
+    expect(calls).toEqual([]);
+    expect(pinned()).toMatchObject({ commit: first, tokenSecret: "new_tok" });
+    expect(readFileSync(userFile(), "utf8")).toContain("// hand-written: keep me");
+    const doc = JSON.parse(out.join(""));
+    expect(doc.ok).toBe(false);
+    expect(doc.entries[0]).toMatchObject({
+      status: "failed",
+      from: first,
+      to: first,
+      started: false,
+      startError: "exited with code 1",
+    });
+    const error: string = doc.entries[0].error;
+    expect(error).toContain(`the pinned build ${first.slice(0, 7)} itself does not start: exited with code 1`);
+    expect(error).toContain(
+      "The change was written to bundles.json anyway (it authenticates with vault secret new_tok)",
+    );
+    expect(error).toContain('"fx" still does not start. Fix the cause.');
+    expect(error).not.toContain("not written");
+    expect(error).not.toContain("--no-start-check");
+  }, 180_000);
+
+  it("on the same commit, a bundles.json write that fails still reports the failed start check, and says the change was NOT written", async () => {
+    const repo = makeRepo(NPM_FILES);
+    const first = git(repo.work, ["rev-parse", "HEAD"]);
+    await buildFrom(HTTPS, repo, first);
+    writeUser(withToken(bundlesText(HTTPS, first), "old_tok"));
+    // Another writer removes the entry while the start check runs.
+    const gone = '{ "servers": [] }\n';
+    const r = await update(["fx", "--git-token-secret", "new_tok", "--json"], {
+      env: aliased(repo, HTTPS),
+      resolveToken: async () => "tok",
+      startCheck: async () => {
+        writeUser(gone);
+        return { ok: false, error: "exited with code 1" };
+      },
+    });
+    expect(r.exitCode).toBe(1);
+    expect(readFileSync(userFile(), "utf8")).toBe(gone);
+    const doc = JSON.parse(out.join(""));
+    expect(doc.ok).toBe(false);
+    expect(doc.entries).toHaveLength(1);
+    // The old ref, with no kind or newerTags: nothing was worked out for it.
+    expect(doc.entries[0]).toMatchObject({
+      status: "failed",
+      from: first,
+      to: first,
+      ref: "main",
+      kind: null,
+      newerTags: [],
+      started: false,
+      startError: "exited with code 1",
+    });
+    const error: string = doc.entries[0].error;
+    expect(error).toContain(`the pinned build ${first.slice(0, 7)} itself does not start: exited with code 1`);
+    expect(error).toContain('The token change could NOT be written to bundles.json: "fx" is no longer a git server');
+    expect(error).toContain('Nothing was changed, and "fx" still does not start. Fix the cause.');
+    expect(error).not.toContain("The pin did not move.");
+    expect(error).not.toContain("written to bundles.json anyway");
+  }, 180_000);
+
+  it("on the same commit, a ref and token change together are written and named together, or both reported unwritten", async () => {
+    const repo = makeRepo(NPM_FILES);
+    const first = git(repo.work, ["rev-parse", "HEAD"]);
+    git(repo.work, ["push", "-q", "origin", `${first}:refs/heads/next`]);
+    await buildFrom(HTTPS, repo, first);
+    const fail = async () => ({ ok: false as const, error: "exited with code 1" });
+    const opts = { env: aliased(repo, HTTPS), resolveToken: async () => "tok" };
+
+    writeUser(withToken(bundlesText(HTTPS, first), "old_tok"));
+    expect(
+      (await update(["fx", "--ref", "next", "--git-token-secret", "new_tok", "--json"], { ...opts, startCheck: fail }))
+        .exitCode,
+    ).toBe(1);
+    const written = JSON.parse(out.join("")).entries[0];
+    expect(written).toMatchObject({ ref: "next", kind: "branch", to: first });
+    expect(written.error).toContain(
+      'The change was written to bundles.json anyway ("fx" now tracks next, and it authenticates with vault secret new_tok)',
+    );
+    expect(pinned()).toMatchObject({ commit: first, ref: "next", tokenSecret: "new_tok" });
+
+    out = [];
+    writeUser(withToken(bundlesText(HTTPS, first), "old_tok"));
+    const gone = '{ "servers": [] }\n';
+    const r = await update(["fx", "--ref", "next", "--git-token-secret", "new_tok", "--json"], {
+      ...opts,
+      startCheck: async () => {
+        writeUser(gone);
+        return fail();
+      },
+    });
+    expect(r.exitCode).toBe(1);
+    const unwritten = JSON.parse(out.join("")).entries[0];
+    expect(unwritten).toMatchObject({ ref: "main", kind: null, newerTags: [], to: first });
+    expect(unwritten.error).toContain("The ref and token changes could NOT be written to bundles.json");
+  }, 180_000);
+
+  it("on a moved commit is NOT written when the new build fails its start check", async () => {
+    const repo = makeRepo(NPM_FILES);
+    const first = git(repo.work, ["rev-parse", "HEAD"]);
+    await buildFrom(HTTPS, repo, first);
+    await recordRepoConsent(HTTPS, home);
+    writeUser(withToken(bundlesText(HTTPS, first), "old_tok"));
+    const before = readFileSync(userFile(), "utf8");
+    const next = repo.commit({ "README.md": "2\n" });
+    const r = await update(["fx", "--git-token-secret", "new_tok", "--json"], {
+      env: aliased(repo, HTTPS),
+      resolveToken: async () => "tok",
+      startCheck: async () => ({ ok: false, error: "exited with code 1" }),
+    });
+    expect(r.exitCode).toBe(1);
+    expect(readFileSync(userFile(), "utf8")).toBe(before);
+    const doc = JSON.parse(out.join(""));
+    expect(doc.ok).toBe(false);
+    expect(doc.entries[0]).toMatchObject({ status: "failed", from: first, to: null, started: false });
+    const error: string = doc.entries[0].error;
+    expect(error).toContain(`${next.slice(0, 7)} built but did not start: exited with code 1`);
+    expect(error).toContain(`Nothing was changed: "fx" stays on ${first.slice(0, 7)}, which keeps running.`);
+    expect(error).toContain("yaw-mcp update fx --git-token-secret new_tok --no-start-check");
+  }, 180_000);
 });
 
 // --- rollback guards, host rebuild, state and lock edges ---------------------
@@ -966,7 +1400,7 @@ describe("rollback guards, host rebuild, state and lock edges", () => {
     expect(pinned().commit).toBe(foreign);
     // Rebuilt, so the marker is this host's again.
     expect(readBuildMarker(gitBuildDir("fx", foreign, home), foreign)?.platform).toBe(process.platform);
-  });
+  }, 180_000);
 
   it("a --to rebuild that fails leaves the pin and reports the failure", async () => {
     // The one destructive-then-failing ordering: discardBuild deletes the kept
@@ -977,7 +1411,10 @@ describe("rollback guards, host rebuild, state and lock edges", () => {
     await buildAt(repo, first);
     await recordRepoConsent(repo.url, home);
     writeUser(bundlesText(repo.url, first));
-    const foreign = `${first.slice(0, 39)}f`;
+    // Another commit than `first` in its last digit only. A fixed `f` WAS
+    // `first` whenever the random sha ended in `f` (1 run in 16), which took
+    // the "still pins" branch instead.
+    const foreign = `${first.slice(0, 39)}${first.endsWith("f") ? "e" : "f"}`;
     fakeFinishedBuild(gitBuildDir("fx", foreign, home), foreign, {
       marker: { url: repo.url, platform: process.platform === "win32" ? "linux" : "win32" },
     });
@@ -989,8 +1426,126 @@ describe("rollback guards, host rebuild, state and lock edges", () => {
     expect(err.join("")).toContain("fx:");
     expect(pinned().commit).toBe(first);
     expect(out.join("")).not.toContain("Rolled back");
-    // discardBuild already ran: the foreign build is gone.
+    // discardBuild already ran: the foreign build is gone, and the message
+    // says so rather than leaving only the builder's "Nothing was changed".
     expect(existsSync(gitBuiltPath("fx", foreign, home))).toBe(false);
+    expect(err.join("")).toContain(
+      `The kept build of ${foreign.slice(0, 7)} was made for another machine and was deleted to rebuild it. The pin did not move (${first.slice(0, 7)}).`,
+    );
+    expect(err.join("")).not.toContain("Nothing was changed");
+    // An explicit budget like every other test here that runs git builds:
+    // this one does two (the setup build and the failing re-clone), each a few
+    // git spawns, with no wait on a lock or a timer -- the 30 s default was
+    // all that made it time out under a loaded full-suite run.
+  }, 120_000);
+
+  /** A real second commit of a fresh repo, built for real, then its marker
+   *  re-stamped for another platform -- so a --to rebuild of it clones and
+   *  checks out fine and reaches the package manager. */
+  async function foreignBuildOnRealCommit(): Promise<{ repo: Repo; first: string; foreign: string }> {
+    const repo = makeRepo(NPM_FILES);
+    const first = git(repo.work, ["rev-parse", "HEAD"]);
+    await buildAt(repo, first);
+    await recordRepoConsent(repo.url, home);
+    const foreign = repo.commit({ "README.md": "foreign\n" });
+    await buildAt(repo, foreign);
+    expect(first.startsWith(foreign.slice(0, 7)), "--to must hit exactly one build").toBe(false);
+    const markerPath = gitBuiltPath("fx", foreign, home);
+    const stamped = JSON.parse(readFileSync(markerPath, "utf8")) as Record<string, unknown>;
+    stamped.platform = process.platform === "win32" ? "linux" : "win32";
+    writeFileSync(markerPath, JSON.stringify(stamped));
+    return { repo, first, foreign };
+  }
+
+  it("a --to rebuild whose BUILD step fails says the foreign build is gone, not 'Nothing was changed'", async () => {
+    // The test above fails at checkout, so it reaches only rollBack's append
+    // fallback. A real commit gets to the package manager, where the builder
+    // ends its message with `unchanged` -- without it the user read "Nothing
+    // was changed; the previous build still runs." next to "was deleted".
+    const { repo, first, foreign } = await foreignBuildOnRealCommit();
+    writeUser(bundlesText(repo.url, first));
+
+    out = [];
+    err = [];
+    const r = await update(["fx", "--to", foreign.slice(0, 7)], { runPm: fakePm(calls, true) });
+    expect(r.exitCode).toBe(1);
+    expect(pinned().commit).toBe(first);
+    const text = err.join("");
+    expect(text).toContain("failed (exit 2)");
+    expect(text).toContain(
+      `The kept build of ${foreign.slice(0, 7)} was made for another machine and was deleted to rebuild it. The pin did not move (${first.slice(0, 7)}).`,
+    );
+    expect(text).not.toContain("Nothing was changed");
+  }, 180_000);
+
+  it("a failed --to rebuild of the commit already pinned says the pin now has no build here", async () => {
+    // The other pinStays branch: a config restored from another machine pins
+    // exactly the foreign build, so after the discard the pin points at
+    // nothing on disk and the message must say how to build it.
+    const { repo, foreign } = await foreignBuildOnRealCommit();
+    writeUser(bundlesText(repo.url, foreign));
+
+    out = [];
+    err = [];
+    const r = await update(["fx", "--to", foreign.slice(0, 7)], { runPm: fakePm(calls, true) });
+    expect(r.exitCode).toBe(1);
+    expect(pinned().commit).toBe(foreign);
+    const text = err.join("");
+    expect(text).toContain(
+      `"fx" still pins ${foreign.slice(0, 7)}, which now has no build here; once the cause is fixed, build it with: yaw-mcp sidecars install`,
+    );
+    expect(text).not.toContain("Nothing was changed");
+  }, 180_000);
+
+  /** ENV with a PATH that holds no git: every PATH spelling dropped (Windows
+   *  carries `Path`), then one empty directory. */
+  function envWithoutGit(): NodeJS.ProcessEnv {
+    const env = Object.fromEntries(Object.entries(ENV).filter(([k]) => k.toUpperCase() !== "PATH"));
+    env.PATH = newTmp("yaw no-git-");
+    return env;
+  }
+
+  it("--to goes back to a kept build for this host on a machine without git", async () => {
+    // No remote and no clone are involved in re-pinning a build that is on
+    // disk and was made for this host, so a lost git must not block it.
+    const repo = makeRepo(NPM_FILES);
+    const first = git(repo.work, ["rev-parse", "HEAD"]);
+    writeUser(bundlesText(repo.url, first));
+    fakeFinishedBuild(gitBuildDir("fx", OTHER, home), OTHER, { marker: { url: repo.url } });
+
+    const r = await update(["fx", "--to", OTHER.slice(0, 7)], { env: envWithoutGit() });
+    expect(r.exitCode, err.join("")).toBe(0);
+    expect(out.join("")).toContain("Rolled back");
+    expect(pinned().commit).toBe(OTHER);
+    expect(calls).toEqual([]);
+  });
+
+  it("--to without git refuses a rebuild BEFORE discarding the kept build, exit 2", async () => {
+    // A build made for another host has to be re-cloned, which does need git.
+    // The refusal must come before discardBuild, or the machine loses the one
+    // copy it had for nothing.
+    const repo = makeRepo(NPM_FILES);
+    const first = git(repo.work, ["rev-parse", "HEAD"]);
+    writeUser(bundlesText(repo.url, first));
+    fakeFinishedBuild(gitBuildDir("fx", OTHER, home), OTHER, {
+      marker: { url: repo.url, platform: process.platform === "win32" ? "linux" : "win32" },
+    });
+
+    const r = await update(["fx", "--to", OTHER.slice(0, 7), "--json"], { env: envWithoutGit() });
+    expect(r.exitCode).toBe(2);
+    expect(err.join("")).toContain("git is not installed or not on PATH");
+    expect(JSON.parse(out.join(""))).toMatchObject({ ok: false, exitCode: 2 });
+    expect(pinned().commit).toBe(first);
+    expect(existsSync(gitBuiltPath("fx", OTHER, home))).toBe(true);
+  });
+
+  it("the other modes still refuse up front without git, exit 2", async () => {
+    const repo = makeRepo(NPM_FILES);
+    const first = git(repo.work, ["rev-parse", "HEAD"]);
+    writeUser(bundlesText(repo.url, first));
+    const r = await update(["fx"], { env: envWithoutGit() });
+    expect(r.exitCode).toBe(2);
+    expect(err.join("")).toContain("git is not installed or not on PATH");
   });
 
   it("update --json on a failing entry reports ok false, status failed and the error", async () => {
@@ -1019,7 +1574,7 @@ describe("rollback guards, host rebuild, state and lock edges", () => {
     expect(typeof doc.entries[0].error).toBe("string");
     expect(doc.entries[0].error).toMatch(/exit 2/);
     expect(pinned().commit).toBe(second);
-  });
+  }, 180_000);
 
   it("malformed state.json reads as empty and writeGitState merges rows without dropping them", async () => {
     mkdirSync(gitRoot(home), { recursive: true });

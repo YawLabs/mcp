@@ -328,6 +328,33 @@ describe("parseSecretsArgs", () => {
     if (!r.ok) expect(r.error).toMatch(/--value applies to `set` only/);
   });
 
+  // runSecrets takes --value and never reads stdin, so the pair used to parse
+  // and silently drop whatever was piped in.
+  it("rejects --value together with --stdin, in either order", () => {
+    for (const argv of [
+      ["set", "gh", "--value", "x", "--stdin"],
+      ["set", "gh", "--stdin", "--value", "x"],
+    ]) {
+      const r = parseSecretsArgs(argv);
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error).toMatch(/^yaw-mcp secrets set: --value and --stdin are mutually exclusive/);
+    }
+    expect(parseSecretsArgs(["set", "gh", "--value", "x"]).ok).toBe(true);
+  });
+
+  // Pinned as documented ("Accepted and ignored on the other actions"):
+  // refusing it would break a script that passes --force to every action.
+  it("still accepts --force on an action that has nothing to confirm", () => {
+    for (const argv of [
+      ["list", "--force"],
+      ["rotate", "--force"],
+      ["get", "gh", "--force"],
+    ]) {
+      expect(parseSecretsArgs(argv).ok).toBe(true);
+    }
+    expect(SECRETS_USAGE).toContain("Accepted and ignored on the other actions.");
+  });
+
   it("rejects the audit-only filters on a non-audit action", () => {
     const r = parseSecretsArgs(["list", "--secret", "gh"]);
     expect(r.ok).toBe(false);
@@ -391,6 +418,24 @@ describe("parseSecretsArgs", () => {
     // The message alone, like every runtime envelope: the prose
     // `yaw-mcp secrets <action>:` label is for the human rendering.
     expect(envelope.error).not.toContain("yaw-mcp secrets");
+    // The plain message index.ts's run() puts in the stdout document's
+    // `error`. It used to take `error` (this envelope string) instead, so a
+    // script reading stdout got JSON double-encoded inside a JSON string.
+    expect(r.jsonError).toBe(envelope.error);
+  });
+
+  it("a prose argument refusal carries no jsonError (run() only reads it under --json)", () => {
+    const r = parseSecretsArgs(["list", "--bogus"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.jsonError).toBeUndefined();
+  });
+
+  it("the --json usage promises a one-line stdout document with the plain message", () => {
+    expect(SECRETS_USAGE).toMatch(
+      /argument error also puts one line on stdout,\s+\{"ok":false,"error":\.\.\.,"exitCode":2\}/,
+    );
+    expect(SECRETS_USAGE).not.toMatch(/multi-line\s+\{"ok":false/);
+    expect(SECRETS_USAGE).not.toMatch(/read the message from the stderr envelope/);
   });
 
   it("without --json the same refusal stays prose with the usage appended, and --help stays usage", () => {

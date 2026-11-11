@@ -27,10 +27,12 @@
  *      passes it like install's own. A pinned `--package` form, an `oam`
  *      launch with no `run <entry>`, or an oam entry for somebody else's
  *      server fail it and are invisible to the sweep.
- *   2. ACTUALLY BROKEN -- the entry path is not a regular file: missing, or a
- *      directory, or an unreadable or dangling link. A WORKING entry is never
- *      touched, however unusual it looks, so a user who hand-tuned something
- *      that still starts keeps it.
+ *   2. ACTUALLY BROKEN -- the entry path is absolute and not a regular file:
+ *      missing, or a directory, or an unreadable or dangling link. A WORKING
+ *      entry is never touched, however unusual it looks, so a user who
+ *      hand-tuned something that still starts keeps it; a RELATIVE path
+ *      resolves against the client's working directory, not this process's,
+ *      so it is left alone rather than judged.
  *   3. NOT READ-ONLY  -- `YAW_MCP_READONLY_DIAGNOSTICS` is honoured, so the
  *      panel's background poll stays a pure read. That flag exists precisely
  *      so a poll nobody asked for writes nothing, and this does not flip it.
@@ -47,8 +49,8 @@
  * session. Everything here reports through `log` (stderr) or through the
  * returned result.
  */
-import { statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import { posix, win32 } from "node:path";
 import { atomicWriteFile } from "./atomic-write.js";
 import {
   addressOf,
@@ -65,7 +67,7 @@ import {
   terminateWithNewline,
 } from "./client-config.js";
 import { isReadOnlyDiagnostics } from "./config-loader.js";
-import { isForeignAbsoluteLaunch, oamLaunchParts, oamRunEntryPath } from "./doctor-cmd.js";
+import { isForeignAbsoluteLaunch, isLaunchableEntryFile, oamLaunchParts, oamRunEntryPath } from "./doctor-cmd.js";
 import { ENTRY_NAME, resolveAppDataDir } from "./install-target-model.js";
 import {
   buildLaunchEntry,
@@ -302,19 +304,6 @@ function isOwnBrokerEntry(entryPath: string, platform: NodeJS.Platform): boolean
   return norm(entryPath, platform).includes("/node_modules/@yawlabs/mcp/");
 }
 
-/** Gate 2's real question: can `oam run` actually start this path? Only a
- *  regular file can be, so a directory sitting at the entry path is as broken
- *  as a missing one. Throws (ENOENT, EACCES, a dangling symlink) count as
- *  broken, which is the safe direction: the worst case is rewriting an entry
- *  that was already not going to start. */
-function isLaunchableFile(entryPath: string): boolean {
-  try {
-    return statSync(entryPath).isFile();
-  } catch {
-    return false;
-  }
-}
-
 /**
  * Re-point every stale broker entry this machine can see: every row, every
  * scope, every copy of a fanned-out file (Cline's editor copies), and -- for
@@ -453,15 +442,26 @@ export async function healStaleBrokerEntries(opts: HealOptions = {}): Promise<He
       // checked BEFORE gate 2, because gate 2 is exactly what gets it wrong.
       if (isForeignEntry(launch.command, parts.oam, entryPath, platform)) return;
 
+      // A RELATIVE entry path is not ours to judge either: the client resolves
+      // it against ITS working directory, and gate 2's stat would resolve it
+      // against this process's (home, under Yaw Terminal) -- so a hand-written
+      // `./node_modules/@yawlabs/mcp/dist/index.js` that starts fine from its
+      // client read as broken and was rewritten. install only ever writes an
+      // absolute path, and doctor's launch check skips a relative one the
+      // same way (launchChecks in doctor-cmd.ts).
+      if (!(platform === "win32" ? win32.isAbsolute : posix.isAbsolute)(entryPath)) return;
+
       // Gate 2: only a BROKEN entry is ever rewritten.
       //
       // A FILE, not merely something at that path: `existsSync` is true for a
       // directory, and `oam run <a directory>` cannot start the broker any
       // more than a missing path can -- so testing existence alone declared
-      // an unstartable entry healthy and left it that way. statSync follows
-      // symlinks, which is what we want: a link to a real file is fine, and a
-      // dangling one throws and counts as broken.
-      if (isLaunchableFile(entryPath)) return;
+      // an unstartable entry healthy and left it that way. The test is
+      // doctor's own (isLaunchableEntryFile), so the two cannot disagree
+      // about which entry file is broken. A throw (ENOENT, EACCES, a dangling
+      // symlink) counts as broken, which is the safe direction: the worst
+      // case is rewriting an entry that was already not going to start.
+      if (isLaunchableEntryFile(entryPath)) return;
 
       const { oamBinPath, oamEntry } = await replacementFor();
       const base = buildLaunchEntry({
@@ -475,7 +475,7 @@ export async function healStaleBrokerEntries(opts: HealOptions = {}): Promise<He
         transform: target.entry,
         os,
         purpose: "broker",
-        env: carryableEnvOf(stored.value),
+        env: carryableEnvOf(stored.value, target.entry),
         carried: carriedFieldsOf(stored.value, target.entry),
       });
 

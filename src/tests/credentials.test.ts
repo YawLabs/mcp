@@ -112,6 +112,44 @@ describe("detectMissingCredentials", () => {
     expect(detectMissingCredentials("Missing environment: OPENAI_API_KEY")).toEqual(["OPENAI_API_KEY"]);
   });
 
+  it("reads past a credential noun in front of the name ('Missing API key: X')", () => {
+    // Pattern 1 used to commit to the noun as the name -- "API" (not
+    // credential-shaped) or lowercase "credentials" -- and nothing elicited.
+    expect(detectMissingCredentials("Missing API key: OPENAI_API_KEY")).toEqual(["OPENAI_API_KEY"]);
+    expect(detectMissingCredentials("Missing credentials: GITHUB_TOKEN")).toEqual(["GITHUB_TOKEN"]);
+    expect(detectMissingCredentials("Missing required API key OPENAI_API_KEY")).toEqual(["OPENAI_API_KEY"]);
+    expect(detectMissingCredentials("missing token: `GH_TOKEN`")).toEqual(["GH_TOKEN"]);
+    expect(detectMissingCredentials("Missing secret: STRIPE_SECRET_KEY")).toEqual(["STRIPE_SECRET_KEY"]);
+    // The noun needs a separator after it, so a name that merely STARTS with
+    // one keeps its first word.
+    expect(detectMissingCredentials("Missing TOKEN_GITHUB")).toEqual(["TOKEN_GITHUB"]);
+    expect(detectMissingCredentials("Missing SECRET_KEY")).toEqual(["SECRET_KEY"]);
+    expect(detectMissingCredentials("Missing API_KEY")).toEqual(["API_KEY"]);
+    // A noun with no name after it, or a non-credential one, elicits nothing.
+    expect(detectMissingCredentials("Missing API key")).toEqual([]);
+    expect(detectMissingCredentials("Missing credentials: LOG_LEVEL")).toEqual([]);
+    // And the noun does not carry the phrase across a line break on its own.
+    expect(detectMissingCredentials("missing token\nOPENAI_API_KEY loaded from vault")).toEqual([]);
+  });
+
+  it("still elicits for a variable literally named like a credential noun when a word follows", () => {
+    // The noun is its own pattern with a mandatory noun, not an optional
+    // prefix of pattern 1. As a prefix it took "TOKEN" as the noun, captured
+    // the next word ("environment", "for", "none") as the name, and the
+    // ALL_CAPS filter dropped that -- so a bare TOKEN variable, which elicited
+    // before the noun was added, stopped eliciting.
+    expect(detectMissingCredentials("Missing TOKEN environment variable")).toEqual(["TOKEN"]);
+    expect(detectMissingCredentials("Error: missing TOKEN for discord bot")).toEqual(["TOKEN"]);
+    expect(detectMissingCredentials("missing TOKEN for discord")).toEqual(["TOKEN"]);
+    expect(detectMissingCredentials("Missing SECRETS: none")).toEqual(["SECRETS"]);
+    expect(detectMissingCredentials("Missing required env var TOKEN in config")).toEqual(["TOKEN"]);
+    // With nothing after it the noun was always read as the name.
+    expect(detectMissingCredentials("Missing TOKEN")).toEqual(["TOKEN"]);
+    // An ALL_CAPS noun in front of a second credential-shaped name is
+    // ambiguous, so both readings are reported.
+    expect(detectMissingCredentials("Missing CREDENTIALS JSON_KEY")).toEqual(["CREDENTIALS", "JSON_KEY"]);
+  });
+
   it("matches the plural 'variables' / 'vars' of that same line", () => {
     // The trailing "s" defeated the var/variable group, so the name capture
     // took the word "variables" itself and isAllCaps dropped it.

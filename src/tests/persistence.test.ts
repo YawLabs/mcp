@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { LearningStore } from "../learning.js";
 import { PackDetector } from "../pack-detect.js";
 import {
@@ -254,6 +254,77 @@ describe("persistence.loadState", () => {
       const c = await loadStateClassified(file);
       expect(c.parsedCleanly).toBe(false);
       expect(c.state).toEqual(emptyState());
+    });
+
+    it("names the failure, and tells a missing file from a healthy one", async () => {
+      // parsedCleanly is true for "no file" and "good file" alike, and false
+      // for three different problems; `missing` and `failure` are what let a
+      // reporting caller word each one without re-reading the file.
+      const absent = await loadStateClassified(join(dir, "absent.json"));
+      expect(absent.missing).toBe(true);
+      expect(absent.failure).toBeNull();
+
+      writeFileSync(file, JSON.stringify({ version: STATE_SCHEMA_VERSION, learning: {}, packHistory: [] }), "utf8");
+      const ok = await loadStateClassified(file);
+      expect(ok.missing).toBe(false);
+      expect(ok.failure).toBeNull();
+      expect(ok.parsedCleanly).toBe(true);
+
+      writeFileSync(file, "{ not json", "utf8");
+      const bad = await loadStateClassified(file);
+      expect(bad.missing).toBe(false);
+      expect(bad.failure?.kind).toBe("malformed");
+      expect(bad.failure?.kind === "malformed" && bad.failure.message.length > 0).toBe(true);
+
+      // A top-level array is typeof "object"; it is malformed, not a schema
+      // mismatch at version undefined.
+      for (const root of ["[1,2,3]", "[]", "null", "7"]) {
+        writeFileSync(file, root, "utf8");
+        const c = await loadStateClassified(file);
+        expect(c.failure, root).toEqual({ kind: "malformed", message: "top-level value is not an object" });
+        expect(c.parsedCleanly, root).toBe(false);
+        expect(c.state, root).toEqual(emptyState());
+      }
+
+      writeFileSync(file, JSON.stringify({ version: 99, learning: {}, packHistory: [] }), "utf8");
+      expect((await loadStateClassified(file)).failure).toEqual({ kind: "stale-version", version: 99 });
+      writeFileSync(file, JSON.stringify({ learning: {} }), "utf8");
+      expect((await loadStateClassified(file)).failure).toEqual({ kind: "stale-version", version: undefined });
+
+      // A directory where the file should be: it exists and cannot be read.
+      const asDir = join(dir, "state-as-dir.json");
+      mkdirSync(asDir);
+      const unreadable = await loadStateClassified(asDir);
+      expect(unreadable.missing).toBe(false);
+      expect(unreadable.failure?.kind).toBe("unreadable");
+      expect(unreadable.state.loadFailed).toBe(true);
+    });
+
+    it("quiet drops the two warn logs and changes nothing else", async () => {
+      // doctor reports a bad state.json in its own STATE section; without
+      // `quiet` the loader's own warning also reached stderr, worded for the
+      // server ("starting fresh"). The loud half proves the spy sees the line
+      // the quiet half must not produce.
+      const asDir = join(dir, "state-as-dir.json");
+      mkdirSync(asDir);
+      const spy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      try {
+        writeFileSync(file, "{ not json", "utf8");
+        const loudBad = await loadStateClassified(file);
+        const loudUnreadable = await loadStateClassified(asDir);
+        const loud = spy.mock.calls.map((c) => String(c[0])).join("");
+        expect(loud).toContain("Failed to load yaw-mcp state, starting fresh");
+        expect(loud).toContain("Could not read yaw-mcp state file");
+
+        spy.mockClear();
+        const quietBad = await loadStateClassified(file, { quiet: true });
+        const quietUnreadable = await loadStateClassified(asDir, { quiet: true });
+        expect(spy).not.toHaveBeenCalled();
+        expect(quietBad).toEqual(loudBad);
+        expect(quietUnreadable).toEqual(loudUnreadable);
+      } finally {
+        spy.mockRestore();
+      }
     });
 
     it("reports rawCounts from the FILE, before the sanitizers drop anything", async () => {
@@ -690,9 +761,8 @@ describe("persistence.saveState", () => {
 describe("LearningStore snapshot round-trip", () => {
   it("export then load reproduces usage", () => {
     const a = new LearningStore();
-    a.recordDispatch("gh");
-    a.recordSuccess("gh");
-    a.recordDispatch("linear");
+    a.recordOutcome("gh", 1);
+    a.recordMiss("linear");
     const snapshot = a.exportSnapshot();
 
     const b = new LearningStore();
@@ -705,7 +775,7 @@ describe("LearningStore snapshot round-trip", () => {
 
   it("loadSnapshot replaces prior state", () => {
     const s = new LearningStore();
-    s.recordDispatch("old");
+    s.recordMiss("old");
     s.loadSnapshot({ fresh: { dispatched: 2, succeeded: 1, lastUsedAt: 99 } });
     expect(s.get("old")).toBeUndefined();
     expect(s.get("fresh")?.succeeded).toBe(1);

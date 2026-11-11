@@ -245,8 +245,8 @@ describe("parse and classify", () => {
     // break. Measured against smol-toml 1.8.0.
     expect(read.line).toBe(2);
     expect(read.column).toBe(15);
-    // `detail` is the position-less reason, the core's own meaning of the
-    // field, so the adapter copies it; `positioned` carries the position.
+    // `detail` is the position-less reason (the adapter appends the position
+    // for the core's read); `positioned` carries the position in front.
     expect(read.detail).toBe("control characters are not allowed in strings");
     expect(read.positioned).toBe("line 2, column 15: control characters are not allowed in strings");
     expect(read.syntax).toBe("TOML");
@@ -681,8 +681,8 @@ describe("renderer", () => {
 
   it("names the field it would have dropped, for the two table-valued fields Codex has and this writer does not", () => {
     // The decision above FIELD_ORDER, as behaviour: `oauth` and `tools` are
-    // tables in Codex, this renderer writes neither, and the answer is a
-    // refusal that names the field -- never a silent drop. Measured on
+    // tables in Codex, this renderer writes neither, and its answer to an
+    // entry that holds one is a refusal that names the field. Measured on
     // codex-cli 0.144.0 under a scratch CODEX_HOME: re-serializing an entry
     // that carried both wrote `[mcp_servers.hh.oauth]` (explicit, flat, and
     // an unknown key inside it dropped) and `[mcp_servers.zz.tools.echo]`
@@ -1171,11 +1171,13 @@ describe("refusals -- the spellings a span splice will not edit", () => {
     expect(() => removeTomlEntry(input, CONTAINER, ENTRY)).toThrow(TomlConfigError);
   });
 
-  it("refuses a --repair that would drop a tools table off our own entry, and writes nothing", () => {
-    // The decision above FIELD_ORDER, end to end. --repair re-renders our
-    // entry from the fields read off disk, so a `[mcp_servers.mcp.tools.*]`
-    // the user hand-wrote is a field the re-render cannot spell. The refusal
-    // names it; the file is untouched, so the table survives.
+  it("refuses an entry handed back with its tools table, and drops that table when the new entry lacks it", () => {
+    // The decision above FIELD_ORDER, both halves. A caller that passes the
+    // stored fields back in WHOLE hands the renderer a
+    // `[mcp_servers.mcp.tools.*]` it cannot spell, and the refusal names it.
+    // No production caller does that: install and --repair compose the entry
+    // from the row's carry hook, which never includes `tools`, so they take
+    // the second half below.
     const input = lf(
       "[mcp_servers.mcp]",
       'command = "old"',
@@ -1189,9 +1191,10 @@ describe("refusals -- the spellings a span splice will not edit", () => {
     expect(() => upsertTomlEntry(input, CONTAINER, ENTRY, { ...carried, ...BROKER })).toThrow(
       /would drop your "tools" table/,
     );
-    // --force is the other half of the decision and is NOT a silent drop: the
-    // caller passing BROKER alone has asked for the entry to be replaced, and
-    // replacing it takes its sub-tables with it (g08 pins the bytes).
+    // The other half, and the one install, --repair and --force all take: an
+    // entry WITHOUT the table replaces the stored one, and replacing it takes
+    // its sub-tables with it, with no message naming them (g08 pins the
+    // bytes).
     expect(upsertTomlEntry(input, CONTAINER, ENTRY, BROKER)).not.toContain("tools");
   });
 
@@ -1217,6 +1220,21 @@ describe("canon and post-write verification", () => {
     expect(canonTomlConfig(lf('d = "1979-05-27"'), CONTAINER)).not.toBe(
       canonTomlConfig(lf("d = 1979-05-27"), CONTAINER),
     );
+  });
+
+  it("canon keeps a table named __proto__, so the post-write check sees a change to it", () => {
+    // smol-toml returns `__proto__` as an OWN key; a canon that rebuilt the
+    // table by plain assignment dropped it, and these two compared equal.
+    const one = lf("[__proto__]", "x = 1", "", "[mcp_servers.mcp]", 'command = "npx"');
+    const two = lf("[__proto__]", "x = 2", "", "[mcp_servers.mcp]", 'command = "npx"');
+    expect(canonTomlConfig(one, CONTAINER)).toBe('{"__proto__":{"x":1},"mcp_servers":{"mcp":{"command":"npx"}}}');
+    expect(canonTomlConfig(one, CONTAINER)).not.toBe(canonTomlConfig(two, CONTAINER));
+    expect(() => verifyTomlSplice(one, two, CONTAINER)).toThrow(
+      "the edit changed settings outside the entry it was asked to change",
+    );
+    // The same copy in entryAsWritten: an own `__proto__` field is kept.
+    const entry = JSON.parse('{"command":"npx","__proto__":"v"}') as Record<string, unknown>;
+    expect(Object.keys(entryAsWritten(entry))).toEqual(["command", "__proto__"]);
   });
 
   it("canon drops the named entries and treats an emptied container as absent", () => {

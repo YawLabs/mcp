@@ -3,6 +3,6 @@ dist/
 *.tgz
 .env
 .claude/
-# Machine-local yaw-mcp overrides (token, per-machine server list). Project
+# Machine-local yaw-mcp overrides (per-machine server list). Project
 # .yaw-mcp/config.json + .yaw-mcp/YAW-MCP.md are meant to be checked in.
 .yaw-mcp/config.local.json

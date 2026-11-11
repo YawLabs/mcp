@@ -61,6 +61,7 @@ import {
   type ClientConfigView,
   type ConfigSite,
   canonicalJson,
+  carryableEnvOf,
   classifyClientConfig,
   composeEntry,
   effectiveConfigFormat,
@@ -699,6 +700,51 @@ describe("the nested transport form the Cline CLI writes", () => {
     const stamp = statSync(file).mtimeMs;
     expect(installAcross(base).find((o) => o.id === "vscode")?.action).toBe("identical");
     expect(statSync(file).mtimeMs).toBe(stamp);
+  });
+
+  it("carries an env stored INSIDE the transport object across the flattening rewrite", () => {
+    // The MUTATION this pins: read the carried env off the STORED value again
+    // (drop the transform from the view's `carryableEnv`) and this goes red.
+    // The nested form keeps `env` beside `command`, inside `transport`, so the
+    // stored value's own top level has none -- and the rewrite that flattens
+    // the entry then wrote it back without the env the same entry spelled
+    // flat would have kept.
+    const nested = JSON.stringify(
+      {
+        mcpServers: {
+          mcp: {
+            transport: { type: "stdio", command: "old", args: ["x"], env: { OAM_BIN: "C:/oam/oam.exe", N: 1 } },
+            disabled: false,
+          },
+        },
+      },
+      null,
+      2,
+    );
+    const base = machine("windows");
+    const file = editorRan(base, "Code", `${nested}\n`);
+    const view = viewOf(detectedSites(base)[1]);
+    // String values only, as for a flat entry.
+    expect(view.carryableEnv()).toEqual({ OAM_BIN: "C:/oam/oam.exe" });
+
+    expect(installAcross(base).find((o) => o.id === "vscode")?.action).toBe("wrote");
+    expect(JSON.parse(readFileSync(file, "utf8")).mcpServers.mcp).toEqual({
+      disabled: false,
+      command: "cmd",
+      args: ["/c", "npx", "-y", "@yawlabs/mcp@latest"],
+      env: { OAM_BIN: "C:/oam/oam.exe" },
+    });
+    // --force is still a true overwrite: it carries neither.
+    const forced = machine("windows");
+    const fFile = editorRan(forced, "Code", `${nested}\n`);
+    installAcross(forced, "force");
+    expect(readFileSync(fFile, "utf8")).toBe(FRESH_WIN);
+
+    // The flat spelling wins when both are present, as it does for every
+    // other field `normalize` folds.
+    expect(
+      carryableEnvOf({ transport: { command: "c", env: { A: "nested" } }, env: { A: "flat" } }, row.entry),
+    ).toEqual({ A: "flat" });
   });
 });
 

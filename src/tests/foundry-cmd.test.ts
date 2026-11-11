@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { fallbackToolsFor } from "../fallback-tools.js";
 import { FOUNDRY_FILENAME } from "../foundry.js";
 import { DEFAULT_OUT, defaultLoadServers, FOUNDRY_USAGE, parseFoundryArgs, runFoundryExport } from "../foundry-cmd.js";
 import { DEFAULT_CORPUS_CAP } from "../foundry-corpus.js";
@@ -73,6 +74,34 @@ describe("parseFoundryArgs", () => {
     expect(parseFoundryArgs(["export", "--cap", "-1"]).ok).toBe(false);
     expect(parseFoundryArgs([]).ok).toBe(false);
   });
+
+  it("rejects a --cap that is not a plain positive integer, echoing it", () => {
+    // 0.5 used to pass the `> 0` check and floor to a cap of 0, which capped
+    // every entry away and then blamed the catalog; Number() also read the
+    // hex and exponent spellings.
+    for (const bad of ["0.5", "0", "2.5", "0x10", "1e3", "abc", ""]) {
+      const p = parseFoundryArgs(["export", "--cap", bad]);
+      expect(p.ok, `--cap ${JSON.stringify(bad)}`).toBe(false);
+      if (!p.ok) {
+        expect(p.error).toContain("--cap needs a positive integer");
+        expect(p.error).toContain(`got "${bad}"`);
+        expect(p.help).toBeUndefined();
+      }
+    }
+    const missing = parseFoundryArgs(["export", "--cap"]);
+    expect(missing.ok).toBe(false);
+    if (!missing.ok) expect(missing.error).toContain("--cap needs a positive integer\n");
+    const one = parseFoundryArgs(["export", "--cap", "1"]);
+    expect(one.ok && one.options.cap).toBe(1);
+  });
+
+  it("does not take the next flag as the --out path", () => {
+    // `--out --json` used to write the corpus to a file named "--json".
+    const p = parseFoundryArgs(["export", "--out", "--json"]);
+    expect(p.ok).toBe(false);
+    if (!p.ok) expect(p.error).toContain("--out needs a path");
+    expect(parseFoundryArgs(["export", "--out"]).ok).toBe(false);
+  });
 });
 
 describe("runFoundryExport", () => {
@@ -88,9 +117,12 @@ describe("runFoundryExport", () => {
 
   it("writes a corpus from injected traces + server catalog", async () => {
     const out = join(dir, "corpus.json");
+    // A mixed harvest: rows written before `loaded` existed, and a current row
+    // whose pick (github) failed to start and was served by slack. The
+    // corpus folds on `chosen` either way.
     const blob = [
       JSON.stringify({ tokens: ["issue", "pull"], chosen: "github" }),
-      JSON.stringify({ tokens: ["pull", "issue"], chosen: "github" }), // dedups -> weight 2
+      JSON.stringify({ tokens: ["pull", "issue"], chosen: "github", loaded: "slack" }), // dedups -> weight 2
       JSON.stringify({ tokens: ["message", "channels"], chosen: "slack" }),
     ].join("\n");
     const r = await runFoundryExport({
@@ -323,6 +355,60 @@ describe("defaultLoadServers", () => {
     const servers = await defaultLoadServers(cwd, home);
     expect(servers).toHaveLength(1);
     expect(servers[0].tools).toEqual([]);
+  });
+
+  describe("bundled fallback list", () => {
+    const writeGithubImage = (): void => {
+      writeFileSync(
+        localBundlesPath(userConfigDir(home)),
+        JSON.stringify({
+          version: 1,
+          servers: [
+            {
+              namespace: "gh",
+              name: "GitHub",
+              command: "docker",
+              args: ["run", "-i", "--rm", "ghcr.io/github/github-mcp-server"],
+            },
+          ],
+        }),
+        "utf8",
+      );
+    };
+
+    it("snapshots a well-known server with no learned list on its bundled tools", async () => {
+      // The live ranker falls back to fallback-tools.ts for such a server
+      // (ConnectServer.rankableTools), so the dispatch that produced `chosen`
+      // ranked it on those tools. The snapshot used to give it tools: [].
+      writeGithubImage();
+      const servers = await defaultLoadServers(cwd, home);
+      expect(servers).toHaveLength(1);
+      expect(servers[0].tools).toEqual(
+        fallbackToolsFor({ command: "docker", args: ["ghcr.io/github/github-mcp-server"] }),
+      );
+      expect(servers[0].tools.length).toBeGreaterThan(0);
+    });
+
+    it("lets a learned list win over the bundled one, even an empty learned list", async () => {
+      writeGithubImage();
+      const writeState = (tools: Array<{ name: string }>): void =>
+        writeFileSync(
+          statePath(userConfigDir(home)),
+          JSON.stringify({
+            version: STATE_SCHEMA_VERSION,
+            savedAt: Date.now(),
+            learning: {},
+            packHistory: [],
+            toolCache: { gh: { tools, learnedAt: Date.now() } },
+          }),
+          "utf8",
+        );
+      writeState([{ name: "real_tool" }]);
+      expect((await defaultLoadServers(cwd, home))[0].tools).toEqual([{ name: "real_tool" }]);
+      // "Spawned and offered nothing" is an observation, not a missing list.
+      writeState([]);
+      expect((await defaultLoadServers(cwd, home))[0].tools).toEqual([]);
+    });
   });
 
   it("names an UNTRUSTED project bundles.json and points at `yaw-mcp trust` instead of saying none was found", async () => {

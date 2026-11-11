@@ -76,8 +76,9 @@ function resolveContinuePath(base: PathBase): ResolvedPath {
 export const CONTINUE_TARGET = defineTarget({
   clientId: "continue",
   label: "Continue",
-  // DEDICATED: this file is created by install and holds nothing else, unlike
-  // every other row's shared user config.
+  // DEDICATED: install creates this file itself, where every other row is
+  // handed a user config. It is data only -- nothing reads it, and a user may
+  // still add servers to the file (see the header).
   config: { format: "jsonc", root: "mcpServers", ownership: "dedicated" },
   availableOn: ["macos", "linux", "windows"],
   // Continue's VS Code extension does not watch the mcpServers folder, so the

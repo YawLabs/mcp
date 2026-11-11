@@ -186,6 +186,13 @@ describe("parseTryArgs", () => {
     expect(TRY_USAGE).not.toContain("YAW_MCP_BASE_URL");
   });
 
+  it("the --client help says auto-detect skips a TOML-config client", () => {
+    // autoDetectClient only returns a probe whose syntax is JSON, so a machine
+    // with only Codex CLI configured falls through to claude-code.
+    expect(TRY_USAGE).toMatch(/Only a client with a JSON config is auto-detected/);
+    expect(TRY_USAGE).toContain("--client codex-cli");
+  });
+
   it("rejects unknown flags", () => {
     const r = parseTryArgs(["demo", "--bogus"]);
     expect(r.ok).toBe(false);
@@ -1502,10 +1509,48 @@ describe("scanTrials + gcExpiredTrials", () => {
     // ("still wired in", "run yaw-mcp try-cleanup") would send them at the
     // client config, which is already clean.
     const warning = trialGcFailureWarning(result.failures[0]);
-    expect(warning).toContain("its entry was removed from");
+    expect(warning).toContain(`its entry is no longer in ${clientPath}`);
     expect(warning).toContain(stuckMarkerPath);
     expect(warning).toContain("delete that marker by hand");
     expect(warning).not.toContain("still wired in");
+  });
+
+  it("does not claim a removal when the entry was already gone before the sweep", async () => {
+    // Stage "unlink" is also where an ABSENT peel lands (no file, no entry, a
+    // blocked container): nothing was removed by this sweep, so the wording
+    // may only say the entry is not there.
+    const baseNow = 1_700_000_000_000;
+    const clientPath = join(synthHome, ".claude.json");
+    const before = JSON.stringify({ mcpServers: { keep: { command: "y" } } });
+    writeFileSync(clientPath, before);
+    const stuckMarkerPath = join(trialsDir(synthHome), "gone.json");
+    mkdirSync(stuckMarkerPath, { recursive: true });
+    writeFileSync(join(stuckMarkerPath, "not-empty"), "x");
+    const expiredMarker: TrialMarker = {
+      schemaVersion: 1,
+      slug: "gone",
+      expiresAt: baseNow - 1,
+      clientPath,
+      clientName: "claude-code",
+      containerPath: ["mcpServers"],
+      entryName: "yaw-mcp-try-gone",
+      createdAt: baseNow - 3_600_000,
+    };
+
+    const result = await gcExpiredTrials({
+      home: synthHome,
+      scan: {
+        live: [],
+        expired: [{ marker: expiredMarker, path: stuckMarkerPath, msUntilExpiry: -1, expired: true }],
+        malformed: [],
+      },
+    });
+    expect(result.failures[0].stage).toBe("unlink");
+    // The sweep wrote nothing: there was no entry to peel.
+    expect(readFileSync(clientPath, "utf8")).toBe(before);
+    const warning = trialGcFailureWarning(result.failures[0]);
+    expect(warning).toContain(`its entry is no longer in ${clientPath}`);
+    expect(warning).not.toContain("was removed");
   });
 });
 
@@ -1731,6 +1776,30 @@ describe("runTryCleanup — marker field validation", () => {
     expect(r.exitCode).toBe(1);
     expect(cap.errText()).toMatch(/is unreadable/);
     expect(existsSync(markerPath)).toBe(true);
+  });
+
+  it("refuses a marker whose containerPath holds a non-string, and doctor's scan agrees", async () => {
+    // ONE shape check for both readers: try-cleanup and scanTrials used to
+    // spell it separately, and neither looked inside the array.
+    const { clientPath, markerPath } = wireTrial({ ...baseMarker(), containerPath: ["mcpServers", 7] });
+
+    const cap = captureIO();
+    const r = await runTryCleanup({
+      slug: "demo",
+      home: synthHome,
+      force: true,
+      out: cap.pushOut,
+      err: cap.pushErr,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(cap.errText()).toMatch(/is unreadable/);
+    expect(existsSync(markerPath)).toBe(true);
+    expect(JSON.parse(readFileSync(clientPath, "utf8")).mcpServers["yaw-mcp-try-demo"]).toBeDefined();
+
+    const scan = await scanTrials({ home: synthHome });
+    expect(scan.live).toHaveLength(0);
+    expect(scan.expired).toHaveLength(0);
+    expect(scan.malformed).toEqual([markerPath]);
   });
 });
 

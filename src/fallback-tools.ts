@@ -11,9 +11,8 @@
 // Scope, deliberately narrow:
 //   * used ONLY when the server has no real list: no live connection, no
 //     list learned in this or an earlier session (an EMPTY learned list is a
-//     real observation and also wins), and no curated toolCache on the entry.
-//     The first successful load replaces it for good (see rankableFor in
-//     server.ts, the one reader).
+//     real observation and also wins). The first successful load replaces
+//     it for good (see rankableFor in server.ts, the one reader).
 //   * keyed by the server's IDENTITY -- the docker image or the binary its
 //     command runs -- never by the namespace the user chose, so a server
 //     someone named "github" that runs something else gets nothing.

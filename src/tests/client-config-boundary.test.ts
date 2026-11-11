@@ -81,8 +81,7 @@ const RULES: Rule[] = [
     allowed: {
       "src/client-config-json.ts": "the JSON-family adapter -- these ARE its implementation",
       "src/jsonc.ts": "the splicer the adapter delegates to; it declares editJsoncEntry/removeJsoncEntry",
-      "src/install-targets.ts":
-        "declares findBlockedContainerSegment and findLegacyEntry, which doctor and install both ask",
+      "src/install-targets.ts": "declares findLegacyEntry, which doctor asks",
       "src/doctor-cmd.ts": NOT_YET_MIGRATED,
     },
     positive: [
@@ -147,7 +146,7 @@ const RULES: Rule[] = [
         "compared when de-duplicating the searched scopes, and carried into `siteAt` as the address the " +
         "removal goes to. Not a walk: every read and write goes through the core",
       "src/install-cmd.ts":
-        "the SITE's own container path, read off the resolver -- rendered by `describeContainer` in the " +
+        "the SITE's own container path, read off the resolver -- rendered by the adapter's `describeLocation` in the " +
         "entry-count line, handed to `claudeCodeContainerPathVariants` as the canonical address a write " +
         "goes to, carried per RemovalSite into `siteAt`, and compared by `sharedGrantHolder` to keep the " +
         "sites an uninstall is emptying out of its holder search. Not a walk: every read and write goes " +

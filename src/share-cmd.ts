@@ -17,6 +17,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { CATALOG_SLUG_RE } from "./catalog.js";
 import {
+  asciiLines,
   GIT_MANIFEST_FILENAME,
   type GitManifest,
   type GitRefKind,
@@ -28,10 +29,12 @@ import {
   readGitManifest,
   readGitState,
   runGit,
+  tokenUsername,
 } from "./git-source.js";
-import { deriveNamespace } from "./local-bundles.js";
+import { deriveNamespace, relativeSegments } from "./local-bundles.js";
 import { createStreamWriter } from "./logger.js";
 import { GIT_BUILD_SHA_LEN, gitBuildDir } from "./paths.js";
+import { SECRET_REF_RE } from "./secrets-vault.js";
 import { pickGitEntry, type RawGitEntry, readTargetGitEntries } from "./update-cmd.js";
 
 export const SHARE_USAGE = `Usage: yaw-mcp share <name> [--pin] [--project] [--json]
@@ -82,11 +85,30 @@ export function parseShareArgs(
   return { ok: true, options: opts };
 }
 
-/** Quote a word for a POSIX shell (and PowerShell): bare when it is plainly
- *  safe, else in single quotes, which neither shell expands inside. */
+/** The POSIX spelling of an apostrophe inside a single-quoted word: close the
+ *  quote, a double-quoted apostrophe, reopen. */
+const POSIX_APOSTROPHE = `'"'"'`;
+
+/** Quote a word for a POSIX shell: bare when it is plainly safe, else in
+ *  single quotes. A word is never left bare when it STARTS with `#` (both
+ *  shells read that as a comment and drop the rest of the line) or with `@`
+ *  (PowerShell's splat sigil); past the first character both are inert.
+ *
+ *  PowerShell reads the same line the same way (it does not expand inside
+ *  single quotes either) with TWO exceptions, and runShare adds a note for
+ *  each whenever a word needs it:
+ *   - an embedded apostrophe. POSIX has to leave the quotes to write one and
+ *     PowerShell doubles it instead, so no single spelling serves both; the
+ *     POSIX one is printed.
+ *   - an embedded double quote. Windows PowerShell 5.1 drops it when it hands
+ *     a single-quoted word to a native command ('say "hi"' arrives as
+ *     `say hi`) unless it is written \" (both checked on 5.1.26100).
+ *     PowerShell 7.3 changed native argument passing and is documented to
+ *     pass the quote through; that was not checked here.
+ *  cmd.exe is not covered: single quotes do not quote there. */
 function shellWord(w: string): string {
-  if (/^[A-Za-z0-9._/:@#=+,-]+$/.test(w)) return w;
-  return `'${w.replace(/'/g, `'"'"'`)}'`;
+  if (/^[A-Za-z0-9._/:=+,-][A-Za-z0-9._/:@#=+,-]*$/.test(w)) return w;
+  return `'${w.replace(/'/g, POSIX_APOSTROPHE)}'`;
 }
 
 /** Forges whose ssh user is always "git", so any other ssh username in a URL
@@ -142,7 +164,11 @@ async function refKind(
   return st && normalizeRepoUrl(st.url) === normalizeRepoUrl(e.git.url) ? st.kind : null;
 }
 
-const SECRET_REF_RE = /^\$\{secret:([^}]+)\}$/;
+/** `${secret:NAME}` and nothing else, anchored. Built from the vault's own
+ *  SECRET_REF_RE source (as local-set-cmd.ts does) rather than a wider class
+ *  of its own, so a malformed reference such as `${secret:gh token}` is a
+ *  plain value here exactly as it is to the vault. */
+const WHOLE_SECRET_REF_RE = new RegExp(`^${SECRET_REF_RE.source}$`);
 
 interface ShareFlag {
   flag: string;
@@ -165,13 +191,19 @@ function flagsFor(e: RawGitEntry, manifest: GitManifest | null, inferred: string
   if (description && description !== manifest?.description) {
     push("--description", ["--description", description], manifest?.description !== undefined);
   }
+  // Compared as directories, not as strings: the stored subdir is the tidy
+  // spelling ("server") while the manifest's is read as its author typed it
+  // ("./server", "server/"), and those name one directory.
   const subdir = e.git.subdir;
-  if (subdir && subdir !== manifest?.subdir) push("--subdir", ["--subdir", subdir], manifest?.subdir !== undefined);
+  const dirOf = (p: string | undefined): string => relativeSegments(p ?? "").join("/");
+  if (subdir && dirOf(subdir) !== dirOf(manifest?.subdir)) {
+    push("--subdir", ["--subdir", subdir], manifest?.subdir !== undefined);
+  }
   const entryCovered = manifest?.entry !== undefined ? manifest.entry === e.git.entry : inferred === e.git.entry;
   if (!entryCovered) push("--entry", ["--entry", e.git.entry], manifest?.entry !== undefined);
   for (const [key, value] of Object.entries(e.env)) {
     const decl = manifest?.env?.[key];
-    const ref = SECRET_REF_RE.exec(value)?.[1];
+    const ref = WHOLE_SECRET_REF_RE.exec(value)?.[1];
     if (decl?.secret !== undefined && decl.secret === ref) continue;
     if (decl?.default !== undefined && decl.default === value) continue;
     push(
@@ -187,14 +219,26 @@ function flagsFor(e: RawGitEntry, manifest: GitManifest | null, inferred: string
 export async function runShare(opts: ShareCommandOptions): Promise<{ exitCode: number }> {
   const out = opts.out ?? createStreamWriter(process.stdout);
   const err = opts.err ?? createStreamWriter(process.stderr);
-  const print = (s = ""): void => out(`${s.replace(/[^\x20-\x7e\n]/g, "?")}\n`);
+  // Terminal hardening for the human text: anything outside printable ASCII
+  // becomes "?". That alters a paste line holding such a character, which is
+  // why the text path adds a note when it happens (see below).
+  const print = (s = ""): void => out(`${asciiLines(s)}\n`);
+  // The --json document is data, so it is escaped rather than replaced: every
+  // UTF-16 unit outside printable ASCII is written as a JSON \uXXXX escape
+  // (JSON.stringify already escaped the C0 controls; the newlines left are its
+  // own indentation). The output is still pure ASCII and parses back to the
+  // exact strings.
+  const printJson = (doc: unknown): void =>
+    out(
+      `${JSON.stringify(doc, null, 2).replace(/[^\x20-\x7e\n]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`)}\n`,
+    );
   const fail = (exitCode: number, message: string): { exitCode: number } => {
     // Under --json the refusal is the result: stdout gets the document (same
-    // print/sanitizer path the success doc uses), stderr keeps the human
+    // printJson path the success doc uses), stderr keeps the human
     // line. share's refusals are selection failures, so nothing has been
     // rendered yet and the doc is the whole stdout.
-    if (opts.json === true) print(JSON.stringify({ ok: false, error: `yaw-mcp share: ${message}`, exitCode }, null, 2));
-    err(`yaw-mcp share: ${message.replace(/[^\x20-\x7e\n]/g, "?")}\n`);
+    if (opts.json === true) printJson({ ok: false, error: `yaw-mcp share: ${message}`, exitCode });
+    err(`yaw-mcp share: ${asciiLines(message)}\n`);
     return { exitCode };
   };
   const home = opts.home ?? homedir();
@@ -204,7 +248,7 @@ export async function runShare(opts: ShareCommandOptions): Promise<{ exitCode: n
 
   const file = await readTargetGitEntries(opts.project === true, home, cwd, env);
   if ("error" in file) return fail(1, file.error);
-  for (const w of file.warnings) err(`warning: ${w.replace(/[^\x20-\x7e\n]/g, "?")}\n`);
+  for (const w of file.warnings) err(`warning: ${asciiLines(w)}\n`);
   const pick = pickGitEntry(file, name);
   if (!pick.ok) {
     const hint = !opts.project && pick.exitCode === 1 ? " For a project entry add --project." : "";
@@ -241,30 +285,47 @@ export async function runShare(opts: ShareCommandOptions): Promise<{ exitCode: n
       ? null
       : (e.slug ?? (CATALOG_SLUG_RE.test(e.namespace) ? e.namespace : e.namespace.replace(/_/g, "-")));
   const flags = flagsFor(e, manifest, inferred);
-  const lineFor = (url: string, https: boolean): string =>
-    [
-      "yaw-mcp",
-      "add",
-      ...(nameWord ? [nameWord] : []),
-      "--git",
-      `${url}${ref ? `#${ref}` : ""}`,
-      ...flags.flatMap((f) => f.words),
-      ...(https && e.git.tokenSecret ? ["--git-token-secret", e.git.tokenSecret] : []),
-    ]
-      .map(shellWord)
-      .join(" ");
+  const wordsFor = (url: string, https: boolean): string[] => [
+    "yaw-mcp",
+    "add",
+    ...(nameWord ? [nameWord] : []),
+    "--git",
+    `${url}${ref ? `#${ref}` : ""}`,
+    ...flags.flatMap((f) => f.words),
+    ...(https && e.git.tokenSecret ? ["--git-token-secret", e.git.tokenSecret] : []),
+  ];
+  const lineFor = (url: string, https: boolean): string => wordsFor(url, https).map(shellWord).join(" ");
   const other = otherProtocolUrl(spec);
-  const sshUrl = spec.protocol === "ssh" ? spec.url : other;
-  const httpsUrl = spec.protocol === "https" ? spec.url : other;
+  // The sharer's own https username is dropped, as otherProtocolUrl drops it:
+  // the repo is the same without it, and a coworker pasting it would be
+  // prompted for that account. (parseGitSpec already refused a password or a
+  // token there.) The exception is a URL username that git SENDS beside the
+  // vault token: with --git-token-secret, tokenUsername uses it on every host
+  // it has no fixed name for, so it can be the one the host requires
+  // (Bitbucket's x-token-auth) and dropping it would authenticate coworkers as
+  // "git". It is kept, and a note names it. An ssh username is kept too -- it
+  // can be the account the host requires -- and named when it is not the
+  // conventional "git".
+  const tokenUser =
+    spec.protocol === "https" &&
+    e.git.tokenSecret &&
+    spec.username !== undefined &&
+    tokenUsername(spec) === spec.username
+      ? spec.username
+      : null;
+  const ownUrl =
+    spec.protocol === "https" && tokenUser === null ? spec.url.replace(/^([a-z]+:\/\/)[^/@]*@/i, "$1") : spec.url;
+  const sshUrl = spec.protocol === "ssh" ? ownUrl : other;
+  const httpsUrl = spec.protocol === "https" ? ownUrl : other;
   const commands = {
-    primary: lineFor(spec.url, spec.protocol === "https"),
+    primary: lineFor(ownUrl, spec.protocol === "https"),
     ssh: sshUrl ? lineFor(sshUrl, false) : null,
     https: httpsUrl ? lineFor(httpsUrl, true) : null,
   };
 
   const secrets = new Map<string, string>();
   for (const [key, value] of Object.entries(e.env)) {
-    const s = SECRET_REF_RE.exec(value)?.[1];
+    const s = WHOLE_SECRET_REF_RE.exec(value)?.[1];
     if (s && !secrets.has(s)) secrets.set(s, key);
   }
   for (const [key, decl] of Object.entries(manifest?.env ?? {})) {
@@ -299,6 +360,32 @@ export async function runShare(opts: ShareCommandOptions): Promise<{ exitCode: n
       `${e.namespace} is not built on this machine, so the repo's yaw-mcp.json was not read; the command spells out every flag.`,
     );
   }
+  if (spec.protocol === "ssh" && spec.username !== undefined && spec.username !== "git") {
+    notes.push(
+      `The SSH URL logs in as "${spec.username}". Coworkers who do not use that account replace it with their own username.`,
+    );
+  }
+  if (tokenUser !== null) {
+    notes.push(
+      `The HTTPS URL keeps the username "${tokenUser}": git sends it with the token on this host. Coworkers whose token needs a different username replace it.`,
+    );
+  }
+  // Every form shares its words bar the URL, so the primary line's words plus
+  // the other protocol's URL cover all of them.
+  const allWords = [...wordsFor(ownUrl, true), other ?? ""];
+  if (allWords.some((w) => w.includes("'"))) {
+    notes.push(
+      `The command is quoted for bash and zsh. It contains an apostrophe, written ${POSIX_APOSTROPHE}; in PowerShell replace each ${POSIX_APOSTROPHE} with two single quotes ('').`,
+    );
+  }
+  // See shellWord: Windows PowerShell 5.1 drops a double quote inside a
+  // single-quoted word on its way to yaw-mcp, so the paste would silently
+  // change the value.
+  if (allWords.some((w) => w.includes('"'))) {
+    notes.push(
+      `The command is quoted for bash and zsh. It contains a double quote ("), which Windows PowerShell 5.1 drops when it runs the command; there, write each one as \\".`,
+    );
+  }
   if (e.args.length > 0) {
     notes.push(
       `${e.namespace} also passes ${e.args.length} server argument${e.args.length === 1 ? "" : "s"}, not shown here (they can hold local paths); coworkers add their own after --.`,
@@ -307,27 +394,29 @@ export async function runShare(opts: ShareCommandOptions): Promise<{ exitCode: n
 
   const repo = normalizeRepoUrl(spec.url);
   if (opts.json) {
-    print(
-      JSON.stringify(
-        {
-          ok: true,
-          namespace: e.namespace,
-          repo,
-          ref: ref ?? null,
-          kind,
-          pinned: opts.pin === true,
-          command: commands.primary,
-          commands: { ssh: commands.ssh, https: commands.https },
-          flags: [...new Set(flags.map((f) => f.flag))],
-          secrets: [...secrets].map(([secret, envKey]) => ({ name: secret, env: envKey })),
-          tokenSecret: e.git.tokenSecret ?? null,
-          notes,
-        },
-        null,
-        2,
-      ),
-    );
+    printJson({
+      ok: true,
+      namespace: e.namespace,
+      repo,
+      ref: ref ?? null,
+      kind,
+      pinned: opts.pin === true,
+      command: commands.primary,
+      commands: { ssh: commands.ssh, https: commands.https },
+      flags: [...new Set(flags.map((f) => f.flag))],
+      secrets: [...secrets].map(([secret, envKey]) => ({ name: secret, env: envKey })),
+      tokenSecret: e.git.tokenSecret ?? null,
+      notes,
+    });
     return { exitCode: 0 };
+  }
+  // Text only: `print` turns anything outside printable ASCII into "?", so a
+  // command holding such a character is NOT what the entry says. The --json
+  // document carries it exactly, hence the pointer.
+  if ([commands.primary, commands.ssh ?? "", commands.https ?? ""].some((c) => /[^\x20-\x7e]/.test(c))) {
+    notes.push(
+      `The command holds characters outside printable ASCII, shown here as "?". Coworkers retype them after pasting; yaw-mcp share ${shellWord(name)}${opts.project ? " --project" : ""} --json prints the command exactly.`,
+    );
   }
   // The placeholder travels INSIDE the paste line on purpose (a paste must be
   // one byte-exact line), so it needs the only place a human reads this: an

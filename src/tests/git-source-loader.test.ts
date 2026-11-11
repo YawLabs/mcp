@@ -200,6 +200,11 @@ describe("unsafeRelativePathReason", () => {
     "a\\..",
     `a${String.fromCharCode(10)}b`,
     `a${String.fromCharCode(0)}`,
+    // DEL and the C1 range (0x9b is an 8-bit CSI): the same rule a `--git`
+    // URL and a yaw-mcp.json string are held to.
+    `a${String.fromCharCode(0x7f)}`,
+    `a${String.fromCharCode(0x80)}b`,
+    `a${String.fromCharCode(0x9b)}2J`,
   ])("refuses %j", (p) => {
     expect(unsafeRelativePathReason(p)).not.toBeNull();
   });
@@ -359,5 +364,24 @@ describe("upsert: converting between git, command and url", () => {
       { home, origin: "custom" },
     );
     expect(otherSubdir.launchChanged?.to).toEqual({ git: { url: URL, subdir: "packages/server" } });
+  });
+
+  it("one subdir spelled two ways is not a launch change", async () => {
+    // A stored entry holding the subdir as it was typed, re-added with the
+    // tidy spelling `add --git` records now: the same directory, so no note.
+    for (const typed of ["./packages/server/", "packages\\server", "packages/server/"]) {
+      writeBundles([gitEntry({ ...git, subdir: typed }, { slug: "acme-tools" })]);
+      const tidy = { ...git, commit: COMMIT_B, subdir: "packages/server" };
+      const incoming = { namespace: "acme_tools", slug: "acme-tools", git: tidy };
+      const preview = await previewUpsert(incoming, { home, origin: "custom" });
+      expect(preview.launchChanged, typed).toBeUndefined();
+      const written = await upsert(incoming, { home, origin: "custom" });
+      expect(written.launchChanged, typed).toBeUndefined();
+      expect(readBundles().servers[0].git).toEqual(tidy);
+    }
+    // "." and no subdir are both the repo root.
+    writeBundles([gitEntry({ ...git, subdir: "." }, { slug: "acme-tools" })]);
+    const root = await previewUpsert({ namespace: "acme_tools", slug: "acme-tools", git }, { home, origin: "custom" });
+    expect(root.launchChanged).toBeUndefined();
   });
 });

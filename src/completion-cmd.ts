@@ -60,11 +60,14 @@ interface SubcommandSpec {
    *  INSIDE brackets, not after a colon (`name:description` is `_describe`
    *  syntax and `_values` would read the text after ':' as an argument spec).
    *  Keep it free of '[' / ']' (they close the description early) and of
-   *  parentheses (they open an action group). */
+   *  parentheses (they open an action group). An apostrophe is safe to write
+   *  but better avoided: the zsh generator emits each spec inside single
+   *  quotes and escapes one through zshSingleQuoted, while a bare one would
+   *  unbalance the whole script. */
   description: string;
   /** Positional argument POSITIONS, in order. Each inner array is the set of
    *  one-of-N alternative candidates that complete at that single position
-   *  (`install` takes ONE client chosen from four, so all four clients live
+   *  (`install` takes ONE client out of the list, so every client lives
    *  together in position 0 -- NOT one candidate per position). An entry like
    *  "<slug>" is a documentation placeholder for a free-form argument;
    *  placeholders are filtered out of the generated scripts but keep their
@@ -164,7 +167,7 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
   // Mirrors parseImportArgs in src/import-cmd.ts.
   {
     name: "import",
-    description: "Adopt a client's existing MCP servers into bundles.json",
+    description: "Adopt the MCP servers a client already has into bundles.json",
     positional: [[...INSTALL_CLIENTS]],
     flags: ["--scope", "--project-dir", "--dry-run", "--remove-originals", "--keep-originals", "--force", "--help"],
   },
@@ -301,7 +304,7 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
   // --force / -y / --yes, and off a TTY the delete refuses without one.
   {
     name: "reset-learning",
-    description: "Clear cross-session learning history",
+    description: "Delete state.json: learning history and cached tool lists",
     flags: ["--force", "--yes", "--help"],
   },
   {
@@ -326,7 +329,7 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
     flags: ["--json", "--help"],
   },
   // --strict / --min-grade are forwarded verbatim to the mcp-compliance child
-  // (see npxArgs in compliance-cmd.ts) and are what turn a failing grade into a
+  // (see suiteArgs in compliance-cmd.ts) and are what turn a failing grade into a
   // non-zero exit, so they are the flags a CI gate is written around -- they
   // belong in completion even though this command's own parser only inspects
   // --help/--publish.
@@ -429,8 +432,8 @@ function renderBash(): string {
   const topLevelFlags = "--help -h --version -V";
   const cases = SUBCOMMAND_SPEC.map((spec) => {
     // Emit one if-block per positional SLOT, offering every alternative for
-    // that slot in a single compgen word list (so `install <TAB>` shows all
-    // four clients at once). The slot's original index computes the cword
+    // that slot in a single compgen word list (so `install <TAB>` shows every
+    // client at once). The slot's original index computes the cword
     // position (cword == slotIndex + 2 because COMP_WORDS[0] is "yaw-mcp",
     // COMP_WORDS[1] is the subcommand).
     //
@@ -478,6 +481,13 @@ complete -F _yaw-mcp yaw-mcp
 `;
 }
 
+/** One zsh single-quoted word. Nothing is special inside single quotes, the
+ *  quote itself included, so an embedded one is written as close-quote,
+ *  backslash-quote, reopen (`'\''`). Exported for the test that pins it. */
+export function zshSingleQuoted(s: string): string {
+  return `'${s.replace(/'/g, "'\\''")}'`;
+}
+
 function renderZsh(): string {
   // Descriptions come straight from the spec (single source of truth), so a
   // newly-added subcommand can never render with a blank zsh description.
@@ -490,10 +500,17 @@ function renderZsh(): string {
   //      description at all. (`name:description` is `_describe` syntax.)
   //   2. Join with " \\\n" -- every spec line but the last must end in a
   //      line-continuation. Joining on a bare newline continued only the
-  //      FIRST spec onto the `_values` call; the other 18 were emitted as
-  //      standalone commands, so a user got `install` as the only candidate
-  //      plus 18 `command not found: add:...` errors on the first TAB.
-  const subcommandList = SUBCOMMAND_SPEC.map((s) => `    '${s.name}[${s.description}]'`).join(" \\\n");
+  //      FIRST spec onto the `_values` call; every other one was emitted as a
+  //      standalone command, so a user got `install` as the only candidate
+  //      plus a `command not found: add:...` error per remaining spec on the
+  //      first TAB.
+  //   3. An apostrophe in a description. Each spec is one single-quoted word,
+  //      so a bare one (`a client's ...`) ended the word early and left the
+  //      script with an odd number of quotes -- zsh refused to load the whole
+  //      file. zshSingleQuoted closes, escapes and reopens the quote.
+  const subcommandList = SUBCOMMAND_SPEC.map((s) => `    ${zshSingleQuoted(`${s.name}[${s.description}]`)}`).join(
+    " \\\n",
+  );
 
   const argsCases = SUBCOMMAND_SPEC.map((spec) => {
     const lines = [`      ${spec.name})`];

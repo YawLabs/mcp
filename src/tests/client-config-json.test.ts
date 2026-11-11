@@ -26,9 +26,6 @@ import {
 } from "../client-config.js";
 import { buildFreshConfig, JSON_ADAPTER, JSONC_ADAPTER, UTF8_BOM } from "../client-config-json.js";
 import { deepEqualJson } from "../install-cmd.js";
-// findBlockedContainerSegment lives in install-targets.ts, which is where
-// doctor reads it from too; install-cmd.ts only imports it.
-import { findBlockedContainerSegment } from "../install-targets.js";
 
 // TAB is built from its code point, never typed as an escape: a backslash-t
 // that loses a level on its way into this file becomes a REAL tab inside a
@@ -245,10 +242,9 @@ describe("a nested container", () => {
     expect(uninstall(installed, NESTED)).toContain('"C:/other"');
   });
 
-  it("names itself in a message the way install already spells it", () => {
-    // Byte-identical to describeContainer(file, containerPath) in
-    // install-cmd.ts, which is not exported -- so the wording is pinned here
-    // and the consumer's copy is deleted when it adopts this adapter.
+  it("names itself in a message the way install spells it", () => {
+    // install-cmd.ts prints this through `view.adapter.describeLocation` and
+    // keeps no copy of its own, so the wording is pinned here.
     const addr = { format: "jsonc" as const, containerPath: NESTED.resolved.containerPath };
     expect(JSONC_ADAPTER.describeLocation("/home/u/.claude.json", addr)).toBe(
       '/home/u/.claude.json under projects["C:/repo"].mcpServers',
@@ -477,6 +473,52 @@ describe("strict JSON refuses what its client cannot read", () => {
   });
 });
 
+describe("a key written twice in one object", () => {
+  // JSON.parse (every reader here) takes the LAST definition; the splicer
+  // locates the FIRST. So the edit lands on a definition nothing reads, and
+  // the facade's read-back refused it -- with "did not read back ... as it
+  // was written" for an install and "is still in ... after removing it" for an
+  // uninstall, neither of which names the cause. The MUTATION these pin:
+  // delete the `refuseDuplicateKey` calls in client-config-json.ts and both
+  // messages go back to those.
+  const TWICE =
+    '{\n  "mcpServers": {\n    "mcp": {"command": "A"},\n    "fs": {"command": "x"},\n' +
+    '    "mcp": {"command": "B"}\n  }\n}\n';
+
+  it("refuses an install and an uninstall of that key, saying which key and why", () => {
+    const why =
+      '/home/u/cfg.json could not be edited ("mcp" is defined 2 times under "mcpServers"; a JSON parser reads ' +
+      "only the last definition, so delete the others by hand, then re-run)";
+    expect(refusalOf(() => install(TWICE)).message).toBe(why);
+    expect(refusalOf(() => uninstall(TWICE)).message).toBe(why);
+    expect(refusalOf(() => install(TWICE, STRICT)).message).toBe(why);
+  });
+
+  it("names a duplicated CONTAINER key too, at whatever depth it sits", () => {
+    const top = '{\n  "mcpServers": {"fs": {"command": "x"}},\n  "mcpServers": {}\n}\n';
+    expect(refusalOf(() => install(top)).message).toBe(
+      '/home/u/cfg.json could not be edited ("mcpServers" is defined 2 times at the top level; a JSON parser ' +
+        "reads only the last definition, so delete the others by hand, then re-run)",
+    );
+    const nested = site(["projects", "C:/repo", "mcpServers"]);
+    const deep = '{"projects": {"C:/repo": {"mcpServers": {}}, "C:/repo": {"mcpServers": {}}}}\n';
+    expect(refusalOf(() => install(deep, nested)).message).toContain('"C:/repo" is defined 2 times under "projects"');
+  });
+
+  it("still edits a key that is written once beside a duplicated neighbour", () => {
+    // Only the path being edited is checked: somebody else's duplicated
+    // server is not ours to refuse over, and the edit leaves both copies
+    // byte for byte.
+    const raw = '{\n  "mcpServers": {\n    "fs": {"command": "A"},\n    "fs": {"command": "B"}\n  }\n}\n';
+    const installed = install(raw);
+    expect(installed).toContain('"fs": {"command": "A"},\n    "fs": {"command": "B"},');
+    expect(classifyClientConfig(installed, FLAT).entry()?.launch?.command).toBe("npx");
+    expect(uninstall(installed)).toBe(raw);
+    // A removal of a key that is not there stays the identity no-op.
+    expect(JSONC_ADAPTER.remove(raw, { format: "jsonc", containerPath: ["mcpServers"] }, "mcp")).toBe(raw);
+  });
+});
+
 describe("malformed and blocked files", () => {
   it("reports a reason and a position, and writes nothing", () => {
     const raw = '{\n  "mcpServers": {\n    "mcp": {\n      "command": "npx",\n';
@@ -609,27 +651,28 @@ describe("malformed and blocked files", () => {
     );
   });
 
-  it("agrees with install-cmd's own blocked-segment walk", () => {
-    // The adapter has its own copy while the consumer still has one; pinned
-    // against each other so they cannot drift apart unnoticed.
-    for (const [label, doc] of [
-      ["null", { mcpServers: null }],
-      ["scalar", { mcpServers: 3 }],
-      ["empty array", { mcpServers: [] }],
-      ["full array", { mcpServers: [{ a: 1 }] }],
-      ["fine", { mcpServers: { mcp: {} } }],
-      ["deep", { projects: 5 }],
+  it("names the blocked segment and whether it is reparable, shape by shape", () => {
+    // The adapter's walk is the only one there is: install and doctor both
+    // take path / shape / reparable from this read. These rows used to be
+    // compared against a second walk in install-targets.ts; that walk is
+    // deleted, so its answers are pinned here as values.
+    for (const [label, doc, expected] of [
+      ["null", { mcpServers: null }, { path: ["mcpServers"], reparable: true }],
+      ["scalar", { mcpServers: 3 }, { path: ["mcpServers"], reparable: true }],
+      ["empty array", { mcpServers: [] }, { path: ["mcpServers"], reparable: true }],
+      ["full array", { mcpServers: [{ a: 1 }] }, { path: ["mcpServers"], reparable: false }],
+      ["fine", { mcpServers: { mcp: {} } }, null],
+      ["deep", { projects: 5 }, { path: ["projects"], reparable: true }],
     ] as const) {
       const path = label === "deep" ? ["projects", "C:/r", "mcpServers"] : ["mcpServers"];
-      const theirs = findBlockedContainerSegment(doc as Record<string, unknown>, path);
       const read = classifyClientConfig(JSON.stringify(doc), site(path)).read;
-      if (theirs === null) {
+      if (expected === null) {
         expect(read.kind, label).not.toBe("blocked");
       } else {
         expect(read.kind, label).toBe("blocked");
         if (read.kind !== "blocked") continue;
-        expect(read.path, label).toEqual(theirs.path);
-        expect(read.reparable, label).toBe(theirs.reparable);
+        expect(read.path, label).toEqual(expected.path);
+        expect(read.reparable, label).toBe(expected.reparable);
       }
     }
   });

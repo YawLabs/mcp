@@ -40,7 +40,6 @@ import { type BundlesSummary, runInstall } from "../install-cmd.js";
 import {
   blockedContainerFix,
   claudeCodeProjectKey,
-  describeJsonShape,
   ENTRY_NAME,
   INSTALL_TARGETS,
   resolveInstallSites,
@@ -49,6 +48,7 @@ import {
 } from "../install-targets.js";
 import { isOamLaunch, MIN_OAM_VERSION, OAM_INSTALL_PS1, OAM_INSTALL_SH } from "../oam-spawn.js";
 import { STATE_FILENAME, STATE_SCHEMA_VERSION } from "../persistence.js";
+import { REGISTRY_CACHE_FILENAME } from "../registry-cache.js";
 import {
   createEmptyVault,
   isUnlocked,
@@ -343,6 +343,26 @@ describe("runDoctor — client detection", () => {
     expect(cap.text()).not.toMatch(/Claude Code \(user\): OK/);
     expect(r.exitCode).toBe(2);
     expect(cap.text()).not.toContain("All good");
+  });
+
+  it("flags a DIRECTORY at the oam entry path, the entry the heal sweep rewrites", async () => {
+    // existsSync is true for a directory, so this read "OK (runs on oam)",
+    // exit 0, while heal's gate 2 (a regular FILE or it is broken) called the
+    // same entry dead. One test for both now: isLaunchableEntryFile.
+    const oamBin = join(synthHome, "oam");
+    writeFileSync(oamBin, "");
+    const dirEntry = join(synthHome, "pkg", "dist");
+    mkdirSync(dirEntry, { recursive: true });
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: oamBin, args: ["run", "--no-check", dirEntry] } } }),
+    );
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, err: () => {} });
+    const client = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
+    expect(client?.launchOamEntryMissing).toBe(dirEntry);
+    expect(cap.text()).not.toMatch(/Claude Code \(user\): OK/);
+    expect(r.exitCode).toBe(2);
   });
 
   it("reports a fully resolvable oam entry as OK", async () => {
@@ -1197,6 +1217,7 @@ describe("runDoctor — env table lockstep with `yaw-mcp --help`", () => {
     "YAW_MCP_VAULT_PASSPHRASE", // a credential -- SECRET VAULT reports it as a boolean
     "YAW_MCP_VAULT_PASSPHRASE_NEW", // a credential, same reason
     "YAW_MCP_READONLY_DIAGNOSTICS", // reported by the `mode: read-only` line / `readOnly`, and only when set
+    "YAW_MCP_LOG_LEVEL", // log verbosity/rendering knob, like the unprefixed LOG_LEVEL doctor does not list
   ]);
 
   it("finds the help table at all", () => {
@@ -1275,6 +1296,10 @@ describe("runDoctor — UPGRADE AVAILABLE method-aware hints", () => {
     const txt = cap.text();
     expect(txt).toContain("UPGRADE AVAILABLE");
     expect(txt).toContain("restart your MCP client");
+    // Only an @latest entry is refreshed by a restart; the hint says so and
+    // names the remedy for the other kind.
+    expect(txt).toContain("pick it up if its entry runs");
+    expect(txt).toContain("@yawlabs/mcp@latest; otherwise re-run `yaw-mcp install <client>`.");
     expect(txt).not.toContain("npm install");
   });
 
@@ -1369,6 +1394,241 @@ describe("runDoctor — UPGRADE AVAILABLE method-aware hints", () => {
     const txt = cap.text();
     expect(txt).toContain("UPGRADE AVAILABLE");
     expect(txt).toContain("npm install -g @yawlabs/mcp@latest");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The 24 h registry cache (registry-cache.ts). Yaw Terminal's MCP panel runs
+// `doctor --json` on every refresh, and each run used to make one registry GET
+// for @yawlabs/mcp plus one per installed sidecar. The hooks stand in for the
+// request only, so counting their calls counts the GETs a real run would make.
+// ---------------------------------------------------------------------------
+
+describe("runDoctor — registry cache", () => {
+  const fixedNow = 1_000_000_000_000;
+  const HOUR = 60 * 60 * 1000;
+
+  function cacheFile(): string {
+    return join(synthHome, ".yaw-mcp", REGISTRY_CACHE_FILENAME);
+  }
+
+  function seedCache(packages: Record<string, { latest: string; at: number }>): void {
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    writeFileSync(cacheFile(), JSON.stringify({ version: 1, packages }));
+  }
+
+  function countingFetch(answer: string | null) {
+    const calls: number[] = [];
+    const fetch = async (): Promise<string | null> => {
+      calls.push(1);
+      return answer;
+    };
+    return { calls, fetch };
+  }
+
+  /** A text run in the UPGRADE AVAILABLE configuration (see the describe
+   *  above), so the latest version doctor settled on is visible in the text. */
+  async function runText(registryFetch: () => Promise<string | null>, env: NodeJS.ProcessEnv = {}) {
+    const cap = captureOut();
+    await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env,
+      os: "linux",
+      out: cap.out,
+      err: () => {},
+      now: () => fixedNow,
+      currentVersion: "0.40.0",
+      argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
+      registryFetch,
+    });
+    return cap.text();
+  }
+
+  it("a fresh cache entry answers with no GET, on the text and --json paths", async () => {
+    seedCache({ "@yawlabs/mcp": { latest: "0.45.0", at: fixedNow - HOUR } });
+    const probe = countingFetch("0.99.0");
+
+    const txt = await runText(probe.fetch);
+    expect(txt).toContain("UPGRADE AVAILABLE");
+    expect(txt).toContain("npm latest is 0.45.0");
+
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: () => {},
+      err: () => {},
+      json: true,
+      now: () => fixedNow,
+      currentVersion: "0.40.0",
+      registryFetch: probe.fetch,
+    });
+    expect(JSON.parse(r.lines[0]).upgrade).toMatchObject({ latest: "0.45.0", stale: true });
+    expect(probe.calls).toHaveLength(0);
+  });
+
+  it("a miss fetches once and stores the answer, so the next run makes no GET", async () => {
+    const probe = countingFetch("0.45.0");
+    expect(await runText(probe.fetch)).toContain("npm latest is 0.45.0");
+    expect(probe.calls).toHaveLength(1);
+    expect(JSON.parse(readFileSync(cacheFile(), "utf8"))).toEqual({
+      version: 1,
+      packages: { "@yawlabs/mcp": { latest: "0.45.0", at: fixedNow } },
+    });
+
+    expect(await runText(probe.fetch)).toContain("npm latest is 0.45.0");
+    expect(probe.calls).toHaveLength(1);
+  });
+
+  it("an entry 24 h old or older is refetched and replaced", async () => {
+    seedCache({ "@yawlabs/mcp": { latest: "0.41.0", at: fixedNow - 24 * HOUR } });
+    const probe = countingFetch("0.45.0");
+    expect(await runText(probe.fetch)).toContain("npm latest is 0.45.0");
+    expect(probe.calls).toHaveLength(1);
+    expect(JSON.parse(readFileSync(cacheFile(), "utf8")).packages["@yawlabs/mcp"]).toEqual({
+      latest: "0.45.0",
+      at: fixedNow,
+    });
+  });
+
+  it("a corrupt cache file reads as a miss: refetched, and rewritten whole", async () => {
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    writeFileSync(cacheFile(), '{"version":1,"packages":{"@yawlabs/mcp":');
+    const probe = countingFetch("0.45.0");
+    expect(await runText(probe.fetch)).toContain("npm latest is 0.45.0");
+    expect(probe.calls).toHaveLength(1);
+    expect(JSON.parse(readFileSync(cacheFile(), "utf8")).packages["@yawlabs/mcp"].latest).toBe("0.45.0");
+  });
+
+  it("an 'unknown' answer is not cached: the next run asks again", async () => {
+    const probe = countingFetch(null);
+    expect(await runText(probe.fetch)).not.toContain("UPGRADE AVAILABLE");
+    expect(await runText(probe.fetch)).not.toContain("UPGRADE AVAILABLE");
+    expect(probe.calls).toHaveLength(2);
+    expect(existsSync(cacheFile())).toBe(false);
+  });
+
+  it("caches each sidecar package too, keyed by name", async () => {
+    writeYawMcpConfig(synthHome, "bundles.json", {
+      version: 1,
+      servers: [{ namespace: "fetch", name: "Fetch", command: "npx", args: ["-y", "@yawlabs/fetch-mcp@latest"] }],
+    });
+    const pkgDir = join(synthHome, ".yaw-mcp", "sidecars", "node_modules", "@yawlabs", "fetch-mcp");
+    mkdirSync(pkgDir, { recursive: true });
+    writeFileSync(join(pkgDir, "package.json"), JSON.stringify({ name: "@yawlabs/fetch-mcp", version: "0.3.6" }));
+    const probed: string[] = [];
+    const run = () =>
+      runDoctor({
+        cwd: synthCwd,
+        home: synthHome,
+        env: {},
+        os: "linux",
+        out: () => {},
+        err: () => {},
+        json: true,
+        skipRegistryCheck: true,
+        now: () => fixedNow,
+        oamProbe: () => ({
+          bin: "/usr/local/bin/oam",
+          binPath: "/usr/local/bin/oam",
+          version: MIN_OAM_VERSION,
+          belowMin: false,
+          failure: null,
+          failureDetail: null,
+        }),
+        sidecarRegistryFetch: async (pkg) => {
+          probed.push(pkg);
+          return "0.9.9";
+        },
+      });
+
+    for (let i = 0; i < 2; i++) {
+      const parsed = JSON.parse((await run()).lines[0]);
+      expect(parsed.oamRuntime.managed.packages).toEqual([
+        { pkg: "@yawlabs/fetch-mcp", version: "0.3.6", latest: "0.9.9", stale: true },
+      ]);
+    }
+    expect(probed).toEqual(["@yawlabs/fetch-mcp"]);
+    expect(JSON.parse(readFileSync(cacheFile(), "utf8")).packages["@yawlabs/fetch-mcp"]).toEqual({
+      latest: "0.9.9",
+      at: fixedNow,
+    });
+  });
+
+  it("skipRegistryCheck with no hook still skips everything: no GET, no cache read or write", async () => {
+    seedCache({ "@yawlabs/mcp": { latest: "0.45.0", at: fixedNow - HOUR } });
+    const before = readFileSync(cacheFile(), "utf8");
+    const cap = captureOut();
+    await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      err: () => {},
+      now: () => fixedNow,
+      currentVersion: "0.40.0",
+      skipRegistryCheck: true,
+    });
+    // The gate sits in FRONT of the cache: a skipped check reports nothing,
+    // even with a fresh answer on disk.
+    expect(cap.text()).not.toContain("UPGRADE AVAILABLE");
+    expect(readFileSync(cacheFile(), "utf8")).toBe(before);
+  });
+
+  describe("under YAW_MCP_READONLY_DIAGNOSTICS", () => {
+    const READONLY_ENV = { YAW_MCP_READONLY_DIAGNOSTICS: "1" };
+
+    it("uses a fresh entry an ordinary run stored, with no GET", async () => {
+      seedCache({ "@yawlabs/mcp": { latest: "0.45.0", at: fixedNow - HOUR } });
+      const probe = countingFetch("0.99.0");
+      expect(await runText(probe.fetch, READONLY_ENV)).toContain("npm latest is 0.45.0");
+      expect(probe.calls).toHaveLength(0);
+    });
+
+    it("fetches on a miss but writes no cache file -- the run still writes nothing", async () => {
+      const probe = countingFetch("0.45.0");
+      const txt = await runText(probe.fetch, READONLY_ENV);
+      expect(txt).toContain("no registry-cache write");
+      expect(txt).toContain("npm latest is 0.45.0");
+      expect(probe.calls).toHaveLength(1);
+      expect(existsSync(cacheFile())).toBe(false);
+      expect(existsSync(join(synthHome, ".yaw-mcp"))).toBe(false);
+    });
+
+    it("leaves an expired entry on disk byte-identical while refetching past it", async () => {
+      seedCache({ "@yawlabs/mcp": { latest: "0.41.0", at: fixedNow - 25 * HOUR } });
+      const before = readFileSync(cacheFile(), "utf8");
+      const probe = countingFetch("0.45.0");
+      expect(await runText(probe.fetch, READONLY_ENV)).toContain("npm latest is 0.45.0");
+      expect(probe.calls).toHaveLength(1);
+      expect(readFileSync(cacheFile(), "utf8")).toBe(before);
+    });
+  });
+
+  // The flag is read from the env doctor was GIVEN (opts.env), not
+  // process.env, which does not carry it here: both cases go red if
+  // registryCacheFor stops passing `env` through.
+  describe("under YAW_MCP_DISABLE_PERSISTENCE in opts.env", () => {
+    const NO_PERSIST_ENV = { YAW_MCP_DISABLE_PERSISTENCE: "1" };
+
+    it("ignores a fresh entry and leaves it byte-identical", async () => {
+      seedCache({ "@yawlabs/mcp": { latest: "0.41.0", at: fixedNow - HOUR } });
+      const before = readFileSync(cacheFile(), "utf8");
+      const probe = countingFetch("0.45.0");
+      expect(await runText(probe.fetch, NO_PERSIST_ENV)).toContain("npm latest is 0.45.0");
+      expect(probe.calls).toHaveLength(1);
+      expect(readFileSync(cacheFile(), "utf8")).toBe(before);
+    });
+
+    it("writes no cache file on a miss", async () => {
+      const probe = countingFetch("0.45.0");
+      expect(await runText(probe.fetch, NO_PERSIST_ENV)).toContain("npm latest is 0.45.0");
+      expect(probe.calls).toHaveLength(1);
+      expect(existsSync(cacheFile())).toBe(false);
+    });
   });
 });
 
@@ -1511,6 +1771,40 @@ describe("runDoctor — --json", () => {
     expect(parsed.state.prewarmFailures).toBeNull();
     // A corrupt file yields no reliability data either.
     expect(parsed.reliability).toEqual([]);
+  });
+
+  it.each([
+    ["malformed", (file: string) => writeFileSync(file, "{ not json at all")],
+    // A directory at the path: the read fails with EISDIR (EACCES on win32),
+    // which is the loader's other warning branch.
+    ["unreadable", (file: string) => mkdirSync(file)],
+  ])("writes nothing to process.stderr for a %s state.json: the STATE section is the one report", async (status, seed) => {
+    // The state loader logs a server-worded warning for both shapes ("starting
+    // fresh" / "flagged unreadable so a save cannot overwrite it"), and log()
+    // writes straight to process.stderr, past the `err` sink below. Doctor
+    // starts nothing and saves nothing, so it asks for a quiet load.
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    seed(join(synthHome, ".yaw-mcp", STATE_FILENAME));
+    const stderrWrite = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    let written: string;
+    let r: Awaited<ReturnType<typeof runDoctor>>;
+    try {
+      r = await runDoctor({
+        cwd: synthCwd,
+        home: synthHome,
+        env: {},
+        os: "linux",
+        out: () => {},
+        err: () => {},
+        json: true,
+        skipRegistryCheck: true,
+      });
+      written = stderrWrite.mock.calls.map((c) => String(c[0])).join("");
+    } finally {
+      stderrWrite.mockRestore();
+    }
+    expect(JSON.parse(r.lines[0]).state.status).toBe(status);
+    expect(written).toBe("");
   });
 
   it("reports a schema-mismatched state.json as stale-version", async () => {
@@ -2560,7 +2854,11 @@ describe("runDoctor — OAM RUNTIME section", () => {
     // remedy is "nothing -- it moves on its own". Telling this user to re-run
     // `sidecars install` was busywork: an eligible package is absent from
     // refreshSkips and used to fall through to the generic manual advice.
-    expect(cap.text()).toContain("0.3.6  (latest 0.9.9 -- the daily background refresh will update it)");
+    // The two exceptions are named because doctor checks neither (a tree the
+    // refresh stands down for, a package inside its back-off).
+    expect(cap.text()).toContain(
+      "0.3.6  (latest 0.9.9 -- the daily background refresh will update it, unless the tree was installed from another config or npm could not deliver that version)",
+    );
     expect(r.exitCode, "staleness is advisory, never a warning").toBe(0);
     // A package that is not installed has no version to be stale AGAINST --
     // its problem is "not in the managed tree", and probing the registry for
@@ -3505,6 +3803,16 @@ describe("scanShellHistoryForShadows -- window size and wrapper parsing", () => 
     // used to report zero shadowed commands.
     const hits = scanShellHistoryForShadows({ home: synthHome, env: { HISTFILE: custom } });
     expect(hits.find((h) => h.cli === "npm")?.count).toBe(1);
+  });
+
+  it("reads a relocated HISTFILE that is zsh's, by the shape of each line", () => {
+    // HISTFILE is zsh's variable too, and an exported one that is not
+    // ~/.zsh_history was read as plain lines: the leading binary of
+    // `: 1700000000:0;npm audit` is then `:`, and the file counted for nothing.
+    const custom = join(synthHome, "relocated_zsh_history");
+    writeFileSync(custom, ": 1700000000:0;npm audit\n: 1700000001:2;npm ci\nnpm test\n");
+    const hits = scanShellHistoryForShadows({ home: synthHome, env: { HISTFILE: custom } });
+    expect(hits.find((h) => h.cli === "npm")?.count).toBe(3);
   });
 
   it("reads pwsh PSReadLine history from the XDG data dir (no APPDATA)", () => {
@@ -4704,10 +5012,10 @@ describe("runDoctor -- a strict client config its client cannot load", () => {
     // install checks the blocked read first, so that is the refusal the user
     // would actually hit -- and the row says that one, not the strictness.
     expect(clientsRow(cap.text(), PROJECT_LABEL).status).toBe(
-      `present, but "mcpServers" is ${describeJsonShape(servers)}, not a JSON object -- install refuses to overwrite it; ${blockedContainerFix(`run \`${PROJECT_INSTALL}\``)}`,
+      `present, but "mcpServers" is an array of 1, not a JSON object -- install refuses to overwrite it; ${blockedContainerFix(`run \`${PROJECT_INSTALL}\``)}`,
     );
     const probe = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "project");
-    expect(probe?.containerBlocked).toBe(`"mcpServers" is ${describeJsonShape(servers)}`);
+    expect(probe?.containerBlocked).toBe('"mcpServers" is an array of 1');
     // The strictness is still recorded, so fixing the container does not
     // leave the row silent about the comment.
     expect(probe?.unloadable).toBe(problemFor(raw));

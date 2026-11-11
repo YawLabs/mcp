@@ -364,6 +364,11 @@ function runChild(
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [script, file, id, String(iterations)], {
       stdio: ["ignore", "ignore", "pipe"],
+      // Errors only, so the 4000-char stderr tail kept below holds the failure
+      // rather than lock-contention warnings. YAW_MCP_LOG_LEVEL, not LOG_LEVEL:
+      // logger.ts reads both and a recognized YAW_MCP_LOG_LEVEL wins, so an
+      // inherited YAW_MCP_LOG_LEVEL=debug would override a LOG_LEVEL pin. The
+      // child never sets the CLI surface, so this changes only the threshold.
       env: { ...process.env, YAW_MCP_LOG_LEVEL: "error" },
     });
     let stderr = "";

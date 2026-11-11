@@ -762,6 +762,48 @@ describe("yaw-mcp trust --revoke", () => {
     expect(await listTrusted({ home: synthHome })).toEqual([]);
   });
 
+  // The DIRECTORY spelling of a project that is gone. With nothing to stat,
+  // the path used to go to the store verbatim, match no row, and report "was
+  // not approved (nothing to do)" with the grant still there.
+  it.each([
+    ["the project root", (root: string) => root],
+    ["its .yaw-mcp directory", (root: string) => join(root, CONFIG_DIRNAME)],
+  ])("revokes a deleted project named by %s", async (_label, spell) => {
+    const root = join(synthHome, "deleted-repo");
+    const gone = join(root, CONFIG_DIRNAME, "bundles.json");
+    await grantTrust(gone, "whatever", { home: synthHome });
+    const io = captureIO();
+    const r = await runTrust({
+      mode: "revoke",
+      path: spell(root),
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: io.push,
+      err: io.pushErr,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(io.text()).toContain(`Revoked ${gone}`);
+    expect(io.text()).not.toContain("nothing to do");
+    expect(await listTrusted({ home: synthHome })).toEqual([]);
+  });
+
+  it("a deleted path that was never approved still reports the path as typed", async () => {
+    const typed = join(synthHome, "never-there");
+    const io = captureIO();
+    const r = await runTrust({
+      mode: "revoke",
+      path: typed,
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: io.push,
+      err: io.pushErr,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(io.text()).toContain(`${typed} was not approved (nothing to do).`);
+  });
+
   it("a no-op revoke still exits 0", async () => {
     writeBundles(synthCwd, HOSTILE);
     const io = captureIO();
@@ -1182,6 +1224,35 @@ describe("the preview says which entries execute content the hash does not cover
     expect(io.text()).toContain("mcp-server-time@latest is not pinned to an exact version");
   });
 
+  it("checks a runner whatever case or Windows extension its command carries", async () => {
+    // Windows runs NPX.cmd, Uvx.exe and a capitalised Npx as npx / uvx; the
+    // check used to match the basename case-sensitively, so those entries
+    // skipped it and their floating specs went unreported.
+    writeBundles(synthCwd, {
+      version: 1,
+      servers: [
+        { namespace: "upper", name: "Upper", command: "NPX.cmd", args: ["-y", "pkg-upper"] },
+        { namespace: "uvexe", name: "UvExe", command: "Uvx.exe", args: ["pkg-uvexe@latest"] },
+        { namespace: "cap", name: "Cap", command: "Npx", args: ["-y", "pkg-cap@^2"] },
+        {
+          namespace: "abspath",
+          name: "AbsPath",
+          command: String.raw`C:\Program Files\nodejs\NPX.CMD`,
+          args: ["-y", "pkg-abs"],
+        },
+        { namespace: "pnpmdlx", name: "PnpmDlx", command: "PNPM.exe", args: ["dlx", "pkg-dlx"] },
+        // ...and the same runner spelled oddly still stays quiet on a real pin.
+        { namespace: "upinned", name: "UPinned", command: "NPX.CMD", args: ["-y", "pkg-pinned@1.2.3"] },
+      ],
+    });
+    const io = captureIO();
+    await runTrust({ home: synthHome, cwd: synthCwd, env: {}, yes: true, out: io.push, err: io.pushErr });
+    for (const spec of ["pkg-upper", "pkg-uvexe@latest", "pkg-cap@^2", "pkg-abs", "pkg-dlx"]) {
+      expect(io.text()).toContain(`${spec} is not pinned to an exact version`);
+    }
+    expect(io.text()).not.toContain("pkg-pinned@1.2.3 is not pinned");
+  });
+
   it("renders an empty argv token instead of silently dropping it", async () => {
     // `sh -c ""` and `sh -c` are different commands, and the preview is meant
     // to be the exact argv that gets spawned.
@@ -1266,7 +1337,19 @@ describe("granting against a store that cannot be read", () => {
     const io = captureIO();
     const r = await runTrust({ home: synthHome, cwd: synthCwd, env: {}, yes: true, out: io.push, err: io.pushErr });
     expect(r.exitCode).toBe(0);
-    expect(io.errText()).toContain("not valid JSON and has been replaced");
+    expect(io.errText()).toContain("could not be parsed as a trust store and has been replaced");
+    expect(await listTrusted({ home: synthHome })).toHaveLength(1);
+  });
+
+  it("the replaced-store note does not call a valid-JSON store of the wrong shape invalid JSON", async () => {
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(trustStorePath(synthHome), "[]");
+    writeBundles(synthCwd, HOSTILE);
+    const io = captureIO();
+    const r = await runTrust({ home: synthHome, cwd: synthCwd, env: {}, yes: true, out: io.push, err: io.pushErr });
+    expect(r.exitCode).toBe(0);
+    expect(io.errText()).toContain("could not be parsed as a trust store and has been replaced");
+    expect(io.errText()).not.toContain("not valid JSON");
     expect(await listTrusted({ home: synthHome })).toHaveLength(1);
   });
 });
@@ -1291,7 +1374,7 @@ describe("the approval is byte-pinned end to end", () => {
 describe("a file swapped while the prompt is open is not approved", () => {
   /** Answer `y` at the REAL prompt, mutating the project file first. The reader
    *  writes its question to `stdout` before it starts reading `stdin` (see
-   *  secrets-cmd:readLineFromTTY), so the first chunk out of `stdout` is the
+   *  tty-reader.ts's readLine), so the first chunk out of `stdout` is the
    *  question -- which is exactly the moment a hostile repo would swap the file
    *  in. promptAnswer cannot express this: it short-circuits askYesNo, so there
    *  is no pause to swap during. */

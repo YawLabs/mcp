@@ -2,23 +2,30 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { CONFIG_DIRNAME, gitBuildDir, sidecarsRoot } from "../paths.js";
+import { CONFIG_DIRNAME, gitBuildDir, sidecarsNodeModules, sidecarsRoot } from "../paths.js";
 import {
+  activeUnmoved,
   backgroundInstallOptions,
   buildRefreshPlan,
+  installMovedTheTree,
   loadSidecarSpecs,
+  manifestLosses,
   maybeRefreshSidecars,
   mergeSidecarRefreshState,
+  parseManagedDependencies,
   parseSidecarRefreshState,
+  runBackgroundRefresh,
   SIDECAR_REFRESH_START_DELAY_MS,
   SIDECAR_REFRESH_THROTTLE_MS,
+  SIDECAR_REFRESH_UNMOVED_BACKOFF_MS,
   type SidecarRefreshDeps,
   type SidecarRefreshState,
   type SidecarRefreshStatePatch,
   sidecarRefreshStatePath,
   unbuiltGitNote,
+  unmovedAfterRefresh,
 } from "../sidecar-refresh.js";
-import { configuredRange, type SidecarSpec, sidecarsManifest } from "../sidecars-cmd.js";
+import { configuredRange, runSidecarsInstall, type SidecarSpec, sidecarsManifest } from "../sidecars-cmd.js";
 import { fakeFinishedBuild } from "./git-fixture.js";
 
 // =====================================================================
@@ -307,6 +314,11 @@ function harness(over: Partial<SidecarRefreshDeps> = {}) {
   );
   const hasManagedSidecarsImpl = vi.fn(over.hasManagedSidecarsImpl ?? ((_home?: string): boolean => true));
   const specsImpl = vi.fn(over.specsImpl ?? (async (): Promise<SidecarSpec[]> => [spec("a-mcp")]));
+  // An empty manifest by default: a rewrite from any spec set removes nothing
+  // from it, so the step-7b guard passes unless a test stages a tree.
+  const managedDependenciesImpl = vi.fn(
+    over.managedDependenciesImpl ?? ((_home: string): Record<string, string> | null => ({})),
+  );
   const nowImpl = vi.fn(over.nowImpl ?? ((): number => NOW));
   // Resolves at once by default: the delay's PLACEMENT is what the tests
   // below pin, and a real minute would make every other assertion here wait.
@@ -324,6 +336,7 @@ function harness(over: Partial<SidecarRefreshDeps> = {}) {
     installedVersionImpl,
     hasManagedSidecarsImpl,
     specsImpl,
+    managedDependenciesImpl,
     nowImpl,
     delayImpl,
     readStateImpl,
@@ -339,6 +352,7 @@ function harness(over: Partial<SidecarRefreshDeps> = {}) {
     installedVersionImpl,
     hasManagedSidecarsImpl,
     specsImpl,
+    managedDependenciesImpl,
     nowImpl,
     delayImpl,
     readStateImpl,
@@ -575,6 +589,59 @@ describe("maybeRefreshSidecars", () => {
     expect(h.spawnRefreshImpl).not.toHaveBeenCalled();
     expect(h.writeStateImpl).not.toHaveBeenCalled();
     // Reddens if recordCheck moves above the lock acquisition.
+  });
+
+  it("does NOT refresh a tree whose manifest names a package the user-global config does not", async () => {
+    // A manual `sidecars install` from an approved project filled the shared
+    // tree with a-mcp AND project-only-mcp. The refresh rewrites the manifest
+    // from the user-global set (a-mcp alone) and npm prunes the rest, with
+    // both output channels muted. Reddens if step 7b is removed.
+    const h = harness({
+      managedDependenciesImpl: () => ({ "a-mcp": "latest", "project-only-mcp": "latest" }),
+    });
+    await maybeRefreshSidecars(h.deps);
+    expect(h.spawnRefreshImpl).not.toHaveBeenCalled();
+    // The lock it took to read the manifest is given back, and the check is
+    // recorded: the state lasts until a manual install, so the next start
+    // must not probe the registry again.
+    expect(h.release).toHaveBeenCalledTimes(1);
+    expect(h.writeStateImpl).toHaveBeenCalledWith({ lastSidecarRefreshCheck: NOW });
+    expect(h.managedDependenciesImpl).toHaveBeenCalledWith(HOME);
+  });
+
+  it("does NOT refresh over a pin the manifest carries at a different range", async () => {
+    const h = harness({ managedDependenciesImpl: () => ({ "a-mcp": "1.0.0" }) });
+    await maybeRefreshSidecars(h.deps);
+    expect(h.spawnRefreshImpl).not.toHaveBeenCalled();
+    expect(h.release).toHaveBeenCalledTimes(1);
+  });
+
+  it("does NOT refresh when the manifest cannot be read", async () => {
+    const h = harness({ managedDependenciesImpl: () => null });
+    await maybeRefreshSidecars(h.deps);
+    expect(h.spawnRefreshImpl).not.toHaveBeenCalled();
+    expect(h.release).toHaveBeenCalledTimes(1);
+  });
+
+  it("refreshes when the rewrite only ADDS to the manifest on disk", async () => {
+    // The tree was installed from the user-global config before b-mcp was
+    // added to it. Nothing is taken away, so the refresh runs (and acquires
+    // b-mcp as a side effect -- the header's KNOWN GAP).
+    const h = harness({
+      specsImpl: async () => [spec("a-mcp"), spec("b-mcp", "2.0.0")],
+      managedDependenciesImpl: () => ({ "a-mcp": "latest" }),
+    });
+    await maybeRefreshSidecars(h.deps);
+    expect(h.spawnRefreshImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("reads the manifest only under the lock", async () => {
+    // The manual install that could change the answer takes the same lock, so
+    // a read made before the lock is a read that can be stale by the time npm
+    // runs. Reddens if step 7b moves above the lock acquisition.
+    const h = harness({ acquireLockImpl: vi.fn(() => null) });
+    await maybeRefreshSidecars(h.deps);
+    expect(h.managedDependenciesImpl).not.toHaveBeenCalled();
   });
 
   it("locks the sidecars root, not some other directory", async () => {
@@ -816,6 +883,290 @@ describe("maybeRefreshSidecars", () => {
 });
 
 // ---------------------------------------------------------------------
+// A refresh that completes without moving the package.
+//
+// Staleness is probed on registry.npmjs.org; npm installs from whatever
+// registry it is configured with. Behind a mirror that lags, the package
+// reads as stale every day and every day's whole-tree npm run changes
+// nothing. A completed refresh therefore records what it failed to move,
+// and the plan passes those over until `latest` changes or a week passes.
+// ---------------------------------------------------------------------
+
+describe("a refresh that cannot move a package", () => {
+  let prevOptOut: string | undefined;
+  beforeEach(() => {
+    prevOptOut = process.env.YAW_MCP_SIDECAR_REFRESH;
+    delete process.env.YAW_MCP_SIDECAR_REFRESH;
+  });
+  afterEach(() => {
+    if (prevOptOut === undefined) delete process.env.YAW_MCP_SIDECAR_REFRESH;
+    else process.env.YAW_MCP_SIDECAR_REFRESH = prevOptOut;
+  });
+
+  const completes = (_stale: SidecarSpec[], onDone: (ok?: boolean) => void): void => onDone(true);
+  const unmovedWrites = (h: ReturnType<typeof harness>) =>
+    h.writeStateImpl.mock.calls.map((c) => c[0]).filter((p) => p.unmoved !== undefined);
+
+  it("buildRefreshPlan passes over a package already tried against this exact latest", () => {
+    const specs = [spec("a-mcp"), spec("b-mcp")];
+    const plan = buildRefreshPlan({
+      specs,
+      installed: new Map([
+        ["a-mcp", "1.0.0"],
+        ["b-mcp", "1.0.0"],
+      ]),
+      latest: new Map([
+        ["a-mcp", "1.1.0"],
+        ["b-mcp", "1.1.0"],
+      ]),
+      // b-mcp was tried against an OLDER latest: 1.1.0 is news, so it is stale.
+      unmoved: new Map([
+        ["a-mcp", { latest: "1.1.0", at: NOW }],
+        ["b-mcp", { latest: "1.0.5", at: NOW }],
+      ]),
+    });
+    expect(plan.stale.map((s) => s.pkg)).toEqual(["b-mcp"]);
+    expect(plan.skipped).toHaveLength(1);
+    expect(plan.skipped[0].reason).toMatch(/still 1\.0\.0 after a refresh aimed at 1\.1\.0/);
+    expectPartitions(plan, specs);
+  });
+
+  it("activeUnmoved keeps well-formed entries inside the back-off and drops the rest", () => {
+    const state = {
+      unmoved: {
+        fresh: { latest: "2.0.0", at: NOW - 1000 },
+        expired: { latest: "2.0.0", at: NOW - SIDECAR_REFRESH_UNMOVED_BACKOFF_MS },
+        future: { latest: "2.0.0", at: NOW + 1000 },
+        noStamp: { latest: "2.0.0" },
+        notAnObject: "2.0.0",
+      },
+    } as SidecarRefreshState;
+    expect([...activeUnmoved(state, NOW).keys()]).toEqual(["fresh"]);
+    expect(activeUnmoved(null, NOW).size).toBe(0);
+    expect(activeUnmoved({ unmoved: ["x"] }, NOW).size).toBe(0);
+  });
+
+  it("unmovedAfterRefresh lists only packages still behind what they were measured against", () => {
+    const stale = [
+      { pkg: "moved", installed: "1.0.0", latest: "1.1.0" },
+      { pkg: "stuck", installed: "1.0.0", latest: "1.1.0" },
+      { pkg: "partway", installed: "1.0.0", latest: "1.2.0" },
+      { pkg: "gone", installed: "1.0.0", latest: "1.1.0" },
+    ];
+    const now: Record<string, string | null> = { moved: "1.1.0", stuck: "1.0.0", partway: "1.1.0", gone: null };
+    const out = unmovedAfterRefresh(stale, (pkg) => now[pkg], NOW);
+    expect([...out.keys()]).toEqual(["stuck", "partway", "gone"]);
+    expect(out.get("partway")).toEqual({ latest: "1.2.0", at: NOW });
+  });
+
+  it("records the package after an install that exited 0 and left it where it was", async () => {
+    // Reddens if onRefreshDone stops recording: the next day's check would
+    // spawn the same two npm runs again, and the day after.
+    const h = harness({ spawnRefreshImpl: completes });
+    await maybeRefreshSidecars(h.deps);
+    await vi.waitFor(() => expect(unmovedWrites(h)).toHaveLength(1));
+    expect(unmovedWrites(h)[0].unmoved).toEqual({ "a-mcp": { latest: "1.1.0", at: NOW } });
+    expect(h.release).toHaveBeenCalledTimes(1);
+  });
+
+  it("records nothing as unmoved when the install moved the package", async () => {
+    let installs = 0;
+    const h = harness({
+      // 1.0.0 for the plan, 1.1.0 once the refresh has run.
+      installedVersionImpl: () => (installs++ === 0 ? "1.0.0" : "1.1.0"),
+      spawnRefreshImpl: completes,
+    });
+    await maybeRefreshSidecars(h.deps);
+    await vi.waitFor(() => expect(unmovedWrites(h)).toHaveLength(1));
+    expect(unmovedWrites(h)[0].unmoved).toEqual({});
+  });
+
+  it("installMovedTheTree needs exit 0 AND a successful update step", () => {
+    expect(installMovedTheTree({ exitCode: 0, updateError: null })).toBe(true);
+    expect(installMovedTheTree({ exitCode: 0, updateError: "npm update exited 1" })).toBe(false);
+    expect(installMovedTheTree({ exitCode: 1, updateError: null })).toBe(false);
+  });
+
+  it("records nothing when the install exits 0 but its `npm update` step failed", async () => {
+    // The real command, with npm injected: `install` lands the package and
+    // exits 0, `update` fails -- what a running sidecar holding a native .node
+    // open does on Windows. The command still exits 0 (the tree is usable),
+    // so an `ok` derived from the exit code alone would record a-mcp as
+    // unmoved and back it off for a week behind a lagging-mirror hint.
+    // Reddens if installMovedTheTree goes back to reading exitCode only.
+    const home = tempHome();
+    mkdirSync(join(home, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(
+      join(home, CONFIG_DIRNAME, "bundles.json"),
+      JSON.stringify({
+        version: 1,
+        servers: [
+          {
+            id: "1",
+            name: "A",
+            namespace: "a",
+            type: "local",
+            transport: "stdio",
+            command: "npx",
+            args: ["-y", "a-mcp@latest"],
+          },
+        ],
+      }),
+    );
+    let result: Awaited<ReturnType<typeof runSidecarsInstall>> | undefined;
+    const h = harness({
+      spawnRefreshImpl: (_stale: SidecarSpec[], onDone: (ok?: boolean) => void): void => {
+        void (async () => {
+          result = await runSidecarsInstall({
+            ...backgroundInstallOptions(home),
+            oamProbe: async () => ({
+              bin: null,
+              binPath: null,
+              version: null,
+              belowMin: false,
+              failure: null,
+              failureDetail: null,
+            }),
+            runNpm: async (args) => {
+              if (args[0] !== "install") return 7;
+              const dir = join(sidecarsNodeModules(home), "a-mcp");
+              mkdirSync(dir, { recursive: true });
+              writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "a-mcp", version: "1.0.0" }));
+              return 0;
+            },
+          });
+          onDone(installMovedTheTree(result));
+        })();
+      },
+    });
+    await maybeRefreshSidecars(h.deps);
+    await vi.waitFor(() => expect(h.release).toHaveBeenCalledTimes(1));
+    await new Promise((r) => setImmediate(r));
+    expect(result?.exitCode, "a usable tree is not a failure").toBe(0);
+    expect(result?.updateError).toContain("npm update exited 7");
+    expect(unmovedWrites(h)).toHaveLength(0);
+  });
+
+  // The production background body (runBackgroundRefresh, which
+  // defaultSpawnRefresh awaits) with only the install injected, wired to
+  // onDone exactly as defaultSpawnRefresh wires it. These pin the `ok` it
+  // hands back, which the tests above reach only through a hand-written
+  // spawnRefreshImpl that calls installMovedTheTree itself.
+  const viaBackgroundRefresh =
+    (home: string, result: { exitCode: number; updateError: string | null }) =>
+    (stale: SidecarSpec[], onDone: (ok?: boolean) => void): void => {
+      void (async () => {
+        let ok = false;
+        try {
+          ok = await runBackgroundRefresh(stale, home, async () => ({
+            exitCode: result.exitCode,
+            installed: stale.map((s) => ({ pkg: s.pkg, version: "1.0.0", namespaces: [] })),
+            lines: [],
+            updateError: result.updateError,
+          }));
+        } finally {
+          onDone(ok);
+        }
+      })();
+    };
+
+  it("runBackgroundRefresh: install exit 0 with a failed update step is not ok, and records nothing", async () => {
+    // Reddens if the background refresh's `ok` goes back to exitCode === 0
+    // alone: a-mcp would be recorded as unmoved and backed off for a week.
+    const home = tempHome();
+    const install = vi.fn(async () => ({
+      exitCode: 0,
+      installed: [],
+      lines: [],
+      updateError: "npm update exited 1",
+    }));
+    expect(await runBackgroundRefresh([spec("a-mcp")], home, install)).toBe(false);
+    expect(install).toHaveBeenCalledTimes(1);
+
+    const h = harness({
+      home,
+      spawnRefreshImpl: viaBackgroundRefresh(home, { exitCode: 0, updateError: "npm update exited 1" }),
+    });
+    await maybeRefreshSidecars(h.deps);
+    await vi.waitFor(() => expect(h.release).toHaveBeenCalledTimes(1));
+    await new Promise((r) => setImmediate(r));
+    expect(unmovedWrites(h)).toHaveLength(0);
+  });
+
+  it("runBackgroundRefresh: install exit 0 with a clean update step is ok, so an unmoved package is recorded", async () => {
+    const home = tempHome();
+    expect(
+      await runBackgroundRefresh([spec("a-mcp")], home, async () => ({
+        exitCode: 0,
+        installed: [],
+        lines: [],
+        updateError: null,
+      })),
+    ).toBe(true);
+    // A non-zero exit, and a throw, are not ok either.
+    expect(
+      await runBackgroundRefresh([spec("a-mcp")], home, async () => ({
+        exitCode: 1,
+        installed: [],
+        lines: [],
+        updateError: null,
+      })),
+    ).toBe(false);
+    expect(
+      await runBackgroundRefresh([spec("a-mcp")], home, async () => {
+        throw new Error("boom");
+      }),
+    ).toBe(false);
+
+    const h = harness({ home, spawnRefreshImpl: viaBackgroundRefresh(home, { exitCode: 0, updateError: null }) });
+    await maybeRefreshSidecars(h.deps);
+    await vi.waitFor(() => expect(unmovedWrites(h)).toHaveLength(1));
+    expect(unmovedWrites(h)[0].unmoved).toEqual({ "a-mcp": { latest: "1.1.0", at: NOW } });
+  });
+
+  it("records nothing when the install did not complete -- a failed npm run is retried as before", async () => {
+    // onDone() with no `true`: what defaultSpawnRefresh reports for a non-zero
+    // exit, a failed update step or a throw. Backing off on that would turn
+    // one EPERM into a week.
+    const h = harness();
+    await maybeRefreshSidecars(h.deps);
+    await new Promise((r) => setImmediate(r));
+    expect(h.spawnRefreshImpl).toHaveBeenCalledTimes(1);
+    expect(unmovedWrites(h)).toHaveLength(0);
+  });
+
+  it("does not spawn again while the recorded entry is in force, and does once latest moves", async () => {
+    const stuck = { unmoved: { "a-mcp": { latest: "1.1.0", at: NOW - 1000 } } } as SidecarRefreshState;
+    const held = harness({ readStateImpl: () => stuck });
+    await maybeRefreshSidecars(held.deps);
+    expect(held.spawnRefreshImpl).not.toHaveBeenCalled();
+    // Still a completed check: the throttle stamp is written.
+    expect(held.writeStateImpl).toHaveBeenCalledWith({ lastSidecarRefreshCheck: NOW });
+
+    const newer = harness({ readStateImpl: () => stuck, fetchLatestImpl: async () => "1.2.0" });
+    await maybeRefreshSidecars(newer.deps);
+    expect(newer.spawnRefreshImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("carries over an entry still in force for a package this run did not list", async () => {
+    // The write replaces the map, so dropping `...heldBack` would un-record
+    // b-mcp the moment a-mcp triggered a refresh.
+    const state = { unmoved: { "b-mcp": { latest: "1.1.0", at: NOW - 1000 } } } as SidecarRefreshState;
+    let aReads = 0;
+    const h = harness({
+      specsImpl: async () => [spec("a-mcp"), spec("b-mcp")],
+      readStateImpl: () => state,
+      installedVersionImpl: (pkg: string) => (pkg === "a-mcp" && aReads++ > 0 ? "1.1.0" : "1.0.0"),
+      spawnRefreshImpl: completes,
+    });
+    await maybeRefreshSidecars(h.deps);
+    expect(h.spawnRefreshImpl.mock.calls[0][0].map((s) => s.pkg)).toEqual(["a-mcp"]);
+    await vi.waitFor(() => expect(unmovedWrites(h)).toHaveLength(1));
+    expect(unmovedWrites(h)[0].unmoved).toEqual({ "b-mcp": { latest: "1.1.0", at: NOW - 1000 } });
+  });
+});
+
+// ---------------------------------------------------------------------
 // Which config scope the background refresh acts on.
 //
 // The managed tree is keyed on HOME alone and shared by every project on
@@ -911,6 +1262,46 @@ describe("configuredRange agrees with sidecarsManifest", () => {
 // be tested -- the wrappers themselves are short-circuited under VITEST, so
 // every branch below used to be unreachable from a test.
 // ---------------------------------------------------------------------
+
+describe("manifestLosses", () => {
+  it("is empty when the rewrite keeps every on-disk dependency as it is", () => {
+    expect(manifestLosses({}, [spec("a")])).toEqual([]);
+    expect(manifestLosses({ a: "latest", b: "1.2.3" }, [spec("a"), spec("b", "1.2.3"), spec("c")])).toEqual([]);
+    // A bare name is written as "latest", so it matches a "latest" on disk.
+    expect(manifestLosses({ a: "latest" }, [spec("a", "")])).toEqual([]);
+  });
+
+  it("names a package the rewrite would drop and one it would re-range", () => {
+    expect(manifestLosses({ a: "latest", gone: "latest", pinned: "1.0.0" }, [spec("a"), spec("pinned")])).toEqual([
+      "gone",
+      "pinned (1.0.0 -> latest)",
+    ]);
+  });
+
+  it("treats an inherited property name as an ordinary package", () => {
+    // `in` / a plain index would find Object.prototype.constructor.
+    expect(manifestLosses({ constructor: "latest" }, [spec("a")])).toEqual(["constructor"]);
+  });
+});
+
+describe("parseManagedDependencies", () => {
+  it("reads the dependency map sidecarsManifest writes", () => {
+    expect(parseManagedDependencies(sidecarsManifest([spec("a"), spec("b", "1.2.3")]))).toEqual({
+      a: "latest",
+      b: "1.2.3",
+    });
+  });
+
+  it("reads a manifest with no dependencies key as empty", () => {
+    expect(parseManagedDependencies('{"name":"x"}')).toEqual({});
+  });
+
+  it("returns null for anything it cannot vouch for", () => {
+    for (const text of ["", "not json", "null", "[]", '{"dependencies":[]}', '{"dependencies":{"a":1}}']) {
+      expect(parseManagedDependencies(text), text).toBeNull();
+    }
+  });
+});
 
 describe("parseSidecarRefreshState", () => {
   it("reads a well-formed document", () => {

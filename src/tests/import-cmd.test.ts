@@ -3,7 +3,8 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { parseImportArgs, runImport } from "../import-cmd.js";
+import type { EntryTransform } from "../client-config.js";
+import { IMPORT_USAGE, parseImportArgs, runImport } from "../import-cmd.js";
 import { CURRENT_OS, INSTALL_TARGETS, resolveInstallPath } from "../install-targets.js";
 import { loadLocalBundles } from "../local-bundles.js";
 import { CONFIG_DIRNAME } from "../paths.js";
@@ -1660,5 +1661,321 @@ describe("runImport -- promptAnswer answers the bundles.json overwrite question 
     });
     expect(r2.written).toEqual([]);
     expect(readFileSync(seed.bundlesPath, "utf8")).toBe(seed.bundlesBefore);
+  });
+});
+
+describe("runImport -- a Cline ${env:NAME} is refused by name, not imported verbatim", () => {
+  it("skips the server carrying one and still imports its neighbours", async () => {
+    // Cline expands `${env:NAME}` itself and yaw-mcp does not, so the entry
+    // used to be copied across with the literal text -- and --remove-originals
+    // then deleted the working Cline entry it was copied from.
+    const settings = join(synthHome, ".cline", "data", "settings");
+    mkdirSync(settings, { recursive: true });
+    const file = join(settings, "cline_mcp_settings.json");
+    writeFileSync(
+      file,
+      `${JSON.stringify(
+        {
+          mcpServers: {
+            mcp: { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] },
+            needsenv: { command: "node", args: ["a.js"], env: { TOKEN: "${env:MY_TOKEN}" } },
+            // Not a Cline variable: literal text to Cline, so literal here.
+            literal: { command: "node", args: ["${notAVariable}/b.js"] },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    const cap = capture();
+    const r = await runImport({ clientId: "cline", home: synthHome, cwd: synthCwd, removeOriginals: true, ...cap });
+    expect(r.exitCode).toBe(0);
+    const rows = bundles();
+    expect(rows.map((s) => s.namespace)).toEqual(["literal"]);
+    expect(rows[0].args).toEqual(["${notAVariable}/b.js"]);
+    expect(cap.errText()).toMatch(/Skipped \(Cline expands these variables itself/);
+    expect(cap.errText()).toContain("needsenv");
+    expect(cap.errText()).toContain("${env:MY_TOKEN}");
+    // The skipped server is still Cline's to launch: it was not removed.
+    const after = JSON.parse(readFileSync(file, "utf8"));
+    expect(Object.keys(after.mcpServers).sort()).toEqual(["mcp", "needsenv"]);
+  });
+});
+
+describe("runImport -- the removal works on the file as it is NOW, not as the plan read it", () => {
+  /** Runs `edit` at the moment the "still launches" line prints: after every
+   *  bundles.json write and before the removal -- the window a prompt holds
+   *  open while the client goes on rewriting its own config. */
+  function editBeforeRemoval(edit: () => void) {
+    const cap = capture();
+    let done = false;
+    return {
+      ...cap,
+      out: (s: string) => {
+        cap.out(s);
+        if (!done && s.includes("still launches")) {
+          done = true;
+          edit();
+        }
+      },
+    };
+  }
+
+  it("keeps what the client wrote to its config while the import was running", async () => {
+    const path = writeClaudeCode(WIRED);
+    const cap = editBeforeRemoval(() => {
+      const now = JSON.parse(readFileSync(path, "utf8"));
+      now.numStartups = 42;
+      now.mcpServers.added = { command: "node", args: ["new.js"] };
+      writeFileSync(path, JSON.stringify(now, null, 2));
+    });
+    const r = await runImport({
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      removeOriginals: true,
+      out: cap.out,
+      err: cap.err,
+    });
+    expect(r.exitCode).toBe(0);
+    const after = JSON.parse(readFileSync(path, "utf8"));
+    expect(after.numStartups).toBe(42);
+    expect(Object.keys(after.mcpServers).sort()).toEqual(["added", "mcp"]);
+  });
+
+  it("leaves, and names, an entry that changed after it was read", async () => {
+    const path = writeClaudeCode(WIRED);
+    const cap = editBeforeRemoval(() => {
+      const now = JSON.parse(readFileSync(path, "utf8"));
+      now.mcpServers.github.args = ["-y", "a-different-server"];
+      writeFileSync(path, JSON.stringify(now, null, 2));
+    });
+    const r = await runImport({
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      removeOriginals: true,
+      out: cap.out,
+      err: cap.err,
+    });
+    expect(r.exitCode).toBe(0);
+    const after = JSON.parse(readFileSync(path, "utf8"));
+    expect(Object.keys(after.mcpServers).sort()).toEqual(["github", "mcp"]);
+    expect(after.mcpServers.github.args).toEqual(["-y", "a-different-server"]);
+    expect(cap.errText()).toMatch(/changed there after the import read it: github/);
+  });
+
+  it("says an entry the client deleted meanwhile is gone, not left behind", async () => {
+    const path = writeClaudeCode(WIRED);
+    const cap = editBeforeRemoval(() => {
+      const now = JSON.parse(readFileSync(path, "utf8"));
+      delete now.mcpServers.github;
+      writeFileSync(path, JSON.stringify(now, null, 2));
+    });
+    const r = await runImport({
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      removeOriginals: true,
+      out: cap.out,
+      err: cap.err,
+    });
+    expect(r.exitCode).toBe(0);
+    const after = JSON.parse(readFileSync(path, "utf8"));
+    expect(Object.keys(after.mcpServers)).not.toContain("github");
+    expect(cap.errText()).toMatch(/already gone from .*removed there after the import read it: github/);
+    // Nothing is left in the file and there is no current entry to re-import.
+    expect(cap.errText()).not.toMatch(/left in .*: github/);
+    expect(cap.errText()).not.toContain("Re-run the import to pick up");
+  });
+
+  it("removes nothing when the file stopped parsing in the meantime", async () => {
+    const path = writeClaudeCode(WIRED);
+    const cap = editBeforeRemoval(() => writeFileSync(path, "{ not json"));
+    const r = await runImport({
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      removeOriginals: true,
+      out: cap.out,
+      err: cap.err,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(readFileSync(path, "utf8")).toBe("{ not json");
+    expect(r.written).not.toContain(path);
+    expect(cap.errText()).toMatch(/nothing was removed from it/);
+  });
+});
+
+describe("runImport -- the ImportView fields a forImport hook reports are acted on", () => {
+  // Codex CLI's row reads its own entries through `forImport`
+  // (target-codex-cli.ts codexImportView), which reports a switched-off
+  // server, the keys it could not carry and -- for any row that sets one -- a
+  // reason the server cannot be imported at all. The importer used to read the
+  // view's `entry` alone, so a server switched off in Codex imported ACTIVE
+  // and every dropped key vanished unnamed.
+
+  function writeCodexToml(body: string): string {
+    const dir = join(synthHome, ".codex");
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, "config.toml");
+    writeFileSync(path, body);
+    return path;
+  }
+
+  it("imports a server Codex stores `enabled = false` as INACTIVE and says how to turn it on", async () => {
+    writeCodexToml(
+      '[mcp_servers.off]\ncommand = "npx"\nargs = ["-y", "off-server"]\nenabled = false\n\n[mcp_servers.on]\ncommand = "npx"\nargs = ["-y", "on-server"]\n',
+    );
+    const cap = capture();
+    const r = await runImport({
+      clientId: "codex-cli",
+      home: synthHome,
+      cwd: synthCwd,
+      keepOriginals: true,
+      isTTY: false,
+      ...cap,
+    });
+    expect(r.exitCode).toBe(0);
+    const byNs = new Map(bundles().map((s) => [s.namespace, s]));
+    expect(byNs.get("off")?.isActive).toBe(false);
+    expect(byNs.get("on")?.isActive).toBe(true);
+    // The plan line, under the server it is about, and the summary after the
+    // write -- both naming the command that turns it on.
+    expect(cap.text()).toContain(
+      '  off -> off\n    $ npx -y off-server\n    inactive: Codex CLI has it switched off, so it lands "isActive": false and does not load -- `yaw-mcp enable off` turns it on\n',
+    );
+    expect(cap.text()).toContain(
+      "Imported inactive, because Codex CLI has it switched off: off. It does not load until turned on with `yaw-mcp enable <namespace>`.",
+    );
+    // The active one gets neither line.
+    expect(cap.text()).toContain("  on -> on\n    $ npx -y on-server\n\n");
+    expect(cap.text()).not.toContain("`yaw-mcp enable on`");
+    // Only the active server runs twice; the duplicate-run line names it.
+    expect(cap.text()).toContain(
+      "Codex CLI still launches that server itself (on), so it would now run twice -- once directly, once through yaw-mcp.",
+    );
+  });
+
+  // The merge path: bundles.json already holds the server. The two tests above
+  // import into an empty file, so they never reach local-bundles' merge.
+  const OFF_ENTRY = { namespace: "off", name: "off", type: "local", command: "npx", args: ["-y", "off-server"] };
+
+  it("re-importing a server Codex now switches off turns an ACTIVE stored entry off, and the diff shows it", async () => {
+    writeBundles([{ ...OFF_ENTRY, isActive: true }]);
+    writeCodexToml('[mcp_servers.off]\ncommand = "npx"\nargs = ["-y", "off-server"]\nenabled = false\n');
+    const cap = capture();
+    const r = await runImport({
+      clientId: "codex-cli",
+      home: synthHome,
+      cwd: synthCwd,
+      keepOriginals: true,
+      isTTY: false,
+      force: true,
+      ...cap,
+    });
+    expect(r.exitCode, cap.errText()).toBe(0);
+    expect(bundles().find((s) => s.namespace === "off")?.isActive).toBe(false);
+    expect(cap.text()).toContain(
+      'Overwriting the "off" entry in bundles.json (--force):\n  isActive: would change (value not shown)\n',
+    );
+  });
+
+  it("an enabled import never re-enables a stored INACTIVE entry", async () => {
+    writeBundles([{ ...OFF_ENTRY, isActive: false }]);
+    writeCodexToml('[mcp_servers.off]\ncommand = "npx"\nargs = ["-y", "off-server"]\n');
+    const cap = capture();
+    const r = await runImport({
+      clientId: "codex-cli",
+      home: synthHome,
+      cwd: synthCwd,
+      keepOriginals: true,
+      isTTY: false,
+      force: true,
+      ...cap,
+    });
+    expect(r.exitCode, cap.errText()).toBe(0);
+    expect(bundles().find((s) => s.namespace === "off")?.isActive).toBe(false);
+    // Nor does the diff claim it would: the stored false stands.
+    expect(cap.text()).not.toContain("isActive:");
+  });
+
+  it("does not claim an all-inactive import runs twice", async () => {
+    writeCodexToml('[mcp_servers.off]\ncommand = "npx"\nargs = ["-y", "off-server"]\nenabled = false\n');
+    const cap = capture();
+    const r = await runImport({
+      clientId: "codex-cli",
+      home: synthHome,
+      cwd: synthCwd,
+      keepOriginals: true,
+      isTTY: false,
+      ...cap,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.text()).not.toContain("would now run twice");
+    expect(cap.text()).toContain(
+      "Codex CLI has that server switched off, so it does not run from there either; removing the original only tidies its config.",
+    );
+  });
+
+  it("names every key Codex's view discarded, beside the env/headers notes", async () => {
+    const path = writeCodexToml(
+      '[mcp_servers.fs]\ncommand = "npx"\nargs = ["-y", "fs"]\ncwd = "/srv"\nstartup_timeout_sec = 20\n',
+    );
+    const cap = capture();
+    const r = await runImport({ clientId: "codex-cli", home: synthHome, cwd: synthCwd, dryRun: true, ...cap });
+    expect(r.exitCode).toBe(0);
+    expect(cap.errText()).toBe(
+      `warning: ${path}: ignoring 'cwd' on "fs" (a Codex CLI setting bundles.json has no field for) -- it was not carried over\n` +
+        `warning: ${path}: ignoring 'startup_timeout_sec' on "fs" (a Codex CLI setting bundles.json has no field for) -- it was not carried over\n`,
+    );
+  });
+
+  it("skips a server whose view carries a skipReason, by name, with that reason", async () => {
+    // No shipped row sets skipReason yet, so the Codex row's hook is wrapped
+    // for this one test: the field is the row's to set, and the importer must
+    // honour it whichever row does.
+    const row = INSTALL_TARGETS.find((t) => t.clientId === "codex-cli") as unknown as { entry: EntryTransform };
+    const original = row.entry.forImport;
+    if (original === undefined) throw new Error("codex-cli row lost its forImport hook");
+    row.entry.forImport = (stored) =>
+      stored.command === "ext-only"
+        ? { ...original(stored), skipReason: "Codex resolves it through an extension" }
+        : original(stored);
+    try {
+      writeCodexToml(
+        '[mcp_servers.viaext]\ncommand = "ext-only"\n\n[mcp_servers.fs]\ncommand = "npx"\nargs = ["-y", "fs"]\n',
+      );
+      const cap = capture();
+      const r = await runImport({
+        clientId: "codex-cli",
+        home: synthHome,
+        cwd: synthCwd,
+        keepOriginals: true,
+        isTTY: false,
+        ...cap,
+      });
+      expect(r.exitCode).toBe(0);
+      expect(cap.errText()).toContain(
+        "Skipped (Codex CLI says these cannot be imported):\n  viaext: Codex resolves it through an extension\n",
+      );
+      expect(cap.text()).toContain("Servers to import (1):\n  fs -> fs\n");
+      expect(bundles().map((s) => s.namespace)).toEqual(["fs"]);
+    } finally {
+      row.entry.forImport = original;
+    }
+  });
+});
+
+describe("IMPORT_USAGE -- the vault step it recommends is the one the run prints", () => {
+  it("names the one-step `set env.KEY --secret` form for env credentials", () => {
+    expect(IMPORT_USAGE).toContain("yaw-mcp set <server> env.KEY --secret");
+    expect(IMPORT_USAGE).not.toContain("env.KEY='${secret:NAME}'");
+  });
+
+  it("says the value is asked for again, not carried over from the imported entry", () => {
+    // `set --secret` reads the value from a prompt or stdin, never from the
+    // stored entry, so "moves the credential" with no more said was wrong.
+    expect(IMPORT_USAGE.replace(/\s+/g, " ")).toContain("asks for the value again (a no-echo prompt, or piped stdin)");
   });
 });

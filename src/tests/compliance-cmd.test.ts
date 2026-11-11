@@ -14,7 +14,6 @@ import {
   isRenderableReport,
   locateComplianceSuite,
   PUBLISH_REMOVED_MESSAGE,
-  resolveComplianceSuiteSpec,
   resolveNpxLaunch,
   resolveSuiteLaunch,
   runComplianceCommand,
@@ -397,7 +396,7 @@ describe("runComplianceCommand unlaunchable path", () => {
       // The argv the diagnostic is built from is the npx fallback's: the
       // pinned spec (this repo has the dependency, so the manifest resolves)
       // ahead of the suite's own subcommand and the target.
-      const spec = await mod.resolveComplianceSuiteSpec();
+      const spec = `@yawlabs/mcp-compliance@${await resolveComplianceSuiteVersion()}`;
       expect(spec).toMatch(/^@yawlabs\/mcp-compliance@\d/);
       expect(cap.err()).toBe(mod.formatLaunchFailure(["-y", spec, "test", "--format", "json", target], "win32"));
     } finally {
@@ -693,7 +692,18 @@ describe("resolveSuiteLaunch", () => {
 describe("compliance suite launch", () => {
   it("pins the fallback spec to the dependency version audit records", async () => {
     const version = await resolveComplianceSuiteVersion();
-    const spec = await resolveComplianceSuiteSpec();
+    // Only npx-cli.js "exists", so the installed bin is passed over and the
+    // launch is the npx fallback -- the one path that carries a spec.
+    const res = await resolveSuiteLaunch([], {
+      execPath: "/usr/local/bin/node",
+      platform: "linux",
+      exists: (p) => p.endsWith("npx-cli.js"),
+    });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.launch.via).toBe("npx");
+    expect(res.launch.args[1]).toBe("-y");
+    const spec = res.launch.args[2];
     // This repo has the dependency installed, so the pin must resolve here.
     expect(version).toBeTypeOf("string");
     expect(spec).toBe(`@yawlabs/mcp-compliance@${version}`);

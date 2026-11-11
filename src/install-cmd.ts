@@ -232,10 +232,12 @@ export interface InstallCommandOptions {
    *  tests leave it undefined to stay hermetic against an env-set value. */
   claudeConfigDir?: string;
   /** Every client env var, as `readClientEnv` reported it, threaded from the
-   *  dispatcher. Only a MODULAR row reads it (Zed's $XDG_CONFIG_HOME, Cline's
-   *  three knobs, Continue's global dir); the six inline rows take their one
-   *  variable from `claudeConfigDir` above. Read by the dispatcher and never
-   *  here, so a test that calls this runner directly stays hermetic. */
+   *  dispatcher. A MODULAR row reads its own variables from it (Zed's
+   *  $XDG_CONFIG_HOME, Cline's three knobs, Continue's global dir); of the six
+   *  inline rows, VS Code's Linux user path reads $XDG_CONFIG_HOME from it and
+   *  the rest take their one variable from `claudeConfigDir` above. Read by
+   *  the dispatcher and never here, so a test that calls this runner directly
+   *  stays hermetic. */
   clientEnv?: ClientEnvValues;
   /** Override for tests; defaults to process.stdin/stdout. */
   io?: {
@@ -354,19 +356,6 @@ export async function summarizeBundles(opts: { home?: string; cwd?: string }): P
 // spellings of it, non-object values included. It is `view.otherServerKeys()`
 // now -- the same rule, answered by the core off the site's own adapter, with
 // one reader of the legacy-name list instead of two.
-
-/** Where the counted entries live. The file alone under-describes claude-code
- *  LOCAL scope, whose container is projects[<dir>].mcpServers inside a
- *  ~/.claude.json that also carries a top-level mcpServers this count does not
- *  include. */
-function describeContainer(file: string, containerPath: string[]): string {
-  if (containerPath.length <= 1) return file;
-  const tail = containerPath
-    .slice(2)
-    .map((k) => `.${k}`)
-    .join("");
-  return `${file} under ${containerPath[0]}[${JSON.stringify(containerPath[1])}]${tail}`;
-}
 
 /** A row's top-level default as the messages spell it: `key = value`. The
  *  value is JSON-spelled, which for the scalars a default can hold (a number,
@@ -526,6 +515,11 @@ export interface InstallResult {
    *  matching the refusal's prose, which is how it once swallowed the diff
    *  with it. */
   collisionRefused?: boolean;
+  /** True when the user answered [a]bort at the collision prompt (exit 1).
+   *  `install --all` reads it to end the whole run there, as it does on the
+   *  Ctrl+C cancel (exit 130): exit 1 alone cannot tell an abort from a
+   *  failure the run should carry on past. */
+  collisionAborted?: boolean;
 }
 
 /** Every row's top-level defaults as USAGE names them, one row per entry:
@@ -616,6 +610,8 @@ const USAGE =
   "  and refuses without one, showing what differs (exit 2; a real failure, such\n" +
   "  as a malformed config, exits 1). Under --all the run exits 2 when every\n" +
   "  client that did not succeed was refused this way, and 1 if any one failed.\n" +
+  "  At a prompt, [a]bort (exit 1) or Ctrl+C (exit 130) ends an --all run and\n" +
+  "  names the clients it did not attempt.\n" +
   "  Answer up front with:\n" +
   "  --force     Overwrite whatever is there, env included: the new entry keeps\n" +
   "              none of the old entry's env, and install names each key it drops.\n" +
@@ -632,7 +628,7 @@ const USAGE =
   refusalUsage() +
   "\n" +
   "  Deprecated (accepted, ignored, warns): --token <mcp_pat_...>, --no-yaw-mcp-config.\n" +
-  "  yaw-mcp is local-only -- it stores no token and never writes ~/.yaw-mcp/config.json.\n" +
+  "  yaw-mcp is local-only -- install stores no token and no longer writes ~/.yaw-mcp/config.json.\n" +
   "  Configure servers in ~/.yaw-mcp/bundles.json (see `yaw-mcp add <slug>`).";
 
 /** How every command in this file reports a config file it could not READ.
@@ -898,8 +894,9 @@ export function resolveInstallSite(
       projectDir,
       claudeConfigDir: opts.claudeConfigDir,
       // A MODULAR row resolves its own path from these (Zed's
-      // $XDG_CONFIG_HOME, Cline's three knobs, Continue's global dir). Read
-      // once by the dispatcher; a row never reads process.env itself.
+      // $XDG_CONFIG_HOME, Cline's three knobs, Continue's global dir), and so
+      // does VS Code's Linux user path ($XDG_CONFIG_HOME). Read once by the
+      // dispatcher; a row never reads process.env itself.
       clientEnv: opts.clientEnv,
     });
   } catch (e) {
@@ -985,10 +982,44 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
 
   const plan = resolveInstallSite("install", opts, err);
   if (!plan) return { written: [], wouldWrite: [], messages, exitCode: 2 };
-  const { target, os, scope, projectDir, resolved } = plan;
+  const { target, os, scope, projectDir } = plan;
+
+  // The sites this machine actually has: every unconditional one, plus each
+  // conditional one whose editor-storage directory exists. Every row but Cline
+  // declares exactly one, so `extraSites` is empty for all of them and nothing
+  // downstream of it runs.
+  //
+  // The first SELECTED site is THE site: the file every message names, the one
+  // the collision ladder and the drift diff are about, and the one a fresh
+  // install creates. The extras are COPIES of the same entry -- see
+  // applyToExtraSites.
+  const selectedSites = selectSites(plan.sites);
+  const site = selectedSites[0];
+  const extraSites = selectedSites.slice(1);
 
   log(`Target: ${target.label} (${scope})`);
-  log(`File:   ${resolved.absolute}`);
+  // `plan.resolved` (the first DECLARED site) only when nothing was selected:
+  // the refusal just below is the one path that has no selected site to name.
+  log(`File:   ${(site ?? plan).resolved.absolute}`);
+
+  // `selectedSites[0]` is a bare index, so `site` is `undefined` for a row
+  // whose every declared site is conditional and none of whose detect dirs
+  // exist. No row declares such a set today (each keeps one `detectDir: null`
+  // site first, and a row without a `sites` hook has exactly one), so this is
+  // a named refusal for a row that might -- not a TypeError deep in the read
+  // below, over a `.resolved` of undefined, that names no client and no file.
+  if (site === undefined) {
+    err(
+      `yaw-mcp install: ${target.label} (${scope}) has no config file on this machine -- none of the copies ` +
+        "the row declares belongs to an installed editor, so there is nothing to write into.",
+    );
+    return { written: [], wouldWrite: [], messages, exitCode: 1 };
+  }
+  // The path, fingerprint and write all come from the site the view is READ
+  // from. They used to come from `plan.resolved` -- the first declared site --
+  // which is the same file only while every row declares an unconditional
+  // site first.
+  const resolved = site.resolved;
 
   // The resolve inputs every settings-side question below shares, and the ones
   // install's own plan resolved with. Up here, ahead of the read, because the
@@ -1006,30 +1037,6 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   // order, indentation and the neighbouring entries all survive -- and now
   // the result is VERIFIED before install has anything to persist.
   const containerPath = resolved.containerPath;
-  // The sites this machine actually has: every unconditional one, plus each
-  // conditional one whose editor-storage directory exists. Every row but Cline
-  // declares exactly one, so `extraSites` is empty for all of them and nothing
-  // downstream of it runs.
-  //
-  // `sites[0]` stays THE site: the file every message names, the one the
-  // collision ladder and the drift diff are about, and the one a fresh install
-  // creates. The extras are COPIES of the same entry -- see applyToExtraSites.
-  const selectedSites = selectSites(plan.sites);
-  const site = selectedSites[0];
-  const extraSites = selectedSites.slice(1);
-  // `selectedSites[0]` is a bare index, so `site` is `undefined` for a row
-  // whose every declared site is conditional and none of whose detect dirs
-  // exist. No row declares such a set today (each keeps one `detectDir: null`
-  // site first, and a row without a `sites` hook has exactly one), so this is
-  // a named refusal for a row that might -- not a TypeError deep in the read
-  // below, over a `.resolved` of undefined, that names no client and no file.
-  if (site === undefined) {
-    err(
-      `yaw-mcp install: ${target.label} (${scope}) has no config file on this machine -- none of the copies ` +
-        "the row declares belongs to an installed editor, so there is nothing to write into.",
-    );
-    return { written: [], wouldWrite: [], messages, exitCode: 1 };
-  }
   /** `projects[...]` keys that name THIS project with the other drive-letter
    *  case and already carry yaw-mcp wiring. Reported, never written to -- see
    *  claudeCodeContainerPaths for why install adds rather than migrates. */
@@ -1118,16 +1125,18 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     return { written: [], wouldWrite: [], messages, exitCode: 1 };
   }
   // A container key that already holds a non-object this run will NOT repair
-  // (a non-empty array, a string -- a shape that can carry real server
-  // definitions, see `blocked.reparable`) is a refusal of the same class as
+  // (`blocked.reparable` false: in JSON a non-empty array, the one shape that
+  // can carry real server definitions -- a scalar such as a string IS
+  // reparable there and is replaced with {} at the write; in TOML every
+  // blocked shape) is a refusal of the same class as
   // the one above, and it is made HERE, beside it, for the same reason: every
   // path through this run ends in it (the read carries no entries, so `--skip`
   // never sees one to leave, and the entry can never read as identical), so
   // nothing printed between here and the write is true. It used to sit at the
   // write itself, AFTER the buffered Runtime lines were flushed and after the
   // kept-root-default Notes -- "Runtime: will run on oam" over an entry that
-  // was then refused. The REPARABLE shape (an empty array, null) stays with
-  // the write, where the repair is planned as the first edit.
+  // was then refused. The REPARABLE shape (an empty array, null, a scalar)
+  // stays with the write, where the repair is planned as the first edit.
   if (read.kind === "blocked" && !read.reparable) {
     err(
       `yaw-mcp install: "${read.path.join(".")}" in ${resolved.absolute} is ${read.shape}, not ${containerNounFor(view.adapter.syntax)} -- refusing to overwrite it; ${blockedContainerFix("re-run", view.adapter.syntax)}.`,
@@ -1575,7 +1584,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     }
     if (decision === "abort") {
       err("Aborted.");
-      return { written: [], wouldWrite: [], messages, exitCode: 1 };
+      return { written: [], wouldWrite: [], messages, exitCode: 1, collisionAborted: true };
     }
     if (decision === "cancelled") {
       // Ctrl+C at the prompt. Exit 130, the convention every other prompt in
@@ -2026,7 +2035,9 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
       err,
       {
         names: directEntryNames,
-        where: describeContainer(resolved.absolute, containerPath),
+        // Where the counted entries live, named by the site's own adapter:
+        // the file alone, or the file plus the nested container it holds.
+        where: view.adapter.describeLocation(resolved.absolute, view.address),
         clientLabel: target.label,
       },
       bundles,
@@ -2223,7 +2234,11 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   logInstallTail(
     log,
     err,
-    { names: directEntryNames, where: describeContainer(resolved.absolute, containerPath), clientLabel: target.label },
+    {
+      names: directEntryNames,
+      where: view.adapter.describeLocation(resolved.absolute, view.address),
+      clientLabel: target.label,
+    },
     bundles,
   );
   // Claude Code gates project-scope (.mcp.json) servers behind a one-time
@@ -2568,10 +2583,26 @@ export function describeEntryDiff(stored: unknown, nextEntry: object): string[] 
     const parts: string[] = [];
     if (dropped.length > 0) parts.push(`drops ${dropped.join(", ")}`);
     if (added.length > 0) parts.push(`adds ${added.join(", ")}`);
-    // Same keys on both sides and still unequal means a VALUE moved (or a
-    // non-string value was filtered on the way in). Named, never printed.
-    if (parts.length === 0) parts.push("same keys, value(s) differ");
-    lines.push(`env: ${parts.join("; ")} (values not shown)`);
+    if (before.length === 0 && after.length === 0) {
+      // No key on either side and still unequal: a side holds an empty
+      // `env: {}` or a non-object, and the other holds no env or the other of
+      // those two. No named value moves, so "value(s) differ" would be false
+      // -- the block itself is what goes, arrives or changes shape.
+      const shape = (v: unknown): string =>
+        typeof v === "object" && v !== null && !Array.isArray(v) ? "empty block" : "non-object value";
+      lines.push(
+        next.env === undefined
+          ? `env: ${shape(prev.env)} would be removed${shape(prev.env) === "empty block" ? "" : " (value not shown)"}`
+          : prev.env === undefined
+            ? `env: ${shape(next.env)} would be added`
+            : "env: would change, no keys on either side (value not shown)",
+      );
+    } else {
+      // Same keys on both sides and still unequal means a VALUE moved (or a
+      // non-string value was filtered on the way in). Named, never printed.
+      if (parts.length === 0) parts.push("same keys, value(s) differ");
+      lines.push(`env: ${parts.join("; ")} (values not shown)`);
+    }
   }
   for (const key of Object.keys(prev)) {
     if (key === "command" || key === "args" || key === "env") continue;
@@ -2668,7 +2699,14 @@ export function describeEntryDiff(stored: unknown, nextEntry: object): string[] 
  *  legacy key had to come out (its entry is re-spliced with the same value),
  *  is in `touched` and not in `entryWrites`: install's
  *  Done line reads the second list, and names a new MCP server only when some
- *  file got one. Always empty for the removal. */
+ *  file got one. Always empty for the removal.
+ *
+ *  `failed` is the REMOVAL's third list, and stays empty for an install: every
+ *  copy this pass warned about and left as it was -- one it could not read, or
+ *  one whose removal threw. Neither is in `touched`, so without this list a
+ *  copy that still holds the entry and a copy that never held it look the same
+ *  to uninstall's closing line. Filled on the preview pass too (an unreadable
+ *  copy is unreadable on both), where nothing reads it. */
 async function applyToExtraSites(args: {
   cmd: "install" | "uninstall";
   sites: readonly ConfigSite[];
@@ -2684,10 +2722,11 @@ async function applyToExtraSites(args: {
   dryRun: boolean;
   log: (s: string) => void;
   err: (s: string) => void;
-}): Promise<{ touched: string[]; entryWrites: string[] }> {
+}): Promise<{ touched: string[]; entryWrites: string[]; failed: string[] }> {
   const { cmd, compose, log, err } = args;
   const touched: string[] = [];
   const entryWrites: string[] = [];
+  const failed: string[] = [];
   for (const site of args.sites) {
     const where = site.resolved.absolute;
     const named = `${where} (${site.label})`;
@@ -2695,6 +2734,7 @@ async function applyToExtraSites(args: {
     const read = view.read;
     if (read.kind === "unreadable" || read.kind === "malformed" || read.kind === "unspliceable") {
       err(`yaw-mcp ${cmd}: warning -- ${named} could not be edited; left unchanged. Edit it by hand.`);
+      if (compose === undefined) failed.push(where);
       continue;
     }
     const legacy = view.legacyKey();
@@ -2734,6 +2774,7 @@ async function applyToExtraSites(args: {
         err(
           `yaw-mcp ${cmd}: warning -- failed to remove ${removed.join(" and ")} from ${named} (${(e as Error).message}); left unchanged. Remove ${removed.length > 1 ? "them" : "it"} by hand.`,
         );
+        failed.push(where);
       }
       continue;
     }
@@ -2760,6 +2801,19 @@ async function applyToExtraSites(args: {
     const entryChanges = !hasEntry || !deepEqualJson(stored, entry);
 
     if (!entryChanges && !trimLegacy) {
+      // No edit is built on this path, so the write facade's unloadable-config
+      // gate never runs for it. Asked here instead, as runInstall asks it on
+      // the primary's read: a matching entry in a strict-JSON copy carrying a
+      // comment is one its client loads nothing from, and "already correct"
+      // over it is the one claim this line must not make.
+      const unloadable = view.unloadable();
+      if (unloadable !== null) {
+        err(
+          `yaw-mcp ${cmd}: warning -- ${named} ${unloadableConfigProblem(unloadable)}; left unchanged. ` +
+            `To fix it, ${unloadableConfigFix("re-run")}.`,
+        );
+        continue;
+      }
       log(`The "${ENTRY_NAME}" entry in ${named} is already correct.`);
       continue;
     }
@@ -2813,7 +2867,7 @@ async function applyToExtraSites(args: {
       );
     }
   }
-  return { touched, entryWrites };
+  return { touched, entryWrites, failed };
 }
 
 /** True when a value-flag's argument reads as the NEXT flag rather than as the
@@ -3355,8 +3409,14 @@ function displayPath(abs: string, home: string, os: InstallOS): string {
  *       reason: a script can tell "re-run with a flag" from "the write failed"
  *       without parsing prose.
  *    1  at least one client failed outright (an unreadable or malformed
- *       config, a refused write, an abort or cancel at the prompt), refused
- *       clients or not -- a flag alone will not make that run succeed. */
+ *       config, a refused write, an [a]bort at the prompt), refused clients
+ *       or not -- a flag alone will not make that run succeed.
+ *  130  the user pressed Ctrl+C at a client's collision prompt -- the code a
+ *       single-client cancel returns, whatever the clients before it did.
+ *
+ *  An [a]bort answer and a Ctrl+C cancel at a client's collision prompt both
+ *  END the run: the clients after it are not attempted and are named on
+ *  stderr. Abort exits 1, as a single-client abort does; cancel exits 130. */
 async function runInstallAll(
   opts: InstallCommandOptions,
   log: (s: string) => void,
@@ -3434,6 +3494,11 @@ async function runInstallAll(
   // (deferCollisionHint); the part they all share -- no TTY, and the flags
   // that answer it -- prints ONCE below instead of N identical times.
   const refusedClients: string[] = [];
+  /** The client whose collision prompt ended the run -- answered [a]bort or
+   *  cancelled with Ctrl+C -- and the planned clients it therefore never
+   *  reached. */
+  let stoppedAt: { clientId: string; how: "aborted" | "cancelled" } | null = null;
+  let notAttempted: string[] = [];
   for (const plan of plans) {
     log(`-- ${plan.clientId} (${plan.scope}) --`);
     const result = await runInstall({
@@ -3475,14 +3540,26 @@ async function runInstallAll(
     else if (result.collisionRefused) refusedClients.push(plan.clientId);
     else failed += 1;
     log("");
+    // Ctrl+C at a client's collision prompt (the one path that returns 130)
+    // and an [a]bort answer there (`collisionAborted`) both stop the RUN, not
+    // just that client. Carrying on opened the next client's prompt -- or,
+    // with no collision there, wrote its config -- after the user had said
+    // stop. The stopping client is counted in `failed` above; the ones after
+    // it are named below as not attempted.
+    if (result.exitCode === 130 || result.collisionAborted) {
+      stoppedAt = { clientId: plan.clientId, how: result.exitCode === 130 ? "cancelled" : "aborted" };
+      notAttempted = plans.slice(plans.indexOf(plan) + 1).map((p) => p.clientId);
+      break;
+    }
   }
 
   // The single copy the per-client suppression above defers to. Probed here
-  // rather than threaded out of the loop because probeOam is cached for the
-  // process lifetime, so this is a cache hit, and the test hook has to be
-  // honoured on this path too or a fixture-driven --all run would consult the
-  // real machine. Only the ABSENT case: every other Runtime reason still prints
-  // per client, where it belongs.
+  // rather than threaded out of the loop: probeOam caches its verdict, so this
+  // is normally a cache hit (every verdict is kept for the process lifetime
+  // but a timed-out probe's, which expires and is probed again), and the test
+  // hook has to be honoured on this path too or a fixture-driven --all run
+  // would consult the real machine. Only the ABSENT case: every other Runtime
+  // reason still prints per client, where it belongs.
   // Gated on the run leaving at least one entry in place: the note is a
   // runtime tip ABOUT the entries yaw-mcp is wired into, so on an
   // all-refused / all-failed run it printed advice for entries that do not
@@ -3530,6 +3607,15 @@ async function runInstallAll(
     );
   }
 
+  if (stoppedAt !== null) {
+    err(
+      `yaw-mcp install --all: ${stoppedAt.how} at ${stoppedAt.clientId}; ` +
+        (notAttempted.length > 0
+          ? `not attempted: ${notAttempted.join(", ")}.`
+          : "it was the last client planned, so none was left unattempted."),
+    );
+  }
+
   const totalPlanned = plans.length;
   const plural = (n: number): string => (n === 1 ? "" : "s");
   if (failed === 0 && refused === 0) {
@@ -3561,7 +3647,9 @@ async function runInstallAll(
     written: aggregateWritten,
     wouldWrite: aggregateWouldWrite,
     messages,
-    exitCode: failed > 0 ? 1 : 2,
+    // A cancel exits 130 whatever else the run did, like a single-client
+    // cancel; an abort is counted in `failed`, so it lands on 1.
+    exitCode: stoppedAt?.how === "cancelled" ? 130 : failed > 0 ? 1 : 2,
   };
 }
 
@@ -3619,7 +3707,7 @@ const UNINSTALL_USAGE =
   // reason, at the end, after the real clients.
   `Usage: yaw-mcp uninstall <${clientChoices("uninstall").join("|")}> [--scope user|project|local]\n` +
   "                         [--project-dir <path>] [--os macos|linux|windows]\n" +
-  "                         [--force | -y] [--keep-legacy] [--dry-run]\n" +
+  "                         [--force | --yes | -y] [--keep-legacy] [--dry-run]\n" +
   "\n" +
   `  Removes the "${ENTRY_NAME}" entry from the client's config, and for ${grantSharingLabels()} drops\n` +
   `  ${CLAUDE_CODE_ALLOW_PATTERN} from permissions.allow -- unless another of them still has its entry and\n` +
@@ -3653,15 +3741,13 @@ export interface UninstallCommandOptions {
   /** Claude Code's `CLAUDE_CONFIG_DIR`; see InstallCommandOptions. */
   claudeConfigDir?: string;
   /** Every client env var, as `readClientEnv` reported it, threaded from the
-   *  dispatcher. Only a MODULAR row reads it (Zed's $XDG_CONFIG_HOME, Cline's
-   *  three knobs, Continue's global dir); the six inline rows take their one
-   *  variable from `claudeConfigDir` above. Read by the dispatcher and never
-   *  here, so a test that calls this runner directly stays hermetic. */
+   *  dispatcher; see InstallCommandOptions.clientEnv for which rows read
+   *  what. Read by the dispatcher and never here, so a test that calls this
+   *  runner directly stays hermetic. */
   clientEnv?: ClientEnvValues;
   io?: InstallCommandOptions["io"];
   /** Override for tests; replaces the interactive prompt with a fixed answer. */
   promptAnswer?: string;
-  helpRequested?: boolean;
 }
 
 export function parseUninstallArgs(
@@ -4156,20 +4242,22 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
   }
   const plan = resolveInstallSite("uninstall", opts, err);
   if (!plan) return { written: [], wouldWrite: [], messages, exitCode: 2 };
-  const { target, os, scope, projectDir, resolved } = plan;
+  const { target, os, scope, projectDir } = plan;
 
-  log(`Target: ${target.label} (${scope})`);
-  log(`File:   ${resolved.absolute}`);
-
-  const containerPath = resolved.containerPath;
-  // Same site selection install makes: `sites[0]` is the file every message
-  // names, and `extraSites` holds each per-editor copy this machine has. Empty
-  // for every row but Cline. An uninstall that cleared only the shared file
-  // would leave a live broker entry in every editor copy install had written
-  // -- the duplicate-broker state the legacy trim exists to prevent.
+  // Same site selection install makes: the first selected site is the file
+  // every message names, and `extraSites` holds each per-editor copy this
+  // machine has. Empty for every row but Cline. An uninstall that cleared only
+  // the shared file would leave a live broker entry in every editor copy
+  // install had written -- the duplicate-broker state the legacy trim exists
+  // to prevent.
   const selectedSites = selectSites(plan.sites);
   const site = selectedSites[0];
   const extraSites = selectedSites.slice(1);
+
+  log(`Target: ${target.label} (${scope})`);
+  // As in install: the first DECLARED site only for the refusal just below.
+  log(`File:   ${(site ?? plan).resolved.absolute}`);
+
   // Same guard as install's, for the same reason: a bare `[0]` over a row
   // whose every site is conditional and absent would be a TypeError below,
   // naming nothing. No row declares such a set today.
@@ -4180,6 +4268,9 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
     );
     return { written: [], wouldWrite: [], messages, exitCode: 1 };
   }
+  // From the site the view is read from, as in install.
+  const resolved = site.resolved;
+  const containerPath = resolved.containerPath;
   /** Every container carrying wiring for this project -- see RemovalSite. */
   const sites: RemovalSite[] = [];
   // Fingerprinted BEFORE the read and compared again ahead of the write, for
@@ -4634,24 +4725,26 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
   // what a user running uninstall wants gone. That state REACHES this line
   // now -- `extraWouldRemove` is what carries it past the gate, which used to
   // return first, because `removals` is built from the shared file alone.
-  written.push(
-    ...(
-      await applyToExtraSites({
-        cmd: "uninstall",
-        sites: extraSites,
-        transform: target.entry,
-        compose: undefined,
-        keepLegacy: opts.keepLegacy === true,
-        authorised: true,
-        dryRun: false,
-        log,
-        err,
-      })
-    ).touched,
-  );
+  const extraLive = await applyToExtraSites({
+    cmd: "uninstall",
+    sites: extraSites,
+    transform: target.entry,
+    compose: undefined,
+    keepLegacy: opts.keepLegacy === true,
+    authorised: true,
+    dryRun: false,
+    log,
+    err,
+  });
+  const extraRemoved = extraLive.touched;
+  /** Copies the live pass warned about and left as they were (see `failed` on
+   *  applyToExtraSites). Read by the closing lines alone. */
+  const extraFailed = extraLive.failed;
+  written.push(...extraRemoved);
 
   // Best-effort, exactly like install's patch: the entry is already gone, and a
   // stale allow-pattern costs the user nothing but a dead line in a config.
+  let grantRemoved = false;
   for (const settingsPatch of settingsPatches) {
     if (!settingsPatch.changed) continue;
     if (!sameFingerprint(settingsPatch.fingerprint, await fileFingerprint(settingsPatch.path))) {
@@ -4663,6 +4756,7 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
         await atomicWriteFile(settingsPatch.path, settingsPatch.nextJson);
         log(`Wrote ${settingsPatch.path} (removed ${CLAUDE_CODE_ALLOW_PATTERN} from permissions.allow)`);
         written.push(settingsPatch.path);
+        grantRemoved = true;
       } catch (e) {
         err(
           `yaw-mcp uninstall: warning -- failed to patch ${settingsPatch.path}: ${(e as Error).message}. Remove "${CLAUDE_CODE_ALLOW_PATTERN}" from permissions.allow by hand.`,
@@ -4688,13 +4782,90 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
   // would make a scoped uninstall report on wiring it deliberately does not
   // touch, which is a separate decision. Read the line below as "nothing this
   // run left behind in the containers this scope reads".
+  //
+  // This branch returns before the failed-copy lines further down, so it names
+  // an editor copy the live pass could not edit itself, in the same words as
+  // the "Not unwired" / "Not fully unwired" lines. With no failed copy the line
+  // is unchanged.
   const stillLaunching = sites.filter((s) => s.legacyEntry !== null && !trimsLegacy(s));
   if (stillLaunching.length > 0) {
     const kept = stillLaunching.map((s) => `"${s.legacyEntry}"${where(s)}`);
+    const failedCopies =
+      extraFailed.length > 0
+        ? `Nothing was removed from ${extraFailed.join(" or ")} (see the warning above), so any yaw-mcp entry ` +
+          "there is still wired. " +
+          (extraFailed.length === 1
+            ? "Fix that file and run uninstall again to clear it. "
+            : "Fix those files and run uninstall again to clear them. ")
+        : "";
     log(
       `\n${target.label} still launches yaw-mcp through the legacy ${kept.join(" and ")} ` +
         `entr${kept.length === 1 ? "y" : "ies"} you asked to keep (--keep-legacy). Remove ` +
         `${kept.length === 1 ? "it" : "them"} from ${resolved.absolute} to stop it. ` +
+        failedCopies +
+        "Your servers in ~/.yaw-mcp/bundles.json are untouched.",
+    );
+    return { written, wouldWrite: [], messages, exitCode: 0 };
+  }
+
+  // No entry left any file. Three ways to be here past the "Nothing to do"
+  // gate, and only two of them mean the client was not wired:
+  //
+  //   1. a stale grant alone carried the run past the gate;
+  //   2. an editor copy held the entry at the preview pass and no longer did
+  //      when the live pass re-read it;
+  //   3. an editor copy could not be edited -- the preview counts a copy
+  //      without rendering its removal, and the live pass then found it
+  //      unreadable or failed the write, warned, and left it as it was.
+  //
+  // In 1 and 2 the client was not launching yaw-mcp from these files when the
+  // write would have landed, so "no longer launches ... Restart it" below
+  // would report a change that did not happen. Say what did: the grant went,
+  // or -- when its write was skipped or failed, each with its own warning in
+  // the loop above -- nothing did.
+  //
+  // In 3 "had no yaw-mcp entry to remove" is the false all-clear: the entry is
+  // still in that copy. `extraFailed` is what tells it apart, and the line
+  // names the copy instead. "any yaw-mcp entry there", not "the entry": a copy
+  // whose write failed is known to hold one, but a copy that could not be READ
+  // is only not known to be clean, and one list carries both.
+  //
+  // Exit 0 on every one of them: the copies and the grant patch are both
+  // best-effort (see applyToExtraSites), and each failure has already warned.
+  if (removals.length === 0 && extraRemoved.length === 0) {
+    if (extraFailed.length > 0) {
+      log(
+        `\nNot unwired: ${target.label} (${scope}) -- nothing was removed from ${extraFailed.join(" or ")} ` +
+          "(see the warning above), so any yaw-mcp entry there is still wired." +
+          (grantRemoved ? ` Only the leftover ${CLAUDE_CODE_ALLOW_PATTERN} grant was removed.` : "") +
+          " Your servers in ~/.yaw-mcp/bundles.json are untouched.",
+      );
+      return { written, wouldWrite: [], messages, exitCode: 0 };
+    }
+    log(
+      `\nDone: ${target.label} (${scope}) had no yaw-mcp entry to remove` +
+        (grantRemoved
+          ? `; only the leftover ${CLAUDE_CODE_ALLOW_PATTERN} grant was removed.`
+          : ", and nothing was removed.") +
+        " Your servers in ~/.yaw-mcp/bundles.json are untouched.",
+    );
+    return { written, wouldWrite: [], messages, exitCode: 0 };
+  }
+
+  // Something was removed, but an editor copy could not be edited: the mixed
+  // case of 3 above. uninstallDoneLine's "no longer launches yaw-mcp" would be
+  // the same false all-clear there, so the line names each copy left as it was
+  // instead. The reload clause stays: the files that WERE cleared still need
+  // the client restarted (or its next session) before it drops the server.
+  // Exit 0 still -- the copies are best-effort, and each has warned.
+  if (extraFailed.length > 0) {
+    log(
+      `\nNot fully unwired: ${target.label} (${scope}) -- the yaw-mcp entry was removed elsewhere, but nothing ` +
+        `was removed from ${extraFailed.join(" or ")} (see the warning above), so any yaw-mcp entry there is ` +
+        `still wired. ${reloadRemovalClause(target.reload, target.label)} ` +
+        (extraFailed.length === 1
+          ? "Fix that file and run uninstall again to clear it. "
+          : "Fix those files and run uninstall again to clear them. ") +
         "Your servers in ~/.yaw-mcp/bundles.json are untouched.",
     );
     return { written, wouldWrite: [], messages, exitCode: 0 };
@@ -4702,7 +4873,8 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
 
   // Names what was NOT touched on purpose: `uninstall` unwires a client, it
   // does not delete the user's servers. Without this line the obvious reading
-  // of "uninstall" is that bundles.json went with it.
+  // of "uninstall" is that bundles.json went with it. Reached only when every
+  // site this scope reads came clean, so its all-clear is true.
   log(uninstallDoneLine(target, resolved.display, scope, projectDir));
   return { written, wouldWrite: [], messages, exitCode: 0 };
 }

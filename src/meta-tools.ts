@@ -22,6 +22,29 @@ const PENALTY_RATE_PCT = Math.round(PENALTY_RATE_THRESHOLD * 100);
  *  `limit` schema text below quotes the same number handleFindTool clamps to. */
 export const FIND_TOOL_MAX_LIMIT = 50;
 
+// The remaining numbers the descriptions quote. Like FIND_TOOL_MAX_LIMIT,
+// server.ts imports each of these and enforces from it (the place is named per
+// constant below); meta-tools.test.ts compares the rendered text against
+// server.ts's side as a second check.
+
+/** find_tool's `limit` when the caller passes none (server.ts
+ *  ConnectServer.FIND_TOOL_DEFAULT_LIMIT). */
+export const FIND_TOOL_DEFAULT_LIMIT = 10;
+
+/** dispatch's `budget` default and ceiling (server.ts: the `budget` fallback
+ *  in handleToolCall's dispatch branch, and handleDispatch's safeBudget
+ *  clamp). */
+export const DISPATCH_DEFAULT_BUDGET = 1;
+export const DISPATCH_MAX_BUDGET = 10;
+
+/** How long find_tool and exec wait on the startup scan, in whole seconds
+ *  (server.ts ConnectServer.STARTUP_PREWARM_WAIT_MS, which is milliseconds). */
+export const STARTUP_PREWARM_WAIT_SECONDS = 20;
+
+/** Size past which exec drops the echoed intermediate `steps`, in whole KB
+ *  (server.ts EXEC_ECHO_BUDGET_BYTES, which is bytes). */
+export const EXEC_ECHO_BUDGET_KB = 4;
+
 /**
  * The server-level `instructions` string sent once in the initialize result.
  *
@@ -60,7 +83,7 @@ export const META_TOOLS = {
   discover: {
     name: "mcp_connect_discover",
     description:
-      "List the MCP servers installed in the user's ~/.yaw-mcp/bundles.json: name, namespace, tool count, an estimated token cost (a tilde marks an estimate from cached metadata), whether it is loaded, any local CLI it shadows, an inline `[A]`-`[F]` compliance grade when scored (ungraded is unmarked, not penalized), and usage hints. Tool-name lists are truncated; pass `server` for one server's full card. Recurring packs get a ready-to-run `mcp_connect_activate` call at the top.",
+      "List the MCP servers installed in the bundles.json in effect: name, namespace, tool count, an estimated token cost (a tilde marks an estimate from cached metadata), whether it is loaded, any local CLI it shadows, an inline `[A]`-`[F]` compliance grade when scored (ungraded is unmarked, not penalized), and usage hints. Tool-name lists are truncated; pass `server` for one server's full card. Recurring packs get a ready-to-run `mcp_connect_activate` call at the top.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -181,9 +204,9 @@ export const META_TOOLS = {
           // sub-1 band the clamp exists to absorb.
           type: "integer",
           minimum: 1,
-          maximum: 10,
-          default: 1,
-          description: "How many top-ranked servers to load. Default 1, cap 10.",
+          maximum: DISPATCH_MAX_BUDGET,
+          default: DISPATCH_DEFAULT_BUDGET,
+          description: `How many top-ranked servers to load. Default ${DISPATCH_DEFAULT_BUDGET}, cap ${DISPATCH_MAX_BUDGET}.`,
         },
         routeEffort: {
           type: "string",
@@ -202,7 +225,7 @@ export const META_TOOLS = {
       openWorldHint: false,
     },
   },
-  read_tool: {
+  readTool: {
     name: "mcp_connect_read_tool",
     description:
       "Return one tool's full input schema without loading its server. Free for a loaded server; for an unloaded one yaw-mcp opens a transient connection, reads the schema and closes it -- nothing is added to the session. To call the tool, load its server with `mcp_connect_activate` or call it by name from `mcp_connect_exec`.",
@@ -230,8 +253,7 @@ export const META_TOOLS = {
   },
   findTool: {
     name: "mcp_connect_find_tool",
-    description:
-      'Search every installed server\'s tools by what they DO ("resize an image", "list pull requests") when you do not know which server has it. Ranks tool names and descriptions across loaded and unloaded servers from cache; nothing is loaded and no server is contacted. On a fresh install a no-match first waits (up to 20 s) for the startup scan still learning a server\'s tools. A match on a loaded server carries its full input schema; one on a never-loaded server carries name and description only -- `mcp_connect_read_tool` returns its arguments.',
+    description: `Search every installed server's tools by what they DO ("resize an image", "list pull requests") when you do not know which server has it. Ranks tool names and descriptions across loaded and unloaded servers from cache; nothing is loaded and no server is contacted. On a fresh install a no-match first waits (up to ${STARTUP_PREWARM_WAIT_SECONDS} s) for the startup scan still learning a server's tools. A match on a loaded server carries its full input schema; one on a never-loaded server carries name and description only -- \`mcp_connect_read_tool\` returns its arguments.`,
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -242,7 +264,7 @@ export const META_TOOLS = {
         },
         limit: {
           type: "number",
-          description: `Maximum matches to return. Default 10, cap ${FIND_TOOL_MAX_LIMIT}.`,
+          description: `Maximum matches to return. Default ${FIND_TOOL_DEFAULT_LIMIT}, cap ${FIND_TOOL_MAX_LIMIT}.`,
         },
       },
       required: ["query"],
@@ -322,7 +344,7 @@ export const META_TOOLS = {
     description: [
       "Run a short DECLARATIVE pipeline of upstream tool calls in one round-trip, when you already know the 2-4 calls and one step's output feeds another's args -- e.g. `a = gh_list_prs(); b = gh_get_pr(a[0].number); return b`. No expressions, loops, branches or arithmetic. Steps run in order; the only data flow is `{\"$ref\": \"<stepId>[.path.to.value]\"}` (dot keys, `[N]`/`.N` indexing), substituting a prior step's output into a later step's args. A `$ref` reads the output as the server sent it, before the pruning and size cap applied to the echoed copy. Each `tool` is a namespaced upstream name: a loaded server is called directly; an unloaded server whose tools are cached is loaded on first use (its tools join this session). A compliance-floor refusal is decided before step 0 runs and refuses the whole pipeline with nothing done, so a re-run repeats no side effect; a server-cap refusal is only knowable when the step is reached and fails it there, with `partial` holding what already ran. A name neither loaded nor cached, or on a disabled/profile-blocked server, fails its step.",
       `Max ${MAX_EXEC_STEPS} steps per exec.`,
-      "Refused before step 0: plain `exec: ...` text; a later failure: `{ ok: false, failedStep, error, partial }`. Success returns `{ ok: true, result, steps }`; with a named `return`, `result` is that step's output, `stepKeys` is added, and `steps` is dropped once the intermediates exceed about 4 KB. Name a `return` when one value is enough: it keeps a large intermediate out of your context.",
+      `Refused before step 0: plain \`exec: ...\` text; a later failure: \`{ ok: false, failedStep, error, partial }\`. Success returns \`{ ok: true, result, steps }\`; with a named \`return\`, \`result\` is that step's output, \`stepKeys\` is added, and \`steps\` holds the others, dropped once they exceed about ${EXEC_ECHO_BUDGET_KB} KB. Name a \`return\` when one value is enough: it keeps a large intermediate out of your context.`,
     ].join(" "),
     inputSchema: {
       type: "object" as const,
@@ -341,8 +363,7 @@ export const META_TOOLS = {
               },
               tool: {
                 type: "string",
-                description:
-                  'Namespaced tool name (e.g. "gh_list_prs"); a cached-but-unloaded server is loaded on first use. Meta-tools (mcp_connect_*) are not callable from exec. On a fresh install a name with no route waits up to 20 s for the startup scan.',
+                description: `Namespaced tool name (e.g. "gh_list_prs"); a cached-but-unloaded server is loaded on first use. Meta-tools (mcp_connect_*) are not callable from exec. On a fresh install a name with no route waits up to ${STARTUP_PREWARM_WAIT_SECONDS} s for the startup scan.`,
               },
               args: {
                 type: "object",
@@ -363,8 +384,7 @@ export const META_TOOLS = {
         },
         return: {
           type: "string",
-          description:
-            "Optional: id of the step whose output becomes `result` (default: the last step). Naming one adds `stepKeys` and drops `steps` once the intermediate outputs exceed about 4 KB, so a large payload you skipped is not replayed.",
+          description: `Optional: id of the step whose output becomes \`result\` (default: the last step). Naming one adds \`stepKeys\` and drops \`steps\` once the intermediate outputs exceed about ${EXEC_ECHO_BUDGET_KB} KB, so a large payload you skipped is not replayed.`,
         },
       },
       required: ["steps"],
@@ -392,7 +412,7 @@ export const META_TOOLS = {
 export const LITE_META_TOOL_NAMES: ReadonlySet<string> = new Set([
   META_TOOLS.exec.name,
   META_TOOLS.findTool.name,
-  META_TOOLS.read_tool.name,
+  META_TOOLS.readTool.name,
 ]);
 
 export interface SecretsReportRow {
@@ -401,7 +421,8 @@ export interface SecretsReportRow {
   injectedSecrets: string[];
   /** Names this server references but the vault LACKS (sorted). */
   missing: string[];
-  /** `${secret:` references in this server's env that do not PARSE, in
+  /** `${secret:` references in this server's env (its headers, for a remote
+   *  server -- see computeSecretsReport) that do not PARSE, in
    *  secrets-vault's bounded `display` form (`<malformed ref> ${secret:gh
    *  token}`; sorted). Never a raw env value: the span is control-stripped
    *  and capped before it gets here (see MalformedSecretRef). A server with
@@ -423,9 +444,8 @@ export interface SecretsReportRow {
  */
 export function computeSecretsReport(
   // `command` and `url` are here for isRemoteEntry, not for this function:
-  // the predicate falls back to command-less-with-a-url because validateEntry
-  // defaults a missing `"type"` to "local", so a hand-written url+headers
-  // entry is invisible to a `type`-only test.
+  // the predicate also answers true for a command-less entry with a url and
+  // no `type`. Its docblock in types.ts says when that fallback still matters.
   servers: Array<{
     namespace: string;
     type?: string;
@@ -480,7 +500,7 @@ export function computeSecretsReport(
  *  The sole consumer (server.ts) uses this to enforce the contract advertised
  *  on mcp_connect_exec: meta-tools are not callable from inside an exec
  *  pipeline. A hand-maintained copy made that a security-shaped invariant
- *  guarded by a list someone has to remember to update -- add an 11th
+ *  guarded by a list someone has to remember to update -- add another
  *  meta-tool, forget the entry, and that tool becomes exec-callable (a step
  *  could deactivate a server a later step needs, or recurse exec into
  *  itself) with nothing to catch it. Deriving removes the drift surface. */
