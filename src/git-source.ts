@@ -3,9 +3,11 @@
 //
 // Everything here runs the repo's own code (lifecycle scripts, the build), so
 // it only ever runs behind a consent: `add --git`, and later `update`,
-// `sidecars install` and the build `trust` offers. Activation never reaches
-// this module -- upstream.ts only checks for the marker a finished build
-// leaves (gitBuildMissing).
+// `sidecars install` and the build `trust` offers. Activation never clones,
+// installs or builds: upstream.ts checks for the marker a finished build
+// leaves (gitBuildMissing) and imports this module on demand for two things
+// only -- hasRepoConsent, to word the "not built" message, and
+// recordLoadedGitPin, to note in refs.json which file uses the build.
 //
 // Credentials are never accepted in a URL (parseGitSpec refuses them before
 // anything is persisted or logged). Auth is the user's own git -- ssh-agent,
@@ -28,6 +30,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { asciiLines, printable } from "./ascii.js";
 import { atomicWriteFile } from "./atomic-write.js";
 import { ENV_KEY_RE } from "./catalog.js";
 import {
@@ -43,11 +46,13 @@ import { parseJsonc } from "./jsonc.js";
 import {
   GIT_COMMIT_RE,
   gitSourceFromRaw,
+  hasControlChar,
   localBundlesPath,
   NAMESPACE_RE,
   probeProjectTrust,
   projectFileIsHonoured,
   readBundlesServersSync,
+  relativeSegments,
   unsafeRelativePathReason,
 } from "./local-bundles.js";
 import { log } from "./logger.js";
@@ -93,20 +98,15 @@ function isBareUsername(user: string): boolean {
   return !/^(gh[pousr]_|github_pat_|glpat-|glptt-|xox[abp]-)/i.test(user);
 }
 
-/** Repo-supplied text made safe for a terminal: anything outside printable
- *  ASCII (an ESC starting an OSC 52 clipboard write, a CSI screen clear)
- *  becomes "?". */
-export function printable(s: string): string {
-  return s.replace(/[^\x20-\x7e]/g, "?");
-}
-
-function hasControlBytes(s: string): boolean {
-  for (let i = 0; i < s.length; i++) {
-    const c = s.charCodeAt(i);
-    if (c < 0x20 || (c >= 0x7f && c <= 0x9f)) return true;
-  }
-  return false;
-}
+// `printable` (one line) and `asciiLines` (several) make repo-supplied text
+// safe for a terminal. They live in the leaf module ascii.ts, which imports
+// nothing, so a module this file itself imports could take them without a
+// cycle (none does yet: this file is the only importer). Re-exported here for
+// the callers that take them from this module.
+// The loader's path-segment splitter, re-exported so a caller comparing a
+// stored or manifest subdir with the tidy one a build records (see
+// `tidySubdir` in buildLocked) can take it from the module that tidies.
+export { asciiLines, printable, relativeSegments };
 
 /** A ref a user may name after `#`: a branch, a tag or a (short) SHA. */
 export function gitRefProblem(ref: string): string | null {
@@ -127,7 +127,7 @@ export function gitRefProblem(ref: string): string | null {
  */
 export function parseGitSpec(raw: string): { ok: true; spec: GitSpec } | { ok: false; error: string } {
   const fail = (error: string): { ok: false; error: string } => ({ ok: false, error });
-  if (hasControlBytes(raw)) return fail("--git: the URL contains control characters.");
+  if (hasControlChar(raw)) return fail("--git: the URL contains control characters.");
   const value = raw.trim();
   if (value === "") return fail("--git requires a URL");
   if (value.startsWith("-")) return fail('--git: the URL cannot start with "-".');
@@ -193,7 +193,7 @@ export function parseGitSpec(raw: string): { ok: true; spec: GitSpec } | { ok: f
   if (scp) {
     const [, user, host = "", path = ""] = scp;
     if (host.length === 1) return fail("--git: local paths need a file:// URL (file:///C:/path/to/repo).");
-    if (path.startsWith("/") && path.startsWith("//")) return fail(`--git: not a git URL. Use ${GIT_URL_FORMS}.`);
+    if (path.startsWith("//")) return fail(`--git: not a git URL. Use ${GIT_URL_FORMS}.`);
     return withRef({ url, protocol: "ssh", host: host.toLowerCase(), ...(user ? { username: user } : {}) });
   }
   return fail(`--git: not a git URL. Use ${GIT_URL_FORMS}.`);
@@ -218,7 +218,13 @@ export function normalizeRepoUrl(url: string): string {
   if (!spec.ok) return tidy(url.trim());
   const bare = spec.spec.url;
   if (spec.spec.protocol === "file") {
-    let path = decodeURIComponent(new URL(bare).pathname);
+    let path = new URL(bare).pathname;
+    try {
+      path = decodeURIComponent(path);
+    } catch {
+      // A stray "%" (file:///tmp/a%zz/repo) parses as a URL but does not
+      // decode. The raw pathname is still one stable identity for the repo.
+    }
     if (/^\/[A-Za-z]:/.test(path)) path = path.slice(1).toLowerCase();
     return `file:${tidy(path)}`;
   }
@@ -249,9 +255,9 @@ export function redactGitOutput(text: string, secrets: Record<string, string> = 
 export const GIT_MISSING_MESSAGE =
   "git is not installed or not on PATH. Install: winget install Git.Git / xcode-select --install / apt install git";
 
-/** The env a git (or package manager) child runs under, minus yaw-mcp's own
- *  secrets. Off a TTY nothing may prompt: git fails fast instead of hanging a
- *  `--json` run or the panel. */
+/** The env a git child runs under, minus yaw-mcp's own secrets. Off a TTY
+ *  nothing may prompt: git fails fast instead of hanging a `--json` run or
+ *  the panel. */
 export interface GitRunContext {
   env: NodeJS.ProcessEnv;
   interactive: boolean;
@@ -967,14 +973,17 @@ function readManifestFile(file: string, label: string, warnings: string[], allow
     }
   }
   if (m.version !== undefined && m.version !== 1) {
+    const shown = printable(JSON.stringify(m.version) ?? "");
     warnings.push(
-      `${label}: version ${printable(JSON.stringify(m.version) ?? "")} is newer than this yaw-mcp; reading the fields it knows.`,
+      typeof m.version === "number" && m.version > 1
+        ? `${label}: version ${shown} is newer than this yaw-mcp; reading the fields it knows.`
+        : `${label}: version ${shown} is not a supported version (this yaw-mcp reads version 1); reading the fields it knows.`,
     );
   }
   const str = (key: string): string | undefined => {
     const v = m[key];
     if (v === undefined) return undefined;
-    if (typeof v !== "string" || v.trim() === "" || hasControlBytes(v)) {
+    if (typeof v !== "string" || v.trim() === "" || hasControlChar(v)) {
       warnings.push(`${label}: "${key}" ignored: not a non-empty string.`);
       return undefined;
     }
@@ -1022,8 +1031,8 @@ function readManifestFile(file: string, label: string, warnings: string[], allow
           else warnings.push(`${label}: env "${k}" secret name ignored: letters, digits, "_", "." or "-" only.`);
         }
         if (d.required === true) decl.required = true;
-        if (typeof d.help === "string" && !hasControlBytes(d.help)) decl.help = d.help;
-        if (typeof d.default === "string" && !hasControlBytes(d.default)) {
+        if (typeof d.help === "string" && !hasControlChar(d.help)) decl.help = d.help;
+        if (typeof d.default === "string" && !hasControlChar(d.default)) {
           if (decl.secret) warnings.push(`${label}: env "${k}" default ignored: a secret has no default.`);
           else decl.default = d.default;
         }
@@ -1218,6 +1227,11 @@ export interface GitBuildRequest {
 
 export interface GitBuildContext {
   home: string;
+  /** The env git children run under, and the PATH the package manager's
+   *  binary is looked up on. It does NOT reach the install and build children
+   *  themselves: `runPm` (defaultRunNpm) starts them from the stripped
+   *  process.env plus the plan's overlay. The CLI passes process.env here, so
+   *  the two only differ for an embedder or a test. */
   env: NodeJS.ProcessEnv;
   interactive: boolean;
   /** `--yes`: the consent to run the repo's lifecycle scripts. */
@@ -1283,6 +1297,14 @@ function insideRelative(base: string, abs: string): string | null {
   return rel.replace(/\\/g, "/");
 }
 
+function isRegularFile(path: string): boolean {
+  try {
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
 /** The entry a package's own package.json names ("bin", else "main"), relative
  *  to `pkgDir` with forward slashes, or null when it names no file on disk. */
 export function inferredEntry(pkgDir: string): string | null {
@@ -1319,7 +1341,7 @@ export function consentLines(
     const parts = secrets.map(([k, d]) => `${d.secret} (${k})${d.help ? ` -- ${d.help}` : ""}`);
     lines.push(`Needs secrets: ${parts.join(", ")}`);
   }
-  return lines.map((l) => l.replace(/[^\x20-\x7e]/g, "?"));
+  return lines.map(printable);
 }
 
 /**
@@ -1418,17 +1440,24 @@ async function buildLocked(
   const gitCtx = prepared.run;
   const secrets = prepared.secrets;
   const redact = (text: string): string => redactGitOutput(lastLines(text), secrets);
+  // One spelling per directory: "./pkg", "pkg/" and "pkg" build, record and
+  // compare as "pkg", and "." as the repo root -- what the loader's own
+  // relativeSegments makes of a stored git.subdir.
+  const tidySubdir = (s: string): string => relativeSegments(s).join("/");
+  const reqSubdir = req.subdir === undefined ? undefined : tidySubdir(req.subdir);
   const subdirOf = (manifest: GitManifest): string | undefined =>
-    req.subdir !== undefined ? req.subdir || undefined : manifest.subdir;
+    (reqSubdir !== undefined ? reqSubdir : tidySubdir(manifest.subdir ?? "")) || undefined;
 
   const fullKnown = /^[0-9a-f]{40}$/.test(req.commit);
   const reuse = (ns: string, commit: string): GitBuildResult | GitFailure | null => {
     const dir = gitBuildDir(ns, commit, ctx.home);
     const marker = readBuildMarker(dir, commit);
     if (!marker) return null;
-    const { manifest, warnings } = readGitManifest(dir, req.subdir);
+    const { manifest, warnings } = readGitManifest(dir, reqSubdir);
     const subdir = subdirOf(manifest);
-    if ((marker.subdir ?? "") !== (subdir ?? "")) {
+    // Tidied on both sides: a marker an earlier yaw-mcp wrote holds the
+    // subdir as it was typed.
+    if (tidySubdir(marker.subdir ?? "") !== (subdir ?? "")) {
       return {
         ok: false,
         exitCode: 1,
@@ -1439,11 +1468,16 @@ async function buildLocked(
     }
     for (const w of warnings) warn(w);
     const entry = (req.entry ?? marker.entry).replace(/\\/g, "/");
-    if (!existsSync(join(dir, ...(subdir ?? "").split(/[\\/]/), ...entry.split("/")))) {
+    // A regular file, as readBuildMarker demands of the entry a marker names.
+    const entryPath = join(dir, ...(subdir ?? "").split("/"), ...entry.split("/"));
+    if (!isRegularFile(entryPath)) {
+      // The fresh-build branch's sentence (step "entry" below), so a directory
+      // is not reported as missing.
+      const why = existsSync(entryPath) ? "is not a file" : "does not exist";
       return {
         ok: false,
         exitCode: 1,
-        message: printable(`Built ${commit.slice(0, 7)} has no ${entry}. Pass --entry <file>.`),
+        message: printable(`Built ${commit.slice(0, 7)} but its entry ${entry} ${why}. Pass --entry <file>.`),
       };
     }
     return {
@@ -1464,7 +1498,7 @@ async function buildLocked(
   if (req.namespace && fullKnown && !ancestorCheck) {
     const hit = reuse(req.namespace, req.commit);
     if (hit) {
-      progress(`Using the existing build of ${req.commit.slice(0, GIT_BUILD_SHA_LEN)}`);
+      if (hit.ok) progress(`Using the existing build of ${req.commit.slice(0, GIT_BUILD_SHA_LEN)}`);
       return hit;
     }
   }
@@ -1492,10 +1526,10 @@ async function buildLocked(
       }
     }
     if (record && namespace && /^[0-9a-f]{40}$/.test(commit)) {
-      const record = { commit, at: (ctx.now?.() ?? new Date()).toISOString(), step, tail: redact(tail) };
+      const failedRecord = { commit, at: (ctx.now?.() ?? new Date()).toISOString(), step, tail: redact(tail) };
       try {
         mkdirSync(dirname(gitFailedPath(namespace, commit, ctx.home)), { recursive: true, mode: 0o700 });
-        writeFileSync(gitFailedPath(namespace, commit, ctx.home), `${JSON.stringify(record, null, 2)}\n`, {
+        writeFileSync(gitFailedPath(namespace, commit, ctx.home), `${JSON.stringify(failedRecord, null, 2)}\n`, {
           mode: 0o600,
         });
       } catch {
@@ -1581,7 +1615,7 @@ async function buildLocked(
     if (Number.isInteger(count)) ahead = count;
   }
 
-  const { manifest, warnings: manifestWarnings } = readGitManifest(work, req.subdir);
+  const { manifest, warnings: manifestWarnings } = readGitManifest(work, reqSubdir);
   for (const w of manifestWarnings) warn(w);
   namespace = namespace ?? manifest.namespace;
   if (!namespace) {
@@ -1591,7 +1625,7 @@ async function buildLocked(
     const hit = reuse(namespace, commit);
     if (hit) {
       tryRemoveTree(work, warn);
-      progress(`Using the existing build of ${commit.slice(0, GIT_BUILD_SHA_LEN)}`);
+      if (hit.ok) progress(`Using the existing build of ${commit.slice(0, GIT_BUILD_SHA_LEN)}`);
       return hit.ok && ahead !== undefined ? { ...hit, ahead } : hit;
     }
     const dest = gitBuildDir(namespace, commit, ctx.home);
@@ -1606,7 +1640,7 @@ async function buildLocked(
     work = dest;
   }
   const subdir = subdirOf(manifest);
-  const targetDir = subdir ? join(work, ...subdir.split(/[\\/]/).filter(Boolean)) : work;
+  const targetDir = subdir ? join(work, ...subdir.split("/")) : work;
   if (targetDir !== work && insideRelative(work, targetDir) === null) {
     return fail(2, `subdir "${subdir}" is outside the repository; refusing to build.`, "", "", false);
   }
@@ -1629,6 +1663,11 @@ async function buildLocked(
       `${subdir ? `${subdir}/` : "the repo root "}has no package.json; pass --subdir <path> to the package.`,
     );
   }
+  // ONE install, at the root whenever the root has a package.json: that is
+  // right for a workspace, and it is an assumption for anything else. A subdir
+  // package the root does not list as a workspace member (its own lockfile,
+  // a tooling-only root) gets no install of its own -- its build and start
+  // see only what the root install put in the root node_modules.
   const installDir = existsSync(join(work, "package.json")) ? work : targetDir;
 
   const plan = detectPackageManager(installDir);
@@ -1714,8 +1753,14 @@ async function buildLocked(
   const entryName = req.entry ?? manifest.entry;
   let entry: string | null = null;
   if (entryName !== undefined) {
-    if (existsSync(join(targetDir, ...entryName.split(/[\\/]/)))) entry = entryName.replace(/\\/g, "/");
-    else return fail(1, `Built ${sha7} but its entry ${entryName} does not exist. Pass --entry <file>.`);
+    // A regular file: readBuildMarker accepts nothing else, so a directory
+    // here (`--entry dist`) would write a marker that never reads as built.
+    const entryPath = join(targetDir, ...entryName.split(/[\\/]/));
+    if (isRegularFile(entryPath)) entry = entryName.replace(/\\/g, "/");
+    else {
+      const why = existsSync(entryPath) ? "is not a file" : "does not exist";
+      return fail(1, `Built ${sha7} but its entry ${entryName} ${why}. Pass --entry <file>.`);
+    }
   } else {
     entry = inferredEntry(targetDir);
     if (!entry) {
@@ -1779,10 +1824,6 @@ export interface GitEntryReport {
   commit: string | null;
   status: GitEntryStatus;
   error: string | null;
-}
-
-function asciiLines(text: string): string {
-  return text.replace(/\r\n/g, "\n").replace(/[^\x20-\x7e\n]/g, "?");
 }
 
 /**
@@ -2377,11 +2418,11 @@ export async function gcGitBuilds(
 }
 
 /** Delete one build so it can be made again (a build for another machine),
- *  under the git lock. */
-/** Delete one build so it can be made again (a build for another machine),
  *  under the git lock. Liveness is read under that lock, like every other
  *  deletion: a source that cannot be read may pin this build, so nothing is
- *  deleted then -- `gitLivenessWarning` says so. */
+ *  deleted then -- `gitLivenessWarning` says so. A READABLE pin does not stop
+ *  it, on purpose: the caller rebuilds this same commit straight after, so
+ *  every file that pins it gets the build back. */
 export async function discardBuild(
   namespace: string,
   commit: string,
@@ -2407,6 +2448,46 @@ export async function discardBuild(
     return { ok: true };
   } catch (e) {
     return { ok: false, exitCode: 1, message: asciiLines((e as Error).message) };
+  } finally {
+    release();
+  }
+}
+
+/**
+ * Delete the build of `commit` when no file pins it: the one `add` made for an
+ * entry it then refused to write, so nothing would ever name it again. Under
+ * the git lock, with liveness read there like every other deletion. A build
+ * some file pins is left alone (`removed: false`, no reason). A held lock or a
+ * source that cannot be read leaves it too, and `reason` says which. The
+ * namespace directory goes with it when that leaves it empty.
+ */
+export async function discardUnpinnedBuild(
+  namespace: string,
+  commit: string,
+  home: string,
+  opts: { cwd?: string; env?: NodeJS.ProcessEnv } = {},
+): Promise<{ removed: boolean; reason?: string }> {
+  const root = gitRoot(home);
+  const release = acquireSidecarsLock(root, GIT_LOCK_NAME);
+  if (release === null) return { removed: false, reason: lockedMessage(root, "the build was left in place.") };
+  try {
+    const live = await gitLiveness(namespace, home, { ...opts, repair: false });
+    if (live.unreadable.length > 0) {
+      return { removed: false, reason: `yaw-mcp could not read ${live.unreadable.join(", ")}, which may pin it.` };
+    }
+    const sha12 = commit.slice(0, GIT_BUILD_SHA_LEN);
+    if (live.pins.some((p) => p.sha12 === sha12)) return { removed: false };
+    const dir = gitBuildDir(namespace, commit, home);
+    rmSync(builtMarkerPath(dir), { force: true });
+    removeTree(dir);
+    try {
+      rmdirSync(gitCheckoutDir(namespace, home));
+    } catch {
+      // Not empty (another build, refs.json) or already gone.
+    }
+    return { removed: true };
+  } catch (e) {
+    return { removed: false, reason: asciiLines((e as Error).message) };
   } finally {
     release();
   }

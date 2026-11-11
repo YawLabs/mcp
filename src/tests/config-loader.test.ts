@@ -797,6 +797,31 @@ describe("toProfile (loadYawMcpConfig -> Profile)", () => {
     expect(p?.userPath).toContain(join(synthHome, CONFIG_DIRNAME));
   });
 
+  it("names the files that declare blockedTools, not just the primary one", async () => {
+    // REGRESSION: with a config.local.json loaded, `path` is that file and
+    // `userPath` the global one, so a deny that lives in the committed project
+    // config.json was attributed to files that do not contain it.
+    const localFile = writeConfig(synthCwd, LOCAL_CONFIG_FILENAME, { servers: ["github"] });
+    const projectFile = writeConfig(synthCwd, CONFIG_FILENAME, { blockedTools: ["github_delete_repo"] });
+    const p = await resolveProfile(synthCwd, synthHome);
+    expect(p?.path).toBe(localFile);
+    expect(p?.userPath).toBeUndefined();
+    expect(p?.blockedToolsPaths).toEqual([projectFile]);
+
+    // Two declaring files: both, highest precedence first.
+    const globalFile = writeConfig(synthHome, CONFIG_FILENAME, { blockedTools: ["slack_post"] });
+    const both = await resolveProfile(synthCwd, synthHome);
+    expect(both?.blockedToolsPaths).toEqual([projectFile, globalFile]);
+    expect(both?.blockedTools).toEqual(["github_delete_repo", "slack_post"]);
+  });
+
+  it("leaves blockedToolsPaths unset when no file declares the key", async () => {
+    writeConfig(synthHome, CONFIG_FILENAME, { blocked: ["slack"] });
+    const p = await resolveProfile(synthCwd, synthHome);
+    expect(p).not.toBeNull();
+    expect(p?.blockedToolsPaths).toBeUndefined();
+  });
+
   it("project allow-list takes precedence over global", async () => {
     writeConfig(synthHome, CONFIG_FILENAME, { servers: ["github", "postgres"] });
     writeConfig(synthCwd, CONFIG_FILENAME, { servers: ["github"] });
@@ -916,6 +941,30 @@ describe("blockedTools", () => {
     writeConfig(synthHome, "config.json", { blocked: ["GitHub"] });
     const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
     expect(r.warnings.some((w) => w.includes("is not a valid namespace") && w.includes("'GitHub'"))).toBe(true);
+  });
+
+  it("names tool names, not namespaces, in the shared array warnings", async () => {
+    // REGRESSION: filterStringArray's own two warnings said "namespace" for
+    // every field, so a mistyped blockedTools was described as a namespace list.
+    writeConfig(synthHome, "config.json", { blockedTools: "github_delete_repo" });
+    let r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    expect(r.warnings.some((w) => w.includes("'blockedTools' must be an array of tool-name strings"))).toBe(true);
+    writeConfig(synthHome, "config.json", { blockedTools: ["github_delete_repo", 7], blocked: ["gh", 7] });
+    r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    expect(
+      r.warnings.some((w) => w.includes("'blockedTools' dropped 1") && w.includes("non-empty tool-name strings")),
+    ).toBe(true);
+    expect(r.warnings.some((w) => w.includes("'blocked' dropped 1") && w.includes("non-empty namespace strings"))).toBe(
+      true,
+    );
+  });
+
+  it("tells a too-long namespace about the length cap", async () => {
+    writeConfig(synthHome, "config.json", { blocked: ["a".repeat(31)] });
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    expect(r.warnings.some((w) => w.includes("is not a valid namespace") && w.includes("30 characters at most"))).toBe(
+      true,
+    );
   });
 
   it("is undefined when no scope sets it", async () => {

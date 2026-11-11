@@ -4,9 +4,10 @@
 #
 # Single-machine flow: lint + typecheck + tests + the oam floor check (npm run
 # verify:oam-floor, which hosts a stdio SDK server on this machine's oam and
-# never moves the floor), bump package.json + server.json in lockstep, commit +
-# tag + push, publish to npm via ~/.npmrc, publish server.json to the MCP
-# registry via mcp-publisher.
+# never moves the floor), build, the client matrix (npm run verify:clients,
+# which installs that build into every supported client and launches it), bump
+# package.json + server.json in lockstep, commit + tag + push, publish to npm
+# via ~/.npmrc, publish server.json to the MCP registry via mcp-publisher.
 # No GitHub release creation, no per-platform build orchestration, no
 # SEA binaries. Install story is `npm install -g @yawlabs/mcp` (or
 # `npx -y @yawlabs/mcp`) -- see docs/v0.70.3-binary-track-decision.md
@@ -16,7 +17,7 @@
 # per-platform SEA build orchestration that briefly lived in
 # scripts/build-platforms-all.sh (removed in v0.70.3). The script is
 # the single source of truth: it runs the pre-flight gates (lint,
-# typecheck, tests, build), bumps package.json + server.json in
+# typecheck, tests, oam floor, build, client matrix), bumps package.json + server.json in
 # lockstep, commits and tags, publishes to npm via the ~/.npmrc
 # automation token, publishes server.json to the MCP registry via
 # mcp-publisher, and exits.
@@ -177,9 +178,14 @@ set -Eeuo pipefail
 # message (the non-tty confirm brake and the two behaviour-change-gate
 # aborts): nothing failed and nothing was released, so the failure banner
 # would only add a misleading "failed at line unknown" under the real reason.
+#
+# NPM_CHECK_LOG is the temp file run_npm_check tees a gate's output into. It
+# is set only while a gate runs, so an interrupt in the middle of one (the
+# test suite takes minutes) does not leave the gate's output in the temp dir.
 WORKDIR=""
 FAIL_LINE=""
 ABORTED=""
+NPM_CHECK_LOG=""
 trap 'FAIL_LINE=$LINENO' ERR
 cleanup() {
   rc=$?
@@ -188,6 +194,9 @@ cleanup() {
   fi
   if [ -n "$WORKDIR" ] && [ -d "$WORKDIR" ]; then
     rm -rf "$WORKDIR"
+  fi
+  if [ -n "$NPM_CHECK_LOG" ]; then
+    rm -f "$NPM_CHECK_LOG"
   fi
 }
 trap cleanup EXIT
@@ -251,9 +260,11 @@ esac
 
 # Run an npm-run-script tool that may segfault on this box. $1 label, $2 script,
 # $3 ERE for real failures, $4 (opt) ERE proving the tool ran, $5 (opt) direct
-# verify command (no npm-run wrapper) for tools that print no completion marker.
+# verify command for tools that print no completion marker. It must not go
+# through the npm CLI at all -- `npx` is `npm exec`, the same CLI whose exit
+# cleanup segfaults -- so it names node and the tool's own entry file.
 run_npm_check() {
-  local label="$1" script="$2" fail_re="$3" done_re="${4:-}" verify_cmd="${5:-}" out plain rc=0
+  local label="$1" script="$2" fail_re="$3" done_re="${4:-}" verify_cmd="${5:-}" out plain log rc=0
   # SKIP_LINT=1 escape hatch -- an explicit LAST RESORT, not a routine skip. It
   # takes lint out of the release entirely and nothing else re-checks
   # formatting: this repo has no CI (no .github/workflows, and GitHub Actions is
@@ -276,11 +287,22 @@ run_npm_check() {
     warn "SKIP_LINT=1 -- skipping '$label' (lint gate disabled by request; formatting goes unverified)"
     return 0
   fi
-  # `|| rc=$?` is load-bearing: under `set -e` a bare `out=$(npm run ...)` whose
-  # command substitution exits non-zero aborts the function THERE, before the
-  # analysis below runs.
-  out=$(npm run "$script" 2>&1) || rc=$?
-  printf '%s\n' "$out"
+  # Through tee into a file, as step 4's publish is: the operator sees each
+  # line as the tool prints it, and the verdict greps below read the file's
+  # copy. Capturing with out=$(npm run ...) and printing afterwards kept every
+  # gate silent until it exited -- minutes for the test suite, about 100 s for
+  # the client matrix -- so a wedged gate and a slow one looked the same.
+  # `|| rc=$?` is load-bearing: under `set -e` a bare failing pipeline aborts
+  # the function THERE, before the analysis below runs; under `set -o
+  # pipefail` the pipeline carries npm's code, not tee's.
+  # NPM_CHECK_LOG hands the path to cleanup() for the time the gate runs, so
+  # an exit in the middle of it removes the file too.
+  log=$(mktemp)
+  NPM_CHECK_LOG="$log"
+  npm run "$script" 2>&1 | tee "$log" || rc=$?
+  out=$(cat "$log")
+  rm -f "$log"
+  NPM_CHECK_LOG=""
   # Every verdict grep below reads $plain -- $out with its CSI escape
   # sequences (ESC [ ... final byte: colours, cursor moves, erases) removed --
   # never $out itself. vitest colours its summary even into a pipe: its colour
@@ -300,7 +322,8 @@ run_npm_check() {
   # `m` form vitest emits today. It runs in the C locale so those ranges mean
   # bytes and the suite's non-ASCII console output cannot make sed stumble.
   # Non-CSI escapes (OSC hyperlinks, 8-bit C1) are not stripped; nothing in
-  # this toolchain emits them. The human still sees the coloured output above.
+  # this toolchain emits them. The human still sees the coloured output, which
+  # tee passed through untouched.
   plain=$(LC_ALL=C sed -E $'s/\033\\[[0-?]*[ -/]*[@-~]//g' <<<"$out")
   # Every grep over $plain below reads it from a here-string, never from a
   # pipe: under `set -o pipefail`, `producer | grep -q` reports a MISS when
@@ -908,12 +931,16 @@ if [ -n "$REMOTE_HEAD" ] && [ "$LOCAL_HEAD" != "$REMOTE_HEAD" ]; then
   # exceptions here. The floor now moves only by hand (npm run
   # verify:oam-floor -- --raise), landed like any other change, so every
   # commit local main has and origin/main lacks is the operator's own.
-  if [ "$RESUMING" = true ]; then
-    # A resume reaches here from either side of the push: the prior run may
-    # have pushed the bump (HEAD and origin/main then differ until the fetch
-    # above has caught up) or died between the commit and the push (HEAD is
-    # one bump commit ahead). Both are the same resume.
-    info "Local HEAD differs from origin/main (resuming a prior run) -- proceeding"
+  if [ "$RESUMING" = true ] && git merge-base --is-ancestor "$REMOTE_HEAD" "$LOCAL_HEAD" 2>/dev/null; then
+    # A resume may be AHEAD, and only ahead: the prior run died between the
+    # bump commit and the push, so HEAD is that commit on top of origin/main.
+    # (A prior run that did push leaves the two equal -- the push itself moves
+    # the tracking ref -- and never reaches this block, unless the fetch above
+    # failed under ALLOW_STALE_REMOTE=1 and REMOTE_HEAD is an older ref, which
+    # is still an ancestor.) A resume that is behind or diverged falls through
+    # to the pull instruction below: step 3's push would be rejected
+    # non-fast-forward, after every step 1-2 gate had been paid for.
+    info "Local HEAD is ahead of origin/main (resuming a prior run) -- proceeding"
   elif git merge-base --is-ancestor "$REMOTE_HEAD" "$LOCAL_HEAD" 2>/dev/null; then
     # Strictly AHEAD: origin/main is an ancestor of HEAD, so there is nothing
     # to pull. Telling the operator to `git pull --ff-only` here is the wrong
@@ -1033,7 +1060,7 @@ elif grep -qE 'ENEEDAUTH|E401|need auth|log in' <<<"$WHOAMI_TEXT"; then
   if [ "$ALREADY_PUBLISHED" = "$VERSION" ]; then
     warn "npm is not authenticated, but @yawlabs/mcp@${VERSION} is already published so step 4 will skip the publish -- continuing. Restore the ~/.npmrc automation token before the next release."
   else
-    fail "npm is not authenticated -- step 4 would fail AFTER v${VERSION} is committed, tagged and pushed to main. Restore the ~/.npmrc automation token (see CLAUDE.md npm-token-restore); do NOT run 'npm login --auth-type=web' -- it overwrites the automation token."
+    fail "npm is not authenticated -- step 4 would fail AFTER v${VERSION} is committed, tagged and pushed to main. Restore the automation token line in ~/.npmrc (//registry.npmjs.org/:_authToken=<token>) and confirm with 'npm whoami'; do NOT run 'npm login --auth-type=web' -- it overwrites the automation token."
   fi
 else
   warn "npm whoami inconclusive (exit ${WHOAMI_RC}): ${WHOAMI_DIAG:-${NPM_WHO:-no output}} -- proceeding; step 4 will surface a real auth failure"
@@ -1060,11 +1087,36 @@ if [ "$RESUMING" != true ] && git rev-parse -q --verify "refs/tags/v${VERSION}" 
   fail "Tag v${VERSION} already exists (at ${EXISTING_TAG_COMMIT:0:9}) -- refusing to reuse an existing release number on a new commit. Pick an unused version, or delete the stale tag if it is wrong."
 fi
 
-if [ "$SKIP_CONFIRM" != "true" ] && [ "$RESUMING" != "true" ]; then
+# >>> resume evidence
+# RESUMING only says package.json already reads v${VERSION}. That is what an
+# interrupted run leaves, and equally what a merged bump commit or a hand-run
+# `npm version --no-git-tag-version` leaves -- a tree no earlier run of this
+# script ever confirmed. The confirm and the behaviour-change gate below are
+# skipped only when there is more to see than that: a local v${VERSION} tag,
+# which step 3 makes, or the version on npm, which step 4 publishes. A run
+# that died between the bump and the tag has neither and is asked again, which
+# costs one keypress.
+#
+# NOT PROOF OF AN EARLIER RUN: the tag check is local and takes a tag from any
+# source. A plain hand-run `npm version X` commits AND tags vX (npm's
+# git-tag-version defaults to true, which is why step 3 passes
+# --no-git-tag-version), so that tree skips both prompts here, as it did
+# before this check existed. Only the tag-less trees above are asked again.
+RESUME_PROVEN=false
+if [ "$RESUMING" = true ]; then
+  if git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null 2>&1 || [ "$ALREADY_PUBLISHED" = "$VERSION" ]; then
+    RESUME_PROVEN=true
+  else
+    warn "package.json already reads v${VERSION}, but there is no v${VERSION} tag and npm does not serve it -- no sign of an earlier run, so this one is confirmed like a fresh release"
+  fi
+fi
+# <<< resume evidence
+
+if [ "$SKIP_CONFIRM" != "true" ] && [ "$RESUME_PROVEN" != "true" ]; then
   echo ""
   echo -e "${YELLOW}About to release v${VERSION}. This will:${NC}"
   echo "  1. Run lint + typecheck + tests, and verify the oam floor on this machine's oam"
-  echo "  2. Build the bundled CLI (npm run build)"
+  echo "  2. Build the bundled CLI (npm run build), then install it into every supported client and launch it (npm run verify:clients, about 100 s)"
   echo "  3. Bump version in package.json + server.json, commit, tag, push"
   echo "  4. Publish to npm (using ~/.npmrc automation token)"
   echo "  5. Publish server.json to the MCP registry (mcp-publisher)"
@@ -1133,15 +1185,21 @@ if [ "$SKIP_CONFIRM" != "true" ] && [ "$RESUMING" != "true" ]; then
     # satisfied by a name mentioned three releases ago, which is exactly the
     # case where the operator most needs to be stopped.
     #
-    # CONVENTION this depends on: CHANGELOG.md keeps a `## Unreleased` heading
-    # and this script never renames it -- nothing in steps 3-5 touches the
-    # changelog, so the release's notes are expected to sit under Unreleased
-    # at the moment this prompt runs, and whoever retitles that heading to the
-    # version does it after the release, as docs. If the heading has already
-    # been renamed to `## <version>` when this runs, the awk below finds no
-    # Unreleased section, the grep misses, and the gate aborts on a switch
-    # that IS documented. The fix in that case is to answer the prompt from a
-    # tree whose heading still reads Unreleased, not to loosen this grep.
+    # CONVENTION this depends on, and does NOT enforce: CHANGELOG.md keeps a
+    # `## Unreleased` heading that holds this release's notes, and only this
+    # release's, at the moment this prompt runs. This script never renames
+    # the heading -- nothing in steps 3-5 touches the changelog -- so heading
+    # the notes with the version is a hand edit, and both ways of getting it
+    # wrong have happened. Headed BEFORE the release (1.1.6 and 1.1.7 were),
+    # the awk below finds an empty Unreleased section or none, the grep
+    # misses, and the gate aborts on a switch that IS documented. Never
+    # headed (1.1.8 to 1.1.10 shipped that way), earlier releases' notes are
+    # still under Unreleased and a switch documented releases ago satisfies
+    # the grep, which is the case the scoping exists to stop. Until the
+    # script owns the retitle, the working order is: release with the notes
+    # under Unreleased, then head them with the version and leave an empty
+    # `## Unreleased` above (scripts/verify-oam-floor.mjs --raise requires
+    # that heading to be the first section).
     UNRELEASED_BODY=$(awk '/^## [Uu]nreleased/ { inside = 1; next } inside && /^## / { exit } inside { print }' CHANGELOG.md 2>/dev/null || true)
     # `-e` so a flag-shaped switch is a PATTERN, not an option. Without it
     # `grep -qF "--no-cap"` exits 2 with "unknown option", and the message
@@ -1173,7 +1231,7 @@ fi
 
 step 1 "Lint + typecheck + tests + oam floor"
 run_npm_check "Lint" lint 'Found [0-9]+ error' 'Checked [1-9][0-9]* files'  # done_re is live on the exit-0 path: biome's "Checked N files" summary must appear, with N >= 1, or the gate fails on silence -- "Checked 0 files" is biome handed only ignored paths, the very shape the guard exists for. On the 139/134 path it is inert -- the lint-crash guard hard-fails before the ARM64 tolerance block that would read it.
-run_npm_check "Type check" typecheck 'error TS[0-9]' '' 'npx tsc --noEmit'
+run_npm_check "Type check" typecheck 'error TS[0-9]' '' 'node node_modules/typescript/bin/tsc --noEmit'
 # >>> oam floor gate
 # scripts/verify-oam-floor.mjs hosts a stdio @modelcontextprotocol/server
 # server on THIS machine's oam through `oam run`, completes both protocol eras
@@ -1223,6 +1281,16 @@ step 2 "Build"
 # build BEFORE the irreversible commit+tag+push of step 3, which is worth one
 # extra tsup run (a couple of seconds).
 #
+# What that means for the gates: the dist/ built here, and launched by the
+# client matrix below, is NOT the dist/ that ships. On a fresh release this
+# step runs before step 3's bump, and tsup.config.ts bakes package.json's
+# version into the bundle as __VERSION__, so the gated build carries the
+# PREVIOUS version string; the published one is prepublishOnly's rebuild, after
+# the bump, which nothing launches. The two differ by that one `define` as
+# long as the tree does not change between them -- step 3 touches only
+# package.json, package-lock.json and server.json. (On a resume the bump is
+# already in package.json, so both builds carry the new version.)
+#
 # Same ARM64 tolerance as run_npm_check, applied to the ARTIFACT rather than to
 # a log marker: MINGW64 on Windows ARM64 can segfault (139/134) in npm's exit
 # cleanup AFTER tsup has already written dist/index.js. tsup prints no stable
@@ -1251,8 +1319,8 @@ info "Build complete"
 # HOME; launches each written entry exactly as its client spawns it, through a
 # 127.0.0.1 registry serving `npm pack` of this checkout as @yawlabs/mcp@latest
 # (so the entries stay what users get and still run this build); runs `claude
-# mcp list`, `gemini mcp list` and `codex mcp get` where those CLIs are on
-# PATH; and uninstalls. A client CLI that is absent is a skip line, not a
+# mcp get mcp`, `gemini mcp list` and `codex mcp get mcp --json` where those
+# CLIs are on PATH; and uninstalls. A client CLI that is absent is a skip line, not a
 # failure. Like the oam floor gate, it prints exactly one
 # `[verify:clients] OK` or `FAIL` line, and its per-check lines are indented,
 # so the anchored patterns cannot match one of them.
@@ -1459,9 +1527,9 @@ info "Pushed to origin"
 
 step 4 "Publish to npm"
 # The script is the publisher now. ~/.npmrc must carry the automation token
-# (NOT a WebAuthn web session -- the npm publishing rule in CLAUDE.md is
-# explicit on this: `npm login --auth-type=web` overwrites the automation
-# token and the next publish EOTPs on WebAuthn).
+# (NOT a WebAuthn web session: `npm login --auth-type=web` overwrites the
+# automation token and the next publish EOTPs on WebAuthn). The pre-flight
+# npm auth guard's message carries the restore steps.
 PUBLISHED_VERSION=""
 if npm_has_version "$VERSION"; then PUBLISHED_VERSION="$VERSION"; fi
 # Which branch ran decides how the final tarball-content check READS a
@@ -1473,9 +1541,15 @@ if [ "$PUBLISHED_VERSION" = "$VERSION" ]; then
   info "@yawlabs/mcp@${VERSION} already on npm -- skipping"
 else
   # >>> step-4 npm publish
-  # Retry up to 3 times on EOTP/EAUTH/OTP (WebAuthn-fresh sessions sometimes
-  # need ~30s for the auth backend to propagate); fail fast on everything else
-  # so a packaging error or duplicate-version doesn't waste 60s spinning.
+  # Retry up to 3 times, 30 s apart, on EOTP/EAUTH/OTP; fail fast on everything
+  # else so a packaging error or duplicate-version doesn't waste 60s spinning.
+  # The retry dates from when a fresh `npm login --auth-type=web` session was
+  # how this publish authenticated (such a session could take ~30s to
+  # propagate), and it is at odds with the header above: with the automation
+  # token this step now requires, an OTP challenge means ~/.npmrc holds a web
+  # session or the wrong token, and waiting does not fix that. The retry is
+  # kept because release-sh.test.ts pins it; the messages below say which of
+  # the two cases waiting can help.
   NPM_ALREADY_THERE=false
   ATTEMPT=1
   MAX_ATTEMPTS=3
@@ -1551,13 +1625,13 @@ else
     # error as an OTP challenge worth two more attempts and 60 s of sleep.
     if ! grep -qE 'npm (error|ERR!) code (EOTP|EAUTH)|one-time password' "$PUBLISH_LOG"; then
       rm -f "$PUBLISH_LOG"
-      fail "npm publish failed (non-OTP error -- see output above). If E401/E404, your ~/.npmrc session is stale: see CLAUDE.md npm-token-restore."
+      fail "npm publish failed (non-OTP error -- see output above). If E401/E404, your ~/.npmrc session is stale: restore the automation token line (//registry.npmjs.org/:_authToken=<token>), confirm with 'npm whoami', and re-run ./release.sh ${VERSION}."
     fi
     rm -f "$PUBLISH_LOG"
     if [ $ATTEMPT -ge $MAX_ATTEMPTS ]; then
-      fail "npm publish failed after $MAX_ATTEMPTS OTP-class attempts. WebAuthn session may not be propagating."
+      fail "npm publish failed after $MAX_ATTEMPTS OTP-class attempts. npm asked for a one-time password or refused the credentials each time, which the automation token this step expects never causes: ~/.npmrc most likely holds a web-login session or the wrong token. Restore the automation token line (//registry.npmjs.org/:_authToken=<token>), confirm with 'npm whoami', and re-run ./release.sh ${VERSION} -- v${VERSION} is already committed, tagged and pushed, so steps 1-2 repeat their gates and build, step 3 skips what is done, and step 4 publishes."
     fi
-    warn "npm publish attempt $ATTEMPT EOTPed -- waiting 30s for WebAuthn session to propagate"
+    warn "npm publish attempt $ATTEMPT EOTPed -- retrying in 30s (only a fresh web-login session gets better with waiting; with the automation token this step expects, an OTP challenge means the token in ~/.npmrc is missing or wrong)"
     ATTEMPT=$((ATTEMPT + 1))
     sleep 30
   done
@@ -1637,8 +1711,8 @@ else
   fi
   # <<< step-5 npm wait
 
-  # Download + sha256-verify mcp-publisher to a temp dir. Pinned + digest-verified
-  # the same way the old CI workflow did.
+  # Download mcp-publisher to a temp dir at the pinned version and check the
+  # tarball's sha256 against the checksums file of that same release.
   WORKDIR=$(mktemp -d)
   # mcp-publisher ships a tarball per (platform, arch). Map the current host to
   # the matching tarball name so this works on a Linux, macOS, or Windows
@@ -1659,15 +1733,25 @@ else
   esac
   TARBALL="mcp-publisher_${GOOS}_${GOARCH}.tar.gz"
   info "Downloading mcp-publisher ${MCP_PUBLISHER_VERSION} (${GOOS}/${GOARCH})"
-  curl -fsSL -o "${WORKDIR}/${TARBALL}" \
-    "https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}/${TARBALL}"
+  # Both downloads are bounded, like every other curl in this script: they run
+  # AFTER the npm publish, and a stalled GitHub download with no limit would
+  # hang the release with the version live on npm and unregistered. A failure
+  # names the re-run, as the other step-5 failures do.
+  DL_RC=0
+  curl -fsSL --connect-timeout 20 --max-time 120 -o "${WORKDIR}/${TARBALL}" \
+    "https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}/${TARBALL}" || DL_RC=$?
+  [ "$DL_RC" -eq 0 ] || fail "Could not download mcp-publisher ${MCP_PUBLISHER_VERSION} (${TARBALL}) from its GitHub release (curl exit ${DL_RC}; the limit is 120s). npm already serves @yawlabs/mcp@${VERSION}; the MCP registry publish has not been attempted. Re-run ./release.sh ${VERSION} once github.com answers: steps 1-2 repeat their gates and build, steps 3-4 skip what is done, and step 5 downloads again."
 
-  # Verify against the registry's per-release checksums file. This is the
-  # source of truth (signed via the release's attestation) and is the only
-  # correct sha256 to check against for the per-platform tarball we picked.
+  # Check the tarball against the release's own checksums file. This is
+  # DOWNLOAD INTEGRITY only: the checksums file comes from the same GitHub
+  # release as the tarball, no signature or attestation is verified, and the
+  # digest is deliberately not pinned here (see MCP_PUBLISHER_VERSION). It
+  # catches a truncated or corrupted download, not a replaced release asset.
   info "Verifying ${TARBALL} against the release's checksums.txt"
-  curl -fsSL -o "${WORKDIR}/checksums.txt" \
-    "https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}/registry_${MCP_PUBLISHER_VERSION#v}_checksums.txt"
+  DL_RC=0
+  curl -fsSL --connect-timeout 20 --max-time 60 -o "${WORKDIR}/checksums.txt" \
+    "https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}/registry_${MCP_PUBLISHER_VERSION#v}_checksums.txt" || DL_RC=$?
+  [ "$DL_RC" -eq 0 ] || fail "Could not download mcp-publisher ${MCP_PUBLISHER_VERSION}'s checksums file from its GitHub release (curl exit ${DL_RC}; the limit is 60s). npm already serves @yawlabs/mcp@${VERSION}; the MCP registry publish has not been attempted. Re-run ./release.sh ${VERSION} once github.com answers: steps 1-2 repeat their gates and build, steps 3-4 skip what is done, and step 5 downloads again."
   # sha256sum on Linux/Git-Bash; shasum -a 256 is the macOS stock spelling.
   if command -v sha256sum >/dev/null; then
     (cd "$WORKDIR" && sha256sum -c --ignore-missing < checksums.txt) || fail "sha256 verification failed for ${TARBALL} -- refusing to run an unverified binary"
@@ -2089,10 +2173,16 @@ echo ""
 # The banner reports what was VERIFIED, not what was attempted. Asserting
 # "released to npm + MCP registry" three lines under a warning saying the
 # registry does not list it is how a half-finished release gets closed out.
-if [ "$REGISTRY_FINAL" = true ]; then
+# The same goes for npm: NPM_FINAL_MANIFEST is empty when the final read of
+# npm's per-version document failed, so "npm" is named only when it is not.
+if [ -n "$NPM_FINAL_MANIFEST" ] && [ "$REGISTRY_FINAL" = true ]; then
   echo -e "${GREEN}  v${VERSION} released to npm + MCP registry.${NC}"
-else
+elif [ -n "$NPM_FINAL_MANIFEST" ]; then
   echo -e "${YELLOW}  v${VERSION} released to npm; the MCP registry did not confirm the listing (see above).${NC}"
+elif [ "$REGISTRY_FINAL" = true ]; then
+  echo -e "${YELLOW}  v${VERSION} is listed on the MCP registry; npm did not confirm @yawlabs/mcp@${VERSION} on the final read (see above).${NC}"
+else
+  echo -e "${YELLOW}  v${VERSION}: neither npm nor the MCP registry confirmed the release on the final read (see above).${NC}"
 fi
 echo ""
 echo -e "  npm:        https://www.npmjs.com/package/@yawlabs/mcp"

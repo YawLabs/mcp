@@ -186,9 +186,26 @@ const SECRET_KEY_NAMES =
 //                      502" survives and a following pair is still redacted
 //                      on its own.
 //
-// ABSENCE_VALUE is the ONE safe-list and the only judgement left, because it
-// is the only one that needs none: no credential is literally the word
-// "unset". It keeps the clause intact so the common diagnostics still read.
+// ABSENCE_VALUE is the ONE safe-list, and it IS a judgement: the words on it
+// are what a diagnostic says where a value would be ("not", "missing",
+// "unset", but also "must", "invalid", "expected", "cannot", "failed"), and a
+// first value token that is exactly one of them is handed back with its
+// clause so the common diagnostics still read. Two things follow, both
+// accepted and stated here rather than left implied:
+//
+//   - A credential that IS literally one of those words survives:
+//     "password=required", "token: empty". Nothing in the text can tell that
+//     from the diagnostic it looks like, and hiding every "TOKEN: not set" to
+//     cover it is the worse trade.
+//   - The rest of the clause is NOT handed back blind. "token: invalid
+//     abc123secretvalue" starts with a listed word and then echoes the value,
+//     so a later token in the clause that is shaped like a credential by rule
+//     1's own gate (8+ chars, and a digit or 16+ chars) is redacted on its
+//     own (ABSENCE_TAIL_VALUE). A prose word with no digit and under 16
+//     letters passes that gate untouched, and what is left reads "invalid
+//     <redacted>", which is true. A short all-letter echoed value ("token:
+//     invalid hunter") is the accepted miss; a long word or a digit-bearing
+//     token of 8+ chars in the diagnostic (a path, a timestamp) is hidden.
 //
 // Accepted cost, stated plainly: a diagnostic whose first value token is not
 // on that list is now HIDDEN rather than shown -- "API_KEY: environment
@@ -200,6 +217,11 @@ const SECRET_KEY_NAMES =
 // than these gates and deliberately not folded in here.)
 const ABSENCE_VALUE =
   /^(?:not|no|missing|unset|undefined|null|none|empty|required|absent|blank|nil|n\/a|must|invalid|expected|cannot|failed)$/i;
+
+// A token in the clause AFTER an absence word that is shaped like a
+// credential: rule 1's bare-word gate (8+ chars, and a digit or 16+ chars),
+// over the same characters rule 2's tail admits. See the header above.
+const ABSENCE_TAIL_VALUE = /(?<![^ \t])(?=[^ \t]{16}|[^ \t]*[0-9])[^ \t]{8,}/g;
 
 const SECRET_PATTERNS: ReadonlyArray<{ re: RegExp; replace: (match: string, ...groups: string[]) => string }> = [
   // 1. An HTTP `Authorization: Bearer <blob>` / `Basic <blob>` header value.
@@ -251,8 +273,9 @@ const SECRET_PATTERNS: ReadonlyArray<{ re: RegExp; replace: (match: string, ...g
   //    DOES match, the callback redacts WHOLE (see the header above): a quoted
   //    value loses its body, a compact NAME=v loses its one token, and a
   //    whitespace-separated value loses the rest of the clause. The only
-  //    thing handed back untouched is a first value token on ABSENCE_VALUE,
-  //    so "GITHUB_TOKEN: not set" still reads as the diagnostic it is.
+  //    thing handed back is a first value token on ABSENCE_VALUE with its
+  //    clause (less any credential-shaped token later in it), so
+  //    "GITHUB_TOKEN: not set" still reads as the diagnostic it is.
   //
   //    Everything the callback needs is inside the match, so this stays a
   //    single linear pass. An earlier revision looked ahead at the rest of the
@@ -282,8 +305,9 @@ const SECRET_PATTERNS: ReadonlyArray<{ re: RegExp; replace: (match: string, ...g
       // reprs, shell `export`, single-quoted YAML.
       if (single !== undefined) return `${name}${sep}'${REDACTED}'`;
       if (double !== undefined) return `${name}${sep}"${REDACTED}"`;
-      // The only safe-list. Keeps the clause intact so the diagnostic reads.
-      if (ABSENCE_VALUE.test(bare)) return `${name}${sep}${bare}${tail}`;
+      // The only safe-list. Keeps the clause so the diagnostic reads, minus
+      // any later token shaped like a credential ("token: invalid <value>").
+      if (ABSENCE_VALUE.test(bare)) return `${name}${sep}${bare}${tail.replace(ABSENCE_TAIL_VALUE, REDACTED)}`;
       // Compact separator: the value is unambiguously ONE token, so redact it
       // and leave the rest of the line alone.
       if (!/[ \t]$/.test(sep)) return `${name}${sep}${REDACTED}${tail}`;

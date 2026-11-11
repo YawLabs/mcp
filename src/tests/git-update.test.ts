@@ -993,6 +993,57 @@ describe("rollback guards, host rebuild, state and lock edges", () => {
     expect(existsSync(gitBuiltPath("fx", foreign, home))).toBe(false);
   });
 
+  /** ENV with a PATH that holds no git: every PATH spelling dropped (Windows
+   *  carries `Path`), then one empty directory. */
+  function envWithoutGit(): NodeJS.ProcessEnv {
+    const env = Object.fromEntries(Object.entries(ENV).filter(([k]) => k.toUpperCase() !== "PATH"));
+    env.PATH = newTmp("yaw no-git-");
+    return env;
+  }
+
+  it("--to goes back to a kept build for this host on a machine without git", async () => {
+    // No remote and no clone are involved in re-pinning a build that is on
+    // disk and was made for this host, so a lost git must not block it.
+    const repo = makeRepo(NPM_FILES);
+    const first = git(repo.work, ["rev-parse", "HEAD"]);
+    writeUser(bundlesText(repo.url, first));
+    fakeFinishedBuild(gitBuildDir("fx", OTHER, home), OTHER, { marker: { url: repo.url } });
+
+    const r = await update(["fx", "--to", OTHER.slice(0, 7)], { env: envWithoutGit() });
+    expect(r.exitCode, err.join("")).toBe(0);
+    expect(out.join("")).toContain("Rolled back");
+    expect(pinned().commit).toBe(OTHER);
+    expect(calls).toEqual([]);
+  });
+
+  it("--to without git refuses a rebuild BEFORE discarding the kept build, exit 2", async () => {
+    // A build made for another host has to be re-cloned, which does need git.
+    // The refusal must come before discardBuild, or the machine loses the one
+    // copy it had for nothing.
+    const repo = makeRepo(NPM_FILES);
+    const first = git(repo.work, ["rev-parse", "HEAD"]);
+    writeUser(bundlesText(repo.url, first));
+    fakeFinishedBuild(gitBuildDir("fx", OTHER, home), OTHER, {
+      marker: { url: repo.url, platform: process.platform === "win32" ? "linux" : "win32" },
+    });
+
+    const r = await update(["fx", "--to", OTHER.slice(0, 7), "--json"], { env: envWithoutGit() });
+    expect(r.exitCode).toBe(2);
+    expect(err.join("")).toContain("git is not installed or not on PATH");
+    expect(JSON.parse(out.join(""))).toMatchObject({ ok: false, exitCode: 2 });
+    expect(pinned().commit).toBe(first);
+    expect(existsSync(gitBuiltPath("fx", OTHER, home))).toBe(true);
+  });
+
+  it("the other modes still refuse up front without git, exit 2", async () => {
+    const repo = makeRepo(NPM_FILES);
+    const first = git(repo.work, ["rev-parse", "HEAD"]);
+    writeUser(bundlesText(repo.url, first));
+    const r = await update(["fx"], { env: envWithoutGit() });
+    expect(r.exitCode).toBe(2);
+    expect(err.join("")).toContain("git is not installed or not on PATH");
+  });
+
   it("update --json on a failing entry reports ok false, status failed and the error", async () => {
     const repo = makeRepo(NPM_FILES);
     const first = git(repo.work, ["rev-parse", "HEAD"]);

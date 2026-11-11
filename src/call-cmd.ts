@@ -53,7 +53,11 @@
 //   0  the tool ran and returned a result
 //   1  the call did not produce one -- unknown server or tool, the connect
 //      failed, the transport errored -- or the tool answered with isError
-//   2  usage error, or a policy gate refused before anything was spawned
+//   2  usage error, or a policy gate refused. Every gate but one answers
+//      before anything is spawned; the exception is a `blockedTools` deny
+//      that only matches once the server's real tool list is known (a tool
+//      whose own name embeds the namespace), which refuses after the connect
+//      and before the tool is called
 
 import { homedir } from "node:os";
 import { loadYawMcpConfig, toProfile } from "./config-loader.js";
@@ -72,7 +76,7 @@ import {
 import { TransientConnectError, withTransientUpstream } from "./transient-upstream.js";
 import { displaySafe } from "./trust-cmd.js";
 import type { UpstreamConnection, UpstreamServerConfig } from "./types.js";
-import { resolveTimeoutEnv } from "./upstream.js";
+import { resolveTimeoutEnv, shellActivationMessage } from "./upstream.js";
 
 export const CALL_USAGE = `Usage: yaw-mcp call <namespace> <tool> [<json>] [flags]
 
@@ -105,8 +109,10 @@ Exit codes:
   2  a usage error, or your config refuses this call
 
   The same policy a proxied call gets applies here: a disabled server, one your
-  project profile blocks, one below YAW_MCP_MIN_COMPLIANCE, and any tool on the
-  \`blockedTools\` deny list are all refused -- before the server is spawned.`;
+  project profile blocks and one below YAW_MCP_MIN_COMPLIANCE are refused before
+  the server is spawned, and a tool on the \`blockedTools\` deny list is refused
+  before it is called (also before the spawn, unless the deny only matches the
+  tool's name as the server itself lists it).`;
 
 /** Default bound on the single tools/call this command makes, under the same
  *  operator knob the proxy's calls use (MCP_CALL_TIMEOUT, the SDK's 60s). The
@@ -519,7 +525,15 @@ export async function runCall(opts: CallCommandOptions): Promise<CallCommandResu
       // server that fails to boot gets to write bytes onto this line. The
       // namespace is quoted too, for the same reason it is at the unknown-
       // server branch above -- it is an argument this process was handed.
-      printErr(`yaw-mcp call: Could not connect to "${displaySafe(namespace)}": ${displaySafe(e.message)}`);
+      //
+      // shellActivationMessage, not e.message: an ActivationError that carries
+      // a config pointer ends "then activate it again", which is the wording
+      // for an MCP session. There is nothing to activate from a shell, so the
+      // helper swaps in "then run the command again."; any other cause (a
+      // locked vault, a pointer-less failure) comes back as its own message.
+      printErr(
+        `yaw-mcp call: Could not connect to "${displaySafe(namespace)}": ${displaySafe(shellActivationMessage(e.cause))}`,
+      );
       return { exitCode: 1 };
     }
     // Anything else escaping the body is a bug here rather than an upstream

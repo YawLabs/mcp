@@ -53,7 +53,7 @@ import type {
   StrictViolation,
 } from "./client-config.js";
 import { canonicalJson, describeValueShape, launchOf, normalizeEntry, positionAt } from "./client-config-values.js";
-import { editJsoncEntry, parseJsonc, removeJsoncEntry } from "./jsonc.js";
+import { duplicateJsoncKeyOnPath, editJsoncEntry, parseJsonc, removeJsoncEntry } from "./jsonc.js";
 
 /** U+FEFF, built from its code point rather than written as an escape: a
  *  typed escape sequence in a source file is one backslash level away from
@@ -189,8 +189,8 @@ export function buildFreshConfig(
  *  The file alone under-describes a NESTED container -- Claude Code's local
  *  scope keys its servers under one project inside a file that also carries a
  *  top-level container this count does not include -- so a nested path is
- *  spelled out. Byte-identical to `describeContainer` in install-cmd.ts, whose
- *  output src/tests/client-config-json.test.ts pins. */
+ *  spelled out. install-cmd.ts prints this through the adapter's
+ *  `describeLocation`; src/tests/client-config-json.test.ts pins the wording. */
 function describeJsonLocation(absolute: string, addr: EntryAddress): string {
   const segments = addr.containerPath;
   if (segments.length <= 1) return absolute;
@@ -317,12 +317,35 @@ function classifyJson(
   return { kind: "ok", containerPresent: true, entries: entriesOf(container, transform), unloadable };
 }
 
+/** Refuse an edit at `path` when a key along it is written more than once in
+ *  its object.
+ *
+ *  Every reader here takes the LAST definition of a duplicated key
+ *  (`JSON.parse`) and the splicer edits the FIRST (see
+ *  `duplicateJsoncKeyOnPath`), so the edit would land on a definition nothing
+ *  reads. The write facade's read-back already refused such a write -- with
+ *  "did not read back ... as it was written" or "is still in ... after
+ *  removing it", neither of which says why. Throwing here puts the cause in
+ *  the facade's "could not be edited (...)" refusal instead. */
+function refuseDuplicateKey(raw: string, path: readonly string[]): void {
+  const duplicate = duplicateJsoncKeyOnPath(raw, path);
+  if (duplicate === null) return;
+  const key = duplicate.path[duplicate.path.length - 1];
+  const parent = duplicate.path.slice(0, -1);
+  const under = parent.length === 0 ? "at the top level" : `under ${JSON.stringify(parent.join("."))}`;
+  throw new Error(
+    `${JSON.stringify(key)} is defined ${duplicate.count} times ${under}; a JSON parser reads only the last ` +
+      "definition, so delete the others by hand, then re-run",
+  );
+}
+
 function upsertJson(raw: string | null, addr: EntryAddress, key: string, entry: Record<string, unknown>): string {
   // No bytes to preserve -> render the document. Byte-identical to the
   // missing-file path install takes today, trailing newline included.
   if (raw === null || raw.trim().length === 0) {
     return `${JSON.stringify(buildFreshConfig(addr.containerPath, key, entry), null, 2)}\n`;
   }
+  refuseDuplicateKey(raw, [...addr.containerPath, key]);
   // Everything else is a splice into the original bytes. Missing containers
   // along the path are created by the splicer itself.
   return editJsoncEntry(raw, [...addr.containerPath], key, entry);
@@ -345,6 +368,7 @@ function removeJson(raw: string, addr: EntryAddress, key: string): string {
   if (!isRecord(parsed)) return raw;
   const container = containerAt(parsed, addr.containerPath);
   if (container === null || !Object.hasOwn(container, key)) return raw;
+  refuseDuplicateKey(raw, [...addr.containerPath, key]);
   return removeJsoncEntry(raw, [...addr.containerPath], key);
 }
 

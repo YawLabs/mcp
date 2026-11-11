@@ -131,13 +131,24 @@ export function isToolDenied(wireName: string, blockedTools: readonly string[] |
 /**
  * Which file the user has to edit to lift a `blockedTools` deny.
  *
- * `blockedTools` merges across scopes, so when both a project and a
- * user-global config contributed we cannot say which one carries THIS entry
- * without re-reading them -- name both rather than guess, since sending
- * someone to the wrong file is worse than sending them to two.
+ * `profile.blockedToolsPaths` lists the loaded files that declare the key (up
+ * to three: config.local.json, the project config.json, user-global). One
+ * file is named outright. `blockedTools` merges across scopes, so with more
+ * than one we cannot say which carries THIS entry without re-reading them --
+ * name them all rather than guess, since sending someone to the wrong file is
+ * worse than sending them to several.
+ *
+ * A Profile built without that field (tests construct them by hand) falls
+ * back to `path` / `userPath`, which cannot name a project config.json that
+ * sits under a config.local.json.
  */
 export function blockedToolsSource(profile: Profile | null): string {
   if (!profile) return "your yaw-mcp config";
+  const files = profile.blockedToolsPaths;
+  if (files && files.length === 1) return files[0];
+  if (files && files.length > 1) {
+    return `whichever of ${files.join(" / ")} declares it (blockedTools merges across scopes)`;
+  }
   return profile.userPath
     ? `whichever of ${profile.path} / ${profile.userPath} declares it (blockedTools merges across scopes)`
     : profile.path;

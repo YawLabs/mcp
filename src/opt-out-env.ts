@@ -15,7 +15,7 @@
 //   - the same two spellings, TRIMMED (PREWARM, the deleted AUTO_PREWARM).
 //
 // The trim is the one that bites, and on Yaw's primary platform: cmd.exe's
-// `set VAR=0 && yaw-mcp serve` keeps the space before `&&`, so the value
+// `set VAR=0 && yaw-mcp` keeps the space before `&&`, so the value
 // arrives as "0 " with a trailing space. An untrimmed check reads that as
 // "not an opt-out" and the feature runs -- silently, because the variable
 // reads as set everywhere the user can look. A user who turned off the
@@ -72,9 +72,10 @@ export function isFeatureEnabled(name: string, env: NodeJS.ProcessEnv = process.
 /**
  * Strict non-negative integer env parse: trimmed, then a bare digit run, else
  * `defaultValue`. Number.parseInt alone is not safe here: its PREFIX parsing
- * turns "0x1000", "100_000" and "0abc" into 0 and "1e2" into 1, and for the
- * ceilings that read this 0 is the DISABLE sentinel, so a typo would silently
- * remove a bound instead of falling back to it. Unset and empty also fall
+ * turns "0x1000" and "0abc" into 0, "1e2" into 1 and "100_000" into 100. For
+ * the ceilings that read this 0 is the DISABLE sentinel, so the first two
+ * typos would silently remove a bound instead of falling back to it, and the
+ * other two would shrink it a hundred- or thousandfold. Unset and empty also fall
  * back. `min` rejects a parsed value below it (to the default), for a reader
  * whose 0 would mean something harmful rather than "off".
  */

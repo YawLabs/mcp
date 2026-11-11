@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   acquireUpgradeLock,
   attemptedRecentlyAt,
+  defaultConfirmGlobalPrefix,
   detectRunningInstallPrefix,
   maybeAutoUpgrade,
   quoteArgForDisplay,
@@ -12,7 +13,7 @@ import {
   runsUnderNpmConfigPrefix,
   writeCheckMemo,
 } from "../auto-upgrade.js";
-import { BINARY_RETIRED_HINT } from "../upgrade-cmd.js";
+import { BINARY_RETIRED_HINT, NPX_LATEST_CAVEAT } from "../upgrade-cmd.js";
 
 // ═══════════════════════════════════════════════════════════════════════
 // maybeAutoUpgrade — fire-and-forget startup self-upgrade check.
@@ -515,6 +516,88 @@ describe("runAutoUpgrade: --prefix injection into spawn args", () => {
     });
 
     expect(spawnImpl).toHaveBeenCalledWith("npm", GLOBAL_NPM_ARGS, RELEASE_LOCK);
+  });
+});
+
+describe("name-only global-npm markers need a bin shim before the background install", () => {
+  // `<dir>/npm/node_modules` and `<dir>/bin/node_modules` classify as
+  // global-npm on the directory NAME. A project directory called `bin` or
+  // `npm` matches too, and the prefix derived from it is that project -- so
+  // the unprompted `npm install -g --prefix <dir>` asks for a second signal.
+  const PROJECT_BIN = join(sep, "home", "u", "proj", "bin");
+  const PROJECT_NPM = join(sep, "home", "u", "proj", "npm");
+  const entryUnder = (prefix: string): string => join(prefix, "node_modules", "@yawlabs", "mcp", "dist", "index.js");
+  const WIN_DEFAULT = "C:\\Users\\j\\AppData\\Roaming\\npm";
+  const WIN_DEFAULT_ENTRY = `${WIN_DEFAULT}\\node_modules\\@yawlabs\\mcp\\dist\\index.js`;
+
+  it.each([
+    ["bin", PROJECT_BIN],
+    ["npm", PROJECT_NPM],
+  ])("does not spawn into a directory named %s that has no shim beside it", async (_name, prefix) => {
+    // Nothing is injected for the check: the fixture path is on no filesystem,
+    // so the real existsSync answers "no shim".
+    const spawnImpl = vi.fn();
+    const recordAttemptImpl = vi.fn();
+    await maybeAutoUpgrade({
+      currentVersion: "0.47.0",
+      argvPath: entryUnder(prefix),
+      fetchLatestImpl: async () => "0.47.8",
+      spawnImpl,
+      recordAttemptImpl,
+    });
+    expect(spawnImpl).not.toHaveBeenCalled();
+    // Stopped before the lock and the attempt memo, not after them.
+    expect(recordAttemptImpl).not.toHaveBeenCalled();
+  });
+
+  it("spawns with --prefix once the shim confirms the prefix", async () => {
+    const spawnImpl = vi.fn();
+    const confirmGlobalPrefixImpl = vi.fn(() => true);
+    await maybeAutoUpgrade({
+      currentVersion: "0.47.0",
+      argvPath: entryUnder(PROJECT_BIN),
+      fetchLatestImpl: async () => "0.47.8",
+      spawnImpl,
+      confirmGlobalPrefixImpl,
+    });
+    expect(confirmGlobalPrefixImpl).toHaveBeenCalledWith(entryUnder(PROJECT_BIN), PROJECT_BIN);
+    expect(spawnImpl).toHaveBeenCalledWith(
+      "npm",
+      ["install", "-g", "--prefix", PROJECT_BIN, "@yawlabs/mcp@latest"],
+      RELEASE_LOCK,
+    );
+  });
+
+  it("defaultConfirmGlobalPrefix: a name-only marker is confirmed by either shim in the prefix root", () => {
+    const entry = entryUnder(PROJECT_BIN);
+    expect(defaultConfirmGlobalPrefix(entry, PROJECT_BIN, () => false)).toBe(false);
+    expect(defaultConfirmGlobalPrefix(entry, PROJECT_BIN, (p) => p === join(PROJECT_BIN, "yaw-mcp.cmd"))).toBe(true);
+    expect(defaultConfirmGlobalPrefix(entry, PROJECT_BIN, (p) => p === join(PROJECT_BIN, "yaw-mcp"))).toBe(true);
+    // A shim somewhere else (a project's node_modules/.bin) is not the signal.
+    expect(
+      defaultConfirmGlobalPrefix(entry, PROJECT_BIN, (p) => p === join(PROJECT_BIN, "node_modules", ".bin", "yaw-mcp")),
+    ).toBe(false);
+  });
+
+  it("defaultConfirmGlobalPrefix: anchored prefixes are never asked for a shim", () => {
+    const never = vi.fn(() => false);
+    expect(defaultConfirmGlobalPrefix(GLOBAL_NPM_PATH, GLOBAL_NPM_PREFIX, never)).toBe(true);
+    expect(defaultConfirmGlobalPrefix(WIN_DEFAULT_ENTRY, WIN_DEFAULT, never)).toBe(true);
+    expect(defaultConfirmGlobalPrefix(undefined, GLOBAL_NPM_PREFIX, never)).toBe(true);
+    expect(never).not.toHaveBeenCalled();
+  });
+
+  it("judges the RESOLVED entrypoint, the path the prefix was derived from", () => {
+    // A shim under an anchored directory that resolves INTO a project `bin`
+    // tree installs into the project, so the resolved path is what counts.
+    const shim = join(sep, "usr", "local", "bin", "yaw-mcp");
+    mockRealpathSync.mockImplementation((p) => (p === shim ? entryUnder(PROJECT_BIN) : String(p)));
+    try {
+      expect(defaultConfirmGlobalPrefix(shim, PROJECT_BIN, () => false)).toBe(false);
+    } finally {
+      mockRealpathSync.mockReset();
+      mockRealpathSync.mockImplementation((p: Parameters<typeof mockRealpathSync>[0]) => String(p));
+    }
   });
 });
 
@@ -1148,6 +1231,16 @@ describe("maybeAutoUpgrade -- advice for the non-spawnable methods", () => {
     expect(cp.calls).toHaveLength(0);
     return adviceLog();
   }
+
+  it("qualifies the npx restart advice with the @latest condition `upgrade` prints", async () => {
+    // A restart refetches only for an entry that runs @yawlabs/mcp@latest; a
+    // bare @yawlabs/mcp entry keeps its cached copy. The log used to promise
+    // the restart alone was enough.
+    const [, message, fields] = await adviseFor(NPX_PATH);
+    expect(message).toContain("restart your MCP client");
+    expect(message).toContain(NPX_LATEST_CAVEAT);
+    expect(fields).toMatchObject({ method: "npx" });
+  });
 
   it("points a local-node-modules install at `upgrade --run`, which really can upgrade it", async () => {
     // upgrade-cmd builds a runSpec for local-node-modules (npm install in the

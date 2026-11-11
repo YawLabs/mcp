@@ -358,6 +358,10 @@ async function probeModern(opts) {
   child.on("close", (code, signal) =>
     fail(new Error(`the server exited (code ${code}, signal ${signal}) before the probe finished`)),
   );
+  // A server that answers and then exits turns the next write into EPIPE, and
+  // with no listener that is an uncaught exception: a stack trace instead of
+  // the FAIL line. `ended` already reports the exit, so the error is dropped.
+  child.stdin.on("error", () => {});
   const pending = new Map();
   let buf = "";
   child.stdout.setEncoding("utf8");
@@ -495,26 +499,31 @@ function addFloorBlock(name, text, block, next) {
  * The three rewritten texts, or a throw naming the first target that does not
  * validate. Pure: the caller decides whether to write, and writes all three or
  * none. `prev` is read out of the source rather than trusted from the caller,
- * so the changelog names the floor that was really there.
+ * so the changelog names the floor that was really there. `next` comes back
+ * too, because it is not always `f.next`: build metadata ("0.20.0+abc123") is
+ * dropped before anything is written. Semver gives it no precedence, and
+ * FLOOR_LINE / RATCHET_LINE match a bare x.y.z only, so a floor written with
+ * it is one readFloor could not read back on the next run.
  * @param {{ src: string, test: string, changelog: string, next: string, day: string }} f
  */
 export function raiseFloorText(f) {
+  const next = f.next.replace(/\+.*$/, "");
   const prev = readFloor(f.src);
-  const cmp = compareVersions(f.next, prev);
+  const cmp = compareVersions(next, prev);
   if (cmp === 0) throw new Error(`the floor is already ${prev}`);
   if (cmp < 0)
     throw new Error(
-      `refusing to LOWER the floor from ${prev} to ${f.next}: the ratchet test pins it from below, and a lower floor is a hand edit with a reason in the changelog, not a verification`,
+      `refusing to LOWER the floor from ${prev} to ${next}: the ratchet test pins it from below, and a lower floor is a hand edit with a reason in the changelog, not a verification`,
     );
-  if (isPrerelease(f.next))
+  if (isPrerelease(next))
     throw new Error(
-      `refusing to raise the floor to ${f.next}: a prerelease is never a floor, and oamjs.org only ever installs releases`,
+      `refusing to raise the floor to ${next}: a prerelease is never a floor, and oamjs.org only ever installs releases`,
     );
-  const src = moveOne(FLOOR_SRC, f.src, FLOOR_LINE, "MIN_OAM_VERSION", f.next);
-  const test = moveOne(FLOOR_TEST, f.test, RATCHET_LINE, "const FLOOR", f.next);
-  const block = renderFloorBlock({ next: f.next, prev, day: f.day });
-  const changelog = addFloorBlock(FLOOR_CHANGELOG, f.changelog, block, f.next);
-  return { src, test, changelog, prev };
+  const src = moveOne(FLOOR_SRC, f.src, FLOOR_LINE, "MIN_OAM_VERSION", next);
+  const test = moveOne(FLOOR_TEST, f.test, RATCHET_LINE, "const FLOOR", next);
+  const block = renderFloorBlock({ next, prev, day: f.day });
+  const changelog = addFloorBlock(FLOOR_CHANGELOG, f.changelog, block, next);
+  return { src, test, changelog, prev, next };
 }
 
 // ---------------------------------------------------------------------------
@@ -660,14 +669,34 @@ export async function verifyOamFloor(opts = {}, deps = {}) {
     );
   }
   // All three validated above; now all three are written. A write that fails
-  // midway is reported as such -- the operator has a git diff to read.
-  writeFile(FLOOR_SRC, texts.src);
-  writeFile(FLOOR_TEST, texts.test);
-  writeFile(FLOOR_CHANGELOG, texts.changelog);
+  // midway is a FAIL line naming what was and was not written. The constant
+  // goes first, so a re-run after a partial write compares equal to the floor
+  // and writes nothing -- hence the advice to revert before re-running.
+  const targets = [
+    [FLOOR_SRC, texts.src],
+    [FLOOR_TEST, texts.test],
+    [FLOOR_CHANGELOG, texts.changelog],
+  ];
+  const written = [];
+  for (const [path, text] of targets) {
+    try {
+      writeFile(path, text);
+    } catch (err) {
+      const rest = targets.map(([p]) => p).filter((p) => p !== path && !written.includes(p));
+      const done =
+        written.length > 0
+          ? `already written: ${written.join(", ")} -- revert ${written.length > 1 ? "them" : "it"} (\`git checkout -- ${written.join(" ")}\`) before re-running, or the re-run finds the floor already at ${texts.next} and writes nothing`
+          : "nothing was written";
+      return fail(
+        `oam ${installed} is verified, but raising the floor ${texts.prev} -> ${texts.next} stopped at ${path}: ${err instanceof Error ? err.message : String(err)}. ${done}${rest.length > 0 ? `; not attempted: ${rest.join(", ")}` : ""}.`,
+      );
+    }
+    written.push(path);
+  }
   out(
-    `${TAG} raised the oam floor ${texts.prev} -> ${installed} in ${FLOOR_SRC}, ${FLOOR_TEST} and ${FLOOR_CHANGELOG}; review the diff and commit it`,
+    `${TAG} raised the oam floor ${texts.prev} -> ${texts.next} in ${FLOOR_SRC}, ${FLOOR_TEST} and ${FLOOR_CHANGELOG}; review the diff and commit it`,
   );
-  out(`${TAG} OK -- oam ${installed} hosts ${HOSTED}; the floor is now ${installed}`);
+  out(`${TAG} OK -- oam ${installed} hosts ${HOSTED}; the floor is now ${texts.next}`);
   return 0;
 }
 

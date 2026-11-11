@@ -3235,6 +3235,42 @@ describe("runInstall --all", () => {
     expect(existsSync(join(synthHome, ".yaw-mcp", "config.json"))).toBe(false);
   });
 
+  it("Ctrl+C at one client's collision prompt ends the run: later clients are not prompted or written", async () => {
+    // The loop used to carry on after a cancel, so the next client either
+    // opened a prompt of its own or -- with no collision, as here -- had its
+    // config written after the user pressed Ctrl+C.
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "old" } } }, null, 2),
+    );
+    const twoClients = INSTALL_TARGETS.filter((t) => t.clientId === "claude-code" || t.clientId === "cursor");
+    expect(twoClients.map((t) => t.clientId)).toEqual(["claude-code", "cursor"]);
+    const cap = captureIo();
+    const stdin = new PassThrough();
+    const pending = runInstall({
+      os: "linux",
+      home: synthHome,
+      cwd: synthCwd,
+      all: true,
+      targets: twoClients,
+      io: { ...cap.io, stdin, isTTY: true, terminal: true },
+      oamProbe: OAM_ABSENT,
+    });
+    await new Promise<void>((r) => setImmediate(r));
+    // ETX from its code, so no control byte sits in this source file.
+    stdin.write(String.fromCharCode(3));
+    const r = await pending;
+    expect(cap.stderr()).toMatch(/Cancelled/);
+    expect(cap.stderr()).toContain("yaw-mcp install --all: cancelled at claude-code; not attempted: cursor.");
+    expect(cap.stdout()).not.toContain("-- cursor");
+    expect(existsSync(join(synthHome, ".cursor", "mcp.json"))).toBe(false);
+    expect(r.written).toEqual([]);
+    // The documented --all code for a cancel; see runInstallAll's contract.
+    expect(r.exitCode).toBe(1);
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(client.mcpServers[ENTRY_NAME]).toEqual({ command: "old" });
+  });
+
   it("--project-dir is refused rather than silently dropped", async () => {
     // Every client carries a user scope now, so --all plans them all there and
     // hands `projectDir: undefined` to each sub-install: the flag would parse,
@@ -5541,6 +5577,48 @@ describe("describeEntryDiff / deepEqualJson", () => {
     expect(d.join(" ")).not.toContain("s3cr3t");
   });
 
+  it("calls a stored empty env an empty block going away, not a value that differs", () => {
+    // install does not carry an empty `env: {}` forward, so the entry it would
+    // write has no env. No key exists on either side: "same keys, value(s)
+    // differ" named a value change that was not happening.
+    expect(describeEntryDiff({ command: "npx", env: {} }, { command: "npx" })).toEqual([
+      "env: empty block would be removed",
+    ]);
+    expect(describeEntryDiff({ command: "npx" }, { command: "npx", env: {} })).toEqual([
+      "env: empty block would be added",
+    ]);
+    // A real value change over one key set keeps its own wording.
+    expect(describeEntryDiff({ command: "npx", env: { A: "1" } }, { command: "npx", env: { A: "2" } })).toEqual([
+      "env: same keys, value(s) differ (values not shown)",
+    ]);
+  });
+
+  it("names a non-object env by shape, never by value", () => {
+    // A hand-edited entry can hold anything under `env`. It has no keys to
+    // name, so the line says what kind of thing goes or arrives -- and a
+    // stored one is not echoed, as no other env value is.
+    const scalar = describeEntryDiff({ command: "npx", env: "s3cr3t-string" }, { command: "npx" });
+    expect(scalar).toEqual(["env: non-object value would be removed (value not shown)"]);
+    expect(scalar.join(" ")).not.toContain("s3cr3t");
+    // An array is not an env block either, empty or not.
+    expect(describeEntryDiff({ command: "npx", env: [] }, { command: "npx" })).toEqual([
+      "env: non-object value would be removed (value not shown)",
+    ]);
+    expect(describeEntryDiff({ command: "npx" }, { command: "npx", env: [] })).toEqual([
+      "env: non-object value would be added",
+    ]);
+  });
+
+  it("reports a keyless env on BOTH sides as a change, with neither value shown", () => {
+    // `{}` against `[]` or a scalar: unequal, no key on either side, and no
+    // block going or arriving -- the value changes shape in place.
+    const line = "env: would change, no keys on either side (value not shown)";
+    expect(describeEntryDiff({ command: "npx", env: {} }, { command: "npx", env: [] })).toEqual([line]);
+    const scalar = describeEntryDiff({ command: "npx", env: "s3cr3t-string" }, { command: "npx", env: {} });
+    expect(scalar).toEqual([line]);
+    expect(scalar.join(" ")).not.toContain("s3cr3t");
+  });
+
   it("names an unmodelled key without echoing its value", () => {
     const d = describeEntryDiff({ command: "npx", secretHeader: "Bearer abc" }, { command: "npx" });
     expect(d).toEqual(["secretHeader: would be removed (value not shown)"]);
@@ -5925,6 +6003,76 @@ describe("runUninstall", () => {
     const allow = (JSON.parse(readFileSync(settingsPath, "utf8")) as { permissions: { allow: string[] } }).permissions
       .allow;
     expect(allow).toEqual(["Bash(git *)"]);
+    // The client was not launching yaw-mcp before this run, so the closing
+    // line must not report that it stopped, nor ask for a restart.
+    expect(cap.stdout()).toContain(
+      `Done: Claude Code (user) had no yaw-mcp entry to remove; only the leftover ${CLAUDE_CODE_ALLOW_PATTERN} ` +
+        "grant was removed. Your servers in ~/.yaw-mcp/bundles.json are untouched.",
+    );
+    expect(cap.stdout()).not.toContain("no longer launches yaw-mcp");
+    expect(cap.stdout()).not.toContain("Restart it");
+  });
+
+  it.each([
+    "the write fails",
+    "the file changes mid-run",
+  ] as const)("says nothing was removed when the lingering allow-pattern could not be taken out (%s)", async (how) => {
+    const settingsDir = join(synthHome, ".claude");
+    mkdirSync(settingsDir, { recursive: true });
+    const settingsPath = join(settingsDir, "settings.json");
+    const seeded = JSON.stringify({ permissions: { allow: ["Bash(git *)", CLAUDE_CODE_ALLOW_PATTERN] } });
+    writeFileSync(settingsPath, seeded);
+    const cap = captureIo();
+    let landed = seeded;
+    const run = (): ReturnType<typeof runUninstall> =>
+      runUninstall({
+        clientId: "claude-code",
+        scope: "user",
+        os: "linux",
+        home: synthHome,
+        // No client config holds our entry, so settings.json is the only file
+        // this run writes -- and, on the second arm, the confirmation is the
+        // one point between its read and that write.
+        ...(how === "the write fails" ? { force: true } : { promptAnswer: "y" }),
+        io: cap.io,
+      });
+    let r: Awaited<ReturnType<typeof runUninstall>>;
+    if (how === "the write fails") {
+      atomicWriteSeam.beforeWrite = (path) => {
+        if (path === settingsPath) throw new Error("EPERM: operation not permitted");
+      };
+      r = await run();
+      expect(cap.stderr()).toContain(`warning -- failed to patch ${settingsPath}: EPERM: operation not permitted`);
+    } else {
+      // Another process rewrites settings.json while the prompt is up: the
+      // fingerprint taken at the read no longer matches, so the patch is
+      // skipped rather than written over the newer file.
+      landed = JSON.stringify({ permissions: { allow: ["Bash(git *)", "Bash(ls *)", CLAUDE_CODE_ALLOW_PATTERN] } });
+      const stdout = cap.io.stdout as unknown as { write: (chunk: string) => boolean };
+      const realWrite = stdout.write.bind(stdout);
+      let fired = false;
+      stdout.write = (chunk: string): boolean => {
+        if (!fired && String(chunk).includes("grant:")) {
+          fired = true;
+          writeFileSync(settingsPath, landed);
+        }
+        return realWrite(chunk);
+      };
+      r = await run();
+      expect(fired).toBe(true);
+      expect(cap.stderr()).toContain(`warning -- ${settingsPath} changed while uninstall was running`);
+    }
+    expect(r.exitCode).toBe(0);
+    expect(r.written).toEqual([]);
+    expect(readFileSync(settingsPath, "utf8")).toBe(landed);
+    // Neither the grant nor an entry went, so the line says so: not "only the
+    // leftover grant was removed", and not that the client stopped launching.
+    expect(cap.stdout()).toContain(
+      "Done: Claude Code (user) had no yaw-mcp entry to remove, and nothing was removed. " +
+        "Your servers in ~/.yaw-mcp/bundles.json are untouched.",
+    );
+    expect(cap.stdout()).not.toContain("grant was removed");
+    expect(cap.stdout()).not.toContain("no longer launches yaw-mcp");
   });
 
   it("leaves the legacy allow-wildcards alone -- the global list can serve a container this run never reads", async () => {
@@ -6976,6 +7124,30 @@ describe.each(CLINE_PLATFORMS)("runInstall / runUninstall -- a target whose one 
     }
   });
 
+  it('does not call a copy "already correct" when its client cannot load the file', async () => {
+    const home = mkdtempSync(join(tmpdir(), "yaw-cline-"));
+    try {
+      const copy = seedEditorStorage(home);
+      await runInstall({ ...clineOpts(home), io: captureIo().io });
+      // cline_mcp_settings.json is strict JSON: with a comment in it Cline
+      // loads no server from this copy, matching entry or not.
+      const commented = `// mine\n${readFileSync(copy, "utf8")}`;
+      writeFileSync(copy, commented, "utf8");
+
+      const cap = captureIo();
+      const r = await runInstall({ ...clineOpts(home), io: cap.io });
+      // Best-effort, like every other extra-site failure: a warning, exit 0.
+      expect(r.exitCode).toBe(0);
+      expect(cap.stdout()).not.toContain(`The "${ENTRY_NAME}" entry in ${copy}`);
+      expect(cap.stderr()).toContain(`warning -- ${copy} (`);
+      expect(cap.stderr()).toContain("has comments or trailing commas");
+      expect(cap.stderr()).toContain("left unchanged");
+      expect(readFileSync(copy, "utf8")).toBe(commented);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   // -------------------------------------------------------------------------
   // --keep-legacy reaches the copies, and every removal line names the key it
   // actually took out.
@@ -7496,6 +7668,113 @@ describe.each(CLINE_PLATFORMS)("runInstall / runUninstall -- a target whose one 
       // both sides would say it twice for one file.
       expect(cap.stderr().split(warning).length - 1).toBe(1);
       expect(readFileSync(copy, "utf8")).toBe(broken);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // The closing line when NO entry left any file. The preview pass counts a
+  // copy without rendering its removal, so a run can pass the "Nothing to do"
+  // gate on a copy the live pass then takes nothing out of.
+  // -------------------------------------------------------------------------
+
+  const NO_ENTRY_LINE =
+    "Done: Cline (user) had no yaw-mcp entry to remove, and nothing was removed. " +
+    "Your servers in ~/.yaw-mcp/bundles.json are untouched.";
+
+  /** An io whose stdout runs `between` once, when the confirmation preview
+   *  names the copy -- the one point between uninstall's two passes over the
+   *  copies that a test can reach (the prompt is answered by `promptAnswer`,
+   *  and with the shared file holding nothing of ours no write precedes the
+   *  live pass). */
+  function ioActingBetweenPasses(between: () => void) {
+    const cap = captureIo();
+    const out: string[] = [];
+    let fired = false;
+    const stdout = new Writable({
+      write(chunk: Buffer, _enc, cb): void {
+        const text = chunk.toString();
+        out.push(text);
+        if (!fired && text.includes("Would also remove")) {
+          fired = true;
+          between();
+        }
+        cb();
+      },
+    }) as unknown as NodeJS.WritableStream;
+    return { io: { ...cap.io, stdout }, stdout: () => out.join(""), stderr: cap.stderr, fired: () => fired };
+  }
+
+  it("does not say the client had no entry when the copy's removal FAILED", async () => {
+    const home = mkdtempSync(join(tmpdir(), "yaw-cline-"));
+    try {
+      const copy = await wireCopyOnly(home, "empty");
+      const before = readFileSync(copy, "utf8");
+      // The copy's write throws, as it does on a read-only file. The shared
+      // file holds nothing of ours, so this is the only write the run tries.
+      atomicWriteSeam.beforeWrite = (path) => {
+        if (path === copy) throw new Error("EPERM: operation not permitted");
+      };
+
+      const cap = captureIo();
+      const r = await runUninstall({ ...clineOpts(home), force: true, io: cap.io });
+      // Best-effort, like every copy: warned, exit 0.
+      expect(r.exitCode).toBe(0);
+      expect(r.written).toEqual([]);
+      expect(cap.stderr()).toContain(`failed to remove the "${ENTRY_NAME}" entry from ${copy}`);
+      expect(readFileSync(copy, "utf8")).toBe(before);
+      // The entry is still in the copy, so "had no yaw-mcp entry to remove" is
+      // the one thing the closing line must not say -- measured before the
+      // failed list existed: that sentence, directly under the warning.
+      expect(cap.stdout()).not.toContain("had no yaw-mcp entry");
+      expect(cap.stdout()).not.toContain("no longer launches yaw-mcp");
+      expect(cap.stdout()).toContain(
+        `Not unwired: Cline (user) -- nothing was removed from ${copy} (see the warning above), so any yaw-mcp ` +
+          "entry there is still wired. Your servers in ~/.yaw-mcp/bundles.json are untouched.",
+      );
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("does not say the client had no entry when the copy became unreadable before the live pass", async () => {
+    const home = mkdtempSync(join(tmpdir(), "yaw-cline-"));
+    try {
+      const copy = await wireCopyOnly(home, "empty");
+      const broken = "{ this is not json\n";
+      const cap = ioActingBetweenPasses(() => writeFileSync(copy, broken));
+      const r = await runUninstall({ ...clineOpts(home), promptAnswer: "y", io: cap.io });
+      expect(cap.fired()).toBe(true);
+      expect(r.exitCode).toBe(0);
+      expect(r.written).toEqual([]);
+      expect(cap.stderr()).toContain("could not be edited");
+      expect(readFileSync(copy, "utf8")).toBe(broken);
+      expect(cap.stdout()).not.toContain("had no yaw-mcp entry");
+      expect(cap.stdout()).toContain(`Not unwired: Cline (user) -- nothing was removed from ${copy} (see the warning`);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("says nothing was removed when the copy lost the entry between the preview and the live pass", async () => {
+    const home = mkdtempSync(join(tmpdir(), "yaw-cline-"));
+    try {
+      const copy = await wireCopyOnly(home, "empty");
+      // Someone else removes the entry while the prompt waits. The live pass
+      // re-reads the copy, finds nothing of ours and passes over it in
+      // silence: no failure, and nothing this run took out.
+      const other = `${JSON.stringify({ mcpServers: { other: { command: "node" } } }, null, 2)}\n`;
+      const cap = ioActingBetweenPasses(() => writeFileSync(copy, other));
+      const r = await runUninstall({ ...clineOpts(home), promptAnswer: "y", io: cap.io });
+      expect(cap.fired()).toBe(true);
+      expect(r.exitCode).toBe(0);
+      expect(r.written).toEqual([]);
+      expect(cap.stderr()).toBe("");
+      expect(readFileSync(copy, "utf8")).toBe(other);
+      expect(cap.stdout()).toContain(NO_ENTRY_LINE);
+      expect(cap.stdout()).not.toContain("Not unwired");
+      expect(cap.stdout()).not.toContain("no longer launches yaw-mcp");
     } finally {
       rmSync(home, { recursive: true, force: true });
     }

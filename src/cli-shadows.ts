@@ -5,14 +5,20 @@
 //   - guide: auto-generated "Installed servers" section appended to YAW-MCP.md
 //   - doctor: scan shell history for shadowed-CLI invocations
 //
-// Written to cover every slug in the yaw.sh/mcp Explore catalog (checked
-// against the 2026-08-23 snapshot of https://yaw.sh/data/mcp-catalog.json,
-// 80 servers) so a user who imports from the catalog with the default
-// namespace gets the hint with no configuration. Nothing ENFORCES that
-// coverage: the catalog is generated outside this repo, no slug list is
-// vendored here, and no test diffs the two -- so read the claim as "true as
-// of that snapshot", and re-check it against the live catalog before relying
-// on it. Namespace keys are lowercased at lookup time.
+// Written against the yaw.sh/mcp Explore catalog, so a user who imports a
+// covered server with the default namespace gets the hint with no
+// configuration -- but it does NOT cover the whole catalog. Measured
+// 2026-11-11 against https://yaw.sh/data/mcp-catalog.json (generated
+// 2026-10-16, 85 servers): 35 rows derive a namespace with no key here.
+// Some of those name a real CLI (terraform, vault, consul, docker, mysql,
+// redis, azure, digitalocean, ansible) and get no hint from this table; the
+// rest (datadog, zendesk, salesforce, pagerduty, ...) lack the EMPTY entry
+// described below. An unregistered namespace falls through to the tool-name
+// heuristic, which can only ever answer with a prefix in KNOWN_CLI_PREFIXES.
+// Nothing ENFORCES coverage either: the catalog is generated outside this
+// repo, no slug list is vendored here, and no test diffs the two -- so
+// re-measure against the live catalog before relying on any count here.
+// Namespace keys are lowercased at lookup time.
 //
 // CLI-name lookups are NOT case-normalized here. Both CLI-keyed tables below
 // (the cliToNamespaces reverse index and SHADOW_INSTALL_TARGETS) are keyed by
@@ -63,8 +69,8 @@ export interface CliShadow {
 // inferring a wrong shadow from the tool-name prefix.
 const EMPTY: readonly CliShadow[] = [];
 
-// Namespace → shadowed CLI(s). Keys cover every catalog slug plus
-// common aliases. Subcommand lists are only filled in where the MCP
+// Namespace → shadowed CLI(s). Keys are catalog slugs (not all of them;
+// see the coverage note in the header) plus common aliases. Subcommand lists are only filled in where the MCP
 // server meaningfully restricts itself to a subset (e.g. npmjs is a
 // read/admin-only surface, not `npm install`).
 const NAMESPACE_REGISTRY: Record<string, readonly CliShadow[]> = {

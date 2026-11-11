@@ -1,6 +1,13 @@
 import type { CreateMessageRequestParamsBase, ProtocolEra } from "@modelcontextprotocol/server";
 import { log } from "./logger.js";
-import { capForPrompt, extractText, INTENT_MAX, type SamplingPeer, TOOL_NAME_MAX } from "./reward-grader.js";
+import {
+  capForPrompt,
+  createNoSamplingNotice,
+  extractText,
+  INTENT_MAX,
+  type SamplingPeer,
+  TOOL_NAME_MAX,
+} from "./reward-grader.js";
 import type { UpstreamServerConfig } from "./types.js";
 
 // Top-2 scores within this ratio of each other trigger a sampling
@@ -346,11 +353,15 @@ export function sampleCountForEffort(effort: RouteEffort): number {
  *  advertise sampling EVERY ambiguous dispatch skips the tiebreak, and a user
  *  who set YAW_MCP_ROUTE_EFFORT=aggressive has no other way to learn the dial
  *  is inert. */
-let noSamplingNoticeLogged = false;
+const tiebreakNotice = createNoSamplingNotice(
+  "the LLM routing tiebreak is off and YAW_MCP_ROUTE_EFFORT=aggressive has no effect",
+);
 
-/** Test hook: let the one-time notice fire again. */
+/** Test hook: let the tiebreak's one-time notice fire again. The reward
+ *  grader's notice is a separate flag with its own hook of the same name in
+ *  reward-grader.ts. */
 export function resetNoSamplingNotice(): void {
-  noSamplingNoticeLogged = false;
+  tiebreakNotice.reset();
 }
 
 /** Emit the one-time notice. Exported because the PRODUCTION caller is
@@ -358,14 +369,7 @@ export function resetNoSamplingNotice(): void {
  *  would call bestOfNViaSampling (so a client without sampling never sees the
  *  "asking LLM to pick" progress line) and emits the notice when it skips. */
 export function noteNoSamplingCapability(era?: ProtocolEra): void {
-  if (noSamplingNoticeLogged) return;
-  noSamplingNoticeLogged = true;
-  log(
-    "info",
-    era === "modern"
-      ? "The client is on MCP 2026-07-28, where a server cannot ask it for sampling; the LLM routing tiebreak is off and YAW_MCP_ROUTE_EFFORT=aggressive has no effect"
-      : "Client does not advertise the sampling capability; the LLM routing tiebreak is off and YAW_MCP_ROUTE_EFFORT=aggressive has no effect",
-  );
+  tiebreakNotice.note(era);
 }
 
 // Best-of-N tiebreak: call the client LLM N times, majority-vote the parsed

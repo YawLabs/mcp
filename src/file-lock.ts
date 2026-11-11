@@ -2,7 +2,7 @@
 //
 // Shared by grades-cache.ts (grades.json, written by one-shot `yaw-mcp audit`
 // processes) and persistence.ts (state.json, written by every running
-// `yaw-mcp serve` -- one per MCP client pane). Both files are rewritten whole
+// yaw-mcp server -- one per MCP client pane). Both files are rewritten whole
 // by tmp+rename (atomic-write.ts), which stops a torn file but not a
 // last-writer-wins overwrite: two processes that each read the pre-write
 // file and each publish their own version silently drop one side. The lock

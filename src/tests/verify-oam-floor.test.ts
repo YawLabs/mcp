@@ -269,6 +269,24 @@ describe("verify-oam-floor raiseFloorText", () => {
     );
   });
 
+  it("drops build metadata from the version it writes, so the floor it leaves can be read back", () => {
+    // `0.17.0+abc123` parses as a release (isPrerelease is false for it), but
+    // the floor and ratchet lines match a bare x.y.z only: written verbatim,
+    // the next readFloor found no MIN_OAM_VERSION line at all.
+    const r = raiseFloorText({ ...fixture(), next: "0.17.0+abc123", day: "2026-09-21" });
+    expect(r.next).toBe("0.17.0");
+    expect(r.src).toBe(fixture("0.17.0").src);
+    expect(r.test).toBe(fixture("0.17.0").test);
+    expect(readFloor(r.src)).toBe("0.17.0");
+    expect(r.changelog).toContain(`${BLOCK_HEAD}0.17.0**`);
+    expect(r.changelog).not.toContain("abc123");
+    // Build metadata has no precedence: the floor's own version plus a build
+    // tag is still "already there".
+    expect(() => raiseFloorText({ ...fixture(), next: "0.16.3+abc123", day: "d" })).toThrow(
+      "the floor is already 0.16.3",
+    );
+  });
+
   it("refuses when the ratchet literal is missing, so the constant cannot move without it", () => {
     const f = fixture();
     f.test = "describe('no ratchet here', () => {});\n";
@@ -396,6 +414,48 @@ process.stdin.resume();
     ).rejects.toThrow(/before the probe finished\n {2}server stderr \(tail\): boom: no such module/);
   });
 
+  it("rejects on 2026-07-28, without an uncaught EPIPE, when the server exits right after its first answer", async () => {
+    // The child answers server/discover and exits. This thread is held
+    // blocked while it does, so by the time the answer is read the child is
+    // gone and the probe's next write (tools/list) lands on a broken pipe.
+    // With no 'error' listener on the child's stdin that EPIPE is an uncaught
+    // exception -- a stack trace where the script promises one FAIL line.
+    // Measured before the fix: the blocked parent got EPIPE every time; the
+    // same child without the block never did (the write beat the exit). If
+    // the child takes longer than the block to start, the write wins again
+    // and this case passes without exercising the listener -- weaker, never
+    // a false failure.
+    const src = `
+let buf = "";
+process.stdin.on("data", (c) => {
+  buf += c.toString();
+  const i = buf.indexOf("\\n");
+  if (i < 0) return;
+  const msg = JSON.parse(buf.slice(0, i));
+  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { supportedVersions: ["2026-07-28"] } }) + "\\n", () => process.exit(0));
+});
+`;
+    const uncaught: unknown[] = [];
+    const onUncaught = (err: unknown) => uncaught.push(err);
+    process.on("uncaughtException", onUncaught);
+    try {
+      const probing = probeHosting({
+        command: process.execPath,
+        args: ["-e", src],
+        timeoutMs: 10_000,
+        era: "2026-07-28",
+      });
+      probing.catch(() => {});
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1500);
+      await expect(probing).rejects.toThrow("before the probe finished");
+      // An EPIPE surfaces a tick or two after the write that caused it.
+      await new Promise((r) => setTimeout(r, 100));
+    } finally {
+      process.off("uncaughtException", onUncaught);
+    }
+    expect(uncaught).toEqual([]);
+  });
+
   it("rejects with the server's stderr tail when the child dies before initialize", async () => {
     await expect(
       probeHosting({
@@ -444,6 +504,8 @@ function drive(opts: {
   env?: NodeJS.ProcessEnv;
   platform?: NodeJS.Platform;
   src?: string;
+  /** Throw from the write of this path, as a locked or read-only file would. */
+  failWrite?: string;
 }) {
   const files: Record<string, string> = { ...fixture(opts.floor ?? "0.16.3") };
   const byPath: Record<string, string> = {
@@ -480,6 +542,7 @@ function drive(opts: {
       return byPath[p];
     },
     writeFile: (p, t) => {
+      if (p === opts.failWrite) throw new Error(`EACCES: permission denied, open '${p}'`);
       writes.push(p);
       byPath[p] = t;
     },
@@ -606,6 +669,41 @@ describe("verify-oam-floor verifyOamFloor", () => {
       `raised the oam floor 0.16.3 -> 0.17.0 in ${FLOOR_SRC}, ${FLOOR_TEST} and ${FLOOR_CHANGELOG}; review the diff and commit it`,
     );
     expect(d.lines.at(-1)).toContain("the floor is now 0.17.0");
+  });
+
+  it("--raise on an oam whose version carries build metadata writes and reports the bare version", async () => {
+    const d = drive({ installed: "0.17.0+abc123", raise: true });
+    expect(await d.run()).toBe(0);
+    expect(d.files[FLOOR_SRC]).toContain('export const MIN_OAM_VERSION = "0.17.0";');
+    expect(d.files[FLOOR_TEST]).toContain('const FLOOR = "0.17.0";');
+    expect(readFloor(d.files[FLOOR_SRC])).toBe("0.17.0");
+    expect(d.lines.join("\n")).toContain("raised the oam floor 0.16.3 -> 0.17.0 in ");
+    expect(d.lines.at(-1)).toBe(`${TAG} OK -- oam 0.17.0+abc123 hosts ${HOSTED}; the floor is now 0.17.0`);
+  });
+
+  it("--raise reports a write that fails as one FAIL line naming what was and was not written", async () => {
+    // First target: nothing on disk has moved.
+    const first = drive({ installed: "0.17.0", raise: true, failWrite: FLOOR_SRC });
+    expect(await first.run()).toBe(1);
+    expect(first.writes).toEqual([]);
+    expect(first.lines.at(-1)).toBe(
+      `${TAG} FAIL -- oam 0.17.0 is verified, but raising the floor 0.16.3 -> 0.17.0 stopped at ${FLOOR_SRC}: EACCES: permission denied, open '${FLOOR_SRC}'. nothing was written; not attempted: ${FLOOR_TEST}, ${FLOOR_CHANGELOG}.`,
+    );
+    // Midway: the constant moved and the ratchet did not, which a re-run
+    // would read as "already raised" -- so the line says to revert first.
+    const mid = drive({ installed: "0.17.0", raise: true, failWrite: FLOOR_TEST });
+    expect(await mid.run()).toBe(1);
+    expect(mid.writes).toEqual([FLOOR_SRC]);
+    expect(mid.lines.at(-1)).toBe(
+      `${TAG} FAIL -- oam 0.17.0 is verified, but raising the floor 0.16.3 -> 0.17.0 stopped at ${FLOOR_TEST}: EACCES: permission denied, open '${FLOOR_TEST}'. already written: ${FLOOR_SRC} -- revert it (\`git checkout -- ${FLOOR_SRC}\`) before re-running, or the re-run finds the floor already at 0.17.0 and writes nothing; not attempted: ${FLOOR_CHANGELOG}.`,
+    );
+    expect(mid.lines.join("\n")).not.toContain(`${TAG} OK`);
+    // Last target: two to revert, none left to attempt.
+    const last = drive({ installed: "0.17.0", raise: true, failWrite: FLOOR_CHANGELOG });
+    expect(await last.run()).toBe(1);
+    expect(last.lines.at(-1)).toContain(
+      `already written: ${FLOOR_SRC}, ${FLOOR_TEST} -- revert them (\`git checkout -- ${FLOOR_SRC} ${FLOOR_TEST}\`) before re-running, or the re-run finds the floor already at 0.17.0 and writes nothing.`,
+    );
   });
 
   it("--raise writes nothing when the floor is already the installed version", async () => {

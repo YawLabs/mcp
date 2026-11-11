@@ -171,6 +171,16 @@ describe("normalizeRepoUrl: one repo, any protocol", () => {
   it("normalizes file:// URLs by path", () => {
     expect(normalizeRepoUrl("file:///C:/Repos/x.git")).toBe(normalizeRepoUrl("file:///c:/Repos/x/"));
   });
+
+  it("does not throw on a file:// URL whose path holds a stray percent sign", () => {
+    // parseGitSpec accepts it (new URL parses it), and decodeURIComponent of
+    // its pathname throws URIError: the consent lookup must not.
+    expect(parseGitSpec("file:///tmp/a%zz/repo").ok).toBe(true);
+    expect(normalizeRepoUrl("file:///tmp/a%zz/repo.git")).toBe("file:/tmp/a%zz/repo");
+    expect(hasRepoConsent("file:///tmp/a%zz/repo", dir)).toBe(false);
+    // A path that does decode still does.
+    expect(normalizeRepoUrl("file:///tmp/a%20b/repo")).toBe("file:/tmp/a b/repo");
+  });
 });
 
 describe("redaction", () => {
@@ -490,13 +500,65 @@ describe("reuse of a finished build on disk", () => {
     expect(r.ok).toBe(false);
     if (r.ok) return;
     expect(r.exitCode).toBe(1);
-    expect(r.message).toBe(`Built ${COMMIT.slice(0, 7)} has no dist/index.js. Pass --entry <file>.`);
+    expect(r.message).toBe(
+      `Built ${COMMIT.slice(0, 7)} but its entry dist/index.js does not exist. Pass --entry <file>.`,
+    );
   });
 
   it("reuses a build the request does fit, without contacting the remote", async () => {
     fakeFinishedBuild(buildDir(), COMMIT);
-    const r = await buildGitSource({ spec: spec(), commit: COMMIT, namespace: "acme" }, { home, ...ctx });
+    const said: string[] = [];
+    const r = await buildGitSource(
+      { spec: spec(), commit: COMMIT, namespace: "acme" },
+      { home, ...ctx, progress: (l) => said.push(l) },
+    );
     expect(r).toMatchObject({ ok: true, reused: true, namespace: "acme", entry: "index.js", dir: buildDir() });
+    expect(said).toEqual([`Using the existing build of ${COMMIT.slice(0, 12)}`]);
+  });
+
+  it('does not announce "Using the existing build" for a build it then refuses', async () => {
+    fakeFinishedBuild(buildDir(), COMMIT);
+    const said: string[] = [];
+    const quiet = { home, ...ctx, progress: (l: string) => said.push(l) };
+    const wrongSubdir = await buildGitSource(
+      { spec: spec(), commit: COMMIT, namespace: "acme", subdir: "packages/srv" },
+      quiet,
+    );
+    const noEntry = await buildGitSource(
+      { spec: spec(), commit: COMMIT, namespace: "acme", entry: "dist/index.js" },
+      quiet,
+    );
+    expect(wrongSubdir.ok).toBe(false);
+    expect(noEntry.ok).toBe(false);
+    expect(said).toEqual([]);
+  });
+
+  it("refuses to reuse a build for an --entry that is a directory, and says it is not a file", async () => {
+    fakeFinishedBuild(buildDir(), COMMIT, { entry: "dist/index.js" });
+    const r = await buildGitSource(
+      { spec: spec(), commit: COMMIT, namespace: "acme", entry: "dist" },
+      { home, ...ctx },
+    );
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toBe(`Built ${COMMIT.slice(0, 7)} but its entry dist is not a file. Pass --entry <file>.`);
+  });
+
+  it("treats one subdir spelled differently as the same directory", async () => {
+    // A marker an earlier build wrote as typed ("./packages/srv"), asked for
+    // again under every other spelling; the result always carries the tidy one.
+    fakeFinishedBuild(buildDir(), COMMIT, { subdir: "./packages/srv" });
+    for (const subdir of ["packages/srv", "./packages/srv", "packages/srv/", "packages\\srv"]) {
+      const r = await buildGitSource({ spec: spec(), commit: COMMIT, namespace: "acme", subdir }, { home, ...ctx });
+      expect(r, subdir).toMatchObject({ ok: true, reused: true, subdir: "packages/srv" });
+    }
+  });
+
+  it('treats subdir "." as the repo root', async () => {
+    fakeFinishedBuild(buildDir(), COMMIT);
+    const r = await buildGitSource({ spec: spec(), commit: COMMIT, namespace: "acme", subdir: "." }, { home, ...ctx });
+    expect(r).toMatchObject({ ok: true, reused: true });
+    if (r.ok) expect(r.subdir).toBeUndefined();
   });
 });
 
@@ -539,6 +601,22 @@ describe("readGitManifest (yaw-mcp.json)", () => {
     });
     expect(warnings.join("\n")).toMatch(/"subdir" ignored in a subdir manifest/);
     expect(readGitManifest(dir, "other").manifest.description).toBe("root");
+  });
+
+  it('calls only a version above 1 "newer"; anything else is an unsupported version', () => {
+    const warned = (version: unknown): string => {
+      write("yaw-mcp.json", JSON.stringify({ version, description: "d" }));
+      const { manifest, warnings } = readGitManifest(dir);
+      expect(manifest.description).toBe("d");
+      return warnings.join("\n");
+    };
+    expect(warned(1)).toBe("");
+    expect(warned(2)).toBe("yaw-mcp.json: version 2 is newer than this yaw-mcp; reading the fields it knows.");
+    for (const v of [0, "1", "2", null]) {
+      expect(warned(v)).toBe(
+        `yaw-mcp.json: version ${JSON.stringify(v)} is not a supported version (this yaw-mcp reads version 1); reading the fields it knows.`,
+      );
+    }
   });
 
   it("is silent when there is no manifest, and refuses unsafe paths", () => {

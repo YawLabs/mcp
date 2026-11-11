@@ -34,7 +34,7 @@ vi.mock("undici", () => ({
   request: vi.fn(),
 }));
 
-// Mock node:child_process so onPath("uv") always returns false -- we want
+// Mock node:child_process so probePath("uv") always answers "absent" -- we want
 // to exercise the download path, not the PATH-hit short-circuit.
 // spawnSync is also stubbed so the "uv present" describe (in the other
 // test file) would skip, though it is not loaded here at all.
@@ -233,6 +233,27 @@ describe("fetchWithRedirects redirect following", () => {
     const urls = mockRequest.mock.calls.map((c) => (c as [string, ...unknown[]])[0]);
     expect(urls[0]).toMatch(/\.sha256$/);
     expect(urls).toContain("https://cdn.example.com/uv.zip");
+  });
+
+  it("resolves a RELATIVE Location against the URL that redirected", async () => {
+    // A bare path is a legal Location and not a URL request() accepts; used
+    // as-is it became the next request target.
+    let hits = 0;
+    mockRequest.mockImplementation((_url: unknown) => {
+      hits++;
+      return Promise.resolve(
+        hits === 1
+          ? (fakeResponse(302, Buffer.alloc(0), { location: "/mirror/uv.sha256" }) as never)
+          : (fakeResponse(404, Buffer.alloc(0)) as never),
+      );
+    });
+
+    const err = await ensureUv().catch((e: unknown) => e);
+
+    const urls = mockRequest.mock.calls.map((c) => (c as [string, ...unknown[]])[0]);
+    expect(urls[0]).toMatch(/^https:\/\/github\.com\/.+\.sha256$/);
+    expect(urls[1]).toBe("https://github.com/mirror/uv.sha256");
+    expect((err as Error).message).toContain("GET https://github.com/mirror/uv.sha256 failed: HTTP 404");
   });
 });
 

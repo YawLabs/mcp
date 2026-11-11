@@ -13,5 +13,10 @@ export default defineConfig({
   // package could not actually run on 18 while still claiming to.
   target: "node20",
   banner: { js: "#!/usr/bin/env node" },
+  // Read at build time, so a dist/ is only as current as the package.json it
+  // was built from. release.sh builds in step 2, BEFORE its version bump, and
+  // the published bundle is prepublishOnly's rebuild after it: the build the
+  // release gates launch carries the previous version string (see step 2's
+  // comment in release.sh).
   define: { __VERSION__: JSON.stringify(version) },
 });

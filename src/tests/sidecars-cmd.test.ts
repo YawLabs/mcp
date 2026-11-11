@@ -32,6 +32,7 @@ import {
   runSidecarsInstall,
   SIDECAR_LOCK_HEARTBEAT_MS,
   SIDECARS_LOCK_NAME,
+  SIDECARS_USAGE,
   sidecarsManifest,
   sidecarsNodeModules,
   sidecarsPlatformPath,
@@ -424,6 +425,29 @@ const JSON_KEYS = [
   "skipped",
   "git",
 ].sort();
+
+describe("SIDECARS_USAGE", () => {
+  it("describes --json and names every key of the document", () => {
+    // --json sat in the synopsis with no description, and the one place that
+    // listed the keys had six of the ten.
+    const jsonHelp = SIDECARS_USAGE.slice(SIDECARS_USAGE.indexOf("  --json "));
+    expect(jsonHelp).toContain("JSON document");
+    for (const key of JSON_KEYS) expect(jsonHelp, key).toMatch(new RegExp(`\\b${key}\\b`));
+  });
+});
+
+/** Stand in for what a real `npm install` of @yawlabs/fetch-mcp leaves in the
+ *  managed tree, and report exit 0. A `runNpm: async () => 0` that writes
+ *  nothing is the npm-exited-0-but-nothing-landed FAILURE (exit 1), so a test
+ *  about what a successful install prints has to land a package. */
+function npmLandsFetchMcp(home: string): () => Promise<number> {
+  return async () => {
+    const dir = join(sidecarsNodeModules(home), "@yawlabs", "fetch-mcp");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "@yawlabs/fetch-mcp", version: "0.3.6" }));
+    return 0;
+  };
+}
 
 /** The ordinary installable server, for the tests below that are about the
  *  install's surroundings (the lock) rather than about the config. */
@@ -961,6 +985,9 @@ describe("runSidecarsInstall", () => {
     expect(res.exitCode, "a usable tree is not a failure").toBe(0);
     expect(doc.error, "the install itself worked").toBeNull();
     expect(doc.updateError).toContain("npm update exited 7");
+    // The same string on the returned result: exit 0 alone cannot tell the
+    // background refresh that nothing could have moved (installMovedTheTree).
+    expect(res.updateError).toBe(doc.updateError);
     expect(doc.installed[0].version).toBe("0.3.6");
   });
 
@@ -1136,13 +1163,14 @@ describe("runSidecarsInstall", () => {
     expect(ok.installed[0].version).toBe("0.3.6");
   });
 
-  it("says so when nothing will read the tree it just filled", async () => {
+  it("says which runtime runs the tree when oam will not host the servers", async () => {
     // collectSidecarSpecs filters on the npx launch SHAPE (nodeLaunchKind, per
     // the classifier test above -- never `command === "npx"`) and nothing else,
-    // but the managed tree is read ONLY by resolveNpmEntry on the oam path.
-    // A server pinned to the node runtime spawns through npx and never looks
-    // there, so "These versions are now fixed" on its own tells the user their
-    // servers are pinned when nothing has changed. `runtime: "node"` is checked
+    // so it cannot see that oam will not host a server. The tree is still
+    // read: a launch oam does not take is started from it by node
+    // (resolveManagedSpawn). The note used to say "Nothing reads these copies
+    // yet ... read only on the oam runtime", which stopped being true when
+    // that path replaced the raw npx spawn. `runtime: "node"` is checked
     // before any probe, so this case is deterministic on any machine -- and the
     // probe below is deliberately a WORKING oam, to show the note is about
     // configuration, not about oam being missing.
@@ -1163,16 +1191,19 @@ describe("runSidecarsInstall", () => {
       home,
       cwd: home,
       out: () => {},
-      runNpm: async () => 0,
+      runNpm: npmLandsFetchMcp(home),
       oamProbe: async () => probeWith("oam"),
     });
 
     const text = res.lines.join("\n");
-    expect(text).toContain("Nothing reads these copies yet");
+    expect(text).toContain("None of these servers will be hosted on oam:");
     // The reason comes from describeServerRuntime, so this note and doctor's
     // runtime section cannot drift apart.
     expect(text).toContain('per-server runtime:"node"');
-    expect(text).toContain("the managed copies are read only");
+    expect(text).toContain("They still start from these copies");
+    // The retired claim, in either of its two sentences.
+    expect(text).not.toContain("Nothing reads these copies");
+    expect(text).not.toContain("the managed copies are read only");
   });
 
   it("stays quiet about the runtime when oam will host the servers", async () => {
@@ -1193,20 +1224,20 @@ describe("runSidecarsInstall", () => {
       home,
       cwd: home,
       out: () => {},
-      runNpm: async () => 0,
+      runNpm: npmLandsFetchMcp(home),
       oamProbe: async () => probeWith("oam"),
     });
 
     // Anchor the negative to the success path: the note is printed right after
-    // this line, so an absent "Nothing reads these copies" means the verdict
+    // this line, so an absent "will be hosted on oam" means the verdict
     // really was reached and was empty -- not that the run ended earlier.
     expect(res.lines.join("\n")).toContain("These versions are now fixed");
-    expect(res.lines.join("\n")).not.toContain("Nothing reads these copies");
+    expect(res.lines.join("\n")).not.toContain("will be hosted on oam");
   });
 
   it("says so when oam is not installed at all", async () => {
     // The other half of the same blind spot: nothing about the config is wrong,
-    // the machine just has no oam, so every spawn still goes through npx. Only
+    // the machine just has no oam, so node runs every server instead. Only
     // the headline is asserted -- the exact reason string also depends on
     // YAW_MCP_DEFAULT_RUNTIME, which belongs to whoever runs the suite.
     writeBundles([
@@ -1225,20 +1256,84 @@ describe("runSidecarsInstall", () => {
       home,
       cwd: home,
       out: () => {},
+      runNpm: npmLandsFetchMcp(home),
+      oamProbe: async () => probeWith(null),
+    });
+
+    expect(res.lines.join("\n")).toContain("None of these servers will be hosted on oam:");
+  });
+
+  it("does not print the success closing lines when npm exited 0 and nothing landed", async () => {
+    // The run exits 1 and --json carries an `error`; the text report used to
+    // end "These versions are now fixed" all the same, so a human read a
+    // success sentence on a failed run.
+    writeBundles([FETCH_SERVER]);
+
+    const res = await runSidecarsInstall({
+      home,
+      cwd: home,
+      out: () => {},
       runNpm: async () => 0,
       oamProbe: async () => probeWith(null),
     });
 
-    expect(res.lines.join("\n")).toContain("Nothing reads these copies yet");
+    const text = res.lines.join("\n");
+    expect(res.exitCode).toBe(1);
+    expect(text).toContain("NOT FOUND");
+    expect(text).toContain("nothing was installed");
+    expect(text).not.toContain("These versions are now fixed");
+    // No copies landed, so nothing "still starts from these copies".
+    expect(text).not.toContain("They still start from these copies");
+  });
+
+  it("releases the lock when the git build throws, not only when npm fails", async () => {
+    // The lock is taken BEFORE the git build and the install's `finally`
+    // opens after it. A throw in between used to leave the lockfile behind,
+    // and the next run said "Another yaw-mcp process is refreshing ..." until
+    // the stale window passed. The throw here is the progress line the build
+    // prints before it clones.
+    const gitServer = {
+      id: "2",
+      name: "G",
+      namespace: "fx",
+      type: "local",
+      transport: "stdio",
+      git: {
+        url: "https://example.com/acme/fx.git",
+        commit: "0123456789abcdef0123456789abcdef01234567",
+        entry: "dist/index.js",
+      },
+    };
+    writeBundles([FETCH_SERVER, gitServer]);
+    const events: string[] = [];
+
+    await expect(
+      runSidecarsInstall({
+        home,
+        cwd: home,
+        yes: true,
+        isTTY: false,
+        out: (s) => {
+          if (s.includes("building git")) throw new Error("stdout closed");
+        },
+        acquireLock: () => () => events.push("release"),
+        runNpm: async () => {
+          events.push("npm");
+          return 0;
+        },
+      }),
+    ).rejects.toThrow("stdout closed");
+
+    expect(events).toEqual(["release"]);
   });
 
   it("carries the unhosted verdict in --json, where `print` cannot reach", async () => {
     // The whole note goes through `print`, which is SUPPRESSED under --json, and
     // no field carried it -- so the Yaw Terminal MCP panel, which shells out to
-    // `sidecars install --json`, read a full `installed` array with
-    // `error: null` and reported a clean install on a machine where every server
-    // in fact still resolves through the npx cache and the managed tree is dead
-    // weight. The probe was being paid for and then thrown away.
+    // `sidecars install --json`, had no way to learn that none of the servers
+    // it just installed would run on oam. The probe was being paid for and
+    // then thrown away. (Non-empty is not "the tree is unused": node runs the
+    // servers from it.)
     writeBundles([
       {
         id: "1",
@@ -1279,7 +1374,7 @@ describe("runSidecarsInstall", () => {
     expect(doc.unhosted).toHaveLength(1);
     expect(doc.unhosted[0]).toContain('per-server runtime:"node"');
     // stdout carries the document and nothing else; the prose really is gone.
-    expect(out).not.toContain("Nothing reads these copies yet");
+    expect(out).not.toContain("None of these servers will be hosted on oam:");
   });
 
   it("reports an empty unhosted array when oam will host the servers", async () => {

@@ -1,6 +1,7 @@
-// The "is this git build finished?" signal, in a module with no imports of its
-// own beyond node and paths.ts, so upstream.ts (activation) can read it
-// without importing git-source.ts, which imports upstream.ts.
+// The "is this git build finished?" signal, in a module that imports nothing
+// at runtime beyond node and paths.ts (types.ts is a type-only import), so
+// upstream.ts (activation) can read it without statically importing
+// git-source.ts, which imports upstream.ts.
 //
 // The marker lives OUTSIDE the checkout, at `<ns>/<sha12>.built` next to
 // `<sha12>.failed`. A repo controls every file in its own tree, so a marker

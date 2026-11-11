@@ -11,7 +11,13 @@
 //   update --to <sha> back to a build kept on this machine
 //
 // A failed build changes nothing: the pin stays, the old build keeps running,
-// and the command exits 1. Only `git.commit` (and `ref` / `tokenSecret` when
+// and the command exits 1. A build that SUCCEEDS but then fails its start
+// check is a different outcome and does not get that treatment: the pin still
+// moves to it, the entry reports `status: "updated"` with `started: false`
+// and the reason, and the command exits 0 with `ok: true` -- unlike
+// `add --git`, which exits 1 when the server it wrote does not start. The
+// previous build is kept, and the line naming `update <name> --to <sha>` is
+// the way back. Only `git.commit` (and `ref` / `tokenSecret` when
 // asked) is spliced into the file, so comments survive. Old builds are
 // collected under the git lock, keeping the current and the previous one and
 // every build any bundles.json still pins -- the user file, every trusted
@@ -23,6 +29,7 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import {
+  asciiLines,
   buildGitSource,
   buildMatchesHost,
   discardBuild,
@@ -66,7 +73,9 @@ import { askYesNo, type YesNoOptions } from "./readline-question.js";
 import { SECRET_NAME_RE } from "./secrets-vault.js";
 import type { GitSource, UpstreamServerConfig } from "./types.js";
 
-export const UPDATE_USAGE = `Usage: yaw-mcp update [<name>] [--check] [--ref <ref>] [--to <sha>] [--project] [--yes] [--json]
+export const UPDATE_USAGE = `Usage: yaw-mcp update [<name>] [--check] [--ref <ref>] [--to <sha>]
+                      [--git-token-secret <name>] [--project] [--yes]
+                      [--no-start-check] [--json]
 
   Move git servers (added with yaw-mcp add --git) to the commit the ref they
   track points at now. The new commit is built beside the current build, and
@@ -88,7 +97,10 @@ export const UPDATE_USAGE = `Usage: yaw-mcp update [<name>] [--check] [--ref <re
   --yes, -y         Allow a repo's install and build scripts to run. Asked
                     once per repo; when stdin or stdout is not a TTY, required
                     until the repo is allowed here.
-  --no-start-check  Skip the one real handshake after the build.
+  --no-start-check  Skip the one real handshake after the build. A build that
+                    fails that handshake is still pinned and the exit code is
+                    still 0: the output says it did not start and names the
+                    command that goes back to the previous build.
   --json            Print a JSON document.`;
 
 export interface UpdateCommandOptions {
@@ -332,7 +344,6 @@ export interface UpdateReport {
 }
 
 const sha7 = (c: string | null | undefined): string => (c ? c.slice(0, 7) : "(none)");
-const ascii = (s: string): string => s.replace(/\r\n/g, "\n").replace(/[^\x20-\x7e\n]/g, "?");
 
 function interactiveFor(opts: UpdateCommandOptions): boolean {
   if (opts.json) return false;
@@ -365,10 +376,10 @@ export async function runUpdate(opts: UpdateCommandOptions = {}): Promise<{ exit
   const out = opts.out ?? createStreamWriter(process.stdout);
   const err = opts.err ?? createStreamWriter(process.stderr);
   const print = (s = ""): void => out(`${s}\n`);
-  const printErr = (s: string): void => err(`${ascii(s)}\n`);
+  const printErr = (s: string): void => err(`${asciiLines(s)}\n`);
   // Progress belongs with the result on a terminal, and off stdout under
   // --json, where stdout is the document.
-  const progress = opts.json ? printErr : (s: string) => print(ascii(s));
+  const progress = opts.json ? printErr : (s: string) => print(asciiLines(s));
   const warn = (w: string): void => printErr(`warning: ${w}`);
   const home = opts.home ?? homedir();
   const cwd = opts.cwd ?? process.cwd();
@@ -403,7 +414,10 @@ export async function runUpdate(opts: UpdateCommandOptions = {}): Promise<{ exit
     }
     return { exitCode: 0 };
   }
-  if (!(await gitAvailable({ env, interactive }))) return fail(2, GIT_MISSING_MESSAGE);
+  // `--to` is the one mode that can finish without git: a kept build made for
+  // this host is re-pinned from disk. rollBack asks for git itself, and only
+  // on its rebuild path, so a machine that lost git can still go back.
+  if (opts.to === undefined && !(await gitAvailable({ env, interactive }))) return fail(2, GIT_MISSING_MESSAGE);
 
   const state: Record<string, GitStateEntry> = {};
   const reports: UpdateReport[] = [];
@@ -441,7 +455,7 @@ export async function runUpdate(opts: UpdateCommandOptions = {}): Promise<{ exit
       startError: null,
     };
     const failed = (message: string, status: UpdateStatus = "failed"): void => {
-      const error = ascii(message);
+      const error = asciiLines(message);
       reports.push({ ...base, status, error });
       printErr(`yaw-mcp update: ${e.namespace}: ${error}`);
     };
@@ -479,6 +493,10 @@ export async function runUpdate(opts: UpdateCommandOptions = {}): Promise<{ exit
     if (opts.to !== undefined) {
       const r = await rollBack(e, parsed.spec, opts.to, tokenSecret, buildCtx(), file.path, { cwd, env });
       if (!r.ok) {
+        // Same exit 2 and same document as the gate the other modes pass
+        // before the loop. Nothing has been touched when no entry has been
+        // reported yet -- and `--to` names one server, so none has.
+        if (r.gitMissing && reports.length === 0) return fail(2, GIT_MISSING_MESSAGE);
         failed(r.message);
         continue;
       }
@@ -690,7 +708,9 @@ async function startCheck(
 }
 
 /** `--to`: the kept build whose commit starts with `prefix`. One made for
- *  another platform, arch or node major is rebuilt first. */
+ *  another platform, arch or node major is rebuilt first, and that rebuild is
+ *  the only step here that runs git: it is checked for BEFORE the kept build
+ *  is discarded, so a machine without git keeps the build it has. */
 async function rollBack(
   e: RawGitEntry,
   spec: GitSpec,
@@ -699,7 +719,7 @@ async function rollBack(
   ctx: GitBuildContext,
   pinFile: string,
   where: { cwd: string; env: NodeJS.ProcessEnv },
-): Promise<{ ok: true; commit: string; rebuilt: boolean } | { ok: false; message: string }> {
+): Promise<{ ok: true; commit: string; rebuilt: boolean } | { ok: false; message: string; gitMissing?: true }> {
   const kept = keptBuilds(e.namespace, ctx.home);
   const hits = kept.filter((k) => k.marker.commit.startsWith(prefix));
   if (hits.length === 0) {
@@ -715,6 +735,9 @@ async function rollBack(
     return { ok: false, message: `the kept build ${sha7(hit.marker.commit)} was made from another repository.` };
   }
   if (buildMatchesHost(hit.marker)) return { ok: true, commit: hit.marker.commit, rebuilt: false };
+  if (!(await gitAvailable({ env: ctx.env, interactive: ctx.interactive }))) {
+    return { ok: false, message: GIT_MISSING_MESSAGE, gitMissing: true };
+  }
   const discarded = await discardBuild(e.namespace, hit.marker.commit, ctx.home, where);
   if (!discarded.ok) return { ok: false, message: discarded.message };
   const build = await buildGitSource(

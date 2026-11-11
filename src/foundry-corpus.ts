@@ -16,7 +16,9 @@
 //
 // The corpus is a checked-in fixture, not live data. A maintainer runs
 // `yaw-mcp foundry export` to fold ~/.yaw-mcp/foundry.jsonl into the fixture;
-// the gate consumes it. Until a fixture exists the gate cleanly skips.
+// the gate (src/tests/foundry-routing.test.ts) consumes it. Until a fixture
+// exists the gate is DORMANT, and says so: a passing banner test plus a `todo`
+// row, not a skip. A fixture that exists but does not validate FAILS the gate.
 
 import { readFileSync } from "node:fs";
 import { type RankableServer, type RankableTool, rankServers } from "./relevance.js";
@@ -192,7 +194,7 @@ export function scoreCorpus(corpus: FoundryCorpus): CorpusScore {
   };
 }
 
-// A server the BM25 floor can consume without crashing: buildDocFields
+// A server the BM25 floor can consume without crashing: buildDoc
 // (relevance.ts) iterates `tools` unguarded and tokenizes namespace / name /
 // description plus each tool's name / description, so each must carry the
 // declared type or be absent. Element-level, because a truncated or
@@ -232,8 +234,10 @@ function isCorpusEntryShape(e: unknown): e is FoundryCorpusEntry {
   );
 }
 
-// Validate a parsed object as a FoundryCorpus. Returns the typed corpus or null
-// (used by the gate to skip cleanly on a missing/garbage/empty fixture).
+// Validate a parsed object as a FoundryCorpus. Returns the typed corpus or
+// null for a garbage, wrong-version or empty one. Null says nothing about
+// whether a file exists; the gate decides that separately (see
+// loadFoundryCorpus).
 export function validateCorpus(obj: unknown): FoundryCorpus | null {
   if (!obj || typeof obj !== "object") return null;
   const c = obj as Partial<FoundryCorpus>;
@@ -254,8 +258,10 @@ export function validateCorpus(obj: unknown): FoundryCorpus | null {
 }
 
 // Load + validate a corpus fixture from disk. Returns null when the file is
-// absent, unreadable, malformed, or empty -- the gate treats null as "no
-// corpus committed yet, skip".
+// absent, unreadable, malformed, or empty, WITHOUT saying which. The gate
+// therefore checks existence itself: null with no file on disk is its dormant
+// state (a banner test plus a `todo`), null with a file present is a hard
+// failure.
 export function loadFoundryCorpus(path: string): FoundryCorpus | null {
   let text: string;
   try {

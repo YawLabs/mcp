@@ -593,16 +593,49 @@ export type ActivationFailureCategory =
   | "protocol_error" // handshake completed but something downstream failed
   | "unknown";
 
+/** The `-> Fix ...` suffix of an activation error, kept as DATA beside the
+ *  rendered message. `message` always ends in the BROKER's remediation
+ *  ("activate it again ... on the next mcp_connect_* call"), which is the
+ *  right sentence for the model reading an activate result and the wrong one
+ *  for a person reading a shell command's stderr. A shell caller rebuilds its
+ *  own line from these two halves -- see shellActivationMessage. */
+export interface ActivationConfigPointer {
+  /** The failure itself, with no pointer suffix. */
+  summary: string;
+  /** Which entry in which file to edit: `Fix "<ns>" in <file hint>`. No
+   *  remediation verb and no trailing punctuation. */
+  fix: string;
+}
+
 export class ActivationError extends Error {
   constructor(
     message: string,
     public readonly category: ActivationFailureCategory,
     public readonly stderrTail?: string,
     public readonly cause?: unknown,
+    /** Set when `message` carries the config pointer; undefined for the
+     *  failures that never had one (a post-handshake tools/list error). */
+    public readonly configPointer?: ActivationConfigPointer,
   ) {
     super(message);
     this.name = "ActivationError";
   }
+}
+
+/**
+ * An activation failure worded for a SHELL reader: the same failure and the
+ * same file/namespace pointer as `err.message`, with the remediation a shell
+ * can act on. `message` tells its reader to "activate it again" on "the next
+ * mcp_connect_* call", and a one-shot CLI process has neither.
+ *
+ * Returns the message unchanged for anything that carries no pointer, so a
+ * caller can pass whatever it caught.
+ */
+export function shellActivationMessage(err: unknown): string {
+  if (!(err instanceof ActivationError) || !err.configPointer) {
+    return err instanceof Error ? err.message : String(err);
+  }
+  return `${err.configPointer.summary} -> ${err.configPointer.fix}, then run the command again.`;
 }
 
 /** True for a value that is itself an unresolved `${secret:NAME}` reference
@@ -831,6 +864,55 @@ function localRedactionMap(
  *  without a password, stays readable like any other configuration. */
 function hasUrlPassword(value: string): boolean {
   return /^[a-z][a-z0-9+.-]*:\/\/[^/@\s:]*:[^/@\s]+@/i.test(value.trim());
+}
+
+/** A remote entry's url as an error message may quote it: scheme, host and
+ *  path, with the userinfo and the query string left out. Both are places a
+ *  hosted MCP's key is commonly written (`https://user:key@host/mcp`,
+ *  `https://host/mcp?api_key=...`), and the connect-failure messages that
+ *  quote the url are logged and returned to the model. The remote redaction
+ *  map cannot catch them: it holds the resolved headers only.
+ *
+ *  A dropped query (or fragment) is shown as `?...` so the reader can tell
+ *  the url was shortened rather than misread. The PATH is kept: it is what
+ *  tells one endpoint from another, so a key written as a path segment is
+ *  still shown.
+ *
+ *  Takes the raw config string, not a URL, because one caller is reporting
+ *  that the string does not parse; that case is scrubbed textually.
+ *
+ *  An UNENCODED credential can hold `/`, `?`, `#` or a space (a base64 key
+ *  does), and then the userinfo does not end where a parser says it does:
+ *  `https://abc/def==@host/mcp` parses cleanly with the host `abc` and the
+ *  rest of the key in the path. So the parsed parts are trusted only when no
+ *  `@` is left in the path, query or fragment. Otherwise everything up to the
+ *  LAST `@` of the string is dropped, and shown as `...@` unless it was a
+ *  plain userinfo. That over-trims a url whose path or query legitimately
+ *  holds an `@` (`https://host/mcp?user=a@b.example` shows as
+ *  `https://...@b.example`); the two cannot be told apart, and a shortened
+ *  url in an error message costs less than a quoted key. Exported for
+ *  tests. */
+export function displayRemoteUrl(raw: string): string {
+  try {
+    const u = new URL(raw);
+    // A host-less parse is a scheme-less typo the parser read as an opaque
+    // url ("localhost:3000/mcp" has the scheme "localhost:"); rebuilding it
+    // from parts would print a url the operator never wrote.
+    if (u.host !== "" && !`${u.pathname}${u.search}${u.hash}`.includes("@")) {
+      return `${u.protocol}//${u.host}${u.pathname}${u.search || u.hash ? "?..." : ""}`;
+    }
+  } catch {
+    // Not parseable: scrubbed textually below.
+  }
+  const scheme = /^[a-z][a-z0-9+.-]*:\/\//i.exec(raw)?.[0] ?? "";
+  const rest = raw.slice(scheme.length);
+  const withoutQuery = (s: string) => s.replace(/[?#][\s\S]*$/, "?...");
+  // The userinfo is cut BEFORE the query: cutting the query first would stop
+  // at a `?` or `#` inside the credential and leave what precedes it.
+  const at = rest.lastIndexOf("@");
+  if (at === -1) return `${scheme}${withoutQuery(rest)}`;
+  const dropped = rest.slice(0, at);
+  return `${scheme}${/[/?#\s]/.test(dropped) ? "...@" : ""}${withoutQuery(rest.slice(at + 1))}`;
 }
 
 /** The credential-shaped slice of the PARENT env -- the half of the child's
@@ -1077,18 +1159,40 @@ export function redactSecretsInOutput(text: string, env: Record<string, string>)
  * at the global file sends a project-local server's fix to a file this session
  * never reads.
  *
+ * Returns the ActivationError itself rather than a decorated string, so the
+ * suffix cannot be attached without also being recorded as data (below).
+ *
  * It does NOT order a restart. This suffix rides every activation and connect
  * failure into the text the LLM reads and relays, so it is the most-read
  * sentence yaw-mcp prints -- and "then restart this MCP client" stopped being
  * true when bundles.json became a live re-read at meta-tool boundaries. The
  * fixed entry is loaded by the next activate, which is both cheaper and the
  * thing the reader was about to do anyway.
+ *
+ * "Activate it again ... on the next mcp_connect_* call" is the BROKER's
+ * remediation, and this function has callers with no broker: `yaw-mcp call`
+ * and the start check behind `yaw-mcp add` run it from a shell. So the two
+ * halves also ride the error as data (ActivationError.configPointer), for
+ * shellActivationMessage to re-render with a remediation a shell can act on.
  */
-function withConfigPointer(message: string, config: UpstreamServerConfig): string {
+function withConfigPointer(
+  summary: string,
+  config: UpstreamServerConfig,
+  category: ActivationFailureCategory,
+  stderrTail?: string,
+  cause?: unknown,
+): ActivationError {
+  const fix = `Fix "${config.namespace}" in ${bundlesFileHint("defines-it")}`;
   // ASCII arrow on purpose: this suffix rides every activation error into the
   // stderr log, and a `->` survives a Windows console codepage where the
   // Unicode arrow renders as mojibake and then gets pasted into bug reports.
-  return `${message} -> Fix "${config.namespace}" in ${bundlesFileHint("defines-it")}, then activate it again -- the edit is picked up on the next mcp_connect_* call, with no client restart.`;
+  return new ActivationError(
+    `${summary} -> ${fix}, then activate it again -- the edit is picked up on the next mcp_connect_* call, with no client restart.`,
+    category,
+    stderrTail,
+    cause,
+    { summary, fix },
+  );
 }
 
 /** The longest failed-build tail an activation error quotes. The full record
@@ -1221,14 +1325,27 @@ function unstartableFileMessage(code: "EFTYPE" | "UNKNOWN", err: unknown, comman
   }). Common causes: a binary built for another CPU architecture, a corrupt or partial download, or an application-control or antivirus block.`;
 }
 
+/** errno codes that mean the OS never started the command: missing (ENOENT)
+ *  or not runnable by this user (EACCES, EPERM). */
+const SPAWN_ERRNO = /\b(?:ENOENT|EACCES|EPERM)\b/;
+
 function categorizeSpawnError(err: unknown): ActivationFailureCategory {
   if (unstartableFileCode(err)) return "spawn_failure";
-  const msg = err instanceof Error ? err.message : String(err);
+  const code = typeof err === "object" && err !== null ? (err as { code?: unknown }).code : undefined;
+  // A NUMERIC code is a JSON-RPC error (the SDK's McpError carries it from
+  // the wire), i.e. an answer from a child that DID start. Its text is
+  // whatever the server wrote -- "Method not found", "tool not found" -- and
+  // must not be read as a missing binary by the wording match below.
+  if (typeof code === "number") return "unknown";
   // Node's child_process surfaces ENOENT as the most common spawn failure —
-  // binary isn't on PATH. Other codes (EACCES, EPERM) are rare enough to
-  // bucket under spawn_failure too.
-  if (/ENOENT|not found|cannot find|command failed to start/i.test(msg)) return "spawn_failure";
-  if (/EACCES|permission denied/i.test(msg)) return "spawn_failure";
+  // binary isn't on PATH. EACCES and EPERM are rare enough to bucket under
+  // spawn_failure too. Read off `code` first; the message match is the
+  // fallback for an error that arrives without one (a resolver's own Error,
+  // or a wrapper that kept only the text).
+  if (typeof code === "string" && SPAWN_ERRNO.test(code)) return "spawn_failure";
+  const msg = err instanceof Error ? err.message : String(err);
+  if (SPAWN_ERRNO.test(msg)) return "spawn_failure";
+  if (/not found|cannot find|command failed to start|permission denied/i.test(msg)) return "spawn_failure";
   return "unknown";
 }
 
@@ -1293,7 +1410,13 @@ function redactActivationMessage(err: unknown, env: Record<string, string>): unk
   if (!(err instanceof ActivationError)) return err;
   const safe = redactSecretsInOutput(err.message, env);
   if (safe === err.message) return err;
-  return new ActivationError(safe, err.category, err.stderrTail, err.cause);
+  // The pointer's summary is a second rendering of the same text, so it is
+  // redacted with it: a shell caller prints the summary, not the message.
+  const pointer = err.configPointer && {
+    summary: redactSecretsInOutput(err.configPointer.summary, env),
+    fix: err.configPointer.fix,
+  };
+  return new ActivationError(safe, err.category, err.stderrTail, err.cause, pointer);
 }
 
 /** Attach the child's stderr tail to an ActivationError raised AFTER the
@@ -1319,8 +1442,12 @@ function withStderrTail(err: unknown, stderrRing: string, env: Record<string, st
   // The hint goes in the MESSAGE, ahead of the tail: buried in 500 characters
   // of banner it is invisible, and the message is the only part the user reads.
   const oomHint = oamHeapOomHint(trimmed);
-  const message = `${err.message}${oomHint ? ` ${oomHint}` : ""} stderr tail: ${safe.slice(-500)}`;
-  return new ActivationError(message, err.category, safe, err.cause);
+  const appended = `${oomHint ? ` ${oomHint}` : ""} stderr tail: ${safe.slice(-500)}`;
+  const pointer = err.configPointer && {
+    summary: `${err.configPointer.summary}${appended}`,
+    fix: err.configPointer.fix,
+  };
+  return new ActivationError(`${err.message}${appended}`, err.category, safe, err.cause, pointer);
 }
 
 /** Spawn facts for one connectToUpstream CALL (not one attempt), threaded out
@@ -1737,7 +1864,7 @@ async function connectToUpstreamOnce(
     // Ahead of the command check: a git entry with no pinned commit has no
     // derived command, and "command is required" would name the wrong fix.
     const notBuilt = await gitBuildMissing(config, undefined, await gitRepoConsented(config));
-    if (notBuilt !== null) throw new ActivationError(withConfigPointer(notBuilt, config), "install_failure");
+    if (notBuilt !== null) throw withConfigPointer(notBuilt, config, "install_failure");
     if (config.git?.commit) await recordActivatedGitPin(config.namespace, config.git.commit);
     if (!config.command) {
       throw new Error("command is required for local servers");
@@ -1877,8 +2004,9 @@ async function connectToUpstreamOnce(
     } catch (err) {
       if (err instanceof ActivationError) throw err;
       const message = err instanceof Error ? err.message : String(err);
-      throw new ActivationError(
-        withConfigPointer(`Server "${config.namespace}" could not resolve its launch command. ${message}`, config),
+      throw withConfigPointer(
+        `Server "${config.namespace}" could not resolve its launch command. ${message}`,
+        config,
         categorizeSpawnError(err),
         undefined,
         err,
@@ -1886,6 +2014,13 @@ async function connectToUpstreamOnce(
     }
     spawnedCommand = resolved.command;
 
+    // serverEnv wins over parentEnv, PATH included, and a bare command is
+    // looked up on the CHILD's PATH. For the user's own command that is the
+    // point of setting PATH on a server. For a bare `uv` / `oam` a rewrite
+    // above produced it is a gap: both were probed against the broker's PATH
+    // (uv-bootstrap.ts probePath, oam-spawn.ts spawnVersionProbe), so an entry
+    // that overrides PATH can spawn a different binary than the one probed,
+    // or fail to find one. Not detected here; see OamProbe.bin and ensureUv.
     const stdioTransport = new StdioClientTransport({
       command: resolved.command,
       args: resolved.args,
@@ -1962,8 +2097,9 @@ async function connectToUpstreamOnce(
       url = new URL(config.url);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      throw new ActivationError(
-        withConfigPointer(`Server "${config.namespace}" has an invalid url "${config.url}": ${message}`, config),
+      throw withConfigPointer(
+        `Server "${config.namespace}" has an invalid url "${displayRemoteUrl(config.url)}": ${message}`,
+        config,
         "unknown",
         undefined,
         err,
@@ -2018,14 +2154,10 @@ async function connectToUpstreamOnce(
         );
       } catch (err) {
         if (err instanceof InvalidResolvedValueError) {
-          throw new ActivationError(
-            withConfigPointer(
-              `Server "${config.namespace}" has an invalid value for header "${err.key}" -- an HTTP header value cannot contain a line break or a control character (the value is not shown).`,
-              config,
-            ),
+          throw withConfigPointer(
+            `Server "${config.namespace}" has an invalid value for header "${err.key}" -- an HTTP header value cannot contain a line break or a control character (the value is not shown).`,
+            config,
             "unknown",
-            undefined,
-            undefined,
           );
         }
         throw err;
@@ -2190,9 +2322,10 @@ async function connectToUpstreamOnce(
       // nothing of the kind (401, 404, ENOTFOUND, a self-signed certificate),
       // and the SDK error carrying the truth was discarded entirely.
       const detail = timedOut ? "" : remoteFailureDetail(err, resolvedServerEnv);
+      const shownUrl = displayRemoteUrl(config.url ?? "");
       message = timedOut
-        ? `Remote server at ${config.url} did not respond within ${deadlineMs / 1000}s. Verify the URL is reachable.`
-        : `Remote server at ${config.url} refused the connection.${detail ? ` ${detail}` : ""}`;
+        ? `Remote server at ${shownUrl} did not respond within ${deadlineMs / 1000}s. Verify the URL is reachable.`
+        : `Remote server at ${shownUrl} refused the connection.${detail ? ` ${detail}` : ""}`;
     } else if (timedOut) {
       category = "init_timeout";
       message = `Server "${config.namespace}" started but didn't complete the MCP handshake within ${deadlineMs / 1000}s${
@@ -2228,16 +2361,25 @@ async function connectToUpstreamOnce(
         // "install Node.js" would both point the wrong way.
         message = `${unstartableFileMessage(unstartable, err, config.command)}${spawnedNote}`;
       } else if (category === "spawn_failure") {
-        message = `Command '${config.command}' is not on PATH or is not executable. Verify the runtime is installed (e.g. Node.js for npx, Python for uvx).${spawnedNote}`;
+        // A message that already names the errno ("spawn npx ENOENT", or a
+        // longer one with ENOENT / EACCES / EPERM anywhere in it) is left
+        // off: the sentence below says the same thing, and the text is still
+        // on `cause`.
+        // Anything else was bucketed here on its WORDING, which is a guess, so
+        // the original text is kept in the message rather than only on `cause`:
+        // if the guess is wrong the reader still sees what actually happened.
+        const raw = err instanceof Error ? err.message : String(err);
+        const underlying = SPAWN_ERRNO.test(raw)
+          ? ""
+          : ` Underlying error: ${redactSecretsInOutput(raw, resolvedServerEnv).slice(0, 300)}`;
+        message = `Command '${config.command}' is not on PATH or is not executable. Verify the runtime is installed (e.g. Node.js for npx, Python for uvx).${spawnedNote}${underlying}`;
       } else {
         message = err instanceof Error ? err.message : String(err);
       }
     }
 
-    message = withConfigPointer(message, config);
-
     const redactedTail = trimmedStderr ? redactSecretsInOutput(trimmedStderr, resolvedServerEnv) : undefined;
-    throw new ActivationError(message, category, redactedTail, err);
+    throw withConfigPointer(message, config, category, redactedTail, err);
   }
 
   // Name the runtime that actually won: "oam" (with the probed oam version)
@@ -2264,9 +2406,15 @@ async function connectToUpstreamOnce(
       ? { runtime: "node", downgradedFromOam: true }
       : { runtime: "oam", oamVersion: attempt.oamVersion };
   } else if (attempt.managedRewriteApplied) {
+    // The oam pin rides along here too. A namespace an earlier oam downgrade
+    // pinned skips the oam gate and normally boots from the managed tree, so
+    // this arm -- not the pinned one below -- is where a pinned npx server
+    // usually lands; without the markers its line read as a server that had
+    // never been on oam.
+    const oamPinFields = isPinnedToNode(config) ? { downgradedFromOam: true, oamPinned: true } : {};
     runtimeFields = suppressRewrites
-      ? { runtime: "node", downgradedFromManaged: true }
-      : { runtime: "node", managedSpawn: true };
+      ? { runtime: "node", ...oamPinFields, downgradedFromManaged: true }
+      : { runtime: "node", managedSpawn: true, ...oamPinFields };
   } else if (config.type === "local" && (isPinnedToNode(config) || isPinnedToNpx(config))) {
     // ADDITIVE, not an else-if chain: both memos can pin the same launch
     // (oam boot failed and the npx respawn won; later the managed boot failed
@@ -2512,7 +2660,8 @@ export async function disconnectFromUpstream(connection: UpstreamConnection): Pr
  *
  *  Default (initial connect): SWALLOW and return [] -- a server that simply
  *  doesn't implement the capability answers with an error, and that is not a
- *  boot failure.
+ *  boot failure. Every error is swallowed, not only that one; anything other
+ *  than -32601 is logged at warn first (warnSwallowedListError).
  *
  *  `throwOnError` (the list_changed refresh path): THROW instead, so the
  *  caller can leave the previous inventory in place. Swallowing on refresh
@@ -2631,7 +2780,10 @@ export async function fetchResourcesFromUpstream(
     }));
   } catch (err) {
     // Server may not support resources — that's fine at connect time.
-    if (!opts.throwOnError) return [];
+    if (!opts.throwOnError) {
+      warnSwallowedListError(err, namespace, "resources/list");
+      return [];
+    }
     const message = err instanceof Error ? err.message : String(err);
     throw new Error(`"${namespace}" returned an error on resources/list: ${message}`);
   }
@@ -2669,7 +2821,10 @@ export async function fetchPromptsFromUpstream(
     }));
   } catch (err) {
     // Server may not support prompts — that's fine at connect time.
-    if (!opts.throwOnError) return [];
+    if (!opts.throwOnError) {
+      warnSwallowedListError(err, namespace, "prompts/list");
+      return [];
+    }
     const message = err instanceof Error ? err.message : String(err);
     throw new Error(`"${namespace}" returned an error on prompts/list: ${message}`);
   }
@@ -2682,6 +2837,22 @@ export async function fetchPromptsFromUpstream(
  *  merely mention the phrase. */
 function isMethodNotFound(err: unknown): boolean {
   return (err as { code?: unknown } | null)?.code === -32601;
+}
+
+/** The log line for a resources/prompts list error the initial connect
+ *  swallowed. -32601 is the expected answer from a server without the
+ *  capability and stays silent. Anything else (a LIST_TIMEOUT, a transport
+ *  error, a server that has the capability and failed) still yields an empty
+ *  inventory, but says so: otherwise a server whose resources or prompts went
+ *  missing leaves no trace of why. The message is truncated because it is
+ *  upstream-written text of no fixed length. */
+function warnSwallowedListError(err: unknown, namespace: string, endpoint: string): void {
+  if (isMethodNotFound(err)) return;
+  log("warn", "Upstream list failed at connect; continuing with an empty inventory", {
+    namespace,
+    endpoint,
+    error: (err instanceof Error ? err.message : String(err)).slice(0, 300),
+  });
 }
 
 /** How a tools/list failure is reported. */

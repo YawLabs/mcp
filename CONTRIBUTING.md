@@ -44,6 +44,7 @@ npm test
 | `npm run lint` | Check for lint errors |
 | `npm run lint:fix` | Auto-fix lint and formatting |
 | `npm run verify:oam-floor` | Host a real MCP server on this machine's oam and check it against `MIN_OAM_VERSION`; `release.sh` runs it. `-- --raise` is the only way the floor moves (see `scripts/verify-oam-floor.mjs`) |
+| `npm run verify:clients` | Install the built `dist/` into every supported client inside a throwaway home, launch each written entry, and uninstall; `release.sh` runs it after the build. Needs `npm run build` first and network access, and takes about 100 seconds (see `scripts/verify-clients.mjs`) |
 
 ## Code Style
 

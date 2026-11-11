@@ -100,7 +100,8 @@ async function migrateFile(
   if (st.isSymbolicLink()) {
     // Skipped rather than followed: renaming the link breaks a relative
     // target, and copying through it would hoist a file the ownership check
-    // above never covered. Left in place with a warn so the drop is visible.
+    // below never covers (it reads the lstat taken above, which describes the
+    // link, not its target). Left in place with a warn so the drop is visible.
     log("warn", "yaw-mcp config: legacy path is a symlink -- skipping migration", {
       scope,
       legacy,

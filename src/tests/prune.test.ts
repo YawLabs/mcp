@@ -343,6 +343,93 @@ describe("pruneContent", () => {
     expect(r.content[0].text).toContain("empty0");
   });
 
+  // Key fidelity. The same round-trip re-sorts an object's integer-like keys
+  // (JS enumerates them first, ascending) and keeps one value per repeated
+  // key, so JSON mode is skipped for the whole document when either would
+  // show. Each fixture carries 40 droppable nulls: "empty0" still being there
+  // is the proof the document was skipped rather than returned by the gate.
+  const NULLS = Array.from({ length: 40 }, (_, i) => `"empty${i}": null`).join(", ");
+
+  it("keeps a rank-ordered object of numeric ids in the order it was sent", () => {
+    const raw = `{"hits": {"1532": "first", "87": "second", "3": "third"}, ${NULLS}}`;
+    const r = pruneContent([{ type: "text", text: raw }]);
+    const out = r.content[0].text;
+    expect(out.indexOf('"1532"')).toBeLessThan(out.indexOf('"87"'));
+    expect(out.indexOf('"87"')).toBeLessThan(out.indexOf('"3"'));
+    expect(out).toContain("empty0");
+  });
+
+  it("keeps an integer-like key that follows a named key where it was", () => {
+    const raw = `{"total": 2, "7": "seven", ${NULLS}}`;
+    const r = pruneContent([{ type: "text", text: raw }]);
+    const out = r.content[0].text;
+    expect(out.indexOf('"total"')).toBeLessThan(out.indexOf('"7"'));
+    expect(out).toContain("empty0");
+  });
+
+  it("finds a misordered object nested inside an array of rows", () => {
+    const raw = `[{"ok": true}, {"row": [{"20": "a", "10": "b"}]}, {${NULLS}}]`;
+    const r = pruneContent([{ type: "text", text: raw }]);
+    const out = r.content[0].text;
+    expect(out.indexOf('"20"')).toBeLessThan(out.indexOf('"10"'));
+    expect(out).toContain("empty0");
+  });
+
+  it("decodes an escaped key before judging it integer-like", () => {
+    // Backslash-u-0-0-3-1 spells the key "1". Built from a char code so no
+    // tool or shell between here and the file can turn the escape into the
+    // character it names.
+    const escapedOne = `${String.fromCharCode(92)}u0031`;
+    const raw = `{"name": "x", "${escapedOne}": "one", ${NULLS}}`;
+    expect(Object.keys(JSON.parse(raw))[0]).toBe("1"); // the reorder being guarded
+    const r = pruneContent([{ type: "text", text: raw }]);
+    expect(r.content[0].text).toBe(raw);
+  });
+
+  it("does not re-serialize a document with a duplicate key, so its first value survives", () => {
+    const raw = `{"status": "first", "status": "second", ${NULLS}}`;
+    const r = pruneContent([{ type: "text", text: raw }]);
+    expect(r.content[0].text).toContain('"first"');
+    expect(r.content[0].text).toContain('"second"');
+    expect(r.content[0].text).toContain("empty0");
+  });
+
+  it("still trims whitespace around a document it does not re-serialize", () => {
+    // "Not re-serialized" is not "byte-identical": the skipped document falls
+    // through to the whitespace rules, which only ever touch inter-token
+    // whitespace. Keys, their order and every value stay as sent.
+    const rows = Array.from({ length: 20 }, (_, i) => `  "empty${i}": null,   `).join("\n");
+    const raw = `{\n  "status": "first",   \n  "status": "second",\n\n\n\n${rows}\n  "end": 1\n}`;
+    const out = pruneContent([{ type: "text", text: raw }]).content[0].text;
+    expect(out).not.toBe(raw);
+    expect(out).toContain('"status": "first",\n  "status": "second",\n\n  "empty0": null,\n');
+    expect(JSON.parse(out)).toEqual(JSON.parse(raw));
+  });
+
+  it("still prunes integer-like keys that are already where JS puts them", () => {
+    // The counterweight: ascending integer keys ahead of the named ones is
+    // exactly the order the round-trip produces, so nothing moves and the
+    // document keeps its savings. A string VALUE full of braces, commas,
+    // quotes and a repeated key is there to show values are not read as keys.
+    const tricky = '{"a":1,"a":2},[9,"8":{';
+    const raw = `{"3": "x", "87": "y", "1532": "z", "note": ${JSON.stringify(tricky)}, "list": ["7", "5"], ${NULLS}}`;
+    const r = pruneContent([{ type: "text", text: raw }]);
+    const parsed = JSON.parse(r.content[0].text);
+    expect(parsed.empty0).toBeUndefined();
+    expect(Object.keys(parsed)).toEqual(["3", "87", "1532", "note", "list"]);
+    expect(parsed.note).toBe(tricky);
+    expect(parsed.list).toEqual(["7", "5"]);
+  });
+
+  it("still prunes when the same key repeats across sibling objects", () => {
+    // One key per OBJECT is the rule; every row of a table repeats its columns.
+    const rows = Array.from({ length: 30 }, (_, i) => `{"id": ${i}, "name": "r${i}", "note": null}`).join(", ");
+    const r = pruneContent([{ type: "text", text: `[${rows}]` }]);
+    const parsed = JSON.parse(r.content[0].text);
+    expect(parsed).toHaveLength(30);
+    expect(parsed[0]).toEqual({ id: 0, name: "r0" });
+  });
+
   it("still prunes a computed double that needs all 17 digits (0.30000000000000004)", () => {
     // The counterweight to the three cases above. JSON.stringify reproduces
     // this literal byte for byte, so it is faithful -- but a mantissa bound of

@@ -75,8 +75,9 @@ const RENAME_RETRY_DELAYS_MS = [10, 50, 100];
  *  opens per run, and most runs fell between 40 and 110. Those are failed
  *  opens, not races -- one race can fail several opens across its three
  *  loops. It reproduces across processes too, with sync openSync against
- *  unlinkSync. The lock takes in grades-cache.ts
- *  and auto-upgrade.ts retry on it for that reason. POSIX has neither cause. */
+ *  unlinkSync. The lock takes in file-lock.ts (withFileLock, which
+ *  grades-cache.ts and persistence.ts go through) and auto-upgrade.ts retry
+ *  on it for that reason. POSIX has neither cause. */
 export function isWin32TransientFsError(err: unknown): boolean {
   if (process.platform !== "win32") return false;
   const code = (err as NodeJS.ErrnoException | null)?.code;
@@ -115,7 +116,7 @@ export async function atomicWriteFile(
   contents: string,
   encoding: BufferEncoding = "utf8",
   // Optional creation mode for the tmp file. Pass 0o600 for secret-bearing
-  // files (token config, session cookie, vault) so the file is born
+  // files (the vault, the trust store, bundles.json) so the file is born
   // owner-only and never sits at the default-umask perms (often 0644) in the
   // window between rename and a post-hoc chmod. The bits are masked by the
   // process umask like any creat(2); callers that need an exact mode should
@@ -126,7 +127,7 @@ export async function atomicWriteFile(
   // file is worth protecting; pass a mode only when the content does.
   mode?: number,
   // Optional mode for the parent-directory chain. Pass 0o700 for secret-
-  // bearing paths (vault, team-session cookie) so newly-created parent
+  // bearing paths (the vault, the trust store) so newly-created parent
   // directories aren't born group/other-readable -- mkdir(2)'s default of
   // 0o777-&-umask typically lands at 0o755, which lets others list the
   // directory and observe filenames/timestamps of secret files inside.

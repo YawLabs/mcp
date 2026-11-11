@@ -62,9 +62,10 @@
 //     collision and is not asked about.
 //   * The plan prints the namespace the file will actually hold, which is not
 //     always the derived one: a stored entry matched by NAME keeps its own.
-//   * A `${...}` the client expands itself is expanded here, or the server is
-//     refused BY NAME. yaw-mcp does not expand them at spawn, so importing one
-//     verbatim produces an entry that cannot work while looking imported.
+//   * For VS Code and Cline, a `${...}` the client expands itself is expanded
+//     here, or the server is refused BY NAME. yaw-mcp does not expand them at
+//     spawn, so importing one verbatim produces an entry that cannot work
+//     while looking imported. No other client's entries are interpreted.
 //   * Nothing is dropped in silence: an `env` / `headers` shape the loader
 //     would refuse is named (key names only), and one un-removable key never
 //     aborts the removal of the others.
@@ -131,9 +132,13 @@ export const IMPORT_USAGE = `Usage: yaw-mcp import <client> [flags]
   command, args, url, headers and env come across as they are -- an import that
   dropped the env would produce servers that cannot start -- so a credential
   sitting in your client config lands in bundles.json (file mode 0600 on
-  macOS/Linux; on Windows only as private as your user profile's ACL). Move it
-  into the vault afterwards with \`yaw-mcp secrets set NAME\` and
-  \`yaw-mcp set <server> env.KEY='\${secret:NAME}'\`.
+  macOS/Linux; on Windows only as private as your user profile's ACL). Move an
+  env credential into the vault afterwards with
+  \`yaw-mcp set <server> env.KEY --secret\`, which asks for the value again (a
+  no-echo prompt, or piped stdin), stores it, and replaces the plain value
+  with the \${secret:NAME} reference in one step. A header credential takes two:
+  \`yaw-mcp secrets set NAME\`, then put \${secret:NAME} in that server's
+  "headers" in bundles.json by hand.
 
   A server already in bundles.json is MERGED, with the client's copy winning,
   so the plan names every entry that would be replaced and shows the launch
@@ -142,8 +147,9 @@ export const IMPORT_USAGE = `Usage: yaw-mcp import <client> [flags]
   skips that server -- and a run off one writes nothing and exits 2 unless you
   pass --force. A stored entry the merge would leave as it is is not asked
   about. A VS Code server written with a \${input:...} or
-  \${env:...} variable is skipped by name: VS Code expands those itself and
-  yaw-mcp does not, so importing one would produce a server that cannot start.
+  \${env:...} variable is skipped by name, and so is a Cline server written
+  with \${env:...}: the client expands those itself and yaw-mcp does not, so
+  importing one would produce a server that cannot start.
 
   AFTER AN IMPORT THE CLIENT STILL LAUNCHES THOSE SERVERS ITSELF, so you would
   be running each of them twice -- once directly, once through yaw-mcp. This
@@ -183,10 +189,12 @@ export interface ImportCommandOptions {
   appData?: string;
   claudeConfigDir?: string;
   /** Every client env var, as `readClientEnv` reported it, threaded from the
-   *  dispatcher. Only a MODULAR row reads it (Zed's $XDG_CONFIG_HOME, Cline's
-   *  three knobs, Continue's global dir); the six inline rows take their one
-   *  variable from `claudeConfigDir` above. Read by the dispatcher and never
-   *  here, so a test that calls this runner directly stays hermetic. */
+   *  dispatcher. A MODULAR row reads its own variables from it (Zed's
+   *  $XDG_CONFIG_HOME, Cline's three knobs, Continue's global dir); of the six
+   *  inline rows, VS Code's Linux user path reads $XDG_CONFIG_HOME from it and
+   *  the rest take their one variable from `claudeConfigDir` above. Read by
+   *  the dispatcher and never here, so a test that calls this runner directly
+   *  stays hermetic. */
   clientEnv?: ClientEnvValues;
   out?: (s: string) => void;
   err?: (s: string) => void;
@@ -311,6 +319,12 @@ interface ClientVars {
   /** The workspace folder, or undefined at a scope that resolves none (VS
    *  Code's user-profile mcp.json belongs to no workspace at all). */
   workspaceFolder?: string;
+  /** Which `${...}` spans are the client's OWN variables. "all" is VS Code,
+   *  where every span is one (workspace, input, env, ...). "env" is Cline:
+   *  `${env:NAME}` is the one spelling its row records it expanding
+   *  (target-cline.ts), so only that is treated as a variable and any other
+   *  span is carried across as the text it is. */
+  spans: "all" | "env";
 }
 
 /**
@@ -336,6 +350,10 @@ interface ClientVars {
  * Any of those makes the whole server UNRESOLVED: it is refused by name rather
  * than imported broken.
  *
+ * Under `spans: "env"` (Cline) only `${env:VAR}` is a variable at all: it is
+ * unresolved for the reason above, and every other span is returned untouched
+ * and is not recorded.
+ *
  * `${secret:NAME}` is left alone and is NOT unresolved -- that is yaw-mcp's own
  * reference, resolved against the vault at spawn (secrets-vault.ts), so a
  * hand-written one in a client config still means here what it says.
@@ -344,6 +362,7 @@ function expandClientVars(s: string, vars: ClientVars, unresolved: Set<string>):
   return s.replace(/\$\{[^{}]*\}/g, (span) => {
     const name = span.slice(2, -1);
     if (name.startsWith("secret:")) return span;
+    if (vars.spans === "env" && !name.startsWith("env:")) return span;
     if (vars.workspaceFolder !== undefined) {
       if (name === "workspaceFolder") return vars.workspaceFolder;
       if (name === "workspaceFolderBasename") return basename(vars.workspaceFolder);
@@ -377,9 +396,10 @@ interface BuiltEntry {
  *
  * `vars` is null for a client whose expansion rules this command does not
  * know, and then nothing is interpreted at all. Guessing one would refuse
- * strings that work today, so only the client whose own file DECLARES its
- * variables -- VS Code, via the `inputs` block in that same mcp.json -- gets
- * the treatment.
+ * strings that work today, so only two clients get the treatment: VS Code,
+ * whose own file DECLARES its variables (the `inputs` block in that same
+ * mcp.json), and Cline, whose row declares `hooks.importVariables:
+ * "cline-env"` -- see the caller.
  */
 function toEntry(key: string, value: unknown, vars: ClientVars | null): BuiltEntry | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
@@ -934,6 +954,7 @@ async function searchForBroker(
   source: ClientConfigView,
   opts: ImportCommandOptions,
   home: string,
+  appData: string,
 ): Promise<BrokerSearch> {
   const { target } = site;
   const searched: ContainerRef[] = [sourceRef];
@@ -953,7 +974,8 @@ async function searchForBroker(
         scope: spec.scope,
         os: site.os,
         home,
-        appData: resolveAppDataDir({ appData: opts.appData, home }),
+        // The %APPDATA% runImport chose once, for the target scope too.
+        appData,
         // Same env the target scope resolved with, so an env-redirected client
         // is searched at its REAL other-scope path rather than the default one.
         clientEnv: opts.clientEnv,
@@ -1096,7 +1118,13 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
   const printErr = (s: string): void => errOut(`${s}\n`);
 
   const home = opts.home ?? homedir();
-  const site = resolveInstallSite("import", { ...opts, home }, printErr);
+  // %APPDATA% is chosen ONCE, from the CALLER's `home` and not the defaulted
+  // one above: resolveAppDataDir reads the ambient %APPDATA% only when no home
+  // was overridden, so handing it `home` made that branch unreachable and a
+  // box with %APPDATA% redirected away from <home>\AppData\Roaming was read at
+  // the home-derived path ("does not exist") while install wrote the real one.
+  const appData = resolveAppDataDir({ appData: opts.appData, home: opts.home });
+  const site = resolveInstallSite("import", { ...opts, home, appData }, printErr);
   if (!site) return { exitCode: 2, written: [] };
   const { target, resolved } = site;
 
@@ -1189,11 +1217,20 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
     return { exitCode: 0, written: [] };
   }
 
-  // VS Code is the only client that declares its own variables in the file
-  // being read (the `inputs` block), so it is the only one whose `${...}`
-  // spans are interpreted here -- see toEntry.
+  // Two clients have their `${...}` spans interpreted here -- see toEntry.
+  // VS Code declares its own variables in the file being read (the `inputs`
+  // block) and every span in its file is one of its variables. Cline's row
+  // declares `hooks.importVariables: "cline-env"`: Cline expands `${env:NAME}`
+  // itself, there is no value to substitute from here, and so a server
+  // carrying one is refused by name while every other span in a Cline entry
+  // is carried across as it is. Every other client's entries are carried
+  // across uninterpreted.
   const isVsCode = target.clientId === "vscode";
-  const vars: ClientVars | null = isVsCode ? { workspaceFolder: site.projectDir } : null;
+  const vars: ClientVars | null = isVsCode
+    ? { workspaceFolder: site.projectDir, spans: "all" }
+    : target.hooks?.importVariables === "cline-env"
+      ? { spans: "env" }
+      : null;
   const inputs = isVsCode ? readVsCodeInputs(view.raw ?? "") : new Map<string, string>();
 
   const candidates: ImportCandidate[] = [];
@@ -1393,7 +1430,7 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
           `yaw-mcp import: would remove nothing from ${file} -- none of these servers would be imported, because their write to bundles.json could not be previewed (the warning above says why).`,
         );
       } else {
-        const broker = await searchForBroker(site, siteAt(targetSite, sourcePath), source, opts, home);
+        const broker = await searchForBroker(site, siteAt(targetSite, sourcePath), source, opts, home, appData);
         if (broker.wiredIn === null) {
           printErr(`Would not remove the originals: ${removalRefusal(broker, target)}`);
         } else {
@@ -1565,15 +1602,16 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
       `Not imported (another key that derives the same namespace overwrote it): ${lost}. Left in ${displaySafe(resolved.absolute)} so nothing is lost: rename one of them there and re-run, or add it by hand with \`yaw-mcp add\`.`,
     );
   }
-  // A local server's credentials are env keys, which `set --secret` moves into
-  // the vault in one step. A remote server's are headers, and `set` has no
+  // A local server's credentials are env keys, which `set --secret` puts into
+  // the vault in one step (it reads the value afresh from a prompt or stdin,
+  // never from the stored entry). A remote server's are headers, and `set` has no
   // header path, so those keep the two-step form and a hand edit.
   const isRemote = (r: (typeof imported)[number]): boolean => r.candidate.entry.type === "remote";
   const envKeys = [...new Set(imported.filter((r) => !isRemote(r)).flatMap((r) => r.candidate.credentialKeys))];
   const headerKeys = [...new Set(imported.filter(isRemote).flatMap((r) => r.candidate.credentialKeys))];
   if (envKeys.length > 0) {
     print(
-      `Credentials came across as plain values: ${envKeys.map(displayArg).join(", ")}. Move each one into the vault with \`yaw-mcp set <server> env.KEY --secret\`, which stores the value and writes the \${secret:NAME} reference in one step.`,
+      `Credentials came across as plain values: ${envKeys.map(displayArg).join(", ")}. Move each one into the vault with \`yaw-mcp set <server> env.KEY --secret\`, which asks for the value again (a no-echo prompt, or piped stdin), stores it, and replaces the plain value with the \${secret:NAME} reference in one step.`,
     );
   }
   if (headerKeys.length > 0) {
@@ -1600,7 +1638,7 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
   // Where a yaw-mcp entry could be, across every scope of the client -- see
   // searchForBroker. With none, removing the originals is never right, and
   // the reason and the step to take are removalRefusal's.
-  const search = await searchForBroker(site, siteAt(targetSite, sourcePath), source, opts, home);
+  const search = await searchForBroker(site, siteAt(targetSite, sourcePath), source, opts, home, appData);
   const wiredIn = search.wiredIn;
   if (!wiredIn) {
     printErr(`Not removing the originals: ${removalRefusal(search, target)}`);
@@ -1633,15 +1671,48 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
     }
   }
 
-  // Peeled out of the bytes the plan was read from, one key at a time, at the
-  // container address the servers were actually READ from (`sourcePath`, a
-  // drive-case sibling included) -- see spliceOutOriginals.
-  const splice = spliceOutOriginals(
-    view.raw ?? "",
-    siteAt(targetSite, sourcePath),
-    imported.map((r) => r.candidate.key),
-    target.entry,
-  );
+  // RE-READ, then peel. The plan's bytes (`view.raw`) were read before the
+  // overwrite question, the removal question and every bundles.json write, and
+  // ~/.claude.json is a file a running Claude Code rewrites on its own
+  // schedule: splicing those bytes and writing them back reverted whatever the
+  // client had written in between. So the removal works on the file as it is
+  // NOW, at the container address the servers were actually READ from
+  // (`sourcePath`, a drive-case sibling included), and takes out only a key
+  // whose entry is still the one that was imported -- one that was edited or
+  // removed meanwhile is left alone and named.
+  const removalSite = siteAt(targetSite, sourcePath);
+  const fresh = await readClientConfigFile(removalSite, { transform: target.entry });
+  if (fresh.read.kind !== "ok" || fresh.raw === null) {
+    printErr(
+      `yaw-mcp import: ${displaySafe(resolved.absolute)} changed while this was running and no longer reads as a config with those entries; nothing was removed from it. The servers are imported either way -- check the file and remove the entries by hand.`,
+    );
+    return { exitCode: 0, written };
+  }
+  const still: string[] = [];
+  const changedSince: string[] = [];
+  // Removed by the client meanwhile: nothing is left to peel and there is no
+  // current entry to re-import, so it gets its own sentence.
+  const goneSince: string[] = [];
+  for (const r of imported) {
+    const key = r.candidate.key;
+    const now = fresh.entry(key);
+    const then = source.entry(key);
+    if (now === undefined) goneSince.push(displayArg(key));
+    else if (then !== undefined && deepEqualJson(now.value, then.value)) still.push(key);
+    else changedSince.push(displayArg(key));
+  }
+  if (goneSince.length > 0) {
+    printErr(
+      `yaw-mcp import: already gone from ${displaySafe(resolved.absolute)}, removed there after the import read ${goneSince.length === 1 ? "it" : "them"}: ${goneSince.join(", ")}. The imported ${goneSince.length === 1 ? "copy is" : "copies are"} in bundles.json either way.`,
+    );
+  }
+  if (changedSince.length > 0) {
+    printErr(
+      `yaw-mcp import: left in ${displaySafe(resolved.absolute)} because ${changedSince.length === 1 ? "it" : "they"} changed there after the import read ${changedSince.length === 1 ? "it" : "them"}: ${changedSince.join(", ")}. Re-run the import to pick up the current ${changedSince.length === 1 ? "entry" : "entries"}.`,
+    );
+  }
+  // One key at a time -- see spliceOutOriginals.
+  const splice = spliceOutOriginals(fresh.raw, removalSite, still, target.entry);
   if (splice.unremovable.length > 0) {
     printErr(unremovableNote("could not be removed", displaySafe(resolved.absolute), splice.unremovable, target.label));
   }

@@ -364,7 +364,10 @@ function runChild(
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [script, file, id, String(iterations)], {
       stdio: ["ignore", "ignore", "pipe"],
-      env: { ...process.env, YAW_MCP_LOG_LEVEL: "error" },
+      // LOG_LEVEL is the name logger.ts reads (there is no YAW_MCP_-prefixed
+      // one): errors only, so the 4000-char stderr tail kept below holds the
+      // failure rather than lock-contention warnings.
+      env: { ...process.env, LOG_LEVEL: "error" },
     });
     let stderr = "";
     child.stderr.on("data", (d: Buffer) => {

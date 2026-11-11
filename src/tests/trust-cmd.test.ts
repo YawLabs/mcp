@@ -762,6 +762,48 @@ describe("yaw-mcp trust --revoke", () => {
     expect(await listTrusted({ home: synthHome })).toEqual([]);
   });
 
+  // The DIRECTORY spelling of a project that is gone. With nothing to stat,
+  // the path used to go to the store verbatim, match no row, and report "was
+  // not approved (nothing to do)" with the grant still there.
+  it.each([
+    ["the project root", (root: string) => root],
+    ["its .yaw-mcp directory", (root: string) => join(root, CONFIG_DIRNAME)],
+  ])("revokes a deleted project named by %s", async (_label, spell) => {
+    const root = join(synthHome, "deleted-repo");
+    const gone = join(root, CONFIG_DIRNAME, "bundles.json");
+    await grantTrust(gone, "whatever", { home: synthHome });
+    const io = captureIO();
+    const r = await runTrust({
+      mode: "revoke",
+      path: spell(root),
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: io.push,
+      err: io.pushErr,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(io.text()).toContain(`Revoked ${gone}`);
+    expect(io.text()).not.toContain("nothing to do");
+    expect(await listTrusted({ home: synthHome })).toEqual([]);
+  });
+
+  it("a deleted path that was never approved still reports the path as typed", async () => {
+    const typed = join(synthHome, "never-there");
+    const io = captureIO();
+    const r = await runTrust({
+      mode: "revoke",
+      path: typed,
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: io.push,
+      err: io.pushErr,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(io.text()).toContain(`${typed} was not approved (nothing to do).`);
+  });
+
   it("a no-op revoke still exits 0", async () => {
     writeBundles(synthCwd, HOSTILE);
     const io = captureIO();
@@ -1266,7 +1308,19 @@ describe("granting against a store that cannot be read", () => {
     const io = captureIO();
     const r = await runTrust({ home: synthHome, cwd: synthCwd, env: {}, yes: true, out: io.push, err: io.pushErr });
     expect(r.exitCode).toBe(0);
-    expect(io.errText()).toContain("not valid JSON and has been replaced");
+    expect(io.errText()).toContain("could not be parsed as a trust store and has been replaced");
+    expect(await listTrusted({ home: synthHome })).toHaveLength(1);
+  });
+
+  it("the replaced-store note does not call a valid-JSON store of the wrong shape invalid JSON", async () => {
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(trustStorePath(synthHome), "[]");
+    writeBundles(synthCwd, HOSTILE);
+    const io = captureIO();
+    const r = await runTrust({ home: synthHome, cwd: synthCwd, env: {}, yes: true, out: io.push, err: io.pushErr });
+    expect(r.exitCode).toBe(0);
+    expect(io.errText()).toContain("could not be parsed as a trust store and has been replaced");
+    expect(io.errText()).not.toContain("not valid JSON");
     expect(await listTrusted({ home: synthHome })).toHaveLength(1);
   });
 });
@@ -1291,7 +1345,7 @@ describe("the approval is byte-pinned end to end", () => {
 describe("a file swapped while the prompt is open is not approved", () => {
   /** Answer `y` at the REAL prompt, mutating the project file first. The reader
    *  writes its question to `stdout` before it starts reading `stdin` (see
-   *  secrets-cmd:readLineFromTTY), so the first chunk out of `stdout` is the
+   *  tty-reader.ts's readLine), so the first chunk out of `stdout` is the
    *  question -- which is exactly the moment a hostile repo would swap the file
    *  in. promptAnswer cannot express this: it short-circuits askYesNo, so there
    *  is no pause to swap during. */

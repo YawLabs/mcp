@@ -40,7 +40,6 @@ import { type BundlesSummary, runInstall } from "../install-cmd.js";
 import {
   blockedContainerFix,
   claudeCodeProjectKey,
-  describeJsonShape,
   ENTRY_NAME,
   INSTALL_TARGETS,
   resolveInstallSites,
@@ -343,6 +342,26 @@ describe("runDoctor — client detection", () => {
     expect(cap.text()).not.toMatch(/Claude Code \(user\): OK/);
     expect(r.exitCode).toBe(2);
     expect(cap.text()).not.toContain("All good");
+  });
+
+  it("flags a DIRECTORY at the oam entry path, the entry the heal sweep rewrites", async () => {
+    // existsSync is true for a directory, so this read "OK (runs on oam)",
+    // exit 0, while heal's gate 2 (a regular FILE or it is broken) called the
+    // same entry dead. One test for both now: isLaunchableEntryFile.
+    const oamBin = join(synthHome, "oam");
+    writeFileSync(oamBin, "");
+    const dirEntry = join(synthHome, "pkg", "dist");
+    mkdirSync(dirEntry, { recursive: true });
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: oamBin, args: ["run", "--no-check", dirEntry] } } }),
+    );
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, err: () => {} });
+    const client = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
+    expect(client?.launchOamEntryMissing).toBe(dirEntry);
+    expect(cap.text()).not.toMatch(/Claude Code \(user\): OK/);
+    expect(r.exitCode).toBe(2);
   });
 
   it("reports a fully resolvable oam entry as OK", async () => {
@@ -1275,6 +1294,10 @@ describe("runDoctor — UPGRADE AVAILABLE method-aware hints", () => {
     const txt = cap.text();
     expect(txt).toContain("UPGRADE AVAILABLE");
     expect(txt).toContain("restart your MCP client");
+    // Only an @latest entry is refreshed by a restart; the hint says so and
+    // names the remedy for the other kind.
+    expect(txt).toContain("pick it up if its entry runs");
+    expect(txt).toContain("@yawlabs/mcp@latest; otherwise re-run `yaw-mcp install <client>`.");
     expect(txt).not.toContain("npm install");
   });
 
@@ -1511,6 +1534,40 @@ describe("runDoctor — --json", () => {
     expect(parsed.state.prewarmFailures).toBeNull();
     // A corrupt file yields no reliability data either.
     expect(parsed.reliability).toEqual([]);
+  });
+
+  it.each([
+    ["malformed", (file: string) => writeFileSync(file, "{ not json at all")],
+    // A directory at the path: the read fails with EISDIR (EACCES on win32),
+    // which is the loader's other warning branch.
+    ["unreadable", (file: string) => mkdirSync(file)],
+  ])("writes nothing to process.stderr for a %s state.json: the STATE section is the one report", async (status, seed) => {
+    // The state loader logs a server-worded warning for both shapes ("starting
+    // fresh" / "flagged unreadable so a save cannot overwrite it"), and log()
+    // writes straight to process.stderr, past the `err` sink below. Doctor
+    // starts nothing and saves nothing, so it asks for a quiet load.
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    seed(join(synthHome, ".yaw-mcp", STATE_FILENAME));
+    const stderrWrite = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    let written: string;
+    let r: Awaited<ReturnType<typeof runDoctor>>;
+    try {
+      r = await runDoctor({
+        cwd: synthCwd,
+        home: synthHome,
+        env: {},
+        os: "linux",
+        out: () => {},
+        err: () => {},
+        json: true,
+        skipRegistryCheck: true,
+      });
+      written = stderrWrite.mock.calls.map((c) => String(c[0])).join("");
+    } finally {
+      stderrWrite.mockRestore();
+    }
+    expect(JSON.parse(r.lines[0]).state.status).toBe(status);
+    expect(written).toBe("");
   });
 
   it("reports a schema-mismatched state.json as stale-version", async () => {
@@ -2560,7 +2617,11 @@ describe("runDoctor — OAM RUNTIME section", () => {
     // remedy is "nothing -- it moves on its own". Telling this user to re-run
     // `sidecars install` was busywork: an eligible package is absent from
     // refreshSkips and used to fall through to the generic manual advice.
-    expect(cap.text()).toContain("0.3.6  (latest 0.9.9 -- the daily background refresh will update it)");
+    // The two exceptions are named because doctor checks neither (a tree the
+    // refresh stands down for, a package inside its back-off).
+    expect(cap.text()).toContain(
+      "0.3.6  (latest 0.9.9 -- the daily background refresh will update it, unless the tree was installed from another config or npm could not deliver that version)",
+    );
     expect(r.exitCode, "staleness is advisory, never a warning").toBe(0);
     // A package that is not installed has no version to be stale AGAINST --
     // its problem is "not in the managed tree", and probing the registry for
@@ -3505,6 +3566,16 @@ describe("scanShellHistoryForShadows -- window size and wrapper parsing", () => 
     // used to report zero shadowed commands.
     const hits = scanShellHistoryForShadows({ home: synthHome, env: { HISTFILE: custom } });
     expect(hits.find((h) => h.cli === "npm")?.count).toBe(1);
+  });
+
+  it("reads a relocated HISTFILE that is zsh's, by the shape of each line", () => {
+    // HISTFILE is zsh's variable too, and an exported one that is not
+    // ~/.zsh_history was read as plain lines: the leading binary of
+    // `: 1700000000:0;npm audit` is then `:`, and the file counted for nothing.
+    const custom = join(synthHome, "relocated_zsh_history");
+    writeFileSync(custom, ": 1700000000:0;npm audit\n: 1700000001:2;npm ci\nnpm test\n");
+    const hits = scanShellHistoryForShadows({ home: synthHome, env: { HISTFILE: custom } });
+    expect(hits.find((h) => h.cli === "npm")?.count).toBe(3);
   });
 
   it("reads pwsh PSReadLine history from the XDG data dir (no APPDATA)", () => {
@@ -4704,10 +4775,10 @@ describe("runDoctor -- a strict client config its client cannot load", () => {
     // install checks the blocked read first, so that is the refusal the user
     // would actually hit -- and the row says that one, not the strictness.
     expect(clientsRow(cap.text(), PROJECT_LABEL).status).toBe(
-      `present, but "mcpServers" is ${describeJsonShape(servers)}, not a JSON object -- install refuses to overwrite it; ${blockedContainerFix(`run \`${PROJECT_INSTALL}\``)}`,
+      `present, but "mcpServers" is an array of 1, not a JSON object -- install refuses to overwrite it; ${blockedContainerFix(`run \`${PROJECT_INSTALL}\``)}`,
     );
     const probe = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "project");
-    expect(probe?.containerBlocked).toBe(`"mcpServers" is ${describeJsonShape(servers)}`);
+    expect(probe?.containerBlocked).toBe('"mcpServers" is an array of 1');
     // The strictness is still recorded, so fixing the container does not
     // leave the row silent about the comment.
     expect(probe?.unloadable).toBe(problemFor(raw));

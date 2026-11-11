@@ -44,7 +44,9 @@ const USAGE =
   "\n" +
   "Re-point yaw-mcp entries whose launch file no longer exists -- what an app\n" +
   "upgrade leaves behind when it deletes the directory the entry named.\n" +
-  "Only an entry yaw-mcp wrote AND that is currently broken is touched.\n" +
+  "Only an oam entry that points into an @yawlabs/mcp package tree AND whose\n" +
+  "launch file is currently missing (or not a file) is touched -- a hand-written\n" +
+  "entry of that shape included. A working entry is never rewritten.\n" +
   "\n" +
   "  --json      Machine-readable result: { healed, unhealable, failed, count, dryRun, readOnly };\n" +
   "              with --dry-run, `healed` and `count` are what WOULD be re-pointed;\n" +

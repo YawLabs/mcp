@@ -379,10 +379,10 @@ export type TrustStatus =
 /**
  * Classify one path + its exact bytes against an already-loaded store.
  *
- * Every consumer (local-bundles, trust-cmd, doctor) holds a store already and
- * classifies through here, so the file is read once per command; there is no
- * one-shot "load and check" wrapper any more -- one existed, had no caller,
- * and was deleted rather than kept for a hypothetical embedder.
+ * local-bundles.ts is the only production caller: probeProjectTrust reads the
+ * store once and classifies through here, and trust-cmd, doctor and the other
+ * commands take their verdict from that probe. Its bytesAreTrusted is the one
+ * load-and-check in a single call (read the file, read the store, classify).
  *
  * NOTE: neither this nor readTrustStore consults TRUST_BYPASS_ENV. The bypass
  * is a LOADER-level policy decision (see local-bundles.ts), not a claim that

@@ -246,7 +246,33 @@ export interface ClassifiedState {
    * state file was reported as unreadable).
    */
   parsedCleanly: boolean;
+  /**
+   * True only when there was NO file (ENOENT, or ENOTDIR on a path component).
+   * `parsedCleanly` is true for that case and for a healthy file alike, so a
+   * caller that words the two differently needs this to tell them apart.
+   */
+  missing: boolean;
+  /**
+   * WHY the state is the empty fallback, or null when it is not (a healthy
+   * file, or no file). Non-null exactly when `parsedCleanly` is false. Named
+   * here, at the one read+parse, so a reporting caller does not have to open
+   * the file again with a parser of its own to find out which it was.
+   */
+  failure: StateLoadFailure | null;
 }
+
+/** The three ways loadStateClassified falls back to the empty state for a
+ *  file that exists. */
+export type StateLoadFailure =
+  /** The file exists and could not be read (EACCES, EBUSY, EISDIR, ...).
+   *  `message` is the read error's. */
+  | { kind: "unreadable"; message: string }
+  /** Not JSON (`message` is the parser's), or JSON whose top-level value is
+   *  not an object -- null, a scalar or an array. */
+  | { kind: "malformed"; message: string }
+  /** An object at a schema version this build cannot read. `version` is the
+   *  file's raw value, whatever type it had (undefined when absent). */
+  | { kind: "stale-version"; version: unknown };
 
 // Load persisted state from disk. Always returns a PersistedState
 // object — on any failure (missing file, bad JSON, version mismatch,
@@ -258,7 +284,17 @@ export async function loadState(filePath: string = statePath()): Promise<Persist
 // loadState plus the parsedCleanly classification. THE single read+parse of
 // the state file: loadState is a thin wrapper over this, so a caller that
 // needs both cannot end up with two parsers that disagree.
-export async function loadStateClassified(filePath: string = statePath()): Promise<ClassifiedState> {
+//
+// `quiet` suppresses the two warn logs below, and nothing else: the returned
+// classification is identical. It is for a caller that reports the failure in
+// its own words from `failure` (doctor's STATE section) -- on the cli surface
+// a warn goes straight to stderr, and "starting fresh" is untrue of a command
+// that starts nothing and never saves.
+export async function loadStateClassified(
+  filePath: string = statePath(),
+  options: { quiet?: boolean } = {},
+): Promise<ClassifiedState> {
+  const quiet = options.quiet === true;
   let raw: string;
   try {
     raw = await readFile(filePath, "utf8");
@@ -268,7 +304,7 @@ export async function loadStateClassified(filePath: string = statePath()): Promi
     // start empty. Same split as grades-cache/config-loader. Clean, not
     // failed: with no file on disk the empty state IS what is there.
     if (isFileNotFound(err) || (err as NodeJS.ErrnoException).code === "ENOTDIR")
-      return { state: emptyState(), rawCounts: NO_RAW_COUNTS, parsedCleanly: true };
+      return { state: emptyState(), rawCounts: NO_RAW_COUNTS, parsedCleanly: true, missing: true, failure: null };
     // The file EXISTS but we could not read it -- a transient handle error
     // (win32 AV/indexer EBUSY, EACCES) on a presumed-HEALTHY file. Flag it
     // so the caller does not overwrite real learning/packHistory/toolCache
@@ -279,10 +315,18 @@ export async function loadStateClassified(filePath: string = statePath()): Promi
     // do next: it used to promise "state saves are disabled for this session",
     // which is true for server.ts and flatly false for reset-learning, whose
     // very next act is to delete the file.
-    log("warn", "Could not read yaw-mcp state file; flagged unreadable so a save cannot overwrite it", {
-      error: errorMessage(err),
-    });
-    return { state: { ...emptyState(), loadFailed: true }, rawCounts: NO_RAW_COUNTS, parsedCleanly: false };
+    if (!quiet) {
+      log("warn", "Could not read yaw-mcp state file; flagged unreadable so a save cannot overwrite it", {
+        error: errorMessage(err),
+      });
+    }
+    return {
+      state: { ...emptyState(), loadFailed: true },
+      rawCounts: NO_RAW_COUNTS,
+      parsedCleanly: false,
+      missing: false,
+      failure: { kind: "unreadable", message: errorMessage(err) },
+    };
   }
   try {
     // Strip a leading UTF-8 BOM (U+FEFF) before parsing -- same strip
@@ -292,14 +336,31 @@ export async function loadStateClassified(filePath: string = statePath()): Promi
     // sanitizeLearning); without the strip, one Notepad save would drop ALL
     // learning, pack history, and tool cache via the empty-state fallback.
     const parsed = JSON.parse(raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw);
-    if (!parsed || typeof parsed !== "object")
-      return { state: emptyState(), rawCounts: NO_RAW_COUNTS, parsedCleanly: false };
+    // Arrays are typeof "object" too: without the explicit test a top-level
+    // `[]` fell through to the version check and was classified as a schema
+    // mismatch. The returned state is the same empty fallback either way; only
+    // the named failure differs.
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+      return {
+        state: emptyState(),
+        rawCounts: NO_RAW_COUNTS,
+        parsedCleanly: false,
+        missing: false,
+        failure: { kind: "malformed", message: "top-level value is not an object" },
+      };
+    const version = (parsed as { version?: unknown }).version;
     // Any version loadState can READ counts as clean, not just the current
     // one: v1 MIGRATES (see READABLE_STATE_VERSIONS), so treating it as
     // unreadable would discard real counts for the one session before the
     // first save rewrites the file.
-    if (!isReadableStateVersion((parsed as { version?: unknown }).version))
-      return { state: emptyState(), rawCounts: NO_RAW_COUNTS, parsedCleanly: false };
+    if (!isReadableStateVersion(version))
+      return {
+        state: emptyState(),
+        rawCounts: NO_RAW_COUNTS,
+        parsedCleanly: false,
+        missing: false,
+        failure: { kind: "stale-version", version },
+      };
     const p = parsed as Record<string, unknown>;
     return {
       state: {
@@ -321,13 +382,21 @@ export async function loadStateClassified(filePath: string = statePath()): Promi
         prewarmFailures: countRawEntries(p.prewarmFailures),
       },
       parsedCleanly: true,
+      missing: false,
+      failure: null,
     };
   } catch (err) {
     // Reached only for a parse failure -- read errors are handled above.
     // The file is genuinely unusable, so starting fresh (and letting the
     // next save replace it) is the intended behavior; no loadFailed flag.
-    log("warn", "Failed to load yaw-mcp state, starting fresh", { error: errorMessage(err) });
-    return { state: emptyState(), rawCounts: NO_RAW_COUNTS, parsedCleanly: false };
+    if (!quiet) log("warn", "Failed to load yaw-mcp state, starting fresh", { error: errorMessage(err) });
+    return {
+      state: emptyState(),
+      rawCounts: NO_RAW_COUNTS,
+      parsedCleanly: false,
+      missing: false,
+      failure: { kind: "malformed", message: errorMessage(err) },
+    };
   }
 }
 
@@ -349,7 +418,8 @@ function countRawEntries(input: unknown): number {
 //
 // CROSS-PROCESS: the sidecar lock in file-lock.ts (`state.json.lock`, O_EXCL
 // take, stale takeover by rename after STATE_LOCK_STALE_MS, ownership-checked
-// release). Every running `yaw-mcp serve` -- one per MCP client pane -- saves
+// release). Every running yaw-mcp server (a bare `yaw-mcp`; there is no
+// `serve` verb) -- one per MCP client pane -- saves
 // this same file, and each used to publish the whole document from the
 // snapshot it loaded at startup: pane A loads, pane B loads, B saves its
 // calls, A saves and B's calls are gone. Now every save takes the lock,
@@ -393,7 +463,7 @@ export type SavableState = Pick<PersistedState, "learning" | "packHistory"> &
  * owns the WHOLE document: an omitted cache persists as `{}`, and whatever
  * another process saved is replaced. That is the right primitive for a writer
  * that genuinely means "this is the file now" (tests seeding a fixture) and
- * the wrong one for a running broker -- `yaw-mcp serve` saves through
+ * the wrong one for a running broker -- the server process saves through
  * StateSync, which merges instead. Best-effort: failures log but never throw.
  */
 export function saveState(
@@ -598,7 +668,7 @@ export interface StateSyncOptions {
 }
 
 /**
- * Merging saver for a long-running process (`yaw-mcp serve`). Holds the
+ * Merging saver for a long-running process (the yaw-mcp server). Holds the
  * BASELINE -- the state this process last loaded from or wrote to disk -- so
  * each save sends only its delta (see mergeStateDelta) instead of overwriting
  * the file with a snapshot that is missing other processes' work.

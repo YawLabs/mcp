@@ -44,6 +44,7 @@ export function raiseFloorText(f: { src: string; test: string; changelog: string
   test: string;
   changelog: string;
   prev: string;
+  next: string;
 };
 
 export interface VerifyDeps {

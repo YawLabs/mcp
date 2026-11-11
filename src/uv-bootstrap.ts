@@ -7,6 +7,7 @@ import { pipeline } from "node:stream/promises";
 import { request } from "undici";
 import { stripInternalSecretsFromEnv } from "./internal-secret-env.js";
 import { log } from "./logger.js";
+import { launcherBasename } from "./oam-spawn.js";
 import { cacheDir } from "./paths.js";
 
 // Ship the default catalog on the premise that "if yaw-mcp runs, every
@@ -19,9 +20,12 @@ import { cacheDir } from "./paths.js";
 // Lazy: nothing happens until a Python server is actually added.
 // Memoized: concurrent Python server activations share one download.
 // Verified: we fetch the `.sha256` alongside the archive and refuse
-// to install on mismatch — protects against in-transit tampering and
-// partial downloads. A compromise of Astral's release pipeline itself
-// is out of scope; users who need that guarantee pre-install `uv`.
+// to install on mismatch — protects against partial or corrupted
+// downloads. It is NOT a defence against tampering: the hash and the
+// archive come from the same release URL over the same channel, so
+// anyone able to alter one response can alter the other. TLS is what
+// covers the transfer, and a compromise of Astral's release pipeline
+// itself is out of scope; users who need that guarantee pre-install `uv`.
 
 /**
  * The uv release this bootstrap downloads.
@@ -125,11 +129,22 @@ export const PATH_PROBE_TIMEOUT_MS = 3_000;
  *  causing exactly that download. */
 type PathProbe = "present" | "absent" | "unknown";
 
-// Resolve a bare command against PATH. Runs the binary with
-// `--version` and considers exit 0 as "present." Faster and more
-// portable than rolling our own PATH walk (which has to cope with
-// PATHEXT on Windows and symlinks on Unix). The PATH_PROBE_TIMEOUT_MS
-// cap guards against a wedged shim. resolveUv is the production caller.
+// Resolve a bare command against PATH by RUNNING it: `--version`, and
+// exit 0 is "present". A spawn rather than a directory walk because the
+// answer has to match what the real launch will do with the same bare
+// name, .cmd / .bat shims included (see `shell` below). oam-spawn.ts
+// splits the job for oam on purpose: resolveBinAbsolute LOCATES the
+// binary by walking PATH x PATHEXT, with no child, and a separate
+// bounded `--version` spawn (spawnVersionProbe) then verifies it. Here
+// the one spawn does both, so the two are not interchangeable: the cost
+// is a child on the activation path, which the PATH_PROBE_TIMEOUT_MS
+// cap bounds. resolveUv is the production caller.
+//
+// The settle / timer / SIGKILL / unref skeleton below is written out
+// three times: here, in runCommand further down, and in
+// spawnVersionProbe in oam-spawn.ts. They differ in stdio, in what a
+// non-zero exit means and in what expiry settles to, and share no
+// helper, so a fix to the teardown has to be made in all three.
 async function probePath(cmd: string): Promise<PathProbe> {
   return new Promise((resolve) => {
     let settled = false;
@@ -198,12 +213,13 @@ async function probePath(cmd: string): Promise<PathProbe> {
   });
 }
 
-/** Is `cmd` runnable from PATH? An inconclusive probe reads as false, which is
- *  the historical contract; callers that care about the difference (resolveUv)
- *  use probePath directly. No production code calls this any more: it is the
- *  boolean wrapper kept exported for the tests that drive probePath through it
- *  (the spawn-options and timeout-path tests). */
-export async function onPath(cmd: string): Promise<boolean> {
+/** Test seam for probePath: true only for a "present" verdict, so "absent" and
+ *  an inconclusive timeout both read as false. No production code calls it
+ *  (resolveUv uses probePath directly, because it needs to tell those two
+ *  apart); the uv-bootstrap tests drive the probe through it. Named as a test
+ *  hook, like __resetUvBootstrap, and deliberately not `onPath`: git-source.ts
+ *  has an unrelated local of that name which returns a path, not a boolean. */
+export async function __probePathPresent(cmd: string): Promise<boolean> {
   return (await probePath(cmd)) === "present";
 }
 
@@ -274,8 +290,15 @@ async function fetchWithRedirects(
     if (res.statusCode >= 300 && res.statusCode < 400) {
       const loc = res.headers.location;
       if (!loc) throw new Error(`Redirect without Location header from ${current}`);
-      current = Array.isArray(loc) ? loc[0] : loc;
       await res.body.dump();
+      // Resolved against the URL that answered: Location may be relative
+      // (RFC 9110 allows it), and a bare path is not a URL request() accepts.
+      const target = Array.isArray(loc) ? loc[0] : loc;
+      try {
+        current = new URL(target, current).href;
+      } catch {
+        throw new Error(`Redirect to an unusable Location (${target}) from ${current}`);
+      }
       continue;
     }
     if (res.statusCode !== 200) {
@@ -346,7 +369,7 @@ async function extractArchive(archivePath: string, destDir: string): Promise<voi
 // How long an extract child (tar / powershell Expand-Archive) gets before it is
 // killed and the bootstrap fails.
 //
-// Everything else on this path is already bounded -- onPath's 3s probe,
+// Everything else on this path is already bounded -- probePath's 3s probe,
 // UV_FETCH_TIMEOUT_MS (idle) plus UV_FETCH_TOTAL_MS (wall-clock) on the
 // download -- and this was the one hole left. A
 // wedged extractor is not hypothetical: tar on a stalled network mount takes no
@@ -476,6 +499,13 @@ let pending: Promise<string> | null = null;
 // server activations share one download. Throws on unsupported
 // platforms or download/verify failures so `upstream.ts` can wrap the
 // error into an ActivationError with a useful message.
+//
+// The literal "uv" was verified against THIS process's PATH (probePath runs
+// with the broker's env). upstream.ts spawns the child with the server's own
+// `env` merged over the broker's, so a server entry that sets PATH has the
+// bare name looked up again on its own path: a different uv than the one
+// probed, or none (a spawn_failure, with no fallback to the managed copy).
+// Nothing here detects that case.
 export function ensureUv(): Promise<string> {
   if (!pending) {
     // Clear the memo on rejection so the next call retries rather than
@@ -623,17 +653,12 @@ async function resolveUv(): Promise<string> {
   return finalBin;
 }
 
-/** Trailing Windows executable extension, any casing -- mirrors WIN_EXE_EXT
- *  in oam-spawn.ts: a hand-written or installer-generated config carries
- *  `uvx.exe` or `UV.EXE` as readily as the bare name, and the extension says
- *  nothing about what the program IS. */
-const UV_WIN_EXE_EXT = /\.(?:exe|cmd|bat)$/i;
-
 /**
  * Which uv launcher a BARE command names, or null for anything else.
  *
- * Matched with any Windows executable extension stripped, case-insensitively,
- * so `uvx.exe` / `UV.CMD` get the same bootstrap-and-rewrite treatment as
+ * Matched with any Windows executable extension stripped, case-insensitively
+ * (launcherBasename in oam-spawn.ts, the helper nodeLaunchKind uses), so
+ * `uvx.exe` / `UV.CMD` get the same bootstrap-and-rewrite treatment as
  * `uvx` / `uv`. Exact string equality -- which is what this replaced --
  * silently passed those shapes through, reintroducing the exact Windows
  * failure the uvx rewrite below exists to prevent (mirrors nodeLaunchKind in
@@ -654,7 +679,7 @@ const UV_WIN_EXE_EXT = /\.(?:exe|cmd|bat)$/i;
  */
 export function uvLaunchKind(command: string): "uv" | "uvx" | null {
   if (/[\\/]/.test(command)) return null;
-  const base = command.replace(UV_WIN_EXE_EXT, "").toLowerCase();
+  const base = launcherBasename(command);
   if (base === "uv") return "uv";
   if (base === "uvx") return "uvx";
   return null;
@@ -673,7 +698,7 @@ export function uvLaunchKind(command: string): "uv" | "uvx" | null {
 // `uv tool run ARGS`, we ALWAYS rewrite uvx to the canonical form
 // using whichever `uv` we have — PATH or bootstrapped. That makes the
 // actual spawn target always `uv`, which we've already verified is
-// reachable (either because onPath("uv") said so, or we just
+// reachable (either because probePath("uv") said so, or we just
 // downloaded it).
 /** The rewrite half of resolveUvSpawn, as a PURE function of the launch kind,
  *  the resolved uv binary and the args.

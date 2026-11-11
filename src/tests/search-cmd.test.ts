@@ -381,6 +381,28 @@ describe("runSearch with optional env", () => {
     expect(parsed.results[0].requiredEnvKeys).toEqual(["CONSUL_HTTP_ADDR"]);
     expect(parsed.results[0].optionalEnvKeys).toEqual(["CONSUL_HTTP_TOKEN"]);
   });
+
+  // The listing reads the keys through the resolver's own split
+  // (catalog.ts catalogEnvKeys), so it cannot name a key `add` would not gate
+  // on or seed: a malformed name is dropped, and a key the catalog lists both
+  // ways is required only.
+  it("agrees with the add on a malformed key and on a key listed both ways", async () => {
+    const odd = [
+      {
+        slug: "odd",
+        name: "Odd",
+        description: "Catalog bugs.",
+        install: { command: "npx odd", runtime: "node" },
+        requiredEnv: [{ key: "FOO-BAR" }, { key: "BOTH", optional: true }, { key: "BOTH" }, "BARE"],
+      },
+    ] as unknown as CatalogServer[];
+    const cap = capture();
+    await runSearch({ query: "odd", json: true, fetchCatalog: async () => odd, env: {}, ...cap });
+    const row = JSON.parse(cap.text()).results[0];
+    // BARE: the one deliberate difference -- a bare string is listed as needed.
+    expect(row.requiredEnvKeys).toEqual(["BOTH", "BARE"]);
+    expect(row.optionalEnvKeys).toEqual([]);
+  });
 });
 
 describe("runSearch -- the default fetcher's staleness note goes to the injected err writer", () => {

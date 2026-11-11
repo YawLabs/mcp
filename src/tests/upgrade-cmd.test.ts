@@ -9,10 +9,12 @@ import {
   detectSea,
   fetchLatestVersion,
   GLOBAL_UPGRADE_METHODS,
+  globalNpmMarkerIsUnanchored,
   globalUpgradeCommandLineForTool,
   type InstallMethod,
   killProcessTree,
   localInstallRoot,
+  NPX_LATEST_CAVEAT,
   npmGlobalPrefix,
   type ProbeSpawn,
   parseUpgradeArgs,
@@ -22,6 +24,7 @@ import {
   runUpgrade,
   UPGRADE_COMMANDS,
   UPGRADE_PACKAGE_SPEC,
+  UPGRADE_USAGE,
   upgradeCommandLine,
   upgradeSpawnSpec,
 } from "../upgrade-cmd.js";
@@ -197,6 +200,30 @@ describe("detectInstallMethod", () => {
         "C:\\Users\\jeff\\scoop\\apps\\nodejs22\\current\\bin\\node_modules\\@yawlabs\\mcp\\dist\\index.js",
       ),
     ).toBe("global-npm");
+  });
+
+  it("globalNpmMarkerIsUnanchored: true only for the name-only `npm` and `bin` markers", () => {
+    // These two classify on a directory NAME, so a project tree matches them
+    // too; the background upgrade wants a second signal for exactly this set.
+    expect(globalNpmMarkerIsUnanchored("/home/u/proj/bin/node_modules/@yawlabs/mcp/dist/index.js")).toBe(true);
+    expect(globalNpmMarkerIsUnanchored("/home/u/proj/npm/node_modules/@yawlabs/mcp/dist/index.js")).toBe(true);
+    expect(
+      globalNpmMarkerIsUnanchored(
+        "C:\\Users\\jeff\\scoop\\persist\\nodejs22\\bin\\node_modules\\@yawlabs\\mcp\\dist\\index.js",
+      ),
+    ).toBe(true);
+    // Every path it flags is one the classifier calls global-npm.
+    expect(detectInstallMethod("/home/u/proj/npm/node_modules/@yawlabs/mcp/dist/index.js")).toBe("global-npm");
+    // npm's default Windows prefix is anchored on a real install root.
+    expect(
+      globalNpmMarkerIsUnanchored(
+        "C:\\Users\\jeff\\AppData\\Roaming\\npm\\node_modules\\@yawlabs\\mcp\\dist\\index.js",
+      ),
+    ).toBe(false);
+    // The anchored lib markers and non-global paths are not its business.
+    expect(globalNpmMarkerIsUnanchored("/usr/local/lib/node_modules/@yawlabs/mcp/dist/index.js")).toBe(false);
+    expect(globalNpmMarkerIsUnanchored("/home/u/.npm-global/node_modules/@yawlabs/mcp/dist/index.js")).toBe(false);
+    expect(globalNpmMarkerIsUnanchored("/home/u/proj/node_modules/@yawlabs/mcp/dist/index.js")).toBe(false);
   });
 
   it("detects nvm-style /home/u/.nvm/versions/node/.../lib/node_modules as global", () => {
@@ -978,6 +1005,30 @@ describe("runUpgrade", () => {
     const out = io.out.join("\n");
     expect(out).toContain("restart the MCP client");
     expect(out).not.toContain("npm install");
+  });
+
+  it("qualifies the npx restart advice: it only holds for an @latest client entry", async () => {
+    // upgrade never reads the client entry, so it cannot know whether a
+    // restart re-resolves (`@yawlabs/mcp@latest`) or reuses the npx cache (a
+    // bare `@yawlabs/mcp`). Stale and offline both say so, and the usage too.
+    const NPX = "/home/u/.npm/_npx/abc/node_modules/@yawlabs/mcp/dist/index.js";
+    for (const fetchLatest of [async () => "0.45.0", async () => null]) {
+      const io = captureIO();
+      const r = await runUpgrade({
+        currentVersion: "0.40.0",
+        argvPath: NPX,
+        fetchLatest,
+        out: io.push,
+        err: io.pushErr,
+      });
+      expect(r.exitCode).toBe(0);
+      const out = io.out.join("\n");
+      expect(out).toContain(NPX_LATEST_CAVEAT);
+    }
+    expect(NPX_LATEST_CAVEAT).toContain("@yawlabs/mcp@latest");
+    expect(NPX_LATEST_CAVEAT).toContain("yaw-mcp install <client>");
+    expect(UPGRADE_USAGE).not.toContain("they always fetch the latest");
+    expect(UPGRADE_USAGE).toContain("yaw-mcp install <client>");
   });
 
   it("with --run, spawns npm install -g and reports success", async () => {

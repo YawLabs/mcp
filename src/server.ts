@@ -81,10 +81,15 @@ import { bundlesSignature, loadLocalBundles } from "./local-bundles.js";
 import { log } from "./logger.js";
 import {
   computeSecretsReport,
+  DISPATCH_DEFAULT_BUDGET,
+  DISPATCH_MAX_BUDGET,
+  EXEC_ECHO_BUDGET_KB,
+  FIND_TOOL_DEFAULT_LIMIT,
   FIND_TOOL_MAX_LIMIT,
   META_TOOL_NAMES,
   META_TOOLS,
   SERVER_INSTRUCTIONS,
+  STARTUP_PREWARM_WAIT_SECONDS,
 } from "./meta-tools.js";
 import { isFeatureDisabled, isFeatureEnabled, resolveNonNegativeIntEnv } from "./opt-out-env.js";
 import { PackDetector } from "./pack-detect.js";
@@ -125,7 +130,15 @@ import {
 import { type Content, pruneContent } from "./prune.js";
 import { findTool, formatReadToolOutput, formatToolNotFound, normalizeToolName } from "./read-tool.js";
 import { RedispatchTracker } from "./redispatch.js";
-import { queryCoverage, type RankableServer, rankServers, rankTools, tokenize, tokenizeQuery } from "./relevance.js";
+import {
+  QUERY_FUNCTION_WORDS,
+  queryCoverage,
+  type RankableServer,
+  rankServers,
+  rankTools,
+  tokenize,
+  tokenizeQuery,
+} from "./relevance.js";
 import { type CapContent, capContent, resolveMaxResultBytes, serializedBytes } from "./result-cap.js";
 import { computeOutcomeReward } from "./reward.js";
 import {
@@ -193,10 +206,11 @@ declare const __VERSION__: string;
 // site below wants.
 
 // resolveMinCompliance and complianceRefusalReason moved to spawn-gate.ts,
-// beside the verdict that consumes them, and are re-exported below: the CLI's
-// `call` has to apply the same floor and cannot import this module for it (see
-// the header of spawn-gate.ts). Re-exported rather than re-declared so
-// server.test.ts and every in-file caller keep their existing import.
+// beside the verdict that consumes them: the CLI's `call` has to apply the
+// same floor and cannot import this module for it (see the header of
+// spawn-gate.ts). Only resolveMinCompliance is re-exported below, so
+// server.test.ts keeps its existing import; complianceRefusalReason is
+// imported for the in-file caller and not re-exported.
 export { resolveMinCompliance };
 
 // Opt-in auto-load. Set YAW_MCP_AUTO_LOAD=1 (or "true") to pre-activate the
@@ -248,17 +262,25 @@ const LEGACY_PROTOCOL_VERSIONS = SUPPORTED_PROTOCOL_VERSIONS.filter((v) => v < "
 // per-session: a learned list is persisted to state.json and is only
 // re-learned once it ages past TOOLCACHE_REFRESH_MS. (With
 // YAW_MCP_DISABLE_PERSISTENCE set nothing carries it across, so every
-// session re-learns every server whose bundles.json entry does not carry a
-// toolCache of its own.) Rare is not never, though, and an upstream whose
+// session re-learns every server: state.json is the only source of a
+// LEARNED tool list, since a bundles.json entry cannot carry one -- the
+// bundled lists in fallback-tools.ts feed ranking only and never count as
+// known.) Rare is not never, though, and an upstream whose
 // startup is not idempotent (it takes a lock, binds a port, opens a DB
 // session, writes a login audit event) does that side effect twice each
 // time, the second being the one the user actually asked for.
 //
 // Off costs what pre-warm buys: a server whose tools are not already known
-// advertises none of them in tools/list until it is activated (see
-// getDeferredServers), though `mcp_connect_discover` still lists the
-// server itself -- it reads getProfiledActiveServers, not the tool cache --
-// and activating it by namespace works exactly as before.
+// has no deferred route until it is activated (see getDeferredServers), so
+// `mcp_connect_exec` cannot call its tools by name, and
+// `mcp_connect_find_tool` sees them only where yaw-mcp ships a bundled list
+// for that server (rankableTools falls back to fallback-tools.ts, tagged
+// "[bundled list]"); any other unlearned server it cannot find. Under
+// YAW_MCP_TOOL_EXPOSURE=full it also advertises none of them in tools/list;
+// under the default gateway exposure tools/list never lists an un-activated
+// server's tools, with or without pre-warm. `mcp_connect_discover` still
+// lists the server itself -- it reads getProfiledActiveServers, not the tool
+// cache -- and activating it by namespace works exactly as before.
 export function isPrewarmEnabled(): boolean {
   // The shared opt-out parse (opt-out-env.ts): `0` and `false`, trimmed, turn
   // it off; anything else, including unset, leaves pre-warm on. Kept as a
@@ -488,13 +510,14 @@ function credentialAskSubject(namespace: string): string {
 /** How many bytes of intermediate step output an exec echoes back when the
  *  caller named an explicit `return`.
  *
- *  Under it, every binding rides along: the values a caller cannot reconstruct
+ *  Under it, every binding but the returned one (already in `result`) rides
+ *  along in `steps`: the values a caller cannot reconstruct
  *  after a side-effecting step (an issue number, a created URL) are small, and
  *  losing them to save a few hundred bytes is a bad trade. Over it, only
  *  `stepKeys` -- that is the large skipped payload whose replay this exists to
  *  avoid. Sized well above a handful of ids and well below a list worth
  *  paging through. */
-export const EXEC_ECHO_BUDGET_BYTES = 4096;
+export const EXEC_ECHO_BUDGET_BYTES = EXEC_ECHO_BUDGET_KB * 1024;
 
 // Last baseline the clamp warning in resolveIdleThreshold fired for. Keyed on
 // the VALUE, not a boolean, so a session (or a test) that changes the env to a
@@ -1022,43 +1045,23 @@ export function measureResultBytes(result: { content?: unknown; structuredConten
   return bytes + structured;
 }
 
-// Words that are never content terms but clear relevance.ts's 3-char prose
-// floor, so tokenizeQuery keeps them. BM25 tolerates them (IDF flattens a
-// term that occurs everywhere), but the summary's per-tool match below is a
-// bare set-intersection with no IDF at all: one "the" in the query matched
-// nearly every tool description, and the 5-hit cap then filled with whatever
-// happened to come first in list order. Only closed-class words -- anything
-// that could name a tool or a domain stays out.
-const SUMMARY_STOPWORDS = new Set([
-  "the",
-  "and",
-  "for",
-  "with",
-  "from",
-  "that",
-  "this",
-  "into",
-  "your",
-  "you",
-  "are",
-  "was",
-  "has",
-  "how",
-  "can",
-  "will",
-  "some",
-  "any",
-  "all",
-]);
-
 // Tokenizer for the discover "matches" summary. Delegates to relevance.ts's
 // tokenizeQuery -- the SAME tokenizer the BM25 query path uses (1-char floor
-// so "pr" / "ci" survive, minus the sub-floor closed-class words) -- so the
-// summary's per-tool match logic lines up with the ranking that chose the
-// servers it annotates. SUMMARY_STOPWORDS above is the extra subtraction the
-// summary needs and the ranker does not.
+// so "pr" / "ci" survive, minus the sub-floor closed-class words) -- and then
+// drops relevance.ts's QUERY_FUNCTION_WORDS, the same set both rankers and
+// queryCoverage drop from the query. Those words clear the 3-char prose floor,
+// and the summary's per-tool match is a bare set-intersection with no IDF at
+// all: one "the" in the query matched nearly every tool description, and the
+// 5-hit cap then filled with whatever happened to come first in list order.
+//
+// Only the surface tokenization and that subtraction are shared. The ranker
+// goes on to expand abbreviations and suffix-fold each term (queryTermsFor in
+// relevance.ts); the summary compares raw tokens, so a query of "issues" or
+// "pr" can rank a server on `create_issue` / `create_pull_request` while
+// matchedToolNames finds no hit and falls back to the server's first tool
+// names.
 function tokenizeForSummary(text: string): Set<string> {
-  return new Set(tokenizeQuery(text).filter((t) => !SUMMARY_STOPWORDS.has(t)));
+  return new Set(tokenizeQuery(text).filter((t) => !QUERY_FUNCTION_WORDS.has(t)));
 }
 
 // Detect tools with the same BARE name across multiple currently-connected
@@ -1756,9 +1759,13 @@ export class ConnectServer {
       decide = resolve;
     });
     const ask: SecretAsk = { pageId: randomUUID(), subject, request, decision, decide };
-    // Past the codec's TTL a retry is refused before it reaches the handler,
-    // so the record has no reader left. unref: a pending drop must not keep
-    // the process up.
+    // Dropped one TTL after it was POSTED, and not re-armed afterwards. A
+    // retry carrying the first state past that point is refused by the codec
+    // before it reaches the handler. But a retry that brought no answer was
+    // handed a re-minted state with a fresh expiry (callToolCarryingInput),
+    // so a later retry on that state can still arrive after this drop; it
+    // finds no record and is told the prompt is no longer open. unref: a
+    // pending drop must not keep the process up.
     ask.dropTimer = setTimeout(() => this.dropSecretAsk(ask), SECRET_ASK_TTL_SECONDS * 1000);
     ask.dropTimer.unref?.();
     this.secretAsks.set(ask.pageId, ask);
@@ -1824,7 +1831,11 @@ export class ConnectServer {
           content: [
             {
               type: "text",
-              text: "That secret-entry prompt is no longer open: a retry already answered it. Call the tool again.",
+              // Two ways to get here, and the caller cannot tell them apart:
+              // an earlier retry consumed the ask (below), or its drop timer
+              // fired. The second is reachable with a state the codec still
+              // accepts -- see postSecretAsk.
+              text: "That secret-entry prompt is no longer open: a retry already answered it, or it expired. Call the tool again.",
             },
           ],
           isError: true,
@@ -2193,7 +2204,7 @@ export class ConnectServer {
    *  for a larger bundle without holding a call anywhere near a client's
    *  tool timeout (Codex: 300 s). Neither private nor readonly, so a test can
    *  shrink it without a cast; nothing outside the tests writes it. */
-  static STARTUP_PREWARM_WAIT_MS = 20_000;
+  static STARTUP_PREWARM_WAIT_MS = STARTUP_PREWARM_WAIT_SECONDS * 1000;
 
   /** How many servers the startup pre-warm activates at once (formerly an
    *  inline `CONCURRENCY = 3` in prewarmDormantServers). handleActivate stays
@@ -2277,6 +2288,32 @@ export class ConnectServer {
     await this.notifyAllListsChanged();
   }
 
+  /** Whether a call about to activateOne(namespace) will JOIN an activation
+   *  whose initiator sends the list_changed notifications -- so this caller
+   *  must not send them again. Shared by the two tools/call paths that
+   *  activate on demand (deferred load, auto-reconnect) so they cannot
+   *  diverge. Must be sampled BEFORE the activateOne call: prewarm registers
+   *  its claim before its inflight entry, and an explicit activateOne
+   *  deletes the claim.
+   *
+   *  The prewarm exclusion: a prewarm-initiated inflight notifies only when
+   *  the whole sweep finishes, so a caller joining THAT one is treated as
+   *  the initiator and notifies itself. */
+  private joinsNotifyingActivation(namespace: string): boolean {
+    return this.activationInflight.has(namespace) && !this.prewarmNamespaces.has(namespace);
+  }
+
+  /** The routes step after a successful on-demand activation. Every sharer
+   *  rebuilds locally (synchronous, idempotent, no wire traffic); only the
+   *  initiator notifies. See joinsNotifyingActivation. */
+  private async refreshRoutesAfterActivation(joinedExisting: boolean): Promise<void> {
+    if (joinedExisting) {
+      this.rebuildRoutes();
+    } else {
+      await this.refreshRoutesAndNotify();
+    }
+  }
+
   // Active servers, narrowed by the project profile if one is loaded.
   // Centralizing this here means discover/dispatch/auto-warm all see the
   // same set — no accidental bypass of the profile via a second code path.
@@ -2294,10 +2331,12 @@ export class ConnectServer {
   }
 
   // Configured-but-not-currently-connected servers that have a persisted
-  // toolCache. Fed into buildToolList/buildToolRoutes so the LLM can see
-  // their tools in tools/list before activation; first tools/call on any
-  // of those tools triggers lazy activation via activateOne in
-  // handleToolCall. Merges in any in-session toolCache (this.toolCache)
+  // toolCache. Fed into buildToolList/buildToolRoutes: the routes are built
+  // under every exposure, so a first tools/call (or exec step) on any of
+  // those tools triggers lazy activation via activateOne in handleToolCall;
+  // buildToolList advertises them in tools/list only under
+  // YAW_MCP_TOOL_EXPOSURE=full (proxy.ts withholds the placeholders
+  // otherwise). Merges in any in-session toolCache (this.toolCache)
   // that hasn't yet been flushed to state.json, so recently-used
   // servers that got idle-evicted still appear as deferred.
   private getDeferredServers(): UpstreamServerConfig[] {
@@ -2316,7 +2355,10 @@ export class ConnectServer {
   // the in-memory map is what tools/list and formatShadowLine should
   // actually see. An EMPTY learned list does not win: it is a real
   // observation for hasKnownTools, but as a tool list it has nothing to
-  // show, so a curated list is still worth rendering over it.
+  // show, so a list already on the entry is still worth rendering over it.
+  // (No production loader puts one there -- see the identity note below --
+  // so that arm serves an already-merged clone passed in again, which is
+  // what makes this idempotent, and configs built by hand in tests.)
   //
   // This is the ONE precedence rule for a cold server's tool list. Every
   // reader of the LIST goes through it: getProfiledActiveServers merges once,
@@ -2348,18 +2390,24 @@ export class ConnectServer {
     return cache === server.toolCache ? server : { ...server, toolCache: cache };
   }
 
-  // Does this server's tool list already exist somewhere we trust — the
-  // toolCache shipped in bundles.json, or the one we learned in a previous
-  // session and hydrated from state.json? Gates pre-warm: a `false` here
-  // means the only way to find out what the server offers is to spawn it.
+  // Do we already hold this server's tool list -- learned this session, or
+  // in a previous one and hydrated from state.json? Gates pre-warm: a `false`
+  // here means the only way to find out what the server offers is to spawn
+  // it.
   //
   // A LEARNED entry counts as known even when it is empty. "We spawned this
   // server and it offered zero tools" is an answer, and a resources/prompts-
   // only upstream is a real shape; requiring length > 0 here meant that
   // answer was never trusted, so pre-warm spawned such a server every
-  // session forever. A CURATED empty list in bundles.json is still treated
-  // as absent -- validation drops the field, so an empty one there is a
-  // config artifact rather than an observation.
+  // session forever.
+  //
+  // The first branch reads a non-empty `toolCache` on the entry itself. No
+  // production loader sets one on a config entry: validateEntry
+  // (local-bundles.ts) has no toolCache field, so bundles.json cannot ship a
+  // list, and the only writer is mergeToolCache's clone, whose list came from
+  // this.toolCache anyway. It fires for configs built by hand (the tests) and
+  // would for a curated list if bundles.json ever accepted one; an EMPTY list
+  // on the entry is treated as absent, not as an observation.
   private hasKnownTools(server: UpstreamServerConfig): boolean {
     if (server.toolCache && server.toolCache.length > 0) return true;
     return this.toolCache.get(server.namespace) !== undefined;
@@ -2379,10 +2427,10 @@ export class ConnectServer {
   // learning, should be re-learned -- "age" when it is old enough to
   // re-verify, "config-changed" when the entry it was learned under moved
   // (below), null when it is current. Scoped to learned entries on
-  // purpose: a toolCache shipped in bundles.json is curated, carries no
-  // learnedAt, and is never refreshed here -- refreshing it every session
-  // is exactly the per-session `npx -y <pkg>@latest` resolve pre-warm
-  // exists to avoid. runActivateOne stamps a fresh learnedAt on every
+  // purpose: a toolCache set on the config entry itself (hand-built configs
+  // only today; bundles.json cannot carry one) has no learnedAt and is never
+  // refreshed here -- refreshing it every session is exactly the per-session
+  // `npx -y <pkg>@latest` resolve pre-warm exists to avoid. runActivateOne stamps a fresh learnedAt on every
   // activation, so a server in actual use never looks stale.
   //
   // A learned list is ALSO stale, at any age, when it was learned under a
@@ -2492,6 +2540,15 @@ export class ConnectServer {
     if (Object.keys(grades).length === 0) return;
     let applied = 0;
     this.config.servers = this.config.servers.map((server) => {
+      // Own keys only -- defence in depth. readGradesCache already hands back
+      // a prototype-less map (the only plain object here is the empty catch
+      // fallback above, which has returned by now), so this guard matters
+      // only if that ever changes. A namespace is free to be `constructor`
+      // or `valueOf`: on a plain object a bare index would return the
+      // inherited Object.prototype member, which is truthy and has no
+      // `.grade`, and the spread below would replace the entry's own grade
+      // with undefined -- ungraded, which always passes the floor.
+      if (!Object.hasOwn(grades, server.namespace)) return server;
       const cached = grades[server.namespace];
       if (!cached) return server;
       applied++;
@@ -2703,10 +2760,12 @@ export class ConnectServer {
     this.bundlesLoadedFrom = result.path;
     this.bundlesVanishedWarned = false;
     // Re-overlay grades for the same reason start() overlays them before
-    // anything reads the config: freshly-parsed entries carry no
-    // complianceGrade (validateEntry drops it), so without this a reload would
-    // blank the [A]-[F] badge on every server it re-read and
-    // YAW_MCP_MIN_COMPLIANCE would stop filtering.
+    // anything reads the config: freshly-parsed entries carry only the grade
+    // bundles.json itself records (validateEntry passes it through), not the
+    // locally measured grades.json overlay that has to win over it. Without
+    // this a reload would revert every re-read server to its file grade, or
+    // to ungraded where the file has none -- the [A]-[F] badge and the
+    // YAW_MCP_MIN_COMPLIANCE verdict would stop reflecting `yaw-mcp audit`.
     await this.hydrateComplianceGrades();
     const changed = this.configVersion !== previousVersion;
     log("info", changed ? "Reloaded bundles" : "bundles.json touched but unchanged", {
@@ -3172,9 +3231,12 @@ export class ConnectServer {
     // config (serving comes first), so the work also waits for `ready`.
     this.ready.then(
       () => {
-        // Dormant servers (isActive but no persisted toolCache yet) are
-        // invisible in tools/list because getDeferredServers() filters on
-        // toolCache presence. That breaks the "I toggled it on in the
+        // Dormant servers (isActive but no persisted toolCache yet) have no
+        // deferred routes because getDeferredServers() filters on toolCache
+        // presence: exec cannot call their tools by name, find_tool ranks
+        // them only where yaw-mcp ships a bundled list (fallback-tools.ts),
+        // and under YAW_MCP_TOOL_EXPOSURE=full they are missing
+        // from tools/list. That breaks the "I toggled it on in the
         // bundles.json and it disappeared" user experience. Pre-warm each one
         // in the background: activate → populate the in-memory toolCache
         // → disconnect so we're not holding 9 upstream processes idle.
@@ -3317,9 +3379,12 @@ export class ConnectServer {
   }
 
   // Populate toolCache for any isActive server whose tools we don't know
-  // yet, so Claude's tools/list shows the full toggled set on first run.
-  // "Don't know yet" spans BOTH sources — the toolCache in bundles.json and
-  // the one hydrated from state.json — so this is a one-time cost per
+  // yet, so the full toggled set is routable by name (exec, a first
+  // tools/call) and rankable by find_tool on its REAL list on first run
+  // (before that find_tool has at most a bundled list to go on) -- and, under
+  // YAW_MCP_TOOL_EXPOSURE=full, listed in tools/list. "Don't know yet" is
+  // judged against the list hydrated from state.json (bundles.json cannot
+  // carry one — see hasKnownTools), so this is a one-time cost per
   // server rather than a per-session `npx -y <pkg>@latest` resolve for
   // every active server (which is what it degenerated into while the
   // learned cache had nowhere to persist). A learned list past
@@ -3352,13 +3417,15 @@ export class ConnectServer {
     // mean "spawn nothing at startup" rather than "scan, then decline".
     // Said out loud once per session, because turning this off has a
     // visible consequence a user will otherwise report as a bug: a server
-    // they just enabled shows none of its tools in tools/list until they
-    // activate it. Only when the var is actually set -- the default path
-    // stays silent.
+    // they just enabled cannot be called by tool name through exec until
+    // they activate it, and find_tool sees its tools only where yaw-mcp
+    // ships a bundled list for it (and, under YAW_MCP_TOOL_EXPOSURE=full,
+    // it shows none of its tools in tools/list).
+    // Only when the var is actually set -- the default path stays silent.
     if (!isPrewarmEnabled()) {
       log(
         "info",
-        "Pre-warm disabled by YAW_MCP_PREWARM; servers with no learned tool list stay unadvertised until activated",
+        "Pre-warm disabled by YAW_MCP_PREWARM; servers with no learned tool list cannot be called by tool name, and find_tool sees them only where yaw-mcp ships a bundled list, until activated",
         {
           value: process.env.YAW_MCP_PREWARM,
         },
@@ -3476,9 +3543,11 @@ export class ConnectServer {
                 });
                 return;
               }
-              // A failed prewarm of a server with no list leaves it invisible
-              // in tools/list for the session -- the exact UX prewarm exists
-              // to prevent. One re-learning after a config change keeps
+              // A failed prewarm of a server with no list leaves it without
+              // deferred routes for the session (unreachable by tool name,
+              // ranked by find_tool only on a bundled list if yaw-mcp ships
+              // one, absent from a full-exposure
+              // tools/list) -- the exact UX prewarm exists to prevent. One re-learning after a config change keeps
               // serving its old list instead (discover says so). Never silent.
               log("warn", "Pre-warm could not learn a dormant server's tools", {
                 namespace: server.namespace,
@@ -3539,12 +3608,15 @@ export class ConnectServer {
             // and nobody is handed a connection; an explicit joiner released
             // the claim itself when it joined, and the sweep's own teardown
             // releases it before its first await -- so this delete never
-            // races a live owner. Left behind, the entry is inert until the
-            // next explicit activate of this namespace clears it (every
-            // reader of prewarmNamespaces also requires an inflight, which
-            // activateOne's finally has already removed), but a claim with
-            // nothing behind it is exactly the stale state the `!result.ok`
-            // branch refuses to leave for a future reader to trust.
+            // races a live owner. Left behind, the entry is NOT inert: the
+            // cap accounting in evaluateCapFor reads prewarmNamespaces with
+            // no inflight condition, so a stale claim on a namespace that
+            // did connect (a throw after the connection landed) would exempt
+            // it from the server cap until the next explicit activate of
+            // that namespace cleared it, and this sweep's own
+            // `prewarmNamespaces.has` check above reads it the same way. So
+            // this delete is load-bearing, like the one in the `!result.ok`
+            // branch.
             this.prewarmNamespaces.delete(server.namespace);
             const error = err instanceof Error ? err.message : String(err);
             log("warn", "Pre-warm of server failed", {
@@ -3705,7 +3777,8 @@ export class ConnectServer {
     }
     if (name === META_TOOLS.dispatch.name) {
       const intent = typeof args.intent === "string" ? args.intent : "";
-      const budget = typeof args.budget === "number" && Number.isFinite(args.budget) ? args.budget : 1;
+      const budget =
+        typeof args.budget === "number" && Number.isFinite(args.budget) ? args.budget : DISPATCH_DEFAULT_BUDGET;
       // Per-call override of the routing effort dial (off|auto|aggressive);
       // falls back to YAW_MCP_ROUTE_EFFORT when absent. See sampling-rank.ts.
       const routeEffort = typeof args.routeEffort === "string" ? args.routeEffort : undefined;
@@ -3741,7 +3814,7 @@ export class ConnectServer {
     if (name === META_TOOLS.health.name) {
       return this.observed(this.attachGuideNudge(this.handleHealth()));
     }
-    if (name === META_TOOLS.read_tool.name) {
+    if (name === META_TOOLS.readTool.name) {
       const serverArg = typeof args.server === "string" ? args.server : "";
       const toolArg = typeof args.tool === "string" ? args.tool : "";
       const result = await this.handleReadTool(serverArg, toolArg, progress);
@@ -3824,13 +3897,10 @@ export class ConnectServer {
       // means it JOINS one already in flight, so only the initiator sends
       // the list_changed triplet. Without it, N parallel first-calls on one
       // dormant server each emitted three notifications and made the client
-      // refetch the whole catalog N times for a single load. The prewarm
-      // exclusion matters: a prewarm-initiated inflight notifies only when
-      // the whole sweep finishes, so a caller joining THAT one must still
-      // notify itself. Order is load-bearing -- prewarm registers its claim
-      // before its inflight entry, and an explicit activateOne deletes the
-      // claim, so both reads have to happen before the call.
-      const joinedExisting = this.activationInflight.has(deferredNs) && !this.prewarmNamespaces.has(deferredNs);
+      // refetch the whole catalog N times for a single load. Joining a
+      // PREWARM inflight does not count as joining, and the sample has to
+      // precede the call -- both in joinsNotifyingActivation.
+      const joinedExisting = this.joinsNotifyingActivation(deferredNs);
       progress?.(`Loading "${deferredNs}" on first tools/call…`);
       const activation = await this.activateOne(deferredNs, progress);
       if (!activation.ok) {
@@ -3853,11 +3923,7 @@ export class ConnectServer {
       // "no longer available" error that no retry can clear. The NOTIFY half
       // is the initiator's job only (see joinedExisting above); a joiner
       // still rebuilds locally, which is synchronous, idempotent and silent.
-      if (joinedExisting) {
-        this.rebuildRoutes();
-      } else {
-        await this.refreshRoutesAndNotify();
-      }
+      await this.refreshRoutesAfterActivation(joinedExisting);
       // Re-snapshot against fresh routes. If the upstream no longer
       // exposes a tool by this name (cache was stale), fall through to
       // the routes.get(name) miss path below with a clear message.
@@ -3915,8 +3981,11 @@ export class ConnectServer {
           // Sampled BEFORE activateOne: false means we are about to START
           // the activation (its initiator); true means we will JOIN one
           // already in flight. Used below to send the list_changed
-          // notifications exactly once per reconnect.
-          const joinedExisting = this.activationInflight.has(ns);
+          // notifications exactly once per reconnect. The same predicate as
+          // the deferred path, prewarm exclusion included: this used to be a
+          // bare inflight check, so a reconnect that joined a prewarm
+          // inflight left its list_changed to the end of the sweep.
+          const joinedExisting = this.joinsNotifyingActivation(ns);
           progress?.(`Reconnecting "${ns}"…`);
           const activation = await this.activateOne(ns, progress);
           if (!activation.ok) {
@@ -3959,11 +4028,7 @@ export class ConnectServer {
           // for one reconnect. If the upstream no longer exposes a tool by
           // this name, surface the same clear "no longer available"
           // message the deferred path emits.
-          if (joinedExisting) {
-            this.rebuildRoutes();
-          } else {
-            await this.refreshRoutesAndNotify();
-          }
+          await this.refreshRoutesAfterActivation(joinedExisting);
           routes = this.toolRoutes;
           route = routes.get(name);
           if (!route || route.deferred) {
@@ -3971,7 +4036,7 @@ export class ConnectServer {
               content: [
                 {
                   type: "text",
-                  text: `Tool "${name}" is ${ROUTING_FAULT_TOOL_GONE} after reconnecting "${serverConfig.namespace}" — the upstream's tool set changed. Call mcp_connect_discover to list the current tools for that namespace.`,
+                  text: `Tool "${name}" is ${ROUTING_FAULT_TOOL_GONE} after reconnecting "${ns}" — the upstream's tool set changed. Call mcp_connect_discover to list the current tools for that namespace.`,
                 },
               ],
               isError: true,
@@ -4237,9 +4302,15 @@ export class ConnectServer {
       // credit is attributed per step by handleExec. Skipping them let
       // detectMiss flag a server as an abandoned "loser" after a
       // direct-call-then-exec sequence in which the model never left it.
-      if (!routingFault) {
+      if (!nonObservation) {
         this.redispatch.markReply(route.namespace, !result.isError);
       } else {
+        // Neither kind of non-observation may GRADE the record. A cancelled
+        // call used to take the branch above as an error reply: on a fresh
+        // record that set `replied` without `cleanReply`, and the clean
+        // retry that followed could then only set furtherUse, so the
+        // dispatch never counted as answered cleanly.
+        //
         // A routing fault must not GRADE the record (it says nothing about
         // the server), but it must still count as USAGE: before the guard,
         // this fault called markReply(ns, false), whose second-reply path
@@ -4280,10 +4351,6 @@ export class ConnectServer {
     return result;
   }
 
-  // Build RankableServer inputs for BM25 — uses live tool metadata when
-  // the server is connected in this session, otherwise falls back to the
-  // in-memory toolCache (populated from prior activations this session)
-  // and finally the persistent toolCache shipped in the config payload.
   // Pick up to five tool names from the server whose own tokens overlap
   // with the query tokens. Falls back to the first three cached tool
   // names when nothing overlaps (the server scored on name/description,
@@ -4660,6 +4727,7 @@ export class ConnectServer {
     // `discover(server: "gh")` followed inside the 3s TTL by
     // `discover(server: "pg")` replays gh's card labelled as pg's -- and the
     // back-to-back double call is exactly the pattern this memo exists for.
+    const focusSignature = focusNamespace ?? "";
     // The config WARNINGS, which are not derivable from configVersion. The
     // degraded-load path is the whole reason: a bundles.json that breaks
     // mid-session swaps new warnings in and deliberately leaves the running
@@ -4684,7 +4752,7 @@ export class ConnectServer {
     // (the model would never see the candidates, and the block would not
     // even run), and a plain call's body must not be replayed to listOnly.
     const listOnlySignature = listOnly ? "list" : "";
-    return `${this.configVersion ?? ""}|${context ?? ""}|${warmedNamespace ?? ""}|${activeNamespaces}|${filterSignature}|${advertisedSignature}|${focusNamespace ?? ""}|${warningSignature}|${floorSignature}|${exposureSignature}|${listOnlySignature}`;
+    return `${this.configVersion ?? ""}|${context ?? ""}|${warmedNamespace ?? ""}|${activeNamespaces}|${filterSignature}|${advertisedSignature}|${focusSignature}|${warningSignature}|${floorSignature}|${exposureSignature}|${listOnlySignature}`;
   }
 
   /** The "there is nothing to route to" text, for discover / dispatch /
@@ -4886,7 +4954,10 @@ export class ConnectServer {
     if (this.configWarnings.length > 0) {
       for (const w of this.configWarnings) lines.push(`! ${w}`);
       lines.push(
-        "Fix bundles.json (or run `yaw-mcp doctor` for the full report); the fix is picked up on the next mcp_connect_* call, with no client restart.\n",
+        // The file IN EFFECT, not a bare name: under a trusted project-local
+        // bundles.json the warnings are about that file, and an edit to the
+        // user-global one would change nothing this session reads.
+        `Fix ${bundlesFileHint("in-effect")}, or run \`yaw-mcp doctor\` for the full report; the fix is picked up on the next mcp_connect_* call, with no client restart.\n`,
       );
     }
     // A header over an EMPTY list reads as "nothing is installed", which is
@@ -5007,12 +5078,6 @@ export class ConnectServer {
     // requires status "connected" -- so an advertised connection that had errored
     // rendered "0 tools in context (~1,234 tokens)". Both counts now agree on
     // what is in context: connected, advertised, post-filter.
-    // Set when a known-tools line was capped or dropped, so the footer that
-    // explains the recovery path appears only when there is something to
-    // recover. Deliberately NOT set for a server with an empty cache: it
-    // omitted nothing.
-    let omittedToolNames = false;
-
     let totalContextTokens = 0;
     for (const conn of this.connections.values()) {
       const ns = conn.config.namespace;
@@ -5020,6 +5085,12 @@ export class ConnectServer {
       const visible = this.visibleTools(ns, conn.tools);
       if (visible.length > 0) totalContextTokens += estimateFromConnectedTools(visible).tokens;
     }
+
+    // Set when a known-tools line was capped or dropped, so the footer that
+    // explains the recovery path appears only when there is something to
+    // recover. Deliberately NOT set for a server with an empty cache: it
+    // omitted nothing.
+    let omittedToolNames = false;
 
     for (const server of sorted) {
       const connection = this.connections.get(server.namespace);
@@ -5070,13 +5141,16 @@ export class ConnectServer {
       }
 
       // Compliance annotation — the grade is a trust signal, so it's
-      // shown unconditionally whenever the backend has scored this
-      // server (A–F). Passing graded server → `[A]` tag. When
-      // YAW_MCP_MIN_COMPLIANCE is set and the grade is below it, replace
-      // the tag with an inline refusal reason so the model knows why
-      // the line is surfaced but won't be activated. Ungraded servers
-      // stay unannotated — don't punish unknown on a catalog where
-      // many entries aren't scored yet.
+      // shown unconditionally whenever this server carries one (A–F).
+      // Both sources are local: the grade recorded on its bundles.json
+      // entry, and the `yaw-mcp audit` result cached in grades.json,
+      // which is overlaid on top (see hydrateComplianceGrades). Passing
+      // graded server → `[A]` tag. When YAW_MCP_MIN_COMPLIANCE is set
+      // and the grade is below it, replace the tag with an inline
+      // refusal reason so the model knows why the line is surfaced but
+      // won't be activated. Ungraded servers stay unannotated — don't
+      // punish unknown when many installed servers have never been
+      // graded.
       let complianceLabel = "";
       if (server.complianceGrade) {
         if (minCompliance !== null && !passesMinCompliance(server.complianceGrade, minCompliance)) {
@@ -5575,8 +5649,9 @@ export class ConnectServer {
   }
 
   /** The tool list known for a namespace WITHOUT a live connection: the
-   *  merged cache (this session's learned list over the curated one in
-   *  bundles.json) while the config still defines the server, else whatever
+   *  merged cache (this session's learned list over a list set on the config
+   *  entry itself -- hand-built configs only, bundles.json cannot carry one)
+   *  while the config still defines the server, else whatever
    *  this session learned about it. The one lookup estimateTokensFor and
    *  unmatchedFilterNames both need, kept in one place so neither can drift
    *  to the raw this.toolCache and pick an empty learned list over a curated
@@ -5591,19 +5666,26 @@ export class ConnectServer {
   // configured server from a shell, with no broker in the process -- enforces
   // the identical policy without importing this module.
   //
-  // Both callers HERE -- runActivateOne (persistent activation) and
-  // handleReadTool (transient inspect) -- actually execute the server's
-  // configured command with its resolved env, so "we disconnect afterwards"
-  // buys read_tool no exemption. They used to carry line-for-line copies of
+  // Four callers HERE. Two actually execute the server's configured command
+  // with its resolved env -- runActivateOne (persistent activation) and
+  // handleReadTool (transient inspect) -- so "we disconnect afterwards" buys
+  // read_tool no exemption. Those two used to carry line-for-line copies of
   // the checks, which meant a policy change had to land twice to stay
-  // consistent. `purpose` supplies the only words that legitimately differ:
-  // what the caller was about to do with the server once it started.
+  // consistent. The other two spawn nothing and only want the verdict as
+  // text: handleSecretsReport, to say why a named server is missing from its
+  // report, and handleExec's pre-flight, to refuse a pipeline before step 0
+  // when a later step's deferred server would be refused anyway. `purpose`
+  // supplies the only words that legitimately differ: what the caller was
+  // about to do with the server.
   //
   // The WORDS stay here rather than in the shared module because the
   // remediation is world-specific: inside the broker the fix for a disabled
   // server is an edit picked up on the next mcp_connect_* call, and a shell
   // caller has no such call to wait for. Same verdict, different sentence.
-  private spawnGateRefusal(server: UpstreamServerConfig, purpose: "activate" | "inspect its tools"): string | null {
+  private spawnGateRefusal(
+    server: UpstreamServerConfig,
+    purpose: "activate" | "inspect its tools" | "report its secrets",
+  ): string | null {
     const refusal = spawnGateVerdict(server, this.profile, resolveMinCompliance());
     if (!refusal) return null;
     switch (refusal.kind) {
@@ -5616,21 +5698,6 @@ export class ConnectServer {
     }
   }
 
-  // `skipCap` is for the post-elicitation retry only: that caller is already
-  // inside this namespace's own activation, holding its pendingActivations
-  // reservation, and the user has just typed a credential. evaluateCapFor
-  // deliberately does NOT grant a self-allowance for a pending reservation
-  // (see its "skip self" comment), so a re-check there could refuse the
-  // retry because OTHER namespaces filled the cap while the modal was open --
-  // credentials typed, slot gone, nothing to show for it.
-  //
-  // `isElicitRetry` marks the ONE re-entry maybeElicitAndRetry makes after the
-  // user typed credentials. It exists to stop that re-entry eliciting again:
-  // the prompt budget is per namespace, not per activate, so a child that
-  // keeps reporting the same key missing would otherwise open a second,
-  // byte-identical modal inside the same activate call -- spending the whole
-  // budget (and three spawn attempts plus their retry sleeps) before the user
-  // has any chance to go fix the value somewhere else.
   /** One predicate behind every count that claims to describe tools/list.
    *  A tool hidden by a FILTER and a tool hidden by a DENY both leave the
    *  advertised set, so both leave these numbers -- the difference between
@@ -5753,14 +5820,30 @@ export class ConnectServer {
     if (server.type !== "local" || server.command === undefined) return "";
     const cached = this.mergeToolCache(server).toolCache;
     if (cached && cached.length > 0) return "";
-    // The launcher basename, with the Windows extensions stripped the same way
-    // nodeLaunchKind does it -- `npx.cmd`, `C:/.../uvx.exe` and a bare `npx`
-    // are one launcher.
+    // The launcher basename with its Windows extension stripped, so `npx.cmd`,
+    // `C:/.../uvx.exe` and a bare `npx` are one launcher. A local copy of the
+    // pattern, not nodeLaunchKind's (oam-spawn.ts WIN_EXE_EXT): this one also
+    // strips `.ps1`, which that one leaves on.
     const base = (server.command.split(/[\\/]/).pop() ?? server.command).replace(/\.(exe|cmd|bat|ps1)$/i, "");
     const fetches = COLD_START_LAUNCHERS[base.toLowerCase()];
     return fetches === undefined ? "" : ` first load on this machine: ${fetches}`;
   }
 
+  // `skipCap` is for the post-elicitation retry only: that caller is already
+  // inside this namespace's own activation, holding its pendingActivations
+  // reservation, and the user has just typed a credential. evaluateCapFor
+  // deliberately does NOT grant a self-allowance for a pending reservation
+  // (see its "skip self" comment), so a re-check there could refuse the
+  // retry because OTHER namespaces filled the cap while the modal was open --
+  // credentials typed, slot gone, nothing to show for it.
+  //
+  // `isElicitRetry` marks the ONE re-entry maybeElicitAndRetry makes after the
+  // user typed credentials. It exists to stop that re-entry eliciting again:
+  // the prompt budget is per namespace, not per activate, so a child that
+  // keeps reporting the same key missing would otherwise open a second,
+  // byte-identical modal inside the same activate call -- spending the whole
+  // budget (and three spawn attempts plus their retry sleeps) before the user
+  // has any chance to go fix the value somewhere else.
   private async runActivateOne(
     namespace: string,
     progress?: ProgressReporter,
@@ -7202,13 +7285,15 @@ export class ConnectServer {
           if (installedFilter.prev) this.toolFilters.set(namespace, installedFilter.prev);
           else this.toolFilters.delete(namespace);
           installedFilter = null;
-          // Rolled back, so there is no filter left to report unmatched names
-          // against -- and the server never came up, so its tool list is
-          // unknown anyway.
-          filterRequestedFor = null;
           // The surface never actually moved, so don't announce that it did.
           filtersChanged = false;
         }
+        // No unmatched-name note after a failed load, whether or not a filter
+        // was rolled back above: a re-sent identical filter installs nothing
+        // (installedFilter stays null), and the server did not come up, so
+        // there is no live tool list to check the names against -- the note
+        // would sit under a "Failed to load" line quoting a dead connection.
+        if (filterRequestedFor === namespace) filterRequestedFor = null;
       }
     }
     // NB: no trailing "Done" progress notification here. MCP clients
@@ -7239,17 +7324,24 @@ export class ConnectServer {
       const ns = filterRequestedFor;
       const unmatched = this.unmatchedFilterNames(ns);
       if (unmatched.length > 0) {
+        // The same list unmatchedFilterNames judged the names against, so it
+        // is never empty here: that helper returns [] for an unknown list.
         const conn = this.connections.get(ns);
-        const offered = conn ? conn.tools.map((t) => t.name) : [];
+        const offered =
+          conn && conn.status === "connected"
+            ? conn.tools.map((t) => t.name)
+            : (this.cachedToolsFor(ns) ?? []).map((t) => t.name);
         const plural = unmatched.length === 1;
         const lead = `Note: the ${plural ? "tool" : "tools"} you asked to keep ${plural ? "does" : "do"} not exist on "${ns}": ${unmatched.join(", ")}.`;
-        const fix =
-          offered.length > 0
-            ? ` That server offers: ${offered.join(", ")}. Re-run mcp_connect_activate with a name from that list, or omit "tools" to advertise all of them.`
-            : " It advertises no tools at all right now, so the filter hides nothing that exists.";
+        const fix = ` That server offers: ${offered.join(", ")}. Re-run mcp_connect_activate with a name from that list, or omit "tools" to advertise all of them.`;
         results.push(lead + fix);
       }
     }
+
+    // Broker prose, so it goes BEFORE the third-party blocks (see the push
+    // just below).
+    const execHint = this.execHintForNonRelistingClient(loadedOk);
+    if (execHint) results.push(execHint);
 
     // Third-party text goes LAST within this text block, after every line
     // yaw-mcp wrote itself. Not an aesthetic choice: each block carries its own
@@ -7263,10 +7355,6 @@ export class ConnectServer {
     // is separate -- a distinct block, opening with the `[yaw-mcp]` prefix that
     // sanitizeUpstreamInstructions neutralizes inside any payload, so no fenced
     // text can pass itself off as that tip or be mistaken for part of it.
-    // Broker prose, so it goes BEFORE the third-party blocks (see below).
-    const execHint = this.execHintForNonRelistingClient(loadedOk);
-    if (execHint) results.push(execHint);
-
     results.push(...upstreamInstructions);
 
     return {
@@ -7402,7 +7490,7 @@ export class ConnectServer {
     // ambiguity-aware gate (off|auto|aggressive). auto preserves today's
     // behavior (one sample on genuine ambiguity); aggressive samples
     // best-of-3 on milder ambiguity.
-    const safeBudget = Math.max(1, Math.min(10, Math.floor(budget)));
+    const safeBudget = Math.max(1, Math.min(DISPATCH_MAX_BUDGET, Math.floor(budget)));
     const effort = parseRouteEffort(routeEffortOverride ?? process.env.YAW_MCP_ROUTE_EFFORT);
     // The capability check is hoisted out of bestOfNViaSampling (which also
     // makes it, and returns null) so that a client WITHOUT sampling never
@@ -7449,34 +7537,27 @@ export class ConnectServer {
 
     const winners = ranked.slice(0, safeBudget);
 
-    // Re-dispatch routing-miss + opt-in foundry harvest. The primary winner
-    // is the server this dispatch actually routed to. If a token-similar
-    // intent was recently routed to a DIFFERENT, then-abandoned server, that
-    // earlier choice was the wrong route — penalize it (recordMiss). Then
-    // record this dispatch so a future re-route can be judged against it.
+    // The ranker's top pick. NOT necessarily the server this dispatch ends up
+    // loading: the runner-up fallback in the load loop below can replace a
+    // winner that fails to start. The re-dispatch bookkeeping therefore waits
+    // until after that loop (see "Re-dispatch routing-miss" there); only the
+    // two things that describe the RANKING are booked here.
     const primary = winners[0]?.namespace;
+    // The dispatch decision's clock, taken before any spawn so a slow load
+    // does not move the re-dispatch window.
+    const dispatchedAt = Date.now();
     if (primary) {
       // Remember the intent each activated server was routed for, so the
       // optional LLM reward grader can judge later tool calls against the goal.
       for (const w of winners) this.lastIntentByNamespace.set(w.namespace, trimmed);
-      const intentTokens = tokenize(trimmed);
-      const now = Date.now();
-      const miss = this.redispatch.detectMiss(primary, intentTokens, now, (a, b) => this.isLegitChain(a, b));
-      if (miss) {
-        this.learning.recordMiss(miss.loser);
-        this.scheduleStateSave();
-        // recordMiss moves the loser's `usage:` / `reliability:` numbers,
-        // which discover renders and the cache key does not cover -- drop
-        // the memo so the next discover inside the TTL shows the penalty
-        // instead of the pre-miss text.
-        this.invalidateDiscoverCache();
-      }
-      this.redispatch.push(primary, intentTokens, now);
       // Privacy-safe, opt-in routing-eval harvest (the "environment foundry").
       // Disabled unless YAW_MCP_FOUNDRY is set; only a REDACTED token bag plus
       // the chosen namespace is ever written -- never the raw intent string,
       // and not the ranker's shortlist either (it was accepted and dropped on
-      // the floor for a release; see FoundryTrace in foundry.ts).
+      // the floor for a release; see FoundryTrace in foundry.ts). `chosen` is
+      // the RANKED pick, written before the load: a winner that then fails to
+      // start is still the row's namespace, even when a runner-up was loaded
+      // in its place.
       if (isFoundryEnabled()) {
         const redacted = redactIntent(trimmed);
         void appendFoundryTrace({
@@ -7574,6 +7655,32 @@ export class ConnectServer {
     // No trailing "Dispatch complete" progress — see handleActivate for
     // the client-side race this avoids.
 
+    // Re-dispatch routing-miss. Keyed on the server this dispatch actually
+    // routed to: the first one it left loaded (a lower-ranked winner or a
+    // runner-up when the top pick failed to start), and the top pick itself
+    // when it loaded or when nothing did. If a token-similar intent was recently routed to a
+    // DIFFERENT, then-abandoned server, that earlier choice was the wrong
+    // route — penalize it (recordMiss). Then record this dispatch so a future
+    // re-route can be judged against it. Booking these on the ranked winner
+    // before the loop left a rescuer with no record at all, so a later
+    // re-route away from it could never count as a miss, and judged the
+    // earlier route against a server that never started.
+    const routed = dispatchedOk[0] ?? primary;
+    if (routed) {
+      const intentTokens = tokenize(trimmed);
+      const miss = this.redispatch.detectMiss(routed, intentTokens, dispatchedAt, (a, b) => this.isLegitChain(a, b));
+      if (miss) {
+        this.learning.recordMiss(miss.loser);
+        this.scheduleStateSave();
+        // recordMiss moves the loser's `usage:` / `reliability:` numbers,
+        // which discover renders and the cache key does not cover -- drop
+        // the memo so the next discover inside the TTL shows the penalty
+        // instead of the pre-miss text.
+        this.invalidateDiscoverCache();
+      }
+      this.redispatch.push(routed, intentTokens, dispatchedAt);
+    }
+
     await this.announceExplicitLoads(tally);
 
     // Tool-level guidance: which of the loaded tools fit THIS intent, with
@@ -7630,7 +7737,9 @@ export class ConnectServer {
     for (const ns of loaded) {
       const conn = this.connections.get(ns);
       if (!conn) continue;
-      const tools = this.splitShadowedTools(ns, conn.tools).served.filter((t) => !this.isToolDenied(t.namespacedName));
+      // `served` is already profile-clean: splitShadowedTools iterates
+      // visibleTools, which drops filtered and denied tools.
+      const tools = this.splitShadowedTools(ns, conn.tools).served;
       for (const t of tools) byKey.set(`${ns}\u0000${t.name}`, t);
       views.push({
         namespace: ns,
@@ -8122,7 +8231,8 @@ export class ConnectServer {
       // namespaces too, and reporting either of those as "No installed
       // server" contradicts handleReadTool, which names the real reason for
       // the very same namespace and points at the fix. Same lookup and same
-      // wording as that path, so the two agree.
+      // sentence as that path, so the two agree; only the trailing verb (the
+      // `purpose` argument) is this tool's own.
       //
       // spawnGateRefusal covers exactly the two ways getProfiledActiveServers()
       // drops a configured server (disabled, profile-blocked), so a
@@ -8131,7 +8241,7 @@ export class ConnectServer {
       // not-installed message below. There is no third state; the fallback
       // string that used to stand in for one could not run.
       const configured = this.config?.servers.find((s) => s.namespace === serverArg);
-      const refusal = configured ? this.spawnGateRefusal(configured, "inspect its tools") : null;
+      const refusal = configured ? this.spawnGateRefusal(configured, "report its secrets") : null;
       if (refusal) return { content: [{ type: "text", text: refusal }], isError: true };
       return {
         content: [
@@ -8298,7 +8408,7 @@ export class ConnectServer {
    *  spend less context than activating servers to look, and a bare term
    *  against a 30-server setup can match a hundred tools. Ten is enough to
    *  choose from and small enough that the reply stays cheap. */
-  private static readonly FIND_TOOL_DEFAULT_LIMIT = 10;
+  private static readonly FIND_TOOL_DEFAULT_LIMIT = FIND_TOOL_DEFAULT_LIMIT;
   private static readonly FIND_TOOL_MAX_LIMIT = FIND_TOOL_MAX_LIMIT;
 
   /** Search every configured server's tools by what they do.
@@ -8461,8 +8571,10 @@ export class ConnectServer {
     );
     const bundledShown = [...new Set(usable.map((h) => h.namespace).filter((ns) => unseen.bundled.includes(ns)))];
     if (bundledShown.length > 0) {
+      // Pluralized on every slot, like unseenToolListLine below.
+      const plural = bundledShown.length > 1;
       lines.push(
-        `[bundled list]: ${bundledShown.join(", ")} has never loaded on this machine, so its tools above come from yaw-mcp's bundled copy of the upstream list and are unconfirmed; loading it replaces them with what it really serves.`,
+        `[bundled list]: ${bundledShown.join(", ")} ${plural ? "have" : "has"} never loaded on this machine, so ${plural ? "their" : "its"} tools above come from yaw-mcp's bundled copy of the upstream ${plural ? "lists" : "list"} and are unconfirmed; loading ${plural ? "one replaces its tools with what it really serves" : "it replaces them with what it really serves"}.`,
       );
     }
     if (unseen.none.length > 0) lines.push(this.unseenToolListLine(query, unseen.none));
@@ -8550,13 +8662,15 @@ export class ConnectServer {
     ];
     for (const pack of ranked) {
       const nsList = pack.namespaces.join(", ");
-      const secondsAgo = Math.max(0, Math.round((Date.now() - pack.lastSeenAt) / 1000));
+      // A compact age, not raw seconds: pack history persists across restarts,
+      // so "last seen" is routinely days old.
+      const age = formatRelativeAge(Date.now() - pack.lastSeenAt);
       // Each pack carries its own ready-to-run call, as the suggest
       // description promises. `mcp_connect_activate` is the call for a
       // known namespace set; `dispatch` picks servers by intent, so pointing
       // at it here would make the model re-describe a set it already has.
       lines.push(
-        `  {${nsList}} — seen ${pack.frequency} times (last ${secondsAgo}s ago); activate with ${activateServersCall(pack.namespaces)}`,
+        `  {${nsList}} — seen ${pack.frequency} times (last ${age} ago); activate with ${activateServersCall(pack.namespaces)}`,
       );
     }
 
@@ -8635,8 +8749,12 @@ export class ConnectServer {
   //   2. Single text item (non-JSON) -> the raw text string.
   //   3. Everything else (multi-item, non-text, empty) -> the content array.
   //
-  // This is intentionally simple and loss-free: callers can still reach
-  // the full wire payload via the `partial` / `steps` objects if needed.
+  // Intentionally simple, and NOT loss-free. For a single text item the wire
+  // wrapper is discarded, and rule 1 parses ANY valid JSON text, scalars
+  // included: the text "42" binds the number 42, "true" a boolean, "null"
+  // null, and an integer past 2^53 loses precision. The parsed value is all
+  // exec keeps -- the `partial` / `steps` objects in its reply carry these
+  // same values, not the wire content array.
   private static parseStepPayload(result: {
     content?: Array<{ type: string; text?: string }>;
     isError?: boolean;
@@ -9208,12 +9326,17 @@ export class ConnectServer {
     // -- 5,067 bytes measured to discard 51 bytes of issue number, while `b`
     // was transmitted regardless. The cost being avoided is the EXTRA payload
     // of echoing what the caller skipped, so that is what gets weighed.
+    //
+    // And `skipped` is what gets echoed, too: under an explicit `return`,
+    // `steps` holds every binding EXCEPT the returned one, which is already
+    // in `result`. Echoing all of `echoed` here sent that value twice.
+    // `stepKeys` still names the returned step.
     const skipped = Object.fromEntries(Object.entries(echoed).filter(([k]) => k !== returnKey));
     const body = !explicitReturn
       ? { ok: true, result: finalResult, steps: echoed }
       : JSON.stringify(skipped).length > EXEC_ECHO_BUDGET_BYTES
         ? { ok: true, result: finalResult, stepKeys }
-        : { ok: true, result: finalResult, stepKeys, steps: echoed };
+        : { ok: true, result: finalResult, stepKeys, steps: skipped };
 
     return {
       content: [

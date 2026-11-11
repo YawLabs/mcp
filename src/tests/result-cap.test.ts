@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   type CapContent,
   capContent,
@@ -49,9 +49,10 @@ describe("resolveMaxResultBytes", () => {
   });
 
   it("falls back to the ceiling rather than DISABLING it on a typo", () => {
-    // The failure that matters: parseInt reads all three of these as 0, which
-    // is the disable sentinel -- so a typo would silently remove the ceiling
-    // while looking like it set one.
+    // The failure that matters: parseInt reads "0x1000" as 0, which is the
+    // disable sentinel -- so a typo would silently remove the ceiling while
+    // looking like it set one. It reads "100_000" as 100 and "1e5" as 1, which
+    // keeps a ceiling but one so small that every result is cut.
     for (const raw of ["0x1000", "100_000", "1e5", "abc", "  "]) {
       expect(resolveMaxResultBytes({ YAW_MCP_MAX_RESULT_BYTES: raw } as NodeJS.ProcessEnv)).toBe(
         DEFAULT_MAX_RESULT_BYTES,
@@ -133,6 +134,47 @@ describe("capContent", () => {
     const r = capContent(many, 8_000);
     expect(r.capped).toBe(true);
     expect(Buffer.byteLength(JSON.stringify(r.content), "utf8")).toBeLessThanOrEqual(8_000);
+  });
+
+  it("drops blocks, and says so, when only the array framing puts a result over", () => {
+    // 3704 tiny blocks: their sizes sum to 96304, under the ceiling less the
+    // notice reserve, while the array they sit in is 100009 -- the brackets
+    // and 3703 commas are what put it over. The loop used to budget bare block
+    // sizes, so every block "fit": nothing was dropped, the notice still said
+    // CUT, and the array handed back was the whole input plus the notice.
+    const many = Array.from({ length: 3704 }, () => text("x"));
+    const summed = many.reduce((acc, b) => acc + Buffer.byteLength(JSON.stringify(b), "utf8"), 0);
+    const serialized = Buffer.byteLength(JSON.stringify(many), "utf8");
+    // The fixture has to sit in the gap or it proves nothing.
+    expect(summed).toBeLessThan(DEFAULT_MAX_RESULT_BYTES - 1_000);
+    expect(serialized).toBeGreaterThan(DEFAULT_MAX_RESULT_BYTES);
+
+    const r = capContent(many, DEFAULT_MAX_RESULT_BYTES);
+    expect(r.capped).toBe(true);
+    expect(Buffer.byteLength(JSON.stringify(r.content), "utf8")).toBeLessThanOrEqual(DEFAULT_MAX_RESULT_BYTES);
+    // Something really was cut, and the notice counts it.
+    const kept = r.content.length - 1;
+    expect(kept).toBeLessThan(many.length);
+    expect(r.content[r.content.length - 1]?.text).toContain(
+      `${many.length - kept} further content block(s) were dropped`,
+    );
+  });
+
+  it("encodes an oversized text once, not once per search step", () => {
+    // The fit is a binary search, and each step used to hand the WHOLE text to
+    // cutToBytes, which encodes its argument -- a couple of dozen full encodes
+    // of a payload that is oversized by definition. Counted rather than timed,
+    // so the pin does not depend on the host.
+    const body = "2026-09-10 INFO something happened\n".repeat(20_000);
+    const spy = vi.spyOn(Buffer, "from");
+    try {
+      const r = capContent([text(body)], 10_000);
+      const fullEncodes = spy.mock.calls.filter((args) => (args[0] as unknown) === body).length;
+      expect(r.capped).toBe(true);
+      expect(fullEncodes).toBe(1);
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it("reports bytesKept as the CONTENT it kept, excluding the notice", () => {

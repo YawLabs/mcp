@@ -53,7 +53,10 @@ export interface AuditEvent {
   server: string;
   /** Secret NAME (never a value). */
   secret: string;
-  /** Whether the secret was injected or was referenced-but-absent. */
+  /** "injected": the secret was decrypted and handed to the server.
+   *  "missing": a reference the spawn was refused over -- the name is not in
+   *  the vault, its entry is there but did not decrypt, or the reference
+   *  itself did not parse (a `<malformed ref>` marker in `secret`). */
   event: AuditEventKind;
 }
 

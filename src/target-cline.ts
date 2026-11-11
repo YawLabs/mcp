@@ -54,10 +54,11 @@ function displayPath(base: PathBase, segments: readonly string[]): string {
 /** The directory an editor keeps its User/ tree in, per OS, as BOTH the
  *  absolute path and the display segments naming it, so the two cannot drift.
  *
- *  Linux hardcodes `~/.config` rather than honouring $XDG_CONFIG_HOME -- the
- *  same rule, and the same known gap, as the existing vscode row's user path.
- *  The value is already threaded as `base.env.xdgConfigHome` (the Zed row
- *  reads it); this function just does not consult it. */
+ *  Linux hardcodes `~/.config`; the vscode row's user path honours an absolute
+ *  $XDG_CONFIG_HOME and this function does not yet, so on such a box Cline's
+ *  per-editor copies are looked for in the wrong directory. The value is
+ *  already threaded as `base.env.xdgConfigHome` (the Zed and vscode rows read
+ *  it); this function just does not consult it. */
 function editorRoot(base: PathBase, dirName: string): { dir: string; display: string[] } {
   if (base.os === "windows") return { dir: join(base.appData, dirName), display: ["%APPDATA%", dirName] };
   if (base.os === "macos") {

@@ -5,7 +5,9 @@
 //   - global npm (`npm install -g @yawlabs/mcp`)  -> `npm install -g @yawlabs/mcp@latest`
 //   - pnpm / bun global store                      -> `pnpm add -g` / `bun add -g @yawlabs/mcp@latest`
 //   - local node_modules                           -> `npm install @yawlabs/mcp@latest` in that tree's root
-//   - npx cache                                    -> restart the MCP client; `npx -y` always pulls the latest
+//   - npx cache                                    -> restart the MCP client; `npx -y @yawlabs/mcp@latest` re-resolves
+//                                                     on each spawn (an entry WITHOUT `@latest` keeps its cached copy --
+//                                                     see NPX_LATEST_CAVEAT)
 //   - bundled inside Yaw Terminal (asar.unpacked)  -> nothing to run; it updates with the app
 //   - standalone SEA binary (track retired 0.70.3) -> `npm install -g @yawlabs/mcp@latest`; delete the old executable
 //   - unknown / dev checkout                       -> print the command and let the user decide
@@ -88,16 +90,15 @@ import { isTestSandbox } from "./opt-out-env.js";
 
 declare const __VERSION__: string;
 
-/** The SEA binary track was RETIRED in 0.70.3 (docs/v0.70.3-binary-track-
- *  decision.md); the last binaries live on the frozen v0.70.2 release --
- *  OLDER than npm, so pointing users at "releases/latest" was a dead end.
- *  A binary install still gets detected (real v0.70.2 downloads exist),
- *  and its upgrade path is: install from npm, delete the old executable.
- *  Single source of truth for that message so upgrade / auto-upgrade /
- *  doctor all say the same thing. */
-// Built below UPGRADE_COMMANDS (it needs the table) -- see BINARY_RETIRED_HINT
-// after upgradeCommandLine. Declared there rather than here so the command it
-// quotes is the table's global-npm line, never a second spelling of the spec.
+// The SEA binary track was RETIRED in 0.70.3 (docs/v0.70.3-binary-track-
+// decision.md); the last binaries live on the frozen v0.70.2 release --
+// OLDER than npm, so pointing users at "releases/latest" was a dead end.
+// A binary install still gets detected (real v0.70.2 downloads exist),
+// and its upgrade path is: install from npm, delete the old executable.
+// The one message for that is BINARY_RETIRED_HINT, built below
+// UPGRADE_COMMANDS (it needs the table), after upgradeCommandLine. Declared
+// there rather than here so the command it quotes is the table's global-npm
+// line, never a second spelling of the spec.
 
 export interface UpgradeCommandOptions {
   /** When true, actually spawn the upgrade command. Runnable methods only --
@@ -212,6 +213,36 @@ const POSIX_GLOBAL_LIB_PREFIX = /^(?:[A-Za-z]:)?(?:\/usr(?:\/local)?|\/opt\/[^/]
 const MANAGED_NODE_LIB_PREFIX =
   /\/(?:\.nvm\/versions\/node\/[^/]+|\.volta\/tools\/image\/node\/[^/]+|\.asdf\/installs\/nodejs\/[^/]+|(?:\.local\/share\/)?\.?fnm\/node-versions\/[^/]+\/installation|\.nodenv\/versions\/[^/]+|\.nvs\/[^/]+\/[^/]+\/[^/]+|n\/versions\/node\/[^/]+|\.local)\/lib\/node_modules\/@yawlabs\/mcp\//;
 
+/** The two global-npm markers that anchor on nothing but a directory NAME:
+ *  `<anything>/npm/node_modules` (the Windows default prefix is
+ *  `%APPDATA%\npm`) and `<anything>/bin/node_modules` (scoop's nodejs persist
+ *  dir, custom prefixes). Named so classifyEntrypoint and
+ *  globalNpmMarkerIsUnanchored read the same two patterns. */
+const NPM_DIR_GLOBAL_MARKER = /\/npm\/node_modules\/@yawlabs\/mcp\//;
+const BIN_DIR_GLOBAL_MARKER = /\/bin\/node_modules\/@yawlabs\/mcp\//;
+
+/** npm's DEFAULT Windows global prefix, `%APPDATA%\npm`. The one `npm`-named
+ *  directory that is anchored on a real install root rather than on its name. */
+const WIN32_DEFAULT_NPM_PREFIX = /\/AppData\/Roaming\/npm\/node_modules\/@yawlabs\/mcp\//i;
+
+/** Did this path earn `global-npm` from a directory NAME alone -- the `npm` or
+ *  `bin` marker, outside npm's default Windows prefix?
+ *
+ *  Those two markers have the false positive POSIX_GLOBAL_LIB_PREFIX was
+ *  anchored to remove: a project directory literally named `npm` or `bin`
+ *  holding node_modules/@yawlabs/mcp classifies as a global install, and the
+ *  prefix derived from it is that project directory. The classification
+ *  itself is left alone -- real scoop and custom-prefix installs depend on it
+ *  -- so this predicate exists for the one caller that acts on it without
+ *  asking: auto-upgrade's background `npm install -g --prefix <dir>`, which
+ *  requires a global bin shim beside the prefix before it spawns for such a
+ *  path. Pass the RESOLVED entrypoint (the path the prefix is derived from). */
+export function globalNpmMarkerIsUnanchored(entryPath: string): boolean {
+  const normalized = entryPath.replace(/\\/g, "/");
+  if (WIN32_DEFAULT_NPM_PREFIX.test(normalized)) return false;
+  return NPM_DIR_GLOBAL_MARKER.test(normalized) || BIN_DIR_GLOBAL_MARKER.test(normalized);
+}
+
 export interface UpgradePlan {
   current: string;
   latest: string | null;
@@ -236,7 +267,10 @@ export const UPGRADE_USAGE = `Usage: yaw-mcp upgrade [--run] [--json]
   Show (or execute) the command to upgrade @yawlabs/mcp to the latest version.
 
   --run     Run the upgrade in place (global npm, pnpm, bun, and local npm
-            installs). No-op for npx installs -- they always fetch the latest.
+            installs). No-op for npx installs: a client entry that runs
+            @yawlabs/mcp@latest fetches the latest on every start. One
+            without @latest keeps its cached copy -- re-run
+            \`yaw-mcp install <client>\` to rewrite it.
   --json    Emit a machine-readable snapshot ({ current, latest, stale,
             method, command, cwd }) instead of prose. "cwd" is the directory
             "command" must run IN -- the package-tree root for a
@@ -351,7 +385,15 @@ function classifyEntrypoint(argvPath: string): InstallMethod {
   // common platforms. The same marker covers the Windows default prefix
   // (`%APPDATA%\npm\node_modules\...`, i.e. `/AppData/Roaming/npm/...` once
   // normalized), so that layout needs no rule of its own.
-  if (/\/npm\/node_modules\/@yawlabs\/mcp\//.test(normalized)) return "global-npm";
+  //
+  // UNANCHORED, unlike the lib markers below: any directory named `npm` that
+  // holds node_modules/@yawlabs/mcp matches, a project tree included. The
+  // classification is kept: plain `upgrade` only prints the command, and
+  // nothing is spawned unless the user passes --run. `upgrade` never asks, so
+  // `--run` DOES install into a prefix matched on the name alone. The
+  // unprompted background upgrade does not act on the name alone -- see
+  // globalNpmMarkerIsUnanchored.
+  if (NPM_DIR_GLOBAL_MARKER.test(normalized)) return "global-npm";
   // `<prefix>/lib/node_modules` -- anchored on real Node-root shapes; see the
   // two regex definitions above for why a bare `/lib/` marker was unsafe.
   if (POSIX_GLOBAL_LIB_PREFIX.test(normalized)) return "global-npm";
@@ -368,11 +410,12 @@ function classifyEntrypoint(argvPath: string): InstallMethod {
   if (/\/\.npm-global\/(?:lib\/)?node_modules\/@yawlabs\/mcp\//.test(normalized)) return "global-npm";
   // Windows npm prefixes that live in a `bin` dir (scoop's nodejs persist
   // dir, custom prefixes): globals land at <prefix>/node_modules with
-  // <prefix> itself named `bin`. A project tree whose root dir is
-  // literally named `bin` is rare enough that this marker is safe, and
-  // misclassifying these as local-node-modules made `upgrade --run`
-  // npm-install into the node prefix instead of upgrading the global.
-  if (/\/bin\/node_modules\/@yawlabs\/mcp\//.test(normalized)) return "global-npm";
+  // <prefix> itself named `bin`. Misclassifying these as local-node-modules
+  // made `upgrade --run` npm-install into the node prefix instead of
+  // upgrading the global. Unanchored like the `npm` marker above -- a project
+  // directory literally named `bin` matches too -- so the background upgrade
+  // asks for a second signal before acting on it (globalNpmMarkerIsUnanchored).
+  if (BIN_DIR_GLOBAL_MARKER.test(normalized)) return "global-npm";
   // pnpm / bun global stores look like local node_modules trees but are
   // internally managed -- running plain `npm install` inside them writes
   // a foreign package-lock + node_modules into the tool's store. Detect
@@ -484,15 +527,6 @@ function defaultInstalledVersion(pkgDir: string): string | null {
   }
 }
 
-/** Ask npm where its global prefix actually is. Returns null when npm
- *  isn't reachable, exits non-zero, or doesn't answer within 3s -- refinement
- *  is then skipped and the path-marker classification stands.
- *
- *  Exported because auto-upgrade's multi-prefix warning needs the same probe:
- *  it used to keep its own copy with no timer, no kill, no exit-code check and
- *  no VITEST guard, so a hung `npm prefix -g` left an unresolved promise and a
- *  live child handle for the broker's lifetime. One helper, one timeout, one
- *  test short-circuit. */
 /** Minimal shape of the child npmGlobalPrefix's timeout has to tear down. */
 interface KillableChild {
   pid?: number;
@@ -556,6 +590,15 @@ export type ProbeSpawn = (
   on(event: string, listener: (...args: any[]) => void): unknown;
 };
 
+/** Ask npm where its global prefix actually is. Returns null when npm
+ *  isn't reachable, exits non-zero, or doesn't answer within 3s -- refinement
+ *  is then skipped and the path-marker classification stands.
+ *
+ *  Exported because auto-upgrade's multi-prefix warning needs the same probe:
+ *  it used to keep its own copy with no timer, no kill, no exit-code check and
+ *  no VITEST guard, so a hung `npm prefix -g` left an unresolved promise and a
+ *  live child handle for the broker's lifetime. One helper, one timeout, one
+ *  test short-circuit. */
 export async function npmGlobalPrefix(spawnImpl?: ProbeSpawn): Promise<string | null> {
   // Auto-skip under a test harness (mirrors doctor-cmd's registry probe) so
   // unit tests never spawn a real npm; tests exercising refinement inject
@@ -705,6 +748,16 @@ export function upgradeCommandLine(method: InstallMethod): string | null {
  *  global-npm line rather than a hand-typed copy of the package spec. */
 export const BINARY_RETIRED_HINT = `the standalone-binary track was retired in 0.70.3. Install from npm instead -- \`${upgradeCommandLine("global-npm")}\` -- then delete this executable.`;
 
+/** The condition every "npx fetches the new version on restart" line depends
+ *  on. `upgrade` identifies an npx install by the cache path it is running
+ *  from and does NOT read the client entry that launched it, so it cannot tell
+ *  an `@yawlabs/mcp@latest` entry (re-resolved on every spawn) from a bare
+ *  `@yawlabs/mcp` one (served from the npx cache until that is cleared). The
+ *  advice therefore states the condition and the remedy instead of promising
+ *  the restart is enough. */
+export const NPX_LATEST_CAVEAT =
+  "That holds when the client's entry runs @yawlabs/mcp@latest; one without @latest keeps its cached copy -- re-run `yaw-mcp install <client>` to rewrite it.";
+
 /** The manual command for the GLOBAL install that `tool` (npm / pnpm / bun)
  *  owns, or null for a tool the table does not know. auto-upgrade's failure
  *  hint: its spawn callback is handed the tool, not the method. Global only,
@@ -742,7 +795,7 @@ export function buildUpgradePlan(input: {
   let command: string | null;
   switch (method) {
     case "npx":
-      command = null; // npx -y refreshes on its own; nothing to run.
+      command = null; // nothing to run: an @latest entry refreshes on restart (NPX_LATEST_CAVEAT).
       break;
     case "bundled-app":
       command = null; // ships inside Yaw Terminal; updates with the app.
@@ -798,7 +851,15 @@ export interface FetchLatestVersionOptions {
  *  callers -- the timeout budget and whether a stand-in can be injected. Both
  *  are parameters now, so a caller with a real difference in requirement gets it
  *  without forking the URL, the response validation, or the failure semantics
- *  along with it. */
+ *  along with it.
+ *
+ *  The URL is registry.npmjs.org, always: npm's configured `registry` (.npmrc,
+ *  npm_config_registry) is NOT read. The install that staleness then triggers
+ *  -- `npm install -g @yawlabs/mcp@latest` and its siblings -- does resolve
+ *  `@latest` against the configured registry, so behind a mirror that lags or
+ *  filters the package the two disagree: the install succeeds without moving
+ *  the version and the copy keeps reading as stale. See KNOWN GAPS in
+ *  auto-upgrade.ts for what that costs the background path. */
 export async function fetchLatestVersion(opts: FetchLatestVersionOptions = {}): Promise<string | null> {
   if (opts.override) {
     try {
@@ -1099,6 +1160,7 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
       print(`yaw-mcp is a standalone binary; ${BINARY_RETIRED_HINT}`);
     } else {
       print("Your install uses `npx -y` -- just restart the MCP client when you're back online.");
+      print(NPX_LATEST_CAVEAT);
     }
     // The oam floor probe is LOCAL (`oam --version`); an unreachable npm
     // registry says nothing about it. Skipping the note here used to hide the
@@ -1127,6 +1189,7 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
   // codepage and then travels, mangled, into bug reports.
   if (method === "npx") {
     print("Your install uses `npx -y` -- restart the MCP client and it will fetch the new version.");
+    print(NPX_LATEST_CAVEAT);
     return { exitCode: 0, lines };
   }
 

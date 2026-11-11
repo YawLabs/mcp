@@ -67,6 +67,17 @@ vi.mock("../proxy.js", async (importOriginal) => {
   return { ...actual, routeToolCall: vi.fn(actual.routeToolCall) };
 });
 
+// readGradesCache passes straight through to the real one too. Wrapped only so
+// one test can hand hydrateComplianceGrades a PLAIN object: the real reader
+// only ever returns a prototype-less map, which leaves server.ts's own
+// Object.hasOwn guard with nothing to do.
+vi.mock("../grades-cache.js", async (importOriginal) => {
+  const actual = (await importOriginal()) as any;
+  return { ...actual, readGradesCache: vi.fn(actual.readGradesCache) };
+});
+
+import { readGradesCache } from "../grades-cache.js";
+
 import { installNudgeStatePath } from "../install-nudge.js";
 import { META_TOOLS } from "../meta-tools.js";
 import { CONFIG_DIRNAME } from "../paths.js";
@@ -588,6 +599,10 @@ describe("ConnectServer", () => {
         expect(text).toContain("ignoring 'env' on \"gh\"");
         // Above the listing, not buried under it.
         expect(text.indexOf("ignoring")).toBeLessThan(text.indexOf("Installed MCP servers"));
+        // The fix line names the file in effect, which may be project-local.
+        expect(text).toContain(
+          "Fix the bundles.json in effect (~/.yaw-mcp/bundles.json, or a trusted project-local .yaw-mcp/bundles.json), or run `yaw-mcp doctor`",
+        );
         // Still lists the server -- it does load; the point is that the model
         // is told the config is broken, not that the entry vanishes.
         expect(text).toContain("gh");
@@ -603,7 +618,7 @@ describe("ConnectServer", () => {
 
         const text = priv.handleDiscover().content[0].text;
         expect(text.startsWith("Installed MCP servers")).toBe(true);
-        expect(text).not.toContain("Fix bundles.json");
+        expect(text).not.toContain("Fix the bundles.json in effect");
       });
 
       it("keeps the co-usage peer that the full listing shows", () => {
@@ -1437,9 +1452,9 @@ describe("ConnectServer", () => {
     });
   });
 
-  // The grade cache written by `yaw-mcp audit` is the ONLY supplier of
-  // `complianceGrade` in local mode: bundles.json entries never carry one
-  // (validateEntry drops unknown fields). Until start() overlaid it, every
+  // The grade cache written by `yaw-mcp audit` was once the ONLY supplier of
+  // `complianceGrade` (a bundles.json entry can now carry one of its own, and
+  // the cache is overlaid on top of it). Until start() overlaid it, every
   // server was permanently ungraded — which made YAW_MCP_MIN_COMPLIANCE inert
   // (ungraded always passes) and blanked the discover badge. These pin the
   // overlay by its EFFECT on gating, not by the field being set.
@@ -1517,6 +1532,50 @@ describe("ConnectServer", () => {
       await priv.hydrateComplianceGrades(gradesHome);
 
       expect(priv.config.servers[0].complianceGrade).toBeUndefined();
+    });
+
+    it("does not let an inherited Object key wipe a namespace's own grade", async () => {
+      // `constructor` is a valid namespace. On a plain-object cache a bare
+      // `grades[ns]` returns the Object function (truthy, no .grade) and the
+      // overlay would replace the entry's grade with undefined -- ungraded,
+      // which always passes YAW_MCP_MIN_COMPLIANCE. This goes through the real
+      // readGradesCache, which returns a prototype-less map, so it pins the
+      // end-to-end behaviour (the reader's half); the next test pins
+      // server.ts's own guard. The cache needs one real entry for the overlay
+      // to run at all.
+      vi.stubEnv("YAW_MCP_MIN_COMPLIANCE", "B");
+      writeGrades({ other: GRADE_D });
+      const priv = getPrivate(server);
+      priv.config = makeConfig([
+        makeServerConfig({ namespace: "constructor", name: "Ctor", complianceGrade: "D" }),
+        makeServerConfig({ namespace: "valueOf", name: "ValueOf", complianceGrade: "F" }),
+      ]);
+
+      await priv.hydrateComplianceGrades(gradesHome);
+
+      expect(priv.config.servers.map((s: { complianceGrade?: string }) => s.complianceGrade)).toEqual(["D", "F"]);
+      const result = await priv.handleActivate(["constructor"]);
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('Refused to load "constructor"');
+      expect(connectToUpstream).not.toHaveBeenCalled();
+    });
+
+    it("keeps its own-key guard even if the reader hands back a plain object", async () => {
+      // Defence in depth: the real reader never returns a plain object with
+      // entries, so stub one in. Without the Object.hasOwn check the
+      // inherited `constructor` / `valueOf` members read as cached grades and
+      // both entries come out ungraded.
+      vi.mocked(readGradesCache).mockResolvedValueOnce({ other: { ...GRADE_D, grade: "D" as const } });
+      const priv = getPrivate(server);
+      priv.config = makeConfig([
+        makeServerConfig({ namespace: "constructor", name: "Ctor", complianceGrade: "D" }),
+        makeServerConfig({ namespace: "valueOf", name: "ValueOf", complianceGrade: "F" }),
+        makeServerConfig({ namespace: "other", name: "Other" }),
+      ]);
+
+      await priv.hydrateComplianceGrades(gradesHome);
+
+      expect(priv.config.servers.map((s: { complianceGrade?: string }) => s.complianceGrade)).toEqual(["D", "F", "D"]);
     });
 
     it("degrades to ungraded when the cache is missing or garbage", async () => {
@@ -2709,9 +2768,9 @@ describe("ConnectServer", () => {
       const priv = getPrivate(server);
       priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
       // Three successful dispatches — enough for the hint to show.
-      priv.learning.recordSuccess("gh");
-      priv.learning.recordSuccess("gh");
-      priv.learning.recordSuccess("gh");
+      priv.learning.recordOutcome("gh", 1);
+      priv.learning.recordOutcome("gh", 1);
+      priv.learning.recordOutcome("gh", 1);
 
       const result = await priv.handleToolCall("mcp_connect_discover", {});
       expect(result.content[0].text).toContain("usage: used 3x");
@@ -3486,6 +3545,36 @@ describe("ConnectServer", () => {
       expect(refresh).toHaveBeenCalledTimes(1);
     });
 
+    it("an auto-reconnect that joins a PREWARM inflight still sends its own list_changed", async () => {
+      // A prewarm-initiated activation notifies only when the whole sweep
+      // ends, so a caller joining it is the notifier, exactly as on the
+      // deferred path. The reconnect branch used a bare inflight check and
+      // stayed silent here.
+      const priv = getPrivate(server);
+      const errorConn = makeConnection("gh", ["create_issue"], "error");
+      priv.connections.set("gh", errorConn);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      priv.rebuildRoutes();
+      let release!: (c: ReturnType<typeof makeConnection>) => void;
+      const gate = new Promise<ReturnType<typeof makeConnection>>((r) => {
+        release = r;
+      });
+      const fresh = makeConnection("gh", ["create_issue"]);
+      fresh.client.callTool = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "ok" }] });
+      vi.mocked(connectToUpstream).mockImplementation(() => gate as never);
+      const refresh = vi.spyOn(priv, "refreshRoutesAndNotify");
+      // Prewarm starts the activation and stalls mid-spawn.
+      const prewarmP = priv.activateOne("gh", undefined, /* fromPrewarm */ true);
+      expect(priv.prewarmNamespaces.has("gh")).toBe(true);
+      const call = priv.handleToolCall("gh_create_issue", {});
+      await new Promise((r) => setTimeout(r, 0));
+      release(fresh);
+      const [result] = await Promise.all([call, prewarmP]);
+      expect(result.isError).toBeFalsy();
+      expect(vi.mocked(connectToUpstream)).toHaveBeenCalledTimes(1);
+      expect(refresh).toHaveBeenCalledTimes(1);
+    });
+
     it("an activate landing in a teardown window (status disconnected) gets no cap self-allowance", async () => {
       // "disconnected" only exists mid-teardown (prewarm teardown, idle
       // reaper, deactivate all flip it and then await the close before
@@ -3602,6 +3691,35 @@ describe("ConnectServer", () => {
         expect(priv.learning.get("gh")).toBeUndefined();
       });
     }
+
+    it("a client-cancelled call does not grade the redispatch record", async () => {
+      // A cancel is a non-observation for health, bytes and learning, and it
+      // has to be one for the redispatch tracker too. It used to go through
+      // markReply(ns, false): on a fresh record that set `replied` without
+      // `cleanReply`, so the clean retry right after could only set
+      // furtherUse and the dispatch never read as answered cleanly.
+      const priv = getPrivate(server);
+      const conn = makeConnection("gh", ["get_resource"]);
+      conn.client.callTool = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "ok" }] });
+      priv.connections.set("gh", conn);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      priv.rebuildRoutes();
+      priv.redispatch.push("gh", ["resource"], Date.now());
+      const record = priv.redispatch.ring[priv.redispatch.ring.length - 1];
+      vi.mocked(routeToolCall).mockImplementationOnce(async () =>
+        brandCancelled({ content: [{ type: "text", text: "Error: withdrawn" }], isError: true }),
+      );
+
+      const cancelled = await priv.handleToolCall("gh_get_resource", {});
+      expect(cancelled.isError).toBe(true);
+      expect(record.replied).toBe(false);
+
+      const retry = await priv.handleToolCall("gh_get_resource", {});
+      expect(retry.isError).toBeFalsy();
+      expect(record.replied).toBe(true);
+      expect(record.cleanReply).toBe(true);
+      expect(record.furtherUse).toBe(false);
+    });
 
     it("exec step attribution still books an upstream error that merely CONTAINS a marker phrase", async () => {
       // The exec counterpart of the direct-path brand test: a genuine
@@ -3916,6 +4034,10 @@ describe("ConnectServer", () => {
       expect(text).not.toContain("mcp_connect_dispatch");
       expect(text).toMatch(/mcp_connect_activate\(\{ servers: \[("gh","linear"|"linear","gh")\] \}\)/);
       expect(text).not.toContain("namespaces=");
+      // The seed timestamps are in 1970 and pack history is cross-session, so
+      // the age is a compact unit, never a raw seconds count.
+      expect(text).toMatch(/\(last \d+d ago\)/);
+      expect(text).not.toMatch(/\d{4,}s ago/);
     });
 
     it("suggest drops a pack that names a server activate cannot load", async () => {
@@ -4021,6 +4143,11 @@ describe("ConnectServer", () => {
       expect(Object.keys(parsed).sort()).toEqual(["ok", "result", "stepKeys", "steps"]);
       expect(parsed.stepKeys.slice().sort()).toEqual(["first", "second"]);
       expect(parsed.steps.first).toBe(42);
+      // The returned step is NOT echoed in `steps`: it already rides in
+      // `result`, and a second copy is the duplication `return` exists to
+      // avoid. `stepKeys` above still names it.
+      expect(parsed.steps).toEqual({ first: 42 });
+      expect(result.content[0].text.match(/PR #42 body/g)).toHaveLength(1);
       // The second upstream call must have received the resolved value,
       // not the raw $ref marker -- otherwise the resolver never fired.
       // "42" parses as the number 42 via JSON.parse, so number (not string).
@@ -4197,6 +4324,9 @@ describe("ConnectServer", () => {
       // ...and the tiny one it cannot get back a second time is still here,
       // because dropping it would have saved 51 bytes on a 5 KB response.
       expect(parsed.steps.a).toEqual({ number: 4242 });
+      // The 5 KB value is sent ONCE, in `result`, not again as `steps.b`.
+      expect(parsed.steps.b).toBeUndefined();
+      expect(result.content[0].text.length).toBeLessThan(big.length * 2);
     });
 
     it("fails the whole pipeline and surfaces partial outputs when a step errors", async () => {
@@ -4951,7 +5081,7 @@ describe("prewarmDormantServers", () => {
     expect(Date.now() - priv.toolCacheLearnedAt.get("gh")).toBeLessThan(60_000);
   });
 
-  it("does not re-warm a fresh learned list or a curated bundles.json toolCache", async () => {
+  it("does not re-warm a fresh learned list or a list set on the config entry itself", async () => {
     const priv = getPrivate(server);
     priv.config = {
       configVersion: "v1",
@@ -4968,7 +5098,8 @@ describe("prewarmDormantServers", () => {
     // gh: learned yesterday -- inside the refresh window.
     priv.toolCache.set("gh", [{ name: "list_issues" }]);
     priv.toolCacheLearnedAt.set("gh", Date.now() - 24 * 60 * 60 * 1000);
-    // slack: curated bundles.json cache only -- carries no learnedAt and is
+    // slack: a list set on the config entry itself (hand-built configs only;
+    // bundles.json cannot carry one) -- carries no learnedAt and is
     // never refreshed here (that would reintroduce the per-session
     // `npx -y <pkg>@latest` resolve pre-warm exists to avoid).
 
@@ -9435,6 +9566,8 @@ describe("handleSecretsReport refusals", () => {
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("installed but disabled");
     expect(result.content[0].text).toContain('"isActive": true');
+    // This tool's own verb, not read_tool's "inspect its tools".
+    expect(result.content[0].text).toContain("try again to report its secrets");
   });
 
   it("names the profile for a profile-blocked server", async () => {
@@ -9839,6 +9972,31 @@ describe("discover match summary", () => {
     expect(summary).not.toContain("list_branches");
     expect(summary).not.toContain("read_file");
     expect(summary).not.toContain("list_commits");
+  });
+
+  it("drops the ranker's longer function-word list, not a shorter copy of it", () => {
+    // "what" / "does" / "use" / "when" are in relevance.ts's
+    // QUERY_FUNCTION_WORDS but were missing from the summary's own shorter
+    // list, so each still counted as a description hit here.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub", description: "Issue tracker" })]);
+    priv.toolCache.set("gh", [
+      { name: "list_runners", description: "Shows what runners exist" },
+      { name: "get_workflow", description: "Use when a workflow fails" },
+      { name: "list_branches", description: "Does a branch listing" },
+      { name: "create_issue", description: "Open a bug report" },
+    ]);
+
+    const text = priv.handleDiscover("what does create issue use when").content[0].text;
+    const lines = text.split("\n");
+    const header = lines.indexOf("Matches for your query:");
+    expect(header).toBeGreaterThanOrEqual(0);
+    const summary = lines[header + 1];
+
+    expect(summary).toContain("create_issue");
+    expect(summary).not.toContain("list_runners");
+    expect(summary).not.toContain("get_workflow");
+    expect(summary).not.toContain("list_branches");
   });
 
   it("keeps a late NAME match when earlier tools already fill the 5-hit cap by description", () => {
@@ -10272,6 +10430,22 @@ describe("activate reports a tool filter name that matches nothing", () => {
     const r = await priv.handleToolCall("mcp_connect_activate", { server: "gh", tools: ["create_issu"] });
     expect(r.content[0].text).not.toContain("does not exist");
     expect(priv.toolFilters.has("gh")).toBe(false);
+  });
+
+  it("stays silent when a re-sent filter's activation fails", async () => {
+    // Re-sending the same filter installs nothing, so there is no rollback to
+    // hang the silence on -- the note used to follow the "Failed" line and
+    // list the dead connection's tools as what the server "offers".
+    const priv = getPrivate(server);
+    withGh(priv);
+    await priv.handleToolCall("mcp_connect_activate", { server: "gh", tools: ["create_issu"] });
+    priv.connections.get("gh").status = "error";
+    vi.mocked(connectToUpstream).mockRejectedValue(new Error("spawn failed"));
+    const r = await priv.handleToolCall("mcp_connect_activate", { server: "gh", tools: ["create_issu"] });
+    expect(r.isError).toBe(true);
+    expect(r.content[0].text).not.toContain("does not exist");
+    // The pre-existing filter is not this call's to remove.
+    expect(priv.toolFilters.has("gh")).toBe(true);
   });
 });
 

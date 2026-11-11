@@ -131,6 +131,7 @@ import {
   type ConfigAdapter,
   type ConfigPosition,
   type ConfigRead,
+  configPositionClause,
   type EntryAddress,
   type EntryTransform,
   type EntryView,
@@ -237,18 +238,21 @@ function classifyToml(raw: string, addr: EntryAddress, transform?: EntryTransfor
   switch (read.kind) {
     case "absent":
       return { kind: "absent" };
-    case "malformed":
-      // `detail` is the reason WITHOUT the position, in both unions: the
-      // facade's refusal adds " at line L column C" of its own from
-      // `position`. (The codec's `positioned` field carries the one WITH it,
-      // for messages that print alone.)
+    case "malformed": {
+      // The codec's `detail` is the reason WITHOUT the position, and
+      // smol-toml's reason names no place of its own (JSON.parse's message
+      // does). install, uninstall, import and try print this read's `detail`
+      // alone, so the position is appended here, as the facade's own clause:
+      // its refusal recognises that ending and prints the position once.
+      const position = tomlPosition(raw, read.line, read.column);
       return {
         kind: "malformed",
         syntax: TOML_SYNTAX,
         reason: "syntax",
-        detail: read.detail,
-        position: tomlPosition(raw, read.line, read.column),
+        detail: `${read.detail}${configPositionClause(position)}`,
+        position,
       };
+    }
     case "blocked":
       // A document whose ROOT is not a table has no container key to name, so
       // it reads as a malformed root rather than as a blocked `""`. smol-toml
@@ -497,47 +501,49 @@ function normalizeCodexEntry(stored: unknown): unknown {
   return { ...rest, startup_timeout_sec: ms / 1000 };
 }
 
-/** Keys a Codex entry can carry that bundles.json has no field for. Named so
- *  `import` can say what it dropped instead of dropping them silently. */
-const IMPORT_DISCARDS = [
-  "env_vars",
-  "cwd",
-  "startup_timeout_sec",
-  "startup_timeout_ms",
-  "tool_timeout_sec",
-  "enabled_tools",
-  "disabled_tools",
-  "default_tools_approval_mode",
-  "bearer_token_env_var",
-  "env_http_headers",
-  "http_headers_helper",
-  "experimental_environment",
-  "environment_id",
-  "required",
-  "supports_parallel_tool_calls",
-  "auth",
-  "oauth",
-  "tools",
-];
+/** The fields `ImportView.entry` holds (see its doc in client-config.ts): the
+ *  only keys of a stored Codex entry that are copied across as they are.
+ *
+ *  An ALLOW list on purpose. It used to be a list of Codex keys to leave out,
+ *  and every key that list did not know -- `scopes`, `oauth_resource`,
+ *  `omit_tools_from`, anything a later Codex adds -- went into `entry`
+ *  unnamed. */
+const IMPORT_FIELDS = ["command", "args", "env", "url", "headers", "type", "description"];
+
+/** Codex's two own spellings that are MAPPED rather than dropped: neither is
+ *  copied into `entry` under its own name, and neither is ever named in
+ *  `discardedKeys` -- not even when its value has the wrong type and so maps
+ *  to nothing (an `http_headers` that is not a table, an `enabled` that is
+ *  not `false`). */
+const IMPORT_MAPPED = ["enabled", "http_headers"];
 
 /** One stored Codex entry as `import` reads it.
  *
  *  Two spellings are Codex's own and are mapped here rather than in the
  *  importer: HTTP headers are `http_headers` (D1), and a server switched off
  *  is `enabled = false` (D1) rather than the `disabled: true` other clients
- *  use. Everything the destination cannot hold is NAMED in `discardedKeys`. */
+ *  use. Every other key that is not one of IMPORT_FIELDS is NAMED in
+ *  `discardedKeys`, in the order the entry holds them, so `import` CAN say
+ *  what it dropped. The two mapped keys are the exception (see
+ *  IMPORT_MAPPED): a non-table `http_headers` is dropped unnamed, and a table
+ *  one replaces a stored `headers` key without naming it.
+ *
+ *  The header mapping takes effect; `disabled` and `discardedKeys` do not yet:
+ *  the importer reads `entry` alone, so an `enabled = false` server is
+ *  imported active and the discarded keys are not printed. */
 function codexImportView(stored: Record<string, unknown>): ImportView {
   const entry: Record<string, unknown> = {};
+  const discarded: string[] = [];
   for (const [key, value] of Object.entries(stored)) {
-    if (IMPORT_DISCARDS.includes(key) || key === "enabled" || key === "http_headers") continue;
-    entry[key] = value;
+    if (IMPORT_MAPPED.includes(key) || value === undefined) continue;
+    if (IMPORT_FIELDS.includes(key)) entry[key] = value;
+    else discarded.push(key);
   }
   if (typeof stored.http_headers === "object" && stored.http_headers !== null && !Array.isArray(stored.http_headers)) {
     entry.headers = stored.http_headers;
   }
   const view: ImportView = { entry };
   if (stored.enabled === false) view.disabled = true;
-  const discarded = IMPORT_DISCARDS.filter((key) => stored[key] !== undefined);
   if (discarded.length > 0) view.discardedKeys = discarded;
   return view;
 }

@@ -479,9 +479,8 @@ function render(value: unknown): string {
  *  "object", and those two are exactly the shapes a hand edit produces -- the
  *  reader needs to know WHICH one to go fix.
  *
- *  Not install-targets.ts's exported describeJsonShape: that one names an
- *  array's LENGTH (install/doctor wording, test-pinned) and has no absent or
- *  object case, both of which an `env` field here needs. */
+ *  Not client-config-values.ts's describeValueShape (the install/doctor
+ *  wording): an `env` field here needs its own absent and object cases. */
 function describeFieldShape(value: unknown): string {
   if (value === null) return "null";
   if (Array.isArray(value)) return "an array";
@@ -855,8 +854,11 @@ async function confirmDestructive(
     const key = a.key as string;
     const stored = originalEnv[key];
     // Only a stored STRING can be destroyed: an absent key has nothing to
-    // lose, and a non-string one was refused by the walk above.
-    if (typeof stored !== "string") continue;
+    // lose, and a non-string one was refused by the walk above. A BLANK one
+    // is no value either: it is the empty seed `add` writes for every
+    // declared key (and tells the user to fill with this very command), and
+    // the loader drops it, so filling or removing it loses nothing.
+    if (typeof stored !== "string" || stored.trim() === "") continue;
     const final = projectedEnv[key];
     if (final === stored) continue;
     destroyed.set(key, final === undefined ? "cleared" : "overwritten");

@@ -62,9 +62,6 @@ export interface InstallScopeSpec {
    *  a comment in it means no server in that file loads). `effectiveConfigFormat`
    *  in client-config.ts is what applies it. */
   strictJson?: boolean;
-  /** A caveat printed after the target's own `notes`, for something true of
-   *  this SCOPE rather than the client. */
-  notes?: string;
 }
 
 /** The MCP client `mcpServers["mcp"]` entry — what `install` writes. The key
@@ -184,12 +181,12 @@ export interface TargetHooks {
    *  row's own format -- the one the client parses them with. */
   alsoReads?: (base: PathBase) => ResolvedPath[];
   /** Which `${...}` expansion rules `import` should apply to this client's
-   *  entries. DECLARED, NOT YET READ: nothing in src/ consumes this field.
-   *  import-cmd.ts still selects the "vscode-inputs" logic (inputs block +
-   *  `${workspaceFolder}`) by `clientId === "vscode"` -- allow-listed in the
-   *  boundary test until import reads this hook instead -- and "cline-env"
-   *  has no handler at all, so a Cline `${env:NAME}` passes through import
-   *  unexpanded. */
+   *  entries. import-cmd.ts reads it for "cline-env": a Cline `${env:NAME}`
+   *  makes the server unresolved and it is skipped by name; other spans are
+   *  carried verbatim. "vscode-inputs" is still DECLARED, NOT YET READ:
+   *  import-cmd.ts selects that logic (inputs block + `${workspaceFolder}`)
+   *  by `clientId === "vscode"` -- allow-listed in the boundary test until
+   *  import reads this hook instead. */
   importVariables?: "vscode-inputs" | "cline-env";
 }
 

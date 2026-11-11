@@ -19,6 +19,13 @@
 // Exit codes: 0 success, 1 refused / aborted / nothing to approve,
 // 2 argv error (matching the sibling subcommands), 130 Ctrl+C at the
 // approval prompt (128 + SIGINT, as every `secrets` prompt exits).
+// A grant can also exit 1 with the approval RECORDED: the file pins a git
+// server that has no build on this machine and either nobody was asked
+// (--yes, which a run with no TTY requires -- without it such a run is
+// refused before anything is recorded) or the build that was started did
+// not finish -- it failed, or the repo's script consent was declined (offerGitBuild).
+// Declining the "Build it now?" prompt exits 0, and so does Ctrl+C there --
+// the 130 is the approval prompt's only.
 
 import { readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -35,7 +42,13 @@ import { localBundlesPath, previewBundlesContent, probeProjectTrust } from "./lo
 import { createStreamWriter } from "./logger.js";
 import { isRegistrySpec, specConstraint } from "./oam-spawn.js";
 import { ALLOW_UNOWNED_ENV, CONFIG_DIRNAME } from "./paths.js";
-import { askYesNo, QUESTION_CANCELLED, type QuestionCancelled } from "./readline-question.js";
+import {
+  askYesNo,
+  QUESTION_CANCELLED,
+  QUESTION_EOF,
+  type QuestionCancelled,
+  type QuestionEof,
+} from "./readline-question.js";
 import {
   grantTrust,
   hashTrustContent,
@@ -50,7 +63,7 @@ import {
 // One prompt reader shared with `secrets` -- see readTrustAnswer at the bottom
 // of this file for why. A leaf module, so sharing it does not pull the
 // secret-vault graph into a command that never opens the vault.
-import { readAnswerFromTTY } from "./tty-reader.js";
+import { ANSWER_EOF, readAnswerFromTTY } from "./tty-reader.js";
 import type { UpstreamServerConfig } from "./types.js";
 
 export const TRUST_USAGE = `Usage: yaw-mcp trust [--yes]
@@ -69,6 +82,12 @@ export const TRUST_USAGE = `Usage: yaw-mcp trust [--yes]
   unversioned package can change without any edit to bundles.json.
 
   Your own ~/.yaw-mcp/bundles.json is never gated by this command.
+
+  When the approved file pins a git server that is not built on this
+  machine, a terminal run offers to build it. With --yes (which a run with
+  no TTY requires), the approval is recorded, the build command is printed,
+  and the exit code is 1 (approved, but not runnable yet). A build that is
+  started and does not finish exits 1 too; declining the offer exits 0.
 
   --yes, -y         Skip the confirmation prompt. Required when stdin or
                     stdout is not a TTY (there is nothing to ask on).
@@ -403,8 +422,12 @@ async function runTrustGrant(opts: TrustCommandOptions): Promise<TrustCommandRes
     throw e;
   }
   if (granted.storeWasMalformed) {
+    // "Could not be parsed as a trust store", not "was not valid JSON": the
+    // "parse" kind grantTrust rebuilds over also covers bytes that ARE valid
+    // JSON in the wrong shape (a non-object root, a bad `version`, no
+    // `trusted` object).
     printErr(
-      `Note: the previous trust store at ${displaySafe(granted.storePath)} was not valid JSON and has been replaced -- any other project you had approved must be approved again.`,
+      `Note: the previous trust store at ${displaySafe(granted.storePath)} could not be parsed as a trust store and has been replaced -- any other project you had approved must be approved again.`,
     );
   }
   print(`Approved ${displaySafe(path)}`);
@@ -476,6 +499,9 @@ async function offerGitBuild(
     `Trusted. ${what} not built. Build ${one ? "it" : "them"} now? This runs ${one ? "its" : "their"} install/build scripts. [Y/n] `,
     readTrustAnswer,
   );
+  // [Y/n]: a bare Enter builds. ^D and ^C are not strings (QUESTION_EOF,
+  // QUESTION_CANCELLED), so neither matches "" and both decline -- leaving the
+  // prompt must never be what runs a repo's install/build scripts.
   if (answer !== "" && answer !== "y" && answer !== "yes") {
     print("Not built. Build later with: yaw-mcp sidecars install");
     return 0;
@@ -960,21 +986,25 @@ async function classifyRecord(path: string, sha256: string): Promise<ListStatus>
  *  verbatim therefore matched nothing and exited 0 with "was not approved
  *  (nothing to do)" -- a silent no-op that reads as a successful revoke.
  *
- *  A path that does not exist is passed through unchanged: there is nothing to
- *  probe, and revokeTrust's not-approved branch is the right answer for it. */
-async function resolveRevokeTarget(target: string): Promise<string> {
+ *  A path that cannot be stat'ed (deleted, usually) is tried verbatim first --
+ *  that is the file-path spelling of a project that is gone. `ifNotApproved`
+ *  then carries the directory reading of the same path, for runTrustRevoke to
+ *  try when the verbatim one matched no row: with nothing on disk to say
+ *  which the user meant, `--revoke /deleted/project` used to match nothing
+ *  and report "was not approved (nothing to do)" with the grant still in the
+ *  store, though the same spelling revoked it while the directory existed. */
+async function resolveRevokeTarget(target: string): Promise<{ target: string; ifNotApproved?: string }> {
+  // <project>/.yaw-mcp -> that directory's bundles.json; anything else is
+  // treated as the project root, which owns a .yaw-mcp/ of its own.
+  const asDirectory =
+    basename(target) === CONFIG_DIRNAME ? localBundlesPath(target) : localBundlesPath(join(target, CONFIG_DIRNAME));
   let isDir: boolean;
   try {
     isDir = (await stat(target)).isDirectory();
   } catch {
-    return target;
+    return { target, ifNotApproved: asDirectory };
   }
-  if (!isDir) return target;
-  // <project>/.yaw-mcp -> that directory's bundles.json; anything else is
-  // treated as the project root, which owns a .yaw-mcp/ of its own.
-  return basename(target) === CONFIG_DIRNAME
-    ? localBundlesPath(target)
-    : localBundlesPath(join(target, CONFIG_DIRNAME));
+  return { target: isDir ? asDirectory : target };
 }
 
 async function runTrustRevoke(opts: TrustCommandOptions): Promise<TrustCommandResult> {
@@ -993,13 +1023,14 @@ async function runTrustRevoke(opts: TrustCommandOptions): Promise<TrustCommandRe
   const bypassed = isTrustBypassEnabled(env);
 
   let target: string;
+  let ifNotApproved: string | undefined;
   // `!== undefined`, not truthiness: an empty string is a PATH the caller
   // named, not an absent one, and falling through to the cwd probe for it
   // revoked a different file than the command asked about. parseTrustArgs
   // rejects an empty operand outright; this is the same rule for the
   // programmatic entry point.
   if (opts.path !== undefined) {
-    target = await resolveRevokeTarget(resolve(cwd, opts.path));
+    ({ target, ifNotApproved } = await resolveRevokeTarget(resolve(cwd, opts.path)));
   } else {
     const probe = await probeProjectTrust({ cwd, home, env });
     if (probe.path === null) {
@@ -1011,7 +1042,18 @@ async function runTrustRevoke(opts: TrustCommandOptions): Promise<TrustCommandRe
     target = probe.path;
   }
 
-  const res = await revokeTrust(target, { home });
+  let res = await revokeTrust(target, { home });
+  // The named path is gone from disk and no row carries it verbatim: try it
+  // as the project directory it may have been (see resolveRevokeTarget). The
+  // first call wrote nothing, so this is still one store write at most. A
+  // miss here too reports the path as the user spelled it.
+  if (!res.removed && !res.storeWasMalformed && ifNotApproved !== undefined) {
+    const second = await revokeTrust(ifNotApproved, { home });
+    if (second.removed || second.storeWasMalformed) {
+      res = second;
+      target = ifNotApproved;
+    }
+  }
   if (res.storeWasMalformed) {
     // The same three kinds --list and the grant path distinguish, with the same
     // remedies. Collapsing them into "is unreadable, so nothing is trusted and
@@ -1076,29 +1118,37 @@ function isInteractive(opts: TrustCommandOptions): boolean {
   return (stdin as { isTTY?: boolean }).isTTY === true && (stdout as { isTTY?: boolean }).isTTY === true;
 }
 
-/** The reader the approval prompt hands askYesNo in place of its readline
+/** The reader all three trust prompts hand askYesNo in place of its readline
  *  default; askYesNo still owns the promptAnswer short-circuit and the
- *  trimmed, lower-cased answer. The prompt defaults to NO -- only an explicit
- *  y/yes proceeds, so a bare Enter (or ^D, or a stray keystroke) leaves the
- *  file unapproved.
+ *  trimmed, lower-cased answer. The approval prompt is [y/N] -- only an
+ *  explicit y/yes proceeds, so a bare Enter (or ^D, or a stray keystroke)
+ *  leaves the file unapproved. The two build prompts in offerGitBuild are
+ *  [Y/n]: a bare Enter proceeds there, and ^D does not.
  *
- *  Routed through secrets-cmd's reader rather than node:readline so both of
- *  the product's confirmation prompts behave identically: control bytes are
- *  dropped instead of buffered and echoed, which is what stops an arrow key
- *  at this prompt from repainting the screen AND leaving an invisible byte in
- *  the answer ("\x1by" is not "y", so the approval silently flipped to a
- *  decline). Two implementations of "read one confirmation" drift; there is
- *  now one.
+ *  Routed through tty-reader.ts's raw-mode reader -- the one `secrets` reads
+ *  its prompts with -- rather than node:readline so the confirmation prompts
+ *  of those two commands behave identically: control bytes are dropped
+ *  instead of buffered and echoed, which is what stops an arrow key at this
+ *  prompt from repainting the screen AND leaving an invisible byte in the
+ *  answer ("\x1by" is not "y", so the approval silently flipped to a
+ *  decline). Every other command's prompt still reads through node:readline
+ *  (readline-question.ts).
  *
  *  null = ^C, handed on as QUESTION_CANCELLED -- the value askYesNo's default
  *  reader produces for the same keystroke -- so the grant path can tell "the
  *  user left" (exit 130, like every secrets prompt) from "the user said no"
- *  (exit 1, Aborted). Folding ^C into "" used to make both exit 1. ^D still
- *  comes back "" from the reader and takes the NO default. */
+ *  (exit 1, Aborted). Folding ^C into "" used to make both exit 1.
+ *
+ *  ANSWER_EOF = ^D, handed on as QUESTION_EOF, again the default reader's
+ *  value for it. It used to come back as "", which the approval prompt read
+ *  as no but both [Y/n] build prompts read as the bare Enter that means yes:
+ *  ^D ran the repo's install/build scripts. */
 async function readTrustAnswer(
   input: NodeJS.ReadableStream,
   output: NodeJS.WritableStream,
   question: string,
-): Promise<string | QuestionCancelled> {
-  return (await readAnswerFromTTY(input, output, question)) ?? QUESTION_CANCELLED;
+): Promise<string | QuestionCancelled | QuestionEof> {
+  const answer = await readAnswerFromTTY(input, output, question);
+  if (answer === null) return QUESTION_CANCELLED;
+  return answer === ANSWER_EOF ? QUESTION_EOF : answer;
 }

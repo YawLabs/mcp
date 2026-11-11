@@ -1,12 +1,14 @@
-// The one raw-mode line reader behind every interactive prompt in the CLI.
+// The raw-mode line reader behind the `secrets` and `trust` prompts.
 //
 // `yaw-mcp secrets` reads its passphrases, its secret value and its
 // destructive-action confirmation here; `yaw-mcp trust` reads its approval
-// prompt here (readAnswerFromTTY). One reader means ^C / ^D / Backspace / a
-// stray ESC behave identically at every prompt in the product -- the fix for
-// an arrow key at a [y/N] prompt (a raw ESC echoed back is EXECUTED by the
-// terminal, and "\x1by" is not "y", so the answer silently flipped) landed
-// here once instead of in a copy per command.
+// prompt and its two build prompts here (readAnswerFromTTY). Every other
+// prompt in the CLI goes through node:readline instead (readline-question.ts).
+// One reader for these two commands means Backspace and a stray ESC behave
+// identically at all of their prompts -- the fix for an arrow key at a [y/N]
+// prompt (a raw ESC echoed back is EXECUTED by the terminal, and "\x1by" is
+// not "y", so the answer silently flipped) landed here once instead of in a
+// copy per command.
 //
 // A LEAF module on purpose: it imports nothing from the rest of the CLI, so
 // trust-cmd.ts can share the reader without pulling the secret-vault graph
@@ -33,6 +35,14 @@ export type Cancelled = typeof CANCELLED;
 export const NO_ECHO: unique symbol = Symbol("yaw-mcp:no-echo-unavailable");
 export type NoEcho = typeof NO_ECHO;
 
+/** Returned by readAnswerFromTTY when the user hit ^D at the prompt, or the
+ *  stream ended under it (what ^D becomes when raw mode was refused). Distinct
+ *  from "" (a bare Enter), because a [Y/n] prompt takes a bare Enter as YES
+ *  and ^D must never be consent. readLineFromTTY does not hand this out: its
+ *  callers all want ^D as the empty entry. */
+export const ANSWER_EOF: unique symbol = Symbol("yaw-mcp:answer-eof");
+export type AnswerEof = typeof ANSWER_EOF;
+
 /** Control bytes the raw-mode reader reacts to. Spelled as escapes: the
  *  literal bytes are invisible in an editor and get mangled by tooling. */
 const CTRL_C = "\x03"; // ETX -- cancel the whole command
@@ -44,7 +54,7 @@ const ESC = "\x1b"; // opens a key sequence (arrow, Alt chord) -- never input
 /** Raw-mode line reader for the controlling TTY. Shared by the passphrase
  *  prompts (echo OFF -- the default), the destructive-action confirmation
  *  (echo ON, so the user can see the y/n they typed), and -- via
- *  readAnswerFromTTY below -- `yaw-mcp trust`'s approval prompt.
+ *  readAnswerFromTTY below -- `yaw-mcp trust`'s approval and build prompts.
  *
  *  A no-echo read that cannot enter raw mode resolves NO_ECHO without
  *  writing the prompt or reading a byte. An echo read carries on
@@ -74,7 +84,20 @@ export function readLineFromTTY(
   echo = false,
   keepTab = false,
 ): Promise<string | Cancelled | NoEcho> {
-  return new Promise<string | Cancelled | NoEcho>((resolve) => {
+  return readLine(stdin, stdout, prompt, echo, keepTab).then((value) => (value === ANSWER_EOF ? "" : value));
+}
+
+/** The reader itself. Resolves ANSWER_EOF for ^D, and for a stream that ends
+ *  or closes before a line is submitted, so readAnswerFromTTY can tell it
+ *  from a bare Enter; readLineFromTTY folds it into "". */
+function readLine(
+  stdin: NodeJS.ReadStream,
+  stdout: NodeJS.WritableStream,
+  prompt: string,
+  echo: boolean,
+  keepTab: boolean,
+): Promise<string | Cancelled | NoEcho | AnswerEof> {
+  return new Promise<string | Cancelled | NoEcho | AnswerEof>((resolve) => {
     const chunks: string[] = [];
     const wasRaw = stdin.isRaw === true;
     // Raw mode BEFORE the prompt is written, so a refused no-echo read leaves
@@ -103,11 +126,14 @@ export function readLineFromTTY(
     stdout.write(prompt);
     stdin.resume();
     stdin.setEncoding("utf8");
-    // Single teardown path: detach the listener, restore the previous raw
-    // mode, pause stdin, then settle. Every exit from onData goes through it.
-    const finish = (value: string | Cancelled): void => {
+    // Single teardown path: detach the listeners, restore the previous raw
+    // mode, pause stdin, then settle. Every exit from onData goes through it,
+    // and so does a stream that ends (onEnd).
+    const finish = (value: string | Cancelled | AnswerEof): void => {
       if (raw) stdout.write("\n");
       stdin.removeListener("data", onData);
+      stdin.removeListener("end", onEnd);
+      stdin.removeListener("close", onEnd);
       try {
         stdin.setRawMode?.(wasRaw);
       } catch {
@@ -120,6 +146,15 @@ export function readLineFromTTY(
     // split an arrow key's bytes over two reads, and the tail of one must
     // not be taken for typed text.
     let esc: "none" | "esc" | "seq" = "none";
+    // The stream ended with no terminating byte: the same outcome as ^D.
+    // Without this the promise never settled. A terminal in cooked mode (the
+    // echo fallback above) turns ^D into a stream end instead of a 0x04 byte,
+    // and a stream can close under a prompt; either way the caller hung, the
+    // event loop drained, and the process exited 0 with nothing decided.
+    // Anything typed before the end is dropped, as it is for the ^D byte.
+    function onEnd(): void {
+      finish(ANSWER_EOF);
+    }
     // Hoisted declaration so `finish` above can name it.
     function onData(chunk: string): void {
       let consumed = 0;
@@ -131,7 +166,7 @@ export function readLineFromTTY(
       // residual at the head of the stream (finish() has already paused
       // it), so the NEXT reader's resume() picks it up. Optional call: the
       // injectable io contract only promises a ReadableStream shape.
-      const finishAndRebuffer = (value: string | Cancelled): void => {
+      const finishAndRebuffer = (value: string | Cancelled | AnswerEof): void => {
         finish(value);
         const rest = chunk.slice(consumed);
         if (rest.length > 0) (stdin as { unshift?: (c: string) => void }).unshift?.(rest);
@@ -176,11 +211,13 @@ export function readLineFromTTY(
           return;
         }
         if (ch === CTRL_D) {
-          // Cancel this entry. Resolve to "", an empty submission -- the
-          // no-echo prompts (passphrase and value) re-prompt on it, and a
-          // y/N or RESET confirmation reads it as no. Never a line
-          // terminator that would submit a partial entry.
-          finishAndRebuffer("");
+          // Cancel this entry. Never a line terminator that would submit a
+          // partial entry. readLineFromTTY's callers get "", an empty
+          // submission: the no-echo prompts (passphrase and value) re-prompt
+          // on it, and the secrets y/N and RESET confirmations read it as
+          // no. readAnswerFromTTY hands ANSWER_EOF on, so a [Y/n] prompt
+          // cannot take it for the bare Enter that means yes.
+          finishAndRebuffer(ANSWER_EOF);
           return;
         }
         if (ch === CTRL_C) {
@@ -214,12 +251,22 @@ export function readLineFromTTY(
       }
     }
     stdin.on("data", onData);
+    // `on`, not `once`: finish() detaches both, and the injectable stream
+    // contract here only promises on/removeListener.
+    stdin.on("end", onEnd);
+    stdin.on("close", onEnd);
+    // A stream that ended BEFORE this read emits neither event again, so the
+    // re-prompt after an end-of-stream would wait forever; this is what lets
+    // the callers' retry caps actually run out on a closed stream.
+    if (stdin.readableEnded || stdin.destroyed) onEnd();
   });
 }
 
 /**
  * Ask a one-line question on the terminal and hand back what was typed
- * (trimmed, lowercased by the caller). Returns null when the user hit ^C.
+ * (trimmed, lowercased by the caller). Returns null when the user hit ^C and
+ * ANSWER_EOF when they hit ^D or the stream ended -- neither is an answer,
+ * and ^D in particular must not come back as the "" a bare Enter produces.
  *
  * Exists so `yaw-mcp trust` and `yaw-mcp secrets` share ONE prompt reader
  * instead of two. trust-cmd used node:readline, secrets-cmd used the raw-mode
@@ -233,7 +280,11 @@ export async function readAnswerFromTTY(
   stdin: NodeJS.ReadableStream,
   stdout: NodeJS.WritableStream,
   question: string,
-): Promise<string | null> {
-  const answer = await readLineFromTTY(stdin as NodeJS.ReadStream, stdout, question, true);
+): Promise<string | AnswerEof | null> {
+  // echo is true, so NO_ECHO (the refusal of a no-echo read) cannot come back.
+  const answer = (await readLine(stdin as NodeJS.ReadStream, stdout, question, true, false)) as
+    | string
+    | Cancelled
+    | AnswerEof;
   return answer === CANCELLED ? null : answer;
 }

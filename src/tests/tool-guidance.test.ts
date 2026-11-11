@@ -170,6 +170,22 @@ describe("find_tool and servers it cannot search", () => {
     expect(after).not.toContain("bundled");
     expect(after).not.toContain("issue_write");
   });
+
+  it("pluralizes the bundled-list footer when several never-loaded servers are shown", async () => {
+    const p = priv();
+    p.config = {
+      configVersion: "v1",
+      servers: [
+        { ...servers()[1], ...GH_IMAGE },
+        { ...servers()[1], id: "gh2", namespace: "github2", ...GH_IMAGE },
+      ],
+    };
+    const text: string = (await p.handleFindTool("create a github issue")).content[0].text;
+    expect(text).toMatch(
+      /\[bundled list\]: github2?, github2? have never loaded on this machine, so their tools above come from yaw-mcp's bundled copy of the upstream lists and are unconfirmed; loading one replaces its tools with what it really serves\./,
+    );
+    expect(text).not.toContain("has never loaded");
+  });
 });
 
 describe("dispatch names the tools that fit, with their arguments", () => {

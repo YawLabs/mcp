@@ -40,12 +40,15 @@
 //      the panel needs to keep rendering, and the warnings ride in the payload
 //      (doctor is the command whose job is to turn a warning into exit 2).
 //   1  genuinely unreadable: a bundles.json is present but could not be read
-//      or parsed, so we cannot say what this machine loads.
+//      or parsed, or the loader itself threw, so we cannot say what this
+//      machine loads. The payload is still printed, with config.readable
+//      false.
 //   2  argv error (index.ts's shared parse-then-dispatch tail).
 
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { type GradesCache, readGradesCache } from "./grades-cache.js";
+import { scrubForWarning } from "./health-score.js";
 import type { NamespaceUsage } from "./learning.js";
 import { isRemoteEntry, loadLocalBundles, localBundlesPath } from "./local-bundles.js";
 import { createStreamWriter } from "./logger.js";
@@ -135,7 +138,9 @@ export interface StatusPayload {
   config: {
     /** The bundles.json that WON, or null when no file exists anywhere.
      *  Non-null with `readable: false` is the "there is a file and we cannot
-     *  use it" state; null with `readable: true` is a fresh install. */
+     *  use it" state; null with `readable: true` is a fresh install. Null
+     *  with `readable: false` is the loader itself failing before it settled
+     *  on a file; `warnings` then carries its message. */
     path: string | null;
     /** Which scope won. A project-local file (approved via `yaw-mcp trust`)
      *  beats the user-global one outright. */
@@ -287,8 +292,24 @@ export async function collectStatus(opts: StatusCommandOptions = {}): Promise<St
   // another's result, and a panel opens on this command. The fourth read,
   // the vault's existsSync below, is synchronous and so sits outside the
   // Promise.all.
+  let loaderThrew = false;
   const [loaded, grades, state] = await Promise.all([
-    loadLocalBundles({ home, cwd, env }),
+    // A loader THROW (not a file it could not read or parse -- it reports
+    // those itself, as a null config beside a path and a warning) is caught
+    // here for the reason doctor catches the same call (collectOamRuntimeStatus
+    // in doctor-cmd.ts): uncaught, it rejected the whole command, and exit 1 came
+    // with a bare stderr line and NO payload, where the header promises exit 1
+    // is a payload whose config.readable is false. Scrubbed, as doctor scrubs
+    // it: an errno message can carry the path it failed on.
+    loadLocalBundles({ home, cwd, env }).catch((err: unknown): Awaited<ReturnType<typeof loadLocalBundles>> => {
+      loaderThrew = true;
+      return {
+        config: null,
+        path: null,
+        warnings: [`could not load bundles.json: ${scrubForWarning(err instanceof Error ? err.message : String(err))}`],
+        consultedPaths: [],
+      };
+    }),
     // readGradesCache swallows its own read and parse failures and returns {}
     // (grades-cache.ts; only the strictRead WRITE path rethrows), so a missing
     // or garbled cache already degrades to "no grades". The catch is the belt
@@ -305,8 +326,11 @@ export async function collectStatus(opts: StatusCommandOptions = {}): Promise<St
   // config === null with a non-null path is the only unreadable shape:
   // loadLocalBundles returns a null config either because no file exists
   // anywhere (path null too) or because the file it committed to could not be
-  // read or parsed (path set, warnings populated). Nothing else here is fatal.
-  const readable = loaded.config !== null || loaded.path === null;
+  // read or parsed (path set, warnings populated). The one other unreadable
+  // state is the loader itself throwing (caught above): it never said which
+  // file it was on, so the path stays null and `loaderThrew` carries the fact.
+  // Nothing else here is fatal.
+  const readable = !loaderThrew && (loaded.config !== null || loaded.path === null);
 
   const learning = state.state.learning;
   // Ask the shared selector once for the whole population rather than
@@ -408,14 +432,27 @@ export async function runStatus(opts: StatusCommandOptions = {}): Promise<Status
   }
 
   print(`yaw-mcp ${payload.version}`);
-  if (payload.config.path === null) {
+  if (payload.config.path === null && !payload.config.readable) {
+    // The loader threw before it settled on a file (collectStatus's catch):
+    // not "none yet", which would send the user to add a server they may
+    // already have. The warning on stderr carries the message.
+    print("config:   UNREADABLE -- could not be loaded (see the warning on stderr)");
+  } else if (payload.config.path === null) {
     print(`config:   none yet -- add a server with \`yaw-mcp add <slug>\``);
   } else {
     print(`config:   ${payload.config.path} (${payload.config.scope})${payload.config.readable ? "" : " UNREADABLE"}`);
   }
   const graded = payload.servers.filter((s) => s.grade !== null).length;
   print(`servers:  ${payload.serverCount} total, ${payload.activeCount} active, ${graded} graded`);
-  print(`vault:    ${payload.vault.exists ? (payload.vault.locked ? "locked" : "unlocked") : "none yet"}`);
+  // Worded as what was actually checked. `locked` is env presence only (this
+  // command never opens the vault), so "unlocked" would be a claim a stale
+  // passphrase makes false; doctor's SECRET VAULT section is what tries it.
+  const vaultState = !payload.vault.exists
+    ? "none yet"
+    : payload.vault.locked
+      ? "present, no passphrase in this env (locked)"
+      : "present, passphrase set (not verified -- `yaw-mcp doctor` checks it unlocks)";
+  print(`vault:    ${vaultState}`);
   const learningState = payload.learning.readable
     ? `${payload.learning.namespaces} namespace${payload.learning.namespaces === 1 ? "" : "s"}, ${payload.learning.calls} calls`
     : "unreadable";

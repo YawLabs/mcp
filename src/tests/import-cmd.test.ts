@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { parseImportArgs, runImport } from "../import-cmd.js";
+import { IMPORT_USAGE, parseImportArgs, runImport } from "../import-cmd.js";
 import { CURRENT_OS, INSTALL_TARGETS, resolveInstallPath } from "../install-targets.js";
 import { loadLocalBundles } from "../local-bundles.js";
 import { CONFIG_DIRNAME } from "../paths.js";
@@ -1660,5 +1660,161 @@ describe("runImport -- promptAnswer answers the bundles.json overwrite question 
     });
     expect(r2.written).toEqual([]);
     expect(readFileSync(seed.bundlesPath, "utf8")).toBe(seed.bundlesBefore);
+  });
+});
+
+describe("runImport -- a Cline ${env:NAME} is refused by name, not imported verbatim", () => {
+  it("skips the server carrying one and still imports its neighbours", async () => {
+    // Cline expands `${env:NAME}` itself and yaw-mcp does not, so the entry
+    // used to be copied across with the literal text -- and --remove-originals
+    // then deleted the working Cline entry it was copied from.
+    const settings = join(synthHome, ".cline", "data", "settings");
+    mkdirSync(settings, { recursive: true });
+    const file = join(settings, "cline_mcp_settings.json");
+    writeFileSync(
+      file,
+      `${JSON.stringify(
+        {
+          mcpServers: {
+            mcp: { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] },
+            needsenv: { command: "node", args: ["a.js"], env: { TOKEN: "${env:MY_TOKEN}" } },
+            // Not a Cline variable: literal text to Cline, so literal here.
+            literal: { command: "node", args: ["${notAVariable}/b.js"] },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    const cap = capture();
+    const r = await runImport({ clientId: "cline", home: synthHome, cwd: synthCwd, removeOriginals: true, ...cap });
+    expect(r.exitCode).toBe(0);
+    const rows = bundles();
+    expect(rows.map((s) => s.namespace)).toEqual(["literal"]);
+    expect(rows[0].args).toEqual(["${notAVariable}/b.js"]);
+    expect(cap.errText()).toMatch(/Skipped \(Cline expands these variables itself/);
+    expect(cap.errText()).toContain("needsenv");
+    expect(cap.errText()).toContain("${env:MY_TOKEN}");
+    // The skipped server is still Cline's to launch: it was not removed.
+    const after = JSON.parse(readFileSync(file, "utf8"));
+    expect(Object.keys(after.mcpServers).sort()).toEqual(["mcp", "needsenv"]);
+  });
+});
+
+describe("runImport -- the removal works on the file as it is NOW, not as the plan read it", () => {
+  /** Runs `edit` at the moment the "still launches" line prints: after every
+   *  bundles.json write and before the removal -- the window a prompt holds
+   *  open while the client goes on rewriting its own config. */
+  function editBeforeRemoval(edit: () => void) {
+    const cap = capture();
+    let done = false;
+    return {
+      ...cap,
+      out: (s: string) => {
+        cap.out(s);
+        if (!done && s.includes("still launches")) {
+          done = true;
+          edit();
+        }
+      },
+    };
+  }
+
+  it("keeps what the client wrote to its config while the import was running", async () => {
+    const path = writeClaudeCode(WIRED);
+    const cap = editBeforeRemoval(() => {
+      const now = JSON.parse(readFileSync(path, "utf8"));
+      now.numStartups = 42;
+      now.mcpServers.added = { command: "node", args: ["new.js"] };
+      writeFileSync(path, JSON.stringify(now, null, 2));
+    });
+    const r = await runImport({
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      removeOriginals: true,
+      out: cap.out,
+      err: cap.err,
+    });
+    expect(r.exitCode).toBe(0);
+    const after = JSON.parse(readFileSync(path, "utf8"));
+    expect(after.numStartups).toBe(42);
+    expect(Object.keys(after.mcpServers).sort()).toEqual(["added", "mcp"]);
+  });
+
+  it("leaves, and names, an entry that changed after it was read", async () => {
+    const path = writeClaudeCode(WIRED);
+    const cap = editBeforeRemoval(() => {
+      const now = JSON.parse(readFileSync(path, "utf8"));
+      now.mcpServers.github.args = ["-y", "a-different-server"];
+      writeFileSync(path, JSON.stringify(now, null, 2));
+    });
+    const r = await runImport({
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      removeOriginals: true,
+      out: cap.out,
+      err: cap.err,
+    });
+    expect(r.exitCode).toBe(0);
+    const after = JSON.parse(readFileSync(path, "utf8"));
+    expect(Object.keys(after.mcpServers).sort()).toEqual(["github", "mcp"]);
+    expect(after.mcpServers.github.args).toEqual(["-y", "a-different-server"]);
+    expect(cap.errText()).toMatch(/changed there after the import read it: github/);
+  });
+
+  it("says an entry the client deleted meanwhile is gone, not left behind", async () => {
+    const path = writeClaudeCode(WIRED);
+    const cap = editBeforeRemoval(() => {
+      const now = JSON.parse(readFileSync(path, "utf8"));
+      delete now.mcpServers.github;
+      writeFileSync(path, JSON.stringify(now, null, 2));
+    });
+    const r = await runImport({
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      removeOriginals: true,
+      out: cap.out,
+      err: cap.err,
+    });
+    expect(r.exitCode).toBe(0);
+    const after = JSON.parse(readFileSync(path, "utf8"));
+    expect(Object.keys(after.mcpServers)).not.toContain("github");
+    expect(cap.errText()).toMatch(/already gone from .*removed there after the import read it: github/);
+    // Nothing is left in the file and there is no current entry to re-import.
+    expect(cap.errText()).not.toMatch(/left in .*: github/);
+    expect(cap.errText()).not.toContain("Re-run the import to pick up");
+  });
+
+  it("removes nothing when the file stopped parsing in the meantime", async () => {
+    const path = writeClaudeCode(WIRED);
+    const cap = editBeforeRemoval(() => writeFileSync(path, "{ not json"));
+    const r = await runImport({
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      removeOriginals: true,
+      out: cap.out,
+      err: cap.err,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(readFileSync(path, "utf8")).toBe("{ not json");
+    expect(r.written).not.toContain(path);
+    expect(cap.errText()).toMatch(/nothing was removed from it/);
+  });
+});
+
+describe("IMPORT_USAGE -- the vault step it recommends is the one the run prints", () => {
+  it("names the one-step `set env.KEY --secret` form for env credentials", () => {
+    expect(IMPORT_USAGE).toContain("yaw-mcp set <server> env.KEY --secret");
+    expect(IMPORT_USAGE).not.toContain("env.KEY='${secret:NAME}'");
+  });
+
+  it("says the value is asked for again, not carried over from the imported entry", () => {
+    // `set --secret` reads the value from a prompt or stdin, never from the
+    // stored entry, so "moves the credential" with no more said was wrong.
+    expect(IMPORT_USAGE.replace(/\s+/g, " ")).toContain("asks for the value again (a no-echo prompt, or piped stdin)");
   });
 });

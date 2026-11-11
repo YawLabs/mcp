@@ -49,6 +49,23 @@ const ENV_WORDS = `(?:(?:env|environment)${GAP})?(?:(?:variable|var)${GAP})?`;
 // group and reports the name as "IANT_TOKEN" (and "Missing ENV_TOKEN" /
 // "Missing VARS_TOKEN" would lose a prefix the same way).
 const LEADING_ENV_WORDS = `(?:(?:env|environment)${SEP})?(?:(?:variables?|vars?)${SEP})?`;
+// A short credential noun in front of the name, read by pattern 1b only:
+// "Missing API key: OPENAI_API_KEY", "Missing credentials: GITHUB_TOKEN",
+// "Missing token GH_TOKEN". Pattern 1 commits to the noun itself as the name
+// ("API", "credentials"), the filters drop that, and no other pattern matches
+// a line of this shape -- so nothing was elicited. The trailing SEP is
+// load-bearing for the same reason it is in LEADING_ENV_WORDS: "Missing
+// TOKEN_X" and "Missing SECRET_KEY" are not read as noun + name, because an
+// underscore is not a separator.
+//
+// MANDATORY, and in a pattern of its own, on purpose. As an optional prefix
+// inside pattern 1 it swallowed an env var literally NAMED like the noun
+// whenever another word followed: the patterns are case-insensitive, so in
+// "Missing TOKEN environment variable" the noun group took "TOKEN", the
+// capture succeeded on "environment", the engine never backtracked to the
+// noun-as-name reading, and isAllCaps then dropped the lowercase word --
+// nothing elicited for a bare TOKEN / SECRETS / CREDENTIALS variable.
+const LEADING_CREDENTIAL_NOUN = `(?:api(?:${GAP}|-)?keys?|tokens?|credentials?|secrets?)${SEP}`;
 
 // Pattern 1 tolerates these words around the name: an optional "required",
 // then LEADING_ENV_WORDS -- an optional "env"/"environment" and an optional
@@ -57,6 +74,12 @@ const LEADING_ENV_WORDS = `(?:(?:env|environment)${SEP})?(?:(?:variables?|vars?)
 // "var"/"variable" -- "Missing env var: OPENAI_API_KEY" (this file's own
 // header example), "Missing env: X" and "missing: X" all elicit. It captures
 // only the FIRST name of a comma-separated list.
+//
+// Pattern 1b is pattern 1 with a LEADING_CREDENTIAL_NOUN required in front of
+// the name ("Missing API key: X"), the noun taking the same optional colon.
+// Both run over every message and feed one set, so an ALL_CAPS noun followed
+// by a second credential-shaped name ("Missing CREDENTIALS JSON_KEY") yields
+// both names: nothing in the text says which reading the server meant.
 //
 // Pattern 2 needs "is" before required/missing/empty/undefined, because
 // without it those words describe something else ("GITHUB_TOKEN required
@@ -81,6 +104,10 @@ const LEADING_ENV_WORDS = `(?:(?:env|environment)${SEP})?(?:(?:variables?|vars?)
 // hit on one message makes the next scan start mid-string and miss.
 const MISSING_PATTERNS: RegExp[] = [
   new RegExp(`\\bmissing${SEP}(?:required${GAP})?${LEADING_ENV_WORDS}${QUOTE}(${NAME})\\b`, "gi"),
+  new RegExp(
+    `\\bmissing${SEP}(?:required${GAP})?${LEADING_ENV_WORDS}${LEADING_CREDENTIAL_NOUN}${QUOTE}(${NAME})\\b`,
+    "gi",
+  ),
   new RegExp(
     `\\b(${NAME})${QUOTE}${GAP}${ENV_WORDS}(?:is${GAP}(?:required|missing|empty|undefined)|(?:is${GAP})?(?:not${GAP}set|unset|not${GAP}provided))\\b`,
     "gi",

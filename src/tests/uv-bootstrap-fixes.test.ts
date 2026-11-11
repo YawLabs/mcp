@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // ═══════════════════════════════════════════════════════════════════════
 // Pins for the two uv-bootstrap bug fixes that require mocking spawn:
 //
-//   Fix 1: onPath must pass shell:true on win32 so PATHEXT shims (.cmd)
+//   Fix 1: probePath must pass shell:true on win32 so PATHEXT shims (.cmd)
 //          are found and the probe doesn't false-negative on Windows --
 //          which MATCHES the real spawn: the SDK's StdioClientTransport
 //          goes through cross-spawn, which resolves PATHEXT shims and
@@ -47,11 +47,11 @@ vi.mock("undici", () => ({
 
 // Mock node:child_process at module level -- required for ESM mocking.
 // We replace spawn with a factory that stores the last options and emits
-// an error event so onPath returns false immediately. The timeout-path
+// an error event so probePath answers "absent" immediately. The timeout-path
 // test flips spawnMode.hang: the fake child then never emits anything, so
-// onPath's 3s timer is the only way out, and the fake records what the
+// probePath's 3s timer is the only way out, and the fake records what the
 // timeout handler did to it (kill signal, unref). spawnMode.pathHit is the
-// opposite flip: the probe exits 0, so onPath returns true and ensureUv
+// opposite flip: the probe exits 0, so probePath answers "present" and ensureUv
 // resolves to the literal "uv" -- how the memo-clear test proves a RETRY can
 // actually succeed rather than merely re-failing.
 const spawnCalls: Array<{ cmd: string; opts: Record<string, unknown> }> = [];
@@ -81,7 +81,7 @@ vi.mock("node:child_process", () => {
       }
       fake.kill = () => {};
       if (spawnMode.pathHit) {
-        // uv answers `--version` with exit 0: onPath resolves true.
+        // uv answers `--version` with exit 0: probePath answers "present".
         setImmediate(() => fake.emit("close", 0));
         return fake;
       }
@@ -92,7 +92,7 @@ vi.mock("node:child_process", () => {
   };
 });
 
-import { __resetUvBootstrap, ensureUv, onPath } from "../uv-bootstrap.js";
+import { __probePathPresent, __resetUvBootstrap, ensureUv } from "../uv-bootstrap.js";
 
 beforeEach(() => {
   spawnCalls.length = 0;
@@ -110,9 +110,9 @@ afterEach(async () => {
   await fs.rm(path.join(os.tmpdir(), "yaw-mcp-uvbf-test-cache"), { recursive: true, force: true }).catch(() => {});
 });
 
-// ── Fix 1: onPath resolves the binary the way the SDK's spawn does ────
-describe("onPath spawn options (fix 1)", () => {
-  // The value onPath vouches for is handed to StdioClientTransport, which
+// ── Fix 1: probePath resolves the binary the way the SDK's spawn does ────
+describe("probePath spawn options (fix 1)", () => {
+  // The value probePath vouches for is handed to StdioClientTransport, which
   // spawns via cross-spawn: PATHEXT resolution + a cmd.exe wrapper for
   // .cmd/.bat shims. shell:true on win32 is the raw-spawn equivalent, so
   // a uv.cmd that passes this probe really does spawn at activation. A
@@ -131,7 +131,7 @@ describe("onPath spawn options (fix 1)", () => {
       spawnCalls.length = 0;
       __resetUvBootstrap();
       await ensureUv().catch(() => {});
-      // At least one spawn call must have been made (the onPath probe).
+      // At least one spawn call must have been made (the probePath probe).
       expect(spawnCalls.length).toBeGreaterThan(0);
       return spawnCalls[0].opts;
     } finally {
@@ -172,8 +172,8 @@ describe("onPath spawn options (fix 1)", () => {
   });
 });
 
-// ── onPath timeout path: SIGKILL + unref, not a bare default kill ─────
-describe("onPath timeout path", () => {
+// ── probePath timeout path: SIGKILL + unref, not a bare default kill ─────
+describe("probePath timeout path", () => {
   it("SIGKILLs and unrefs a wedged probe child, then resolves false", async () => {
     // child.kill() with no signal is SIGTERM, which a trapping child ignores;
     // and a still-referenced live child holds the broker's event loop open at
@@ -183,7 +183,7 @@ describe("onPath timeout path", () => {
     vi.useFakeTimers();
     spawnMode.hang = true;
     try {
-      const probe = onPath("uv");
+      const probe = __probePathPresent("uv");
       await vi.advanceTimersByTimeAsync(3_000);
       await expect(probe).resolves.toBe(false);
       expect(lastHangChild).not.toBeNull();
@@ -201,7 +201,7 @@ describe("uvTarget unsupported platform/arch (coverage gap)", () => {
   // The branch that fires when uvTarget() returns null: resolveUv() throws
   // 'No prebuilt uv binary' + the docs URL.
   //
-  // Strategy: ensureUv() calls onPath("uv") first (false -- the spawn mock
+  // Strategy: ensureUv() calls probePath("uv") first ("absent" -- the spawn mock
   // emits error), then resolveUv() calls uvTarget() with its default
   // parameters, which read process.platform/arch. Those two are stubbed to an
   // unsupported combination for the duration of the test. uvTarget itself is
@@ -259,7 +259,7 @@ describe("ensureUv rejection memo clear (fix 2)", () => {
     const first = await ensureUv().catch((e: unknown) => e);
     expect(first).toBeInstanceOf(Error);
 
-    // Now the transient condition clears -- the probe exits 0, so onPath finds
+    // Now the transient condition clears -- the probe exits 0, so probePath finds
     // uv and resolveUv short-circuits to the literal "uv". A memo that survived
     // the rejection would replay it here and never reach the new spawn
     // behavior, so a RESOLVED "uv" is what proves the clear actually happened.

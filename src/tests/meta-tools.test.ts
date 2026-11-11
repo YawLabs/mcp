@@ -1,15 +1,23 @@
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { MAX_EXEC_STEPS } from "../exec-engine.js";
 import { PENALTY_RATE_THRESHOLD } from "../learning.js";
 import {
   computeSecretsReport,
+  DISPATCH_DEFAULT_BUDGET,
+  DISPATCH_MAX_BUDGET,
+  EXEC_ECHO_BUDGET_KB,
+  FIND_TOOL_DEFAULT_LIMIT,
   LITE_META_TOOL_NAMES,
   META_TOOL_NAMES,
   META_TOOLS,
   SERVER_INSTRUCTIONS,
+  STARTUP_PREWARM_WAIT_SECONDS,
 } from "../meta-tools.js";
 import { buildToolList } from "../proxy.js";
 import { MALFORMED_REF_MARKER, MALFORMED_REF_MAX_CHARS, SECRET_REF_RE } from "../secrets-vault.js";
+import { ConnectServer, EXEC_ECHO_BUDGET_BYTES } from "../server.js";
 
 /** The tools/list wire JSON a client receives before any upstream is
  *  activated, at the given exposure -- exactly what the server's handler
@@ -120,7 +128,7 @@ describe("LITE_META_TOOL_NAMES", () => {
     // has to cap; lite is that choice applied at the source, so the set
     // must not drift from it in either direction.
     expect([...LITE_META_TOOL_NAMES].sort()).toEqual(
-      [META_TOOLS.exec.name, META_TOOLS.findTool.name, META_TOOLS.read_tool.name].sort(),
+      [META_TOOLS.exec.name, META_TOOLS.findTool.name, META_TOOLS.readTool.name].sort(),
     );
     // Cast as server.ts does: META_TOOL_NAMES is typed over the literal names.
     for (const name of LITE_META_TOOL_NAMES) expect((META_TOOL_NAMES as Set<string>).has(name)).toBe(true);
@@ -177,6 +185,48 @@ describe("meta-tool descriptions quote the constants that enforce them", () => {
     // learning.ts promises that moving this threshold moves every surface
     // that renders it -- this description is one of those surfaces.
     expect(META_TOOLS.health.description).toContain(`<${Math.round(PENALTY_RATE_THRESHOLD * 100)}%`);
+  });
+
+  // The next five numbers (four tests) are enforced by server.ts, which derives each from
+  // the meta-tools.ts constant the description quotes. These tests read
+  // server.ts's side, not meta-tools.ts's, so a literal retyped there fails.
+  it("renders the startup-scan wait from ConnectServer.STARTUP_PREWARM_WAIT_MS", () => {
+    const seconds = ConnectServer.STARTUP_PREWARM_WAIT_MS / 1000;
+    expect(STARTUP_PREWARM_WAIT_SECONDS).toBe(seconds);
+    expect(META_TOOLS.findTool.description).toContain(`(up to ${seconds} s)`);
+    expect(META_TOOLS.exec.inputSchema.properties.steps.items.properties.tool.description).toContain(
+      `waits up to ${seconds} s for the startup scan`,
+    );
+  });
+
+  it("renders exec's echo budget from EXEC_ECHO_BUDGET_BYTES", () => {
+    const kb = EXEC_ECHO_BUDGET_BYTES / 1024;
+    expect(EXEC_ECHO_BUDGET_KB).toBe(kb);
+    expect(META_TOOLS.exec.description).toContain(`exceed about ${kb} KB`);
+    expect(META_TOOLS.exec.inputSchema.properties.return.description).toContain(`exceed about ${kb} KB`);
+  });
+
+  it("renders find_tool's default limit from ConnectServer.FIND_TOOL_DEFAULT_LIMIT", () => {
+    // Private static: `private` is compile-time only, the value is there.
+    const enforced = (ConnectServer as unknown as { FIND_TOOL_DEFAULT_LIMIT: number }).FIND_TOOL_DEFAULT_LIMIT;
+    expect(enforced).toEqual(expect.any(Number));
+    expect(FIND_TOOL_DEFAULT_LIMIT).toBe(enforced);
+    expect(META_TOOLS.findTool.inputSchema.properties.limit.description).toContain(`Default ${enforced},`);
+  });
+
+  it("renders dispatch's budget default and cap as server.ts spells them", () => {
+    // server.ts enforces both inside inline expressions with nothing exported
+    // to compare against, so this reads its source text. Either spelling
+    // passes: the imported constant (what it uses today) or the equal literal.
+    const src = readFileSync(fileURLToPath(new URL("../server.ts", import.meta.url)), "utf8");
+    const cap = /Math\.max\(1, Math\.min\((\w+), Math\.floor\(budget\)\)\)/.exec(src);
+    expect(cap?.[1] === String(DISPATCH_MAX_BUDGET) || cap?.[1] === "DISPATCH_MAX_BUDGET").toBe(true);
+    const dflt = /Number\.isFinite\(args\.budget\) \? args\.budget : (\w+);/.exec(src);
+    expect(dflt?.[1] === String(DISPATCH_DEFAULT_BUDGET) || dflt?.[1] === "DISPATCH_DEFAULT_BUDGET").toBe(true);
+    const budget = META_TOOLS.dispatch.inputSchema.properties.budget;
+    expect(budget.description).toContain(`Default ${DISPATCH_DEFAULT_BUDGET}, cap ${DISPATCH_MAX_BUDGET}.`);
+    expect(budget.maximum).toBe(DISPATCH_MAX_BUDGET);
+    expect(budget.default).toBe(DISPATCH_DEFAULT_BUDGET);
   });
 
   it("does not retype the idle-unload threshold in deactivate's description", () => {

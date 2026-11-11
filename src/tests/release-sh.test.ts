@@ -41,10 +41,11 @@
 //   of them land on stubs and the bare repo.
 //
 // Step 4's publish-segfault probe is covered by forcing IS_MINGW_ARM64=true in
-// its extracted block. Still not covered: the other IS_MINGW_ARM64 139/134
-// tolerance paths -- run_npm_check, the build and the bump. The fixture and
-// full-run shapes reach them only when uname reports ARM64, though an
-// extracted-block case could force the variable the same way.
+// its extracted block, and so is run_npm_check's direct re-run path. Still not
+// covered: the other IS_MINGW_ARM64 139/134 tolerance paths -- run_npm_check's
+// done_re one, the build and the bump. The fixture and full-run shapes reach
+// them only when uname reports ARM64, though an extracted-block case could
+// force the variable the same way.
 
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -834,8 +835,69 @@ describe("release.sh tag-at-HEAD guard", () => {
 });
 
 describe("release.sh non-interactive confirm brake", () => {
-  const block = extractBlock('if [ "$SKIP_CONFIRM" != "true" ] && [ "$RESUMING" != "true" ]; then', "fi");
+  const block = extractBlock('if [ "$SKIP_CONFIRM" != "true" ] && [ "$RESUME_PROVEN" != "true" ]; then', "fi");
   const dir = newTmp("release-tty-");
+
+  // What decides RESUME_PROVEN. RESUMING alone only says package.json already
+  // reads the version, which a merged bump commit leaves too; the prompts are
+  // skipped only when a local tag for the version, or the version on npm, is
+  // there. The tag counts whatever made it: these cases build it with
+  // `git tag -a`, and a hand-run `npm version` (which tags by default) would
+  // skip the prompts the same way.
+  const evidence = extractBlock("# >>> resume evidence", "# <<< resume evidence");
+
+  function resume(opts: { resuming: boolean; tag: boolean; published: boolean }): RunResult {
+    const repo = newTmp("release-resume-");
+    git(repo, ["init", "-q", "-b", "main"]);
+    writeFileSync(join(repo, "a.txt"), "a\n");
+    git(repo, ["add", "a.txt"]);
+    git(repo, ["commit", "-q", "-m", "base"]);
+    if (opts.tag) {
+      git(repo, ["tag", "-a", "v9.9.9", "-m", "v9.9.9"]);
+    }
+    const body = [
+      STUB_HELPERS,
+      'VERSION="9.9.9"',
+      'SKIP_CONFIRM="false"',
+      `RESUMING=${opts.resuming}`,
+      `ALREADY_PUBLISHED="${opts.published ? "9.9.9" : ""}"`,
+      "CYAN=''; YELLOW=''; NC=''",
+      evidence,
+      block,
+      'echo "REACHED_STEP_1"',
+    ].join("\n");
+    return runOutside(repo, body);
+  }
+
+  it("still confirms a 'resume' that no earlier run left a tag or a publish for", () => {
+    const r = resume({ resuming: true, tag: false, published: false });
+    expect(r.out).toContain("no sign of an earlier run");
+    // stdin is not a terminal here, so reaching the prompt block is the abort.
+    expect(r.out).toContain("Aborted: stdin is not a terminal");
+    expect(r.out).not.toContain("REACHED_STEP_1");
+    expect(r.status).toBe(1);
+  });
+
+  it("skips the prompts on a resume the tag or the npm version proves", () => {
+    for (const proof of [
+      { tag: true, published: false },
+      { tag: false, published: true },
+    ]) {
+      const r = resume({ resuming: true, ...proof });
+      expect(r.out).not.toContain("no sign of an earlier run");
+      expect(r.out).not.toContain("About to release");
+      expect(r.out).toContain("REACHED_STEP_1");
+      expect(r.status).toBe(0);
+    }
+  });
+
+  it("does not read a pre-existing tag as proof on a fresh bump", () => {
+    // RESUMING=false with the tag present is the tag-collision guard's case,
+    // not a resume; the evidence block must leave the prompts on.
+    const r = resume({ resuming: false, tag: true, published: false });
+    expect(r.out).toContain("Aborted: stdin is not a terminal");
+    expect(r.out).not.toContain("REACHED_STEP_1");
+  });
 
   it("aborts with exit 1 before any mutation when stdin is not a terminal", () => {
     // Every fixture test in this file relies on this brake: if it ever reads
@@ -847,7 +909,7 @@ describe("release.sh non-interactive confirm brake", () => {
       STUB_HELPERS,
       'VERSION="9.9.9"',
       'SKIP_CONFIRM="false"',
-      'RESUMING="false"',
+      'RESUME_PROVEN="false"',
       "CYAN=''; YELLOW=''; NC=''",
       block,
       'echo "REACHED_STEP_1"',
@@ -870,7 +932,7 @@ describe("release.sh non-interactive confirm brake", () => {
       STUB_HELPERS,
       'VERSION="9.9.9"',
       'SKIP_CONFIRM="false"',
-      'RESUMING="false"',
+      'RESUME_PROVEN="false"',
       "CYAN=''; YELLOW=''; NC=''",
       'if [ "${FORCE_FAIL:-}" = "1" ]; then exit 1; fi',
       block,
@@ -1446,6 +1508,12 @@ describe("release.sh step-4 npm publish", () => {
     expect(r.out).toContain("WARN npm publish attempt 2 EOTPed");
     expect(r.out).toContain("FAIL npm publish failed after 3 OTP-class attempts");
     expect(r.out).not.toContain("CONTINUED");
+    // Step 4 requires the automation token, which an OTP challenge means is
+    // missing: the messages name the token to restore, and no longer blame a
+    // web session's propagation as the only cause.
+    expect(r.out).toContain("Restore the automation token line (//registry.npmjs.org/:_authToken=<token>)");
+    expect(r.out).toContain("an OTP challenge means the token in ~/.npmrc is missing or wrong");
+    expect(r.out).not.toContain("WebAuthn");
     // EAUTH on npm's code line is OTP-class too, in either of npm's spellings.
     const eauth = run({ out: "npm ERR! code EAUTH\nnpm ERR! Unable to authenticate", rc: 1 });
     expect(eauth.calls).toBe(3);
@@ -2032,26 +2100,36 @@ describe("release.sh mcp-publisher download and sha256 check", () => {
   const goarch = process.arch === "arm64" ? "arm64" : "amd64";
   const tarball = `mcp-publisher_${goos}_${goarch}.tar.gz`;
   const STUB = ["#!/bin/bash", 'echo "ran $*" >> "$FAKE_STATE/publisher.log"', ""].join("\n");
-  // curl serves the two assets to its -o path, and nothing else.
+  // curl serves the two assets to its -o path, and nothing else. It logs its
+  // arguments, and a `stall-tarball` / `stall-checksums` state file makes that
+  // download answer 28, curl's exit code for a --max-time that ran out.
   const CURL = [
     "curl() {",
     '  local out="" prev="" a',
+    '  echo "curl $*" >> "$FAKE_STATE/curl.log"',
     '  for a in "$@"; do if [ "$prev" = "-o" ]; then out="$a"; fi; prev="$a"; done',
     '  case "$*" in',
-    '    *registry_*_checksums.txt*) cp "$FAKE_FIXTURES/checksums.txt" "$out" ;;',
-    '    *mcp-publisher_*.tar.gz*) cp "$FAKE_FIXTURES/mcp-publisher.tar.gz" "$out" ;;',
+    "    *registry_*_checksums.txt*)",
+    '      if [ -e "$FAKE_STATE/stall-checksums" ]; then return 28; fi',
+    '      cp "$FAKE_FIXTURES/checksums.txt" "$out" ;;',
+    "    *mcp-publisher_*.tar.gz*)",
+    '      if [ -e "$FAKE_STATE/stall-tarball" ]; then return 28; fi',
+    '      cp "$FAKE_FIXTURES/mcp-publisher.tar.gz" "$out" ;;',
     "    *) return 22 ;;",
     "  esac",
     "}",
   ].join("\n");
 
-  function run(opts: { digest?: string; names?: string[] } = {}): RunResult & { ran: string[] } {
+  function run(
+    opts: { digest?: string; names?: string[]; stall?: "tarball" | "checksums" } = {},
+  ): RunResult & { ran: string[]; curls: string[] } {
     const root = newTmp("release-dl-");
     const fixtures = join(root, "fixtures");
     const state = join(root, "state");
     mkdirSync(fixtures);
     mkdirSync(state);
     makePublisherFixture(fixtures, STUB, opts);
+    if (opts.stall) writeFileSync(join(state, `stall-${opts.stall}`), "");
     const body = [
       "set -o pipefail",
       STUB_HELPERS,
@@ -2062,18 +2140,21 @@ describe("release.sh mcp-publisher download and sha256 check", () => {
       `GOOS=${goos}`,
       `GOARCH=${goarch}`,
       'MCP_PUBLISHER_VERSION="v9.9.9"',
+      'VERSION="1.0.2"',
       CURL,
       block,
       'echo "CONTINUED"',
     ].join("\n");
     const r = runBash(body, root, { FAKE_FIXTURES: shPath(fixtures), FAKE_STATE: shPath(state) });
-    let ran: string[] = [];
-    try {
-      ran = readFileSync(join(state, "publisher.log"), "utf8").split("\n").filter(Boolean);
-    } catch {
-      // Never ran, which the refusal cases assert on.
-    }
-    return { ...r, ran };
+    const logLines = (name: string) => {
+      try {
+        return readFileSync(join(state, name), "utf8").split("\n").filter(Boolean);
+      } catch {
+        // Never ran, which the refusal cases assert on.
+        return [];
+      }
+    };
+    return { ...r, ran: logLines("publisher.log"), curls: logLines("curl.log") };
   }
 
   it("extracts and runs the binary when its digest matches", () => {
@@ -2081,6 +2162,30 @@ describe("release.sh mcp-publisher download and sha256 check", () => {
     expect(r.out).toContain("INFO mcp-publisher v9.9.9 ready (sha256 verified)");
     expect(r.ran).toEqual(["ran --help"]);
     expect(r.out).toContain("CONTINUED");
+  });
+
+  it("bounds both downloads, which run after the npm publish", () => {
+    // Bare `curl -fsSL -o` waits for ever on a download that stalls, and by
+    // this point the version is live on npm and not yet registered.
+    const r = run();
+    expect(r.curls).toHaveLength(2);
+    for (const line of r.curls) {
+      expect(line).toMatch(/--connect-timeout \d+/);
+      expect(line).toMatch(/--max-time \d+/);
+    }
+  });
+
+  it.each([
+    ["tarball", `Could not download mcp-publisher v9.9.9 (${tarball}) from its GitHub release (curl exit 28`],
+    ["checksums", "Could not download mcp-publisher v9.9.9's checksums file from its GitHub release (curl exit 28"],
+  ] as const)("fails a %s download that runs out of time by naming the re-run, and runs nothing", (stall, message) => {
+    const r = run({ stall });
+    expect(r.out).toContain(`FAIL ${message}`);
+    expect(r.out).toContain("npm already serves @yawlabs/mcp@1.0.2");
+    expect(r.out).toContain("Re-run ./release.sh 1.0.2 once github.com answers");
+    expect(r.ran).toEqual([]);
+    expect(r.out).not.toContain("ready (sha256 verified)");
+    expect(r.out).not.toContain("CONTINUED");
   });
 
   it("refuses to run a tarball whose digest does not match", () => {
@@ -2099,6 +2204,47 @@ describe("release.sh mcp-publisher download and sha256 check", () => {
     expect(r.out).toContain(`FAIL sha256 verification failed for ${tarball}`);
     expect(r.ran).toEqual([]);
     expect(r.out).not.toContain("CONTINUED");
+  });
+});
+
+describe("release.sh final banner", () => {
+  // The banner names a channel only when the final verification read it back.
+  // It used to branch on the MCP registry alone, so both arms said "released
+  // to npm" under a warning that npm does not serve the version -- reachable
+  // on a resume where step 5 skips (the registry lists the version) and the
+  // last read of npm's per-version document fails.
+  const block = extractBlock('if [ -n "$NPM_FINAL_MANIFEST" ] && [ "$REGISTRY_FINAL" = true ]; then', "fi");
+  const dir = newTmp("release-banner-");
+  const banner = (manifest: string, registry: boolean) =>
+    runBash(
+      [
+        'GREEN=""; YELLOW=""; NC=""',
+        'VERSION="1.0.2"',
+        `NPM_FINAL_MANIFEST='${manifest}'`,
+        `REGISTRY_FINAL=${registry}`,
+        block,
+      ].join("\n"),
+      dir,
+    ).out.trim();
+  const MANIFEST = '{"version":"1.0.2"}';
+
+  it("says released to npm + MCP registry only when both were read back", () => {
+    expect(banner(MANIFEST, true)).toBe("v1.0.2 released to npm + MCP registry.");
+  });
+
+  it("names npm alone when the registry did not confirm", () => {
+    expect(banner(MANIFEST, false)).toBe(
+      "v1.0.2 released to npm; the MCP registry did not confirm the listing (see above).",
+    );
+  });
+
+  it("does not claim npm when the final npm read came back empty", () => {
+    expect(banner("", true)).toBe(
+      "v1.0.2 is listed on the MCP registry; npm did not confirm @yawlabs/mcp@1.0.2 on the final read (see above).",
+    );
+    expect(banner("", false)).toBe(
+      "v1.0.2: neither npm nor the MCP registry confirmed the release on the final read (see above).",
+    );
   });
 });
 
@@ -2377,9 +2523,9 @@ describe("release.sh oam floor gate placement", () => {
     // slowest gate, so a missing oam is reported in seconds, not minutes) --
     // and inside step 1, so it runs before the bump, the tag and the push.
     const order = [
-      at('if [ "$SKIP_CONFIRM" != "true" ] && [ "$RESUMING" != "true" ]; then'),
+      at('if [ "$SKIP_CONFIRM" != "true" ] && [ "$RESUME_PROVEN" != "true" ]; then'),
       at('step 1 "Lint + typecheck + tests + oam floor"'),
-      at(`run_npm_check "Type check" typecheck 'error TS[0-9]' '' 'npx tsc --noEmit'`),
+      at(`run_npm_check "Type check" typecheck 'error TS[0-9]' '' 'node node_modules/typescript/bin/tsc --noEmit'`),
       at("# >>> oam floor gate"),
       at(`  run_npm_check "oam floor" verify:oam-floor '^\\[verify:oam-floor\\] FAIL' '^\\[verify:oam-floor\\] OK'`),
       at("# <<< oam floor gate"),
@@ -2527,10 +2673,130 @@ describe("release.sh origin/main sync guard", () => {
     }
   });
 
-  it("proceeds on a resume, where a prior push already moved main", () => {
+  it("proceeds on a resume that is ahead, where the prior run died before its push", () => {
     const r = run("ahead", true);
     expect(r.out).toContain("resuming a prior run");
     expect(r.out).toContain("CONTINUED");
+  });
+
+  it("refuses a resume that is behind or diverged, before the gates rather than at step 3's push", () => {
+    for (const shape of ["behind", "diverged"] as const) {
+      const r = run(shape, true);
+      expect(r.out).toContain("Pull first: git pull --ff-only origin main");
+      expect(r.out).not.toContain("resuming a prior run");
+      expect(r.out).not.toContain("CONTINUED");
+      expect(r.status).toBe(1);
+    }
+  });
+});
+
+describe("release.sh run_npm_check", () => {
+  const fn = extractBlock("run_npm_check() {", "}");
+
+  /**
+   * Run the gate wrapper over an `npm` shell function. The wrapper's output
+   * goes to a file the stub can read back while it runs; `out` is that file
+   * followed by whatever the harness printed after it.
+   */
+  function run(npmBody: string, args: string, env: Record<string, string> = {}): RunResult & { seen: string } {
+    const dir = newTmp("release-check-");
+    const body = [
+      "set -Eeuo pipefail",
+      STUB_HELPERS,
+      'VERSION="9.9.9"',
+      'IS_MINGW_ARM64="${FORCE_ARM64:-false}"',
+      `npm() {\n${npmBody}\n}`,
+      fn,
+      `run_npm_check ${args} > gate-stdout.log 2>&1`,
+      'echo "PASSED"',
+    ].join("\n");
+    const r = runBash(body, dir, env);
+    let seen = "";
+    try {
+      seen = readFileSync(join(dir, "gate-stdout.log"), "utf8");
+    } catch {
+      // The harness died before the redirect opened the file.
+    }
+    return { status: r.status, out: `${seen}${r.out}`, seen };
+  }
+
+  it("shows a gate's output while it runs, not after it exits", () => {
+    // The stub prints a line, then looks for that line in the gate's own
+    // stdout before it exits. Captured-then-printed output is not there yet.
+    const r = run(
+      [
+        '  echo "EARLY LINE"',
+        "  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do",
+        '    if grep -q "EARLY LINE" gate-stdout.log 2>/dev/null; then echo "STREAMED"; break; fi',
+        "    sleep 0.25",
+        "  done",
+        '  echo "ALL DONE"',
+      ].join("\n"),
+      `"Slow gate" slow '^NEVER' '^ALL DONE'`,
+    );
+    expect(r.seen).toContain("STREAMED");
+    expect(r.out).toContain("PASSED");
+    expect(r.status).toBe(0);
+  });
+
+  it("leaves no gate log in the temp dir when the run is interrupted mid-gate", () => {
+    // The log is removed after the pipeline returns, which an interrupt never
+    // reaches; the EXIT trap has to take it. mktemp is pointed at a directory
+    // of its own so the leftover, if any, is the only thing in it.
+    const dir = newTmp("release-check-int-");
+    mkdirSync(join(dir, "tmp"));
+    const body = (npmBody: string): string =>
+      [
+        "set -Eeuo pipefail",
+        extractBlock('WORKDIR=""', "trap cleanup EXIT"),
+        STUB_HELPERS,
+        'IS_MINGW_ARM64="false"',
+        `npm() {\n${npmBody}\n}`,
+        fn,
+        `run_npm_check "Slow gate" slow '^NEVER' '^ALL DONE'`,
+        'echo "PASSED"',
+      ].join("\n");
+    // The stub signals the script itself ($$ is the script's pid inside the
+    // pipeline's subshell too), as Ctrl+C would.
+    const interrupted = runBash(body('  echo "EARLY LINE"\n  kill -s INT $$\n  sleep 2'), dir, {
+      TMPDIR: join(dir, "tmp"),
+    });
+    expect(interrupted.out).toContain("EARLY LINE");
+    expect(interrupted.out).not.toContain("PASSED");
+    expect(readdirSync(join(dir, "tmp"))).toEqual([]);
+    // The same harness run to completion: the gate passes and removes its own
+    // log, so the empty directory above is not an mktemp that went elsewhere.
+    const finished = runBash(body('  ls "$TMPDIR" | wc -l | tr -d " "\n  echo "ALL DONE"'), dir, {
+      TMPDIR: join(dir, "tmp"),
+    });
+    expect(finished.out).toMatch(/^1$/m);
+    expect(finished.out).toContain("PASSED");
+    expect(readdirSync(join(dir, "tmp"))).toEqual([]);
+  });
+
+  it("still reads the verdict from the streamed output, and carries npm's exit code past tee", () => {
+    const failed = run('  echo "Found 3 errors"', `"Lint" lint 'Found [0-9]+ error' 'Checked [1-9][0-9]* files'`);
+    expect(failed.out).toContain("FAIL Lint failed");
+    expect(failed.out).not.toContain("PASSED");
+    const silent = run("  true", `"Lint" lint 'Found [0-9]+ error' 'Checked [1-9][0-9]* files'`);
+    expect(silent.out).toContain("exited 0 but printed no verdict");
+    const nonZero = run('  echo "something else"; return 7', `"Type check" typecheck 'error TS[0-9]'`);
+    expect(nonZero.out).toContain("FAIL Type check failed (exit 7)");
+  });
+
+  it("re-runs the type check without the npm CLI when npm segfaults on ARM64", () => {
+    // The direct command is word-split and run as is, so `npx tsc` there was
+    // npm again -- the CLI whose exit cleanup is the segfault being tolerated.
+    const call = releaseSh.split("\n").find((l) => l.startsWith('run_npm_check "Type check" '));
+    expect(call).toBeDefined();
+    const verify = /'([^']*)'$/.exec(call ?? "")?.[1] ?? "";
+    expect(verify).toBe("node node_modules/typescript/bin/tsc --noEmit");
+    expect(verify).not.toMatch(/\bnp[mx]\b/);
+    const tolerated = run("  return 139", `"Type check" typecheck 'error TS[0-9]' '' 'true'`, { FORCE_ARM64: "true" });
+    expect(tolerated.out).toContain("a direct re-run is clean -- tolerating");
+    expect(tolerated.out).toContain("PASSED");
+    const red = run("  return 139", `"Type check" typecheck 'error TS[0-9]' '' 'false'`, { FORCE_ARM64: "true" });
+    expect(red.out).toContain("FAIL Type check failed (exit 139)");
   });
 });
 

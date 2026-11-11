@@ -167,10 +167,11 @@ const SECRET_HEADER_NAME_RE = /^[a-z0-9_-]*(token|secret|passw|apikey|api[-_]?ke
  * This is the FIRST of two passes over the preamble. It knows only the two
  * flag shapes above; a credential anywhere else -- inside a URL's query
  * string, an `Authorization: Bearer ...` header arg, an inline JSON body --
- * is not a flag value and printed in the clear. The joined line therefore
- * also goes through health-score's scrubForWarning (see runAudit), which
- * covers exactly those shapes; keeping this pass is what preserves the
- * `--flag <redacted>` rendering the operator reads the argv by.
+ * is not a flag value and printed in the clear. Each arg this returns is
+ * therefore also put through health-score's scrubForWarning on its own (see
+ * runAudit, which scrubs per arg and only then joins), which covers those
+ * shapes; keeping this pass is what preserves the `--flag <redacted>`
+ * rendering the operator reads the argv by.
  *
  * Exported for tests -- the redaction is a leak-prevention control, so it is
  * asserted directly as well as through the `audit` preamble.
@@ -383,8 +384,20 @@ export async function runAudit(opts: AuditCommandOptions = {}): Promise<AuditCom
   if (platform === "win32") {
     const offender = findCmdMetacharToken(server.command, server.args ?? []);
     if (offender !== undefined) {
+      // Redacted like the preamble below, and for a sharper reason: `&` is the
+      // commonest way to trip this gate, so the offender is typically a URL
+      // with a query string (`?api_key=...&v=1`) or the value after `--token`.
+      // Same two passes -- redactSecretArgs for a flag's value (it needs the
+      // whole argv to see the flag in front), then scrubForWarning on the one
+      // token. redactSecretArgs returns one entry per input arg, so the
+      // offender's index carries over; index 0 is the command.
+      const rawArgs = server.args ?? [];
+      const idx = [server.command, ...rawArgs].indexOf(offender);
+      const shown = scrubForWarning(idx <= 0 ? offender : (redactSecretArgs(rawArgs)[idx - 1] ?? "<redacted>"));
+      const flag =
+        idx > 1 && shown === "<redacted>" ? ` (the value after ${scrubForWarning(rawArgs[idx - 2] ?? "")})` : "";
       printErr(
-        `yaw-mcp audit: "${namespace}" cannot be audited on Windows -- its spawn config contains a cmd.exe metacharacter (& | < > ^ parentheses) in ${JSON.stringify(offender)}. The compliance suite spawns stdio targets through cmd.exe here, which would split the command line at that character. Rework the server's command/args in bundles.json to drop it, or audit this server on macOS/Linux.`,
+        `yaw-mcp audit: "${namespace}" cannot be audited on Windows -- its spawn config contains a cmd.exe metacharacter (& | < > ^ parentheses) in ${JSON.stringify(shown)}${flag}. The compliance suite spawns stdio targets through cmd.exe here, which would split the command line at that character. Rework the server's command/args in bundles.json to drop it, or audit this server on macOS/Linux.`,
       );
       return { exitCode: 2 };
     }

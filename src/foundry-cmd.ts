@@ -20,6 +20,7 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
+import { fallbackToolsFor } from "./fallback-tools.js";
 import { FOUNDRY_FILENAME } from "./foundry.js";
 import {
   buildCorpusFromTraces,
@@ -84,13 +85,23 @@ export function parseFoundryArgs(
       json = true;
     } else if (a === "--out") {
       const v = argv[++i];
-      if (!v) return { ok: false, error: `yaw-mcp foundry: --out needs a path\n\n${FOUNDRY_USAGE}` };
+      // A value that starts with "-" is the NEXT flag, not a path: `--out
+      // --json` used to write a corpus to a file named "--json".
+      if (!v || v.startsWith("-"))
+        return { ok: false, error: `yaw-mcp foundry: --out needs a path\n\n${FOUNDRY_USAGE}` };
       out = v;
     } else if (a === "--cap") {
-      const v = Number(argv[++i]);
-      if (!Number.isFinite(v) || v <= 0)
-        return { ok: false, error: `yaw-mcp foundry: --cap needs a positive number\n\n${FOUNDRY_USAGE}` };
-      cap = Math.floor(v);
+      const raw = argv[++i];
+      // Plain decimal digits only. Number() also reads "0x10" and "1e3", and
+      // a fraction below 1 used to floor to a cap of 0 -- every entry capped
+      // away, then reported as a harvest with no usable entries.
+      const v = raw !== undefined && /^\d+$/.test(raw) ? Number(raw) : Number.NaN;
+      if (!Number.isSafeInteger(v) || v < 1)
+        return {
+          ok: false,
+          error: `yaw-mcp foundry: --cap needs a positive integer${raw === undefined ? "" : `, got "${raw}"`}\n\n${FOUNDRY_USAGE}`,
+        };
+      cap = v;
     } else if (a.startsWith("-")) {
       return { ok: false, error: `yaw-mcp foundry: unknown argument "${a}"\n\n${FOUNDRY_USAGE}` };
     } else if (action === undefined) {
@@ -159,7 +170,14 @@ async function loadServerCatalog(
       untrustedProjectPath = probe.path;
     }
   }
-  // Hydrate the PERSISTED tool cache, mirroring ConnectServer.rankableFor.
+  // Give each server the tool list a COLD server ranks on, in the order
+  // ConnectServer.rankableTools (server.ts) resolves it: the persisted learned
+  // list, else a list on the entry itself, else the bundled list
+  // fallback-tools.ts keeps for a few well-known servers. There is no live
+  // branch -- nothing is connected in a CLI run -- so a server that was
+  // connected when it was dispatched to can still snapshot a different list
+  // than the one that produced `chosen`.
+  //
   // bundles.json's loader does not carry `toolCache` through its field
   // whitelist, so a snapshot built from the config alone gives every server
   // `tools: []` -- and FIELD_WEIGHTS (relevance.ts) scores toolName at 2.0
@@ -170,17 +188,33 @@ async function loadServerCatalog(
   //
   // state.json is keyed by namespace, and loadState drops entries older than
   // TOOLCACHE_TTL_MS on the way in -- so a renamed server, or a stale state
-  // file, still snapshots empty. runFoundryExport counts the tool-less
-  // servers so that is visible instead of silent. `s.toolCache` stays as the
-  // fallback in case a future bundles.json does carry the field.
+  // file, snapshots empty unless fallback-tools.ts knows the image or binary
+  // it launches. runFoundryExport counts the tool-less servers so that is
+  // visible instead of silent. `s.toolCache` stays in the order in case a
+  // future bundles.json does carry the field.
   const state = await loadState(statePath(userConfigDir(home)));
   const servers = (config?.servers ?? []).map((s) => ({
     namespace: s.namespace,
     name: s.name,
     description: s.description,
-    tools: state.toolCache[s.namespace]?.tools ?? s.toolCache ?? [],
+    tools: coldToolsFor(s, state.toolCache[s.namespace]?.tools),
   }));
   return { servers, bundlesPath, consultedPaths, untrustedProjectPath };
+}
+
+/** The cold-server tool list for one bundles.json entry. Same order as
+ *  ConnectServer.rankableTools without its live branch: a non-empty learned
+ *  list wins, else a list on the entry; a learned list that is EMPTY still
+ *  counts as an observation (the server was spawned and offered nothing), so
+ *  only an entry with no list of either kind takes the bundled one. */
+function coldToolsFor(
+  server: { command?: string; args?: string[]; toolCache?: RankableServer["tools"] },
+  learned: RankableServer["tools"] | undefined,
+): RankableServer["tools"] {
+  const known = learned && learned.length > 0 ? learned : server.toolCache;
+  if ((known && known.length > 0) || learned !== undefined) return known ?? [];
+  const bundled = fallbackToolsFor(server);
+  return bundled ? [...bundled] : (known ?? []);
 }
 
 export async function runFoundryExport(opts: FoundryExportOptions): Promise<{ exitCode: number; lines: string[] }> {
@@ -269,7 +303,8 @@ export async function runFoundryExport(opts: FoundryExportOptions): Promise<{ ex
     return { exitCode: 1, lines };
   }
 
-  // A snapshot server with no tools is indexed on name+namespace only, so any
+  // A snapshot server with no tools is indexed on its namespace, name and
+  // description only, so any
   // intent phrased in tool vocabulary ("create issue") scores near zero
   // against it and drags the measured floor down for reasons that have
   // nothing to do with the ranker. Say so rather than letting the maintainer
@@ -277,7 +312,7 @@ export async function runFoundryExport(opts: FoundryExportOptions): Promise<{ ex
   const toolless = servers.filter((s) => s.tools.length === 0).length;
   if (toolless > 0) {
     printErr(
-      `yaw-mcp foundry: warning -- ${toolless}/${servers.length} snapshot servers carry no tools (no entry in ~/.yaw-mcp/state.json, or it aged past the tool-cache TTL). Those rank on name + namespace only, which depresses the accuracy printed below; activate them once and re-export.`,
+      `yaw-mcp foundry: warning -- ${toolless}/${servers.length} snapshot servers carry no tools (no entry in ~/.yaw-mcp/state.json, or it aged past the tool-cache TTL, and no bundled fallback list for that server). Those rank on namespace, name and description only, which depresses the accuracy printed below; activate them once and re-export.`,
     );
   }
 

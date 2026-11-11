@@ -106,6 +106,18 @@ describe("redactIntent", () => {
     expect(r.redactedCount).toBe(1);
   });
 
+  it("KNOWN GAP: a key cut into short groups by punctuation survives as its groups", () => {
+    // Pins the gap foundry.ts's privacy scope note documents, so the note
+    // cannot go stale in either direction: every group is under the 12-char
+    // mixed floor, and no raw-string rule covers the shape.
+    const key = redactIntent("activate AB12C-DE34F-GH56I-JK78L");
+    expect(key.tokens).toEqual(expect.arrayContaining(["ab12c", "de34f", "gh56i", "jk78l"]));
+    // A UUID keeps its short groups; only the 12-digit tail goes (phone shape).
+    const uuid = redactIntent("lookup 550e8400-e29b-41d4-a716-446655440000");
+    expect(uuid.tokens).toEqual(expect.arrayContaining(["550e8400", "e29b", "41d4", "a716"]));
+    expect(uuid.tokens).not.toContain("446655440000");
+  });
+
   it("drops a 12-19 char mixed letter+digit key (below the old 20 floor)", () => {
     const r = redactIntent("key a1b2c3d4e5f6g7 here");
     expect(r.tokens).not.toContain("a1b2c3d4e5f6g7");

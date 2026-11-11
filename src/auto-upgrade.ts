@@ -1,4 +1,4 @@
-// Fire-and-forget self-upgrade check, run once per yaw-mcp serve startup.
+// Fire-and-forget self-upgrade check, run once per yaw-mcp server startup.
 //
 // yaw-mcp cannot hot-swap its own running code, so "auto-update" means:
 // detect a stale install and upgrade it in the background so the NEXT
@@ -75,10 +75,26 @@
 //     one in and writes bin shims separately, so the window leaves a
 //     partial install. There is no repair logic; recovery is a manual
 //     `npm install -g @yawlabs/mcp@latest`.
+//   - Staleness is ALWAYS judged against registry.npmjs.org (upgrade-cmd's
+//     fetchLatestVersion hard-codes it; npm's `registry` setting is not
+//     read), while the install it then spawns resolves `@latest` against
+//     whatever registry npm is configured for. Behind a mirror that lags or
+//     filters the package, the install exits 0 without moving the version,
+//     the copy still reads as stale, and the attempt memo is the only brake:
+//     one full install per UPGRADE_ATTEMPT_COOLDOWN_MS (6 h) for as long as
+//     the mirror stays behind. Nothing detects the mismatch; the opt-out
+//     below is the remedy for such a setup.
+//   - A `global-npm` verdict that rests on a directory NAME alone (a prefix
+//     called `npm` outside %APPDATA%, or one called `bin`) is not acted on
+//     unless a yaw-mcp bin shim sits in the prefix root (see
+//     defaultConfirmGlobalPrefix): a project directory with that name would
+//     otherwise receive a `-g --prefix` install. A real global prefix of that
+//     name whose shim is missing is logged and left for `yaw-mcp upgrade`.
 //
 // Opt-out: set YAW_MCP_AUTO_UPGRADE=0 (or =false) to suppress the check
-// entirely -- useful for pinned-version setups or sudo-installed
-// globals where `npm install -g` would always EACCES. Parsed by the ONE
+// entirely -- useful for pinned-version setups, sudo-installed globals
+// where `npm install -g` would always EACCES, or an npm registry mirror
+// that trails registry.npmjs.org (see KNOWN GAPS). Parsed by the ONE
 // helper every YAW_MCP_* opt-out shares (isFeatureDisabled, opt-out-env.ts),
 // so the spellings and the whitespace trim are the same as its siblings'.
 
@@ -86,6 +102,7 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   closeSync,
+  existsSync,
   openSync,
   readFileSync,
   realpathSync,
@@ -114,7 +131,9 @@ import {
   detectSea,
   fetchLatestVersion,
   GLOBAL_UPGRADE_METHODS,
+  globalNpmMarkerIsUnanchored,
   globalUpgradeCommandLineForTool,
+  NPX_LATEST_CAVEAT,
   npmGlobalPrefix,
   upgradeSpawnSpec,
 } from "./upgrade-cmd.js";
@@ -241,6 +260,36 @@ export function runsUnderNpmConfigPrefix(argvPath: string | undefined, env: Node
   return (
     entry.startsWith(`${root}/lib/node_modules/@yawlabs/mcp/`) || entry.startsWith(`${root}/node_modules/@yawlabs/mcp/`)
   );
+}
+
+/** May the background upgrade install into `prefix` unprompted?
+ *
+ *  True for every path except one whose `global-npm` verdict rests on a
+ *  directory name alone (upgrade-cmd's globalNpmMarkerIsUnanchored: the `npm`
+ *  and `bin` markers outside `%APPDATA%\npm`). For those, a global bin shim
+ *  must sit in the prefix root -- `yaw-mcp.cmd` or `yaw-mcp`, where npm puts
+ *  them for the `<prefix>/node_modules` layout these two markers describe.
+ *  The verdict is taken on the RESOLVED entrypoint, the same path
+ *  detectRunningInstallPrefix derived `prefix` from. An entrypoint that will
+ *  not resolve answers true: the caller only gets here with a prefix that
+ *  resolved a moment ago, and this gate is not the place to invent a refusal.
+ *
+ *  Exported for tests. `exists` is injectable because unit-test prefixes are
+ *  on no filesystem. */
+export function defaultConfirmGlobalPrefix(
+  argvPath: string | undefined,
+  prefix: string,
+  exists: (path: string) => boolean = existsSync,
+): boolean {
+  if (!argvPath) return true;
+  let resolved: string;
+  try {
+    resolved = realpathSync(argvPath);
+  } catch {
+    return true;
+  }
+  if (!globalNpmMarkerIsUnanchored(resolved)) return true;
+  return exists(join(prefix, "yaw-mcp.cmd")) || exists(join(prefix, "yaw-mcp"));
 }
 
 /** Log a warning when npm's configured global prefix differs from the
@@ -384,6 +433,15 @@ function lockHolderAlive(lockPath: string): boolean {
   }
 }
 
+/** Options for acquireUpgradeLock. */
+export interface AcquireLockOptions {
+  /** Steal a fresh lock whose holder PROCESS is gone (lockHolderAlive). Only
+   *  correct when the holder's death ends the critical section -- an
+   *  in-process write. Off by default: the npm-child callers must keep the
+   *  mtime rule. */
+  probeHolder?: boolean;
+}
+
 /** Best-effort cross-process lock around the background `npm install -g`.
  *
  *  Returns a release callback when the caller may proceed, and null ONLY when
@@ -396,14 +454,6 @@ function lockHolderAlive(lockPath: string): boolean {
  *  `openSync(path, "wx")` is the whole mutual-exclusion primitive: O_EXCL is
  *  atomic on both POSIX and Windows, so two processes racing it cannot both
  *  win. */
-export interface AcquireLockOptions {
-  /** Steal a fresh lock whose holder PROCESS is gone (lockHolderAlive). Only
-   *  correct when the holder's death ends the critical section -- an
-   *  in-process write. Off by default: the npm-child callers must keep the
-   *  mtime rule. */
-  probeHolder?: boolean;
-}
-
 export function acquireUpgradeLock(
   dir: string,
   lockName: string = UPGRADE_LOCK_NAME,
@@ -770,6 +820,10 @@ export interface AutoUpgradeDeps {
   /** Test hook: replace the recorder for a completed registry check. Receives
    *  the answer the fetch produced (null for an unreachable registry). */
   recordCheckImpl?: (latest: string | null) => void;
+  /** Test hook: replace the second-signal check a name-only global-npm marker
+   *  needs before the background install may write into the detected prefix
+   *  (see defaultConfirmGlobalPrefix). False means "do not spawn". */
+  confirmGlobalPrefixImpl?: (argvPath: string | undefined, prefix: string) => boolean;
   /** Test hook: replace the "this exact upgrade was already attempted" memo. */
   attemptedRecentlyImpl?: (dir: string, lockName: string, version: string) => boolean;
   /** Test hook: replace the recorder for a background upgrade attempt. */
@@ -929,6 +983,22 @@ export async function maybeAutoUpgrade(deps: AutoUpgradeDeps = {}): Promise<void
   // bundled-Node Yaw Terminal ships), in which case installing into
   // npm's reported prefix is a no-op for the running copy.
   const rawPrefix = method === "global-npm" ? detectRunningInstallPrefix(argvPath) : null;
+  // The `npm` and `bin` path markers classify on a directory NAME alone, so a
+  // project directory called `npm` or `bin` that holds
+  // node_modules/@yawlabs/mcp reads as a global install and rawPrefix is that
+  // project directory -- the `-g --prefix <project>` write the anchored lib
+  // markers exist to rule out. Nobody is asked before this spawn, so for those
+  // two markers a second signal is required: the bin shim npm writes into the
+  // prefix root of a real `<prefix>/node_modules` global. A project tree keeps
+  // its shims in node_modules/.bin instead. Without it, say so and stop.
+  if (rawPrefix !== null && !(deps.confirmGlobalPrefixImpl ?? defaultConfirmGlobalPrefix)(argvPath, rawPrefix)) {
+    log(
+      "info",
+      "yaw-mcp is out of date; not upgrading in the background because this copy sits under a directory named `npm` or `bin` with no yaw-mcp bin shim beside it, which may be a project tree rather than a global npm prefix -- run `yaw-mcp upgrade` for the command that updates this install",
+      { current, latest, method, prefix: rawPrefix },
+    );
+    return;
+  }
   // The npm spawn below runs with `shell: true` on win32 (npm is npm.cmd and
   // Node refuses to spawn a .cmd without a shell). With a shell, argv is
   // joined on spaces and NOT quoted -- so an unquoted prefix containing a
@@ -1058,8 +1128,10 @@ export async function maybeAutoUpgrade(deps: AutoUpgradeDeps = {}): Promise<void
   // spawn from here. Log a one-liner so a stale install is at least visible.
   if (method === "npx") {
     // For npx the `@latest` client config (written by `yaw-mcp install`)
-    // makes the next restart fetch the newest version, so a restart fixes it.
-    log("info", "yaw-mcp is out of date; restart your MCP client to pick up the latest version", {
+    // makes the next restart fetch the newest version. This process knows
+    // only the cache path it runs from, not the entry that launched it, so
+    // the line carries the same condition `yaw-mcp upgrade` prints.
+    log("info", `yaw-mcp is out of date; restart your MCP client to pick up the latest version. ${NPX_LATEST_CAVEAT}`, {
       current,
       latest,
       method,

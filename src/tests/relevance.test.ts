@@ -843,6 +843,27 @@ describe("normalizeTerm (light suffix fold)", () => {
     expect(normalizeTerm("speed")).toBe("speed");
   });
 
+  it("gives every inflection of one word the same key", () => {
+    // Each of these used to split: disable -> "dis" vs disabled -> "disabl",
+    // cookie -> "cooki" vs cookies -> "cooky", alias -> "alia" vs aliases ->
+    // "alias".
+    for (const [base, forms] of [
+      ["disable", ["disabled", "disabling", "disables"]],
+      ["cookie", ["cookies"]],
+      ["movie", ["movies"]],
+      ["alias", ["aliases", "aliased", "aliasing"]],
+      ["canvas", ["canvases"]],
+    ] as const) {
+      for (const f of forms) expect(normalizeTerm(f), `${f} vs ${base}`).toBe(normalizeTerm(base));
+    }
+    // The -as plurals the alias fix must not disturb.
+    expect(normalizeTerm("schemas")).toBe(normalizeTerm("schema"));
+    expect(normalizeTerm("quotas")).toBe(normalizeTerm("quota"));
+    // And -able is still stripped where it is a suffix.
+    expect(normalizeTerm("fixable")).toBe(normalizeTerm("fix"));
+    expect(normalizeTerm("enabled")).toBe(normalizeTerm("enable"));
+  });
+
   it("keeps the listed exceptions whole", () => {
     expect(normalizeTerm("news")).toBe("news");
     expect(normalizeTerm("news")).not.toBe(normalizeTerm("new"));

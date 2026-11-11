@@ -2,7 +2,9 @@
 //
 // Imports the LEAF model only, never install-targets.ts -- that module's own
 // evaluation builds INSTALL_TARGETS out of this one, so an import back would
-// be a cycle and a TDZ hazard (the boundary test's R11 pins both directions).
+// be a cycle and a TDZ hazard (src/tests/client-config-boundary.test.ts pins
+// both directions, under "no import cycle between the target rows and the
+// table").
 //
 // What is Zed-specific and lives here rather than in a consumer:
 //   * the container key is `context_servers`, not `mcpServers`;

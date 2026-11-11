@@ -87,11 +87,11 @@ export function positionAt(raw: string, offset: number): ConfigPosition {
  *
  *  A BIGINT renders as its digits. `JSON.stringify` THROWS on one, and a
  *  throw here would surface as a raw TypeError out of a post-write check whose
- *  whole job is to refuse cleanly -- which is reachable the moment a syntax
- *  whose parser yields bigints for large integers is registered (the declared
- *  `"toml"` slot: smol-toml's `integersAsBigInt: "asNeeded"` returns one for an
- *  integer outside the double-safe range). Digits are also the right answer
- *  for the comparison this function serves: under `asNeeded` a value is a
+ *  whole job is to refuse cleanly -- and one does arrive: the registered TOML
+ *  syntax parses with smol-toml's `integersAsBigInt: "asNeeded"`, which
+ *  returns a bigint for an integer outside the double-safe range, and the
+ *  facade compares such a root value through here. Digits are also the right
+ *  answer for the comparison this function serves: under `asNeeded` a value is a
  *  bigint only when it does NOT fit a number, so a bigint and a number that
  *  render alike differ in spelling and not in value.
  *

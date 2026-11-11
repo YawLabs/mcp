@@ -57,10 +57,12 @@ export type BundlesAction = "list" | "match";
 export interface BundlesCommandOptions {
   home?: string;
   cwd?: string;
-  /** Environment `match` runs under. Both loaders it calls read exactly one
-   *  key from it (YAW_MCP_TRUST_PROJECT for bundles.json, the project-dir
-   *  walk's ownership opt-in for config.json), but it must be threaded rather
-   *  than left to default inside them: `add`, `remove` and `list` inject
+  /** Environment `match` runs under. The two loaders it calls read little
+   *  from it -- the bundles.json loader reads YAW_MCP_TRUST_PROJECT and the
+   *  project-dir walk's ownership opt-in
+   *  (YAW_MCP_ALLOW_UNOWNED_PROJECT_DIRS), the config.json loader only the
+   *  latter -- but it must be threaded rather than left to default inside
+   *  them: `add`, `remove` and `list` inject
    *  theirs, and an embedded or test caller supplying an env expects THAT env
    *  to decide which bundles.json is in effect -- not the real process's,
    *  which made `list` and `bundles match` disagree on the same repo. */

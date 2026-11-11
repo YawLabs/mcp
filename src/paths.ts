@@ -29,7 +29,7 @@ export const CONFIG_DIRNAME = ".yaw-mcp";
 
 /** Subdirectory of the config dir holding the sidecar install that
  *  `yaw-mcp sidecars install` manages. */
-export const SIDECARS_DIRNAME = "sidecars";
+const SIDECARS_DIRNAME = "sidecars";
 
 /** Where `yaw-mcp sidecars install` installs MCP server packages. */
 export function sidecarsRoot(home: string = homedir()): string {
@@ -59,7 +59,7 @@ export function sidecarsNodeModules(home: string = homedir()): string {
 
 /** Subdirectory of the config dir holding git-sourced server builds. Kept
  *  apart from the sidecar tree: a git build owns its own node_modules. */
-export const GIT_DIRNAME = "git";
+const GIT_DIRNAME = "git";
 
 /** Length of the commit prefix that names a build directory. */
 export const GIT_BUILD_SHA_LEN = 12;
@@ -206,8 +206,8 @@ export function isUnderHome(dir: string, homeResolved: string): boolean {
 export const ALLOW_UNOWNED_ENV = "YAW_MCP_ALLOW_UNOWNED_PROJECT_DIRS";
 
 // Candidate dirs we have already warned about in THIS process. The walk runs
-// once per config load and there are three independent callers (config-loader,
-// guide.ts, local-bundles), so an untrusted `.yaw-mcp/` on the walk-up path --
+// once per config load and it has several independent callers (the config,
+// guide and bundles loaders among them), so an untrusted `.yaw-mcp/` on the walk-up path --
 // the normal shape for any win32 checkout on a second drive without the env
 // opt-in -- otherwise emits the same warn on every doctor / list / profile
 // refresh. The warning is advice about a static condition, so the first

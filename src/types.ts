@@ -70,13 +70,13 @@ export interface UpstreamServerConfig {
   // every candidate.
   toolCache?: Array<{ name: string; description?: string }>;
   /**
-   * A–F grade for this server, overlaid from the LOCAL grades cache that
-   * `yaw-mcp audit <namespace>` writes to ~/.yaw-mcp/grades.json --
+   * A–F grade for this server. A bundles.json entry may carry the catalog
+   * grade recorded by `yaw-mcp add` (validateEntry in local-bundles.ts
+   * keeps it). The LOCAL grades cache that `yaw-mcp audit <namespace>`
+   * writes to ~/.yaw-mcp/grades.json is applied on top and wins --
    * hydrateComplianceGrades (server.ts) and runList (local-add-cmd.ts)
-   * apply it. It never rides along in bundles.json: validateEntry drops
-   * unknown fields, so the cache is the only supplier. Absent on any
-   * server that has not been audited; absent means "ungraded" and passes
-   * filters by default (we don't punish unknown). See compliance.ts.
+   * apply it. Absent on a server with neither; absent means "ungraded" and
+   * passes filters by default (we don't punish unknown). See compliance.ts.
    */
   complianceGrade?: "A" | "B" | "C" | "D" | "F";
   /**

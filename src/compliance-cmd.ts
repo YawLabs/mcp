@@ -197,14 +197,10 @@ export async function locateComplianceSuite(
   }
 }
 
-/** `<pkg>@<version>` when the version is known, the bare name otherwise. */
-function suiteSpec(version: string | undefined): string {
-  return version ? `${COMPLIANCE_PKG}@${version}` : COMPLIANCE_PKG;
-}
-
 /**
  * The npx spec for the FALLBACK launch: `<pkg>@<version>` pinned to the copy
- * this build depends on, or the bare package name when that cannot be read.
+ * this build depends on, or the bare package name when that version cannot be
+ * read. resolveSuiteLaunch passes the version locateComplianceSuite found.
  *
  * `compliance` and `audit` are two front doors onto the same suite, and they
  * must grade under ONE rubric. `audit` imports the pinned dependency and
@@ -225,8 +221,8 @@ function suiteSpec(version: string | undefined): string {
  * single-file build. npx then fetches `latest`, which is exactly the oldest
  * behaviour: degraded to what shipped before, never broken.
  */
-export async function resolveComplianceSuiteSpec(fromUrl?: string): Promise<string> {
-  return suiteSpec((await locateComplianceSuite(fromUrl))?.version);
+function suiteSpec(version: string | undefined): string {
+  return version ? `${COMPLIANCE_PKG}@${version}` : COMPLIANCE_PKG;
 }
 
 /** How to launch the suite: node + a script (the installed bin, or npm's
@@ -238,7 +234,7 @@ export interface SuiteLaunch {
   args: string[];
   shell: boolean;
   /** "local": the installed dependency's own bin script. "npx": fetched (or
-   *  served from npx's cache) at resolveComplianceSuiteSpec's spec. */
+   *  served from npx's cache) at suiteSpec's spec. */
   via: "local" | "npx";
 }
 
@@ -261,7 +257,7 @@ export type SuiteLaunchResult = { ok: true; launch: SuiteLaunch } | { ok: false;
  * npx stays as the fallback for the absent-dependency case (a pruned global
  * install, a bundled single-file build, a manifest that names no bin):
  * resolveNpxLaunch at the pinned spec when the manifest is readable and the
- * bare name otherwise -- see resolveComplianceSuiteSpec. Only that path can
+ * bare name otherwise -- see suiteSpec. Only that path can
  * fail to launch, which is why the failure carries the npx argv.
  *
  * The seams (`fromUrl`, `execPath`, `platform`, `exists`) are for tests;

@@ -373,6 +373,8 @@ describe("buildToolList -- the blockedTools deny predicate", () => {
 });
 
 describe("buildToolList — cross-namespace name collisions", () => {
+  pinLogLevel();
+
   it("emits ONE entry when two active namespaces flatten to the same name", () => {
     // (ns=`gh`, tool=`actions_list`) and (ns=`gh_actions`, tool=`list`) both
     // render as `gh_actions_list`. MCP tool names must be unique, so the
@@ -383,6 +385,83 @@ describe("buildToolList — cross-namespace name collisions", () => {
     const tools = buildToolList(connections);
     expect(tools.filter((t) => t.name === "gh_actions_list")).toHaveLength(1);
     expect(tools).toHaveLength(Object.keys(META_TOOLS).length + 1);
+  });
+
+  // REGRESSION: the list used to decide the winner by its own `seen` set,
+  // which a namespace hidden by gateway/lite exposure (or a tool hidden by a
+  // filter) never reached -- so it advertised the NEXT namespace's tool under
+  // a wire name the route table still sent to the hidden one. Whatever the
+  // list shows under a name must be what a call to that name runs.
+  const collide = (): Map<string, UpstreamConnection> => {
+    const connections = new Map<string, UpstreamConnection>();
+    connections.set("gh", makeConnection("gh", ["actions_list"], ["x/y"], ["review_pr"]));
+    connections.set("gh_actions", makeConnection("gh_actions", ["list", "other"]));
+    return connections;
+  };
+
+  it.each([
+    "gateway",
+    "lite",
+  ] as const)("does not list the loser of a collision when %s hides the winner's namespace", (exposure) => {
+    const connections = collide();
+    // `gh` is connected (prewarmed) but only `gh_actions` was activated.
+    const names = buildToolList(connections, [], undefined, exposure, new Set(["gh_actions"])).map((t) => t.name);
+    expect(buildToolRoutes(connections, [], true).get("gh_actions_list")?.namespace).toBe("gh");
+    expect(names).not.toContain("gh_actions_list");
+    // The rest of the exposed namespace is untouched.
+    expect(names).toContain("gh_actions_other");
+  });
+
+  it("does not list the loser of a collision when a filter hides the winner's tool", () => {
+    const connections = collide();
+    const filters = new Map([["gh", new Set<string>()]]);
+    const names = buildToolList(connections, [], filters).map((t) => t.name);
+    expect(names).not.toContain("gh_actions_list");
+    expect(names).toContain("gh_actions_other");
+  });
+
+  it("applies the same ownership rule to deferred placeholders", () => {
+    const inactive = [
+      makeInactiveServer("gh", [{ name: "actions_list" }]),
+      makeInactiveServer("gh_actions", [{ name: "list" }, { name: "other" }]),
+    ];
+    const filters = new Map([["gh", new Set<string>()]]);
+    const names = buildToolList(new Map(), inactive, filters).map((t) => t.name);
+    expect(buildToolRoutes(new Map(), inactive, true).get("gh_actions_list")?.namespace).toBe("gh");
+    expect(names).not.toContain("gh_actions_list");
+    expect(names).toContain("gh_actions_other");
+  });
+
+  it("holds for prompts and resources under gateway exposure too", () => {
+    const connections = new Map<string, UpstreamConnection>();
+    connections.set("gh", makeConnection("gh", [], [], ["review_pr"]));
+    connections.set("gh_review", makeConnection("gh_review", [], [], ["pr", "other"]));
+    const prompts = buildPromptList(connections, "gateway", new Set(["gh_review"])).map((p) => p.name);
+    expect(buildPromptRoutes(connections, true).get("gh_review_pr")?.namespace).toBe("gh");
+    expect(prompts).toEqual(["gh_review_other"]);
+
+    // Two namespaces publishing one flattened uri: force it, since
+    // `connect://<ns>/<uri>` only collides for crafted values.
+    const a = makeConnection("a", [], ["shared"]);
+    const b = makeConnection("b", [], ["shared", "own"]);
+    b.resources[0].namespacedUri = a.resources[0].namespacedUri;
+    const rconns = new Map<string, UpstreamConnection>([
+      ["a", a],
+      ["b", b],
+    ]);
+    const uris = buildResourceList(rconns, [], "gateway", new Set(["b"])).map((r) => r.uri);
+    expect(buildResourceRoutes(rconns, true).get("connect://a/shared")?.namespace).toBe("a");
+    expect(uris).toEqual(["connect://b/own"]);
+  });
+
+  it("builds its ownership table without logging the collision a second time", () => {
+    const { writes } = withCapturedStderr(() => {
+      const connections = collide();
+      buildToolList(connections);
+      buildPromptList(connections);
+      buildResourceList(connections);
+    });
+    expect(writes.join("")).not.toContain("collision");
   });
 
   it("does not let an upstream tool duplicate a meta-tool name", () => {
@@ -1397,7 +1476,7 @@ describe("buildToolList — lite exposure", () => {
 
   it("advertises exactly exec, find_tool and read_tool before anything is activated", () => {
     const names = buildToolList(connections, inactive, undefined, "lite", new Set()).map((t) => t.name);
-    expect(names).toEqual([META_TOOLS.read_tool.name, META_TOOLS.findTool.name, META_TOOLS.exec.name]);
+    expect(names).toEqual([META_TOOLS.readTool.name, META_TOOLS.findTool.name, META_TOOLS.exec.name]);
     expect(names).toEqual([...names].filter((n) => LITE_META_TOOL_NAMES.has(n)));
   });
 

@@ -533,6 +533,9 @@ function spliceEdits(text: string, path: JSONPath, value: unknown): Edit[] | nul
   if (parent === undefined || key === undefined) return null;
 
   if (parent.type === "object" && typeof key === "string") {
+    // The FIRST member of that name, where `parseJsonc` reads the last: see
+    // `duplicateJsoncKeyOnPath` below for what that means for a key written
+    // twice.
     const existing = findNodeAtLocation(parent, [key]);
     if (existing?.parent !== undefined) {
       if (toWrite === undefined) return removeMember(text, parent, existing.parent);
@@ -544,6 +547,38 @@ function spliceEdits(text: string, path: JSONPath, value: unknown): Edit[] | nul
   if (parent.type === "array" && typeof key === "number" && toWrite !== undefined && key >= 0) {
     const element = parent.children?.[key];
     if (element !== undefined) return [replaceValue(text, parent, element, toWrite)];
+  }
+  return null;
+}
+
+/** The first key along `path` that its parent object declares MORE THAN ONCE,
+ *  as the path down to it and the number of times it is written -- or null
+ *  when every key on the path is written at most once (or `src` has no tree
+ *  to walk).
+ *
+ *  Why a caller of the editing helpers wants to know: a JSON object may spell
+ *  one key twice, and the two halves of this file then disagree about it.
+ *  `parseJsonc` ends in `JSON.parse`, where the LAST duplicate wins, while
+ *  `spliceEdits` above locates a member with `findNodeAtLocation`, which
+ *  returns the FIRST. So an edit to a duplicated key changes a definition no
+ *  reader sees. Nothing here refuses that by itself -- the splice is still
+ *  made -- which is why this is exported for the caller that reads the result
+ *  back (client-config-json.ts refuses, naming the key).
+ *
+ *  The walk stops at the first duplicated key, so nothing below it is looked
+ *  at. Keys are compared decoded, so `"a"` and an escaped spelling of it are
+ *  one key. */
+export function duplicateJsoncKeyOnPath(
+  src: string,
+  path: readonly string[],
+): { path: string[]; count: number } | null {
+  const debommed = src.charCodeAt(0) === 0xfeff ? src.slice(1) : src;
+  let node = parseTree(debommed, [], { allowTrailingComma: true });
+  for (let i = 0; i < path.length; i++) {
+    if (node === undefined || node.type !== "object") return null;
+    const matches = (node.children ?? []).filter((member) => member.children?.[0]?.value === path[i]);
+    if (matches.length > 1) return { path: path.slice(0, i + 1), count: matches.length };
+    node = matches[0]?.children?.[1];
   }
   return null;
 }

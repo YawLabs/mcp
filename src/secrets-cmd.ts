@@ -121,7 +121,9 @@ Actions:
                           Show the local secret-resolution audit trail
                           (~/.yaw-mcp/secrets-audit.log): which secret
                           NAMES were injected into (or missing for) which
-                          server, and when. Never shows a value. A missing
+                          server, and when. Never shows a value. "missing"
+                          also covers a name whose vault entry is there but
+                          did not decrypt. A missing
                           row whose name starts with \`<malformed ref>\` is a
                           \${secret: reference that did not parse (a space
                           in the name, a dropped brace): fix the typo in
@@ -133,12 +135,15 @@ Flags:
                           envelope, one JSON line; stderr carries one JSON
                           object per line: {"warning":...} lines (a
                           schema-behind file, a malformed check marker, a
-                          short passphrase, a vault just created or reset,
-                          a value printed in cleartext to a terminal) and,
-                          on failure, the {"ok":false,"error":...} envelope
-                          last -- an argument error too (exit 2, no usage
-                          text). Key on "warning" vs "ok", never on line
-                          position.
+                          short passphrase, a vault just created, rotated
+                          or reset, a value printed in cleartext to a
+                          terminal) and, on failure, the
+                          {"ok":false,"error":...} envelope last -- an
+                          argument error too (exit 2, no usage text). Key
+                          on "warning" vs "ok", never on line position. An
+                          argument error also puts a multi-line
+                          {"ok":false,...,"exitCode":2} document on stdout;
+                          read the message from the stderr envelope.
   --value <v>             Inline secret value (set only). The value sits in
                           this process's argv, so it is visible to every
                           other local user via ps / /proc/<pid>/cmdline for
@@ -146,16 +151,19 @@ Flags:
                           derivation), and it lands in your shell history.
                           For scripting pipe the value in on stdin;
                           interactively use the default no-echo prompt.
-  --stdin                 Read the value from stdin even when stdin is a
+                          Cannot be combined with --stdin.
+  --stdin                Read the value from stdin even when stdin is a
                           terminal (set only): raw, multi-line, until EOF,
                           and the terminal echoes it. A piped stdin is read
                           that way without the flag. Either way the value
-                          never appears in argv.
-  --force                 Skip the destructive-action confirmation
+                          never appears in argv. Cannot be combined with
+                          --value.
+  --force                Skip the destructive-action confirmation
                           (remove, reset, and a set that overwrites an
                           existing name). Required for remove and reset
                           when stdin or stdout is not a TTY (both ends are
                           needed to ask). NEVER skips the passphrase.
+                          Accepted and ignored on the other actions.
   --secret <name>         (audit only) Filter to one secret name.
   --server <ns>           (audit only) Filter to one server namespace.
 
@@ -251,7 +259,11 @@ export function parseSecretsArgs(
   // An argv error under --json is the same one-line {"ok":false,"error":...}
   // envelope every runtime failure emits (the promise SECRETS_USAGE makes for
   // stderr), not the prose-plus-usage dump: index.ts's shared run() writes
-  // `error` to stderr verbatim with exit 2, so the JSON is spelled here. The
+  // `error` to stderr verbatim with exit 2, so the JSON is spelled here. That
+  // run() ALSO writes a stdout document on a --json argv error -- pretty-
+  // printed {ok:false, error, exitCode:2} with this whole envelope string as
+  // its `error` field, so the message is double-encoded there; SECRETS_USAGE
+  // points callers at the stderr envelope instead. The
   // flag is looked for anywhere in argv, not just before the bad token:
   // `secrets get --bogus --json` asked for JSON as surely as
   // `--json get --bogus` did. That matches what the loop below would find --
@@ -345,10 +357,19 @@ export function parseSecretsArgs(
   // The usage text marks these flags "(set only)" / "(audit only)", but the
   // parser used to accept and then silently drop them on every other action:
   // `secrets get NAME --stdin` and `secrets list --secret GH` both looked
-  // like they did something. Refuse instead of ignoring.
+  // like they did something. Refuse instead of ignoring. (--force is the one
+  // flag still accepted everywhere and ignored off remove/reset/set, as the
+  // usage text says: refusing it would turn a harmless `rotate --force` in
+  // someone's script into an exit 2.)
   if (opts.action !== "set" && (opts.value !== undefined || opts.fromStdin)) {
     const flag = opts.value !== undefined ? "--value" : "--stdin";
     return refuse(`${flag} applies to \`set\` only`);
+  }
+  // Two sources for one value. runSecrets takes --value and never reads
+  // stdin, so `set NAME --value v --stdin` used to store "v" while whatever
+  // was piped in was dropped unread -- the same silent ignore as above.
+  if (opts.value !== undefined && opts.fromStdin) {
+    return refuse("--value and --stdin are mutually exclusive -- pass the value one way");
   }
   // An empty --value is refused HERE for the same reason the name check
   // below is: runSecrets's own "cannot be empty" check sits after the
@@ -1534,8 +1555,8 @@ export async function runSecrets(
         return { exitCode: 0 };
       } catch (err) {
         // The passphrase itself was already verified by unlock() above (via
-        // the vault check stamp, or the first-entry canary on a legacy
-        // vault), so "wrong passphrase" is NOT reachable here. What is: this
+        // the vault check stamp, or on a legacy vault with none, by some
+        // entry decrypting), so "wrong passphrase" is NOT reachable here. What is: this
         // one entry is damaged, or it was written under a different key than
         // the rest of the vault by an older build.
         return failResult(io, opts.json, "get", err instanceof Error ? err.message : String(err), {

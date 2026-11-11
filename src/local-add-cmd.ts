@@ -23,7 +23,9 @@ import { CATALOG_SLUG_RE, ENV_KEY_RE, type FetchCatalog, resolveCatalogSlug, tok
 import { readClientEnv } from "./client-config.js";
 import { probeClientsAsync } from "./doctor-cmd.js";
 import {
+  asciiLines,
   buildGitSource,
+  discardUnpinnedBuild,
   GIT_MISSING_MESSAGE,
   type GitBuildContext,
   type GitManifest,
@@ -36,6 +38,7 @@ import {
   parseGitSpec,
   planGitRemoval,
   prepareGit,
+  printable,
   recordGitPin,
   redactGitOutput,
   removeGitCheckout,
@@ -62,6 +65,8 @@ import {
   namespacesForStoredIdentity,
   previewUpsertUserBundle,
   RESERVED_HEADER_NAMES,
+  rawEntryLoads,
+  relativeSegments,
   removeUserBundle,
   STORED_TARGET_RE,
   type UpsertOrigin,
@@ -80,6 +85,7 @@ import {
   SECRET_NAME_RE,
   vaultPath,
 } from "./secrets-vault.js";
+import { TransientConnectError, withTransientUpstream } from "./transient-upstream.js";
 // The removal preview renders command / args / url / name straight out of
 // bundles.json immediately above a [y/N] prompt, so it needs the same
 // control-byte neutering the `trust` gate uses. IMPORTED, never re-spelled:
@@ -87,7 +93,7 @@ import {
 // trust-cmd's tests actually cover.
 import { displayArg, displaySafe } from "./trust-cmd.js";
 import type { GitSource, UpstreamServerConfig } from "./types.js";
-import { connectToUpstream, disconnectFromUpstream } from "./upstream.js";
+import { shellActivationMessage } from "./upstream.js";
 
 // --- add --------------------------------------------------------------------
 
@@ -1007,8 +1013,9 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
           // decides whether a server "needs key". The app writes the same
           // marker for the entries it adds; without ours, a server added here
           // showed "needs key" in the panel until re-added from the app.
-          // Always an array so a re-add can CLEAR a stale marker (the merge
-          // drops an empty one); an explicit-command add carries none.
+          // Always an array so a re-add can CLEAR a stale marker; the write
+          // never stores an empty one, fresh add or merge (mergedUpsertEntry
+          // in local-bundles.ts), and an explicit-command add sends [].
           optionalEnvKeys: server.optionalEnvKeys,
         }),
     isActive: true,
@@ -1049,8 +1056,10 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
     if (preview.refusal) {
       // stderr text under --json too: that is what the REAL refusal (the
       // catch around upsertUserBundle below) emits, and every other error
-      // exit in this command. A {ok:false} body on stdout here would be the
+      // exit of runAdd itself. A {ok:false} body on stdout here would be the
       // one place the preview's channel differed from the run it previews.
+      // (`add --git` is the exception in this file: runAddGit's fail() ALSO
+      // prints an {ok:false} document on stdout under --json.)
       // Rendered through displaySafe: the stored half of the collision (name,
       // slug) comes straight out of bundles.json.
       printErr(`yaw-mcp add (dry-run): would refuse: ${formatBundleCollision(preview.refusal, displaySafe)}`);
@@ -1262,19 +1271,21 @@ function gitEntryEnv(manifest: GitManifest, overrides: Record<string, string>): 
   return Object.keys(env).length > 0 ? env : undefined;
 }
 
-/** One real handshake: connect, count the tools, disconnect. */
+/** One real handshake: connect, count the tools, disconnect. The teardown is
+ *  withTransientUpstream's. A failure to connect comes back worded for a
+ *  shell (shellActivationMessage): the activation error's own text ends in a
+ *  remedy addressed to an MCP client. An error with no config pointer -- a
+ *  locked vault -- passes through verbatim, which startRemedy relies on. */
 export async function defaultStartCheck(
   config: UpstreamServerConfig,
 ): Promise<{ ok: true; tools: number } | { ok: false; error: string }> {
-  let conn: Awaited<ReturnType<typeof connectToUpstream>>;
   try {
-    conn = await connectToUpstream(config);
+    const tools = await withTransientUpstream(config, async (conn) => conn.tools.length);
+    return { ok: true, tools };
   } catch (e) {
-    return { ok: false, error: (e as Error).message };
+    if (e instanceof TransientConnectError) return { ok: false, error: shellActivationMessage(e.cause) };
+    throw e;
   }
-  const tools = conn.tools.length;
-  await disconnectFromUpstream(conn).catch(() => {});
-  return { ok: true, tools };
 }
 
 /** `yaw-mcp secrets set` for these names: the real name for one, the command
@@ -1302,12 +1313,8 @@ function startRemedy(
 /** A start-check failure cut to the part a reader acts on, safe to print. */
 export function startFailureTail(error: string, secrets: Record<string, string>): string {
   const text = redactGitOutput(error, secrets).replace(/\s+/g, " ").trim();
-  return (text.length > 400 ? `...${text.slice(-400)}` : text).replace(/[^\x20-\x7e]/g, "?").replace(/\.$/, "");
+  return printable(text.length > 400 ? `...${text.slice(-400)}` : text).replace(/\.$/, "");
 }
-
-/** Printable ASCII and newlines: build and git output is a repo's own text,
- *  and it can carry non-ASCII and terminal control sequences. */
-const asciiText = (s: string): string => s.replace(/\r\n/g, "\n").replace(/[^\x20-\x7e\n]/g, "?");
 
 /** The secret and env bindings a git entry is written with, one line each.
  *  Never a literal value: it may be a credential. */
@@ -1323,9 +1330,10 @@ async function runAddGit(opts: AddCommandOptions, spec: GitSpec): Promise<AddCom
   const out = opts.out ?? createStreamWriter(process.stdout);
   const err = opts.err ?? createStreamWriter(process.stderr);
   // The --json document is data and goes out as written; everything else is
-  // text for a terminal.
-  const print = (s = ""): void => out(`${opts.json ? s : asciiText(s)}\n`);
-  const printErr = (s: string): void => err(`${asciiText(s)}\n`);
+  // text for a terminal, and build and git output is a repo's own text: it
+  // can carry non-ASCII and terminal control sequences.
+  const print = (s = ""): void => out(`${opts.json ? s : asciiLines(s)}\n`);
+  const printErr = (s: string): void => err(`${asciiLines(s)}\n`);
   // Progress belongs with the result on a terminal, and off stdout under
   // --json, where stdout is the document.
   const progress = opts.json ? printErr : print;
@@ -1335,7 +1343,9 @@ async function runAddGit(opts: AddCommandOptions, spec: GitSpec): Promise<AddCom
     // stdout as well as the human line on stderr -- zero bytes on stdout used
     // to mean both "refused" and "worked quietly". Every fail() here runs
     // BEFORE the success document is printed, so stdout carries exactly one
-    // document either way.
+    // document either way. Only `add --git` does this: a catalog, --command
+    // or --url add that fails under --json prints stderr text and leaves
+    // stdout empty (see runAdd).
     if (opts.json)
       print(JSON.stringify({ ok: false, error: `yaw-mcp add: ${f.message}`, exitCode: f.exitCode }, null, 2));
     printErr(`yaw-mcp add: ${f.message}`);
@@ -1455,32 +1465,58 @@ async function runAddGit(opts: AddCommandOptions, spec: GitSpec): Promise<AddCom
   if (opts.project) {
     configDir = (await findProjectConfigDir(cwd, home, env).catch(() => null)) ?? join(cwd, CONFIG_DIRNAME);
   }
+  const upsertOpts = { home, origin: "custom" as const, ...(configDir ? { configDir } : {}) };
+  const bundlesPath = localBundlesPath(configDir ?? userConfigDir(home));
+  // A refusal past this point comes AFTER the build, and the entry that would
+  // have pinned it is not written. A build this add made is deleted again
+  // unless some file pins it; one that was already there is not this add's to
+  // delete.
+  const refuse = async (message: string): Promise<AddCommandResult> => {
+    if (!build.reused) {
+      const gone = await discardUnpinnedBuild(namespace, build.commit, home, { cwd, env });
+      if (gone.reason !== undefined) warn(`the build at ${build.dir} was not deleted: ${gone.reason}`);
+    }
+    return fail({ exitCode: 1, message });
+  };
+  // What the write below would do, read once. An unreadable file is null: the
+  // write fails on it with its own error.
+  const preview = await previewUpsertUserBundle(entry, upsertOpts).catch(() => null);
+  if (preview?.refusal) {
+    for (const w of preview.warnings) printErr(`warning: ${w}`);
+    return refuse(formatBundleCollision(preview.refusal, displaySafe));
+  }
   // A name the repo chose may not take over an entry the user already has:
   // the merge would carry that entry's stored env (its credentials) into
   // this repo's server. Only a name the user typed replaces one -- or the
   // entry is this same repo and package, whose env it already had.
-  if (opts.slug === undefined) {
-    const preview = await previewUpsertUserBundle(entry, {
-      home,
-      origin: "custom",
-      ...(configDir ? { configDir } : {}),
-    });
+  if (opts.slug === undefined && preview !== null) {
     const was = preview.replacing?.git;
     const sameRepo =
       was !== undefined &&
       normalizeRepoUrl(was.url) === normalizeRepoUrl(spec.url) &&
-      (was.subdir ?? "") === (build.subdir ?? "");
+      // Compared as directories: an entry an earlier add wrote may spell the
+      // subdir "./pkg", and build.subdir is always the tidy "pkg".
+      relativeSegments(was.subdir ?? "").join("/") === (build.subdir ?? "");
     if (preview.replaced && !sameRepo) {
       // Only a typed name that derives this same namespace replaces it.
       const replace =
         CATALOG_SLUG_RE.test(namespace) && deriveNamespace(namespace) === namespace
           ? `To replace it, name it yourself: yaw-mcp add ${namespace} --git ${spec.url}`
           : `To replace it, remove it first: yaw-mcp remove ${namespace}`;
-      return fail({
-        exitCode: 1,
-        message: `the repo's yaw-mcp.json names this server "${namespace}", and ${localBundlesPath(configDir ?? userConfigDir(home))} already has a server by that name; nothing was written. ${replace}. To keep both, pick another name: yaw-mcp add <name> --git ${spec.url}`,
-      });
+      return refuse(
+        `the repo's yaw-mcp.json names this server "${namespace}", and ${bundlesPath} already has a server by that name; nothing was written. ${replace}. To keep both, pick another name: yaw-mcp add <name> --git ${spec.url}`,
+      );
     }
+  }
+  // The write keeps the STORED namespace of an entry it matches by name only
+  // (see upsertUserBundle), and the loader launches a git entry from the build
+  // directory of the namespace it stores -- while this build sits under
+  // `namespace`. Written, the entry would point at a build that is not there.
+  if (preview?.namespace !== undefined && preview.namespace !== namespace) {
+    const kept = displaySafe(preview.namespace);
+    return refuse(
+      `${bundlesPath} already has a server named "${displaySafe(name)}" under the namespace "${kept}", and this build is for "${namespace}"; nothing was written. Remove that one first (yaw-mcp remove ${kept}), or pick another name: yaw-mcp add <name> --git ${spec.url}`,
+    );
   }
 
   // Said every time, consent or --yes or not: these are what the repo's
@@ -1533,14 +1569,7 @@ async function runAddGit(opts: AddCommandOptions, spec: GitSpec): Promise<AddCom
     // this add brought: a git-over-git re-add (a ref switch) keeps the stored
     // server args, and the merge keeps stored env values. An unreadable file
     // fails the write below with its own error; the check then uses this add's.
-    const willStore = await previewUpsertUserBundle(entry, {
-      home,
-      origin: "custom",
-      ...(configDir ? { configDir } : {}),
-    }).then(
-      (p) => p.entry,
-      () => entry,
-    );
+    const willStore = preview?.entry ?? entry;
     const storedArgs = Array.isArray(willStore.args) ? willStore.args : [];
     const checkEnv = willStore.env && Object.keys(willStore.env).length > 0 ? willStore.env : undefined;
     // No `git` on this config: its activation preflight looks under the real
@@ -1562,14 +1591,15 @@ async function runAddGit(opts: AddCommandOptions, spec: GitSpec): Promise<AddCom
 
   let res: Awaited<ReturnType<typeof upsertUserBundle>>;
   try {
-    res = await upsertUserBundle(entry, { home, origin: "custom", ...(configDir ? { configDir } : {}) });
+    res = await upsertUserBundle(entry, upsertOpts);
   } catch (e) {
-    if (e instanceof BundleCollisionError) for (const w of e.warnings) printErr(`warning: ${w}`);
-    const msg =
-      e instanceof BundleCollisionError
-        ? formatBundleCollision(e.collision, displaySafe)
-        : nameBundlesFileOnce((e as Error).message, localBundlesPath(configDir ?? userConfigDir(home)));
-    return fail({ exitCode: 1, message: msg });
+    // A collision the preview above did not see: the file changed since.
+    if (e instanceof BundleCollisionError) {
+      for (const w of e.warnings) printErr(`warning: ${w}`);
+      return refuse(formatBundleCollision(e.collision, displaySafe));
+    }
+    // An unreadable file: the build stays, and the re-run after the fix reuses it.
+    return fail({ exitCode: 1, message: nameBundlesFileOnce((e as Error).message, bundlesPath) });
   }
   for (const w of res.warnings) warn(w);
   await recordGitPin(namespace, res.path, build.commit, home, warn);
@@ -1621,8 +1651,10 @@ async function runAddGit(opts: AddCommandOptions, spec: GitSpec): Promise<AddCom
   }
   // The entry IS written (and `written` says so) while the handshake that
   // proves it launches failed: exit 0 told a script the add was fine when the
-  // server it just added does not start. Same shape update-cmd uses for its
-  // own failed start check -- non-zero, with the remedy already printed above.
+  // server it just added does not start. `update` does NOT do this -- it pins
+  // a build that fails its start check and exits 0 (see the header of
+  // update-cmd.ts); `add` exits non-zero because the entry it just wrote is
+  // the only build there is.
   return { exitCode: startError !== null ? 1 : 0, written: [res.path] };
 }
 
@@ -1809,14 +1841,13 @@ async function findRemovalTarget(
     > | null;
     if (!hit) continue;
     const name = typeof hit.name === "string" && hit.name.length > 0 ? hit.name : "(unnamed)";
-    const env = typeof hit.env === "object" && hit.env !== null ? (hit.env as Record<string, unknown>) : {};
     // Same shape test for both maps: this entry is RAW (never validated -- see
     // the doc above), so an array or a string in either field must read as "no
     // keys" rather than reaching Object.keys and rendering indices.
-    const headers =
-      typeof hit.headers === "object" && hit.headers !== null && !Array.isArray(hit.headers)
-        ? (hit.headers as Record<string, unknown>)
-        : {};
+    const plainMap = (v: unknown): Record<string, unknown> =>
+      typeof v === "object" && v !== null && !Array.isArray(v) ? (v as Record<string, unknown>) : {};
+    const env = plainMap(hit.env);
+    const headers = plainMap(hit.headers);
     return {
       namespace: ns,
       name,
@@ -2177,14 +2208,16 @@ export interface ListCommandOptions {
  *
  * One QUEUE of key lists per namespace, in file order, because a namespace
  * can be duplicated and each entry must report its OWN keys. The pairing is
- * exact: validateEntry rejects only non-object entries and invalid
- * namespaces, and a namespace either passes NAMESPACE_RE for every entry
- * that carries it or for none, so the n-th validated entry under a namespace
- * is the n-th raw object entry under it. The caller shifts the queue as it
- * walks the validated list in order. (First-entry-wins used to copy the first
- * duplicate's keys onto the second, misreporting the second's.)
+ * exact because only raw entries the loader KEEPS are queued (rawEntryLoads,
+ * the loader's own validateEntry): an entry it skips -- a non-object, an
+ * invalid namespace, a malformed `git` block -- is skipped here too, so the
+ * n-th validated entry under a namespace is the n-th queued one. The caller
+ * shifts the queue as it walks the validated list in order. (First-entry-wins
+ * used to copy the first duplicate's keys onto the second, misreporting the
+ * second's; queueing every raw object did the same once a bad git block could
+ * drop the first duplicate.)
  */
-async function rawEnvKeysByNamespace(path: string | null): Promise<Map<string, string[][]>> {
+async function rawEnvKeysByNamespace(path: string | null, home: string): Promise<Map<string, string[][]>> {
   const out = new Map<string, string[][]>();
   if (!path) return out;
   // Note the path is whichever file the LOADER won with (project-local can
@@ -2193,7 +2226,7 @@ async function rawEnvKeysByNamespace(path: string | null): Promise<Map<string, s
   if (servers === null) return out;
   for (const s of servers) {
     const e = s as { namespace?: unknown; env?: unknown } | null;
-    if (!e || typeof e.namespace !== "string") continue;
+    if (!e || typeof e.namespace !== "string" || !rawEntryLoads(s, home)) continue;
     const env = e.env && typeof e.env === "object" && !Array.isArray(e.env) ? (e.env as Record<string, unknown>) : {};
     const queue = out.get(e.namespace) ?? [];
     queue.push(Object.keys(env));
@@ -2291,7 +2324,7 @@ export async function runList(opts: ListCommandOptions): Promise<AddCommandResul
     // grade, so a consumer can tell a letter graded under an older rubric from
     // a current one; entries audited before suiteVersion existed surface
     // timestamp only.
-    const rawEnvKeys = await rawEnvKeysByNamespace(loaded.path);
+    const rawEnvKeys = await rawEnvKeysByNamespace(loaded.path, home);
     const jsonServers = graded.map((s) => {
       const entry = jsonEntry(s);
       // `graded` is the validated list in file order, so shifting pairs each

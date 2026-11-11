@@ -49,6 +49,17 @@ export interface CachedGrade {
 /** The on-disk shape: a map of namespace -> cached grade. */
 export type GradesCache = Record<string, CachedGrade>;
 
+/** A fresh, empty cache with NO prototype. Every map readGradesCache hands
+ *  back is built on one, so `cache[namespace]` can only ever find a grade
+ *  that was in the file: on a plain {} a namespace named "constructor"
+ *  (NAMESPACE_RE in local-bundles.ts admits it) indexes Object.prototype's
+ *  member and a caller reads a function as a cached grade. JSON.stringify,
+ *  Object.keys / entries and Object.hasOwn(cache, ns) all work on it; what it
+ *  lacks is the inherited methods, so `cache.hasOwnProperty(...)` throws. */
+function emptyGradesCache(): GradesCache {
+  return Object.create(null) as GradesCache;
+}
+
 const GRADE_LETTERS = new Set(["A", "B", "C", "D", "F"]);
 
 /** Absolute path to grades.json inside the user-global ~/.yaw-mcp/ dir. The
@@ -89,7 +100,9 @@ function validateEntry(entry: unknown): CachedGrade | null {
 
 /** Read the grade cache. Returns an empty object when the file is absent or
  *  malformed -- never throws, so a list command degrades to "no cached grades"
- *  instead of crashing on a hand-edited file. */
+ *  instead of crashing on a hand-edited file. The object has no prototype
+ *  (see emptyGradesCache), so indexing it by a namespace never finds an
+ *  inherited member. */
 export async function readGradesCache(home: string = homedir()): Promise<GradesCache> {
   return readGradesCacheImpl(home, { strictRead: false });
 }
@@ -116,7 +129,7 @@ async function readGradesCacheImpl(home: string, opts: { strictRead: boolean }):
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (opts.strictRead && code !== "ENOENT" && code !== "ENOTDIR") throw err;
-    return {};
+    return emptyGradesCache();
   }
   let parsed: unknown;
   try {
@@ -126,7 +139,7 @@ async function readGradesCacheImpl(home: string, opts: { strictRead: boolean }):
       path,
       error: err instanceof Error ? err.message : String(err),
     });
-    return {};
+    return emptyGradesCache();
   }
   // Warned about, not dropped in silence: a root that PARSES but is not a
   // namespace->grade map (an array, a bare number, `null`) is exactly as
@@ -140,14 +153,16 @@ async function readGradesCacheImpl(home: string, opts: { strictRead: boolean }):
       path,
       rootType: Array.isArray(parsed) ? "array" : parsed === null ? "null" : typeof parsed,
     });
-    return {};
+    return emptyGradesCache();
   }
-  const out: GradesCache = {};
+  const out = emptyGradesCache();
   for (const [ns, entry] of Object.entries(parsed as Record<string, unknown>)) {
     const validated = validateEntry(entry);
-    // setJsonKey, not out[ns]: ns comes straight from the parsed cache file,
-    // and plain assignment to "__proto__" would drop the grade AND repoint
-    // `out`'s prototype at it.
+    // setJsonKey, not out[ns]: ns comes straight from the parsed cache file.
+    // On a plain {} an assignment to "__proto__" would drop the grade AND
+    // repoint the map's prototype at it; `out` has no prototype, so there is
+    // no inherited setter to hit, and the call is kept so the write does not
+    // depend on that.
     if (validated) setJsonKey(out, ns, validated);
   }
   return out;
@@ -203,9 +218,9 @@ export async function writeGrade(
     // strictRead: a transient read failure must throw (surfacing as audit's
     // exit 3), not clobber the cache -- see readGradesCacheImpl.
     const cache = await readGradesCacheImpl(home, { strictRead: true });
-    // setJsonKey, not cache[namespace]: mirrors the read side above. Plain
-    // assignment of "__proto__" would invoke the inherited setter and the
-    // grade would vanish from the serialized file.
+    // setJsonKey, not cache[namespace]: mirrors the read side above. On a
+    // plain {} an assignment of "__proto__" would invoke the inherited setter
+    // and the grade would vanish from the serialized file.
     setJsonKey(cache, namespace, grade);
     await atomicWriteFile(path, `${JSON.stringify(cache, null, 2)}\n`);
   });

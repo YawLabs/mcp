@@ -623,6 +623,26 @@ describe("reading a file", () => {
     expect(view.count()).toBe(0);
   });
 
+  it("addresses an unreadable file at the first candidate container, like every other unclassified read", async () => {
+    const candidates = [
+      ["projects", "C:/repo", "mcpServers"],
+      ["projects", "c:/repo", "mcpServers"],
+    ];
+    const unreadable = await readClientConfigFile(site(), {
+      containerPaths: candidates,
+      readFile: () => Promise.reject(Object.assign(new Error("EACCES: denied"), { code: "EACCES" })),
+    });
+    expect(unreadable.read.kind).toBe("unreadable");
+    expect(unreadable.address.containerPath).toEqual(candidates[0]);
+    expect(unreadable.addressIndex).toBe(0);
+    // The same address an absent file gets.
+    const absent = await readClientConfigFile(site(), {
+      containerPaths: candidates,
+      readFile: () => Promise.reject(Object.assign(new Error("ENOENT"), { code: "ENOENT" })),
+    });
+    expect(absent.address).toEqual(unreadable.address);
+  });
+
   it("classifies what it read", async () => {
     const view = await readClientConfigFile(site(), { readFile: () => Promise.resolve('{"mcpServers":{"mcp":{}}}') });
     expect(view.entry()?.key).toBe("mcp");

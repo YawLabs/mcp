@@ -46,31 +46,30 @@ const FILLER = new Set(
     "you your our its their them they via using use through over also just only more most other " +
     "get list create update delete search set add remove read write run find fetch query info new edit " +
     "covering manage management configure execute talk directly provide provides access tool tools server servers " +
-    "mcp assistant assistants model models intelligence development data date demand pulled up-to-date"
+    "mcp assistant assistants model models intelligence development data date demand pulled"
   ).split(" "),
 );
 
 export type InstalledServer = Pick<UpstreamServerConfig, "namespace" | "name" | "description" | "toolCache">;
 
-// biome-ignore lint/suspicious/noControlCharactersInRegex: stripping them is the point
-const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/g;
-
 /** Domain keywords, in order of first appearance, lowercased and deduped:
  *  from the description when there is one, else from the display name and
- *  the tool names. Only [a-z0-9] runs survive, so nothing from bundles.json
- *  or an upstream's tool list reaches the description as markup or control
- *  characters. */
+ *  the tool names. Only [a-z0-9] runs survive (the split below treats every
+ *  other character, control characters included, as a separator), so nothing
+ *  from bundles.json or an upstream's tool list reaches the description as
+ *  markup or control characters. A word that is the namespace, or one of its
+ *  parts (`google` and `drive` for `google_drive`), is skipped: the entry
+ *  already leads with the namespace. */
 export function serverKeywords(server: InstalledServer): string[] {
-  const ns = server.namespace.toLowerCase();
+  // Split the same way as the source, so a namespace with a separator in it
+  // is compared part by part: a token can never contain `_`.
+  const nsParts = new Set(server.namespace.toLowerCase().split(/[^a-z0-9]+/));
   const source = server.description
     ? server.description
     : [server.name ?? "", ...(server.toolCache ?? []).map((t) => t.name)].join(" ");
   const out: string[] = [];
-  for (const raw of source
-    .replace(CONTROL_CHARS, " ")
-    .toLowerCase()
-    .split(/[^a-z0-9]+/)) {
-    if (raw.length < 3 || /^[0-9]+$/.test(raw) || FILLER.has(raw) || raw === ns) continue;
+  for (const raw of source.toLowerCase().split(/[^a-z0-9]+/)) {
+    if (raw.length < 3 || /^[0-9]+$/.test(raw) || FILLER.has(raw) || nsParts.has(raw)) continue;
     // A plural next to its singular adds nothing ("issue", "issues").
     const singular = raw.endsWith("s") ? raw.slice(0, -1) : raw;
     if (out.includes(raw) || out.includes(singular) || out.includes(`${raw}s`)) continue;

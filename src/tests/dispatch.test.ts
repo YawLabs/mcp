@@ -1167,6 +1167,9 @@ describe("routing confidence in the dispatch and discover handlers", () => {
     expect(priv.sessionActivated.has("beta")).toBe(true);
     expect(priv.sessionActivated.has("alpha")).toBe(false);
     expect(priv.lastIntentByNamespace.get("beta")).toBe("github issue");
+    // The re-dispatch ring records the server that was actually loaded, not
+    // the ranked winner that never started.
+    expect(priv.redispatch.ring.map((rec: { namespace: string }) => rec.namespace)).toEqual(["beta"]);
   });
 
   it("does not swap a failed winner for a runner-up that scores far below it", async () => {

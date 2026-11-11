@@ -1,7 +1,13 @@
 import { createInterface } from "node:readline/promises";
 import { PassThrough } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
-import { type AnswerReader, askYesNo, QUESTION_CANCELLED, questionOrEmpty } from "../readline-question.js";
+import {
+  type AnswerReader,
+  askYesNo,
+  QUESTION_CANCELLED,
+  QUESTION_EOF,
+  questionOrEmpty,
+} from "../readline-question.js";
 
 function makeRl(): { rl: ReturnType<typeof createInterface>; input: PassThrough; output: PassThrough } {
   const input = new PassThrough();
@@ -82,9 +88,8 @@ describe("questionOrEmpty", () => {
   });
 });
 
-// The [y/N] confirmation import, remove, set, reset-learning, try-cleanup and
-// trust all call. These pin the contract each of those commands relied on
-// when it had its own copy.
+// The yes/no confirmation the commands share, [y/N] and [Y/n] alike. These pin
+// the contract each of those commands relies on.
 describe("askYesNo", () => {
   function streams(): { input: PassThrough; output: PassThrough; written: () => string } {
     const input = new PassThrough();
@@ -126,11 +131,30 @@ describe("askYesNo", () => {
     expect(input.listenerCount("data")).toBe(0);
   });
 
-  it("reads EOF as the empty answer, which every caller takes as NO", async () => {
+  it("reads EOF as QUESTION_EOF, never the empty answer a [Y/n] prompt takes as YES", async () => {
+    // It used to come back "" -- safe at a [y/N] prompt, consent at a [Y/n]
+    // one (`answer === "" || answer === "y"`), so a stdin that ran dry
+    // proceeded. The symbol matches neither comparison.
     const { input, output } = streams();
-    const pending = askYesNo({ io: { stdin: input, stdout: output } }, "Remove? [y/N] ");
+    const pending = askYesNo({ io: { stdin: input, stdout: output } }, "Proceed? [Y/n] ");
     input.end();
+    const answer = await pending;
+    expect(answer).toBe(QUESTION_EOF);
+    expect(answer === "" || answer === "y" || answer === "yes").toBe(false);
+  });
+
+  it("still reads a bare Enter as the empty answer", async () => {
+    const { input, output } = streams();
+    const pending = askYesNo({ io: { stdin: input, stdout: output } }, "Proceed? [Y/n] ");
+    input.write("\n");
     await expect(pending).resolves.toBe("");
+  });
+
+  it("passes a custom reader's QUESTION_EOF through unchanged", async () => {
+    const read = vi.fn<AnswerReader>(async () => QUESTION_EOF);
+    await expect(askYesNo({ io: { stdin: new PassThrough(), stdout: new PassThrough() } }, "? ", read)).resolves.toBe(
+      QUESTION_EOF,
+    );
   });
 
   it("returns QUESTION_CANCELLED on Ctrl+C, not the empty default", async () => {

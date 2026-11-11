@@ -145,19 +145,25 @@ function run<T>(
 // and every subcommand here is local-only.
 const subcommand = process.argv[2];
 
-// Every client env var, read by ONE reader and threaded into the verbs that
-// need it -- never inside a runner, so a test that calls the runner directly
-// stays hermetic and cannot inherit a wrapper's env. `readClientEnv` is the
-// single reader of these names (empty counts as UNSET, one rule in one place);
-// three hand-rolled copies of that rule is how two commands came to disagree
-// about whether an empty CLAUDE_CONFIG_DIR relocates anything.
+// Every client env var, read by ONE reader and threaded into the three verbs
+// this file feeds it to: install, uninstall and import. Their runners never
+// read it themselves, so a test that calls one directly stays hermetic and
+// cannot inherit a wrapper's env. `readClientEnv` is the single reader of
+// these names (empty counts as UNSET, one rule in one place); three
+// hand-rolled copies of that rule is how two commands came to disagree about
+// whether an empty CLAUDE_CONFIG_DIR relocates anything.
 //
-// Called from inside the three branches that consume it (install, uninstall,
-// import), not at the top of the dispatcher: a bare `serve` -- the one
-// invocation every MCP client makes -- has no business parsing
-// CLAUDE_CONFIG_DIR and its siblings, and the server never reads them (the
-// help text for CLAUDE_CONFIG_DIR says so). Only one branch runs per
-// process, so this is still one read per invocation.
+// Those three are not the only consumers. doctor, try, heal and add's
+// "nothing is wired" probe call `readClientEnv` inside their own runners,
+// against the `env` option they are handed (doctor-cmd.ts, try-cmd.ts,
+// heal-entries.ts, local-add-cmd.ts) -- same reader, different call site.
+//
+// Called from inside the three branches, not at the top of the dispatcher: a
+// bare `yaw-mcp` (server mode; there is no `serve` verb) -- the one
+// invocation every MCP client makes -- does no client
+// config work in this file. (The server is not env-blind for all that: its
+// startup heal pass reads these names through heal-entries.ts.) Only one
+// branch runs per process, so this is still one read per invocation.
 const clientEnvForVerb = (): ReturnType<typeof readClientEnv> => readClientEnv(process.env);
 
 // Any subcommand at all means a person at a terminal, not a client speaking
@@ -261,6 +267,13 @@ if (subcommand === "compliance") {
     runImport({ ...options, claudeConfigDir: clientEnv.claudeConfigDir, clientEnv }),
   );
 } else if (subcommand === "call") {
+  // KNOWN INCONSISTENCY, left as is: `call --json` has two stdout contracts.
+  // run() above writes an {ok:false,error,exitCode} document for an ARGV
+  // error under --json, while runCall keeps stdout for the tool's result only
+  // -- its own failures (bad JSON arguments, unknown server or tool, a policy
+  // refusal, a connect failure) are stderr-only with zero stdout bytes, and
+  // success is the raw MCP envelope, which has no `ok` field. Making them one
+  // contract changes a JSON shape either way, so it is the owner's call.
   run("call", parseCallArgs(process.argv.slice(3)), runCall);
 } else if (subcommand === "search") {
   run("search", parseSearchArgs(process.argv.slice(3)), runSearch);
@@ -417,9 +430,12 @@ if (subcommand === "compliance") {
     heal                     Re-point client entries whose launch file no
                              longer exists -- what an app upgrade leaves
                              behind when it deletes the directory the entry
-                             named. Only touches an entry yaw-mcp wrote that
-                             is currently broken. Runs automatically at
-                             startup; this is the manual form.
+                             named. Only touches an oam entry that points
+                             into an @yawlabs/mcp package tree and whose
+                             launch file is missing (or not a file) -- a
+                             hand-written entry of that shape included. Runs
+                             automatically at startup; this is the manual
+                             form.
     upgrade                  Show (or --run) the command that bumps
                              @yawlabs/mcp to the latest version.
     update [<name>]          Move git servers (add --git) to the commit their
@@ -433,13 +449,16 @@ if (subcommand === "compliance") {
                              secrets they will be asked for. Never prints env
                              values or local paths. --pin for the exact commit.
     sidecars install         Install your servers into ~/.yaw-mcp/sidecars so
-                             they run from one known version. Worth doing when
-                             servers run on oam: it runs the copy already on
-                             disk and cannot re-resolve \`@latest\` the way npx
-                             did. Re-run to move them forward; \`doctor\` shows
-                             the version each one is on.
-    reset-learning           Clear cross-session learning history
-                             (~/.yaw-mcp/state.json).
+                             they run from one known version. Worth doing on
+                             either runtime: yaw-mcp starts an npx server
+                             from a copy already on disk (oam, or node when
+                             oam is not hosting it), which cannot re-resolve
+                             \`@latest\` the way npx did. Re-run to move them
+                             forward; \`doctor\` shows the version each one is
+                             on.
+    reset-learning           Delete ~/.yaw-mcp/state.json: cross-session
+                             learning, plus the cached tool lists, pack
+                             history and pre-warm failures kept in it.
     completion <shell>       Print a shell completion script for bash, zsh,
                              fish, or powershell. Redirect to your
                              completions directory to install.
@@ -510,12 +529,17 @@ if (subcommand === "compliance") {
                                self-upgrade check at server startup (default:
                                stale global installs are upgraded in the
                                background -- npm, pnpm, and bun globals alike).
+                               The check asks registry.npmjs.org regardless
+                               of npm's configured registry; behind a lagging
+                               mirror, set this to \`0\`.
     YAW_MCP_AUTO_HEAL             Set to \`0\` to disable the startup pass that
                                re-points client entries whose launch file no
                                longer exists -- what an app upgrade leaves
                                behind when it deletes the directory the entry
-                               named (default: on; it only rewrites an entry
-                               yaw-mcp wrote AND that is currently broken).
+                               named (default: on; it only rewrites an oam
+                               entry that points into an @yawlabs/mcp package
+                               tree AND whose launch file is missing or not a
+                               file).
     YAW_MCP_CONFIG_RELOAD         Set to \`0\` to stop re-reading bundles.json
                                while the session runs, restoring the pre-0.81
                                behaviour where an edit takes effect only after
@@ -537,7 +561,7 @@ if (subcommand === "compliance") {
     YAW_MCP_SIDECAR_REFRESH       Set to \`0\` to disable the background check
                                that keeps managed sidecars (\`yaw-mcp sidecars
                                install\`) current. When a managed tree exists,
-                               a serve start, at most once a day, probes the
+                               a server start, at most once a day, probes the
                                npm registry for the packages configured to
                                float (\`@latest\` or no version) and, when one
                                is behind, runs an \`npm install\`/\`npm update\`
@@ -684,8 +708,9 @@ if (subcommand === "compliance") {
                                slow server is otherwise down-ranked in the
                                reliability lines \`discover\` renders.
     CLAUDE_CONFIG_DIR             Claude Code's config directory, honored by
-                               \`install\`, \`try\` and \`doctor\` whenever they
-                               locate Claude Code's config, so a non-default
+                               \`install\`, \`uninstall\`, \`import\`, \`try\`,
+                               \`doctor\` and \`heal\` whenever they locate
+                               Claude Code's config, so a non-default
                                location is read and written instead of
                                ~/.claude. It also decides which settings.json
                                \`install typed\` adds the permissions.allow
@@ -695,37 +720,45 @@ if (subcommand === "compliance") {
                                directory, and install and uninstall say so --
                                except in a Yaw Mode pane, where YAW_MODE
                                (below) decides. It is Claude Code's knob, not
-                               yaw-mcp's; the server itself never reads it.
+                               yaw-mcp's; the server reads it only for the
+                               startup pass that re-points stale client
+                               entries, the same one \`heal\` runs.
     APPDATA                       Windows' roaming app-data directory, honored
-                               by \`install\`, \`try\`, \`doctor\` and
-                               \`install --list\` when they locate a config
-                               under it (Claude Desktop, VS Code, Zed, and
-                               Cline's per-editor copies). Read once, so all
-                               four agree even where it is redirected away
-                               from %USERPROFILE%\\AppData\\Roaming.
-    XDG_CONFIG_HOME               Honored by the same four commands when they
-                               locate Zed's settings.json on Linux, and only
-                               when it is ABSOLUTE -- the rule Zed inherits
-                               from the dirs crate it resolves paths with. The
-                               Flatpak build reads
+                               by \`install\` (and \`install --list\`),
+                               \`uninstall\`, \`import\`, \`try\`, \`doctor\` and
+                               \`heal\` when they locate a config under it
+                               (Claude Desktop, VS Code, Zed, and Cline's
+                               per-editor copies). Read through one helper, so
+                               all six agree even where it is redirected away
+                               from %USERPROFILE%\\AppData\\Roaming. \`add\`
+                               reads these variables through the same helper
+                               for its check that a client is wired; it never
+                               writes a client config.
+    XDG_CONFIG_HOME               Honored by the same six commands when they
+                               locate Zed's settings.json or VS Code's user
+                               mcp.json on Linux, and only when it is ABSOLUTE
+                               (the rule Zed inherits from the dirs crate; VS
+                               Code resolves a relative value against its own
+                               launch directory, which yaw-mcp cannot know).
+                               The Flatpak build of Zed reads
                                $FLATPAK_XDG_CONFIG_HOME instead, which
                                yaw-mcp does not follow.
     CLINE_MCP_SETTINGS_PATH       Cline's own three knobs, in this precedence,
-    CLINE_DATA_DIR                honored by the same four commands when they
+    CLINE_DATA_DIR                honored by the same six commands when they
     CLINE_DIR                     locate Cline's shared cline_mcp_settings.json:
                                the first names the FILE, the second its data
                                directory, the third the directory above that.
                                Cline's per-editor copies are found by probing
                                and are not affected.
     CONTINUE_GLOBAL_DIR           Continue's global directory, honored by the
-                               same four commands when they locate
+                               same six commands when they locate
                                <dir>/mcpServers/yaw-mcp.json. A relative value
                                is resolved against the current directory, as
                                Continue's own IDE core does -- note that
                                resolves against ITS working directory, not
                                this one, so an absolute value is safer.
     CODEX_HOME                    Codex's own state directory, honored by the
-                               same four commands when they locate
+                               same six commands when they locate
                                <dir>/config.toml (it defaults to ~/.codex).
                                Codex requires the directory to EXIST and be a
                                directory; an empty value counts as unset. It
@@ -752,7 +785,9 @@ if (subcommand === "compliance") {
     LOG_LEVEL                     Verbosity of yaw-mcp's own JSON log lines on
                                stderr: \`debug\` | \`info\` | \`warn\` | \`error\`
                                (default info). \`debug\` is what to set when
-                               asking why a server did not load.
+                               asking why a server did not load. Setting it
+                               also makes subcommands print these JSON lines
+                               instead of plain warnings.
     npm_config_prefix             npm's own global prefix, as npm exports it
                                into every \`npm run\` / \`npx\` child. When set,
                                a copy of yaw-mcp running under
@@ -774,11 +809,13 @@ if (subcommand === "compliance") {
                                \`oam --version\`, the registry). Not a user
                                knob: unset it only to test the real thing.
 
-  Config resolution (highest precedence first) -- for the \`servers\` allow-list
-  and \`blocked\` deny-list:
+  Config resolution (highest precedence first) -- for the \`servers\` allow-list,
+  the \`blocked\` deny-list and the \`blockedTools\` per-tool deny-list:
     1. <project>/.yaw-mcp/config.local.json   machine-local overrides (gitignore)
     2. <project>/.yaw-mcp/config.json         project-shared (checked in)
     3. ~/.yaw-mcp/config.json                 user-global default
+  \`servers\` comes from the first file that sets it; \`blocked\` and
+  \`blockedTools\` are the union of every file's entries.
 
   yaw-mcp reads these config.json files ONCE, at startup. Restart the MCP
   client (or kill yaw-mcp; the client will respawn it) after editing one.
@@ -787,7 +824,8 @@ if (subcommand === "compliance") {
 
   The \`token\` and \`apiBase\` config keys, and the \`--token\` /
   \`--no-yaw-mcp-config\` install flags, are deprecated and ignored -- yaw-mcp
-  no longer contacts a hosted API. They are still accepted for one release.
+  no longer contacts a hosted API. They are still accepted, with a warning,
+  so an old config file or setup script keeps working.
   If you have a token on disk, delete it and revoke it at its source.
 
   Docs:   https://yaw.sh/mcp
@@ -909,10 +947,12 @@ async function runServer(): Promise<void> {
   // late) can tear down the stdio transport with no trace. Log and keep
   // running rather than dying silently.
   //
-  // Registered BEFORE the first await below: loadYawMcpConfig() reads and
-  // parses config files, so a malformed config or a permissions error can
-  // reject during startup -- with the handlers installed afterwards that
-  // rejection had no net at all.
+  // Registered BEFORE the first await below, so nothing that goes wrong
+  // while the config loads is left without a net. loadYawMcpConfig() itself
+  // is fail-open -- a malformed config or a permissions error becomes a
+  // warning, not a rejection (see the comment at the runServer() call) --
+  // so this ordering is cheap insurance rather than a guard against a known
+  // startup rejection.
   process.on("unhandledRejection", (e) => log("error", "unhandledRejection", { error: String(e) }));
   process.on("uncaughtException", (e) => log("error", "uncaughtException", { error: String(e) }));
 

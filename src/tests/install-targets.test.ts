@@ -607,6 +607,44 @@ describe("resolveInstallPath — VS Code", () => {
     });
     expect(linux.absolute).toBe(join("/home/alice", ".config", "Code", "User", "mcp.json"));
     expect(linux.containerPath).toEqual(["servers"]);
+    expect(linux.display).toBe("~/.config/Code/User/mcp.json");
+
+    // VS Code keeps its user data under $XDG_CONFIG_HOME/Code when that is
+    // set; the hardcoded ~/.config named a file VS Code never read there.
+    // `resolve` makes the value absolute on whichever OS runs the suite.
+    const xdg = resolve("/xdg");
+    const redirected = resolveInstallPath({
+      clientId: "vscode",
+      scope: "user",
+      os: "linux",
+      home: "/home/alice",
+      clientEnv: { xdgConfigHome: ` ${xdg} ` },
+    });
+    expect(redirected.absolute).toBe(join(xdg, "Code", "User", "mcp.json"));
+    expect(redirected.display).toBe("$XDG_CONFIG_HOME/Code/User/mcp.json");
+    expect(redirected.containerPath).toEqual(["servers"]);
+    // A relative value keeps the default: VS Code resolves it against the cwd
+    // it was launched from, which install cannot know.
+    for (const xdgConfigHome of ["rel/cfg", "   "]) {
+      const fallback = resolveInstallPath({
+        clientId: "vscode",
+        scope: "user",
+        os: "linux",
+        home: "/home/alice",
+        clientEnv: { xdgConfigHome },
+      });
+      expect(fallback.absolute, xdgConfigHome).toBe(join("/home/alice", ".config", "Code", "User", "mcp.json"));
+    }
+    // Linux only: macOS does not follow it.
+    expect(
+      resolveInstallPath({
+        clientId: "vscode",
+        scope: "user",
+        os: "macos",
+        home: "/Users/alice",
+        clientEnv: { xdgConfigHome: xdg },
+      }).absolute,
+    ).toBe(join("/Users/alice", "Library", "Application Support", "Code", "User", "mcp.json"));
 
     const macos = resolveInstallPath({
       clientId: "vscode",
@@ -985,6 +1023,28 @@ describe("escapeCmdArg (Windows cmd /c metacharacter neutralization)", () => {
       expect(() => escapeCmdArg('{"url":"https://x?a=1&b=2"}', { shim })).toThrow(/command injection/);
       expect(() => escapeCmdArg('x"|y', { shim })).toThrow();
     }
+  });
+
+  it("REFUSES an arg that contains a line break, in every other shape", () => {
+    // cmd.exe stops reading its command line at a CR/LF: `a\nver` reached the
+    // child as `a`. It used to pass through shape 4 unchanged.
+    for (const shim of [true, false]) {
+      for (const arg of ["a\nver", "a\rver", "a\r\nver", "x\n&echo INJ", "has space\nand break", '{"a":\n1}']) {
+        expect(() => escapeCmdArg(arg, { shim }), JSON.stringify(arg)).toThrow(/line break \(CR or LF\)/);
+      }
+    }
+    // The command token goes through the same check.
+    expect(() => buildLaunchEntry({ os: "windows", upstream: { command: "npx\n", args: ["-y", "srv"] } })).toThrow(
+      /line break/,
+    );
+    expect(() => buildLaunchEntry({ os: "windows", upstream: { command: "npx", args: ["-y", "srv\nx"] } })).toThrow(
+      /line break/,
+    );
+    // Not on the other OSes, where no cmd.exe sits between client and server.
+    expect(buildLaunchEntry({ os: "linux", upstream: { command: "npx", args: ["-y", "srv\nx"] } }).args).toEqual([
+      "-y",
+      "srv\nx",
+    ]);
   });
 
   it("leaves plain args and % untouched", () => {

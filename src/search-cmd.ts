@@ -1,8 +1,8 @@
 // `yaw-mcp search [<text>...]` -- look through the public catalog without
 // installing anything.
 //
-// WHY. `add` takes an exact slug and nothing else, so a user who does not
-// already know the slug has two options: guess, or open a URL that is not
+// WHY. A catalog add (`yaw-mcp add <slug>`) takes an exact slug, so a user who
+// does not already know the slug has two options: guess, or open a URL that is not
 // clickable from a terminal. This prints what each match needs BEFORE the add,
 // which is the question the add itself answers only by refusing.
 //
@@ -10,7 +10,15 @@
 // is what writes, and the closing line says so, because a search that quietly
 // installed would be a surprise in the wrong direction.
 
-import { type CatalogServer, type FetchCatalog, normalizeCatalogUrl, withWarnSink } from "./catalog.js";
+import {
+  type CatalogRequiredEnv,
+  type CatalogServer,
+  catalogEnvKeys,
+  type FetchCatalog,
+  isRemoteCatalogEntry,
+  normalizeCatalogUrl,
+  withWarnSink,
+} from "./catalog.js";
 import { type CatalogMatch, matchCatalog, suggestCatalogSlugs } from "./catalog-search.js";
 import { createStreamWriter } from "./logger.js";
 
@@ -106,31 +114,27 @@ export function parseSearchArgs(
 
 /** Names, never values -- and the catalog holds no values anyway.
  *
- *  Split the way resolveCatalogSlug splits them (catalog.ts): `required` is
- *  what `add` refuses without, `optional` is what the catalog flags
- *  `"optional": true` -- declared, written into the entry, never gated on.
- *  Read as `=== true` for the same reason as there: this is remote data, and
- *  a truthy read would let a string `"false"` lift a var out of the gate. A
- *  bare-string entry (a shape this listing tolerates and the resolver does
- *  not) cannot carry the flag, so it is required. */
-function catalogEnvKeys(entry: CatalogServer): { required: string[]; optional: string[] } {
+ *  The split is catalog.ts's catalogEnvKeys, the one resolveCatalogSlug gates
+ *  on: `required` is what `add` refuses without, `optional` is what the
+ *  catalog flags `"optional": true` -- declared, written into the entry, never
+ *  gated on. Same key filter, same required-wins rule for a key listed both
+ *  ways, so this listing cannot name a key the add would not.
+ *
+ *  ONE difference, on purpose: a bare-string element (`"requiredEnv":
+ *  ["FOO"]`) is read here as a required key, while the resolver skips it and
+ *  gates on nothing. It cannot carry the flag, and for a listing a var the
+ *  catalog names is better shown than dropped. */
+function listedEnvKeys(entry: CatalogServer): { required: string[]; optional: string[] } {
   const raw = (entry as { requiredEnv?: unknown }).requiredEnv;
-  const required: string[] = [];
-  const optional: string[] = [];
-  if (!Array.isArray(raw)) return { required, optional };
-  for (const r of raw) {
-    const key = typeof r === "string" ? r : (r as { key?: unknown } | null)?.key;
-    if (typeof key !== "string" || key === "") continue;
-    const flagged = typeof r === "object" && r !== null && (r as { optional?: unknown }).optional === true;
-    (flagged ? optional : required).push(key);
-  }
-  return { required, optional };
+  if (!Array.isArray(raw)) return { required: [], optional: [] };
+  const requiredEnv = raw.map((r: unknown) => (typeof r === "string" ? { key: r } : r)) as CatalogRequiredEnv[];
+  return catalogEnvKeys({ ...entry, requiredEnv });
 }
 
 /** The two key lists under the names the --json envelope has always used
  *  (plus the new one), spread into a result row. */
 function catalogEnvKeysJson(entry: CatalogServer): { requiredEnvKeys: string[]; optionalEnvKeys: string[] } {
-  const { required, optional } = catalogEnvKeys(entry);
+  const { required, optional } = listedEnvKeys(entry);
   return { requiredEnvKeys: required, optionalEnvKeys: optional };
 }
 
@@ -149,7 +153,7 @@ function metaLine(entry: CatalogServer): string {
   const parts: string[] = [`runtime ${typeof install.runtime === "string" ? install.runtime : "unknown"}`];
   const toolCount = (entry as { toolCount?: unknown }).toolCount;
   if (typeof toolCount === "number") parts.push(`${toolCount} ${toolCount === 1 ? "tool" : "tools"}`);
-  const { required, optional } = catalogEnvKeys(entry);
+  const { required, optional } = listedEnvKeys(entry);
   if (required.length > 0) parts.push(`needs ${required.join(", ")}`);
   else if ((entry as { requiresSetup?: unknown }).requiresSetup === true)
     // The parenthetical is only true when nothing at all is listed; with an
@@ -161,11 +165,9 @@ function metaLine(entry: CatalogServer): string {
   // asks for neither the second nor -- on an all-optional server -- anything.
   // "no credentials | optional TFE_TOKEN" is the honest line for that one.
   if (optional.length > 0) parts.push(`optional ${optional.join(", ")}`);
-  // `add` refuses a remote entry, so saying so here saves the round trip.
-  const runtime = typeof install.runtime === "string" ? install.runtime.toLowerCase() : "";
-  if (install.url || install.type === "remote" || /^(remote|https?|sse|url)$/.test(runtime)) {
-    parts.push("remote -- add by hand");
-  }
+  // `add` refuses a remote entry (the same predicate, in resolveCatalogSlug),
+  // so saying so here saves the round trip.
+  if (isRemoteCatalogEntry(entry)) parts.push("remote -- add by hand");
   return parts.join(" | ");
 }
 

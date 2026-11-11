@@ -646,11 +646,17 @@ describe("install refuses rather than corrupt a file", () => {
     const position = view.read.kind === "malformed" ? view.read.position : null;
     expect(position).not.toBeNull();
     expect(raw.slice(0, position?.offset ?? 0).endsWith('command = "npx')).toBe(true);
-    // `detail` carries the reason WITHOUT a position, because the refusal adds
-    // one of its own -- otherwise the line reads "at line 2 column 15 (line 2,
-    // column 15: ...)".
+    // `detail` ENDS with the position, because install, uninstall, import and
+    // try print it alone -- "is not valid TOML (<detail>)" -- and smol-toml's
+    // reason names no place of its own.
     const detail = view.read.kind === "malformed" ? view.read.detail : "";
-    expect(detail).not.toContain("line 2");
+    expect(detail).toBe("control characters are not allowed in strings at line 2 column 15");
+    // The facade's refusal prints that position once, in its usual place, not
+    // "at line 2 column 15 (... at line 2 column 15)".
+    const refusal = refusalOf(() =>
+      applyClientConfigEdits(view, [{ op: "upsert", key: ENTRY_NAME, entry: brokerEntry() }], siteFor()),
+    );
+    expect(refusal).toContain("is not valid TOML at line 2 column 15 (control characters are not allowed in strings)");
   });
 
   it("counts a leading BOM when it reports where the TOML broke", () => {
@@ -979,7 +985,42 @@ describe("what Codex owns on our entry", () => {
     );
     expect(view.entry).toEqual({ url: "https://mcp.example.com/mcp", headers: { "X-Region": "us-east-1" } });
     expect(view.disabled).toBe(true);
-    expect(view.discardedKeys).toEqual(["cwd", "startup_timeout_sec", "bearer_token_env_var", "tools"]);
+    // In the order the entry holds them.
+    expect(view.discardedKeys).toEqual(["bearer_token_env_var", "cwd", "startup_timeout_sec", "tools"]);
+  });
+
+  it("names EVERY key the importer has no field for, not only the ones on a list", () => {
+    // The MUTATION this pins: go back to copying every key that is not on a
+    // list of known Codex fields. `scopes`, `oauth_resource` and
+    // `omit_tools_from` are Codex's own and were on no such list, and
+    // `a_field_from_next_year` is one no list could have had -- all four
+    // landed in `entry`, which holds the importer's fields only.
+    const view = importViewOf(
+      {
+        command: "node",
+        args: ["x.js"],
+        env: { A: "1" },
+        scopes: ["read"],
+        oauth_resource: "https://api.example.com",
+        omit_tools_from: ["x"],
+        a_field_from_next_year: 1,
+        enabled: true,
+      },
+      CODEX.entry,
+    );
+    expect(view.entry).toEqual({ command: "node", args: ["x.js"], env: { A: "1" } });
+    expect(view.disabled).toBeUndefined();
+    expect(view.discardedKeys).toEqual(["scopes", "oauth_resource", "omit_tools_from", "a_field_from_next_year"]);
+  });
+
+  it("drops a mapped key of the wrong type without naming it", () => {
+    // What codexImportView's doc says of IMPORT_MAPPED: a non-table
+    // `http_headers` maps to nothing and is not a discard either, and a table
+    // one replaces a stored `headers` key.
+    const wrong = importViewOf({ url: "https://x", http_headers: "X-Region: us", enabled: "no" }, CODEX.entry);
+    expect(wrong).toEqual({ entry: { url: "https://x" } });
+    const both = importViewOf({ url: "https://x", headers: { A: "old" }, http_headers: { A: "new" } }, CODEX.entry);
+    expect(both).toEqual({ entry: { url: "https://x", headers: { A: "new" } } });
   });
 
   it("imports an ordinary stdio entry unchanged, and says nothing was dropped", () => {
@@ -1246,7 +1287,10 @@ describe("install -> --list -> doctor over the file install wrote", () => {
 
     const refused = await install();
     expect(refused.result.exitCode).not.toBe(0);
-    expect(refused.stderr).toContain("is not valid TOML");
+    // The refusal says WHERE the file broke, not only that it did.
+    expect(refused.stderr).toContain(
+      "is not valid TOML (control characters are not allowed in strings at line 2 column 15)",
+    );
     expect(refused.stderr).toContain(
       "-- refusing to overwrite it; fix the TOML by hand, or move the file aside, then re-run.",
     );

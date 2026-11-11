@@ -20,9 +20,9 @@ vi.mock("../logger.js", () => ({ log: vi.fn() }));
 import path from "node:path";
 import { compareVersions } from "../oam-spawn.js";
 import {
+  __probePathPresent,
   __resetUvBootstrap,
   buildUvSpawn,
-  onPath,
   resolveUvSpawn,
   runCommand,
   UV_EXTRACT_TIMEOUT_MS,
@@ -32,7 +32,7 @@ import {
 } from "../uv-bootstrap.js";
 
 // Only ONE test below needs to know whether uv is reachable, and it asks
-// through the resolver's own onPath at the moment it decides -- so the test
+// through the resolver's own probePath at the moment it decides -- so the test
 // and the code can no longer disagree. The module-level probe that used to
 // live here gated five tests on a single early spawn: it made them skip
 // wholesale on a host without uv, and it could not see the resolver timing
@@ -171,7 +171,7 @@ describe("resolveUvSpawn with uv present", () => {
     __resetUvBootstrap();
   });
 
-  // resolveUv checks onPath("uv") FIRST, so with uv reachable the resolve
+  // resolveUv checks probePath("uv") FIRST, so with uv reachable the resolve
   // target is always the literal "uv" -- the managed cache copy is never
   // consulted on that branch, and __resetUvBootstrap in beforeEach clears the
   // memo between tests. The exact command is what pins the PATH-hit branch: a
@@ -242,7 +242,7 @@ describe("resolveUvSpawn with uv present", () => {
     // asked through the SAME function the resolver decides on, at the same
     // moment, so the test and the code can no longer disagree: under load this
     // skips with a visible reason instead of failing with a confusing one.
-    if (!(await onPath("uv"))) {
+    if (!(await __probePathPresent("uv"))) {
       // ctx.skip(), not a bare return: a return reports GREEN while asserting
       // nothing, which is the exact shape this file's header already warns
       // about. A skip says so in the runner output.

@@ -10,10 +10,10 @@
 // GC pass (gcExpiredTrials, both the text and --json paths), which is a
 // read-modify-write + unlink on client config files: it peels expired
 // `yaw-mcp-try-*` entries out of each client config and deletes the trial
-// marker. Nothing leaves the MACHINE -- the expiry-gc telemetry event this
-// used to fire went with the rest of the postEvent seam (see try-cmd.ts's
-// header) -- but the sweep is still reported to the user on both surfaces,
-// and an un-finishable sweep raises the exit code. There is
+// marker. The sweep sends nothing off the machine -- the expiry-gc telemetry
+// event it used to fire went with the rest of the postEvent seam (see
+// try-cmd.ts's header) -- but it is still reported to the user on both
+// surfaces, and an un-finishable sweep raises the exit code. There is
 // no lock around that write, so it carries the same TOCTOU class as any
 // other config mutation. The sweep is best-effort: any failure is swallowed
 // and never aborts the diagnostic. The config load also runs the pre-0.12
@@ -25,6 +25,17 @@
 // a warning, with the command that sweeps it -- and a legacy config file the
 // migration would have moved is reported the same way instead of moved. See
 // isReadOnlyDiagnostics (config-loader.ts). Unset, nothing here changes.
+//
+// Network: doctor is NOT offline. Every run, text or --json, read-only or
+// not, makes unauthenticated GETs to the public npm registry
+// (registry.npmjs.org): one for @yawlabs/mcp's latest version, and one per
+// sidecar package that bundles.json names AND that is installed in the
+// managed tree (fetchSidecarLatest) -- so those package NAMES, a privately
+// scoped one included, are sent there, and a registry configured in .npmrc is
+// not consulted. Each is bounded by DOCTOR_REGISTRY_TIMEOUT_MS and a failure
+// reads as "unknown". The only gate is registrySkipCheck, which no CLI flag or
+// environment variable sets outside a test run; YAW_MCP_READONLY_DIAGNOSTICS
+// governs the two WRITES above and does not touch these requests.
 //
 // Exit codes:
 //   0  healthy — every config file parsed cleanly and raised no warnings
@@ -41,15 +52,21 @@
 //      scanner or the search indexer holds the handle, EAGAIN). Its CLIENTS
 //      line still prints, but it is a moment's contention, not a fault --
 //      see clientCannotLaunch.
-//   (1 = fatal is reserved and currently UNREACHABLE: nothing doctor
-//   inspects is fatal — a bad config file degrades to a warning.)
+//   1  doctor ITSELF failed and produced no report. Nothing doctor inspects
+//      is fatal — a bad config file degrades to a warning — so no code path
+//      here returns 1; it is what index.ts's dispatch() sets when runDoctor
+//      REJECTS, printing `yaw-mcp doctor: <message>` to stderr and, under
+//      --json, nothing on stdout. Two throws propagate on purpose because
+//      they are build defects, not user-file faults (see
+//      classifyProbeViaAdapter); any other is an unexpected error in a
+//      collector that has no catch of its own.
 //
 // The exit-2 gate is UNCONDITIONALLY "any warning". It used to be gated on
 // `config.token !== null`, which meant a warning-producing config exited 0
 // whenever no token was configured -- i.e. always, once account mode went
 // away. Do not re-introduce a precondition here.
 
-import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, posix, resolve, win32 } from "node:path";
@@ -96,6 +113,7 @@ import {
   type GitRefKind,
   hasRepoConsent,
   normalizeRepoUrl,
+  printable,
   readBuildMarker,
   readGitState,
 } from "./git-source.js";
@@ -106,9 +124,7 @@ import {
   type ClientEnvValues,
   CURRENT_OS,
   claudeCodeContainerPaths,
-  describeJsonShape,
   ENTRY_NAME,
-  findBlockedContainerSegment,
   findLegacyEntry,
   INSTALL_TARGETS,
   type InstallClientId,
@@ -134,6 +150,7 @@ import {
   compareVersions,
   isOamCommand,
   isOamLaunch,
+  launcherBasename,
   MIN_OAM_VERSION,
   nodeLaunchKind,
   OAM_SPACED_VALUE_OPTIONS,
@@ -149,9 +166,10 @@ import {
 import { isTestSandbox } from "./opt-out-env.js";
 import { gitBuildDir, gitFailedPath, normalizeForCompare, userConfigDir } from "./paths.js";
 import {
+  type ClassifiedState,
   isPersistenceDisabled,
-  isReadableStateVersion,
-  loadState,
+  loadStateClassified,
+  type PersistedState,
   STATE_FILENAME,
   STATE_SCHEMA_VERSION,
 } from "./persistence.js";
@@ -375,7 +393,7 @@ export interface DoctorJsonSnapshot {
     disabled: boolean;
     /** Result of pre-parsing state.json, mirroring the text path's STATE
      *  section. "disabled" means persistence is off; the other values come
-     *  straight from peekStateFile. WITHOUT this, loadState's swallow-and-
+     *  straight from statePeekOf. WITHOUT this, loadState's swallow-and-
      *  return-empty behaviour made a corrupt file look healthy-and-fresh. */
     status: "disabled" | "ok" | "missing" | "malformed" | "stale-version" | "unreadable";
     /** Parse / read error message for the malformed + unreadable cases,
@@ -724,7 +742,7 @@ export interface ClientProbeResult {
   /** The container key install cannot splice its entry into, worded for a
    *  message (`"mcpServers" is an array of 2`), or null -- the shape install
    *  REFUSES with exit 1. On a JSON-family row it is set only for a key
-   *  findBlockedContainerSegment reports as NOT reparable; a reparable one
+   *  the JSON adapter's read reports as blocked and NOT reparable; a reparable one
    *  (null, a scalar, an empty array) stays null, because install replaces it
    *  with `{}` and the ordinary "run install" line is true there. On a
    *  non-JSON row it is whatever the file's adapter reports as blocked: a TOML
@@ -762,9 +780,10 @@ export interface ClientProbeResult {
    *  inherit from the shell, so the broker fails to start with no fallback.
    *  Existing configs still carry it, so doctor reports it. */
   launchOamNotAbsolute: string | null;
-  /** The absolute `oam run` entry path in the entry that no longer exists, or
-   *  null. oam has no fetch-on-demand, so unlike the npx shape a stale entry
-   *  here cannot be recovered at launch. */
+  /** The absolute `oam run` entry path in the entry that is not a file `oam
+   *  run` can start -- gone, or a directory (isLaunchableEntryFile, the test
+   *  the heal sweep rewrites on) -- or null. oam has no fetch-on-demand, so
+   *  unlike the npx shape a stale entry here cannot be recovered at launch. */
   launchOamEntryMissing: string | null;
   /** A launch command (or the oam it wraps) that is an absolute path for
    *  ANOTHER operating system -- a `C:\` drive-letter path seen by a doctor
@@ -953,32 +972,41 @@ async function collectDoctorBase(opts: DoctorOptions): Promise<{
   };
 }
 
-/** state.json, peeked and (when usable) loaded ONCE, for the STATE and
- *  RELIABILITY sections of BOTH paths.
+/** state.json, read and classified ONCE, for the STATE and RELIABILITY
+ *  sections of BOTH paths.
  *
  *  Shared for the same reason collectDoctorBase is: the text and --json paths
  *  carried separate copies of this prologue, and the copies had already
  *  drifted (one loaded a "missing" file, the other did not). One helper
  *  means one answer to "what is state.json right now".
  *
- *  Reads the file at most twice (peek + load) rather than once per section,
- *  and not at all when persistence is disabled. The peek runs FIRST because
- *  loadState swallows a parse / version / read problem into an empty state
- *  that reads as brand-new -- so only an "ok" peek is loaded, and everything
- *  else is reported from the peek alone. A MISSING file is `persisted: null`
- *  too: both renderers treat null the same as a never-saved state, so there
- *  is nothing to load. */
+ *  ONE read and ONE parse, both persistence.ts's (loadStateClassified), and
+ *  none at all when persistence is disabled. Doctor used to peek the file
+ *  with a parser of its own first, because loadState swallows a parse /
+ *  version / read problem into an empty state that reads as brand-new; the
+ *  classified load names that problem instead (`failure`), so the peek is
+ *  derived from it (statePeekOf) and the two can no longer disagree about a
+ *  file. Only an "ok" file's state is handed on: everything else is reported
+ *  from the peek alone, and a MISSING file is `persisted: null` too -- both
+ *  renderers treat null the same as a never-saved state.
+ *
+ *  The load is asked to be `quiet`: for a file it cannot read or parse the
+ *  loader otherwise logs a warning worded for the server ("starting fresh"),
+ *  and log() writes a warning to process.stderr, past doctor's `err` sink.
+ *  Doctor starts nothing and saves nothing, and the STATE section already
+ *  reports the fault in its own words, so that section stays the one report. */
 async function collectStateStatus(opts: { env: NodeJS.ProcessEnv; home: string }): Promise<{
   disabled: boolean;
   filePath: string;
   peek: StatePeek | null;
-  persisted: Awaited<ReturnType<typeof loadState>> | null;
+  persisted: PersistedState | null;
 }> {
   const disabled = isPersistenceDisabled(opts.env);
   const filePath = join(userConfigDir(opts.home), STATE_FILENAME);
-  const peek: StatePeek | null = disabled ? null : await peekStateFile(filePath);
-  const persisted = peek?.kind === "ok" ? await loadState(filePath) : null;
-  return { disabled, filePath, peek, persisted };
+  if (disabled) return { disabled, filePath, peek: null, persisted: null };
+  const classified = await loadStateClassified(filePath, { quiet: true });
+  const peek = statePeekOf(classified);
+  return { disabled, filePath, peek, persisted: peek.kind === "ok" ? classified.state : null };
 }
 
 /** The CLIENTS-section wording for one probe: the bare client label, the
@@ -1425,8 +1453,13 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
       print(`  Running ${effectiveVersion}; npm latest is ${staleHint}. This copy ships inside`);
       print("  Yaw Terminal and updates with the app -- update Yaw Terminal to get it.");
     } else if (method === "npx") {
+      // True only for an entry that runs @yawlabs/mcp@latest: npx re-resolves
+      // that tag on each spawn, and an entry without it keeps its cached copy
+      // (upgrade-cmd's NPX_LATEST_CAVEAT says the same thing about the same
+      // install method).
       print(`  Running ${effectiveVersion}; npm latest is ${staleHint}. npx fetches the latest`);
-      print("  on each spawn -- restart your MCP client to pick it up.");
+      print("  on each spawn -- restart your MCP client to pick it up if its entry runs");
+      print("  @yawlabs/mcp@latest; otherwise re-run `yaw-mcp install <client>`.");
     } else if (method === "binary") {
       print(`  Running ${effectiveVersion}; npm latest is ${staleHint}. This is a standalone`);
       print(`  binary; ${BINARY_RETIRED_HINT}`);
@@ -1523,8 +1556,8 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
   // at its own section, then the CLIENTS section probes). gcExpiredTrials
   // REWRITES client config files to peel expired `yaw-mcp-try-*` entries out,
   // so probing first would snapshot pre-GC configs and report entries this
-  // same run just deleted -- the "Same data-collection sequence" claim in the
-  // header above is only true with the GC ahead of the probe.
+  // same run just deleted. This is the one ordering constraint the header
+  // above says both paths share.
   const trialStatus = await collectTrialStatus({ home, now: opts.now, readOnly });
   const { scan: trialScan, gc: trialGc } = trialStatus;
 
@@ -1558,13 +1591,13 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
     envOverrides[name] = raw === undefined || raw === "" ? null : raw;
   }
 
-  // STATE + RELIABILITY section data, from the SAME peek-then-load helper the
-  // text path uses (collectStateStatus), so the two surfaces cannot disagree
-  // about what state.json is. They used to carry separate copies of this
-  // prologue, and the copies differed on whether a missing file was loaded.
-  // The peek-first order is what keeps a corrupt / stale-schema / unreadable
-  // state.json from being reported here as healthy-and-fresh (loadState
-  // swallows those into an empty state) while `doctor` (text) calls it out.
+  // STATE + RELIABILITY section data, from the SAME helper the text path uses
+  // (collectStateStatus), so the two surfaces cannot disagree about what
+  // state.json is. They used to carry separate copies of this prologue, and
+  // the copies differed on whether a missing file was loaded. The peek it
+  // returns is what keeps a corrupt / stale-schema / unreadable state.json
+  // from being reported here as healthy-and-fresh (loadState swallows those
+  // into an empty state) while `doctor` (text) calls it out.
   const {
     disabled: persistDisabled,
     filePath: stateFilePath,
@@ -2226,8 +2259,8 @@ async function collectVaultStatus(opts: {
 function renderVaultSection(opts: {
   status: VaultStatus;
   print: (s?: string) => void;
-  /** Doctor's --os (defaults to the host). Picks the Windows permissions
-   *  line below. */
+  /** DoctorOptions.os (defaults to the host; there is no `doctor --os` flag,
+   *  only tests set it). Picks the Windows permissions line below. */
   os: InstallOS;
   /** The home directory the vault files live under; named in that line. */
   home: string;
@@ -2655,8 +2688,6 @@ export interface GitSourceDoctorEntry {
   warning?: string;
 }
 
-const printable = (s: string): string => s.replace(/[^\x20-\x7e]/g, "?");
-
 /** normalizeRepoUrl can throw on a hand-edited file:// url with a bad %-escape;
  *  doctor reads that as "not the same repo" rather than failing the report. */
 function sameRepo(a: string, b: string): boolean {
@@ -2779,7 +2810,7 @@ async function collectOamRuntimeStatus(opts: {
   //
   // A loader THROW (not a malformed file -- the loader reports that in its
   // own `warnings` -- but a failure inside the loader itself: the trust
-  // probe, a config-dir migration, an unexpected errno) used to be swallowed
+  // probe, an unexpected errno) used to be swallowed
   // into `null`, which the rest of this collector cannot tell from "no
   // bundles.json on this machine yet". The report then read "All good" with a
   // fresh-install hint, exit 0, on a machine whose real server list it never
@@ -2884,8 +2915,9 @@ async function collectOamRuntimeStatus(opts: {
   // the versions above can be present, current, and still fail at spawn here.
   const installedFor = anyManaged ? installedPlatform(opts.home) : null;
   // opts.platform, not process.platform: the same override the CLIENTS
-  // launch checks judge paths by, so one `--platform` report cannot say
-  // "foreign path" about an entry and "matches this host" about the tree.
+  // launch checks judge paths by (a DoctorOptions test hook, not a CLI flag),
+  // so one report run with it set cannot say "foreign path" about an entry
+  // and "matches this host" about the tree.
   const hostPlatform = opts.platform ?? process.platform;
   const managed = {
     root: sidecarsRoot(opts.home),
@@ -2925,9 +2957,9 @@ async function collectOamRuntimeStatus(opts: {
 function renderOamRuntimeSection(opts: {
   status: OamRuntimeStatus;
   print: (s?: string) => void;
-  /** Which platform's install command the not-installed branch names. Doctor's
-   *  own --os override, so a report generated for another machine names that
-   *  machine's installer. */
+  /** Which platform's install command the not-installed branch names.
+   *  DoctorOptions.os (the host unless a test sets it; doctor has no `--os`
+   *  flag), so a report built for another OS names that OS's installer. */
   os: InstallOS;
   /** Clock for the git sources "as of ... ago" age. */
   now: () => number;
@@ -3098,12 +3130,18 @@ function renderOamRuntimeSection(opts: {
         //
         // The skip reason comes from buildRefreshPlan so this report and the
         // refresher cannot disagree about what is going to happen.
+        //
+        // Case 2 is worded with its two exceptions because doctor checks
+        // neither: the refresh stands down for a tree whose manifest the
+        // user-global config would not reinstall as it is (sidecar-refresh.ts,
+        // step 7b), and passes over a package npm could not move to this
+        // version for the length of its back-off.
         const refreshSkip = status.refreshSkips.get(p.pkg);
         const remedy =
           refreshSkip ??
           (status.refreshDisabled
             ? "re-run `yaw-mcp sidecars install` (background refresh is off)"
-            : "the daily background refresh will update it");
+            : "the daily background refresh will update it, unless the tree was installed from another config or npm could not deliver that version");
         const staleNote = p.stale && p.latest !== null ? `  (latest ${p.latest} -- ${remedy})` : "";
         print(`    ${p.pkg.padEnd(widest)}  ${p.version ?? "not in the managed tree"}${staleNote}`);
       }
@@ -3183,9 +3221,9 @@ function renderStateSection(opts: {
   /** State loaded once by collectStateStatus, or null. Null does NOT mean
    *  "persistence is disabled": it is also null when the peek says the file
    *  is missing, malformed, an unreadable version, or unreadable at all --
-   *  only an "ok" peek is loaded. Read `disabled` / `peek` for which of those
-   *  it is. */
-  persisted: Awaited<ReturnType<typeof loadState>> | null;
+   *  only an "ok" peek's state is handed on. Read `disabled` / `peek` for
+   *  which of those it is. */
+  persisted: PersistedState | null;
   /** Peek result from collectStateStatus, so state.json is not re-read. Null
    *  EXACTLY when `disabled` (collectStateStatus skips the peek then), which
    *  is why the disabled branch below is the only null branch. */
@@ -3222,8 +3260,8 @@ function renderStateSection(opts: {
     return;
   }
   // persisted can still be null here even though the malformed / stale-version
-  // / unreadable peeks returned above: collectStateStatus only loads state on
-  // an "ok" peek, so a MISSING file arrives as null. That is the same thing to
+  // / unreadable peeks returned above: collectStateStatus only hands state on
+  // for an "ok" peek, so a MISSING file arrives as null. That is the same thing to
   // a reader as a file that exists but has never been saved, and both take
   // the "no persisted state yet" line below.
   if (!persisted || persisted.savedAt === 0) {
@@ -3245,42 +3283,23 @@ type StatePeek =
   | { kind: "stale-version"; version: unknown; expected: number }
   | { kind: "unreadable"; message: string };
 
-async function peekStateFile(filePath: string): Promise<StatePeek> {
-  let raw: string;
-  try {
-    raw = await readFile(filePath, "utf8");
-  } catch (err) {
-    if (err && typeof err === "object" && "code" in err && (err as { code?: unknown }).code === "ENOENT") {
-      return { kind: "missing" };
-    }
-    return { kind: "unreadable", message: err instanceof Error ? err.message : String(err) };
+/** What loadStateClassified found, in doctor's own five words. No parsing
+ *  here: every kind is the classification persistence.ts made at its single
+ *  read+parse (a BOM stripped, a top-level array called malformed, a v1 file
+ *  read as ok because it migrates), so doctor reports the file exactly as the
+ *  server will load it.
+ *
+ *  That includes ENOTDIR -- a path component that is a regular file -- which
+ *  the load classifies as no file at all; doctor's own peek used to call it
+ *  unreadable. */
+function statePeekOf(classified: ClassifiedState): StatePeek {
+  if (classified.missing) return { kind: "missing" };
+  const failure = classified.failure;
+  if (failure === null) return { kind: "ok" };
+  if (failure.kind === "stale-version") {
+    return { kind: "stale-version", version: failure.version, expected: STATE_SCHEMA_VERSION };
   }
-  let parsed: unknown;
-  try {
-    // Same BOM strip loadState applies (persistence.ts), so a Notepad-saved
-    // state.json is not reported malformed by doctor while loading fine.
-    parsed = JSON.parse(raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw);
-  } catch (err) {
-    return { kind: "malformed", message: err instanceof Error ? err.message : String(err) };
-  }
-  // Arrays are typeof "object" too. Without the explicit test a top-level
-  // `[]` slipped through to the version check below and was reported as
-  // "schema mismatch (file is v?)" -- the fix for which (`reset-learning`)
-  // happens to be right, for a reason the line did not give. Same guard
-  // classifyProbeContent applies to a client config.
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    return { kind: "malformed", message: "top-level value is not an object" };
-  }
-  const version = (parsed as { version?: unknown }).version;
-  // Readable, not identical. STATE_SCHEMA_VERSION went 1 -> 2 for the
-  // additive toolCache field, and loadState MIGRATES a v1 file rather than
-  // discarding it -- so an exact-equality check here would report a healthy
-  // v1 file as "stale-version" for the one session before its first save
-  // rewrites it at v2, while learning and packHistory were loading fine.
-  if (!isReadableStateVersion(version)) {
-    return { kind: "stale-version", version, expected: STATE_SCHEMA_VERSION };
-  }
-  return { kind: "ok" };
+  return { kind: failure.kind, message: failure.message };
 }
 
 /** One-line explanation for a non-ok peek, for the --json state.detail
@@ -3305,7 +3324,7 @@ function renderReliabilitySection(opts: {
    *  disabled AND every unusable-file case (missing, malformed, unreadable
    *  version, unreadable), which is why the guard below tests `persisted`
    *  rather than trusting `disabled` alone. */
-  persisted: Awaited<ReturnType<typeof loadState>> | null;
+  persisted: PersistedState | null;
   print: (s?: string) => void;
 }): void {
   const { disabled, persisted, print } = opts;
@@ -3351,7 +3370,9 @@ interface TrialStatus {
   scan: TrialScanResult;
   gc: { cleared: number; failed: number; failures: TrialGcFailure[] };
   /** Expired trials a read-only run left in place. Always empty when the
-   *  sweep ran: every expired trial is then cleared or in `gc.failures`. */
+   *  sweep ran: every expired trial is then cleared or in `gc.failures` --
+   *  including when the sweep itself rejected, which puts every expired
+   *  trial in `gc.failures` (see collectTrialStatus). */
   unswept: TrialScanEntry[];
   /** The warnings to fold, in order: the sweep's failures, or the unswept
    *  trials (only one of the two can be non-empty). */
@@ -3380,14 +3401,36 @@ async function collectTrialStatus(opts: {
       warnings: scan.expired.map(trialUnsweptWarning),
     };
   }
-  // Best-effort: any sweep failure is swallowed rather than aborting the
-  // diagnostic.
-  const gc = await gcExpiredTrials({ home, now, scan }).catch(() => ({
-    cleared: 0,
-    failed: 0,
-    failures: [],
-  }));
-  return { scan, gc, unswept: [], warnings: gc.failures.map(trialGcFailureWarning) };
+  // Best-effort: a sweep that rejects does not abort the diagnostic. It is
+  // not swallowed either. gcExpiredTrials catches per marker, so no rejection
+  // is expected -- but the catch here used to answer one with an EMPTY result,
+  // and every expired trial in the scan then appeared nowhere: not cleared,
+  // not failed, not unswept, no warning, and doctor could say "All good" over
+  // entries still wired in. Each one is reported as a failure instead, so the
+  // state reaches the TRIALS section, WARNINGS and exit 2. Stage "peel" is
+  // the conservative reading (the entry may still be in the client config);
+  // the warning says "may", because how far the sweep got is not known.
+  let gc: TrialStatus["gc"];
+  let warnings: string[];
+  try {
+    gc = await gcExpiredTrials({ home, now, scan });
+    warnings = gc.failures.map(trialGcFailureWarning);
+  } catch (err) {
+    const error = `the sweep stopped before finishing: ${err instanceof Error ? err.message : String(err)}`;
+    const failures: TrialGcFailure[] = scan.expired.map(({ marker, path }) => ({
+      slug: marker.slug,
+      clientPath: marker.clientPath,
+      markerPath: path,
+      stage: "peel",
+      error,
+    }));
+    gc = { cleared: 0, failed: failures.length, failures };
+    warnings = failures.map(
+      (f) =>
+        `trial "${f.slug}": expired, and ${f.error} -- its entry may still be wired into ${f.clientPath}; rerun \`yaw-mcp doctor\`, or run \`yaw-mcp try-cleanup ${f.slug}\``,
+    );
+  }
+  return { scan, gc, unswept: [], warnings };
 }
 
 // Trials section — runs the expired-trial GC pass first (peels each
@@ -3395,7 +3438,7 @@ async function collectTrialStatus(opts: {
 // renders the still-live trials
 // with their countdown. Section is OMITTED when there are no trials
 // at all so healthy installs stay quiet. Mirrors the silence-on-empty
-// convention of the reliability and background-posters sections.
+// convention of the reliability section.
 // A read-only run skips the GC pass and says how many expired trials it left.
 async function renderTrialsSection(opts: {
   home: string;
@@ -3513,7 +3556,7 @@ function renderClientStatus(c: ClientProbeResult, installCmd: string, client: st
   }
   // The same trap one level down: the file parses, but a key on the way to the
   // entry holds a shape install refuses rather than drop -- a non-empty array
-  // on a JSON-family row (see findBlockedContainerSegment), any non-table
+  // on a JSON-family row (blockedSegment in client-config-json.ts), any non-table
   // `mcp_servers` on a TOML row, whose adapter repairs nothing in place. It
   // used to fall through to "present, no entry -- run install", and running
   // it exits 1.
@@ -3660,7 +3703,7 @@ function renderClientStatus(c: ClientProbeResult, installCmd: string, client: st
   // start", so they rank with launchCommandMissing rather than with the OK
   // branches -- reporting "OK (runs on oam)" for either is the wrong answer.
   if (c.launchOamEntryMissing) {
-    return `has "${ENTRY_NAME}" entry running on oam, but its entry file does not exist: ${c.launchOamEntryMissing} -- oam cannot fetch it on demand the way npx would; rerun \`${installCmd}\`${legacy}${rootClause("rerun")}${keyNote}`;
+    return `has "${ENTRY_NAME}" entry running on oam, but its entry file does not exist (or is not a file): ${c.launchOamEntryMissing} -- oam cannot fetch it on demand the way npx would; rerun \`${installCmd}\`${legacy}${rootClause("rerun")}${keyNote}`;
   }
   if (c.launchOamNotAbsolute) {
     return `has "${ENTRY_NAME}" entry with a bare "${c.launchOamNotAbsolute}" command -- it resolves against the client's PATH, which a GUI-launched client does not inherit from your shell; rerun \`${installCmd}\` to write an absolute path (set OAM_BIN to oam's full path first if install cannot find it)${legacy}${rootClause("rerun")}${keyNote}`;
@@ -3763,10 +3806,11 @@ interface ProbeOptions {
    *  `<DIR>/.claude.json` instead of `<HOME>/.claude.json` so doctor and
    *  `yaw-mcp install --list` see the same file Claude Code reads. */
   claudeConfigDir?: string;
-  /** Every client env var, as `readClientEnv` reported it. Only a MODULAR row
-   *  reads it (Zed's $XDG_CONFIG_HOME, Cline's three knobs, Continue's global
-   *  dir); the six inline rows take their one variable from `claudeConfigDir`
-   *  above. Without it, doctor and `--list` resolve a redirected client's path
+  /** Every client env var, as `readClientEnv` reported it. A MODULAR row reads
+   *  its own variables from it (Zed's $XDG_CONFIG_HOME, Cline's three knobs,
+   *  Continue's global dir); of the six inline rows, VS Code's Linux user path
+   *  reads $XDG_CONFIG_HOME from it and the rest take their one variable from
+   *  `claudeConfigDir` above. Without it, doctor and `--list` resolve a redirected client's path
    *  from the DEFAULT location while install writes the redirected one -- the
    *  same read-write split `claudeConfigDir` was added for. */
   clientEnv?: ClientEnvValues;
@@ -4132,6 +4176,26 @@ export function oamLaunchParts(command: string, args: readonly string[]): { oam:
   return unwrapped === null ? null : { oam: unwrapped.oam, entry: oamRunEntryFromTokens(unwrapped.rest) };
 }
 
+/** Can `oam run` actually start this entry path? Only a regular file can be,
+ *  so a directory sitting at the path is as broken as a missing one. statSync
+ *  follows symlinks: a link to a real file is fine. Throws (ENOENT, EACCES, a
+ *  dangling symlink) count as not launchable.
+ *
+ *  The ONE test for "is this oam entry file broken", shared by doctor's launch
+ *  checks (launchChecks) and the heal sweep's gate 2 (heal-entries.ts), so
+ *  doctor cannot report OK for an entry heal rewrites. The two still differ
+ *  on purpose in what they ask it ABOUT: heal declines to judge a POSIX-style
+ *  path on win32 at all (its isForeignEntry, because it writes), while doctor
+ *  checks that path against the local disk and reports what it finds (see
+ *  isForeignAbsoluteLaunch). */
+export function isLaunchableEntryFile(entryPath: string): boolean {
+  try {
+    return statSync(entryPath).isFile();
+  } catch {
+    return false;
+  }
+}
+
 /** The `run` half of oamRunEntryPath, over an already-unwrapped oam argv --
  *  so launchChecks, which needs the unwrap's oam token as well, does
  *  not unwrap the same entry twice. */
@@ -4202,7 +4266,7 @@ function classifyProbe(
   platform: NodeJS.Platform,
 ): ProbeClassification {
   return JSON_PROBE_FORMATS.has(read.site.format)
-    ? classifyProbeContent(raw, read.site.resolved.containerPath, read.site.format === "json", exists, platform)
+    ? classifyProbeContent(raw, read.site, read.site.format === "json", exists, platform)
     : classifyProbeViaAdapter(raw, read.site, read.transform, read.rootDefaults, exists, platform);
 }
 
@@ -4511,8 +4575,20 @@ function launchChecks(
             // `oam run [--no-check] <entry>`: unlike npx, oam cannot fetch a
             // missing entry on demand, so a stale path here is a hard
             // launch failure rather than a slow start.
+            //
+            // A FILE, not merely something at that path: the seam's
+            // existsSync is true for a directory, which `oam run` cannot
+            // start either, and the heal sweep (heal-entries.ts, gate 2)
+            // rewrites such an entry -- so doctor used to read "OK (runs on
+            // oam)" for an entry heal calls dead. isLaunchableEntryFile is
+            // the one test both use; it is asked only once the seam has said
+            // something is there.
             const entryPath = oamArgv.entry;
-            if (entryPath !== null && isAbsolute(entryPath) && !exists(entryPath)) {
+            if (
+              entryPath !== null &&
+              isAbsolute(entryPath) &&
+              !(exists(entryPath) && isLaunchableEntryFile(entryPath))
+            ) {
               launchOamEntryMissing = entryPath;
             }
           }
@@ -4535,19 +4611,23 @@ function launchChecks(
  *  `readStrictJson` -- the CLIENT's own parser, exported from
  *  client-config-json.ts for exactly this -- BEFORE the lenient parse below.
  *  Writing a second `JSON.parse` here instead is what that export exists to
- *  prevent: this file already carries that shape (BOM strip + JSON.parse) for
- *  state.json, and a copy of it would be free to disagree with the refusal
- *  the write facade raises over the same file.
+ *  prevent: a copy of it would be free to disagree with the refusal the write
+ *  facade raises over the same file.
+ *
+ *  `site` is the slot's own site: its container path is the one walked here,
+ *  and it is what the JSON adapter is asked with when no container is found
+ *  (see the blocked-container branch below).
  *
  *  `platform` picks the path semantics for the launch checks (see
  *  launchChecks and ProbeOptions.platform). */
 function classifyProbeContent(
   raw: string,
-  containerPath: string[],
+  site: ConfigSite,
   strict: boolean,
   exists: (p: string) => boolean = existsSync,
   platform: NodeJS.Platform = process.platform,
 ): ProbeClassification {
+  const containerPath = site.resolved.containerPath;
   if (raw.trim().length === 0) {
     return { ...EMPTY_PROBE };
   }
@@ -4560,11 +4640,24 @@ function classifyProbeContent(
   // not a file whose client is failing to load it.
   const client = strict ? readStrictJson(raw) : null;
   const unloadable = client !== null && !client.ok ? unloadableConfigProblem(client.violation) : null;
+  let parsed: unknown;
   try {
-    const parsed = parseJsonc(raw);
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-      return { ...MALFORMED };
-    }
+    parsed = parseJsonc(raw);
+  } catch {
+    // Parse failures only: this try holds nothing but the parse, and the READ
+    // happens in the caller, under its own catch (see unreadableProbe).
+    return { ...MALFORMED };
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return { ...MALFORMED };
+  }
+  // Everything past the parse. None of it is expected to throw, but it used to
+  // share the parse's catch, so a throw from the walk or the launch checks was
+  // reported as "JSON is malformed" over a file that parses (launchChecks'
+  // args filter records one that did). A throw here now degrades the row to
+  // `unreadable`, worded as what failed -- the adapter path's rule for its
+  // launch checks (classifyAdapterView) -- and never to malformed.
+  try {
     // EVERY projects[] read resolves its path through the one helper -- see
     // claudeCodeContainerPaths. The canonical key comes first and wins when it
     // carries wiring; a drive-letter-case sibling is only reported when the
@@ -4592,9 +4685,15 @@ function classifyProbeContent(
       // walkContainer answers "is there a container", and null covers two
       // shapes install treats differently: an absent or reparable key (install
       // writes one) and a non-empty array (install refuses). Only the second
-      // changes what doctor should advise, so ask install's own question.
-      const blocked = findBlockedContainerSegment(parsed as Record<string, unknown>, containerPath);
-      if (blocked !== null && !blocked.reparable) {
+      // changes what doctor should advise, so ask install's own question of
+      // the reader install asks it of: the JSON adapter's read, whose
+      // `blocked` kind carries the key path, the shape's name and whether
+      // install repairs it (install-cmd.ts refuses on the same read). No
+      // `containerPaths` option is passed, so the adapter answers for the
+      // site's CANONICAL path only -- a write goes there and nowhere else, and
+      // a drive-case sibling's shape cannot block it.
+      const blocked = classifyClientConfig(raw, site).read;
+      if (blocked.kind === "blocked" && !blocked.reparable) {
         return {
           ...EMPTY_PROBE,
           // Both, when both are true: a strict file can be unloadable AND
@@ -4603,17 +4702,14 @@ function classifyProbeContent(
           // fixed the container. Which one the ROW leads with is
           // renderClientStatus's business.
           unloadable,
-          containerBlocked: `"${blocked.path.join(".")}" is ${describeJsonShape(blocked.value)}`,
+          containerBlocked: `"${blocked.path.join(".")}" is ${blocked.shape}`,
         };
       }
       return { ...EMPTY_PROBE, unloadable };
     }
     const legacyEntryName = findLegacyEntry(container);
-    // Still inside the try: launchChecks filters args to strings, but any
-    // other throw lands in the catch below exactly as it always did.
-    const { launchCommandMissing, launchRuntime, launchOamNotAbsolute, launchOamEntryMissing, launchForeignPath } =
-      launchChecks(container[ENTRY_NAME], exists, platform);
-    return {
+    const base: ProbeClassification = {
+      ...EMPTY_PROBE,
       hasMcpEntry: ENTRY_NAME in container,
       containerEntries: Object.keys(container).length,
       hasLegacyEntry: legacyEntryName !== null,
@@ -4625,11 +4721,6 @@ function classifyProbeContent(
       unreadable: null,
       unreadableCode: null,
       containerBlocked: null,
-      launchCommandMissing,
-      launchRuntime,
-      launchOamNotAbsolute,
-      launchOamEntryMissing,
-      launchForeignPath,
       // Only when something is actually wired there: a bare sibling container
       // is not news, and naming it would send the user after a key that holds
       // nothing.
@@ -4642,10 +4733,20 @@ function classifyProbeContent(
       // one only on a format whose adapter does (ConfigShape.rootDefaults).
       rootDefaults: [],
     };
-  } catch {
-    // Parse failures only: the READ happens in the caller, under its own
-    // catch (see unreadableProbe), so nothing but the parse can throw here.
-    return { ...MALFORMED };
+    // launchChecks filters args to strings, which was the one throw seen
+    // here. Any other is reported exactly as the adapter path reports its own.
+    try {
+      return { ...base, ...launchChecks(container[ENTRY_NAME], exists, platform) };
+    } catch (e) {
+      return { ...base, unreadable: `launch check failed: ${(e as Error).message}`, unreadableCode: null };
+    }
+  } catch (e) {
+    return {
+      ...EMPTY_PROBE,
+      unloadable,
+      unreadable: `could not classify the parsed file: ${e instanceof Error ? e.message : String(e)}`,
+      unreadableCode: null,
+    };
   }
 }
 
@@ -4765,6 +4866,22 @@ function shellHistorySources(opts: { home: string; env: NodeJS.ProcessEnv }): Sh
   // single-quoted the value -- but that is the common dotfiles spelling, and
   // used as-is it names a path that does not exist, which read as "no
   // history" for exactly the relocated case this lookup exists for.
+  //
+  // Two limits on what this env read can know. (1) It sees HISTFILE only when
+  // the variable was EXPORTED: bash keeps it as a plain shell variable unless
+  // the user's rc file exports it, so a relocation set without `export` never
+  // reaches this process and the lookup falls back to ~/.bash_history. (2) An
+  // exported HISTFILE need not be bash's -- zsh uses the same name -- so the
+  // reader is chosen per LINE, not by which source named the file: a line in
+  // zsh's extended-history shape (`: 1700000000:0;npm audit`) has its prefix
+  // stripped, and every other line is the command as written. Read as plain,
+  // that shape's leading binary was `:` and the file counted for nothing.
+  const histfileLine = (l: string): string | null => {
+    const trimmed = l.trim();
+    if (!trimmed) return null;
+    const extended = /^: *\d+:\d+;/.exec(trimmed);
+    return extended === null ? trimmed : trimmed.slice(extended[0].length) || null;
+  };
   const histfile = opts.env.HISTFILE;
   const bashHistory =
     histfile === undefined || histfile === ""
@@ -4772,7 +4889,7 @@ function shellHistorySources(opts: { home: string; env: NodeJS.ProcessEnv }): Sh
       : histfile.startsWith("~/")
         ? join(opts.home, histfile.slice(2))
         : histfile;
-  sources.push({ path: bashHistory, extractCommand: plain });
+  sources.push({ path: bashHistory, extractCommand: histfileLine });
   sources.push({
     path: join(opts.home, ".zsh_history"),
     // Zsh extended-history lines look like `: 1700000000:0;npm audit`.
@@ -4826,11 +4943,10 @@ function shellHistorySources(opts: { home: string; env: NodeJS.ProcessEnv }): Sh
   // reporting threshold on half the real invocations.
   //
   // LAST entry wins, not the first. The duplicate is always HISTFILE (pushed
-  // first, with the line-is-the-command `plain` reader) colliding with a
-  // format-specific entry below it. Keeping the first would dedupe correctly
-  // and then MIS-PARSE the file: zsh writes `: 1700000000:0;npm audit`, whose
-  // leading binary under `plain` is `:`, so the count would silently go to
-  // zero instead of double. The later entry is the one that knows the format.
+  // first, with the `histfileLine` reader) colliding with a format-specific
+  // entry below it. That reader knows zsh's extended-history lines but not
+  // fish's `- cmd:` records, and under it a fish file would count for nothing
+  // instead of double. The later entry is the one that knows the format.
   const lastIndex = new Map<string, number>();
   sources.forEach((s, i) => {
     // Keyed on the case-folded spelling (win32 / darwin), not the byte-exact
@@ -4930,10 +5046,8 @@ function extractLeadingBinary(command: string): string | null {
   if (!first) return null;
   // Reject pipes, redirects, subshells, empty assignments.
   if (/[|&;<>()`$]/.test(first)) return null;
-  // Strip path prefix — we match on the binary name.
-  const slash = Math.max(first.lastIndexOf("/"), first.lastIndexOf("\\"));
-  const name = slash === -1 ? first : first.slice(slash + 1);
-  // Strip a Windows executable suffix, then lowercase. PowerShell / cmd
+  // Match on the binary name: launcherBasename (oam-spawn.ts) drops the path
+  // prefix, strips a Windows executable suffix, then lowercases. PowerShell / cmd
   // history records what the user typed, and on Windows that is routinely
   // `npm.cmd audit`, `gh.EXE pr list` or plain `NPM audit` -- none of which
   // matches the shadow map, whose keys are bare lowercase binary names and are
@@ -4941,7 +5055,7 @@ function extractLeadingBinary(command: string): string | null {
   // onto the caller, and this is the caller. Lowercasing the whole name (not
   // just the suffix) is safe because ShadowHit.cli is only displayed and
   // looked up, never executed.
-  return name.replace(/\.(exe|cmd|bat)$/i, "").toLowerCase();
+  return launcherBasename(first);
 }
 
 // Version compare, delegated to oam-spawn's `compareVersions` -- the canonical

@@ -21,8 +21,8 @@
 // legitimate, documented setup, so gating the guide on a file that need not
 // exist would break those users for no gain. What we do instead is make it
 // VISIBLE: a project guide loaded from a directory whose bundles.json is not
-// approved (or absent) is flagged `unapproved`, logged once, and surfaced by
-// `yaw-mcp doctor`. Readers of the guide should treat its text as untrusted
+// approved (or absent) is flagged `unapproved`, logged at debug level on each
+// load, and surfaced by `yaw-mcp doctor`. Readers of the guide should treat its text as untrusted
 // input either way — it is prose, not instructions yaw-mcp acts on.
 
 import { createReadStream } from "node:fs";
@@ -202,9 +202,12 @@ export function projectGuideNotice(project: GuideFile | null): string | null {
   return `${project.path}: project YAW-MCP.md is served to the model from a directory whose bundles.json is not approved -- its text is repo-authored, so read it before trusting its routing advice.`;
 }
 
-/** Load both user + project guides for the given cwd/home. `env` is only
- *  read for the project guide's approval flag (YAW_MCP_TRUST_PROJECT);
- *  defaults to process.env. */
+/** Load both user + project guides for the given cwd/home. `env` only
+ *  affects the project guide, through two variables: YAW_MCP_TRUST_PROJECT
+ *  decides its approval flag, and YAW_MCP_ALLOW_UNOWNED_PROJECT_DIRS decides
+ *  whether the project-dir walk accepts a `.yaw-mcp/` outside $HOME whose
+ *  owner it cannot verify (paths.ts ownedByCurrentUser) -- i.e. whether a
+ *  project guide there is found at all. Defaults to process.env. */
 export async function loadGuides(cwd: string, home?: string, env?: NodeJS.ProcessEnv): Promise<LoadedGuides> {
   const [user, project] = await Promise.all([loadUserGuide(home), loadProjectGuide(cwd, home, env)]);
   return { user, project };

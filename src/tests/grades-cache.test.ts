@@ -436,11 +436,45 @@ describe("readGradesCache -- a __proto__ namespace", () => {
     const cache = await readGradesCache(synthHome);
 
     expect(Object.hasOwn(cache, "__proto__")).toBe(true);
-    expect(Object.getPrototypeOf(cache)).toBe(Object.prototype);
+    // The cache is a null-prototype map, so the entry cannot have become one.
+    expect(Object.getPrototypeOf(cache)).toBeNull();
     expect(cache.ctxlint).toEqual(VALID_ENTRY);
     // Without the fix the cache inherits the entry's fields, so a namespace
     // named "grade" resolves to a string instead of undefined.
     expect(cache.grade).toBeUndefined();
+  });
+});
+
+// "constructor" is a legal namespace. On a plain {} a bare `cache[ns]` finds
+// Object.prototype.constructor and a reader takes a function for a cached
+// grade; every map this module returns has no prototype, so a bare index can
+// only find what the file held.
+describe("readGradesCache -- no inherited keys", () => {
+  it("answers undefined for a namespace that names an Object.prototype member", async () => {
+    writeGradesFile(synthHome, JSON.stringify({ ctxlint: VALID_ENTRY }));
+    const cache = await readGradesCache(synthHome);
+    expect(Object.getPrototypeOf(cache)).toBeNull();
+    expect(cache.constructor).toBeUndefined();
+    expect(cache.toString).toBeUndefined();
+    expect(cache.ctxlint).toEqual(VALID_ENTRY);
+  });
+
+  it("is prototype-free on every empty return too (missing, unparseable, wrong root)", async () => {
+    expect(Object.getPrototypeOf(await readGradesCache(synthHome))).toBeNull();
+    writeGradesFile(synthHome, "{ not json");
+    expect(Object.getPrototypeOf(await readGradesCache(synthHome))).toBeNull();
+    writeGradesFile(synthHome, "[]");
+    const cache = await readGradesCache(synthHome);
+    expect(Object.getPrototypeOf(cache)).toBeNull();
+    expect(cache.constructor).toBeUndefined();
+  });
+
+  it("still round-trips a grade for the namespace `constructor` itself", async () => {
+    await writeGrade("constructor", VALID_ENTRY, synthHome);
+    await writeGrade("ctxlint", VALID_ENTRY, synthHome);
+    const cache = await readGradesCache(synthHome);
+    expect(cache.constructor).toEqual(VALID_ENTRY);
+    expect(Object.keys(cache).sort()).toEqual(["constructor", "ctxlint"]);
   });
 });
 

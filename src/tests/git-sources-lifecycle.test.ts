@@ -423,6 +423,53 @@ describe("trust shows git sources and offers the build after a grant", () => {
     expect(existsSync(gitBuildDir("fx", head, home))).toBe(false);
   }, 60_000);
 
+  // Both build prompts are [Y/n], where a bare Enter means yes. ^D (byte 4)
+  // came back from the reader as the same "" and so ran the repo's
+  // install/build scripts; it has to decline at each of them.
+  const typeAtTrustPrompts = async (typed: string, calls: string[][]) => {
+    const stdin = new PassThrough();
+    stdin.write(typed);
+    const stdout = new PassThrough();
+    stdout.on("data", () => {});
+    return trust({ isTTY: true, io: { stdin, stdout }, runPm: fakePm(calls) });
+  };
+  const EOT = String.fromCharCode(4);
+
+  it("^D at the 'Build it now? [Y/n]' prompt declines the build", async () => {
+    const repo = makeRepo(NPM_FILES);
+    const head = git(repo.work, ["rev-parse", "HEAD"]);
+    writeProject([gitEntry(repo, "fx", head)]);
+    const calls: string[][] = [];
+    const res = await typeAtTrustPrompts(`y\n${EOT}`, calls);
+    expect(res.exitCode).toBe(0);
+    expect(out.join("")).toContain("Not built. Build later with: yaw-mcp sidecars install");
+    expect(calls).toEqual([]);
+    expect(existsSync(gitBuiltPath("fx", head, home))).toBe(false);
+  }, 60_000);
+
+  it("^D at the repo-consent 'Proceed? [Y/n]' prompt is not consent", async () => {
+    const repo = makeRepo(NPM_FILES);
+    const head = git(repo.work, ["rev-parse", "HEAD"]);
+    writeProject([gitEntry(repo, "fx", head)]);
+    const calls: string[][] = [];
+    // y approves the file, a bare Enter takes the build offer, ^D leaves the
+    // consent prompt.
+    const res = await typeAtTrustPrompts(`y\n\n${EOT}`, calls);
+    expect(res.exitCode).toBe(1);
+    expect(out.join("")).toContain("This will run code from the repo on this machine:");
+    expect(calls).toEqual([]);
+    expect(existsSync(gitBuiltPath("fx", head, home))).toBe(false);
+  }, 60_000);
+
+  it("a bare Enter at both [Y/n] prompts still builds (the control for the two ^D cases)", async () => {
+    const repo = makeRepo(NPM_FILES);
+    const head = git(repo.work, ["rev-parse", "HEAD"]);
+    writeProject([gitEntry(repo, "fx", head)]);
+    const res = await typeAtTrustPrompts("y\n\n\n", []);
+    expect(res.exitCode, err.join("")).toBe(0);
+    expect(existsSync(gitBuiltPath("fx", head, home))).toBe(true);
+  }, 120_000);
+
   it("shows a file:// entry's token as sent to nothing, with no approving-leaks line", async () => {
     const repo = makeRepo(NPM_FILES);
     const head = git(repo.work, ["rev-parse", "HEAD"]);

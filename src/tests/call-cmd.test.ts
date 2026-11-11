@@ -8,6 +8,7 @@ import { parseCallArgs, runCall } from "../call-cmd.js";
 import { CONFIG_DIRNAME } from "../paths.js";
 import { TransientConnectError } from "../transient-upstream.js";
 import type { UpstreamConnection, UpstreamServerConfig } from "../types.js";
+import { ActivationError } from "../upstream.js";
 
 const homes: string[] = [];
 
@@ -702,6 +703,37 @@ describe("runCall -- upstream text cannot inject control bytes into stderr", () 
     expect(r.exitCode).toBe(1);
     expect(cap.errText()).toContain("INJECTED");
     expect(rawControls(cap.errText())).toEqual([]);
+  });
+
+  it("words a connect failure's config pointer for a shell, not for an MCP session", async () => {
+    // ActivationError.message ends in the broker's remediation ("activate it
+    // again ... on the next mcp_connect_* call"); a one-shot CLI has neither,
+    // so the line is rebuilt from the pointer's two halves.
+    const home = makeHome([GH]);
+    const pointer = { summary: 'Failed to start "gh": spawn nope ENOENT', fix: 'Fix "gh" in the bundles.json' };
+    const brokerMessage = `${pointer.summary} -> ${pointer.fix}, then activate it again -- picked up on the next mcp_connect_* call.`;
+    const fake = fakeConnect({
+      connectError: new ActivationError(brokerMessage, "spawn_failure", undefined, undefined, pointer),
+    });
+    const cap = capture();
+    const r = await runCall({ namespace: "gh", tool: "search", home, connect: fake.connect, ...cap });
+    expect(r.exitCode).toBe(1);
+    expect(cap.errText()).toContain(
+      `yaw-mcp call: Could not connect to "gh": ${pointer.summary} -> ${pointer.fix}, then run the command again.`,
+    );
+    expect(cap.errText()).not.toContain("activate it again");
+    expect(cap.errText()).not.toContain("mcp_connect_");
+  });
+
+  it("prints a pointer-less connect failure's own message unchanged", async () => {
+    const home = makeHome([GH]);
+    const fake = fakeConnect({ connectError: new Error("vault locked: set YAW_MCP_VAULT_PASSPHRASE") });
+    const cap = capture();
+    const r = await runCall({ namespace: "gh", tool: "search", home, connect: fake.connect, ...cap });
+    expect(r.exitCode).toBe(1);
+    expect(cap.errText()).toContain(
+      'yaw-mcp call: Could not connect to "gh": vault locked: set YAW_MCP_VAULT_PASSPHRASE',
+    );
   });
 
   it("escapes the resolved tool name in the post-connect deny", async () => {

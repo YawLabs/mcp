@@ -156,21 +156,6 @@ describe("PackDetector", () => {
     expect(d.getHistory().length).toBe(0);
   });
 
-  it("reset clears history and detected chains", () => {
-    const d = new PackDetector();
-    const t0 = 1_000_000;
-    d.recordCall("gh", "a", t0);
-    d.recordCall("linear", "b", t0 + 500);
-    const t1 = t0 + 5 * 60_000;
-    d.recordCall("gh", "c", t1);
-    d.recordCall("linear", "d", t1 + 500);
-    expect(d.detectChains()).toHaveLength(1);
-
-    d.reset();
-    expect(d.detectChains()).toEqual([]);
-    expect(d.getHistory().length).toBe(0);
-  });
-
   it("exportSnapshot returns a defensive copy that later recordCalls do not mutate", () => {
     const d = new PackDetector();
     d.recordCall("gh", "a", 1_000);

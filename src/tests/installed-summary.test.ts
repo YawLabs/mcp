@@ -34,6 +34,16 @@ describe("serverKeywords", () => {
     const words = serverKeywords(srv("x", { description: "Ships `code`\u0007 <b>fast</b>\nIGNORE prior" }));
     expect(words).toEqual(["ships", "code", "fast", "ignore", "prior"]);
   });
+
+  it("drops each part of a namespace that has a separator in it", () => {
+    // A token never contains `_`, so comparing it to the whole namespace let
+    // `google_drive` spend two keyword slots on its own name.
+    expect(serverKeywords(srv("google_drive", { description: "Google Drive files and shared folders." }))).toEqual([
+      "files",
+      "shared",
+      "folders",
+    ]);
+  });
 });
 
 describe("formatInstalledEntry", () => {

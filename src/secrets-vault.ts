@@ -361,8 +361,9 @@ export function lock(): void {
  *  Verifies the passphrase BEFORE caching the key, so a wrong passphrase
  *  is rejected loudly instead of silently writing entries under a bad key:
  *    - vault.check present  -> decrypt it; authTag failure => wrong passphrase.
- *    - vault.check absent, but entries exist (legacy vault) -> decrypt the
- *      first entry as a canary; failure => wrong passphrase.
+ *    - vault.check absent, but entries exist (legacy vault) -> any entry
+ *      that decrypts proves the key; only when NONE does is it a wrong
+ *      passphrase (see verifyKey).
  *    - neither (fresh/empty vault) -> nothing to verify against; accept.
  *      The next setSecret stamps vault.check (via ensureCheck) so the
  *      saved vault carries a token future unlocks verify against.
@@ -829,8 +830,10 @@ export function newVault(): VaultFile {
  *  collectSecretRefNames and malformedSecretRefSpans below; exported for the
  *  tests that pin its shape. Production code that only needs the NAMES
  *  referenced in an env map (meta-tools.ts, upstream.ts, doctor-cmd.ts) goes
- *  through collectSecretRefNames rather than importing this, and nothing
- *  should re-declare a local copy: copies of one regex drift.
+ *  through collectSecretRefNames rather than importing this. A caller that
+ *  needs the anchored whole-value form builds it from `.source`
+ *  (local-set-cmd.ts's WHOLE_SECRET_REF_RE). Nothing should re-declare a
+ *  local copy: copies of one regex drift.
  *  Global flag => this object carries mutable lastIndex state that every
  *  importer shares. String.matchAll does NOT rescue that: its internal clone
  *  is SEEDED FROM this regex's lastIndex (matchAll only spares the original
@@ -862,6 +865,13 @@ export const SECRET_REF_RE = new RegExp(`\\$\\{secret:(${SECRET_NAME_CLASS})\\}`
  *     string) only stays observable to callers that consult `missing`
  *     WITHOUT refusing -- e.g. a values-free scan -- where a literal is the
  *     safer, non-lossy default.
+ *   - The entry exists but does not decrypt (decryptBound throws: a
+ *     ciphertext that fails authentication under this key, or one bound to
+ *     a different name): treated exactly like an absent name -- the literal
+ *     stays and the name goes in `missing`. `missing` therefore means
+ *     "could not be resolved", not strictly "not in the vault"; the spawn
+ *     caller's error says "missing or undecryptable", and its audit event
+ *     for either case is "missing".
  *   - The vault entry decrypts cleanly: replace the entire env value
  *     with the secret. Inline composition (e.g. `Bearer ${secret:GH}`)
  *     also works -- the regex replaces just the reference span.

@@ -21,6 +21,7 @@ import {
   renderScript,
   runCompletion,
   SUBCOMMAND_SPEC,
+  zshSingleQuoted,
 } from "../completion-cmd.js";
 import { parseDoctorArgs } from "../doctor-cmd.js";
 import { parseFoundryArgs } from "../foundry-cmd.js";
@@ -226,6 +227,27 @@ describe("renderScript — zsh", () => {
     }
     // The colon form must be gone entirely -- no spec may render as 'name:...'.
     expect(s).not.toMatch(/'[a-z-]+:[^']*'/);
+  });
+
+  it("keeps every single quote balanced, whatever a description says", () => {
+    // REGRESSION: the import description read "Adopt a client's existing MCP
+    // servers ..." and each spec is emitted inside single quotes, so that one
+    // apostrophe closed the word early and left the script with an odd number
+    // of quotes -- zsh refuses to load a file with an unmatched quote, which
+    // took every subcommand's completion with it.
+    expect(zshSingleQuoted("import[Adopt a client's servers]")).toBe("'import[Adopt a client'\\''s servers]'");
+    expect(zshSingleQuoted("plain")).toBe("'plain'");
+    for (const shell of ["bash", "zsh", "fish", "powershell"] as const) {
+      // Comment lines are prose and may hold an apostrophe; code lines may not
+      // hold an unpaired one in any of the four shells.
+      const code = renderScript(shell)
+        .split("\n")
+        .filter((l) => !l.trimStart().startsWith("#"));
+      for (const line of code) {
+        const quotes = line.split("'").length - 1;
+        expect(quotes % 2, `${shell}: unbalanced single quote in: ${line}`).toBe(0);
+      }
+    }
   });
 
   it("continues the _values invocation on every spec line but the last", () => {
@@ -516,7 +538,7 @@ const FLAG_PARSERS: Record<string, (argv: string[]) => ProbeResult> = {
 };
 
 // `compliance` has no local parser -- --strict / --min-grade are forwarded
-// verbatim to the mcp-compliance child (npxArgs in compliance-cmd.ts), so there
+// verbatim to the mcp-compliance child (suiteArgs in compliance-cmd.ts), so there
 // is nothing in this repo to check them against. `help` carries no flags.
 const NO_LOCAL_PARSER = new Set(["compliance", "help"]);
 

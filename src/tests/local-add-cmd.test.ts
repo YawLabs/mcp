@@ -2168,6 +2168,26 @@ describe("runRemove confirmation gate", () => {
     expect(io.text()).not.toContain("tskey-super-secret");
   });
 
+  // The previewed entry is RAW: an `env` that is an array has no keys, and
+  // Object.keys on it rendered its indices as key names.
+  it("the preview does not render the indices of an env that is an array", async () => {
+    writeUserBundles({
+      version: 1,
+      servers: [{ namespace: "arr", name: "Arr", command: "npx", env: ["A=b", "C=d"], isActive: true }],
+    });
+    const io = captureIO();
+    await runRemove({
+      target: "arr",
+      home: synthHome,
+      cwd: synthCwd,
+      promptAnswer: "n",
+      out: (s) => io.out.push(s),
+      err: () => {},
+    });
+    expect(io.text()).toMatch(/namespace: arr/);
+    expect(io.text()).not.toContain("env keys:");
+  });
+
   it("renders the url for a remote-shaped entry instead of an empty command", async () => {
     await upsertUserBundle(
       { namespace: "remotey", name: "Remote Thing", type: "remote", url: "https://example.test/mcp", isActive: true },
@@ -2352,7 +2372,10 @@ describe("runRemove confirmation gate", () => {
     // An unparseable file is "uncertain", so the gate steps aside and the write
     // path reports it -- the pre-existing exit 1 + message, not a bogus refusal.
     expect(r.exitCode).toBe(1);
-    expect(io.errText()).toMatch(/could not be parsed/);
+    expect(io.errText()).toMatch(/could not be parsed -- fix the JSON .* first\./);
+    // The read is shared with `add`, and its advice used to end "before
+    // adding servers" on a remove.
+    expect(io.errText()).not.toMatch(/adding/);
   });
 });
 
@@ -2502,6 +2525,32 @@ describe("runList", () => {
     expect(parsed.servers[0].envKeys).toEqual(["FIRST_KEY"]);
     expect(parsed.servers[1].envKeys).toEqual(["SECOND_KEY"]);
     expect(io.text()).not.toContain("s3cret");
+  });
+
+  // The loader also skips an entry whose `git` block is malformed, namespace
+  // valid or not. Queueing every raw object then paired the surviving
+  // duplicate with the SKIPPED entry's keys.
+  it("--json does not hand a skipped duplicate's env keys to the entry that loaded", async () => {
+    writeUserBundles({
+      version: 1,
+      servers: [
+        { namespace: "dupe", name: "Bad git", git: "not-an-object", env: { SKIPPED_KEY: "" }, isActive: true },
+        { namespace: "dupe", name: "Loads", command: "npx", env: { LOADED_KEY: "" }, isActive: true },
+      ],
+    });
+    const io = captureIO();
+    await runList({
+      json: true,
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    const parsed = JSON.parse(io.out.join(""));
+    expect(parsed.servers).toHaveLength(1);
+    expect(parsed.servers[0].name).toBe("Loads");
+    expect(parsed.servers[0].envKeys).toEqual(["LOADED_KEY"]);
   });
 
   // `list` used to call loadLocalBundles with no env at all, so the trust gate
@@ -3896,6 +3945,27 @@ describe("runAdd optional env", () => {
     // Re-add merged onto the existing entry and DROPPED the stale marker rather
     // than keeping it (an empty marker is never stored either).
     expect(rawEntry("terraform")).not.toHaveProperty("optionalEnvKeys");
+  });
+
+  // The merge dropped an empty marker while a FRESH add, which merges onto
+  // nothing, wrote `"optionalEnvKeys": []` for every server without optional
+  // vars -- every --command add among them.
+  it("a fresh add stores no empty marker, and --json reports the entry as written", async () => {
+    const io = captureIO();
+    const r = await runAdd({
+      slug: "plain",
+      command: "npx -y plain-mcp",
+      json: true,
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s) => io.out.push(s),
+      err: () => {},
+    });
+    expect(r.exitCode).toBe(0);
+    expect(rawEntry("plain")).toMatchObject({ namespace: "plain", command: "npx" });
+    expect(rawEntry("plain")).not.toHaveProperty("optionalEnvKeys");
+    expect(JSON.parse(io.text()).entry).not.toHaveProperty("optionalEnvKeys");
   });
 
   it("adds an all-optional server with nothing set, seeding the key EMPTY for a later fill", async () => {

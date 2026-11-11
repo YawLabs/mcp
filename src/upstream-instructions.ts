@@ -19,9 +19,12 @@
 //      on in what looks like the broker's own voice. Defence: the payload is
 //      NEUTRALIZED before it is fenced -- every occurrence of either
 //      delimiter and of the broker's own `[yaw-mcp]` prefix, in ANY letter
-//      case, is replaced, so an upstream can neither close the fence it sits
-//      inside nor speak as this process. That is the one property the fence depends on; without
-//      it the delimiters are decoration.
+//      case and with ANY whitespace between its words, is replaced, so an
+//      upstream can neither write the delimiter that closes the fence it sits
+//      inside nor write this process's prefix. That is the one property the
+//      fence depends on; without it the delimiters are decoration. (A
+//      look-alike that is not the delimiter -- words joined by underscores,
+//      say -- is not replaced; see FORGED_MARKERS.)
 //   2. AUTHORITY. A server writes "ignore previous instructions", or gives
 //      orders about OTHER servers and about the meta-tools. Defence: the
 //      fence header names the namespace, says the text is third-party, scopes
@@ -70,15 +73,38 @@ const FENCE_CLOSE = "<<<END UPSTREAM SERVER TEXT";
  *  Neutralized inside a payload so an upstream cannot borrow it. */
 const BROKER_VOICE = "[yaw-mcp]";
 
+/** Escape the regex metacharacters in a literal. */
+function escapeRegex(literal: string): string {
+  return literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** A fence delimiter as a pattern that tolerates respacing: any run of
+ *  whitespace where the constant has one space, and optional whitespace
+ *  between the `<<<` and the first word. */
+function fencePattern(delimiter: string): string {
+  return delimiter.split(" ").map(escapeRegex).join("\\s+").replace(/^<<</, "<<<\\s*");
+}
+
 /** Every marker an upstream must not be allowed to write, as one
- *  case-insensitive pattern. CASE-INSENSITIVE is the point: the fence is read
- *  by a model, and `<<<end upstream server text` closes it just as well as
- *  the capitalized spelling -- the exact-bytes split/join this replaced let
- *  every re-cased forgery through. Built from the constants above rather than
- *  spelled a second time, with the regex metacharacters in `[yaw-mcp]`
- *  escaped. */
+ *  case-insensitive, whitespace-tolerant pattern. Both tolerances are the
+ *  point: the fence is read by a model, and `<<<end upstream server text`, or
+ *  the same words separated by a tab, a newline, a no-break space or two
+ *  spaces, closes it just as well as the exact spelling -- the exact-bytes
+ *  split/join this replaced let every re-cased forgery through, and the
+ *  single-literal-space pattern after it let every respaced one through.
+ *  `\s` is the JavaScript class, which covers the Unicode space separators
+ *  (U+00A0, U+2000-200A, U+3000 and the rest) as well as tab and newline, the
+ *  two whitespace characters HIDDEN_CHARS keeps. `[ yaw-mcp ]` is matched with
+ *  optional whitespace inside the brackets for the same reason.
+ *
+ *  Built from the constants above rather than spelled a second time. What it
+ *  does NOT catch: a marker whose words are joined by something other than
+ *  whitespace, or misspelled (`<<<END_UPSTREAM_SERVER_TEXT`, `[yaw mcp]`).
+ *  Those are look-alikes, not the delimiter. */
 const FORGED_MARKERS = new RegExp(
-  [FENCE_OPEN, FENCE_CLOSE, BROKER_VOICE].map((m) => m.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|"),
+  [fencePattern(FENCE_OPEN), fencePattern(FENCE_CLOSE), `\\[\\s*${escapeRegex(BROKER_VOICE.slice(1, -1))}\\s*\\]`].join(
+    "|",
+  ),
   "gi",
 );
 

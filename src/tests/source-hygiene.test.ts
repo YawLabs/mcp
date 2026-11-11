@@ -455,13 +455,6 @@ const EXPECTED_WALKS: Record<string, Walk[]> = {
         "INDEX return { absolute, display: absolute, " + 'containerPath: ["projects", projectKey, "mcpServers"] };',
       why: "resolveInstallPath's other return, same canonical path for the explicit --project-dir branch",
     },
-    {
-      shape: "LOOP for (let i = 0; i < containerPath.length; i++)",
-      why:
-        "findBlockedContainerSegment: the pre-WRITE non-object check, on the canonical path a write goes to. " +
-        "It lives here, not in install-cmd.ts, so doctor and import can ask the same question without an " +
-        "import cycle -- and every caller hands it a path it must NOT fold",
-    },
   ],
   // `src/try-cmd.ts` used to sit here with two walks -- peelEntryFromConfig's
   // and configHasEntry's. Both are gone: every `try` read and write goes

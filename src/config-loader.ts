@@ -201,18 +201,6 @@ function deprecatedKeyWarning(path: string, keys: string[]): string {
   );
 }
 
-/** Filter a config array field down to its usable string entries. Warns when
- *  entries are dropped, when the field isn't an array at all, and when a
- *  surviving entry can't be a namespace (warning rather than silently
- *  swallowing an unusable value -- the rule every field in this loader
- *  follows; the retired `apiBase` / `token` keys are warned about the same
- *  way when they are merely present). Returns undefined
- *  when the field isn't an array OR when every entry was invalid: a
- *  non-empty array that filters to [] must fall THROUGH to the parent scope
- *  rather than resolve to [] -- an empty allow-list means allow-all in
- *  isAllowed, so a `servers:[123]` at a specific scope would otherwise
- *  silently shadow a valid parent scope's allow-list with allow-all. A
- *  genuinely empty [] is preserved as-is (an explicit "no filter"). */
 /** Per-entry shape check. Parameterized because `servers`/`blocked` hold
  *  NAMESPACES while `blockedTools` holds flattened `<namespace>_<tool>` wire
  *  names, which NAMESPACE_RE rejects outright -- it is lowercase-only and caps
@@ -223,7 +211,7 @@ type EntryValidator = (entry: string, field: string, path: string) => string | n
 const namespaceEntry: EntryValidator = (entry, field, path) =>
   NAMESPACE_RE.test(entry)
     ? null
-    : `${path}: '${field}' entry '${entry}' is not a valid namespace (a lowercase letter followed by [a-z0-9_]) -- it can never match an installed server.`;
+    : `${path}: '${field}' entry '${entry}' is not a valid namespace (a lowercase letter followed by [a-z0-9_], 30 characters at most) -- it can never match an installed server.`;
 
 /** A flattened wire tool name, optionally ending in a single `*` wildcard.
  *  A bare `*` is refused: a deny that matches everything is far more likely a
@@ -249,6 +237,21 @@ const toolEntry: EntryValidator = (entry, field, path) => {
   return null;
 };
 
+/** Filter a config array field down to its usable string entries. Warns when
+ *  entries are dropped, when the field isn't an array at all, and when an
+ *  entry fails `validate` -- it can't be a namespace (`servers` / `blocked`)
+ *  or a tool name (`blockedTools`). Warning rather than silently swallowing
+ *  an unusable value is the rule every field in this loader follows; the
+ *  retired `apiBase` / `token` keys are warned about the same way when they
+ *  are merely present. Returns undefined
+ *  when the field isn't an array OR when a non-empty array held no usable
+ *  STRING entry (strings that only fail `validate` are a different case under
+ *  `dropInvalid`, which returns [] for them -- see the end of the body): a
+ *  non-empty array that filters to [] must fall THROUGH to the parent scope
+ *  rather than resolve to [] -- an empty allow-list means allow-all in
+ *  isAllowed, so a `servers:[123]` at a specific scope would otherwise
+ *  silently shadow a valid parent scope's allow-list with allow-all. A
+ *  genuinely empty [] is preserved as-is (an explicit "no filter"). */
 function filterStringArray(
   raw: unknown,
   field: string,
@@ -267,6 +270,8 @@ function filterStringArray(
   // and then enforced by the gate's prefix match as deny-everything.
   dropInvalid = false,
 ): string[] | undefined {
+  // What the field holds, for the two warnings that are not the validator's.
+  const noun = validate === toolEntry ? "tool-name" : "namespace";
   if (!Array.isArray(raw)) {
     // A PRESENT but non-array value (`"servers": "github"` -- the plausible
     // hand-edit for "lock this session to one server") used to be dropped in
@@ -276,7 +281,7 @@ function filterStringArray(
     // -- the rest of the file still loads.
     if (raw !== undefined) {
       warnings.push(
-        `${path}: '${field}' must be an array of namespace strings (found ${raw === null ? "null" : typeof raw}) -- ignored.`,
+        `${path}: '${field}' must be an array of ${noun} strings (found ${raw === null ? "null" : typeof raw}) -- ignored.`,
       );
     }
     return undefined;
@@ -295,10 +300,11 @@ function filterStringArray(
   const dropped = raw.length - strings.length;
   if (dropped > 0) {
     warnings.push(
-      `${path}: '${field}' dropped ${dropped} non-string or empty ${dropped === 1 ? "entry" : "entries"} -- only non-empty string namespaces are honored.`,
+      `${path}: '${field}' dropped ${dropped} non-string or empty ${dropped === 1 ? "entry" : "entries"} -- only non-empty ${noun} strings are honored.`,
     );
   }
-  // Namespace-shape check is a WARNING, never a drop: dropping would empty the
+  // The namespace-shape check (servers/blocked; blockedTools passes
+  // dropInvalid, see the parameter) is a WARNING, never a drop: dropping would empty the
   // array, hit the fall-through below, and silently promote a specific scope's
   // deny-all into the parent scope's allow-all -- the exact bug this function
   // exists to prevent. NAMESPACE_RE is imported from local-bundles.ts rather
@@ -322,7 +328,9 @@ function filterStringArray(
   // blockedTools included -- that guard runs first and does not know which
   // field it is serving. Both answers mean "nothing is denied" to the gate
   // (isToolDenied treats undefined and [] alike), so the difference is only
-  // visible to a caller comparing the resolved value.
+  // visible to a caller comparing the resolved value. toProfile is one: its
+  // blockedToolsPaths lists a file whose key resolved to [] (`["*"]`) and
+  // leaves out one whose key resolved to undefined (`[1]`).
   return kept;
 }
 
@@ -558,26 +566,35 @@ export async function loadYawMcpConfig(opts: LoadConfigOptions = {}): Promise<Re
 // --- Profile compatibility layer ---------------------------------------
 //
 // server.ts and a few call sites still speak in terms of a "Profile": a
-// { path, servers?, blocked? } record describing which namespaces are
-// allowed in this session. The new ResolvedConfig carries the same
-// allow/deny lists, so we expose a thin shim that converts the relevant
-// slice and preserves the exact shape server.ts already consumes.
+// { path, servers?, blocked?, blockedTools? } record describing which
+// namespaces and tools are allowed in this session. The new ResolvedConfig
+// carries the same allow/deny lists, so we expose a thin shim that converts
+// the relevant slice and preserves the exact shape server.ts already consumes.
 
 export interface Profile {
-  /** Primary identity: project config file if one was loaded, else user-global. */
+  /** Primary identity: the highest-precedence config file that was loaded --
+   *  the project's config.local.json, else its config.json, else user-global. */
   path: string;
-  /** When both project + user-global contributed, the user-global path is surfaced too. */
+  /** The user-global path, surfaced too when a project-level file is `path`
+   *  and the user-global file was also loaded. */
   userPath?: string;
   servers?: string[];
   blocked?: string[];
   /** Per-tool denies, carried so a refusal can name the file that declares
    *  one and `mcp_connect_health` can show the policy. */
   blockedTools?: string[];
+  /** Every loaded file that itself declares a `blockedTools` key, highest
+   *  precedence first. `path` / `userPath` cannot stand in for this: with a
+   *  config.local.json loaded, a project config.json carrying the deny is
+   *  neither of them. Absent when no file declares the key. */
+  blockedToolsPaths?: string[];
 }
 
 /** Derive a Profile from a ResolvedConfig, or null if no allow/deny
- *  rules are set anywhere. Display-only: it condenses which files
- *  contributed into `path` (+ `userPath`) for `handleHealth()`. */
+ *  rules are set anywhere. The `servers` / `blocked` / `blockedTools` lists
+ *  are what the gates enforce (the server's `this.profile`, and `call`'s
+ *  spawn and tool gates). Only the path fields are for display: they
+ *  condense which files contributed, for health output and refusal text. */
 export function toProfile(config: ResolvedConfig): Profile | null {
   if (config.servers === undefined && config.blocked === undefined && config.blockedTools === undefined) {
     return null;
@@ -607,6 +624,10 @@ export function toProfile(config: ResolvedConfig): Profile | null {
   if (primary !== global && global) {
     result.userPath = global.path;
   }
+  // loadedFiles is pushed local -> project -> global, so this is precedence
+  // order. `f.blockedTools` is set only when the file's own key parsed.
+  const declaring = config.loadedFiles.filter((f) => f.blockedTools !== undefined).map((f) => f.path);
+  if (declaring.length > 0) result.blockedToolsPaths = declaring;
   return result;
 }
 

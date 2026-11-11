@@ -306,9 +306,9 @@ export interface ExecRequest {
   return?: string;
 }
 
-// Validate the exec input shape. Returns a typed error string on any
-// violation (caller surfaces it verbatim); returns null when the input
-// is clean. Pure — no I/O, no side effects.
+// Validate the exec input shape. Returns { ok: false, message } on the
+// first violation (caller surfaces the message verbatim) and { ok: true }
+// when the input is clean. Pure — no I/O, no side effects.
 export function validateExecRequest(req: unknown): { ok: true } | { ok: false; message: string } {
   if (req === null || typeof req !== "object" || Array.isArray(req)) {
     return { ok: false, message: "exec input must be an object with a `steps` array" };

@@ -94,7 +94,14 @@ export function setLogSurface(next: LogSurface): void {
 /** Whether the operator explicitly asked for the structured stream. An
  *  unrecognized value is NOT "explicit": minLevel already falls back to info
  *  for it, so treating `LOG_LEVEL=chatty` as an opt-in would turn a typo into
- *  a wall of JSON. */
+ *  a wall of JSON.
+ *
+ *  "Explicitly" is as far as this can tell: LOG_LEVEL is an unprefixed name
+ *  other tools read too, so a recognized value exported for one of them (a
+ *  shell profile, a CI job) opts every yaw-mcp subcommand into the JSON
+ *  stream just the same. Deliberate and pinned by logger.test.ts ("restores
+ *  the structured stream when LOG_LEVEL asks for it"); there is no
+ *  yaw-mcp-prefixed variable to ask with instead. */
 function logLevelRequested(): boolean {
   return resolveLogLevel() !== null;
 }

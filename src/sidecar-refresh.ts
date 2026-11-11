@@ -1,4 +1,4 @@
-// Fire-and-forget sidecar refresh check, run once per yaw-mcp serve startup.
+// Fire-and-forget sidecar refresh check, run once per yaw-mcp server startup.
 //
 // Sibling of auto-upgrade.ts, and deliberately shaped like it: a ladder of
 // cheap gates, a short registry probe, a best-effort lockfile, and a
@@ -59,6 +59,16 @@
 // local gets no background refresh at all. That is the intended trade: no
 // refresh is recoverable, a pruned shared tree is not.
 //
+// Forcing the scope is only half of that. The tree may have been FILLED from
+// somewhere else: a manual `sidecars install` run from an approved project
+// writes that project's dependency set into the shared manifest. Rewriting the
+// manifest from the user-global set would then drop every package only the
+// project names, and re-range any it pins differently -- the same prune, from
+// the other direction. So the refresh reads the manifest on disk first and
+// stands down when the rewrite would take anything away from it (step 7b,
+// manifestLosses). It resumes by itself once a `sidecars install` from the
+// user-global config rewrites the manifest.
+//
 // Never blocks serving: the registry probes run in parallel behind one short
 // abort budget, the npm child's stdio is ignored, and the whole thing is
 // fire-and-forget. A failure is a no-op -- worst case the sidecars stay on the
@@ -98,8 +108,22 @@
 //   - Consequence of the above: a configured-but-not-installed package IS
 //     acquired as a side effect once any other package triggers a refresh,
 //     even though the plan lists it as skipped. `npm install` against a
-//     manifest that names it cannot do otherwise. It is a merge, not an
-//     `npm ci`, so nothing already in the tree is removed.
+//     manifest that names it cannot do otherwise. The reverse does not
+//     happen: the manifest is REPLACED, not merged, so a package it stopped
+//     naming would go -- and step 7b refuses to run in exactly that case.
+//   - Consequence of step 7b: removing a server from the user-global config,
+//     or changing the version one is configured at, leaves the old entry in
+//     the manifest on disk, which reads the same as a project-installed tree.
+//     The background refresh then stops (one info log per completed check)
+//     until `yaw-mcp sidecars install` is run by hand.
+//   - Staleness is measured against registry.npmjs.org; the install uses the
+//     registry npm is configured with. Behind a mirror that lags, a package
+//     reads as stale and npm cannot move it. That costs ONE wasted whole-tree
+//     run per package per registry version, repeated weekly, not daily: a
+//     completed refresh records what it failed to move and the plan passes
+//     those over (SIDECAR_REFRESH_UNMOVED_BACKOFF_MS). The registry itself is
+//     never resolved, so a package that exists only on a private registry
+//     reads as "registry did not answer" and is never refreshed here.
 //   - The lock is advisory: a sidecars root we cannot write to yields a no-op
 //     lock and the old unserialized behavior, and a lock left behind by a
 //     killed process is stolen once it goes stale BY MTIME (auto-upgrade owns
@@ -121,7 +145,9 @@
 //     session happens; a mid-session re-spawn (the idle reaper) that lands
 //     inside the minute or so npm runs still races. On Windows a RUNNING
 //     sidecar holding a native .node open also makes `npm update` fail EPERM
-//     until that server is reaped, once a day, with nothing on screen.
+//     until that server is reaped, once a day, with nothing on screen: the
+//     run exits 0, so the only trace is a warn line in the broker log. It is
+//     NOT recorded as unmoved (installMovedTheTree), so it stays daily.
 //   - The npm child is not detached, so an MCP client that tears down the
 //     process tree takes a half-finished install with it. Recovery is a manual
 //     `yaw-mcp sidecars install`; nothing here repairs a partial tree.
@@ -151,6 +177,8 @@ import {
   runSidecarsInstall,
   type SidecarSpec,
   type SidecarsInstallOptions,
+  type SidecarsInstallResult,
+  sidecarsManifest,
 } from "./sidecars-cmd.js";
 import type { GitSource, UpstreamServerConfig } from "./types.js";
 
@@ -198,7 +226,25 @@ export function sidecarRefreshStatePath(home: string = homedir()): string {
   return join(home, CONFIG_DIRNAME, SIDECAR_REFRESH_STATE_FILENAME);
 }
 
-/** The persisted throttle state. One KNOWN key today; read-modify-written
+/** How long a package that a completed refresh could not move is left alone.
+ *  Staleness is measured against registry.npmjs.org (defaultFetchLatest) while
+ *  the install goes through npm's CONFIGURED registry, so behind a mirror or
+ *  proxy that lags -- or an npm setting that holds new releases back -- the
+ *  plan reads `installed < latest` every day and each day's npm run changes
+ *  nothing. A week, not forever: the mirror may catch up, and one wasted run a
+ *  week is the price of noticing. A NEWER `latest` ends the wait at once. */
+export const SIDECAR_REFRESH_UNMOVED_BACKOFF_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** One package a completed refresh left behind: the registry version it was
+ *  measured against, and when (epoch ms). */
+export interface UnmovedRefresh {
+  latest: string;
+  at: number;
+}
+
+/** The persisted throttle state. Two keys this build reads -- the stamp, typed
+ *  below, and `unmoved` (package -> UnmovedRefresh), which is validated where
+ *  it is read (activeUnmoved) rather than typed here; read-modify-written
  *  rather than overwritten so a key a later build adds here is not dropped by
  *  an older binary's write.
  *
@@ -218,19 +264,28 @@ export interface SidecarRefreshState {
   [key: string]: unknown;
 }
 
-/** What a write must supply: the state's KNOWN keys, with the timestamp
- *  REQUIRED. Derived from SidecarRefreshState so the two cannot drift --
- *  adding a key there widens this automatically instead of leaving a
- *  hand-copied literal behind. Exported alongside it for the same reason:
- *  writeStateImpl takes one. */
-export type SidecarRefreshStatePatch = Required<Pick<SidecarRefreshState, "lastSidecarRefreshCheck">>;
+/** What a write must supply: the timestamp, REQUIRED, and optionally the
+ *  `unmoved` map. The timestamp is derived from SidecarRefreshState so the two
+ *  cannot drift. `unmoved` is the one hand-written key: the state type leaves
+ *  it untyped on purpose (a stored value is validated where it is read, see
+ *  activeUnmoved), while a WRITE is always the well-formed map, so it is
+ *  typed here and not derived. Exported alongside the state type for the same
+ *  reason: writeStateImpl takes one. */
+export type SidecarRefreshStatePatch = Required<Pick<SidecarRefreshState, "lastSidecarRefreshCheck">> & {
+  /** Written only when a background refresh has COMPLETED (see
+   *  SIDECAR_REFRESH_UNMOVED_BACKOFF_MS); it replaces the stored map. */
+  unmoved?: Record<string, UnmovedRefresh>;
+};
 
 export interface SidecarRefreshDeps {
   /** Test hook: replace the per-package registry probe. */
   fetchLatestImpl?: (pkg: string) => Promise<string | null>;
   /** Test hook: replace the background refresh. `onDone` releases the sidecars
-   *  lock and MUST be called once the refresh has finished (or failed). */
-  spawnRefreshImpl?: (stale: SidecarSpec[], onDone: () => void) => void;
+   *  lock and MUST be called once the refresh has finished (or failed). Pass
+   *  `true` only when the install completed AND its `npm update` step
+   *  succeeded (installMovedTheTree): that is what lets the check record
+   *  which stale packages it failed to move. */
+  spawnRefreshImpl?: (stale: SidecarSpec[], onDone: (ok?: boolean) => void) => void;
   /** Test hook: replace the lockfile that serializes concurrent refreshes.
    *  Returning null means "someone else holds it". */
   acquireLockImpl?: (dir: string) => (() => void) | null;
@@ -240,6 +295,9 @@ export interface SidecarRefreshDeps {
   hasManagedSidecarsImpl?: (home?: string) => boolean;
   /** Test hook: replace the configured-sidecar-spec load. */
   specsImpl?: () => Promise<SidecarSpec[]>;
+  /** Test hook: replace the read of the managed manifest's `dependencies`
+   *  (package name -> range). Null means the manifest could not be read. */
+  managedDependenciesImpl?: (home: string) => Record<string, string> | null;
   /** Test hook: the clock. */
   nowImpl?: () => number;
   /** Test hook: the start delay (see SIDECAR_REFRESH_START_DELAY_MS). Resolves
@@ -315,6 +373,10 @@ export function buildRefreshPlan(args: {
   specs: SidecarSpec[];
   installed: Map<string, string | null>;
   latest: Map<string, string | null>;
+  /** Packages a completed refresh already failed to move, still inside their
+   *  back-off (activeUnmoved). One is passed over while the registry's
+   *  `latest` is the version that refresh was aimed at. */
+  unmoved?: Map<string, UnmovedRefresh>;
 }): SidecarRefreshPlan {
   const stale: SidecarRefreshPlan["stale"] = [];
   const skipped: SidecarRefreshPlan["skipped"] = [];
@@ -346,6 +408,15 @@ export function buildRefreshPlan(args: {
     // is passed over rather than being handed a made-up verdict.
     const cmp = compareVersions(installed, latest);
     if (cmp < 0) {
+      if (args.unmoved?.get(spec.pkg)?.latest === latest) {
+        // Behind, and a refresh has already run against this exact version
+        // without getting there. Running npm again would change nothing.
+        skipped.push({
+          pkg: spec.pkg,
+          reason: `still ${installed} after a refresh aimed at ${latest} -- npm's configured registry did not deliver it; not retried for now`,
+        });
+        continue;
+      }
       stale.push({ pkg: spec.pkg, installed, latest });
     } else if (cmp > 0) {
       // Ahead of the registry: a local dev build linked into the tree, or a
@@ -358,6 +429,109 @@ export function buildRefreshPlan(args: {
   return { stale, skipped };
 }
 
+/**
+ * The `unmoved` entries of a state document that are still in force at `now`:
+ * well-formed, and younger than SIDECAR_REFRESH_UNMOVED_BACKOFF_MS. Pure. The
+ * key rides through parseSidecarRefreshState unvalidated like any other, so
+ * the shape is checked here; a malformed entry is dropped, never trusted. An
+ * entry stamped in the future (a clock stepped back) reads as expired, the
+ * same self-healing answer the throttle gives.
+ */
+export function activeUnmoved(state: SidecarRefreshState | null, now: number): Map<string, UnmovedRefresh> {
+  const out = new Map<string, UnmovedRefresh>();
+  const raw = state?.unmoved;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const [pkg, value] of Object.entries(raw)) {
+    if (!value || typeof value !== "object") continue;
+    const { latest, at } = value as { latest?: unknown; at?: unknown };
+    if (typeof latest !== "string" || typeof at !== "number" || !Number.isFinite(at)) continue;
+    const age = now - at;
+    if (age >= 0 && age < SIDECAR_REFRESH_UNMOVED_BACKOFF_MS) out.set(pkg, { latest, at });
+  }
+  return out;
+}
+
+/**
+ * Which of the packages a refresh was started for are STILL behind the
+ * version they were measured against, read after that refresh completed.
+ * Pure but for the injected version read. A package that is no longer
+ * installed counts as unmoved too: it did not reach `latest`.
+ */
+export function unmovedAfterRefresh(
+  stale: SidecarRefreshPlan["stale"],
+  installedNow: (pkg: string) => string | null,
+  at: number,
+): Map<string, UnmovedRefresh> {
+  const out = new Map<string, UnmovedRefresh>();
+  for (const s of stale) {
+    const now = installedNow(s.pkg);
+    if (now === null || compareVersions(now, s.latest) < 0) out.set(s.pkg, { latest: s.latest, at });
+  }
+  return out;
+}
+
+/**
+ * What rewriting the managed manifest from `specs` would take away from the
+ * tree described by `onDisk` (that manifest's current `dependencies`): every
+ * package the new manifest would no longer name, and every one it would name
+ * at a different range. Empty when the rewrite only adds or changes nothing.
+ * Pure.
+ *
+ * This is the guard behind the header's "a pruned shared tree is not
+ * recoverable": runSidecarsInstall REPLACES the manifest, so anything listed
+ * here is a package another config (a project's manual install) put in the
+ * shared tree and the background refresh would remove or move. The new side
+ * is read back out of sidecarsManifest itself, not re-derived, so this cannot
+ * disagree with the file the install would actually write.
+ */
+export function manifestLosses(onDisk: Record<string, string>, specs: SidecarSpec[]): string[] {
+  const next = (JSON.parse(sidecarsManifest(specs)) as { dependencies: Record<string, string> }).dependencies;
+  const losses: string[] = [];
+  for (const [pkg, range] of Object.entries(onDisk)) {
+    if (!Object.hasOwn(next, pkg)) losses.push(pkg);
+    else if (next[pkg] !== range) losses.push(`${pkg} (${range} -> ${next[pkg]})`);
+  }
+  return losses;
+}
+
+/** The `dependencies` of a managed package.json, from its text. Null for
+ *  anything that is not a manifest with an all-string dependency map -- the
+ *  caller cannot tell what a rewrite would remove from a file it cannot read,
+ *  so null stops the refresh rather than letting it through. A manifest with
+ *  no `dependencies` key at all is an empty map. Pure, and split from the read
+ *  for the reason parseSidecarRefreshState is: the read is short-circuited
+ *  under VITEST. */
+export function parseManagedDependencies(text: string): Record<string, string> | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const deps = (parsed as { dependencies?: unknown }).dependencies;
+  if (deps === undefined) return {};
+  if (!deps || typeof deps !== "object" || Array.isArray(deps)) return null;
+  const out: Record<string, string> = {};
+  for (const [pkg, range] of Object.entries(deps)) {
+    if (typeof range !== "string") return null;
+    out[pkg] = range;
+  }
+  return out;
+}
+
+/** Read the managed manifest's dependencies. Under a unit test this is an
+ *  empty map -- "the rewrite removes nothing" -- so a test that injects no
+ *  reader gets the pre-guard behaviour instead of a read of the real tree. */
+function defaultManagedDependencies(home: string): Record<string, string> | null {
+  if (inUnitTest()) return {};
+  try {
+    return parseManagedDependencies(readFileSync(join(sidecarsRoot(home), "package.json"), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
 /** Latest-version probe for one package. Same contract and response validation
  *  as upgrade-cmd's fetchLatestVersion (null on any failure, hard abort at the
  *  budget) but keyed by package -- that one is hardwired to @yawlabs/mcp.
@@ -366,7 +540,14 @@ export function buildRefreshPlan(args: {
  *  reused: it is unexported, and importing doctor-cmd would drag the entire
  *  diagnostic command onto the serve startup path for one fetch. (oam-spawn's
  *  compareVersions header documents the same dependency-direction rule.) If a
- *  third copy ever wants to exist, promote one to a shared module instead. */
+ *  third copy ever wants to exist, promote one to a shared module instead.
+ *
+ *  Always registry.npmjs.org, NOT the registry npm is configured with -- the
+ *  install that follows (defaultRunNpm) uses the configured one. Resolving it
+ *  would cost an `npm config get registry` spawn on the serve startup path, so
+ *  the mismatch is handled after the fact instead: a refresh that completes
+ *  without reaching the version probed here is recorded and not repeated for
+ *  SIDECAR_REFRESH_UNMOVED_BACKOFF_MS. */
 async function defaultFetchLatest(pkg: string): Promise<string | null> {
   if (inUnitTest()) return null;
   const ac = new AbortController();
@@ -485,6 +666,20 @@ export async function unbuiltGitNote(home: string): Promise<{ message: string; n
   };
 }
 
+/** True when a `sidecars install` run got as far as it can: exit 0 AND a
+ *  successful `npm update`. This is what the background refresh reports as
+ *  `ok`, and the two halves are not redundant. runSidecarsInstall exits 0 when
+ *  `npm install` succeeded and `npm update` FAILED -- the tree is usable, so
+ *  the command does not call that a failure -- but `update` is the only step
+ *  that moves a floating range forward (see the comment above that call in
+ *  sidecars-cmd.ts). After such a run every stale package is still where it
+ *  was for a reason that has nothing to do with the registry, and recording
+ *  it as unmoved would back it off for SIDECAR_REFRESH_UNMOVED_BACKOFF_MS
+ *  behind a log line blaming a lagging mirror. */
+export function installMovedTheTree(result: Pick<SidecarsInstallResult, "exitCode" | "updateError">): boolean {
+  return result.exitCode === 0 && result.updateError === null;
+}
+
 /** Run the refresh in the background and release the lock when it settles.
  *
  *  `stale` is here for the log line and for a test to assert on -- it is NOT a
@@ -495,13 +690,16 @@ export async function unbuiltGitNote(home: string): Promise<{ message: string; n
  *  onDone fires on EVERY exit path -- resolve, reject, and the
  *  impossible-in-practice synchronous throw -- via `finally`. auto-upgrade
  *  needed two handlers and a `released` flag to get the same guarantee out of a
- *  child process; one promise gets it for free. */
-function defaultSpawnRefresh(stale: SidecarSpec[], onDone: () => void, home: string): void {
+ *  child process; one promise gets it for free. It is told whether BOTH npm
+ *  steps succeeded (installMovedTheTree): only then is "this package did not
+ *  move" a fact about the registry and not about a failed npm run. */
+function defaultSpawnRefresh(stale: SidecarSpec[], onDone: (ok?: boolean) => void, home: string): void {
   if (inUnitTest()) {
     onDone();
     return;
   }
   void (async () => {
+    let ok = false;
     try {
       // The whole `sidecars install` command, run INSIDE the serve process.
       // backgroundInstallOptions mutes the command's own writers (`out` /
@@ -512,7 +710,17 @@ function defaultSpawnRefresh(stale: SidecarSpec[], onDone: () => void, home: str
       // just not obvious from "muted": a line about the sidecars tree that
       // appears mid-session comes from here.
       const result = await runSidecarsInstall(backgroundInstallOptions(home));
-      if (result.exitCode === 0) {
+      if (result.exitCode === 0 && result.updateError !== null) {
+        // Exit 0 with a failed `npm update`: the tree is usable and nothing in
+        // it moved. NOT `ok` -- see installMovedTheTree -- so nothing is
+        // recorded as unmoved and the next daily check tries again.
+        log(
+          "warn",
+          "yaw-mcp sidecar refresh: npm install succeeded but npm update failed, so no package was moved forward; the next daily check retries. Run `yaw-mcp sidecars install` to see why",
+          { updateError: result.updateError },
+        );
+      } else if (installMovedTheTree(result)) {
+        ok = true;
         // NOT "restart your MCP client": this writes into the very tree this
         // process re-spawns servers from, so the next ACTIVATION of a refreshed
         // server -- which the idle reaper makes a routine mid-session event --
@@ -540,7 +748,7 @@ function defaultSpawnRefresh(stale: SidecarSpec[], onDone: () => void, home: str
     } catch (err) {
       log("warn", "yaw-mcp sidecar refresh failed", { error: err instanceof Error ? err.message : String(err) });
     } finally {
-      onDone();
+      onDone(ok);
     }
   })();
 }
@@ -732,8 +940,14 @@ export async function maybeRefreshSidecars(deps: SidecarRefreshDeps = {}): Promi
 
     // 2. No managed tree, nothing to refresh. This is the COMMON case --
     // `sidecars install` is opt-in -- and it is one existsSync, so it comes
-    // before the state read and long before the network. An npx-launched
-    // server re-resolves `@latest` on every spawn and was never stale.
+    // before the state read and long before the network. That does NOT mean
+    // such a machine is current: with no managed tree an npx server is still
+    // started from an on-disk copy when one resolves (the npx cache, or a
+    // durable node_modules), and that copy is pinned -- npx only re-resolves
+    // `@latest` for a server with no copy on disk at all. Those copies are not
+    // this module's to move (it owns ~/.yaw-mcp/sidecars and nothing else);
+    // oam-spawn's notePinnedSidecar logs the pin, with the command that
+    // refreshes it, once per package.
     if (!(deps.hasManagedSidecarsImpl ?? defaultHasManagedSidecars)(home)) return;
 
     // 3. Throttle. `age < 0` means the recorded check is in the FUTURE -- a
@@ -827,7 +1041,10 @@ export async function maybeRefreshSidecars(deps: SidecarRefreshDeps = {}): Promi
     // forward anyway, which is what that range asked for. Refusing on one
     // failed lookup would let a single 404 or slow package disable the refresh
     // for every other package, once a day, forever.
-    const plan = buildRefreshPlan({ specs, installed, latest });
+    // `afterDelay` is the freshest read of the state file, so it is also where
+    // the packages an earlier refresh could not move come from.
+    const heldBack = activeUnmoved(afterDelay, now);
+    const plan = buildRefreshPlan({ specs, installed, latest, unmoved: heldBack });
     if (plan.stale.length === 0) {
       // Nothing to do -- including the all-probes-failed (offline) case, which
       // is deliberately RECORDED rather than retried. A machine with no network
@@ -863,6 +1080,29 @@ export async function maybeRefreshSidecars(deps: SidecarRefreshDeps = {}): Promi
       release();
     };
 
+    // 7b. Would the rewrite take anything out of the tree? Read UNDER the
+    // lock, because the manual `sidecars install` that could change the
+    // answer takes the same one. The install below replaces the manifest with
+    // the user-global set, so a package (or a pin) that only a project's
+    // install put there would be pruned or moved -- see the header's WHICH
+    // CONFIG IT ACTS ON. An unreadable manifest gets the same answer: nothing
+    // here can say what a rewrite of it would remove. Recorded as a completed
+    // check, unlike the lock miss above: the condition holds until someone
+    // runs `sidecars install`, and re-probing the registry on every client
+    // start in the meantime is the storm the throttle exists to prevent.
+    const onDisk = (deps.managedDependenciesImpl ?? defaultManagedDependencies)(home);
+    const losses = onDisk === null ? null : manifestLosses(onDisk, specs);
+    if (losses === null || losses.length > 0) {
+      releaseOnce();
+      log(
+        "info",
+        "sidecar refresh: skipped -- the managed tree holds packages the user-global config would not reinstall as they are (installed from a project, or the config changed since); run `yaw-mcp sidecars install` to refresh it",
+        losses === null ? { manifest: "unreadable" } : { wouldChange: losses, stale: plan.stale.map((s) => s.pkg) },
+      );
+      await recordCheck();
+      return;
+    }
+
     // 8. Go. Record the timestamp regardless of how the background refresh
     // turns out: the CHECK is what the throttle governs, and a refresh that
     // fails must not put this process into a retry loop against a registry or
@@ -871,11 +1111,50 @@ export async function maybeRefreshSidecars(deps: SidecarRefreshDeps = {}): Promi
     log("info", "yaw-mcp sidecars are behind npm; refreshing the managed tree in the background", {
       stale: plan.stale.map((s) => `${s.pkg} ${s.installed} -> ${s.latest}`),
     });
+    // What the refresh reports back with. The lock goes first, on every path.
+    // Then, only for an install that exited 0 with a successful `npm update`
+    // (installMovedTheTree): which of the stale packages are STILL behind the
+    // version they were measured against. The probe asked
+    // registry.npmjs.org and npm installed from its configured registry, so
+    // behind a lagging mirror the answer is "all of them", every day -- those
+    // are recorded and passed over (buildRefreshPlan) until `latest` moves or
+    // SIDECAR_REFRESH_UNMOVED_BACKOFF_MS runs out. A failed install, or one
+    // whose update step failed, records nothing: it says nothing about the
+    // registry, and it retries tomorrow as it always has. Entries still in
+    // force for packages this run did not list are carried over, since the
+    // write replaces the map.
+    const onRefreshDone = (ok?: boolean): void => {
+      releaseOnce();
+      if (ok !== true) return;
+      void (async () => {
+        try {
+          const unmoved = unmovedAfterRefresh(
+            plan.stale,
+            (pkg) => installedVersionFn(pkg, home),
+            (deps.nowImpl ?? Date.now)(),
+          );
+          if (unmoved.size > 0) {
+            log("info", "sidecar refresh: npm ran but some packages did not reach the version npmjs.org lists", {
+              unmoved: [...unmoved].map(([pkg, u]) => `${pkg} (wanted ${u.latest})`),
+              hint: "npm's configured registry may be a mirror that is behind; not retried for a week unless a newer version appears",
+            });
+          }
+          await writeState({
+            lastSidecarRefreshCheck: now,
+            unmoved: Object.fromEntries([...heldBack, ...unmoved]),
+          });
+        } catch (err) {
+          log("debug", "sidecar-refresh: failed to record unmoved packages", {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      })();
+    };
     try {
-      (deps.spawnRefreshImpl ?? ((s: SidecarSpec[], done: () => void) => defaultSpawnRefresh(s, done, home)))(
-        staleSpecs,
-        releaseOnce,
-      );
+      (
+        deps.spawnRefreshImpl ??
+        ((s: SidecarSpec[], done: (ok?: boolean) => void) => defaultSpawnRefresh(s, done, home))
+      )(staleSpecs, onRefreshDone);
     } catch (err) {
       // A synchronous throw out of the spawn would otherwise leave the lock held
       // for the full stale window, suppressing the next several startups'

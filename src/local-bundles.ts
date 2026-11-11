@@ -94,11 +94,13 @@ export function localBundlesPath(configDir: string): string {
   return join(configDir, BUNDLES_FILENAME);
 }
 
-/** Canonical regex for valid MCP server namespaces. Two production consumers:
- *  validateEntry below, and config-loader.ts's allow/deny-list validation
- *  (every profile entry must be a namespace this loader could have produced).
- *  Exported so both -- and the test suite -- pin the SAME definition instead of
- *  maintaining an independent copy that drifts from the loader's. */
+/** Canonical regex for valid MCP server namespaces: the single definition.
+ *  validateEntry below applies it on load, and every other namespace check
+ *  imports it -- config-loader.ts's allow/deny-list validation (every profile
+ *  entry must be a namespace this loader could have produced) and the git
+ *  build directories among them. Exported so they -- and the test suite --
+ *  pin the SAME definition instead of maintaining an independent copy that
+ *  drifts from the loader's. */
 export const NAMESPACE_RE = /^[a-z][a-z0-9_]{0,29}$/;
 
 /** The target shape `remove` and `set` accept when no stored entry answers to
@@ -133,10 +135,13 @@ export const RESERVED_HEADER_NAMES = new Set(["mcp-session-id", "mcp-protocol-ve
  *  once the repo grows a collision, and the build directory is keyed on it. */
 export const GIT_COMMIT_RE = /^[0-9a-f]{40}$/;
 
-function hasControlChar(s: string): boolean {
+/** Does `s` hold a C0 control, DEL or a C1 control (0x80-0x9f, where 0x9b is
+ *  an 8-bit CSI)? The one definition a bundles.json git field, a `--git` URL
+ *  and a repo's yaw-mcp.json string are all held to. */
+export function hasControlChar(s: string): boolean {
   for (let i = 0; i < s.length; i++) {
     const c = s.charCodeAt(i);
-    if (c < 0x20 || c === 0x7f) return true;
+    if (c < 0x20 || (c >= 0x7f && c <= 0x9f)) return true;
   }
   return false;
 }
@@ -153,7 +158,10 @@ export function unsafeRelativePathReason(p: string): string | null {
   return null;
 }
 
-function relativeSegments(p: string): string[] {
+/** The segments of a relative path, either separator, with empty and "."
+ *  segments dropped: "./pkg", "pkg/" and "pkg" are one directory, and "." is
+ *  none. */
+export function relativeSegments(p: string): string[] {
   return p.split(/[\\/]/).filter((s) => s !== "" && s !== ".");
 }
 
@@ -832,12 +840,22 @@ export function previewBundlesContent(path: string, rawBytes: Buffer, home: stri
   return { ok: true, servers, warnings };
 }
 
+/** Does the loader keep this raw `servers` element? The same validateEntry
+ *  loadLocalBundles runs, with its warnings discarded, for a caller that walks
+ *  the raw array beside the validated list and has to skip exactly the entries
+ *  the loader skipped (`list --json`'s raw env keys). */
+export function rawEntryLoads(entry: unknown, home: string = homedir()): boolean {
+  return validateEntry(entry, [], home) !== null;
+}
+
 /** Deterministic content-derived configVersion. Nothing polls for a change
  *  any more -- the hosted backend whose ETag this once stood in for is gone.
- *  Its one remaining reader is server.ts, which folds it into a cache key so
- *  two loads of a byte-identical server list share an entry and any edit to
- *  the list misses. Same servers in, same version out, on every machine --
- *  except a git entry, whose derived launch embeds this machine's home. */
+ *  Its one remaining reading module is server.ts, which uses it twice: folded
+ *  into a cache key, so two loads of a byte-identical server list share an
+ *  entry and any edit to the list misses; and compared across a reload, where
+ *  a changed version is what makes the reload reconcile the running servers
+ *  and notify. Same servers in, same version out, on every machine -- except
+ *  a git entry, whose derived launch embeds this machine's home. */
 function hashContent(servers: UpstreamServerConfig[]): string {
   const h = createHash("sha256");
   h.update(JSON.stringify(servers));
@@ -1258,14 +1276,20 @@ export async function loadLocalBundles(
   };
 }
 
-// --- Write path (used by `yaw-mcp add` / `remove` / `set`) ------------------
+// --- Write path (used by `yaw-mcp add` / `remove` / `import` / `update`) -----
 //
-// These mutate the USER-GLOBAL ~/.yaw-mcp/bundles.json. Together with `set`
-// (local-set-cmd.ts, which splices one entry through editJsoncPath instead of
-// rewriting the file) they are the only writers of local server definitions
-// in the CLI. A project-local <cwd>/.yaw-mcp/bundles.json FULLY overrides
-// user-global on load (see loadLocalBundles), so the commands warn separately
-// when a project file would shadow the write -- they don't silently target it.
+// The writers of local server definitions in the CLI are three functions here
+// -- upsertUserBundle (`add`, `import`), removeUserBundle (`remove`) and
+// updateGitPin (`update`) -- plus `set` (local-set-cmd.ts). They mutate the
+// USER-GLOBAL ~/.yaw-mcp/bundles.json unless the caller names a project
+// `.yaw-mcp/` as `configDir`, which only upsertUserBundle (`add --git
+// --project`) and updateGitPin accept: remove and `set` are user-global only.
+// A project-local <cwd>/.yaw-mcp/bundles.json FULLY overrides user-global on
+// load (see loadLocalBundles), so a user-global write warns separately when a
+// project file would shadow it -- it never silently targets that file.
+//
+// Two of the four SPLICE through editJsoncPath and keep every other byte:
+// `set` and updateGitPin. The other two rewrite the file:
 //
 // LOSSY REWRITE: add/remove serialize the file back out via JSON.stringify
 // (readRawUserBundles -> {version, servers, defaultRuntime?} -> atomicWriteFile).
@@ -1487,13 +1511,14 @@ async function readRawUserBundles(
       // A DIRECTORY is not a permissions problem, and telling the user to
       // check permissions on one sends them nowhere useful.
       if (readWarning.includes(IS_A_DIRECTORY_DETAIL)) {
-        throw new Error(`${path} is a directory, not a file -- move or remove it before adding servers.`);
+        throw new Error(`${path} is a directory, not a file -- move or remove it first.`);
       }
-      throw new Error(`${path} could not be read (${warningText}) -- check file permissions before adding servers.`);
+      throw new Error(`${path} could not be read (${warningText}) -- check file permissions first.`);
     }
-    // Default: parse failure or structural mismatch.
+    // Default: parse failure or structural mismatch. No verb in any of the
+    // three: `remove` and `import` reach this read as well as `add`.
     const detail = warnings.length > 0 ? ` (${warningText})` : "";
-    throw new Error(`${path} could not be parsed -- fix the JSON${detail} before adding servers.`);
+    throw new Error(`${path} could not be parsed -- fix the JSON${detail} first.`);
   }
   // DEBUG, not warn: the same facts are in `warnings`, which the caller
   // prints in prose (see the doc above).
@@ -1572,7 +1597,8 @@ function mergeServerEntry(
   // `optionalEnvKeys` marks which blank env seeds are optional (see
   // local-add-cmd's entry). An add writes it as an ARRAY every time so a
   // catalog that stopped flagging a var clears the old marker on re-add; an
-  // empty array carries no information, so it is dropped rather than stored.
+  // empty array carries no information, so it is dropped rather than stored
+  // (mergedUpsertEntry does the same for a fresh add, which never gets here).
   if (Array.isArray(merged.optionalEnvKeys) && merged.optionalEnvKeys.length === 0) delete merged.optionalEnvKeys;
   // The mirror of the rule below, and it has to exist for the same reason:
   // the two launch shapes are exclusive, and half-converting leaves an entry
@@ -1700,12 +1726,16 @@ function launchShapeOf(entry: Record<string, unknown>): LaunchShape {
 }
 
 function sameLaunch(a: LaunchShape, b: LaunchShape): boolean {
+  // The subdir is compared as a directory, not as a string: `add --git` now
+  // stores it tidy ("server"), while an entry written by 1.1.10 or earlier, or
+  // by hand, can hold the same directory as "./server/".
+  const dir = (s: LaunchShape): string => relativeSegments(s.git?.subdir ?? "").join("/");
   return (
     a.command === b.command &&
     a.url === b.url &&
     JSON.stringify(a.args ?? []) === JSON.stringify(b.args ?? []) &&
     a.git?.url === b.git?.url &&
-    a.git?.subdir === b.git?.subdir
+    dir(a) === dir(b)
   );
 }
 
@@ -1952,7 +1982,14 @@ function mergedUpsertEntry(
   entry: Partial<UpstreamServerConfig>,
   target: ReturnType<typeof resolveUpsertTarget>,
 ): Partial<UpstreamServerConfig> {
-  if (target.idx < 0) return entry;
+  if (target.idx < 0) {
+    // Nothing to fold onto, but mergeServerEntry's rule that an EMPTY
+    // optionalEnvKeys is never stored holds for a fresh add too: `add` sends
+    // the array every time, and [] is what most servers send.
+    const fresh: Record<string, unknown> = { ...entry };
+    if (Array.isArray(fresh.optionalEnvKeys) && fresh.optionalEnvKeys.length === 0) delete fresh.optionalEnvKeys;
+    return fresh as Partial<UpstreamServerConfig>;
+  }
   const written = mergeServerEntry(servers[target.idx] ?? {}, entry);
   if (target.matchedByNamespace) return written;
   // Name-fallback match: keep the stored namespace and id -- never rename out
@@ -2152,8 +2189,9 @@ export async function bytesAreTrusted(path: string, home: string): Promise<boole
   }
 }
 
-/** The one serialize-and-write for the user-global bundles.json, shared by
- *  upsert and remove.
+/** The one serialize-and-write of a whole bundles.json, shared by upsert
+ *  (user-global, or a project file under `configDir`) and remove. `set` and
+ *  updateGitPin do not come through here: they splice the existing text.
  *
  *  dirMode 0o700 so a freshly-created ~/.yaw-mcp/ is born owner-only
  *  (matching secrets-vault): bundles.json can carry per-server `--env`

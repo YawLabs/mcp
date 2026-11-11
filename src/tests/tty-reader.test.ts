@@ -1,12 +1,13 @@
-// tty-reader.ts in isolation: the raw-mode reader every CLI prompt shares.
+// tty-reader.ts in isolation: the raw-mode reader `secrets` and `trust` share.
 //
 // secrets-cmd.test.ts and trust-cmd.test.ts drive the same reader through
 // their commands; this file pins the reader's OWN contract -- the ESC/CSI
 // state machine in particular -- against injected streams, so a regression
 // is named here before it surfaces as "the passphrase prompt stored `[D`".
 
+import { PassThrough } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
-import { CANCELLED, NO_ECHO, readAnswerFromTTY, readLineFromTTY } from "../tty-reader.js";
+import { ANSWER_EOF, CANCELLED, NO_ECHO, readAnswerFromTTY, readLineFromTTY } from "../tty-reader.js";
 
 /** Minimal controllable fake of a TTY ReadStream. Each `resume()` (one per
  *  prompt) flushes the next queued chunk to the registered "data" listener on
@@ -192,6 +193,41 @@ describe("readLineFromTTY -- raw mode unavailable", () => {
   });
 });
 
+// A real stream, because the fake above never ends. PassThrough has no
+// setRawMode, which is the cooked fallback an echo read carries on in -- the
+// mode where a terminal turns ^D into a stream end instead of a 0x04 byte.
+describe("a stream that ends without a terminating byte", () => {
+  it("settles an echo read instead of hanging: '' from readLineFromTTY, ANSWER_EOF from readAnswerFromTTY", async () => {
+    const line = new PassThrough();
+    const pendingLine = readLineFromTTY(line as unknown as NodeJS.ReadStream, fakeStdout().stream, "? ", true);
+    line.end();
+    expect(await pendingLine).toBe("");
+
+    const answer = new PassThrough();
+    const pendingAnswer = readAnswerFromTTY(answer, fakeStdout().stream, "? ");
+    answer.end("y");
+    // Typed-but-unsubmitted text is dropped, as it is for the ^D byte: a
+    // [Y/n] prompt must not take a half-typed line as an answer.
+    expect(await pendingAnswer).toBe(ANSWER_EOF);
+  });
+
+  it("settles at once on a stream that had ALREADY ended, so a re-prompt loop runs out", async () => {
+    const stdin = new PassThrough();
+    const first = readLineFromTTY(stdin as unknown as NodeJS.ReadStream, fakeStdout().stream, "? ", true);
+    stdin.end();
+    expect(await first).toBe("");
+    expect(await readLineFromTTY(stdin as unknown as NodeJS.ReadStream, fakeStdout().stream, "? ", true)).toBe("");
+    expect(stdin.listenerCount("data") + stdin.listenerCount("end") + stdin.listenerCount("close")).toBe(0);
+  });
+
+  it("settles a raw-mode no-echo read when the stream closes under the prompt", async () => {
+    const stdin = Object.assign(new PassThrough(), { isRaw: false, setRawMode: () => undefined });
+    const read = readLineFromTTY(stdin as unknown as NodeJS.ReadStream, fakeStdout().stream);
+    stdin.destroy();
+    expect(await read).toBe("");
+  });
+});
+
 describe("readAnswerFromTTY", () => {
   it("hands back the typed answer untouched and null for ^C", async () => {
     const typed = new FakeTTYStdin([" Yes \n"]);
@@ -200,5 +236,19 @@ describe("readAnswerFromTTY", () => {
     expect(await readAnswerFromTTY(cancelled as unknown as NodeJS.ReadableStream, fakeStdout().stream, "? ")).toBe(
       null,
     );
+  });
+
+  it("hands back ANSWER_EOF for ^D and '' for a bare Enter, so a [Y/n] prompt can tell them apart", async () => {
+    // Both used to be "", and a [Y/n] prompt takes "" as yes.
+    const eof = new FakeTTYStdin(["\x04"]);
+    expect(await readAnswerFromTTY(eof as unknown as NodeJS.ReadableStream, fakeStdout().stream, "? ")).toBe(
+      ANSWER_EOF,
+    );
+    const typedThenEof = new FakeTTYStdin(["y\x04\n"]);
+    expect(await readAnswerFromTTY(typedThenEof as unknown as NodeJS.ReadableStream, fakeStdout().stream, "? ")).toBe(
+      ANSWER_EOF,
+    );
+    const enter = new FakeTTYStdin(["\n"]);
+    expect(await readAnswerFromTTY(enter as unknown as NodeJS.ReadableStream, fakeStdout().stream, "? ")).toBe("");
   });
 });

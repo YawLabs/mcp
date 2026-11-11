@@ -52,8 +52,9 @@ export type ErrorCategory = (typeof ERROR_CATEGORIES)[number];
 // SUCCESSFUL replies -- issue numbers ("#429 fix flaky build"),
 // stack-trace line numbers ("server.js:404:12"), byte counts ("rx 429
 // bytes"), JSON payload numbers ('{"number":401}') -- and reward.ts runs
-// classifyError over EVERY proxied result, so each false positive banked
-// a healthy call at 0.2 credit and fed the flaky list.
+// classifyError over the head of EVERY proxied result that is not already
+// flagged isError, so each false positive banked a healthy call at 0.2
+// credit and fed the flaky list.
 //
 // Four context shapes match, chosen against real MCP error bodies:
 //   A1. A STATUS intro before the code: status / statuscode / status_code
@@ -158,11 +159,18 @@ function httpStatusRe(code: number): RegExp {
 // shape, and a 21,480-input differential against the pre-guard version
 // found zero disagreements.)
 //
-// It earns its keep because reward.ts runs classifyError over EVERY
-// proxied result, and the overwhelmingly common case is a SUCCESSFUL
-// reply that carries no status code at all. Such a body used to pay four
-// full regex scans; it now pays four substring scans. Measured on a 98 KB
-// digit-free body: 58 ms before, under 1 ms after.
+// It was added when reward.ts ran classifyError over the WHOLE first text
+// block of every proxied result, where the overwhelmingly common case is a
+// SUCCESSFUL reply that carries no status code at all. Such a body used to
+// pay four full regex scans; it now pays four substring scans. Measured on
+// a 98 KB digit-free body: 58 ms before, under 1 ms after.
+//
+// That whole-body path is gone: reward.ts now classifies only the first
+// RULE2_SCAN_LEN (1000) chars, and the one other in-tree caller (server.ts's
+// exec step accounting) passes an error message. So the 98 KB figures here
+// and the "11 s on a 98 KB reply" one above describe inputs no current
+// caller sends. The guards stay because classifyError is exported and takes
+// a string of any length; error-category.test.ts still times a large body.
 function httpStatusMatcher(code: number): (t: string) => boolean {
   const digits = String(code);
   const re = httpStatusRe(code);
@@ -181,14 +189,22 @@ const RX_NO_TOKEN = /no [a-z_]*token (configured|set)/i;
 //     5000ms exceeded", which starts the string -- and sent it to
 //     upstream_error, where reward.ts treats it as a benign catch-all and
 //     grants the call FULL credit.
-//   - \b on both sides: keeps identifier-shaped text (connectTimeoutMs,
-//     set_timeout, timeout_ms) from false-positiving, since JS word boundaries
-//     treat `_` as a word char.
+//   - \b on both sides: keeps snake_case and camelCase identifiers
+//     (connectTimeoutMs, set_timeout, timeout_ms) from false-positiving, since
+//     JS word boundaries treat `_` as a word char.
+//   - Not directly hyphen-joined: \b does NOT cover kebab-case, because `-` is
+//     a non-word char. `--timeout SECONDS` in a usage line, `connect-timeout:
+//     30s` in a config dump and "the request-timeout header" in prose are a
+//     flag, a key and a header name -- all three used to classify as timeout
+//     from a SUCCESSFUL reply. The cost is a hyphen-glued failure report
+//     ("read-timeout exceeded") falling through to upstream_error, the same
+//     benign direction as the quoted case below.
 //   - Not directly quote-delimited: a `timeout` token wrapped in ' " or `
 //     is DATA, not a failure report -- a config key echoed back by a
 //     successful call (`{"timeout":5000,"retries":3}`) or a zod path in a
 //     validation error (`"path":["timeout"]`). classifyError runs the timeout
-//     check FIRST and server.ts scores EVERY proxied result, so a bare-noun
+//     check FIRST and reward.ts grades the head of every proxied result that
+//     is not already isError (see RULE2_SCAN_LEN there), so a bare-noun
 //     match banked a successful get_config at 0.2 reward instead of 1.0, and
 //     stole -32602 replies from validation_error. Genuine timeouts either say
 //     "timed out" (matched separately below) or use the word in running prose,
@@ -196,7 +212,7 @@ const RX_NO_TOKEN = /no [a-z_]*token (configured|set)/i;
 //     (`{"error":"timeout"}`) falling through to upstream_error; that is the
 //     benign direction, and such payloads normally carry "timed out" or -32001
 //     as well.
-const RX_TIMEOUT = /(?<!["'`])\btimeout\b(?!["'`])/;
+const RX_TIMEOUT = /(?<![-"'`])\btimeout\b(?![-"'`])/;
 
 export function classifyError(text: string | undefined | null): ErrorCategory {
   if (!text) return "upstream_error";

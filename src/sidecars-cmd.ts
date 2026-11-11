@@ -119,8 +119,8 @@ export interface SidecarSpec {
  * ONE predicate, not one per caller. Three sites have to answer this
  * identically -- collectSidecarSpecs and the two skip collectors, which
  * PARTITION the same server set into "installed" and "passed over", and
- * unhostedReasons, which decides whether the question of who reads the tree
- * arises at all. It was written out three times, kept in step only by comments
+ * unhostedReasons, which decides whether there is any server to ask "will oam
+ * host it" about. It was written out three times, kept in step only by comments
  * saying it must be, and a fourth copy would have drifted silently.
  *
  * "npx" is recognised via nodeLaunchKind, NOT string equality: `npx.cmd` and
@@ -398,6 +398,13 @@ export interface SidecarsInstallResult {
   exitCode: number;
   installed: Array<{ pkg: string; version: string | null; namespaces: string[] }>;
   lines: string[];
+  /** Why the `npm update` step failed, else null -- the same string the --json
+   *  document carries as `updateError`. Null on every path that never reached
+   *  that step. `exitCode` alone cannot say this: a failed update leaves a
+   *  usable tree and still exits 0, so a caller that needs to know whether the
+   *  versions could have MOVED (sidecar-refresh's installMovedTheTree) reads
+   *  this field. */
+  updateError: string | null;
 }
 
 /** Every key the `--json` document carries, on every path. */
@@ -419,14 +426,15 @@ interface SidecarsJson {
    *  Like `updateError`, the install itself SUCCEEDED; doctor will just read
    *  the tree as pre-marker until the next successful install. */
   markerError: string | null;
-  /** Why nothing on this machine will READ the tree that was just filled -- one
-   *  entry per distinct reason, from the same verdicts as the human note (see
-   *  unhostedReasons). Empty means at least one server resolves to oam, which
-   *  is the healthy case; NON-empty is the state where `installed` is full and
-   *  every server nonetheless still resolves through the npx cache, so a
-   *  consumer reporting install health has to look here and not only at
-   *  `error`. Empty on the paths that installed nothing, where the question
-   *  does not arise. */
+  /** Why no npx server here will be hosted on OAM -- one entry per distinct
+   *  reason, from the same verdicts as the human note (see unhostedReasons).
+   *  Empty means at least one server resolves to oam. NON-empty does NOT mean
+   *  the tree goes unread: a server oam does not take is started from this
+   *  same tree by node (resolveManagedSpawn, oam-spawn.ts), so the install is
+   *  in use either way and this field says only which runtime runs it. Empty
+   *  on the paths that return before `npm install` has exited 0 (nothing to
+   *  install, a refusal, a failed install), where the question does not arise;
+   *  a run where npm exited 0 but no package landed still fills it. */
   unhosted: string[];
   /** Packages configured at two different versions; the winner is the version
    *  reported in `installed`. Empty in the ordinary case. */
@@ -711,8 +719,9 @@ export const SIDECARS_USAGE = `Usage: yaw-mcp sidecars install [--yes] [--json]
   so they run from one known version instead of whatever npm's npx cache
   happens to hold.
 
-  Worth running when servers are hosted on oam: oam runs the copy already on
-  disk and cannot re-resolve "@latest" the way npx did, so without a managed
+  Worth running on either runtime: yaw-mcp starts an npx server from a copy
+  already on disk -- on oam, or with node when oam is not hosting it -- and
+  that cannot re-resolve "@latest" the way npx did, so without a managed
   install a server stays pinned at whatever was last fetched. Re-run this to
   move them forward.
 
@@ -728,7 +737,11 @@ export const SIDECARS_USAGE = `Usage: yaw-mcp sidecars install [--yes] [--json]
   --yes, -y  Allow a git repo's install and build scripts to run. Asked once
              per repo; when stdin or stdout is not a TTY, required until the
              repo is allowed here. Recorded per repo in
-             ~/.yaw-mcp/git/consent.json.`;
+             ~/.yaw-mcp/git/consent.json.
+  --json     Print one JSON document on stdout instead of the text report,
+             with the same keys on every run: root, installed, reason, error,
+             updateError, markerError, unhosted, conflicts, skipped, git.
+             "error" is null on a clean run.`;
 
 export function parseSidecarsArgs(
   argv: string[],
@@ -763,31 +776,29 @@ export function parseSidecarsArgs(
 }
 
 /**
- * Why NOTHING will read the tree this command just filled -- the distinct
- * reasons, or [] when at least one server would be hosted on oam.
+ * Why no npx server here will be hosted on OAM -- the distinct reasons, or []
+ * when at least one server would be.
  *
  * collectSidecarSpecs filters on the npx launch shape and nothing else -- it
  * cannot see per-server `runtime: "node"`, the config default, or whether oam
- * is installed at all. But the managed tree is consumed ONLY by resolveNpmEntry
- * on the oam rewrite path (oam-spawn.ts): a server that resolves to the node
- * runtime spawns through npx and never looks here. So on a machine with no oam,
- * "These versions are now fixed" on its own is a claim the user cannot act on
- * -- every spawn still goes through the npx cache. Say which gate is closed,
- * using describeServerRuntime's own reason strings so this and doctor cannot
- * drift apart.
+ * is installed at all. The tree is read on BOTH runtimes: resolveNpmEntry
+ * serves the oam rewrite and, for every launch oam does not take,
+ * resolveManagedSpawn (oam-spawn.ts; upstream.ts applies it after the oam
+ * gate), which starts the server as `node <entry>` from this tree. So this is
+ * not "the install is unused" -- it once was, when the node path spawned raw
+ * npx. What it reports is the runtime: which gate keeps these servers off
+ * oam, in describeServerRuntime's own reason strings so this and doctor
+ * cannot drift apart.
  *
- * The install is still worth having in that state -- the copies are used the
- * moment oam arrives -- so this is a note, not a failure.
+ * A note, not a failure: the install is in use either way.
  *
  * Returns the REASONS rather than the finished prose so the human note and the
  * `--json` document are the same verdict rendered twice, not two computations
  * that can disagree. The probe is paid for in both modes deliberately: the
- * cheaper alternative was skipping it under `--json`, but the caller that most
- * needs this answer is a script -- the Yaw Terminal MCP panel shells out to
- * `sidecars install --json` and would otherwise read a full `installed` array
- * with `error: null` as a healthy install on a machine where every server still
- * resolves through the npx cache. probeOam is process-cached, so the cost is one
- * probe per run: a single `oam --version`, or two when the first times out.
+ * Yaw Terminal MCP panel shells out to `sidecars install --json`, where the
+ * human note is suppressed, so the `unhosted` field is the only place the
+ * verdict can reach it. probeOam is process-cached, so the cost is one probe
+ * per run: a single `oam --version`, or two when the first times out.
  *
  * `bundles` is the load the runner ALREADY did. describeDefaultRuntime reads the
  * same file, so letting it do its own read meant bundles.json parsed twice per
@@ -930,10 +941,15 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
       ...over,
       error: over.error ?? gitError,
     });
-  const done = (exitCode: number, installed: SidecarsInstallResult["installed"] = []): SidecarsInstallResult => ({
+  const done = (
+    exitCode: number,
+    installed: SidecarsInstallResult["installed"] = [],
+    updateError: string | null = null,
+  ): SidecarsInstallResult => ({
     exitCode: exitCode === 0 && gitBad + gitUnconsented > 0 ? 1 : exitCode,
     installed,
     lines,
+    updateError,
   });
   // Guarded: on EACCES/EROFS/ENOSPC these used to reject out of the command,
   // and the dispatcher printed `yaw-mcp sidecars: <errno>` on stderr with
@@ -1000,24 +1016,36 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
   // Before the npm step and on every path after it: a config whose only
   // servers are git entries still has work here, and each report rides in the
   // --json document whatever the npm half does.
-  git = opts.buildGit === false ? [] : await buildGitEntriesFor(servers, bundles.path, opts, home, print, printErr);
-  gitBad = git.filter((g) => g.status === "failed" || g.status === "refused").length;
-  gitUnconsented = git.filter((g) => g.status === "needs-consent").length;
-  // Both counts, when a run has both: the consent one names its own remedy.
-  const gitProblems = [
-    ...(gitBad > 0 ? [`${gitBad} git source(s) did not build`] : []),
-    ...(gitUnconsented > 0
-      ? [`${gitUnconsented} git source(s) were not built: their repo's scripts need consent (re-run with --yes)`]
-      : []),
-  ];
-  gitError = gitProblems.length > 0 ? gitProblems.join("; ") : null;
-  if (git.length > 0) {
-    print("Git sources:");
-    for (const g of git) {
-      print(`  ${g.namespace}  ${g.commit ? g.commit.slice(0, 12) : "(no commit)"}  ${g.status}`);
-      if (g.error) for (const l of g.error.split("\n")) print(`    ${l}`);
+  //
+  // The sidecars lock is already HELD here (when there are specs), and the
+  // `finally` that releases it opens further down, after the empty-config
+  // returns. The git build reports its failures as values, but it awaits a
+  // prompt, a pin write and a clone on the way, and a throw out of any of them
+  // would leave the lockfile behind for the whole stale window. So a throw
+  // from this stretch releases before it propagates.
+  try {
+    git = opts.buildGit === false ? [] : await buildGitEntriesFor(servers, bundles.path, opts, home, print, printErr);
+    gitBad = git.filter((g) => g.status === "failed" || g.status === "refused").length;
+    gitUnconsented = git.filter((g) => g.status === "needs-consent").length;
+    // Both counts, when a run has both: the consent one names its own remedy.
+    const gitProblems = [
+      ...(gitBad > 0 ? [`${gitBad} git source(s) did not build`] : []),
+      ...(gitUnconsented > 0
+        ? [`${gitUnconsented} git source(s) were not built: their repo's scripts need consent (re-run with --yes)`]
+        : []),
+    ];
+    gitError = gitProblems.length > 0 ? gitProblems.join("; ") : null;
+    if (git.length > 0) {
+      print("Git sources:");
+      for (const g of git) {
+        print(`  ${g.namespace}  ${g.commit ? g.commit.slice(0, 12) : "(no commit)"}  ${g.status}`);
+        if (g.error) for (const l of g.error.split("\n")) print(`    ${l}`);
+      }
+      print();
     }
-    print();
+  } catch (err) {
+    release?.();
+    throw err;
   }
 
   if (specs.length === 0) {
@@ -1084,11 +1112,12 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
   }
 
   // Released on EVERY path out of the install below -- a failed manifest
-  // write, a failed npm, an exception -- via the one `finally`; a lock left
+  // write, a failed npm, an exception -- via this `finally`; a lock left
   // behind would hold the background refresh off this tree for auto-upgrade's
   // whole stale window over a failure that has already been reported. Taken
-  // (or refused) above, before the git build: this `release` is null only on a
-  // git-only config, which took no lock and owns no root.
+  // (or refused) above, before the git build, whose own stretch releases on a
+  // throw (the catch there): this `release` is null only on a git-only config,
+  // which took no lock and owns no root.
   try {
     try {
       await atomicWriteFile(join(root, "package.json"), sidecarsManifest(specs));
@@ -1188,41 +1217,53 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
       namespaces: s.namespaces,
     }));
     const missing = installed.filter((i) => i.version === null);
+    // npm exited 0 but not one requested package resolved in the tree. Decided
+    // BEFORE the closing lines, because they differ: the text report used to
+    // end "These versions are now fixed" on a run that installed nothing and
+    // exits 1, with the failure said only in the --json `error`.
+    const nothingLanded = missing.length === installed.length;
 
     print("Installed:");
     for (const i of installed) print(`  ${i.pkg}  ${i.version ?? "NOT FOUND"}`);
-    if (missing.length > 0) {
+    if (nothingLanded) {
+      print();
+      print("npm exited 0 but none of these packages resolved in the managed tree -- nothing was installed.");
+      print("Servers keep resolving from the npx cache.");
+    } else if (missing.length > 0) {
       print();
       print(`${missing.length} package(s) did not land; those servers keep resolving from the npx cache.`);
     }
-    if (updateError !== null) {
+    if (updateError !== null && !nothingLanded) {
       print();
       print(`npm update failed (exit ${updateCode}). The installed copies are usable, but a server`);
       print('configured "@latest" may still be on the version it was already on.');
     }
-    print();
-    print("These versions are now fixed. Re-run this command to move them forward.");
-    const unhosted = await unhostedReasons(servers, opts, home, bundles);
-    if (unhosted.length > 0) {
+    if (!nothingLanded) {
       print();
-      print("Nothing reads these copies yet:");
+      print("These versions are now fixed. Re-run this command to move them forward.");
+    }
+    const unhosted = await unhostedReasons(servers, opts, home, bundles);
+    // Not on a run that installed nothing: "they still start from these
+    // copies" has no copies to point at. The --json field is filled either way.
+    if (unhosted.length > 0 && !nothingLanded) {
+      print();
+      print("None of these servers will be hosted on oam:");
       for (const reason of unhosted) print(`  ${reason}`);
-      print("Those servers keep resolving through the npx cache; the managed copies are read only");
-      print("on the oam runtime.");
+      print("They still start from these copies: yaw-mcp runs each one with node instead,");
+      print("and falls back to npx only when it cannot.");
     }
 
-    // npm exited 0 but not one requested package resolved in the tree. A
-    // scripted caller has to be able to tell that from a real install, so it
-    // exits non-zero AND fills in `error` -- the field this document exists to
-    // make the single success/failure discriminator. Reporting exit 1 with
-    // `error: null` meant a consumer branching on `error` read it as clean.
-    const nothingLanded = missing.length === installed.length;
+    // Nothing landed (see above). A scripted caller has to be able to tell
+    // that from a real install, so it exits non-zero AND fills in `error` --
+    // the field this document exists to make the single success/failure
+    // discriminator. Reporting exit 1 with `error: null` meant a consumer
+    // branching on `error` read it as clean.
     const error = nothingLanded ? "npm exited 0 but no requested package resolved in the managed tree" : null;
 
     if (opts.json) {
       write(doc({ installed, conflicts, skipped, error, updateError, unhosted, markerError }));
     }
-    return done(nothingLanded ? 1 : 0, installed);
+    return done(nothingLanded ? 1 : 0, installed, updateError);
   } finally {
     release?.();
   }

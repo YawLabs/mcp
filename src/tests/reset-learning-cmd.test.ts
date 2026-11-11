@@ -382,7 +382,9 @@ describe("runResetLearning", () => {
       const io = captureIO();
       await runResetLearning({ home, env: {}, force: true, out: io.push, err: io.pushErr });
       const combined = io.out.join("\n");
-      expect(combined).toContain("running yaw-mcp serve");
+      expect(combined).toContain("running yaw-mcp server process");
+      // There is no `serve` verb; the note must not name one.
+      expect(combined).not.toMatch(/yaw-mcp serve\b/);
       expect(combined).toContain("Restart your MCP client");
       // Counts must still be reported -- the warning is additive.
       expect(combined).toContain("learning entries removed:     1");
@@ -418,6 +420,15 @@ describe("runResetLearning", () => {
     it("is documented in the usage text, not just the success report", () => {
       expect(RESET_LEARNING_USAGE).toContain("Restart your MCP client");
     });
+  });
+
+  it("the usage names every section of the file the delete takes, not only learning", () => {
+    // The file is the whole persisted state. A help text that says only
+    // "learning" hides three deletions from someone reading --help before
+    // running with --force.
+    expect(RESET_LEARNING_USAGE).toMatch(/cached tool list/);
+    expect(RESET_LEARNING_USAGE).toMatch(/pack history/);
+    expect(RESET_LEARNING_USAGE).toMatch(/pre-warm failed/);
   });
 
   it("preserves the state file contents until unlink succeeds (peek then delete ordering)", async () => {

@@ -252,8 +252,13 @@ const ABBREVIATIONS: Readonly<Record<string, readonly string[]>> = {
 };
 
 /** Words the plural / suffix fold below would mangle into a different word
- *  ("news" -> "new", "series" -> "sery"). */
-const STEM_EXCEPTIONS = new Set(["news", "series", "species", "always", "perhaps"]);
+ *  ("news" -> "new", "series" -> "sery"), plus singulars ending in -as whose
+ *  final s is not a plural: left whole they meet their own inflections
+ *  ("aliases" / "aliased" -> "alias"), where the plain -s strip gave "alia".
+ *  Listed by name because -as cannot be protected the way -ss/-us/-is are:
+ *  that would stop "schemas", "quotas" and "replicas" meeting their
+ *  singulars. */
+const STEM_EXCEPTIONS = new Set(["news", "series", "species", "always", "perhaps", "alias", "atlas", "bias", "canvas"]);
 
 const VOWEL = /[aeiouy]/;
 
@@ -284,7 +289,7 @@ function restoreE(stem: string): string {
 }
 
 /** Light suffix fold, a few Porter-style rules rather than a full stemmer:
- *  plurals (ies/sses/xes/ches/shes/s), then -ied/-ing/-ed, then
+ *  plurals (ies/sses/xes/ches/shes/s) and a singular -ie, then -ied/-ing/-ed, then
  *  -ability/-able, then a final -e. The output is a matching key, not a word
  *  ("issue" and "issues" both fold to "issu", "create" / "created" /
  *  "creating" to "creat", "save" / "saved" / "saving" to "save"); it only has
@@ -300,6 +305,9 @@ export function normalizeTerm(token: string): string {
   if (token.length <= 3 || /\d/.test(token) || STEM_EXCEPTIONS.has(token)) return token;
   let s = token;
   if (s.endsWith("ies") && s.length > 4) s = `${s.slice(0, -3)}y`;
+  // A singular in -ie takes the key its plural just got ("cookie" / "cookies"
+  // -> "cooky"); the final-e strip below would leave it at "cooki" instead.
+  else if (s.endsWith("ie") && s.length > 4) s = `${s.slice(0, -2)}y`;
   else if (s.endsWith("sses")) s = s.slice(0, -2);
   else if (/(?:x|z|ch|sh)es$/.test(s)) s = s.slice(0, -2);
   else if (s.endsWith("s") && !/(?:ss|us|is)$/.test(s)) s = s.slice(0, -1);
@@ -315,7 +323,9 @@ export function normalizeTerm(token: string): string {
   }
 
   if (s.endsWith("ability") && s.length >= 9) s = s.slice(0, -7);
-  else if (s.endsWith("able") && s.length >= 7) s = s.slice(0, -4);
+  // Not "disable": there -able is the root, not a suffix, and stripping it
+  // left "dis" while "disabled" / "disabling" fold to "disabl".
+  else if (s.endsWith("able") && s.length >= 7 && s !== "disable") s = s.slice(0, -4);
   if (s.endsWith("e") && s.length >= 5) s = s.slice(0, -1);
   return s.length >= 3 ? s : token;
 }
@@ -863,7 +873,7 @@ function indexFor(servers: RankableServer[]): RankingIndex {
 // an azure tool). Every word here is removed from the query before
 // normalization, by both rankers and by queryCoverage. Closed-class words
 // only: none of these can name a tool, a resource or a domain.
-const QUERY_FUNCTION_WORDS = new Set(
+export const QUERY_FUNCTION_WORDS = new Set(
   (
     "the and for are that this with what which how does did was were have has had our your their its " +
     "from into about can could would should will just any all some when where who why whether then than " +

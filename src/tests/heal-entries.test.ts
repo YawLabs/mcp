@@ -201,12 +201,29 @@ describe("healStaleBrokerEntries -- gate 2 and unreadable configs", () => {
     // oam run <a directory> cannot start the broker any more than a missing
     // path can, but existsSync is true for both -- so this entry used to be
     // declared healthy and left unstartable forever.
-    const dirEntry = join(home, "adirectory");
+    // The directory is created at the entry path ITSELF (it used to be made
+    // only at its "adirectory" ancestor, which left the entry path missing
+    // and this case a second copy of the missing-file one).
+    const dirEntry = join(home, "adirectory", "node_modules", "@yawlabs", "mcp", "dist");
     mkdirSync(dirEntry, { recursive: true });
-    const p = writeCodexConfig(tomlEntry(join(dirEntry, "node_modules", "@yawlabs", "mcp", "dist")));
+    expect(existsSync(dirEntry)).toBe(true);
+    const p = writeCodexConfig(tomlEntry(dirEntry));
     const healed = await heal();
     expect(healed.filter((h) => h.clientId === "codex-cli")).toHaveLength(1);
     expect(readFileSync(p, "utf8")).not.toContain("adirectory");
+  });
+
+  it("does NOT judge a RELATIVE entry path, which resolves against the client's cwd, not ours", async () => {
+    // Gate 1 passes on shape (`/node_modules/@yawlabs/mcp/`), and gate 2's
+    // stat then resolved the path against THIS process's working directory,
+    // where it does not exist -- so a hand-written entry that starts fine from
+    // its client's directory was rewritten.
+    const p = writeCodexConfig(tomlEntry("./node_modules/@yawlabs/mcp/dist/index.js"));
+    const before = readFileSync(p, "utf8");
+    const r = await healResult();
+    expect(r.healed.filter((h) => h.clientId === "codex-cli")).toEqual([]);
+    expect(r.failed).toEqual([]);
+    expect(readFileSync(p, "utf8")).toBe(before);
   });
 
   it("reports a config it could not read into instead of calling it clean", async () => {
@@ -495,6 +512,34 @@ describe("healStaleBrokerEntries -- a client whose one scope is SEVERAL files", 
     writeFileSync(shared, JSON.stringify(CLINE_ENTRY, null, 2));
     const healed = await heal({ os: "linux" });
     expect(healed.filter((h) => h.clientId === "cline").map((h) => h.path)).toEqual([shared]);
+  });
+
+  it("carries the env of a NESTED-transport entry into the rewrite", async () => {
+    // Cline has written `{ transport: { command, args, env } }`. The launch is
+    // read through the row's normalise hook, so the entry is recognised as
+    // ours and broken -- and the env has to be read through the same hook, or
+    // the rewrite drops `transport.env` while re-pointing the launch.
+    const shared = join(home, ".cline", "data", "settings", "cline_mcp_settings.json");
+    mkdirSync(dirname(shared), { recursive: true });
+    writeFileSync(
+      shared,
+      JSON.stringify(
+        {
+          mcpServers: {
+            mcp: {
+              transport: { command: OAM_BIN, args: ["run", "--no-check", DEAD], env: { YAW_MCP_PROFILE: "work" } },
+            },
+          },
+        },
+        null,
+        2,
+      ),
+    );
+    const healed = await heal({ os: "linux" });
+    expect(healed.filter((h) => h.clientId === "cline").map((h) => h.path)).toEqual([shared]);
+    const after = JSON.parse(readFileSync(shared, "utf8")) as { mcpServers: { mcp: Record<string, unknown> } };
+    expect(after.mcpServers.mcp.env).toEqual({ YAW_MCP_PROFILE: "work" });
+    expect(JSON.stringify(after.mcpServers.mcp)).not.toContain("2.1.2");
   });
 
   it("reports a malformed editor copy separately, and still heals the shared file", async () => {

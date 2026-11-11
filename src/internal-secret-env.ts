@@ -4,8 +4,9 @@
 // Dependency-free on purpose. The strip is called at every spawn site in src/
 // -- the broker's upstream spawn (upstream.ts, which pulls in the whole MCP
 // SDK), both self-upgrade paths (auto-upgrade.ts, upgrade-cmd.ts), the sidecar
-// npm run (sidecars-cmd.ts), the compliance suite (compliance-cmd.ts), the
-// oam and uv probes (oam-spawn.ts, uv-bootstrap.ts) and the browser launcher
+// npm run (sidecars-cmd.ts), the git child behind git sources (git-source.ts),
+// the compliance suite (compliance-cmd.ts), the oam and uv probes
+// (oam-spawn.ts, uv-bootstrap.ts) and the browser launcher
 // (secret-entry-page.ts) -- and those have very different import budgets: the
 // `yaw-mcp upgrade` CLI should not have to load the SDK to print a command.
 // src/tests/internal-secret-env.test.ts scans for a spawn that forgets it.
