@@ -36,6 +36,7 @@ const { gitAvailable } = await import("../git-source.js");
 const { CONFIG_DIRNAME, gitBuildDir, gitFailedPath, gitRoot } = await import("../paths.js");
 const { TRUST_BYPASS_ENV } = await import("../trust.js");
 const { fakeFinishedBuild } = await import("./git-fixture.js");
+const { stateEntry } = await import("../update-cmd.js");
 
 const OK = "1111111111111111111111111111111111111111";
 const BEHIND = "4b77e0d000000000000000000000000000000000";
@@ -261,6 +262,34 @@ describe("doctor git sources", () => {
     });
     const parsed = JSON.parse((await doctor(true)).text);
     expect(parsed.oamRuntime.git.map((g: { remote: unknown }) => g.remote)).toEqual([null, null]);
+  });
+
+  it("matches a check recorded by update for a url with a port and an @ later in its path", async () => {
+    // update's state row runs the url through the single-url scrubber; the
+    // free-text one turned `https://git.corp:8443/@team/...` into
+    // `https://***@team/...`, which normalizes to another host, so doctor
+    // dropped the recorded check.
+    const url = "https://git.corp:8443/@team/mcp.git";
+    writeBundles([entry("acme_port", { url, ref: "main", commit: OK })]);
+    writeMarker("acme_port", OK, { url });
+    const row = stateEntry(
+      { namespace: "acme_port", git: { url, ref: "main", commit: OK, entry: "dist/index.js" }, args: [], env: {} },
+      "main",
+      "branch",
+      BEHIND,
+      [],
+      () => new Date(TWO_HOURS_AGO),
+    );
+    expect(row.url).toBe(url);
+    writeState({ acme_port: row });
+    const parsed = JSON.parse((await doctor(true)).text);
+    expect(parsed.oamRuntime.git[0].remote).toEqual({
+      checkedAt: TWO_HOURS_AGO,
+      kind: "branch",
+      commit: BEHIND,
+      behind: true,
+      newerTags: [],
+    });
   });
 
   it("an up-to-date, matching build adds no warning and exits 0", async () => {

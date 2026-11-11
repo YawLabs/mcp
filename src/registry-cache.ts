@@ -24,6 +24,14 @@
 // YAW_MCP_READONLY_DIAGNOSTICS, whose contract is that the diagnostic
 // commands write nothing (see READONLY_DIAGNOSTICS_ENV in config-loader.ts).
 //
+// YAW_MCP_DISABLE_PERSISTENCE (isPersistenceDisabled, persistence.ts) turns the
+// cache off entirely: the file is neither read nor written and every call
+// fetches, exactly as before the cache existed. A flag that promises no state
+// kept on disk between runs cannot leave a day-long answer behind, and a run
+// under it must not be answered from a file an earlier run left. `opts.env`
+// lets a caller with an injected environment (such as doctor's `opts.env`)
+// pass it; unset, the predicate reads process.env.
+//
 // Writes are serialized within the process (doctor probes its sidecars in
 // parallel), and each write re-reads the file before merging, so concurrent
 // probes in one run do not drop each other's entries. Two PROCESSES writing at
@@ -33,6 +41,7 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { atomicWriteFile } from "./atomic-write.js";
 import { userConfigDir } from "./paths.js";
+import { isPersistenceDisabled } from "./persistence.js";
 
 /** Basename of the cache file inside `~/.yaw-mcp/`. */
 export const REGISTRY_CACHE_FILENAME = "registry-cache.json";
@@ -63,6 +72,9 @@ export interface RegistryCacheOptions {
   now: () => number;
   /** false: read the cache and fetch on a miss, but write nothing. */
   write: boolean;
+  /** Environment checked for YAW_MCP_DISABLE_PERSISTENCE; when set there the
+   *  cache is bypassed (no read, no write). Defaults to process.env. */
+  env?: NodeJS.ProcessEnv;
 }
 
 interface CacheEntry {
@@ -137,13 +149,22 @@ function recordLatest(path: string, pkg: string, latest: string, now: number): P
  * The latest version of `pkg`: from the cache when a fresh entry is there
  * (no network at all), otherwise from `fetchLatest`, whose non-null answer is
  * then stored unless `opts.write` is false. A rejecting `fetchLatest` reads
- * as null ("unknown"), the same as every other probe failure.
+ * as null ("unknown"), the same as every other probe failure. Under
+ * YAW_MCP_DISABLE_PERSISTENCE the cache file is not touched at all and
+ * `fetchLatest` always runs.
  */
 export async function cachedRegistryLatest(
   pkg: string,
   fetchLatest: () => Promise<string | null>,
   opts: RegistryCacheOptions,
 ): Promise<string | null> {
+  if (isPersistenceDisabled(opts.env)) {
+    try {
+      return await fetchLatest();
+    } catch {
+      return null;
+    }
+  }
   const path = registryCachePath(opts.home);
   const now = opts.now();
   const hit = (await readEntries(path)).get(pkg);

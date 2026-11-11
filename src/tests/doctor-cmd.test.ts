@@ -1607,6 +1607,29 @@ describe("runDoctor — registry cache", () => {
       expect(readFileSync(cacheFile(), "utf8")).toBe(before);
     });
   });
+
+  // The flag is read from the env doctor was GIVEN (opts.env), not
+  // process.env, which does not carry it here: both cases go red if
+  // registryCacheFor stops passing `env` through.
+  describe("under YAW_MCP_DISABLE_PERSISTENCE in opts.env", () => {
+    const NO_PERSIST_ENV = { YAW_MCP_DISABLE_PERSISTENCE: "1" };
+
+    it("ignores a fresh entry and leaves it byte-identical", async () => {
+      seedCache({ "@yawlabs/mcp": { latest: "0.41.0", at: fixedNow - HOUR } });
+      const before = readFileSync(cacheFile(), "utf8");
+      const probe = countingFetch("0.45.0");
+      expect(await runText(probe.fetch, NO_PERSIST_ENV)).toContain("npm latest is 0.45.0");
+      expect(probe.calls).toHaveLength(1);
+      expect(readFileSync(cacheFile(), "utf8")).toBe(before);
+    });
+
+    it("writes no cache file on a miss", async () => {
+      const probe = countingFetch("0.45.0");
+      expect(await runText(probe.fetch, NO_PERSIST_ENV)).toContain("npm latest is 0.45.0");
+      expect(probe.calls).toHaveLength(1);
+      expect(existsSync(cacheFile())).toBe(false);
+    });
+  });
 });
 
 describe("runDoctor — --json", () => {

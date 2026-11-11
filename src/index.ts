@@ -662,7 +662,8 @@ if (subcommand === "compliance") {
                                context and apply config.json allow/block
                                lists. Default: such candidates are skipped
                                with a warning.
-    YAW_MCP_DISABLE_PERSISTENCE   Disable cross-session learning state.
+    YAW_MCP_DISABLE_PERSISTENCE   Disable cross-session state (learning, pack
+                               history, doctor's registry cache).
     YAW_MCP_FOUNDRY               Set to \`1\` to OPT IN to harvesting dispatch
                                traces to ~/.yaw-mcp/foundry.jsonl for routing
                                evals (default: off). Only a redacted, SORTED

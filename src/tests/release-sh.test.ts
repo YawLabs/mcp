@@ -228,6 +228,16 @@ const STUB_HELPERS = [
   'fail() { echo "FAIL $1"; exit 1; }',
 ].join("\n");
 
+/**
+ * Git for Windows' gawk reads files in text mode and drops the CR of a CRLF
+ * line before a rule sees it (measured: `printf 'ab\r\n'` reads as length 2),
+ * so a CRLF test passes there whether or not the script strips the CR. Every
+ * other awk keeps it. BINMODE=3 makes gawk on Windows keep it too, as the awk
+ * on a Linux or macOS release host does; elsewhere it is just an unused
+ * variable. Prepend this to a harness that tests CRLF handling.
+ */
+const CR_KEEPING_AWK = 'awk() { command awk -v BINMODE=3 "$@"; }';
+
 // ---------------------------------------------------------------------------
 // FIXTURE RUN
 // ---------------------------------------------------------------------------
@@ -2329,19 +2339,118 @@ describe("release.sh changelog retitle", () => {
     expect(r.after).toBe(text);
   });
 
-  // Step 3's block, in a repo, so the tag check is real.
-  function step3(opts: { changelog: string; tag: boolean }): RunResult & { after: string } {
+  it("finds a bare version heading in a CRLF changelog, and reads that section's notes", () => {
+    // The awk helpers compared `$0 == "## 1.2.0"` exactly, and on a CRLF file
+    // awk sees `## 1.2.0\r`: the heading read as absent, so the notes body
+    // fell back to the (empty) Unreleased section.
+    const dir = newTmp("release-crlf-helpers-");
+    writeFileSync(
+      join(dir, "CHANGELOG.md"),
+      "# Changelog\r\n\r\n## Unreleased\r\n\r\n## 1.2.0\r\n\r\nThe notes.\r\n\r\n## 1.1.0\r\n\r\nOld.\r\n",
+    );
+    const r = runBash(
+      [
+        CR_KEEPING_AWK,
+        helpers,
+        'changelog_version_heading 1.2.0; echo "HEADING=$?"',
+        "echo \"BODY=[$(changelog_notes_body 1.2.0 | tr '\\n' '|')]\"",
+      ].join("\n"),
+      dir,
+    );
+    expect(r.out).toContain("HEADING=0");
+    expect(r.out).toContain("BODY=[|The notes.||]");
+  });
+
+  it("reads a CRLF Unreleased section without its carriage returns", () => {
+    const dir = newTmp("release-crlf-unreleased-");
+    writeFileSync(
+      join(dir, "CHANGELOG.md"),
+      "# Changelog\r\n\r\n## Unreleased\r\n\r\nThe notes.\r\n\r\n## 1.1.0\r\n\r\nOld.\r\n",
+    );
+    const r = runBash(
+      [CR_KEEPING_AWK, helpers, "echo \"BODY=[$(changelog_notes_body 1.2.0 | tr '\\n' '|')]\""].join("\n"),
+      dir,
+    );
+    expect(r.out).toContain("BODY=[|The notes.||]");
+  });
+
+  // Step 3's block, in a repo, so the tag check is real. `pkg` commits a
+  // package.json at that version in the base commit, titled `subject` (default
+  // "base"; "v1.2.0" is this script's own bump commit); `onTop` adds an
+  // unrelated commit after it; `pkgDirty` then rewrites package.json
+  // uncommitted (the bump is not).
+  function step3(opts: {
+    changelog: string;
+    tag: boolean;
+    pkg?: string;
+    subject?: string;
+    onTop?: boolean;
+    pkgDirty?: string;
+  }): RunResult & { after: string } {
     const repo = newTmp("release-retitle-step3-");
     git(repo, ["init", "-q", "-b", "main"]);
     writeFileSync(join(repo, "CHANGELOG.md"), opts.changelog);
     git(repo, ["add", "CHANGELOG.md"]);
-    git(repo, ["commit", "-q", "-m", "base"]);
+    if (opts.pkg !== undefined) {
+      writeFileSync(join(repo, "package.json"), `${JSON.stringify({ version: opts.pkg })}\n`);
+      git(repo, ["add", "package.json"]);
+    }
+    git(repo, ["commit", "-q", "-m", opts.subject ?? "base"]);
+    if (opts.onTop) {
+      writeFileSync(join(repo, "other.txt"), "x\n");
+      git(repo, ["add", "other.txt"]);
+      git(repo, ["commit", "-q", "-m", "docs: unrelated"]);
+    }
+    if (opts.pkgDirty !== undefined) {
+      writeFileSync(join(repo, "package.json"), `${JSON.stringify({ version: opts.pkgDirty })}\n`);
+    }
     if (opts.tag) {
       git(repo, ["tag", "-a", "v1.2.0", "-m", "v1.2.0"]);
     }
     const r = runOutside(repo, [STUB_HELPERS, helpers, 'VERSION="1.2.0"', retitle, 'echo "CONTINUED"'].join("\n"));
     return { ...r, after: readFileSync(join(repo, "CHANGELOG.md"), "utf8") };
   }
+
+  it("step 3 does not retitle when the bump commit is already made with no tag, since that would be a second commit", () => {
+    // A `v1.2.0` bump commit from a release.sh that predates the retitle:
+    // HEAD's package.json reads the version, CHANGELOG.md still says
+    // Unreleased. Also with a commit on top of it.
+    const text = "# Changelog\n\n## Unreleased -- s\n\nThe notes.\n";
+    const warning =
+      "WARN CHANGELOG.md has no ## 1.2.0 heading, but the v1.2.0 bump commit is already made (HEAD's package.json reads 1.2.0) -- not retitling";
+    for (const onTop of [false, true]) {
+      const r = step3({ changelog: text, tag: false, pkg: "1.2.0", subject: "v1.2.0", onTop });
+      expect(r.out).toContain(warning);
+      expect(r.out).toContain("CONTINUED");
+      expect(r.after).toBe(text);
+    }
+  });
+
+  it("step 3 still retitles when package.json is bumped but not committed, or committed at another version", () => {
+    const text = "# Changelog\n\n## Unreleased -- s\n\nThe notes.\n";
+    const retitled = "# Changelog\n\n## Unreleased\n\n## 1.2.0 -- s\n\nThe notes.\n";
+    const uncommitted = step3({ changelog: text, tag: false, pkg: "1.1.0", pkgDirty: "1.2.0" });
+    expect(uncommitted.out).toContain("INFO CHANGELOG.md: ## Unreleased retitled ## 1.2.0");
+    expect(uncommitted.after).toBe(retitled);
+    const other = step3({ changelog: text, tag: false, pkg: "1.1.0", subject: "v1.1.0" });
+    expect(other.out).toContain("INFO CHANGELOG.md: ## Unreleased retitled ## 1.2.0");
+    expect(other.after).toBe(retitled);
+    // A `v1.2.0` subject over a package.json at 1.1.0: only HEAD's version
+    // compare tells this apart from the bump commit.
+    const subjectOnly = step3({ changelog: text, tag: false, pkg: "1.1.0", subject: "v1.2.0" });
+    expect(subjectOnly.out).toContain("INFO CHANGELOG.md: ## Unreleased retitled ## 1.2.0");
+    expect(subjectOnly.after).toBe(retitled);
+  });
+
+  it("step 3 still retitles a bump committed under another subject, such as a merged release PR", () => {
+    // No `v1.2.0` commit exists yet, so the retitle's commit is the release's
+    // only one: skipping it would tag a CHANGELOG.md still headed Unreleased.
+    const text = "# Changelog\n\n## Unreleased -- s\n\nThe notes.\n";
+    const r = step3({ changelog: text, tag: false, pkg: "1.2.0", subject: "chore: release 1.2.0" });
+    expect(r.out).toContain("INFO CHANGELOG.md: ## Unreleased retitled ## 1.2.0");
+    expect(r.out).not.toContain("not retitling");
+    expect(r.after).toBe("# Changelog\n\n## Unreleased\n\n## 1.2.0 -- s\n\nThe notes.\n");
+  });
 
   it("step 3 retitles when there is no version heading and no tag", () => {
     const r = step3({ changelog: "# Changelog\n\n## Unreleased -- s\n\nThe notes.\n", tag: false });
@@ -2401,9 +2510,18 @@ describe("release.sh behaviour-change gate (fixture run)", () => {
     "",
   ].join("\n");
 
-  function run(answers: string[], changelog = CHANGELOG): RunResult {
+  function run(answers: string[], changelog = CHANGELOG, prelude = ""): RunResult {
     writeFileSync(join(dir, "CHANGELOG.md"), changelog);
-    const body = [STUB_HELPERS, helpers, 'VERSION="0.81.0"', "CYAN=''", "NC=''", block, 'echo "CONTINUED"'].join("\n");
+    const body = [
+      prelude,
+      STUB_HELPERS,
+      helpers,
+      'VERSION="0.81.0"',
+      "CYAN=''",
+      "NC=''",
+      block,
+      'echo "CONTINUED"',
+    ].join("\n");
     const file = join(dir, "behaviour-harness.sh");
     writeFileSync(file, body);
     const r = spawnSync("bash", [file], {
@@ -2507,6 +2625,16 @@ describe("release.sh behaviour-change gate (fixture run)", () => {
     const other = run(["y", "YAW_MCP_NEW_THING"], RETITLED.replace("## 0.81.0 --", "## 0.81.01 --"));
     expect(other.out).toContain("does not appear in CHANGELOG.md's Unreleased section");
     expect(other.status).toBe(1);
+  });
+
+  it("reads a bare version heading's section in a CRLF changelog", () => {
+    // A bare `## 0.81.0` (no ` -- summary`) on CRLF was `## 0.81.0\r` to the
+    // awk helpers, so the gate read the empty Unreleased section instead.
+    const crlf = RETITLED.replace("## 0.81.0 -- something", "## 0.81.0").split("\n").join("\r\n");
+    const r = run(["y", "YAW_MCP_NEW_THING"], crlf, CR_KEEPING_AWK);
+    expect(r.out).toContain("found in the ## 0.81.0 section");
+    expect(r.out).toContain("CONTINUED");
+    expect(r.status).toBe(0);
   });
 
   it("refuses a blank switch", () => {
@@ -3518,6 +3646,24 @@ describe("release.sh oam floor gate (stubbed full run)", () => {
     expect(git(f.bare, ["tag", "-l"]).trim()).toBe("");
   });
 
+  it("refuses an empty Unreleased section in the pre-flight when the bump was merged under another subject", () => {
+    // A merged release PR: package.json already reads 1.0.2 at HEAD, but the
+    // commit is not this script's `v1.0.2`, so step 3 would retitle it and
+    // the pre-flight still has to check the notes.
+    const f = setup();
+    const pkg = JSON.parse(readFileSync(join(f.work, "package.json"), "utf8"));
+    writeFileSync(join(f.work, "package.json"), `${JSON.stringify({ ...pkg, version: "1.0.2" }, null, 2)}\n`);
+    writeFileSync(join(f.work, "CHANGELOG.md"), "# Changelog\n\n## Unreleased -- things\n\n## 1.0.1\n\nOld.\n");
+    git(f.work, ["commit", "-q", "-am", "chore: release 1.0.2"]);
+    git(f.work, ["push", "-q", "origin", "main"]);
+    const r = release(f);
+    expect(r.out).toContain("CHANGELOG.md's Unreleased section is empty");
+    expect(r.status).toBe(1);
+    expect(npmLog(f)).not.toContain("npm run lint");
+    expect(subjects(f.bare, "main")).toEqual(["chore: release 1.0.2", "fixture"]);
+    expect(git(f.bare, ["tag", "-l"]).trim()).toBe("");
+  });
+
   it("resumes a run that died after the retitle and before the commit, in one bump commit", () => {
     // The tree a run killed between step 3's retitle and its commit leaves:
     // package.json, server.json and CHANGELOG.md all rewritten, none committed.
@@ -3556,6 +3702,34 @@ describe("release.sh oam floor gate (stubbed full run)", () => {
     expect(r.out).toContain("CHANGELOG.md");
     expect(r.status).toBe(1);
     expect(git(f.bare, ["tag", "-l"]).trim()).toBe("");
+  });
+
+  it("resumes a bump commit made by a release.sh that did not retitle without making a second v<version> commit", () => {
+    // An older release.sh committed `v1.0.2` (package.json + server.json only)
+    // and died before tagging; CHANGELOG.md still heads the notes Unreleased.
+    // Step 3 used to retitle here and commit a SECOND `v1.0.2` on top of the
+    // first, then tag that. It warns instead, and tags the one bump commit.
+    const f = setup();
+    const pkg = JSON.parse(readFileSync(join(f.work, "package.json"), "utf8"));
+    writeFileSync(join(f.work, "package.json"), `${JSON.stringify({ ...pkg, version: "1.0.2" }, null, 2)}\n`);
+    const server = JSON.parse(readFileSync(join(f.work, "server.json"), "utf8"));
+    writeFileSync(
+      join(f.work, "server.json"),
+      `${JSON.stringify({ ...server, version: "1.0.2", packages: [{ version: "1.0.2" }] }, null, 2)}\n`,
+    );
+    git(f.work, ["commit", "-q", "-am", "v1.0.2"]);
+    const r = release(f);
+    expect(r.out).toContain(
+      "CHANGELOG.md has no ## 1.0.2 heading, but the v1.0.2 bump commit is already made (HEAD's package.json reads 1.0.2) -- not retitling",
+    );
+    expect(r.out).not.toContain("the Unreleased section will be headed ## 1.0.2 in the bump commit");
+    expect(r.out).toContain("v1.0.2 released to npm + MCP registry.");
+    expect(r.status).toBe(0);
+    expect(subjects(f.bare, "main")).toEqual(["v1.0.2", "fixture"]);
+    expect(git(f.bare, ["show", "v1.0.2:CHANGELOG.md"])).toBe(
+      "# Changelog\n\n## Unreleased -- things\n\nA paragraph.\n",
+    );
+    expect(git(f.work, ["status", "--porcelain"]).trim()).toBe("");
   });
 
   it("waits out npm's lag and the registry's, then publishes in the same run", () => {

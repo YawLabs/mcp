@@ -89,8 +89,10 @@
 //     unless a yaw-mcp bin shim sits in the prefix root (see
 //     defaultConfirmGlobalPrefix): a project directory with that name would
 //     otherwise receive a `-g --prefix` install. A real global prefix of that
-//     name whose shim is missing is logged and skipped; `yaw-mcp upgrade`
-//     refuses the same prefix and explains the choice and the manual remedies.
+//     name whose shim is missing is skipped, and the log line says the copy
+//     was not updated and gives the two manual remedies (prefixRefusedRemedies).
+//     `yaw-mcp upgrade` refuses the same prefix too -- it does not update that
+//     copy either -- and prints the same remedies.
 //
 // Opt-out: set YAW_MCP_AUTO_UPGRADE=0 (or =false) to suppress the check
 // entirely -- useful for pinned-version setups, sudo-installed globals
@@ -182,6 +184,28 @@ export function quoteArgForDisplay(arg: string, platform: NodeJS.Platform = proc
   // too eagerly is harmless; under-quoting silently splits the paste.
   if (/^[A-Za-z0-9_\-./+,:@=]+$/.test(arg)) return arg;
   return `'${arg.replace(/'/g, "'\\''")}'`;
+}
+
+/** Why a name-only `npm` / `bin` prefix was refused (see
+ *  defaultConfirmGlobalPrefix), as one clause. Shared with `yaw-mcp upgrade`'s
+ *  prefix-refused note so the background log and the CLI explain the refusal
+ *  in the same words. */
+export const PREFIX_REFUSED_REASON =
+  "this copy sits under a directory named `npm` or `bin` with no yaw-mcp bin shim beside it, so it may be a project tree rather than a global npm prefix";
+
+/** The two manual remedies for a copy whose prefix was refused: which one
+ *  applies only the user knows (is `dir` a global prefix or a project?), so
+ *  both are given, pointed at the refused directory. Neither the background
+ *  upgrader nor `yaw-mcp upgrade` will run either one: the plain
+ *  `npm install -g` the CLI falls back to installs into npm's own global
+ *  prefix and does not update the copy under `dir`. Shared by both callers so
+ *  the advice cannot drift. */
+export function prefixRefusedRemedies(dir: string, platform: NodeJS.Platform = process.platform): string {
+  const shownDir = quoteArgForDisplay(dir, platform) ?? dir;
+  return (
+    `If that directory really is a global npm prefix, run \`npm install -g --prefix ${shownDir} @yawlabs/mcp@latest\` instead; ` +
+    `if it is a project, run \`npm install @yawlabs/mcp@latest\` in its project root (${dir}).`
+  );
 }
 
 /** Resolve the global install prefix of the CURRENTLY running yaw-mcp from the
@@ -991,11 +1015,14 @@ export async function maybeAutoUpgrade(deps: AutoUpgradeDeps = {}): Promise<void
   // markers exist to rule out. Nobody is asked before this spawn, so for those
   // two markers a second signal is required: the bin shim npm writes into the
   // prefix root of a real `<prefix>/node_modules` global. A project tree keeps
-  // its shims in node_modules/.bin instead. Without it, say so and stop.
+  // its shims in node_modules/.bin instead. Without it, say so and stop --
+  // and give the manual remedies here rather than pointing at `yaw-mcp
+  // upgrade`, whose printed command (plain `npm install -g`) does not update
+  // this copy either.
   if (rawPrefix !== null && !(deps.confirmGlobalPrefixImpl ?? defaultConfirmGlobalPrefix)(argvPath, rawPrefix)) {
     log(
       "info",
-      "yaw-mcp is out of date; not upgrading in the background because this copy sits under a directory named `npm` or `bin` with no yaw-mcp bin shim beside it, which may be a project tree rather than a global npm prefix -- run `yaw-mcp upgrade` to see why and how to update this copy by hand",
+      `yaw-mcp is out of date; not upgrading in the background: ${PREFIX_REFUSED_REASON}. The copy at ${rawPrefix} was not updated. ${prefixRefusedRemedies(rawPrefix)}`,
       { current, latest, method, prefix: rawPrefix },
     );
     return;

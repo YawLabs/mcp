@@ -12,14 +12,17 @@
 //
 // A failed build changes nothing: the pin stays, the old build keeps running,
 // and the command exits 1. So does a build that finishes but then fails its
-// start check (the one real handshake): bundles.json is not touched (no
-// commit, ref or token change is written), the entry reports
-// `status: "failed"` with `started: false` and the reason, and the command
-// exits 1 with `ok: false`. On a move to a new commit the previous build stays
-// pinned and on disk, and the new build is left on disk unpinned (the next GC
-// takes it), so a re-run once the cause is fixed reuses it. When the commit
-// does not move (only --ref or --git-token-secret changed) the build that
-// failed is the pinned build itself, and only that change is refused.
+// start check (the one real handshake): the entry reports `status: "failed"`
+// with `started: false` and the reason, and the command exits 1 with
+// `ok: false`. On a move to a new commit bundles.json is not touched (no
+// commit, ref or token change is written): the previous build stays pinned
+// and on disk, and the new build is left on disk unpinned (the next GC takes
+// it), so a re-run once the cause is fixed reuses it. When the commit does not
+// move (only --ref or --git-token-secret changed) the build that failed is the
+// pinned build itself, so the server is already broken and refusing the
+// change would protect nothing: the ref / token change IS written, the entry's
+// `to` is that unmoved commit, and its error says the change was written and
+// the pinned build does not start.
 // --no-start-check runs no check, so there is nothing to fail. Ctrl+C at a
 // repo's script-consent prompt stops the run with exit 130.
 // Only `git.commit` (and `ref` / `tokenSecret` when
@@ -60,7 +63,7 @@ import {
   readGitState,
   recordGitPin,
   resolveRefIn,
-  scrubUrlUserinfo,
+  scrubRepoUrlUserinfo,
   writeGitState,
 } from "./git-source.js";
 import { defaultStartCheck, startFailureTail } from "./local-add-cmd.js";
@@ -106,11 +109,13 @@ export const UPDATE_USAGE = `Usage: yaw-mcp update [<name>] [--check] [--ref <re
                     until the repo is allowed here. Ctrl+C at that question
                     stops the run (exit 130).
   --no-start-check  Skip the one real handshake after the build. Without this
-                    flag a build that fails the handshake changes nothing in
-                    bundles.json (no new commit, --ref or token is written),
-                    the output says why it did not start, and the exit code
-                    is 1. On a move to a new commit the previous build stays
-                    pinned.
+                    flag a build that fails the handshake is reported with
+                    why it did not start, and the exit code is 1. On a move
+                    to a new commit nothing in bundles.json changes (no new
+                    commit, --ref or token is written) and the previous build
+                    stays pinned. When the commit does not move, the build
+                    that failed is the one already pinned: a --ref or token
+                    change is still written, and the output says so.
   --json            Print a JSON document.`;
 
 export interface UpdateCommandOptions {
@@ -468,7 +473,9 @@ export async function runUpdate(opts: UpdateCommandOptions = {}): Promise<{ exit
       reports.push({ ...base, status, error });
       printErr(`yaw-mcp update: ${e.namespace}: ${error}`);
     };
-    const writePin = async (patch: GitPinPatch): Promise<boolean> => {
+    // `onFail` replaces the default failure entry when the caller has a truer
+    // one to push (the same-commit start-check failure below).
+    const writePin = async (patch: GitPinPatch, onFail?: (message: string) => void): Promise<boolean> => {
       try {
         const w = await updateGitPin(e.namespace, e.git.commit, patch, {
           home,
@@ -478,7 +485,8 @@ export async function runUpdate(opts: UpdateCommandOptions = {}): Promise<{ exit
         return true;
       } catch (x) {
         // updateGitPin writes nothing when it throws.
-        failed(`${(x as Error).message}\nThe pin did not move.`);
+        if (onFail) onFail((x as Error).message);
+        else failed(`${(x as Error).message}\nThe pin did not move.`);
         return false;
       }
     };
@@ -623,36 +631,86 @@ export async function runUpdate(opts: UpdateCommandOptions = {}): Promise<{ exit
     const started = opts.noStartCheck ? null : await startCheck(e, build, opts);
     if (started) progress(`  Checking it starts ... ${started.ok ? `ok -- ${started.tools} tools` : "failed"}`);
     if (started && !started.ok) {
-      // The build finished but does not start. Not one byte of bundles.json
-      // is written -- no commit, and no ref or token change either, since they
-      // are part of the same update -- and nothing is collected. Three cases:
-      //  - a real move (a new commit over a pinned one): the pinned build
+      // The build finished but does not start. Nothing is collected. Three
+      // cases:
+      //  - a real move (a new commit over a pinned one): not one byte of
+      //    bundles.json is written -- no commit, and no ref or token change
+      //    either, since they are part of the same update. The pinned build
       //    stays, and the new build stays on disk unpinned for a re-run to
       //    reuse once the cause is fixed (the next GC removes it otherwise);
       //  - the same commit under a new --ref or --git-token-secret: the build
-      //    that failed IS the pinned one, so nothing "keeps running" -- only
-      //    the ref or token change is refused;
-      //  - an entry with no commit pinned: there is no previous build.
+      //    that failed IS the pinned one, so the server is already broken and
+      //    refusing the change protects nothing (a token only authenticates
+      //    the clone). The ref / token change is written as asked, the pin
+      //    stays where it was, and the entry still fails (exit 1, ok: false)
+      //    because the server does not start. If that write itself fails, the
+      //    entry says so, keeps the old ref, and still reports the check;
+      //  - an entry with no commit pinned: there is no previous build, and
+      //    bundles.json is not written.
       // buildGitSource recorded this file in refs.json as using the new build:
       // put the record back on the pin the file still holds, or drop it when
       // the file pins no commit, so GC does not keep a build nothing pins.
       if (e.git.commit) await recordGitPin(e.namespace, file.path, e.git.commit, home, warn);
       else await forgetGitPin(e.namespace, file.path, build.commit, home, warn);
       const startError = startFailureTail(started.error, prepared.secrets);
+      if (e.git.commit && build.commit === e.git.commit) {
+        // Same commit: the failed build is the pinned one. Write the ref /
+        // token change anyway. A write that fails still reports the start
+        // check that ran, with the ref the file still holds.
+        const changed = refChanged || tokenChanged;
+        // Only builds `--to` accepts: rollBack refuses one made from another
+        // repository URL.
+        const others = keptBuilds(e.namespace, home)
+          .filter((k) => normalizeRepoUrl(k.marker.url) === normalizeRepoUrl(e.git.url))
+          .map((k) => k.marker.commit)
+          .filter((c) => c !== build.commit);
+        const project = file.configDir !== undefined ? " --project" : "";
+        const back =
+          others.length > 0
+            ? `, or go back to a build kept on this machine: yaw-mcp update ${e.namespace} --to <sha>${project} (kept: ${others.map(sha7).join(", ")})`
+            : "";
+        const head = `the pinned build ${sha7(build.commit)} itself does not start: ${startError}\n`;
+        // `from` is the entry the file holds after this branch: `base` (the
+        // old ref, with no kind or newerTags worked out for it) when the write
+        // failed, `report` (the new ref and its metadata) otherwise.
+        const report1 = (from: UpdateReport, message: string): void => {
+          const error = asciiLines(message);
+          reports.push({ ...from, to: build.commit, status: "failed", error, started: false, startError });
+          printErr(`yaw-mcp update: ${e.namespace}: ${error}`);
+        };
+        const patch = { ...(refChanged ? { ref: resolved.ref } : {}), ...tokenPatch };
+        let writeError: string | null = null;
+        if (changed && !(await writePin(patch, (m) => (writeError = m)))) {
+          report1(
+            base,
+            `${head}The ${refChanged && tokenChanged ? "ref and token changes" : refChanged ? "ref change" : "token change"} could NOT be written to bundles.json: ${writeError}\nNothing was changed, and "${e.namespace}" still does not start. Fix the cause${back}.`,
+          );
+          continue;
+        }
+        const written = [
+          ...(refChanged ? [`"${e.namespace}" now tracks ${resolved.ref}`] : []),
+          ...(tokenChanged ? [`it authenticates with vault secret ${opts.gitTokenSecret}`] : []),
+        ].join(", and ");
+        report1(
+          report,
+          head +
+            (changed
+              ? `The change was written to bundles.json anyway (${written}); the commit did not move, so "${e.namespace}" still does not start.`
+              : `Nothing was written to bundles.json; "${e.namespace}" still does not start.`) +
+            ` Fix the cause${back}.`,
+        );
+        continue;
+      }
       const rerun = [
         `yaw-mcp update ${e.namespace}`,
         ...(refChanged ? [`--ref ${resolved.ref}`] : []),
         ...(tokenChanged ? [`--git-token-secret ${opts.gitTokenSecret}`] : []),
         ...(file.configDir !== undefined ? ["--project"] : []),
       ].join(" ");
-      const changes = [...(refChanged ? ["--ref"] : []), ...(tokenChanged ? ["--git-token-secret"] : [])].join(" and ");
-      const samePin = !!e.git.commit && build.commit === e.git.commit;
       const error = asciiLines(
-        samePin
-          ? `the pinned build ${sha7(build.commit)} itself did not start: ${startError}\nThe ${changes || "update"} change was not written to bundles.json. Fix the cause and run ${rerun} again, or write it without the check: ${rerun} --no-start-check`
-          : e.git.commit
-            ? `${sha7(build.commit)} built but did not start: ${startError}\nNothing was changed: "${e.namespace}" stays on ${sha7(e.git.commit)}, which keeps running. Fix the cause and run ${rerun} again (the new build stays on disk until the next cleanup, so a re-run of the same commit does not rebuild it), or pin it without the check: ${rerun} --no-start-check`
-            : `${sha7(build.commit)} built but did not start: ${startError}\nNothing was changed: "${e.namespace}" has no commit pinned, and bundles.json was not written. Fix the cause and run ${rerun} again (the new build stays on disk until the next cleanup, so a re-run of the same commit does not rebuild it), or pin it without the check: ${rerun} --no-start-check`,
+        e.git.commit
+          ? `${sha7(build.commit)} built but did not start: ${startError}\nNothing was changed: "${e.namespace}" stays on ${sha7(e.git.commit)}, which keeps running. Fix the cause and run ${rerun} again (the new build stays on disk until the next cleanup, so a re-run of the same commit does not rebuild it), or pin it without the check: ${rerun} --no-start-check`
+          : `${sha7(build.commit)} built but did not start: ${startError}\nNothing was changed: "${e.namespace}" has no commit pinned, and bundles.json was not written. Fix the cause and run ${rerun} again (the new build stays on disk until the next cleanup, so a re-run of the same commit does not rebuild it), or pin it without the check: ${rerun} --no-start-check`,
       );
       reports.push({ ...report, status: "failed", commits: build.ahead ?? null, error, started: false, startError });
       printErr(`yaw-mcp update: ${e.namespace}: ${error}`);
@@ -719,7 +777,11 @@ export async function runUpdate(opts: UpdateCommandOptions = {}): Promise<{ exit
   return { exitCode: bad ? 1 : 0 };
 }
 
-function stateEntry(
+/** The git/state.json row for one entry. Its `url` is the entry's url with
+ *  only the credential replaced (scrubRepoUrlUserinfo), so doctor's and
+ *  share's normalizeRepoUrl comparisons still see the same host. Exported
+ *  for tests. */
+export function stateEntry(
   e: RawGitEntry,
   ref: string | null,
   kind: GitRefKind | null,
@@ -728,7 +790,7 @@ function stateEntry(
   now: () => Date,
 ): GitStateEntry {
   return {
-    url: scrubUrlUserinfo(e.git.url),
+    url: scrubRepoUrlUserinfo(e.git.url),
     ref: ref ?? e.git.ref ?? null,
     kind,
     pinned: e.git.commit ?? null,

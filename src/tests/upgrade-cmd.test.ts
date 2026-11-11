@@ -1675,8 +1675,9 @@ describe("runUpgrade", () => {
         // and give both manual remedies, pointed at the refused directory.
         const out = io.out.join("\n");
         expect(out).toContain(`does NOT update the copy at ${prefix}`);
-        expect(out).toContain("npm install -g --prefix ");
-        expect(out).toContain("@yawlabs/mcp@latest` instead");
+        expect(out).toContain(
+          `If that directory really is a global npm prefix, run \`npm install -g --prefix ${quoteArgForDisplay(prefix) ?? prefix} @yawlabs/mcp@latest\` instead; `,
+        );
         expect(out).toContain(`run \`npm install @yawlabs/mcp@latest\` in its project root (${prefix})`);
       });
 

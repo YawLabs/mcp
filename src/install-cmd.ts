@@ -4782,13 +4782,27 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
   // would make a scoped uninstall report on wiring it deliberately does not
   // touch, which is a separate decision. Read the line below as "nothing this
   // run left behind in the containers this scope reads".
+  //
+  // This branch returns before the failed-copy lines further down, so it names
+  // an editor copy the live pass could not edit itself, in the same words as
+  // the "Not unwired" / "Not fully unwired" lines. With no failed copy the line
+  // is unchanged.
   const stillLaunching = sites.filter((s) => s.legacyEntry !== null && !trimsLegacy(s));
   if (stillLaunching.length > 0) {
     const kept = stillLaunching.map((s) => `"${s.legacyEntry}"${where(s)}`);
+    const failedCopies =
+      extraFailed.length > 0
+        ? `Nothing was removed from ${extraFailed.join(" or ")} (see the warning above), so any yaw-mcp entry ` +
+          "there is still wired. " +
+          (extraFailed.length === 1
+            ? "Fix that file and run uninstall again to clear it. "
+            : "Fix those files and run uninstall again to clear them. ")
+        : "";
     log(
       `\n${target.label} still launches yaw-mcp through the legacy ${kept.join(" and ")} ` +
         `entr${kept.length === 1 ? "y" : "ies"} you asked to keep (--keep-legacy). Remove ` +
         `${kept.length === 1 ? "it" : "them"} from ${resolved.absolute} to stop it. ` +
+        failedCopies +
         "Your servers in ~/.yaw-mcp/bundles.json are untouched.",
     );
     return { written, wouldWrite: [], messages, exitCode: 0 };

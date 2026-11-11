@@ -816,8 +816,13 @@ write_server_version() {
 #
 # Exit 0 when CHANGELOG.md has a heading for $1 -- `## $1` alone or with a
 # ` -- <summary>` suffix -- which is what a retitle (or a hand edit) leaves.
+# Every awk helper here drops a line's trailing carriage return first: on a
+# CRLF CHANGELOG.md, awk on Linux and macOS sees a bare `## $1` line as
+# `## $1\r` (Git for Windows' gawk drops the CR in text mode), and the exact
+# compare missed it there (changelog_retitle below keeps CRLF files working
+# too).
 changelog_version_heading() {
-  awk -v h="## $1" '$0 == h || index($0, h " -- ") == 1 { found = 1; exit } END { exit !found }' CHANGELOG.md 2>/dev/null
+  awk -v h="## $1" '{ sub(/\r$/, "") } $0 == h || index($0, h " -- ") == 1 { found = 1; exit } END { exit !found }' CHANGELOG.md 2>/dev/null
 }
 
 # The body of the section that holds v$1's notes: the `## $1` section once it
@@ -826,10 +831,31 @@ changelog_version_heading() {
 # run) and after it (a resume whose bump commit is made but not tagged).
 changelog_notes_body() {
   if changelog_version_heading "$1"; then
-    awk -v h="## $1" 'inside && /^## / { exit } $0 == h || index($0, h " -- ") == 1 { inside = 1; next } inside { print }' CHANGELOG.md 2>/dev/null || true
+    awk -v h="## $1" '{ sub(/\r$/, "") } inside && /^## / { exit } $0 == h || index($0, h " -- ") == 1 { inside = 1; next } inside { print }' CHANGELOG.md 2>/dev/null || true
   else
-    awk '/^## [Uu]nreleased/ { inside = 1; next } inside && /^## / { exit } inside { print }' CHANGELOG.md 2>/dev/null || true
+    awk '{ sub(/\r$/, "") } /^## [Uu]nreleased/ { inside = 1; next } inside && /^## / { exit } inside { print }' CHANGELOG.md 2>/dev/null || true
   fi
+}
+
+# Exit 0 when this script's own `v$1` bump commit is already made: HEAD's
+# package.json reads $1, the working copy does not differ from it (the same
+# "bump is committed" test the resume dirt check makes, `git diff --quiet HEAD
+# -- package.json`), and the last commit to touch package.json carries the
+# subject step 3 writes, `v$1`. A retitle then would ride in a second `v$1`
+# commit -- after a bump commit made by a release.sh that predates the retitle,
+# step 3 used to make exactly that -- so it is skipped. A bump committed under
+# any other subject (a merged `chore: release $1` PR, a hand commit) is not
+# matched: step 3's retitle there is the release's only `v$1` commit.
+changelog_bump_committed() {
+  git diff --quiet HEAD -- package.json 2>/dev/null || return 1
+  [ "$(git log -1 --format=%s HEAD -- package.json 2>/dev/null)" = "v$1" ] || return 1
+  git show HEAD:package.json 2>/dev/null | node -e '
+    let s = "";
+    process.stdin.on("data", (d) => { s += d; });
+    process.stdin.on("end", () => {
+      try { process.exit(JSON.parse(s).version === process.argv[1] ? 0 : 1); } catch { process.exit(1); }
+    });
+  ' "$1"
 }
 
 # `changelog_retitle check <version>` validates, `changelog_retitle write
@@ -1171,9 +1197,12 @@ fi
 # empty version heading -- write the notes (or one line saying there are no
 # user-facing changes) and re-run. Skipped when there is nothing to retitle:
 # a `## ${VERSION}` heading already exists (step 3 retitled it on an earlier
-# run, or it was headed by hand), or the v${VERSION} tag does (the bump commit
-# is made; step 3 will not commit again).
-if ! changelog_version_heading "$VERSION" && ! git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null 2>&1; then
+# run, or it was headed by hand), the v${VERSION} tag does, or a `v${VERSION}`
+# bump commit is made without either (an older release.sh's bump commit, which
+# did not retitle) -- step 3 will not commit again, and warns instead. A bump
+# committed under another subject (a merged release PR) is still checked: step
+# 3 retitles it into the release's one `v${VERSION}` commit.
+if ! changelog_version_heading "$VERSION" && ! git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null 2>&1 && ! changelog_bump_committed "$VERSION"; then
   CHANGELOG_RC=0
   changelog_retitle check "$VERSION" || CHANGELOG_RC=$?
   case "$CHANGELOG_RC" in
@@ -1478,11 +1507,18 @@ fi
 # `## ${VERSION}` heading already exists -- an earlier run's retitle, kept
 # uncommitted or in its bump commit, or a hand edit -- and not when the
 # v${VERSION} tag does: the bump commit is then made, and a retitle would put
-# a second commit on top of the tag.
+# a second commit on top of the tag. Nor when a `v${VERSION}` bump commit is
+# made with no tag yet (a resume after a release.sh old enough not to retitle
+# made it): the retitle would ride in a second `v${VERSION}` commit. One commit
+# per release, so the operator heads the notes by hand afterwards, as in the
+# tag case. A bump committed under another subject (a merged release PR) is
+# retitled as usual: that commit becomes the release's only `v${VERSION}` one.
 if changelog_version_heading "$VERSION"; then
   info "CHANGELOG.md already has a ## ${VERSION} heading -- leaving its headings as they are"
 elif git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null 2>&1; then
   warn "CHANGELOG.md has no ## ${VERSION} heading, but tag v${VERSION} already exists, so its commit is made -- not retitling. Head the notes by hand after the release."
+elif changelog_bump_committed "$VERSION"; then
+  warn "CHANGELOG.md has no ## ${VERSION} heading, but the v${VERSION} bump commit is already made (HEAD's package.json reads ${VERSION}) -- not retitling, which would make a second commit for this release. Head the notes ## ${VERSION} by hand after the release."
 else
   RETITLE_RC=0
   changelog_retitle write "$VERSION" || RETITLE_RC=$?

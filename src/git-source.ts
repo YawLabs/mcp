@@ -238,9 +238,60 @@ export function normalizeRepoUrl(url: string): string {
 
 /** Every `scheme://userinfo@` in `text` with the userinfo replaced. Catches the
  *  bare `https://TOKEN@host` form, which hasUrlPassword (user:pass only) and
- *  the value map cannot see when the token never passed through yaw-mcp. */
+ *  the value map cannot see when the token never passed through yaw-mcp.
+ *
+ *  A `user:password` userinfo runs to the LAST `@` on its line, the rule
+ *  upstream.ts's hasUrlPassword / splitUserinfo apply (mirrored, not
+ *  imported: they are module-private there). An UNENCODED password can hold
+ *  `/`, `?`, `#`, a space or an `@` (a base64 key does), and a matcher that
+ *  stopped at the first `/` or space left `https://user:abc/def==@host` in a
+ *  refusal untouched. As there, the user half stops at `/`, whitespace or
+ *  `:`, so a path `@` with no colon ahead of it (`https://host/@org/mcp`)
+ *  stays readable. Unlike there, `text` is free text (git stderr, a log
+ *  line), not one url, so the password also stops at a newline, a quote
+ *  (git quotes the url it reports) and the next `://`, which keeps a
+ *  second url on the line its own match. The stop is a fixed-width `://`
+ *  lookahead, not a `scheme://` one: re-scanning a scheme run at every
+ *  password character made a long line after `http://host:port` quadratic
+ *  (20k chars took seconds), and this runs on whole build logs. The scheme
+ *  is capped at 32 characters for the same reason: `\b` holds after every
+ *  `.` in a run like `a.b.c...`, and an unbounded scheme scan from each of
+ *  those starts was quadratic too. A real scheme is far shorter; a run
+ *  glued to its front still matches from any `.`, `+` or `-` within 32
+ *  characters of the `://`. What over-matches is a port with
+ *  an `@` later on the line: `https://host:8443/mcp?user=a@b.example`
+ *  becomes `https://***@b.example`. Over-scrubbing a string that is only
+ *  ever displayed costs less than printing a key, but that is why a single
+ *  url that is stored or compared goes through scrubRepoUrlUserinfo
+ *  instead. A password holding a quote is not scrubbed at all: neither
+ *  branch can reach its `@`, so the url is printed as it is. */
 export function scrubUrlUserinfo(text: string): string {
-  return text.replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^/@\s'"]+@/gi, "$1***@");
+  return text.replace(/\b([a-z][a-z0-9+.-]{0,31}:\/\/)(?:[^/\s:'"]*:(?:(?!:\/\/)[^\r\n'"])*|[^/@\s'"]+)@/gi, "$1***@");
+}
+
+/** One repo url (not free text) with its userinfo replaced by `***`, for a
+ *  url that is persisted (state.json) or shown as the repo's identity in an
+ *  error. The userinfo is what the WHATWG URL parser finds: up to the last
+ *  `@` before the first `/`, `?`, `#` or `\`, so a port with an `@` later in
+ *  the path (`https://git.corp:8443/@team/mcp.git`) keeps its host, where
+ *  the free-text scrubUrlUserinfo would run to that `@`. The rest of the url
+ *  is left byte for byte (no URL re-serialisation). A url the parser
+ *  rejects -- an unencoded `/` in a password makes `user:abc` the host, with
+ *  a bad port -- goes through scrubUrlUserinfo, which scrubs more, not less;
+ *  an scp-style `git@host:path` has no `://` and is returned unchanged. */
+export function scrubRepoUrlUserinfo(url: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return scrubUrlUserinfo(url);
+  }
+  if (!parsed.username && !parsed.password) return url;
+  const m = /^([a-z][a-z0-9+.-]*:\/\/)[^/?#\\]*@/i.exec(url);
+  if (m) return `${m[1]}***@${url.slice(m[0].length)}`;
+  parsed.username = "***";
+  parsed.password = "";
+  return parsed.href;
 }
 
 /** Build output made safe to print, persist in `.failed` or put in an error:
@@ -454,7 +505,7 @@ export async function listRemoteRefs(
     const access = gitAccessFailure(spec, r.stderr, tokenSecret, shared);
     if (access) return { ok: false, exitCode: 1, message: access };
     const tail = redactGitOutput(lastLines(r.stderr), git.secrets);
-    return { ok: false, exitCode: 1, message: `git ls-remote failed for ${scrubUrlUserinfo(spec.url)}:\n${tail}` };
+    return { ok: false, exitCode: 1, message: `git ls-remote failed for ${scrubRepoUrlUserinfo(spec.url)}:\n${tail}` };
   }
   const refs = new Map<string, string>();
   let headTarget: string | undefined;
@@ -496,7 +547,7 @@ export function resolveRefIn(spec: GitSpec, remote: RemoteRefs): ({ ok: true } &
       return {
         ok: false,
         exitCode: 1,
-        message: `${scrubUrlUserinfo(spec.url)} has no default branch to track. Name one: --git <url>#<branch>`,
+        message: `${scrubRepoUrlUserinfo(spec.url)} has no default branch to track. Name one: --git <url>#<branch>`,
       };
     if (headTarget?.startsWith("refs/heads/")) {
       return { ok: true, ref: headTarget.slice("refs/heads/".length), kind: "branch", commit: head };
@@ -512,7 +563,7 @@ export function resolveRefIn(spec: GitSpec, remote: RemoteRefs): ({ ok: true } &
   if (/^[0-9a-f]{40}$/i.test(ref)) return { ok: true, ref: ref.toLowerCase(), kind: "sha", commit: ref.toLowerCase() };
   if (/^[0-9a-f]{4,39}$/i.test(ref))
     return { ok: true, ref: ref.toLowerCase(), kind: "sha", shortSha: ref.toLowerCase() };
-  const safe = scrubUrlUserinfo(spec.url);
+  const safe = scrubRepoUrlUserinfo(spec.url);
   return {
     ok: false,
     exitCode: 1,
@@ -1589,7 +1640,7 @@ async function buildLocked(
     if (clone.code === -1 && !clone.stderr) return fail(2, GIT_MISSING_MESSAGE);
     const access = gitAccessFailure(req.spec, clone.stderr, req.tokenSecret, req.shared);
     if (access) return fail(1, access);
-    return fail(1, `git clone failed for ${scrubUrlUserinfo(req.spec.url)}:`, clone.stderr);
+    return fail(1, `git clone failed for ${scrubRepoUrlUserinfo(req.spec.url)}:`, clone.stderr);
   }
   progress(timed("Cloning (blobless)", t));
   step = "checkout";
@@ -1597,14 +1648,17 @@ async function buildLocked(
     const rp = await runGit(["rev-parse", "--verify", "--quiet", `${commit}^{commit}`], gitCtx, work);
     const full = rp.stdout.trim();
     if (rp.code !== 0 || !/^[0-9a-f]{40}$/.test(full)) {
-      return fail(1, `commit ${commit} is not in ${scrubUrlUserinfo(req.spec.url)} (or the short SHA is ambiguous).`);
+      return fail(
+        1,
+        `commit ${commit} is not in ${scrubRepoUrlUserinfo(req.spec.url)} (or the short SHA is ambiguous).`,
+      );
     }
     commit = full;
   }
   const co = await runGit([...gitCfg, "checkout", "--detach", commit], gitCtx, work);
   if (co.code !== 0) {
     const sha12 = commit.slice(0, 12);
-    const url = scrubUrlUserinfo(req.spec.url);
+    const url = scrubRepoUrlUserinfo(req.spec.url);
     let headline = `git checkout of ${sha12} from ${url} failed:`;
     if (/invalid path '/i.test(co.stderr)) {
       headline = `${sha12} of ${url} holds a file name this system cannot create (on Windows: a reserved name such as aux or con, a ":", or a trailing dot or space), so it cannot be checked out here:`;
@@ -1671,7 +1725,7 @@ async function buildLocked(
     // repo's manifest now declares is the likely one.
     if (req.subdir === "") {
       const moved = manifest.subdir ? printable(manifest.subdir) : undefined;
-      const url = scrubUrlUserinfo(req.spec.url) + (req.ref ? `#${req.ref}` : "");
+      const url = scrubRepoUrlUserinfo(req.spec.url) + (req.ref ? `#${req.ref}` : "");
       return fail(
         1,
         `the repo root has no package.json. "${namespace}" builds the repo root (its entry has no git.subdir)${
@@ -1692,7 +1746,7 @@ async function buildLocked(
   const installDir = existsSync(join(work, "package.json")) ? work : targetDir;
 
   const plan = detectPackageManager(installDir);
-  if ("error" in plan) return fail(2, `${scrubUrlUserinfo(req.spec.url)}: ${plan.error}`);
+  if ("error" in plan) return fail(2, `${scrubRepoUrlUserinfo(req.spec.url)}: ${plan.error}`);
   for (const w of plan.warnings) warn(w);
   const pmCmd = resolvePmCommand(plan, { env: ctx.env, platform: ctx.platform, exclude: work });
   if ("error" in pmCmd) return fail(2, pmCmd.error);

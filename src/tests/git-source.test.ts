@@ -42,6 +42,7 @@ import {
   repoConfigFiles,
   resolvePmCommand,
   resolveRefIn,
+  scrubRepoUrlUserinfo,
   scrubUrlUserinfo,
   sweepStaging,
   tokenUsername,
@@ -191,6 +192,79 @@ describe("redaction", () => {
     expect(out).not.toContain("tok-abcdefghij");
     expect(out).toContain("https://***@github.com");
     expect(scrubUrlUserinfo("ssh://git@host/x")).toBe("ssh://***@host/x");
+  });
+
+  it("scrubs an unencoded password holding a slash, whitespace or an @", () => {
+    // A matcher that stopped at the first `/` or space left these untouched,
+    // and one that stopped at the first `@` left the password's tail.
+    expect(scrubUrlUserinfo("https://user:abc/def==@host/mcp")).toBe("https://***@host/mcp");
+    expect(scrubUrlUserinfo("fatal: unable to access 'https://user:abc/def==@github.com/a/b/': 403")).toBe(
+      "fatal: unable to access 'https://***@github.com/a/b/': 403",
+    );
+    expect(scrubUrlUserinfo("https://user:abc def@host/x")).toBe("https://***@host/x");
+    expect(scrubUrlUserinfo("https://user:abc\tdef@host/x")).toBe("https://***@host/x");
+    expect(scrubUrlUserinfo("https://user:p@ss@host/x")).toBe("https://***@host/x");
+    expect(scrubUrlUserinfo("https://user:a?b#c@host/x")).toBe("https://***@host/x");
+  });
+
+  it("keeps the stricter userinfo rule inside one url on one line", () => {
+    // A path `@` with no colon ahead of it is not a userinfo.
+    expect(scrubUrlUserinfo("https://host/@org/mcp")).toBe("https://host/@org/mcp");
+    // An `@` on the NEXT line does not pull the url in.
+    expect(scrubUrlUserinfo("https://host:8443/x\nmail a@b.example")).toBe("https://host:8443/x\nmail a@b.example");
+    // Two credentialed urls on one line are scrubbed one by one, so the first
+    // host stays visible.
+    expect(scrubUrlUserinfo("https://u:p/q@h1/x and https://c:d@h2/y")).toBe("https://***@h1/x and https://***@h2/y");
+    // Accepted over-match: a port with an `@` later on the line.
+    expect(scrubUrlUserinfo("https://host:8443/mcp?user=a@b.example")).toBe("https://***@b.example");
+    // The password stops at the quote git puts round the url, so a later `@`
+    // on the line is not pulled in ...
+    expect(scrubUrlUserinfo("fatal: 'https://u:p@h/x' failed; mail a@b.example")).toBe(
+      "fatal: 'https://***@h/x' failed; mail a@b.example",
+    );
+    // ... and at a bare CR, which git's progress output uses as a line break.
+    expect(scrubUrlUserinfo("https://host:8443/x\rmail a@b.example")).toBe("https://host:8443/x\rmail a@b.example");
+  });
+
+  it("scrubRepoUrlUserinfo: one repo url keeps its host when an @ follows a port", () => {
+    // The free-text rule runs a `host:port` to a later `@`; a single url is
+    // cut where the URL parser ends its userinfo, so the host survives.
+    for (const url of [
+      "https://git.corp:8443/@team/mcp.git",
+      "ssh://git.corp:2222/@org/x.git",
+      "https://host/@org/mcp",
+    ]) {
+      expect(scrubRepoUrlUserinfo(url)).toBe(url);
+    }
+    expect(scrubRepoUrlUserinfo("ssh://git@host:2222/@org/x.git")).toBe("ssh://***@host:2222/@org/x.git");
+    expect(scrubRepoUrlUserinfo("https://u:p@ss@git.corp:8443/@team/mcp.git")).toBe(
+      "https://***@git.corp:8443/@team/mcp.git",
+    );
+    expect(normalizeRepoUrl(scrubRepoUrlUserinfo("ssh://git@host:2222/@org/x.git"))).toBe(
+      normalizeRepoUrl("ssh://git@host:2222/@org/x.git"),
+    );
+    // A url the parser rejects (an unencoded `/` in the password) takes the
+    // free-text rule, which scrubs it; scp-style has no `://` to scrub.
+    expect(scrubRepoUrlUserinfo("https://user:abc/def==@host/mcp")).toBe("https://***@host/mcp");
+    expect(scrubRepoUrlUserinfo("git@github.com:acme/x.git")).toBe("git@github.com:acme/x.git");
+  });
+
+  it("stays linear on a long build-log line with no userinfo", () => {
+    // A `scheme://` stop re-scanned per password character was quadratic: a
+    // 20k tail after `http://host:port` took seconds, 200k never finished.
+    // 50k keeps a regression red in seconds rather than minutes.
+    const portTail = `see http://localhost:3000/${"a".repeat(50_000)}`;
+    // `\b` holds after every `.`, so an unbounded scheme scan from each start
+    // was quadratic too (40k chars took about 5 s).
+    const dotted = "a.".repeat(50_000);
+    const start = Date.now();
+    expect(scrubUrlUserinfo(portTail)).toBe(portTail);
+    expect(scrubUrlUserinfo(dotted)).toBe(dotted);
+    // About 5 ms when linear; the regressions took 24-36 s. The wide bound
+    // keeps a loaded machine from flaking it.
+    expect(Date.now() - start).toBeLessThan(5000);
+    // The cap still lets a scheme glued to a dotted run match.
+    expect(scrubUrlUserinfo(`${"x.".repeat(100)}https://u:p/q@h/r`)).toBe(`${"x.".repeat(100)}https://***@h/r`);
   });
 });
 

@@ -19,7 +19,8 @@
 // and never aborts the diagnostic. The config load also runs the pre-0.12
 // legacy-path migration (a mkdir + rename; see migrate.ts). And each registry
 // answer doctor fetches is stored in ~/.yaw-mcp/registry-cache.json (see
-// Network below).
+// Network below), unless YAW_MCP_DISABLE_PERSISTENCE is set, which bypasses
+// the cache (no read, no write).
 //
 // YAW_MCP_READONLY_DIAGNOSTICS=1 turns ALL THREE writes off, for a caller that
 // runs doctor in the background (Yaw Terminal's MCP panel, on every refresh):
@@ -43,7 +44,8 @@
 // "Unknown" is never cached. A read-only run uses the cache but does not
 // write it, so it only saves requests for entries an ordinary run stored --
 // on a machine where only the panel runs doctor, every panel refresh still
-// makes these GETs. Each GET is bounded by DOCTOR_REGISTRY_TIMEOUT_MS and a
+// makes these GETs. Under YAW_MCP_DISABLE_PERSISTENCE the cache is not used
+// at all (no read, no write), so every run makes every GET. Each GET is bounded by DOCTOR_REGISTRY_TIMEOUT_MS and a
 // failure reads as "unknown". The only gate is registrySkipCheck, which no
 // CLI flag or environment variable sets outside a test run.
 //
@@ -313,7 +315,9 @@ export interface DoctorOptions {
   /** Test hook: return the latest-version string for @yawlabs/mcp. Stands in
    *  for the request only: the 24 h registry cache under `home` is still
    *  consulted first and written after (registry-cache.ts), as for the real
-   *  probe, so a fresh cache entry means the hook is never called. */
+   *  probe, so a fresh cache entry means the hook is never called -- unless
+   *  `env` sets YAW_MCP_DISABLE_PERSISTENCE, which bypasses the cache and
+   *  calls the hook every run. */
   registryFetch?: () => Promise<string | null>;
   /** Test hook: return the latest-version string for a managed sidecar
    *  package. Same contract as registryFetch (null = unknown), but keyed by
@@ -2673,7 +2677,8 @@ export function registrySkipCheck(opts: DoctorOptions, override: unknown): boole
 // The gate for the per-sidecar freshness probe, shared by the text and --json
 // paths so the two cannot disagree about whether the check ran. Behind the
 // gate every package goes through the 24 h registry cache (registry-cache.ts),
-// the test hook included, so a fresh entry answers without a GET.
+// the test hook included, so a fresh entry answers without a GET -- except
+// under YAW_MCP_DISABLE_PERSISTENCE in opts.env, which bypasses the cache.
 function sidecarLatestFetcher(
   opts: DoctorOptions,
   cache: RegistryCacheOptions,
@@ -2701,9 +2706,11 @@ async function selfLatest(opts: DoctorOptions, cache: RegistryCacheOptions): Pro
 
 /** Where and whether the registry cache is used on this run: under the run's
  *  home, on the run's clock, and written only when the run is not read-only
- *  (YAW_MCP_READONLY_DIAGNOSTICS promises the diagnostics write nothing). */
+ *  (YAW_MCP_READONLY_DIAGNOSTICS promises the diagnostics write nothing), and
+ *  not used at all (no read, no write) when YAW_MCP_DISABLE_PERSISTENCE is
+ *  set in opts.env. */
 function registryCacheFor(opts: DoctorOptions, home: string, readOnly: boolean): RegistryCacheOptions {
-  return { home, now: opts.now ?? Date.now, write: !readOnly };
+  return { home, now: opts.now ?? Date.now, write: !readOnly, env: opts.env };
 }
 
 /** One git-sourced server as doctor reports it. */

@@ -42,16 +42,64 @@ function counting(answer: string | null) {
   };
 }
 
-const opts = (over: Partial<{ now: () => number; write: boolean }> = {}) => ({
+const opts = (over: Partial<{ now: () => number; write: boolean; env: NodeJS.ProcessEnv }> = {}) => ({
   home,
   now: () => NOW,
   write: true,
+  env: {} as NodeJS.ProcessEnv,
   ...over,
 });
 
 describe("registryCachePath", () => {
   it("is one file under ~/.yaw-mcp", () => {
     expect(registryCachePath(home)).toBe(join(home, ".yaw-mcp", REGISTRY_CACHE_FILENAME));
+  });
+});
+
+describe("cachedRegistryLatest under YAW_MCP_DISABLE_PERSISTENCE", () => {
+  const DISABLED = { YAW_MCP_DISABLE_PERSISTENCE: "1" };
+
+  it("ignores a fresh cache entry and fetches", async () => {
+    seed(JSON.stringify({ version: 1, packages: { a: { latest: "1.0.0", at: NOW - 1000 } } }));
+    const f = counting("2.0.0");
+    expect(await cachedRegistryLatest("a", f.fetch, opts({ env: DISABLED }))).toBe("2.0.0");
+    expect(f.calls).toBe(1);
+  });
+
+  it("leaves an existing cache file byte-for-byte unchanged", async () => {
+    const seeded = JSON.stringify({ version: 1, packages: { a: { latest: "1.0.0", at: NOW - 1000 } } });
+    seed(seeded);
+    await cachedRegistryLatest("a", async () => "2.0.0", opts({ env: DISABLED }));
+    await cachedRegistryLatest("b", async () => "3.0.0", opts({ env: DISABLED }));
+    expect(readFileSync(registryCachePath(home), "utf8")).toBe(seeded);
+  });
+
+  it("creates neither ~/.yaw-mcp nor the cache file on a miss", async () => {
+    const f = counting("2.0.0");
+    expect(await cachedRegistryLatest("a", f.fetch, opts({ env: DISABLED }))).toBe("2.0.0");
+    expect(f.calls).toBe(1);
+    expect(existsSync(join(home, ".yaw-mcp"))).toBe(false);
+  });
+
+  it("a rejecting fetcher still reads as null", async () => {
+    const reject = async (): Promise<string | null> => {
+      throw new Error("ENOTFOUND");
+    };
+    expect(await cachedRegistryLatest("a", reject, opts({ env: DISABLED }))).toBeNull();
+  });
+
+  it("reads process.env when no env is passed", async () => {
+    seed(JSON.stringify({ version: 1, packages: { a: { latest: "1.0.0", at: NOW - 1000 } } }));
+    const prev = process.env.YAW_MCP_DISABLE_PERSISTENCE;
+    process.env.YAW_MCP_DISABLE_PERSISTENCE = "true";
+    try {
+      const f = counting("2.0.0");
+      expect(await cachedRegistryLatest("a", f.fetch, { home, now: () => NOW, write: true })).toBe("2.0.0");
+      expect(f.calls).toBe(1);
+    } finally {
+      if (prev === undefined) delete process.env.YAW_MCP_DISABLE_PERSISTENCE;
+      else process.env.YAW_MCP_DISABLE_PERSISTENCE = prev;
+    }
   });
 });
 

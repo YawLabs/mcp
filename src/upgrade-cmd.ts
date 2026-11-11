@@ -1138,14 +1138,14 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
     if (rawPrefix !== null && !(await (opts.confirmGlobalPrefix ?? defaultConfirmGlobalPrefix)(argvPath, rawPrefix))) {
       // The command printed below does NOT update this copy, so the note has
       // to carry the two manual remedies: which one applies is something only
-      // the user knows (is <dir> a global prefix or a project?).
-      const { quoteArgForDisplay } = await import("./auto-upgrade.js");
-      const shownDir = quoteArgForDisplay(rawPrefix, opts.platform) ?? rawPrefix;
+      // the user knows (is <dir> a global prefix or a project?). The reason
+      // and the remedies are the background upgrader's own wording
+      // (auto-upgrade's PREFIX_REFUSED_REASON / prefixRefusedRemedies).
+      const { PREFIX_REFUSED_REASON, prefixRefusedRemedies } = await import("./auto-upgrade.js");
       prefixRefusedNote =
-        `Note: not pinning --prefix ${rawPrefix}: this copy sits under a directory named \`npm\` or \`bin\` with no yaw-mcp bin shim beside it, so it may be a project tree rather than a global npm prefix. ` +
+        `Note: not pinning --prefix ${rawPrefix}: ${PREFIX_REFUSED_REASON}. ` +
         `The command below installs into npm's own global prefix and does NOT update the copy at ${rawPrefix}. ` +
-        `If that directory really is a global npm prefix, run \`npm install -g --prefix ${shownDir} @yawlabs/mcp@latest\` instead; ` +
-        `if it is a project, run \`npm install @yawlabs/mcp@latest\` in its project root (${rawPrefix}).`;
+        prefixRefusedRemedies(rawPrefix, opts.platform);
       rawPrefix = null;
     }
     if (rawPrefix !== null) {

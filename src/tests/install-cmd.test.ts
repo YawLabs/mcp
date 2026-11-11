@@ -7889,6 +7889,94 @@ describe.each(CLINE_PLATFORMS)("runInstall / runUninstall -- a target whose one 
     }
   });
 
+  /** Installs Cline into the shared file and the VS Code and Cursor copies,
+   *  then adds a pre-rename "mcp.hosting" entry to the shared file, so an
+   *  uninstall with --keep-legacy ends on the kept-legacy line. */
+  async function wireWithLegacy(home: string): Promise<{ copy: string; cursorCopy: string }> {
+    const copy = seedEditorStorage(home);
+    const cursorCopy = join(
+      dirname(editorRoot(home)),
+      "Cursor",
+      "User",
+      "globalStorage",
+      "saoudrizwan.claude-dev",
+      "settings",
+      "cline_mcp_settings.json",
+    );
+    mkdirSync(dirname(cursorCopy), { recursive: true });
+    await runInstall({ ...clineOpts(home), io: captureIo().io });
+    const shared = JSON.parse(readFileSync(sharedPath(home), "utf8"));
+    shared.mcpServers["mcp.hosting"] = { command: "npx", args: ["-y", "@yawlabs/mcp@0.1.0"] };
+    writeFileSync(sharedPath(home), `${JSON.stringify(shared, null, 2)}\n`);
+    return { copy, cursorCopy };
+  }
+
+  it("names the failed copy on the --keep-legacy line too", async () => {
+    const home = mkdtempSync(join(tmpdir(), "yaw-cline-"));
+    try {
+      const { copy, cursorCopy } = await wireWithLegacy(home);
+      const cursorBefore = readFileSync(cursorCopy, "utf8");
+      atomicWriteSeam.beforeWrite = (path) => {
+        if (path === cursorCopy) throw new Error("EPERM: operation not permitted");
+      };
+      const cap = captureIo();
+      const r = await runUninstall({ ...clineOpts(home), force: true, keepLegacy: true, io: cap.io });
+      expect(r.exitCode).toBe(0);
+      expect(r.written).toEqual([sharedPath(home), copy]);
+      expect(readFileSync(cursorCopy, "utf8")).toBe(cursorBefore);
+      // The kept-legacy branch returns before the "Not fully unwired" line, so
+      // before this it said only that the legacy entry still launches, and
+      // never named the Cursor copy that still holds "mcp".
+      expect(cap.stdout()).toContain(
+        `\nCline still launches yaw-mcp through the legacy "mcp.hosting" entry you asked to keep (--keep-legacy). ` +
+          `Remove it from ${sharedPath(home)} to stop it. Nothing was removed from ${cursorCopy} (see the warning ` +
+          "above), so any yaw-mcp entry there is still wired. Fix that file and run uninstall again to clear it. " +
+          "Your servers in ~/.yaw-mcp/bundles.json are untouched.",
+      );
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("names every failed copy on the --keep-legacy line, in the plural", async () => {
+    const home = mkdtempSync(join(tmpdir(), "yaw-cline-"));
+    try {
+      const { copy, cursorCopy } = await wireWithLegacy(home);
+      atomicWriteSeam.beforeWrite = (path) => {
+        if (path === copy || path === cursorCopy) throw new Error("EPERM: operation not permitted");
+      };
+      const cap = captureIo();
+      const r = await runUninstall({ ...clineOpts(home), force: true, keepLegacy: true, io: cap.io });
+      expect(r.exitCode).toBe(0);
+      expect(r.written).toEqual([sharedPath(home)]);
+      expect(cap.stdout()).toContain(
+        `Remove it from ${sharedPath(home)} to stop it. Nothing was removed from ${copy} or ${cursorCopy} (see the ` +
+          "warning above), so any yaw-mcp entry there is still wired. Fix those files and run uninstall again to " +
+          "clear them. Your servers in ~/.yaw-mcp/bundles.json are untouched.",
+      );
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the --keep-legacy line unchanged when every copy was cleared", async () => {
+    const home = mkdtempSync(join(tmpdir(), "yaw-cline-"));
+    try {
+      const { copy, cursorCopy } = await wireWithLegacy(home);
+      const cap = captureIo();
+      const r = await runUninstall({ ...clineOpts(home), force: true, keepLegacy: true, io: cap.io });
+      expect(r.exitCode).toBe(0);
+      expect(r.written).toEqual([sharedPath(home), copy, cursorCopy]);
+      expect(cap.stdout()).toContain(
+        `\nCline still launches yaw-mcp through the legacy "mcp.hosting" entry you asked to keep (--keep-legacy). ` +
+          `Remove it from ${sharedPath(home)} to stop it. Your servers in ~/.yaw-mcp/bundles.json are untouched.`,
+      );
+      expect(cap.stdout()).not.toContain("Nothing was removed");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it("keeps the ordinary all-clear when every copy was cleared", async () => {
     const home = mkdtempSync(join(tmpdir(), "yaw-cline-"));
     try {

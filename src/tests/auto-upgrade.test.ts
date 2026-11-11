@@ -6,6 +6,7 @@ import {
   defaultConfirmGlobalPrefix,
   detectRunningInstallPrefix,
   maybeAutoUpgrade,
+  prefixRefusedRemedies,
   quoteArgForDisplay,
   quoteShellArgIfNeeded,
   readCheckMemo,
@@ -538,6 +539,7 @@ describe("name-only global-npm markers need a bin shim before the background ins
     // so the real existsSync answers "no shim".
     const spawnImpl = vi.fn();
     const recordAttemptImpl = vi.fn();
+    mockLog.mockClear();
     await maybeAutoUpgrade({
       currentVersion: "0.47.0",
       argvPath: entryUnder(prefix),
@@ -548,6 +550,29 @@ describe("name-only global-npm markers need a bin shim before the background ins
     expect(spawnImpl).not.toHaveBeenCalled();
     // Stopped before the lock and the attempt memo, not after them.
     expect(recordAttemptImpl).not.toHaveBeenCalled();
+    // The log is the only thing the user gets, and `yaw-mcp upgrade` falls
+    // back to a plain `npm install -g` that does not update this copy -- so the
+    // line must say the copy was not updated and carry both manual remedies
+    // itself, never send the user to `yaw-mcp upgrade` for them.
+    const refused = mockLog.mock.calls.filter((c) => c[0] === "info" && String(c[1]).includes("out of date"));
+    expect(refused).toHaveLength(1);
+    const line = String(refused[0][1]);
+    expect(line).toContain(`The copy at ${prefix} was not updated.`);
+    expect(line).toContain(
+      `If that directory really is a global npm prefix, run \`npm install -g --prefix ${quoteArgForDisplay(prefix) ?? prefix} @yawlabs/mcp@latest\` instead; `,
+    );
+    expect(line).toContain(
+      `if it is a project, run \`npm install @yawlabs/mcp@latest\` in its project root (${prefix}).`,
+    );
+    expect(line).not.toContain("yaw-mcp upgrade");
+  });
+
+  it("prefixRefusedRemedies quotes the --prefix argument for display but names the raw directory", () => {
+    const dir = "/home/u/My Tools/bin";
+    expect(prefixRefusedRemedies(dir, "linux")).toBe(
+      "If that directory really is a global npm prefix, run `npm install -g --prefix '/home/u/My Tools/bin' @yawlabs/mcp@latest` instead; " +
+        "if it is a project, run `npm install @yawlabs/mcp@latest` in its project root (/home/u/My Tools/bin).",
+    );
   });
 
   it("spawns with --prefix once the shim confirms the prefix", async () => {

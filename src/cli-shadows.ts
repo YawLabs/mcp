@@ -9,18 +9,22 @@
 // covered server with the default namespace gets the hint with no
 // configuration -- but it does NOT cover the whole catalog. Measured
 // 2026-11-11 against https://yaw.sh/data/mcp-catalog.json (generated
-// 2026-10-16, 85 servers): 24 rows derive a namespace with no key here (35
+// 2026-10-16, 85 servers): 23 rows derive a namespace with no key here (35
 // before the rows for docker, mysql, redis x2, bigquery, azure, digitalocean,
-// vault, consul, terraform-cwd and ansible). The 24 are left out on purpose:
-// none clearly wraps one well-known CLI. Most are API services with no CLI to
-// prefer over (datadog, zendesk, asana, pinecone, ...); a few have a CLI the
-// server does not clearly stand in for (HashiCorp's terraform server works
+// vault, consul, terraform-cwd, ansible and salesforce). The 23 are left out on
+// purpose: none clearly wraps one well-known CLI. Most are API services with no
+// CLI to prefer over (datadog, zendesk, asana, pinecone, ...); a few have a CLI
+// the server does not clearly stand in for (HashiCorp's terraform server works
 // against the Registry and HCP, not a working directory; clickhouse's client
-// binary has two spellings; databricks, snowflake, salesforce, auth0 and
-// huggingface overlap their vendor CLI only in part). None carries the EMPTY
-// entry described below either. An unregistered namespace falls through to
-// the tool-name heuristic, which can only ever answer with a prefix in
-// KNOWN_CLI_PREFIXES.
+// binary has two spellings; databricks, snowflake and huggingface overlap their
+// vendor CLI only in part). auth0 was checked on 2026-11-11 against the tool
+// list in @auth0/auth0-mcp-server's README: applications, resource servers,
+// Actions (incl. deploy), logs and forms, but NO user tools -- and `auth0
+// users` is a main reason an agent runs the CLI -- so it stays unregistered.
+// (salesforce was decided the same way and DID qualify; see its row.) None of
+// these carries the EMPTY entry described below either. An unregistered
+// namespace falls through to the tool-name heuristic, which can only ever
+// answer with a CLI named in KNOWN_CLI_PREFIXES.
 // Nothing ENFORCES coverage either: the catalog is generated outside this
 // repo, no slug list is vendored here, and no test diffs the two -- so
 // re-measure against the live catalog before relying on any count here.
@@ -179,6 +183,13 @@ const NAMESPACE_REGISTRY: Record<string, readonly CliShadow[]> = {
   obsidian: EMPTY,
   googleworkspace: EMPTY,
   googlemaps: EMPTY,
+  // The catalog's salesforce server (@tsmztech/mcp-server-salesforce) runs SOQL
+  // and aggregate queries, record DML, object describe/search and Apex
+  // read/write/execute-anonymous -- the `sf data`, `sf sobject` and `sf apex`
+  // work an agent shells out for. It has no project deploy/retrieve and no org
+  // login, hence the subcommand list.
+  salesforce: [{ cli: "sf", subcommands: ["data", "sobject", "apex"] }],
+  sf: [{ cli: "sf", subcommands: ["data", "sobject", "apex"] }],
 
   // —— Search / web —————————————————————————————————————————————
   bravesearch: EMPTY,
@@ -214,29 +225,35 @@ const NAMESPACE_REGISTRY: Record<string, readonly CliShadow[]> = {
 // state.json at startup and updated as servers activate). getProfiledActiveServers
 // does that merge so discover + guide see learned tools; a server with no
 // learned/persisted tools for its namespace still falls through to [].
-const KNOWN_CLI_PREFIXES = new Set<string>([
-  "npm",
-  "tailscale",
-  "gh",
-  "aws",
-  "kubectl",
-  "docker",
-  "psql",
-  "mongosh",
-  "redis",
-  "stripe",
-  "heroku",
-  "supabase",
-  "flyctl",
-  "shopify",
-  "vercel",
-  "wrangler",
-  "twilio",
-  "caddy",
-  "playwright",
-  "sqlite3",
-  "glab",
-  "op",
+//
+// Keyed by tool-name prefix, valued by the CLI binary the hint names. The two
+// differ only where the word a server puts on its tools is not the executable:
+// Redis tools read `redis_get`, but the binary is `redis-cli` (there is no
+// `redis` executable), so the heuristic used to answer `cli: "redis"`. Every
+// value below is a real executable name; most are their own prefix.
+const KNOWN_CLI_PREFIXES = new Map<string, string>([
+  ["npm", "npm"],
+  ["tailscale", "tailscale"],
+  ["gh", "gh"],
+  ["aws", "aws"],
+  ["kubectl", "kubectl"],
+  ["docker", "docker"],
+  ["psql", "psql"],
+  ["mongosh", "mongosh"],
+  ["redis", "redis-cli"],
+  ["stripe", "stripe"],
+  ["heroku", "heroku"],
+  ["supabase", "supabase"],
+  ["flyctl", "flyctl"],
+  ["shopify", "shopify"],
+  ["vercel", "vercel"],
+  ["wrangler", "wrangler"],
+  ["twilio", "twilio"],
+  ["caddy", "caddy"],
+  ["playwright", "playwright"],
+  ["sqlite3", "sqlite3"],
+  ["glab", "glab"],
+  ["op", "op"],
 ]);
 
 export function resolveShadowedClis(server: Pick<UpstreamServerConfig, "namespace" | "toolCache">): CliShadow[] {
@@ -278,8 +295,8 @@ export function resolveShadowedClis(server: Pick<UpstreamServerConfig, "namespac
     if (first) prefixes.add(first.toLowerCase());
   }
   if (prefixes.size !== 1) return [];
-  const only = [...prefixes][0];
-  return KNOWN_CLI_PREFIXES.has(only) ? [{ cli: only }] : [];
+  const cli = KNOWN_CLI_PREFIXES.get([...prefixes][0]);
+  return cli === undefined ? [] : [{ cli }];
 }
 
 // There is deliberately no `shadowedCliNames(server)` helper. One existed
@@ -346,11 +363,10 @@ export function cliToNamespaces(): Map<string, string[]> {
  *  decision; do not derive this table from NAMESPACE_REGISTRY.
  *
  *  Note the two tiers, easy to conflate: NAMESPACE_REGISTRY is the only one
- *  the doctor reverse index (cliToNamespaces) can report from. heroku, flyctl
- *  and the bare `redis` prefix appear ONLY in KNOWN_CLI_PREFIXES, which feeds
- *  the tool-name-prefix heuristic -- no registry entry names them as a CLI
- *  (the redis rows name `redis-cli`), so they can never surface as a shadow
- *  hit and are not candidates here either. docker, redis-cli, terraform and
+ *  the doctor reverse index (cliToNamespaces) can report from. heroku and
+ *  flyctl appear ONLY in KNOWN_CLI_PREFIXES, which feeds the tool-name-prefix
+ *  heuristic -- no registry entry names them as a CLI, so they can never
+ *  surface as a shadow hit and are not candidates here either. docker, redis-cli, terraform, sf and
  *  the ansible-* CLIs DO have registry rows now, and still no entry here:
  *  being shadowed does not make a CLI an install target. */
 export const SHADOW_INSTALL_TARGETS: Record<string, { package: string; namespace: string; name: string }> = {
