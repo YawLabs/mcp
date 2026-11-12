@@ -897,7 +897,7 @@ describe("rewriteForOam", () => {
     });
   });
 
-  describe("node runtime flags ahead of the entry (oam 0.19.5 floor)", () => {
+  describe("node runtime flags ahead of the entry (from oam 0.19.5)", () => {
     // Every flag scanNodeLaunchFlags accepts, each verified on oam 0.19.5
     // beside node. One case per flag, so dropping one from the allowlist
     // fails by name.
@@ -977,6 +977,11 @@ describe("rewriteForOam", () => {
       { what: "a short flag", args: ["-r", "./hook.js", "/srv/index.js"] },
       { what: "a value flag given spaced", args: ["--max-old-space-size", "4096", "/srv/index.js"] },
       { what: "a value flag with a non-numeric size", args: ["--max-old-space-size=abc", "/srv/index.js"] },
+      // oam 0.20.0 cannot start under a cap of 1-6 MB (exit 3) and runs out at 7,
+      // where node runs; HEAP_MB keeps anything below 16 on node.
+      { what: "a heap cap oam cannot start under", args: ["--max-old-space-size=8", "/srv/index.js"] },
+      { what: "a heap cap just below the minimum", args: ["--max-old-space-size=15", "/srv/index.js"] },
+      { what: "a heap cap with a leading zero", args: ["--max-old-space-size=0128", "/srv/index.js"] },
       { what: "a value flag with an empty value", args: ["--max-http-header-size=", "/srv/index.js"] },
       { what: "an unknown dns order", args: ["--dns-result-order=bogus", "/srv/index.js"] },
       { what: "a zero header size", args: ["--max-http-header-size=0", "/srv/index.js"] },
@@ -3026,7 +3031,7 @@ describe("MIN_OAM_VERSION freshness floor", () => {
   /** The ratchet. ONE literal, and the title is built from it, so the two
    *  cannot say different numbers -- the title used to name 0.13.0 while the
    *  body asserted 0.13.1. */
-  const FLOOR = "0.19.5";
+  const FLOOR = "0.20.0";
 
   it(`is at least ${FLOOR} (bump this literal when you bump the floor)`, () => {
     // POLICY (see the constant's doc): the floor is the last oam release the
@@ -3417,9 +3422,10 @@ describe("oamHeapOomHint", () => {
     expect(hint).toContain("bundles.json");
   });
 
-  it("names node's own knob, honored by oam from the 0.19.5 floor, and its precedence", () => {
-    // oam 0.19.5 maps --max-old-space-size (NODE_OPTIONS or a `run` flag) to
-    // its heap cap, and either beats OAM_MAX_HEAP_MB (measured), so a hint
+  it("names node's own knob, honored by every oam yaw-mcp hosts on, and its precedence", () => {
+    // oam (since 0.19.5; re-measured on 0.20.0) maps --max-old-space-size
+    // (NODE_OPTIONS or a `run` flag) to its heap cap, and either beats
+    // OAM_MAX_HEAP_MB (measured), so a hint
     // naming only OAM_MAX_HEAP_MB sends someone whose NODE_OPTIONS already
     // sets a size to a variable that changes nothing.
     const hint = oamHeapOomHint("error[OAM-RT-OOM]: JavaScript heap out of memory -- reached the 64 MB cap");
@@ -3429,7 +3435,7 @@ describe("oamHeapOomHint", () => {
 
   it("names the launch's own --max-old-space-size flag first, since it beats NODE_OPTIONS", () => {
     // The rewrite now carries `node --max-old-space-size=N entry` onto `oam
-    // run` as a flag; on oam 0.19.5 an argv flag beats NODE_OPTIONS (measured),
+    // run` as a flag; on oam 0.19.5 and 0.20.0 an argv flag beats NODE_OPTIONS (measured),
     // so NODE_OPTIONS advice alone changes nothing for that launch.
     const hint = oamHeapOomHint("error[OAM-RT-OOM]: JavaScript heap out of memory -- reached the 64 MB cap") ?? "";
     expect(hint).toContain("--max-old-space-size=<mb> flag in this server's node args");

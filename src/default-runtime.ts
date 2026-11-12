@@ -350,7 +350,7 @@ export { oamFailureLabel };
  *  rewriteForOam (oam-spawn.ts), in that function's own order. That 1:1 mapping
  *  is the point -- it is what makes a future gate added there and not here an
  *  auditable omission rather than an invisible one. "node-flag-entry" keeps
- *  its name for --json consumers, though since the oam 0.19.5 floor it means
+ *  its name for --json consumers, though since oam 0.19.5 (inside the floor) it means
  *  a leading node flag the rewrite will not carry onto `oam run`, not any
  *  leading flag (see scanNodeLaunchFlags). */
 export type ServerRuntimeCode =

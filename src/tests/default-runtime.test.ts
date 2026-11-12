@@ -632,7 +632,7 @@ describe("describeServerRuntime", () => {
 
     const accepted: Array<{ what: string; command: string; args: string[] }> = [
       { what: "node with a real entry", command: "node", args: ["server.js", "--port", "0"] },
-      // oam 0.19.5 (the floor) takes node flags after `run`; the allowlisted
+      // oam (since 0.19.5) takes node flags after `run`; the allowlisted
       // ones ride along, so doctor must report oam for them.
       { what: "node with a heap-size flag", command: "node", args: ["--max-old-space-size=4096", "server.js"] },
       {

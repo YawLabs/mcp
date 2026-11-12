@@ -2670,7 +2670,7 @@ describe("runDoctor — OAM RUNTIME section", () => {
     expect(txt).toMatch(/ranged\s+node\s+.*\^1\.2\.3/);
     expect(txt).toMatch(/flagged\s+node\s+.*--inspect/);
     expect(txt).toMatch(/spaced\s+node\s+.*--max-old-space-size=<value>/);
-    // From the oam 0.19.5 floor an allowlisted node flag rides onto `oam run`,
+    // On oam (since 0.19.5) an allowlisted node flag rides onto `oam run`,
     // so doctor reports oam for it, as the spawn does.
     expect(txt).toMatch(/heapcap\s+oam\s+per-server runtime:"oam"/);
     // The accepted shape in the same file still reports oam, so the gates are
