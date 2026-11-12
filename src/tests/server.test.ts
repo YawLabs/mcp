@@ -7074,6 +7074,34 @@ describe("downstream client bridge", () => {
     expect((out.requestedSchema as { properties: unknown }).properties).toBe(props);
   });
 
+  it("withoutSchemaIds drops a nested $id (a multi-select field's items) and makes it compile", async () => {
+    const schema = {
+      type: "object",
+      properties: { tags: { type: "array", items: { $id: "my_tag:item", enum: ["a", "b"] } } },
+    };
+    const out = withoutSchemaIds({ message: "m", requestedSchema: schema });
+    expect(out.requestedSchema).toEqual({
+      type: "object",
+      properties: { tags: { type: "array", items: { enum: ["a", "b"] } } },
+    });
+    const { AjvJsonSchemaValidator } = await import("@modelcontextprotocol/server/validators/ajv");
+    const v = new AjvJsonSchemaValidator();
+    expect(() => v.getValidator(schema)).toThrow();
+    expect(v.getValidator(out.requestedSchema as typeof schema)({ tags: ["a"] }).valid).toBe(true);
+  });
+
+  it("withoutSchemaIds keeps a property named $id and an $id inside instance data", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        $id: { type: "string", default: "x" },
+        pick: { type: "object", const: { $id: "data" }, default: { $id: "data" } },
+      },
+    };
+    const params = { message: "m", requestedSchema: schema };
+    expect(withoutSchemaIds(params)).toBe(params);
+  });
+
   it("withoutSchemaIds makes a colon-$id schema compile under the SDK's bundled Ajv", async () => {
     // The failure the helper exists for, measured on 2.4.0: fast-uri 3.1.8
     // rejects `my_form:v1` as an $id ("URI scheme is malformed").
