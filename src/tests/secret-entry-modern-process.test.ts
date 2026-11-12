@@ -3,7 +3,7 @@
 //
 // secret-entry-modern.test.ts covers the 2026-07-28 flow in process, where
 // the upstream is mocked. This runs the whole chain once per runtime: the
-// broker bundle as a child, a @modelcontextprotocol/client 2.3.1 Client
+// broker bundle as a child, a @modelcontextprotocol/client 2.4 Client
 // talking to it over stdio, an upstream child that will not start without
 // PROBE_TOKEN, and the real masked-entry page the broker serves, which the
 // test types into over HTTP. The value typed on the page has to come back

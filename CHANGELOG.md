@@ -4,6 +4,10 @@ All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented 
 
 ## Unreleased
 
+**Changed -- MCP SDK moves to `@modelcontextprotocol/server` 2.4.0 and `@modelcontextprotocol/sdk` 1.32.2**
+
+The server SDK moves from `~2.3.1` to `~2.4.0` (the dev-only `@modelcontextprotocol/client` moves with it), and the upstream client's `@modelcontextprotocol/sdk` floor from `^1.29.0` to `^1.32.2`. The protocol eras are unchanged: 2026-07-28 is still the current MCP revision, and yaw-mcp still serves it beside 2025-11-25. What 2.4.0 changes does not reach yaw-mcp's paths: its new Skills extension is opt-in and not wired; the `ServerEvent` `params` change is for a gateway that re-emits a child's notification, and yaw-mcp sends only its own `list_changed`; the `$ref`-rooted `outputSchema` change is in `McpServer`'s schema conversion, while yaw-mcp's low-level handlers advertise and project a child tool's schema with the same predicate as before, so the listed schema and the returned `structuredContent` still agree; and the stricter fast-uri and `x-mcp-header` checks live in the 2.x client, which yaw-mcp does not use to reach its children (they go through `@modelcontextprotocol/sdk`). `npm run verify:oam-floor` completed both eras on the new server SDK on 2026-11-12.
+
 ## 1.1.12
 
 **Changed -- the oam floor moves to 0.20.1**
