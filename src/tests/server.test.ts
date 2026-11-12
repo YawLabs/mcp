@@ -100,6 +100,7 @@ import {
   resolveIdleThreshold,
   resolveProtocolMode,
   resolveToolExposure,
+  withoutSchemaIds,
 } from "../server.js";
 import type { UpstreamConnection, UpstreamServerConfig } from "../types.js";
 import {
@@ -7035,6 +7036,53 @@ describe("downstream client bridge", () => {
     // A downstream rejection surfaces verbatim -- no invented default.
     priv.server.elicitInput = vi.fn().mockRejectedValue(new Error("client declined"));
     await expect(bridge.elicitInput(elicitParams)).rejects.toThrow("client declined");
+  });
+
+  it("drops $id from a forwarded elicitation schema before Server.elicitInput sees it", async () => {
+    const priv = getPrivate(server);
+    priv.server.elicitInput = vi.fn().mockResolvedValue({ action: "decline" });
+    const params = {
+      message: "m",
+      requestedSchema: {
+        $id: "my_form:v1",
+        type: "object",
+        properties: { a: { $id: "urn:my_form:a", type: "string" } },
+        required: ["a"],
+      },
+    } as any;
+    await priv.clientBridge.elicitInput(params, {});
+    expect(priv.server.elicitInput).toHaveBeenCalledWith(
+      { message: "m", requestedSchema: { type: "object", properties: { a: { type: "string" } }, required: ["a"] } },
+      {},
+    );
+    // The child's own params object is not mutated.
+    expect(params.requestedSchema.$id).toBe("my_form:v1");
+    expect(params.requestedSchema.properties.a.$id).toBe("urn:my_form:a");
+  });
+
+  it("withoutSchemaIds returns the same object when there is no $id to drop", () => {
+    const noSchema = { message: "m" };
+    expect(withoutSchemaIds(noSchema)).toBe(noSchema);
+    const plain = { message: "m", requestedSchema: { type: "object", properties: { a: { type: "string" } } } };
+    expect(withoutSchemaIds(plain)).toBe(plain);
+  });
+
+  it("withoutSchemaIds drops a root-only $id and leaves properties untouched", () => {
+    const props = { a: { type: "string" } };
+    const out = withoutSchemaIds({ message: "m", requestedSchema: { $id: "x:y", type: "object", properties: props } });
+    expect(out.requestedSchema).toEqual({ type: "object", properties: props });
+    expect((out.requestedSchema as { properties: unknown }).properties).toBe(props);
+  });
+
+  it("withoutSchemaIds makes a colon-$id schema compile under the SDK's bundled Ajv", async () => {
+    // The failure the helper exists for, measured on 2.4.0: fast-uri 3.1.8
+    // rejects `my_form:v1` as an $id ("URI scheme is malformed").
+    const { AjvJsonSchemaValidator } = await import("@modelcontextprotocol/server/validators/ajv");
+    const v = new AjvJsonSchemaValidator();
+    const schema = { $id: "my_form:v1", type: "object", properties: { a: { type: "string" } } };
+    expect(() => v.getValidator(schema)).toThrow();
+    const stripped = withoutSchemaIds({ requestedSchema: schema }).requestedSchema as typeof schema;
+    expect(v.getValidator(stripped)({ a: "x" }).valid).toBe(true);
   });
 
   it("threads the same bridge into the transient read_tool connect", async () => {

@@ -777,6 +777,38 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
   return v !== null && typeof v === "object" && !Array.isArray(v);
 }
 
+/** A forwarded upstream elicitation with `$id` dropped from its
+ *  requestedSchema root and from each top-level property. Server.elicitInput
+ *  compiles that schema with the SDK's bundled Ajv to check an accepted
+ *  answer, and since @modelcontextprotocol/server 2.4.0 (fast-uri 3.1.8) an
+ *  `$id` whose text before the first colon is not a URI scheme
+ *  (`my_form:v1`) fails to compile, which turned the user's accepted answer
+ *  into an InternalError for the child. An `$id` names a schema and does not
+ *  constrain the answer, and an elicitation schema is a flat object of
+ *  primitives (no `$ref` to resolve against it), so dropping it changes
+ *  neither what the client renders nor what validation accepts. The child
+ *  still validates the answer against its own copy. Params with no `$id` are
+ *  returned as the same object. */
+export function withoutSchemaIds<P extends object>(params: P): P {
+  const schema = (params as { requestedSchema?: unknown }).requestedSchema;
+  if (!isPlainObject(schema)) return params;
+  const props = isPlainObject(schema.properties) ? schema.properties : undefined;
+  const propHasId = props !== undefined && Object.values(props).some((p) => isPlainObject(p) && "$id" in p);
+  if (!("$id" in schema) && !propHasId) return params;
+  const { $id: _rootId, ...rest } = schema;
+  const next: Record<string, unknown> = rest;
+  if (props !== undefined && propHasId) {
+    next.properties = Object.fromEntries(
+      Object.entries(props).map(([k, p]) => {
+        if (!isPlainObject(p) || !("$id" in p)) return [k, p];
+        const { $id: _propId, ...propRest } = p;
+        return [k, propRest];
+      }),
+    );
+  }
+  return { ...params, requestedSchema: next };
+}
+
 /** One JSON Schema property as a short type label: `string`, `number|null`
  *  -> `number`, an array of strings -> `string[]`, an enum without a type ->
  *  `enum`, a union -> `a|b`, anything else -> `any`. */
@@ -1632,7 +1664,7 @@ export class ConnectServer {
     // cannot answer them and degrade on their own.
     this.clientBridge = {
       getClientCapabilities: () => this.pushCapabilities(),
-      elicitInput: (params, options) => this.server.elicitInput(params, options),
+      elicitInput: (params, options) => this.server.elicitInput(withoutSchemaIds(params), options),
       // The bridge is typed with the v1 client's shapes (upstream.ts stays on
       // the v1 SDK); v2 narrows `metadata` from `object` to a JSON object.
       // Sidecar params are JSON off the wire, so the narrowing holds.
