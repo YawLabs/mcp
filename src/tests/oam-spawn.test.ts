@@ -977,9 +977,10 @@ describe("rewriteForOam", () => {
       { what: "a short flag", args: ["-r", "./hook.js", "/srv/index.js"] },
       { what: "a value flag given spaced", args: ["--max-old-space-size", "4096", "/srv/index.js"] },
       { what: "a value flag with a non-numeric size", args: ["--max-old-space-size=abc", "/srv/index.js"] },
-      // oam 0.20.0 cannot start under a cap of 1-6 MB (exit 3) and runs out at 7,
-      // where node runs; HEAP_MB keeps anything below 16 on node.
-      { what: "a heap cap oam cannot start under", args: ["--max-old-space-size=8", "/srv/index.js"] },
+      // oam 0.20.0 cannot start under a cap of 1-6 MB (exit 3) and runs out at 7;
+      // HEAP_MB keeps anything below 16 (twice that edge) on node.
+      { what: "a heap cap oam cannot start under", args: ["--max-old-space-size=6", "/srv/index.js"] },
+      { what: "a heap cap inside the 16 MB margin", args: ["--max-old-space-size=8", "/srv/index.js"] },
       { what: "a heap cap just below the minimum", args: ["--max-old-space-size=15", "/srv/index.js"] },
       { what: "a heap cap with a leading zero", args: ["--max-old-space-size=0128", "/srv/index.js"] },
       { what: "a value flag with an empty value", args: ["--max-http-header-size=", "/srv/index.js"] },
@@ -3466,6 +3467,22 @@ describe("scanNodeLaunchFlags", () => {
       rest: ["--expose-gc"],
     });
     expect(scanNodeLaunchFlags(["x.js"])).toEqual({ kind: "entry", flags: [], entry: "x.js", rest: [] });
+  });
+
+  it("hosts a heap cap from 16 MB up, the HEAP_MB minimum", () => {
+    for (const v of ["16", "19", "64", "100", "4096"]) {
+      expect(scanNodeLaunchFlags([`--max-old-space-size=${v}`, "x.js"])).toEqual({
+        kind: "entry",
+        flags: [`--max-old-space-size=${v}`],
+        entry: "x.js",
+        rest: [],
+      });
+    }
+    expect(scanNodeLaunchFlags(["--max-old-space-size=15", "x.js"])).toEqual({
+      kind: "refused",
+      flag: "--max-old-space-size",
+      why: "bad-value",
+    });
   });
 
   it("says no-entry for an empty argv, flags alone, or an empty entry slot", () => {

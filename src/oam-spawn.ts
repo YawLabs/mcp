@@ -1572,26 +1572,36 @@ export function nodeLaunchKind(command: string): "node" | "npx" | null {
  *  `--no-check` is still accepted. */
 const TS_ENTRY_RE = /\.[mc]?ts$/i;
 
-/** A positive whole number, as a size flag's value must be. From the 0.20.0
- *  floor oam refuses a non-whole-number `--max-old-space-size` (abc, 512m,
- *  1.5, 0x10) exactly as node does -- exit 9 with node's "illegal value ...
- *  of type size_t" lines (measured; 0.19.5 warned and ran on its default
- *  cap) -- so such a launch dies on either runtime, and keeping it on node
- *  keeps the familiar error. `=0` still diverges: node reads it as "use the
- *  default", while oam ignores it and keeps OAM_MAX_HEAP_MB or its own cap
- *  (measured on 0.20.0). The leading-digit rule also keeps `05`, `+5` and
- *  `" 5"` off oam. */
+/** A positive whole number: the conservative shape yaw-mcp passes to oam for
+ *  `--max-http-header-size`. Both runtimes accept looser values for that
+ *  flag (`abc`, `0`, `05` all run on oam 0.20.0 and node 22, measured), so
+ *  this guards no divergence; a value outside it simply stays on node. */
 const POSITIVE_INT = /^[1-9]\d*$/;
 
 /** A heap cap in MB that oam can start under: a whole number of at least 16.
- *  On oam 0.20.0 a cap of 1-6 MB fails before the entry runs (exit 3, "GC
- *  during deserialization") and 7 runs out of heap at once, while node starts
- *  at every one of them -- its effective cap sits ~48 MB above the number,
- *  oam's ~6 MB (measured on win-arm64: =8 gives oam 14 MB, node 56). 16 is
- *  twice the measured edge, for platform variance in the startup heap. A
- *  smaller value keeps the launch on node, where it runs. Filed as
- *  YawLabs/oam#479; once a fixed oam is the floor, drop this back to
- *  POSITIVE_INT. */
+ *
+ *  The minimum: on oam 0.20.0 a cap of 1-6 MB fails before the entry runs
+ *  (exit 3, "GC during deserialization") and 7 runs out of heap at once. node
+ *  also fails at 1-3 (exit 134) but starts from 4, with an effective cap
+ *  about 48 MB above the number, against oam's about 6 (measured on
+ *  win-arm64: =8 gives oam 14 MB, node 56). 16 is twice oam's measured edge,
+ *  for platform variance in the startup heap. A smaller value keeps the
+ *  launch on node, which starts it from 4 MB and fails on 1-3 just as oam
+ *  would. Filed as YawLabs/oam#479; once a fixed oam is the floor, drop the
+ *  minimum back to any positive whole number.
+ *
+ *  The shape: from the 0.20.0 floor oam refuses a non-whole-number value
+ *  (abc, 512m, 1.5, 0x10) exactly as node does -- exit 9 with node's "illegal
+ *  value ... of type size_t" lines (measured; 0.19.5 warned and ran on its
+ *  default cap) -- so such a launch dies on either runtime, and keeping it on
+ *  node keeps the familiar error. `=0` still diverges: node reads it as "use
+ *  the default", while oam ignores it and keeps OAM_MAX_HEAP_MB or its own cap
+ *  (measured on 0.20.0). No leading zero, `+` or space: oam 0.20.0 crashes on
+ *  `05`, `+5` and `" 5"` where node runs.
+ *
+ *  Only the launch flag is checked. A cap in the server's env NODE_OPTIONS or
+ *  OAM_MAX_HEAP_MB is not seen by the rewrite, so a value below 8 there still
+ *  reaches oam and fails at startup; the README and --help say so. */
 const HEAP_MB = /^(?:1[6-9]|[2-9]\d|[1-9]\d{2,})$/;
 
 /**

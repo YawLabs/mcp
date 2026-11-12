@@ -112,7 +112,9 @@ describe.skipIf(OAM === null)(`oam runtime contracts (oam ${probe.version ?? "ab
 
     // A small cap keeps the run to a fraction of a second; the banner and the
     // exit code are the same at any cap.
-    const r = await runOam(["run", script], { ...process.env, OAM_MAX_HEAP_MB: "64" });
+    // heapFreeEnv: an outer NODE_OPTIONS cap would win over OAM_MAX_HEAP_MB and
+    // change the banner's label.
+    const r = await runOam(["run", script], heapFreeEnv({ OAM_MAX_HEAP_MB: "64" }));
     expect(r.code).toBe(134);
     expect(r.stderr).toContain("error[OAM-RT-OOM]");
     expect(r.stderr).toContain("set by OAM_MAX_HEAP_MB");
