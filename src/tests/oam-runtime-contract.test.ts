@@ -160,6 +160,23 @@ describe.skipIf(OAM === null)(`oam runtime contracts (oam ${probe.version ?? "ab
     expect(r.stdout).toBe("");
   });
 
+  it("a node launch's --max-old-space-size below 16 runs on oam's 16 MB minimum, and the banner says it was raised", async () => {
+    // Why scanNodeLaunchFlags hosts a cap of 1-15 (HEAP_MB): from the 0.20.1
+    // floor oam raises it instead of dying at startup (YawLabs/oam#479; 0.20.0
+    // exited 3 at 1-6). The OOM proves the entry ran under the raised cap.
+    const script = oomScript();
+    const rewritten = rewriteForOam("node", ["--max-old-space-size=5", script], {
+      oamBin: OAM as string,
+      resolveEntry: () => null,
+    });
+    expect(rewritten.args).toEqual(["run", "--max-old-space-size=5", script]);
+    const r = await runOam(rewritten.args, heapFreeEnv({}));
+    expect(r.code, r.stderr).toBe(134);
+    expect(r.stderr).toContain("error[OAM-RT-OOM]");
+    expect(r.stderr).toContain("set by --max-old-space-size to 5 MB, raised to oam's 16 MB minimum");
+    expect(r.stdout).toBe("");
+  });
+
   it("a non-whole-number --max-old-space-size exits 9 on oam, as on node", async () => {
     // Why keeping such a launch on node (scanNodeLaunchFlags' bad-value) loses
     // nothing: from 0.20.0 oam refuses it the way node does, so it would die
