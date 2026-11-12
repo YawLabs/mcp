@@ -977,12 +977,10 @@ describe("rewriteForOam", () => {
       { what: "a short flag", args: ["-r", "./hook.js", "/srv/index.js"] },
       { what: "a value flag given spaced", args: ["--max-old-space-size", "4096", "/srv/index.js"] },
       { what: "a value flag with a non-numeric size", args: ["--max-old-space-size=abc", "/srv/index.js"] },
-      // oam 0.20.0 cannot start under a cap of 1-6 MB (exit 3) and runs out at 7;
-      // HEAP_MB keeps anything below 16 (twice that edge) on node.
-      { what: "a heap cap oam cannot start under", args: ["--max-old-space-size=6", "/srv/index.js"] },
-      { what: "a heap cap inside the 16 MB margin", args: ["--max-old-space-size=8", "/srv/index.js"] },
-      { what: "a heap cap just below the minimum", args: ["--max-old-space-size=15", "/srv/index.js"] },
       { what: "a heap cap with a leading zero", args: ["--max-old-space-size=0128", "/srv/index.js"] },
+      { what: "a heap cap with a plus sign", args: ["--max-old-space-size=+64", "/srv/index.js"] },
+      // =0 diverges: node reads it as its default, oam keeps OAM_MAX_HEAP_MB.
+      { what: "a zero heap cap", args: ["--max-old-space-size=0", "/srv/index.js"] },
       { what: "a value flag with an empty value", args: ["--max-http-header-size=", "/srv/index.js"] },
       { what: "an unknown dns order", args: ["--dns-result-order=bogus", "/srv/index.js"] },
       { what: "a zero header size", args: ["--max-http-header-size=0", "/srv/index.js"] },
@@ -3032,7 +3030,7 @@ describe("MIN_OAM_VERSION freshness floor", () => {
   /** The ratchet. ONE literal, and the title is built from it, so the two
    *  cannot say different numbers -- the title used to name 0.13.0 while the
    *  body asserted 0.13.1. */
-  const FLOOR = "0.20.0";
+  const FLOOR = "0.20.1";
 
   it(`is at least ${FLOOR} (bump this literal when you bump the floor)`, () => {
     // POLICY (see the constant's doc): the floor is the last oam release the
@@ -3469,8 +3467,10 @@ describe("scanNodeLaunchFlags", () => {
     expect(scanNodeLaunchFlags(["x.js"])).toEqual({ kind: "entry", flags: [], entry: "x.js", rest: [] });
   });
 
-  it("hosts a heap cap from 16 MB up, the HEAP_MB minimum", () => {
-    for (const v of ["16", "19", "64", "100", "4096"]) {
+  it("hosts any positive whole-number heap cap: from the 0.20.1 floor oam raises one below 16 MB to 16", () => {
+    // 1.1.11 kept 1-15 on node because oam 0.20.0 could not start under them
+    // (YawLabs/oam#479); the contract test pins the raise on the real binary.
+    for (const v of ["1", "6", "8", "15", "16", "19", "64", "100", "4096"]) {
       expect(scanNodeLaunchFlags([`--max-old-space-size=${v}`, "x.js"])).toEqual({
         kind: "entry",
         flags: [`--max-old-space-size=${v}`],
@@ -3478,7 +3478,7 @@ describe("scanNodeLaunchFlags", () => {
         rest: [],
       });
     }
-    expect(scanNodeLaunchFlags(["--max-old-space-size=15", "x.js"])).toEqual({
+    expect(scanNodeLaunchFlags(["--max-old-space-size=0", "x.js"])).toEqual({
       kind: "refused",
       flag: "--max-old-space-size",
       why: "bad-value",

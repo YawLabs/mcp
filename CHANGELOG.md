@@ -4,6 +4,14 @@ All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented 
 
 ## Unreleased
 
+**Changed -- the oam floor moves to 0.20.1**
+
+`npm run verify:oam-floor` hosted a stdio `@modelcontextprotocol/server` server on oam v0.20.1 through `oam run` on 2026-11-12 -- both protocol eras, 2025-11-25 (initialize) and 2026-07-28 (server/discover), each through tools/list and tools/call -- and raised `MIN_OAM_VERSION` to it; the floor was 0.20.0. A machine whose oam is older hosts its node/npx sidecars on node instead, and logs a warning naming both versions, `oam self-update` as the fix, and that yaw-mcp needs a restart afterwards.
+
+**Changed -- a `node --max-old-space-size` below 16 is hosted on oam again**
+
+oam 0.20.1 raises a heap cap under 16 MB to 16 MB instead of failing at startup (YawLabs/oam#479), from the launch flag, `NODE_OPTIONS` and `OAM_MAX_HEAP_MB` alike, and its out-of-memory message says so (`set by --max-old-space-size to 5 MB, raised to oam's 16 MB minimum`). With that oam as the floor, a `node` launch whose `--max-old-space-size` is any positive whole number now moves onto `oam run`; 1.1.11 kept 1-15 on node. The README and `--help` no longer warn that a `NODE_OPTIONS` or `OAM_MAX_HEAP_MB` cap below 8 fails at startup on oam.
+
 ## 1.1.11
 
 **Breaking -- exit codes, `--json` failure output and `LOG_LEVEL`**

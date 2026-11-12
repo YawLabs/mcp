@@ -710,10 +710,8 @@ if (subcommand === "compliance") {
                                which leaves OAM_MAX_HEAP_MB in charge on oam.
                                <mb> must be a whole number: 512m or 1.5 makes
                                the server exit 9 at startup on oam and node
-                               alike. A launch flag below 16 keeps the server
-                               on node; a NODE_OPTIONS or OAM_MAX_HEAP_MB cap
-                               below 8 is not caught and fails at startup on
-                               oam, so use 16 or more there.
+                               alike. oam raises any cap below 16 to 16 and
+                               says so in its out-of-memory message.
     MCP_CONNECT_TIMEOUT           Milliseconds to wait for a server's MCP
                                handshake (default 15000). This is the FALLBACK
                                only -- a server's own \`connectTimeoutMs\` in

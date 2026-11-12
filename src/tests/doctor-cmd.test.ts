@@ -5348,10 +5348,10 @@ describe("runDoctor -- a launch path written for another OS", () => {
     expect(gone.find((c) => c.clientId === "claude-code" && c.scope === "user")?.launchCommandMissing).toBe(bare);
   });
 
-  it("on win32 an oam.cmd shim (npm install -g's shape) resolves through PATHEXT too", async () => {
-    // `npm install -g` writes oam.cmd + oam.ps1, not oam.exe, so the .exe-only
-    // tests above pin a binary that exists only for a manually downloaded
-    // release. .cmd is in the fixed WIN_PATHEXT list; this holds the list to it.
+  it("on win32 an oam.cmd shim resolves through PATHEXT too", async () => {
+    // oam ships as oam.exe (it is never published to npm), but a hand-written
+    // oam.cmd wrapper on PATH still resolves as oam. .cmd is in the
+    // fixed WIN_PATHEXT list; this holds the list to it.
     writeFileSync(join(synthHome, "oam.cmd"), "");
     const bare = join(synthHome, "oam");
     writeFileSync(

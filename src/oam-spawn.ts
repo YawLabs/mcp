@@ -310,7 +310,7 @@ export function npxSpec(args: readonly string[]): string | null {
  * floor that is too high costs a fallback, while one that is too low hosts
  * production sidecars on a build the check never ran on.
  */
-export const MIN_OAM_VERSION = "0.20.0";
+export const MIN_OAM_VERSION = "0.20.1";
 
 /** The oam installer one-liners, as oamjs.org publishes them. Both install the
  *  current release, which always satisfies MIN_OAM_VERSION. */
@@ -471,12 +471,14 @@ export function oamBuildTreeFix(os: InstallOS, viaOamBin = false): string {
  * The hint names no default cap, because the cgroup rule makes any single
  * number wrong somewhere. It does not need one: the banner is the last thing
  * oam writes before exiting, so the stderr tail that both callers in
- * upstream.ts append to the same message carries the real cap. From the
- * 0.20.0 floor its source label names the setting that set the cap -- "set
- * by --max-old-space-size" (a `run` flag), "set by NODE_OPTIONS
- * --max-old-space-size" or "set by OAM_MAX_HEAP_MB" (measured on 0.20.0;
- * before 0.20.0 it said OAM_MAX_HEAP_MB for all three). The tail follows the
- * hint in that message, so the label comes after the advice.
+ * upstream.ts append to the same message carries the real cap. From oam
+ * 0.20.0 (below the floor) its source label names the setting that set the
+ * cap -- "set by --max-old-space-size" (a `run` flag), "set by NODE_OPTIONS
+ * --max-old-space-size" or "set by OAM_MAX_HEAP_MB" (measured on 0.20.0 and
+ * 0.20.1; before 0.20.0 it said OAM_MAX_HEAP_MB for all three). From the
+ * 0.20.1 floor a cap below 16 MB adds "to N MB, raised to oam's 16 MB
+ * minimum" to the label (measured on 0.20.1). The tail follows the hint in
+ * that message, so the label comes after the advice.
  *
  * node's own knob works too, on every oam yaw-mcp hosts on (since 0.19.5): oam reads
  * `--max-old-space-size=<mb>` from NODE_OPTIONS and from a node flag that
@@ -1356,14 +1358,11 @@ async function probeOamUncached(run: (bin: string) => Promise<string>, generatio
         minVersion: MIN_OAM_VERSION,
         // The floor is a released oam (the last one verify:oam-floor passed
         // on), so below-min always means out of date, and oam updates itself
-        // in place. "In place" holds for every binary that reaches here only
-        // while the floor is 0.20.0: oam 0.20.0+ refuses `self-update` for a
-        // binary inside node_modules (pointing at `npm install -g
-        // oamjs@latest`), and npm's oamjs exposes `oamjs`, not `oam`, so
-        // only an OAM_BIN can point there. When the floor rises past 0.20.x,
-        // and oamjs is published, route this remedy and its copies (doctor,
-        // install, upgrade, verify-oam-floor) through one helper that checks
-        // the resolved path for a node_modules component.
+        // in place. oam 0.20.0+ refuses `self-update` for a binary inside
+        // node_modules, but oam is never published to npm, so no installer
+        // puts one there: only a hand-pointed OAM_BIN could, and that is not
+        // a case this remedy (or its copies in doctor, install, upgrade and
+        // verify-oam-floor) needs to special-case.
         updateWith: "oam self-update",
         // ...but updating alone changes nothing here. A non-timeout verdict
         // like this one is cached for the process lifetime and only cleared by
@@ -1575,43 +1574,47 @@ const TS_ENTRY_RE = /\.[mc]?ts$/i;
 /** A positive whole number: the conservative shape yaw-mcp passes to oam for
  *  `--max-http-header-size`. Both runtimes accept looser values for that
  *  flag (`abc`, `0`, `05` all run on oam 0.20.0 and node 22, measured), so
- *  this guards no divergence; a value outside it simply stays on node. */
+ *  this guards no divergence; a value outside it simply stays on node. Also
+ *  the shape of `--max-old-space-size` (see {@link HEAP_MB}). */
 const POSITIVE_INT = /^[1-9]\d*$/;
 
-/** A heap cap in MB that oam can start under: a whole number of at least 16.
+/** A heap cap in MB that yaw-mcp carries onto `oam run`: any positive whole
+ *  number.
  *
- *  The minimum: on oam 0.20.0 a cap of 1-6 MB fails before the entry runs
- *  (exit 3, "GC during deserialization") and 7 runs out of heap at once. node
- *  also fails at 1-3 (exit 134) but starts from 4, with an effective cap
- *  about 48 MB above the number, against oam's about 6 (measured on
- *  win-arm64: =8 gives oam 14 MB, node 56). 16 is twice oam's measured edge,
- *  for platform variance in the startup heap. A smaller value keeps the
- *  launch on node, which starts it from 4 MB and fails on 1-3 just as oam
- *  would. Filed as YawLabs/oam#479; once a fixed oam is the floor, drop the
- *  minimum back to any positive whole number.
+ *  No minimum: from the 0.20.1 floor oam raises a cap under 16 MB to 16 MB
+ *  and runs (YawLabs/oam#479), from every source -- the launch flag,
+ *  NODE_OPTIONS and OAM_MAX_HEAP_MB -- and an OOM banner then reads "set by
+ *  --max-old-space-size to 5 MB, raised to oam's 16 MB minimum" (measured on
+ *  0.20.1, win-arm64, 2026-11-12: =1 through =15 all run with a 22 MB V8
+ *  heap_size_limit, the same as =16). 0.20.0 failed at 1-6 MB before the
+ *  entry ran (exit 3, "GC during deserialization") and ran out of heap at 7,
+ *  so 1.1.11 kept anything below 16 on node. node itself dies at 1-3 (its own
+ *  heap OOM) and starts from 4, so at 1-3 oam now runs a launch node cannot;
+ *  that difference only turns a server that would die into one that starts.
+ *  The effective cap still differs at every size, as it always has: oam's
+ *  heap_size_limit sits about 6 MB above the number and node's about 48
+ *  (measured: =16 gives oam 22 MB, node 64).
  *
- *  The shape: from the 0.20.0 floor oam refuses a non-whole-number value
- *  (abc, 512m, 1.5, 0x10) exactly as node does -- exit 9 with node's "illegal
- *  value ... of type size_t" lines (measured; 0.19.5 warned and ran on its
- *  default cap) -- so such a launch dies on either runtime, and keeping it on
- *  node keeps the familiar error. `=0` still diverges: node reads it as "use
- *  the default", while oam ignores it and keeps OAM_MAX_HEAP_MB or its own cap
- *  (measured on 0.20.0). No leading zero, `+` or space: oam 0.20.0 crashes on
- *  `05`, `+5` and `" 5"` where node runs.
- *
- *  Only the launch flag is checked. A cap in the server's env NODE_OPTIONS or
- *  OAM_MAX_HEAP_MB is not seen by the rewrite, so a value below 8 there still
- *  reaches oam and fails at startup; the README and --help say so. */
-const HEAP_MB = /^(?:1[6-9]|[2-9]\d|[1-9]\d{2,})$/;
+ *  The shape: from 0.20.0 oam refuses a non-whole-number value (abc, 512m,
+ *  1.5, 0x10) exactly as node does -- exit 9 with node's "illegal value ...
+ *  of type size_t" lines (measured again on 0.20.1) -- so such a launch dies
+ *  on either runtime, and keeping it on node keeps the familiar error. `=0`
+ *  still diverges: node reads it as "use the default", while oam ignores it
+ *  and keeps OAM_MAX_HEAP_MB or its own cap. A leading zero, `+` or space
+ *  (`05`, `+5`, `" 5"`) crashed oam 0.20.0 and runs on 0.20.1 and node alike
+ *  (measured), but stays on node anyway: nobody writes a cap that way, and
+ *  the conservative shape is the one {@link POSITIVE_INT} already pins. */
+const HEAP_MB = POSITIVE_INT;
 
 /**
  * Node runtime flags yaw-mcp carries from a `node` launch onto `oam run`, each
  * VERIFIED against the real oam 0.19.5 (then the floor) by running
  * `oam run <flag> probe.js` beside `node <flag> probe.js` on 2026-11-09 and
- * comparing what the flag changed. On the 0.20.0 floor the
+ * comparing what the flag changed. On the 0.20.1 floor the
  * oam-runtime-contract test confirms each one is accepted and kept in
  * execArgv, and --max-old-space-size's cap, banner label and value
- * validation were re-measured on 0.20.0 (2026-11-12). oam accepts more (its NODE_STYLE_FLAGS,
+ * validation were re-measured on 0.20.0 and again on 0.20.1, with the
+ * sub-16 MB raise (2026-11-12). oam accepts more (its NODE_STYLE_FLAGS,
  * crates/oam_cli/src/main.rs); this list is the subset whose behavior matched
  * node for a sidecar, and it is deliberately conservative -- a flag missing
  * here costs a node launch, a wrong one hosts a server that behaves
@@ -1628,12 +1631,13 @@ const HEAP_MB = /^(?:1[6-9]|[2-9]\d|[1-9]\d{2,})$/;
  *   --expose-gc                            globalThis.gc is callable on both
  *
  * Value flags (the `--flag=value` form only, value checked):
- *   --max-old-space-size=N    the heap cap, N >= 16 (see HEAP_MB). oam sets it
+ *   --max-old-space-size=N    the heap cap, N >= 1 (see HEAP_MB). oam sets it
  *                             for this process only (from 0.20.0 it is not
  *                             exported as OAM_MAX_HEAP_MB, so the server's
  *                             own children do not inherit it, as on node);
  *                             an N-MB cap ends in exit 134 + error[OAM-RT-OOM]
- *                             "set by --max-old-space-size"
+ *                             "set by --max-old-space-size" (N < 16 runs on
+ *                             16, and the banner says it was raised)
  *   --max-http-header-size=N  http.maxHeaderSize reads N on both
  *   --dns-result-order=V      dns.getDefaultResultOrder() reads V on both;
  *                             verbatim, ipv4first and ipv6first
