@@ -112,9 +112,12 @@ describe.skipIf(OAM === null)(`oam runtime contracts (oam ${probe.version ?? "ab
 
     // A small cap keeps the run to a fraction of a second; the banner and the
     // exit code are the same at any cap.
-    const r = await runOam(["run", script], { ...process.env, OAM_MAX_HEAP_MB: "64" });
+    // heapFreeEnv: an outer NODE_OPTIONS cap would win over OAM_MAX_HEAP_MB and
+    // change the banner's label.
+    const r = await runOam(["run", script], heapFreeEnv({ OAM_MAX_HEAP_MB: "64" }));
     expect(r.code).toBe(134);
     expect(r.stderr).toContain("error[OAM-RT-OOM]");
+    expect(r.stderr).toContain("set by OAM_MAX_HEAP_MB");
     // stdout is the MCP protocol channel for a hosted sidecar; the death must
     // not write to it.
     expect(r.stdout).toBe("");
@@ -138,7 +141,7 @@ describe.skipIf(OAM === null)(`oam runtime contracts (oam ${probe.version ?? "ab
     return script;
   }
 
-  it("a node launch's --max-old-space-size, as the rewrite emits it, caps the heap on oam (0.19.5 floor)", async () => {
+  it("a node launch's --max-old-space-size, as the rewrite emits it, caps the heap on oam, and the banner names the flag", async () => {
     // The exact argv rewriteForOam builds for `node --max-old-space-size=64 x`,
     // so this proves the rewrite's shape AND oam's honoring of the flag.
     const script = oomScript();
@@ -151,7 +154,22 @@ describe.skipIf(OAM === null)(`oam runtime contracts (oam ${probe.version ?? "ab
     expect(r.code, r.stderr).toBe(134);
     expect(r.stderr).toContain("error[OAM-RT-OOM]");
     expect(r.stderr).toContain("64 MB");
+    // From 0.20.0 the banner names the setting that set the cap; oamHeapOomHint's
+    // comment rests on it.
+    expect(r.stderr).toContain("set by --max-old-space-size");
     expect(r.stdout).toBe("");
+  });
+
+  it("a non-whole-number --max-old-space-size exits 9 on oam, as on node", async () => {
+    // Why keeping such a launch on node (scanNodeLaunchFlags' bad-value) loses
+    // nothing: from 0.20.0 oam refuses it the way node does, so it would die
+    // on either runtime.
+    const script = nodePath.join(dir, "ok.mjs");
+    writeFileSync(script, "console.log('ran');\n");
+    const r = await runOam(["run", "--max-old-space-size=abc", script], heapFreeEnv({}));
+    expect(r.code, r.stderr).toBe(9);
+    expect(r.stderr).toContain("illegal value for flag");
+    expect(r.stdout).not.toContain("ran");
   });
 
   it("NODE_OPTIONS=--max-old-space-size caps the heap on oam, and beats OAM_MAX_HEAP_MB", async () => {
@@ -166,6 +184,9 @@ describe.skipIf(OAM === null)(`oam runtime contracts (oam ${probe.version ?? "ab
     expect(r.code, r.stderr).toBe(134);
     expect(r.stderr).toContain("error[OAM-RT-OOM]");
     expect(r.stderr).toContain("64 MB");
+    // The label proves the precedence directly: NODE_OPTIONS set the cap, not
+    // OAM_MAX_HEAP_MB=4096.
+    expect(r.stderr).toContain("set by NODE_OPTIONS --max-old-space-size");
     expect(r.stdout).toBe("");
   });
 

@@ -100,6 +100,14 @@ The opt-in foundry harvest (`YAW_MCP_FOUNDRY=1`) now records `loaded` on each `~
 
 `npm run verify:oam-floor` prints its FAIL line, not a stack trace, when the probe server exits between answers or a `--raise` file write fails, and `--raise` on an oam version with build metadata (`0.20.0+abc`) writes the bare version.
 
+**Changed -- the oam floor moves to 0.20.0**
+
+`npm run verify:oam-floor` hosted a stdio `@modelcontextprotocol/server` server on oam v0.20.0 through `oam run` on 2026-11-12 -- both protocol eras, 2025-11-25 (initialize) and 2026-07-28 (server/discover), each through tools/list and tools/call -- and raised `MIN_OAM_VERSION` to it; the floor was 0.19.5. A machine whose oam is older hosts its node/npx sidecars on node instead, and logs a warning naming both versions, `oam self-update` as the fix, and that yaw-mcp needs a restart afterwards.
+
+**Changed -- a `node --max-old-space-size=N` launch moves to oam only when N is at least 16**
+
+On oam 0.20.0 a heap cap of 1-6 MB fails before the server's entry runs (exit 3) and 7 MB runs out of heap at once. node starts from 4 MB (it fails on 1-3 as well), because its effective cap sits about 48 MB above the number and oam's about 6 MB. Such a launch now stays on node; `doctor` reports it as `node-flag-entry`, as it does for any node flag the rewrite will not carry. A cap of 16 MB or more is hosted on oam as before. The oam side is filed as YawLabs/oam#479. The OAM_MAX_HEAP_MB help text and README row now say that `<mb>` must be a whole number (`512m` or `1.5` makes the server exit 9 on oam 0.20.0 and on node), that `NODE_OPTIONS=--max-old-space-size=0` leaves `OAM_MAX_HEAP_MB` in charge on oam, and that oam's out-of-memory message names which setting set the cap (it said `OAM_MAX_HEAP_MB` for all three before 0.20.0). Only the launch flag is checked: a `NODE_OPTIONS` or `OAM_MAX_HEAP_MB` cap below 8 in a server's env still reaches oam and fails at startup, which the help text and README now say.
+
 ## 1.1.10 -- the oam floor moves to 0.19.5, and a `node` launch with runtime flags is hosted on oam
 
 **Changed -- the oam floor moves to 0.19.5**

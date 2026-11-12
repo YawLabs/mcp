@@ -440,7 +440,14 @@ function openLockSync(path: string): number {
  *  unreadable or unparseable answers true -- an unknown holder is honoured,
  *  the mtime rule still bounds the wait. A reused pid can only produce a
  *  false "alive" (the old behaviour: wait out the window), never a false
- *  steal. */
+ *  steal.
+ *
+ *  Under a broker hosted on oam (install-targets' `oam run --no-check`
+ *  entry, which MIN_OAM_VERSION does not gate -- the floor gates sidecar
+ *  launches only), the ESRCH answer needs oam >= 0.20.0: earlier oam answered
+ *  EPERM for every pid, live or dead, so there every holder reads as alive
+ *  and the mtime rule decides -- the slow path, never a false steal. Measured
+ *  on 0.20.0: kill(<exited child pid>, 0) and kill(999999, 0) throw ESRCH. */
 function lockHolderAlive(lockPath: string): boolean {
   let pid: number;
   try {
