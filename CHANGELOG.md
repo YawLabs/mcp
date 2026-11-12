@@ -4,6 +4,8 @@ All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented 
 
 ## Unreleased
 
+## 1.1.12
+
 **Changed -- the oam floor moves to 0.20.1**
 
 `npm run verify:oam-floor` hosted a stdio `@modelcontextprotocol/server` server on oam v0.20.1 through `oam run` on 2026-11-12 -- both protocol eras, 2025-11-25 (initialize) and 2026-07-28 (server/discover), each through tools/list and tools/call -- and raised `MIN_OAM_VERSION` to it; the floor was 0.20.0. A machine whose oam is older hosts its node/npx sidecars on node instead, and logs a warning naming both versions, `oam self-update` as the fix, and that yaw-mcp needs a restart afterwards.
