@@ -161,8 +161,8 @@ describe.skipIf(OAM === null)(`oam runtime contracts (oam ${probe.version ?? "ab
   });
 
   it("a node launch's --max-old-space-size below 16 runs on oam's 16 MB minimum, and the banner says it was raised", async () => {
-    // Why scanNodeLaunchFlags hosts a cap of 1-15 (HEAP_MB): from the 0.20.1
-    // floor oam raises it instead of dying at startup (YawLabs/oam#479; 0.20.0
+    // Why scanNodeLaunchFlags hosts a cap of 1-15 (HEAP_MB): from oam 0.20.1
+    // (below the floor) oam raises it instead of dying at startup (YawLabs/oam#479; 0.20.0
     // exited 3 at 1-6). The OOM proves the entry ran under the raised cap.
     const script = oomScript();
     const rewritten = rewriteForOam("node", ["--max-old-space-size=5", script], {

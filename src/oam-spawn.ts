@@ -310,7 +310,7 @@ export function npxSpec(args: readonly string[]): string | null {
  * floor that is too high costs a fallback, while one that is too low hosts
  * production sidecars on a build the check never ran on.
  */
-export const MIN_OAM_VERSION = "0.20.1";
+export const MIN_OAM_VERSION = "0.20.2";
 
 /** The oam installer one-liners, as oamjs.org publishes them. Both install the
  *  current release, which always satisfies MIN_OAM_VERSION. */
@@ -475,8 +475,8 @@ export function oamBuildTreeFix(os: InstallOS, viaOamBin = false): string {
  * 0.20.0 (below the floor) its source label names the setting that set the
  * cap -- "set by --max-old-space-size" (a `run` flag), "set by NODE_OPTIONS
  * --max-old-space-size" or "set by OAM_MAX_HEAP_MB" (measured on 0.20.0 and
- * 0.20.1; before 0.20.0 it said OAM_MAX_HEAP_MB for all three). From the
- * 0.20.1 floor a cap below 16 MB adds "to N MB, raised to oam's 16 MB
+ * 0.20.1; before 0.20.0 it said OAM_MAX_HEAP_MB for all three). From oam
+ * 0.20.1 (below the floor) a cap below 16 MB adds "to N MB, raised to oam's 16 MB
  * minimum" to the label (measured on 0.20.1). The tail follows the hint in
  * that message, so the label comes after the advice.
  *
@@ -1581,7 +1581,7 @@ const POSITIVE_INT = /^[1-9]\d*$/;
 /** A heap cap in MB that yaw-mcp carries onto `oam run`: any positive whole
  *  number.
  *
- *  No minimum: from the 0.20.1 floor oam raises a cap under 16 MB to 16 MB
+ *  No minimum: from oam 0.20.1 (below the floor) oam raises a cap under 16 MB to 16 MB
  *  and runs (YawLabs/oam#479), from every source -- the launch flag,
  *  NODE_OPTIONS and OAM_MAX_HEAP_MB -- and an OOM banner then reads "set by
  *  --max-old-space-size to 5 MB, raised to oam's 16 MB minimum" (measured on
@@ -1610,7 +1610,7 @@ const HEAP_MB = POSITIVE_INT;
  * Node runtime flags yaw-mcp carries from a `node` launch onto `oam run`, each
  * VERIFIED against the real oam 0.19.5 (then the floor) by running
  * `oam run <flag> probe.js` beside `node <flag> probe.js` on 2026-11-09 and
- * comparing what the flag changed. On the 0.20.1 floor the
+ * comparing what the flag changed. On every oam at or above the floor the
  * oam-runtime-contract test confirms each one is accepted and kept in
  * execArgv, and --max-old-space-size's cap, banner label and value
  * validation were re-measured on 0.20.0 and again on 0.20.1, with the
