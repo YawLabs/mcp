@@ -10,6 +10,14 @@ The server SDK moves from `~2.3.1` to `~2.4.0` (the dev-only `@modelcontextproto
 
 One 2.4.0 change did reach yaw-mcp, and it is handled. The server SDK's bundled Ajv now uses fast-uri 3.1.8, which refuses to compile a schema whose `$id` has no valid URI scheme before its first colon (`my_form:v1`: "URI scheme is malformed"). yaw-mcp forwards a child server's `elicitation/create` through that SDK, which compiles the child's `requestedSchema` to check an accepted answer, so on the 2025 protocol a child whose form schema carried such an `$id` would have had the user's accepted answer turned into an error. yaw-mcp now drops every `$id` keyword from a forwarded `requestedSchema` -- the root, each field, and anything nested under them such as a multi-select field's `items` -- before sending it on; a field named `$id` and an `$id` inside an `enum`, `const`, `default` or `examples` value are kept, and `$ref` is left alone. An `$id` only names a schema, so the client renders the same form and the same answers are accepted; the child still checks the answer against its own copy.
 
+**Changed -- the oam floor moves to 0.20.2**
+
+`npm run verify:oam-floor` hosted a stdio `@modelcontextprotocol/server` server on oam v0.20.2 through `oam run` on 2026-11-13 -- both protocol eras, 2025-11-25 (initialize) and 2026-07-28 (server/discover), each through tools/list and tools/call -- and raised `MIN_OAM_VERSION` to it; the floor was 0.20.1. A machine whose oam is older hosts its node/npx sidecars on node instead, and logs a warning naming both versions, `oam self-update` as the fix, and that yaw-mcp needs a restart afterwards.
+
+**Changed -- what the 0.20.2 floor brings to yaw-mcp and the servers it hosts on oam**
+
+No yaw-mcp option, output or exit code changes; three oam fixes now reach every machine that hosts on oam. On Windows, a child started with `windowsHide: true` now opens its window hidden, as under node (libuv's `SW_HIDE`). Before, oam applied that only to spawns with extra stdio slots or an `argv0`. This covers every server yaw-mcp spawns while it runs on oam, since the MCP SDK sets `windowsHide` on Windows, and every child a hosted server spawns that way. Console programs (node, npx, uvx, python) already started without a console window, so the change shows only for a GUI program. Also on Windows, a hosted server's `spawnSync` / `execSync` child now joins oam's kill-on-close job before it runs rather than just after it starts, so it cannot outlive the server in that window. On Linux and macOS, a hosted server that uses `cluster` and ends with `process.exit()` now takes its workers with it, as under node; before, they kept running after the server had gone.
+
 ## 1.1.12
 
 **Changed -- the oam floor moves to 0.20.1**

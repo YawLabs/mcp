@@ -3030,7 +3030,7 @@ describe("MIN_OAM_VERSION freshness floor", () => {
   /** The ratchet. ONE literal, and the title is built from it, so the two
    *  cannot say different numbers -- the title used to name 0.13.0 while the
    *  body asserted 0.13.1. */
-  const FLOOR = "0.20.1";
+  const FLOOR = "0.20.2";
 
   it(`is at least ${FLOOR} (bump this literal when you bump the floor)`, () => {
     // POLICY (see the constant's doc): the floor is the last oam release the
@@ -3467,7 +3467,7 @@ describe("scanNodeLaunchFlags", () => {
     expect(scanNodeLaunchFlags(["x.js"])).toEqual({ kind: "entry", flags: [], entry: "x.js", rest: [] });
   });
 
-  it("hosts any positive whole-number heap cap: from the 0.20.1 floor oam raises one below 16 MB to 16", () => {
+  it("hosts any positive whole-number heap cap: from oam 0.20.1 (below the floor) oam raises one below 16 MB to 16", () => {
     // 1.1.11 kept 1-15 on node because oam 0.20.0 could not start under them
     // (YawLabs/oam#479); the contract test pins the raise on the real binary.
     for (const v of ["1", "6", "8", "15", "16", "19", "64", "100", "4096"]) {
