@@ -100,6 +100,7 @@ import {
   resolveIdleThreshold,
   resolveProtocolMode,
   resolveToolExposure,
+  withoutSchemaIds,
 } from "../server.js";
 import type { UpstreamConnection, UpstreamServerConfig } from "../types.js";
 import {
@@ -7035,6 +7036,122 @@ describe("downstream client bridge", () => {
     // A downstream rejection surfaces verbatim -- no invented default.
     priv.server.elicitInput = vi.fn().mockRejectedValue(new Error("client declined"));
     await expect(bridge.elicitInput(elicitParams)).rejects.toThrow("client declined");
+  });
+
+  it("withoutSchemaIds returns the same object when the params carry no requestedSchema", () => {
+    const noSchema = { message: "m" };
+    expect(withoutSchemaIds(noSchema)).toBe(noSchema);
+  });
+
+  it("withoutSchemaIds drops a root-only $id and leaves properties untouched", () => {
+    const props = { a: { type: "string" } };
+    const out = withoutSchemaIds({ message: "m", requestedSchema: { $id: "x:y", type: "object", properties: props } });
+    expect(out.requestedSchema).toEqual({ type: "object", properties: props });
+    expect((out.requestedSchema as { properties: unknown }).properties).toBe(props);
+  });
+
+  it("withoutSchemaIds drops a nested $id (a multi-select field's items) and makes it compile", async () => {
+    const schema = {
+      type: "object",
+      properties: { tags: { type: "array", items: { $id: "my_tag:item", enum: ["a", "b"] } } },
+    };
+    const out = withoutSchemaIds({ message: "m", requestedSchema: schema });
+    expect(out.requestedSchema).toEqual({
+      type: "object",
+      properties: { tags: { type: "array", items: { enum: ["a", "b"] } } },
+    });
+    const { AjvJsonSchemaValidator } = await import("@modelcontextprotocol/server/validators/ajv");
+    const v = new AjvJsonSchemaValidator();
+    expect(() => v.getValidator(schema)).toThrow();
+    expect(v.getValidator(out.requestedSchema as typeof schema)({ tags: ["a"] }).valid).toBe(true);
+  });
+
+  it("withoutSchemaIds drops $id inside oneOf / anyOf option lists (titled enums)", () => {
+    const single = {
+      type: "string",
+      oneOf: [
+        { const: "a", title: "A", $id: "opt:a" },
+        { const: "b", title: "B" },
+      ],
+    };
+    const multi = {
+      type: "array",
+      items: {
+        anyOf: [
+          { const: "x", title: "X", $id: "opt:x" },
+          { const: "y", title: "Y" },
+        ],
+      },
+    };
+    const out = withoutSchemaIds({
+      message: "m",
+      requestedSchema: { type: "object", properties: { single, multi } },
+    });
+    expect(out.requestedSchema).toEqual({
+      type: "object",
+      properties: {
+        single: {
+          type: "string",
+          oneOf: [
+            { const: "a", title: "A" },
+            { const: "b", title: "B" },
+          ],
+        },
+        multi: {
+          type: "array",
+          items: {
+            anyOf: [
+              { const: "x", title: "X" },
+              { const: "y", title: "Y" },
+            ],
+          },
+        },
+      },
+    });
+    // The option that had no $id is kept as the same object.
+    const props = (out.requestedSchema as any).properties;
+    expect(props.single.oneOf[1]).toBe(single.oneOf[1]);
+    expect(props.multi.items.anyOf[1]).toBe(multi.items.anyOf[1]);
+  });
+
+  it("withoutSchemaIds returns the same object for a deep schema with no $id", () => {
+    const params = {
+      message: "m",
+      requestedSchema: {
+        type: "object",
+        properties: {
+          single: { type: "string", oneOf: [{ const: "a", title: "A" }] },
+          multi: { type: "array", items: { anyOf: [{ const: "x", title: "X" }] } },
+          tags: { type: "array", items: { type: "string", enum: ["a"] } },
+        },
+      },
+    };
+    expect(withoutSchemaIds(params)).toBe(params);
+  });
+
+  it("withoutSchemaIds keeps sibling fields as the same objects when a nested $id is dropped", () => {
+    const other = { type: "string", title: "Other" };
+    const out = withoutSchemaIds({
+      message: "m",
+      requestedSchema: {
+        type: "object",
+        properties: { tags: { type: "array", items: { $id: "my_tag:item", type: "string", enum: ["a"] } }, other },
+      },
+    });
+    expect((out.requestedSchema as any).properties.other).toBe(other);
+    expect((out.requestedSchema as any).properties.tags.items).toEqual({ type: "string", enum: ["a"] });
+  });
+
+  it("withoutSchemaIds keeps a property named $id and an $id inside instance data", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        $id: { type: "string", default: "x" },
+        pick: { type: "object", const: { $id: "data" }, default: { $id: "data" } },
+      },
+    };
+    const params = { message: "m", requestedSchema: schema };
+    expect(withoutSchemaIds(params)).toBe(params);
   });
 
   it("threads the same bridge into the transient read_tool connect", async () => {

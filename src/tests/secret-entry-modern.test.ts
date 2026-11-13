@@ -7,7 +7,7 @@
 // same call, which waits out the masked-entry page and re-runs the activation
 // with the secret in place.
 //
-// Most of this drives a real @modelcontextprotocol/client 2.3.1 Client with
+// Most of this drives a real @modelcontextprotocol/client 2.4 Client with
 // versionNegotiation "auto" (what a 2026-07-28 client does) against the real
 // ConnectServer serving entry, in process over a linked InMemoryTransport, and
 // a REAL masked-entry page on 127.0.0.1 that the test submits to over HTTP.
