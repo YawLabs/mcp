@@ -18,6 +18,10 @@ One 2.4.0 change did reach yaw-mcp, and it is handled. The server SDK's bundled 
 
 No yaw-mcp option, output or exit code changes; three oam fixes now reach every machine that hosts on oam. On Windows, a child started with `windowsHide: true` now opens its window hidden, as under node (libuv's `SW_HIDE`). Before, oam applied that only to spawns with extra stdio slots or an `argv0`. This covers every server yaw-mcp spawns while it runs on oam, since the MCP SDK sets `windowsHide` on Windows, and every child a hosted server spawns that way. Console programs (node, npx, uvx, python) already started without a console window, so the change shows only for a GUI program. Also on Windows, a hosted server's `spawnSync` / `execSync` child now joins oam's kill-on-close job before it runs rather than just after it starts, so it cannot outlive the server in that window. On Linux and macOS, a hosted server that uses `cluster` and ends with `process.exit()` now takes its workers with it, as under node; before, they kept running after the server had gone.
 
+**Internal -- `release.sh` stops on a stale `node_modules` before the suite runs**
+
+The pre-flight now checks that every package in `package-lock.json` is installed at its locked version (`scripts/check-installed-deps.mjs`; a package the lockfile marks optional, such as another platform's binary, may be absent), and stops with the drifted packages and `npm ci` as the fix. Until now it checked only that the toolchain's bins existed, so a checkout that pulled #220's SDK bump without re-running `npm ci` kept `@modelcontextprotocol/server` 2.3.1 and failed a release minutes into the suite, on a `withoutSchemaIds` assertion that said nothing about the install. Not part of the published package.
+
 ## 1.1.12
 
 **Changed -- the oam floor moves to 0.20.1**

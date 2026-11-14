@@ -510,6 +510,34 @@ if [ -n "$MISSING_BINS" ]; then
   fail "Dependencies are not installed -- missing node_modules/.bin/{${MISSING_BINS# }}. Step 1 would die with an opaque 'not recognized as an internal or external command'. Run \`${INSTALL_CMD}\`, then re-run ./release.sh ${VERSION}."
 fi
 
+# --- Guard: the installed tree must match package-lock.json. The bin check
+# above proves an install happened, not that it is current: a checkout that
+# pulled a dependency bump without re-running `npm ci` keeps every bin, and
+# the stale tree then fails step 1's suite minutes in, on an assertion that
+# names the behaviour rather than the install. Observed after #220 moved
+# @modelcontextprotocol/server to 2.4.0 while 2.3.1 stayed installed.
+# scripts/check-installed-deps.mjs compares every locked package's installed
+# version (packages the lockfile marks optional may be absent). Exit 1 is
+# drift; any other non-zero exit means the check could not run (an
+# unreadable lockfile is exit 2), which fails closed but is not
+# something `npm ci` fixes. Without a lockfile there is nothing to compare
+# against.
+if [ -f package-lock.json ]; then
+  # node exits 1 on a missing script too, which would read as drift.
+  [ -f scripts/check-installed-deps.mjs ] \
+    || fail "The lockfile drift check could not run (scripts/check-installed-deps.mjs is missing)."
+  DEPS_RC=0
+  DEPS_DRIFT=$(node scripts/check-installed-deps.mjs 2>&1) || DEPS_RC=$?
+  if [ "$DEPS_RC" -eq 1 ]; then
+    echo "$DEPS_DRIFT"
+    fail "node_modules does not match package-lock.json (drifted packages above). Run \`npm ci\`, then re-run ./release.sh ${VERSION}."
+  elif [ "$DEPS_RC" -ne 0 ]; then
+    echo "$DEPS_DRIFT"
+    fail "The lockfile drift check could not run (scripts/check-installed-deps.mjs exit ${DEPS_RC}, details above)."
+  fi
+  info "node_modules matches package-lock.json"
+fi
+
 # --- Guard: server.json must satisfy the MCP registry's own field limits
 # BEFORE anything is built, committed, or published. The registry caps
 # ServerDetail.description at 100 characters, caps name at 3-200, and requires
