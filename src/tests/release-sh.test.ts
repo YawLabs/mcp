@@ -99,6 +99,13 @@ vi.setConfig({ testTimeout: 600_000, hookTimeout: 600_000 });
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const releaseShPath = join(repoRoot, "release.sh");
 const releaseSh = readFileSync(releaseShPath, "utf8");
+// release.sh's lockfile-drift guard runs this from its own directory, so every
+// copy of release.sh needs it beside it.
+const depsCheckPath = join(repoRoot, "scripts", "check-installed-deps.mjs");
+function copyDepsCheck(dir: string): void {
+  mkdirSync(join(dir, "scripts"), { recursive: true });
+  copyFileSync(depsCheckPath, join(dir, "scripts", "check-installed-deps.mjs"));
+}
 
 // The cases that let a real timeout(1) stop a publisher need the coreutils one,
 // found the way release.sh finds it. release.sh itself runs unbounded without
@@ -256,6 +263,7 @@ const ALL_BINS = ["biome", "tsc", "vitest", "tsup"];
 function makeFixture(opts: Fixture = {}): string {
   const dir = newTmp("release-sh-");
   copyFileSync(releaseShPath, join(dir, "release.sh"));
+  copyDepsCheck(dir);
 
   mkdirSync(join(dir, "node_modules", ".bin"), { recursive: true });
   for (const b of opts.bins ?? ALL_BINS) {
@@ -348,6 +356,54 @@ describe("release.sh dependency guard (fixture run)", () => {
 
     const noLock = runRelease(makeFixture({ bins: [], lockfile: false }));
     expect(noLock.out).toContain("Run `npm install`");
+  });
+});
+
+describe("release.sh lockfile drift guard (fixture run)", () => {
+  function withLockedPackage(installed: string | null): string {
+    const dir = makeFixture();
+    const lock = { packages: { "": {}, "node_modules/dep": { version: "2.4.0" } } };
+    writeFileSync(join(dir, "package-lock.json"), JSON.stringify(lock));
+    if (installed !== null) {
+      mkdirSync(join(dir, "node_modules", "dep"), { recursive: true });
+      writeFileSync(join(dir, "node_modules", "dep", "package.json"), JSON.stringify({ version: installed }));
+    }
+    return dir;
+  }
+
+  it("stops a stale tree before the suite and names the drifted package", () => {
+    const r = runRelease(withLockedPackage("2.3.1"));
+    expect(r.out).toContain("node_modules/dep: locked 2.4.0, installed 2.3.1");
+    expect(r.out).toContain("node_modules does not match package-lock.json");
+    expect(r.out).toContain("Run `npm ci`");
+    expect(r.out).not.toContain("server.json passes the MCP-registry field limits");
+    expect(r.status).not.toBe(0);
+  });
+
+  it("passes a tree that matches the lockfile", () => {
+    const r = runRelease(withLockedPackage("2.4.0"));
+    expect(r.out).toContain("node_modules matches package-lock.json");
+    expect(r.out).toContain("server.json passes the MCP-registry field limits");
+  });
+
+  it("fails rather than skips when the checker is missing", () => {
+    const dir = withLockedPackage("2.4.0");
+    rmSync(join(dir, "scripts"), { recursive: true });
+    const r = runRelease(dir);
+    expect(r.out).toContain("The lockfile drift check could not run");
+    expect(r.out).not.toContain("Run `npm ci`");
+    expect(r.out).not.toContain("server.json passes the MCP-registry field limits");
+    expect(r.status).not.toBe(0);
+  });
+
+  it("does not prescribe npm ci for an unreadable lockfile", () => {
+    const dir = withLockedPackage("2.4.0");
+    writeFileSync(join(dir, "package-lock.json"), "{ not json");
+    const r = runRelease(dir);
+    expect(r.out).toContain("cannot read package-lock.json");
+    expect(r.out).toContain("drift check could not run (scripts/check-installed-deps.mjs exit 2");
+    expect(r.out).not.toContain("Run `npm ci`");
+    expect(r.status).not.toBe(0);
   });
 });
 
@@ -3395,6 +3451,7 @@ describe("release.sh oam floor gate (stubbed full run)", () => {
     const work = join(root, "work");
     mkdirSync(work);
     copyFileSync(releaseShPath, join(work, "release.sh"));
+    copyDepsCheck(work);
     mkdirSync(join(work, "node_modules", ".bin"), { recursive: true });
     for (const b of ALL_BINS) {
       writeFileSync(join(work, "node_modules", ".bin", b), "");
