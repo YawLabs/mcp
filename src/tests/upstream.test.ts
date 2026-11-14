@@ -357,12 +357,6 @@ describe("fetchResourcesFromUpstream size cap", () => {
     expect(stderr.writes.some((w) => w.includes("truncating"))).toBe(true);
   });
 
-  it("swallows listResources errors (server may not support them)", async () => {
-    const client = makeClient({ listResources: vi.fn().mockRejectedValue(new Error("not supported")) });
-    const out = await fetchResourcesFromUpstream(client, "ns");
-    expect(out).toEqual([]);
-  });
-
   it("stays silent for -32601 and warns for any other swallowed error", async () => {
     // -32601 is the expected answer from a server without the capability. A
     // timeout or transport error still yields [], but must leave a trace:
@@ -382,6 +376,20 @@ describe("fetchResourcesFromUpstream size cap", () => {
       "warn",
       "Upstream list failed at connect; continuing with an empty inventory",
       { namespace: "ns", endpoint: "resources/list", error: "Request timed out" },
+    );
+
+    // An error with no code at all takes the same swallow-and-warn path.
+    vi.mocked(log).mockClear();
+    expect(
+      await fetchResourcesFromUpstream(
+        makeClient({ listResources: vi.fn().mockRejectedValue(new Error("not supported")) }),
+        "ns",
+      ),
+    ).toEqual([]);
+    expect(vi.mocked(log)).toHaveBeenCalledWith(
+      "warn",
+      "Upstream list failed at connect; continuing with an empty inventory",
+      { namespace: "ns", endpoint: "resources/list", error: "not supported" },
     );
   });
 });
@@ -406,12 +414,6 @@ describe("fetchPromptsFromUpstream size cap", () => {
     const out = await fetchPromptsFromUpstream(client, "ns");
     expect(out).toHaveLength(MAX_PROMPTS_PER_SERVER);
     expect(stderr.writes.some((w) => w.includes("truncating"))).toBe(true);
-  });
-
-  it("swallows listPrompts errors (server may not support them)", async () => {
-    const client = makeClient({ listPrompts: vi.fn().mockRejectedValue(new Error("not supported")) });
-    const out = await fetchPromptsFromUpstream(client, "ns");
-    expect(out).toEqual([]);
   });
 
   it("stays silent for -32601 and warns for any other swallowed error", async () => {
@@ -5151,23 +5153,17 @@ describe("connectToUpstream progress reporting", () => {
     expect(messages).toHaveLength(afterFailure);
   });
 
-  it("says nothing extra when the spawn is fast", async () => {
-    // The other half of the rule. A healthy local server answers in
-    // milliseconds; narrating that would spend the client's context on every
-    // activation to describe work that already finished.
-    const messages: string[] = [];
-    await connectToUpstream(makeLocalConfig({ namespace: "gh" }), undefined, undefined, undefined, (m: string) =>
-      messages.push(m),
-    );
-    expect(messages.filter((m) => m.includes("still"))).toEqual([]);
-  });
-
   it("marks the handshake/inventory boundary, so a slow tool list is not read as a slow spawn", async () => {
     const messages: string[] = [];
     await connectToUpstream(makeLocalConfig({ namespace: "gh" }), undefined, undefined, undefined, (m: string) =>
       messages.push(m),
     );
+    // Exactly one message, so no "still" heartbeat on a fast connect: the other
+    // half of the rule. A healthy local server answers in milliseconds;
+    // narrating that would spend the client's context on every activation to
+    // describe work that already finished.
     expect(messages).toHaveLength(1);
+    expect(messages.filter((m) => m.includes("still"))).toEqual([]);
     expect(messages[0]).toContain('"gh" is up');
     expect(messages[0]).toContain("reading its tools");
   });

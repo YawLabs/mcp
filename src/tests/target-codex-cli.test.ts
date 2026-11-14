@@ -1273,7 +1273,7 @@ describe("install -> --list -> doctor over the file install wrote", () => {
     // doctor exited 2 over the file install had just written.
     const d = await doctor();
     expect(d.text).toContain('Codex CLI (user): OK -- has "mcp" entry');
-    expect(d.text).not.toContain("JSON is malformed");
+    expect(d.text).not.toContain("malformed");
     expect(d.exitCode).toBe(0);
   });
 
@@ -2204,33 +2204,6 @@ describe("install sets Codex's startup grace at the top of config.toml", () => {
       // The user's line is left exactly as it was.
       if (head !== "") expect(read(), head).toBe(head.replace(/\n\n$/, "\n"));
     }
-  });
-
-  it("--list and doctor read a file carrying the key as installed and healthy", async () => {
-    await install();
-    expect(read().startsWith(`${GRACE_LINE}\n`)).toBe(true);
-    const cap = captureIo();
-    await runInstall({ listOnly: true, os: "linux", home, cwd: projectDir, io: cap.io });
-    const row = cap
-      .stdout()
-      .split("\n")
-      .map((l) => l.trim().split(/ {2,}/))
-      .find((cells) => cells[0] === "Codex CLI" && cells[1] === "user");
-    expect(row?.[3]).toBe("installed");
-    const out: string[] = [];
-    const diagnosis = await runDoctor({
-      home,
-      cwd: projectDir,
-      os: "linux",
-      env: {},
-      out: (s) => out.push(s),
-      err: () => {},
-      skipRegistryCheck: true,
-      oamProbe: OAM_ABSENT,
-    });
-    expect(out.join("")).toContain('Codex CLI (user): OK -- has "mcp" entry');
-    expect(out.join("")).not.toContain("malformed");
-    expect(diagnosis.exitCode).toBe(0);
   });
 
   /** `install --list`'s whole stdout, run over this describe's home. */

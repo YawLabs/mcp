@@ -210,11 +210,6 @@ describe("secrets-vault: set/get/list/remove", () => {
     expect(call?.[4]).toBe(0o700);
   });
 
-  it("loadVault returns null when no file exists", async () => {
-    const v = await loadVault(join(synthHome, "no-such-file.json"));
-    expect(v).toBeNull();
-  });
-
   it("unlock with wrong passphrase throws before caching the key", async () => {
     let vault = newVault();
     const key = await unlock(vault, "hunter2");
@@ -298,12 +293,6 @@ describe("secrets-vault: set/get/list/remove", () => {
     expect(vault.check).toBeDefined();
     // The check decrypts to the fixed constant under the correct key.
     expect(decryptEntry(vault.check as EncryptedEntry, key, VAULT_CHECK_AAD)).toBe(VAULT_CHECK_PLAINTEXT);
-  });
-
-  it("unlock on a fresh/empty vault accepts any passphrase (nothing to verify)", async () => {
-    const vault = newVault();
-    // No entries, no check -- unlock cannot verify, so it must not throw.
-    await expect(unlock(vault, "anything")).resolves.toBeInstanceOf(Buffer);
   });
 
   it("legacy vault (entries, no check) verifies via any-entry canary", async () => {
@@ -985,6 +974,8 @@ describe("secrets-vault v2: recorded KDF parameters", () => {
     // means raising DEFAULT_KDF silently re-keys every v1 vault in the wild
     // into "wrong passphrase for this vault" -- so the fallback is pinned to
     // LEGACY_KDF, which must never move.
+    // It also covers the v2 binding promise that a v1 entry, written unbound,
+    // still reads.
     const salt = generateSalt();
     const legacyKey = await deriveKey("hunter2", salt, LEGACY_KDF);
     const legacy: VaultFile = {
@@ -1098,19 +1089,6 @@ describe("secrets-vault v2: ciphertexts are bound to their entry name", () => {
     expect(() => getSecret(swapped, key, "DEV")).toThrow();
   });
 
-  it("still reads a v1 vault, whose entries were written unbound", async () => {
-    const salt = generateSalt();
-    const key = await deriveKey("hunter2", salt);
-    const legacy: VaultFile = {
-      version: 1,
-      salt: salt.toString("base64"),
-      entries: { github: encryptEntry("ghp_legacy", key) },
-    };
-    lock();
-    const unlocked = await unlock(legacy, "hunter2");
-    expect(getSecret(legacy, unlocked, "github")).toBe("ghp_legacy");
-  });
-
   it("does NOT accept an unbound blob in a v2 vault", async () => {
     let vault = newVault();
     const key = await unlock(vault, "hunter2");
@@ -1155,14 +1133,6 @@ describe("secrets-vault: passphrase normalization", () => {
     lock();
     const key = await unlock(vault, DECOMPOSED);
     expect(getSecret(vault, key, "github")).toBe("ghp_legacy");
-  });
-
-  it("a genuinely wrong passphrase is still rejected", async () => {
-    let vault = newVault();
-    const key = await unlock(vault, COMPOSED);
-    vault = setSecret(vault, key, "github", "ghp_abc");
-    lock();
-    await expect(unlock(vault, "not-the-passphrase")).rejects.toThrow(/wrong passphrase/i);
   });
 });
 

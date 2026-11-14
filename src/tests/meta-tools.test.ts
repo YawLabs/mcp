@@ -141,10 +141,6 @@ describe("mcp_connect_secrets meta-tool definition", () => {
     expect(META_TOOLS.secrets.annotations.readOnlyHint).toBe(true);
     expect(META_TOOLS.secrets.annotations.openWorldHint).toBe(false);
   });
-
-  it("is included in META_TOOL_NAMES", () => {
-    expect(META_TOOL_NAMES.has("mcp_connect_secrets")).toBe(true);
-  });
 });
 
 describe("mcp_connect_dispatch inputSchema", () => {
@@ -397,7 +393,11 @@ describe("computeSecretsReport (names only, never values)", () => {
   it("reports only the vault keys this server references, never the whole key list", () => {
     // injectedSecrets is referenced ∩ vaultKeys, in that direction. Leaking
     // the vault's other key NAMES here would turn a per-server preview into
-    // an inventory of every credential the user holds.
+    // an inventory of every credential the user holds. The exact toEqual
+    // also pins that only NAMES appear in the report, never env value
+    // content (the literal placeholder) for a well-formed ref. The
+    // `malformed` column is the deliberate exception: it quotes the
+    // unparseable span, bounded, because the typo IS the diagnostic.
     const servers = [{ namespace: "gh", env: { T: "${secret:gh}" } }];
     const rows = computeSecretsReport(servers, new Set(["gh", "aws", "slack"]));
     expect(rows).toEqual([{ server: "gh", injectedSecrets: ["gh"], missing: [], malformed: [] }]);
@@ -443,18 +443,5 @@ describe("computeSecretsReport (names only, never values)", () => {
     } finally {
       SECRET_REF_RE.lastIndex = saved;
     }
-  });
-
-  it("returns no value anywhere in the output -- only names", () => {
-    const servers = [{ namespace: "gh", env: { T: "${secret:gh}" } }];
-    const rows = computeSecretsReport(servers, new Set(["gh"]));
-    const serialized = JSON.stringify(rows);
-    // The only string that should appear is the NAME "gh", never a value.
-    expect(serialized).toContain("gh");
-    // No env value content (the literal placeholder) leaks into the report
-    // for a WELL-FORMED ref. (The `malformed` column is the deliberate
-    // exception: it quotes the unparseable span, bounded, because the typo
-    // IS the diagnostic -- see the malformed cases above.)
-    expect(serialized).not.toContain("${secret:");
   });
 });

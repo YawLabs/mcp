@@ -133,6 +133,8 @@ describe("status", () => {
     expect(payload.config.scope).toBeNull();
     expect(payload.serverCount).toBe(0);
     expect(payload.servers).toEqual([]);
+    // "No vault" is not "locked vault": a panel badge saying locked on a
+    // machine with no secrets at all sends the user to unlock nothing.
     expect(payload.vault.exists).toBe(false);
     expect(payload.vault.locked).toBe(false);
     expect(payload.learning.readable).toBe(true);
@@ -236,13 +238,6 @@ describe("status", () => {
     expect(withPass).not.toMatch(/unlocked/);
     expect(withPass).not.toContain("not-the-real-one");
     expect(await text({})).toMatch(/^vault: +present, no passphrase in this env \(locked\)$/m);
-  });
-
-  it("does not call a vault that was never created locked", async () => {
-    // "No vault" is not "locked vault": a panel badge saying locked on a
-    // machine with no secrets at all sends the user to unlock nothing.
-    const payload = await collect({});
-    expect(payload.vault).toMatchObject({ exists: false, locked: false });
   });
 
   it("flags the servers whose credentials come from the vault", async () => {

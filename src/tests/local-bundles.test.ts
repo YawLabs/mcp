@@ -169,7 +169,7 @@ describe("loadLocalBundles", () => {
     expect(r.warnings).toEqual([]);
   });
 
-  it("loads from user-global ~/.yaw-mcp/bundles.json", async () => {
+  it("loads from user-global ~/.yaw-mcp/bundles.json and synthesizes id when entry omits it", async () => {
     writeBundles(synthHome, {
       version: 1,
       servers: [
@@ -675,15 +675,6 @@ describe("loadLocalBundles", () => {
     const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
     expect(r.config?.servers.map((s) => s.namespace)).toEqual(["github", "ok_under_30_chars_allowed"]);
     expect(r.warnings.length).toBe(3);
-  });
-
-  it("synthesizes id when entry omits it", async () => {
-    writeBundles(synthHome, {
-      version: 1,
-      servers: [{ namespace: "linear", name: "Linear", command: "npx" }],
-    });
-    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
-    expect(r.config?.servers[0].id).toBe("local-linear");
   });
 
   it("preserves explicit id when present", async () => {

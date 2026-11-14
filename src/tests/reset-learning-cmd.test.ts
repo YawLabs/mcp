@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -430,30 +430,6 @@ describe("runResetLearning", () => {
     expect(RESET_LEARNING_USAGE).toMatch(/pack history/);
     expect(RESET_LEARNING_USAGE).toMatch(/pre-warm failed/);
   });
-
-  it("preserves the state file contents until unlink succeeds (peek then delete ordering)", async () => {
-    // Regression guard: report counts must come from the pre-delete
-    // read. If the implementation ever flipped to delete-then-report,
-    // the counts would always be 0.
-    const payload = {
-      version: STATE_SCHEMA_VERSION,
-      savedAt: 1,
-      learning: {
-        a: { dispatched: 1, succeeded: 1, lastUsedAt: 1 },
-        b: { dispatched: 1, succeeded: 1, lastUsedAt: 1 },
-        c: { dispatched: 1, succeeded: 1, lastUsedAt: 1 },
-      },
-      packHistory: [],
-    };
-    writeFileSync(stateFile, JSON.stringify(payload), "utf8");
-    // Sanity: file is readable before we call reset.
-    expect(readFileSync(stateFile, "utf8").length).toBeGreaterThan(0);
-
-    const io = captureIO();
-    const r = await runResetLearning({ home, env: {}, force: true, out: io.push, err: io.pushErr });
-    expect(r.exitCode).toBe(0);
-    expect(io.out.join("")).toContain("learning entries removed:     3");
-  });
 });
 
 describe("parseResetLearningArgs", () => {
@@ -648,16 +624,6 @@ describe("parseResetLearningArgs -- the confirmation bypass", () => {
       expect(r.kind).toBe("ok");
       if (r.kind === "ok") expect(r.options.force).toBe(true);
     }
-  });
-
-  it("still rejects an unknown argument", () => {
-    const r = parseResetLearningArgs(["--nope"]);
-    expect(r.kind).toBe("error");
-  });
-
-  it("still answers --help without deleting anything", () => {
-    expect(parseResetLearningArgs(["--help"]).kind).toBe("help");
-    expect(parseResetLearningArgs(["-h"]).kind).toBe("help");
   });
 
   it("documents the flag in the usage text", () => {

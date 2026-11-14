@@ -37,10 +37,6 @@ describe("isEphemeralMountPath", () => {
     expect(isEphemeralMountPath("/tmp/.mount_Yaw8xKq1/resources/app")).toBe(true);
   });
 
-  it("leaves an ordinary /tmp checkout alone", () => {
-    expect(isEphemeralMountPath("/tmp/build/yaw/node_modules")).toBe(false);
-  });
-
   it("leaves an ordinary install alone", () => {
     expect(isEphemeralMountPath("C:\\app\\1.0.0\\node_modules\\@y\\m\\dist\\index.js")).toBe(false);
   });

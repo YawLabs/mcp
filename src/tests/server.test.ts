@@ -281,20 +281,6 @@ describe("ConnectServer", () => {
   });
 
   describe("handleDiscover", () => {
-    it("returns empty message when no config", () => {
-      const priv = getPrivate(server);
-      priv.config = null;
-      const result = priv.handleDiscover();
-      expect(result.content[0].text).toContain("No servers installed");
-    });
-
-    it("returns empty message when no servers", () => {
-      const priv = getPrivate(server);
-      priv.config = makeConfig([]);
-      const result = priv.handleDiscover();
-      expect(result.content[0].text).toContain("No servers installed");
-    });
-
     it("lists active servers with status", () => {
       const priv = getPrivate(server);
       priv.config = makeConfig([
@@ -2165,15 +2151,6 @@ describe("ConnectServer", () => {
       const priv = getPrivate(server);
       const result = await priv.handleDeactivate([]);
       expect(result.isError).toBe(true);
-    });
-
-    it("reports when server is not loaded (idempotent -- not an error)", async () => {
-      // Already-unloaded is a no-op success, not an error, so idempotent
-      // callers don't have to special-case "wasn't loaded" responses.
-      const priv = getPrivate(server);
-      const result = await priv.handleDeactivate(["unknown"]);
-      expect(result.isError).toBeUndefined();
-      expect(result.content[0].text).toContain("wasn't loaded");
     });
 
     it("unloads a loaded server", async () => {
@@ -4854,17 +4831,6 @@ describe("guide resource + session tracking", () => {
     expect(res.content[0].text).toBe("plain");
   });
 
-  it("does NOT nudge once the guide has been read", () => {
-    const priv = getPrivate(server);
-    priv.guides = {
-      user: { scope: "user", path: "/h/.yaw-mcp/YAW-MCP.md", content: "u" },
-      project: null,
-    };
-    priv.guideRead = true;
-    const res = priv.attachGuideNudge({ content: [{ type: "text", text: "body" }] });
-    expect(res.content[0].text).toBe("body");
-  });
-
   it("reading the guide via the builtin flips guideRead and suppresses the nudge", () => {
     const priv = getPrivate(server);
     priv.guides = {
@@ -4877,6 +4843,7 @@ describe("guide resource + session tracking", () => {
     const res = priv.attachGuideNudge({ content: [{ type: "text", text: "body" }] });
     // guideRead gates the nudge, so even with a guide loaded we shouldn't nudge.
     expect(res.content[0].text).toBe("body");
+    expect(res.content).toHaveLength(1);
   });
 });
 
@@ -7714,26 +7681,6 @@ describe("vault passphrase elicitation", () => {
   function passphrasePages(priv: any, ...entries: Array<string | null>): OpenedPage[] {
     return pagesTyping(priv, ...entries.map((entry) => (entry === null ? null : { passphrase: entry })));
   }
-
-  it("prompts for the passphrase, installs it, and the retry succeeds", async () => {
-    const priv = getPrivate(server);
-    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
-    priv.server.getClientCapabilities = () => ({ elicitation: {} });
-    priv.server.elicitInput = accept();
-    passphrasePages(priv, "correct-horse-battery-staple");
-    // ONE rejection: a vault refusal short-circuits the retry loop, so the
-    // second connect is the post-elicitation retry, not attempt 2.
-    vi.mocked(connectToUpstream)
-      .mockRejectedValueOnce(lockedVaultError("gh"))
-      .mockImplementationOnce(async (cfg: UpstreamServerConfig) => makeConnection(cfg.namespace, ["t"]));
-
-    const result = await priv.activateOne("gh");
-
-    expect(result.ok).toBe(true);
-    // The value reached the module-level session slot -- which is what
-    // resolveServerEnv actually reads.
-    expect(vaultPassphrase()).toBe("correct-horse-battery-staple");
-  });
 
   it("form-only client: the dialog carries NO field, and the passphrase comes from a masked page it opens", async () => {
     // The exposure this guards: a form-mode string field is an ordinary

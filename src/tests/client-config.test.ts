@@ -1458,7 +1458,11 @@ describe("every existing client and scope expresses itself through this model", 
     // which is the whole behavioural difference between the two spellings.
     const project = site({ format: byScope.project, label: "Claude Code" });
     const commented = '{\n  // mine\n  "mcpServers": {"fs": {"command": "npx"}}\n}\n';
-    expect(classifyClientConfig(commented, project).unloadable()).not.toBeNull();
+    const view = classifyClientConfig(commented, project);
+    expect(view.unloadable()).not.toBeNull();
+    expect(() => applyClientConfigEdits(view, [{ op: "upsert", key: "mcp", entry: ENTRY }], project)).toThrow(
+      /refusing to write into it/,
+    );
     expect(classifyClientConfig(commented, site({ format: byScope.user })).unloadable()).toBeNull();
   });
 });
@@ -1780,42 +1784,6 @@ describe("contract fit: the five new clients", () => {
     // And a removal that finds nothing is the same identity no-op it is for
     // JSON, which is how try's cleanup detects "nothing to do".
     expect(applyClientConfigEdits(back, [{ op: "remove", key: "absent-key" }], codex)).toBe(out);
-  });
-
-  it("the mcp alias: a synonym for another target's scope, not a row of its own", () => {
-    // `install mcp` and `install claude-code --scope project` must resolve to
-    // ONE site -- same file, same address, same strictness. The alias is an
-    // argv-level spelling (client-aliases.ts); the model never learns it, and
-    // that absence is what keeps --list and doctor from showing the file twice.
-    const project = resolveInstallPath({
-      clientId: "claude-code",
-      scope: "project",
-      os: "linux",
-      home: "/home/u",
-      projectDir: "/home/u/proj",
-    });
-    const shape = { format: "jsonc" as const, root: "mcpServers" };
-    const viaAlias: ConfigSite = {
-      id: "default",
-      label: "Claude Code",
-      format: effectiveConfigFormat(shape, { strictJson: true }),
-      resolved: project,
-      detectDir: null,
-    };
-    const viaClient: ConfigSite = { ...viaAlias };
-    expect(addressOf(viaAlias)).toEqual(addressOf(viaClient));
-    expect(viaAlias.resolved.absolute).toBe(viaClient.resolved.absolute);
-    expect(viaAlias.format).toBe("json");
-    // Inheriting the scope means inheriting its strictness: a .mcp.json with a
-    // comment refuses through both spellings, identically.
-    const commented = '{\n  // shared with my team\n  "mcpServers": {}\n}\n';
-    for (const where of [viaAlias, viaClient]) {
-      const view = classifyClientConfig(commented, where);
-      expect(view.unloadable()).not.toBeNull();
-      expect(() => applyClientConfigEdits(view, [{ op: "upsert", key: "mcp", entry: ENTRY }], where)).toThrow(
-        /refusing to write into it/,
-      );
-    }
   });
 
   it("hands `import` one canonical entry shape, whatever the client calls its fields", () => {

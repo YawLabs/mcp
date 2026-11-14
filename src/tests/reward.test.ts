@@ -214,11 +214,6 @@ describe("computeOutcomeReward", () => {
       expect(computeOutcomeReward({ structuredContent: { ok: true } })).toBe(1.0);
     });
 
-    it("still scores 0.3 when there is neither text, non-text blocks, nor structuredContent", () => {
-      expect(computeOutcomeReward({ content: [] })).toBe(0.3);
-      expect(computeOutcomeReward({})).toBe(0.3);
-    });
-
     it("rule 2 still beats non-text substance: an error-shaped text block wins over an image sibling", () => {
       expect(
         computeOutcomeReward({

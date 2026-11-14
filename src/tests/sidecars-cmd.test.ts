@@ -813,8 +813,11 @@ describe("runSidecarsInstall", () => {
     // Anchored to the failure it is ABOUT. A null marker also holds when the
     // run never reached npm at all (an unreadable bundles.json, a manifest
     // write that failed), so without these the test could keep passing while
-    // the branch it exists for was gone.
-    expect(verbs, "npm really ran, and npm is what refused").toEqual(["install"]);
+    // the branch it exists for was gone. The exact equality also proves the
+    // `npm update` refresh step does NOT run after a failed install: there is
+    // nothing to move forward, and a second command on a broken tree only adds
+    // noise -- so do not loosen this to toContain("install").
+    expect(verbs, "npm really ran, npm is what refused, and no refresh step followed").toEqual(["install"]);
     expect(res.exitCode).toBe(1);
     expect(res.lines.join("\n")).toContain("npm install failed");
     expect(installedPlatform(home)).toBeNull();
@@ -912,36 +915,6 @@ describe("runSidecarsInstall", () => {
       expect(c.cwd).toBe(sidecarsRoot(home));
       expect(c.args.join(" ")).not.toContain(home);
     }
-  });
-
-  it("does not run the refresh step when the install itself failed", async () => {
-    // Nothing to move forward, and npm has already printed why it failed --
-    // a second command on a broken tree only adds noise.
-    writeBundles([
-      {
-        id: "1",
-        name: "F",
-        namespace: "fetch",
-        type: "local",
-        transport: "stdio",
-        command: "npx",
-        args: ["-y", "@yawlabs/fetch-mcp@latest"],
-      },
-    ]);
-    const verbs: string[] = [];
-
-    const res = await runSidecarsInstall({
-      home,
-      cwd: home,
-      out: () => {},
-      runNpm: async (args) => {
-        verbs.push(args[0]);
-        return 1;
-      },
-    });
-
-    expect(res.exitCode).toBe(1);
-    expect(verbs).toEqual(["install"]);
   });
 
   it("keeps a failed refresh non-fatal but reports it in --json", async () => {

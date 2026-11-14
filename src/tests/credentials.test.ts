@@ -405,11 +405,6 @@ describe("detectMissingCredentials -- only credential-shaped names elicit", () =
     expect(detectMissingCredentials("STRIPE_API_KEY is empty")).toEqual(["STRIPE_API_KEY"]);
   });
 
-  it("does not match a credential word buried inside a longer segment", () => {
-    // MONKEY_CAGE contains "KEY" as a substring but not as a segment.
-    expect(detectMissingCredentials("MONKEY_CAGE is not set")).toEqual([]);
-  });
-
   it("does not apply the substring fallback to a name that has underscores", () => {
     // The fallback exists for names the segment split cannot see into
     // (GITHUBTOKEN). Applied to every name, it made "TOKENIZER_PATH is
@@ -441,6 +436,7 @@ describe("detectMissingCredentials -- only credential-shaped names elicit", () =
     expect(detectMissingCredentials("SECRETARY_EMAIL is not set")).toEqual([]);
     // KEY is kept off the suffix rule: English words end in it. -KEY
     // compounds are enumerated instead (SECRETKEY above).
+    // MONKEY_CAGE also contains "KEY" as a substring but not as a segment.
     expect(detectMissingCredentials("MONKEY_CAGE is not set")).toEqual([]);
     expect(detectMissingCredentials("TURKEY_MODE is required")).toEqual([]);
   });

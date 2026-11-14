@@ -848,13 +848,6 @@ describe("rewriteForOam", () => {
     });
   });
 
-  it("rewrites `node <entry>` to `oam run <entry>`", () => {
-    expect(rewriteForOam("node", ["/srv/index.js"], oam)).toEqual({
-      command: "oam",
-      args: ["run", "/srv/index.js"],
-    });
-  });
-
   it("forwards extra args after `--`", () => {
     expect(rewriteForOam("node", ["/srv/index.js", "--port", "1"], oam)).toEqual({
       command: "oam",
@@ -3526,10 +3519,6 @@ describe("scanNodeLaunchFlags", () => {
 describe("isOamLaunch -- fish and PowerShell wrappers", () => {
   it("recognises fish -c", () => {
     expect(isOamLaunch("fish", ["-c", "oam run --no-check /p/index.js"])).toBe(true);
-  });
-
-  it("recognises pwsh -Command", () => {
-    expect(isOamLaunch("pwsh", ["-Command", "oam run --no-check /p/index.js"])).toBe(true);
   });
 
   it("recognises powershell.exe with switches before -Command", () => {

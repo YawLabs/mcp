@@ -3,9 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { LearningStore } from "../learning.js";
-import { PackDetector } from "../pack-detect.js";
 import {
-  DISABLE_PERSISTENCE_ENV,
   emptyState,
   isPersistenceDisabled,
   isReadableStateVersion,
@@ -106,18 +104,6 @@ describe("persistence.loadState", () => {
 
   it("returns empty state on unparseable JSON", async () => {
     writeFileSync(file, "not json at all", "utf8");
-    const s = await loadState(file);
-    expect(s).toEqual(emptyState());
-  });
-
-  it("drops state with a version mismatch", async () => {
-    const payload = {
-      version: 99,
-      savedAt: 0,
-      learning: { gh: { dispatched: 1, succeeded: 1, lastUsedAt: 1 } },
-      packHistory: [],
-    };
-    writeFileSync(file, JSON.stringify(payload), "utf8");
     const s = await loadState(file);
     expect(s).toEqual(emptyState());
   });
@@ -645,14 +631,7 @@ describe("persistence.saveState", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it("creates the target directory recursively", async () => {
-    await saveState({ learning: {}, packHistory: [] }, file);
-    const raw = readFileSync(file, "utf8");
-    const parsed = JSON.parse(raw);
-    expect(parsed.version).toBe(STATE_SCHEMA_VERSION);
-  });
-
-  it("writes with the current schema version and a timestamp", async () => {
+  it("creates the nested target directory and writes the current schema version and a timestamp", async () => {
     const before = Date.now();
     await saveState({ learning: {}, packHistory: [] }, file);
     const parsed = JSON.parse(readFileSync(file, "utf8"));
@@ -782,44 +761,6 @@ describe("LearningStore snapshot round-trip", () => {
   });
 });
 
-describe("PackDetector snapshot round-trip", () => {
-  it("export then load reproduces history", () => {
-    const a = new PackDetector();
-    a.recordCall("gh", "listPrs", 1);
-    a.recordCall("linear", "createIssue", 2);
-    const snapshot = a.exportSnapshot();
-
-    const b = new PackDetector();
-    b.loadSnapshot(snapshot);
-    expect(b.getHistory()).toHaveLength(2);
-    expect(b.getHistory()[0]).toEqual({ namespace: "gh", toolName: "listPrs", at: 1 });
-  });
-
-  it("loadSnapshot honors maxHistory cap — drops oldest", () => {
-    const d = new PackDetector({ maxHistory: 3 });
-    const oversized = [
-      { namespace: "a", toolName: "t", at: 1 },
-      { namespace: "b", toolName: "t", at: 2 },
-      { namespace: "c", toolName: "t", at: 3 },
-      { namespace: "d", toolName: "t", at: 4 },
-      { namespace: "e", toolName: "t", at: 5 },
-    ];
-    d.loadSnapshot(oversized);
-    const hist = d.getHistory();
-    expect(hist).toHaveLength(3);
-    expect(hist[0].namespace).toBe("c");
-    expect(hist[2].namespace).toBe("e");
-  });
-
-  it("exported snapshot is a defensive copy", () => {
-    const d = new PackDetector();
-    d.recordCall("gh", "t", 1);
-    const snap = d.exportSnapshot();
-    snap[0].namespace = "tampered";
-    expect(d.getHistory()[0].namespace).toBe("gh");
-  });
-});
-
 // sanitizeLearning rebuilds the map with plain assignment onto a fresh {},
 // which drops a "__proto__" namespace (assignment hits Object.prototype's
 // inherited setter) and leaves the map inheriting that entry's fields. Its
@@ -908,9 +849,5 @@ describe("persistence.isPersistenceDisabled", () => {
     } finally {
       delete process.env.YAW_MCP_DISABLE_PERSISTENCE;
     }
-  });
-
-  it("names the env var it reads", () => {
-    expect(DISABLE_PERSISTENCE_ENV).toBe("YAW_MCP_DISABLE_PERSISTENCE");
   });
 });

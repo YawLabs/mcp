@@ -104,11 +104,6 @@ describe("stripTrailingCommas", () => {
     expect(stripTrailingCommas('{"a":"foo,}"}')).toBe('{"a":"foo,}"}');
   });
 
-  it("preserves string content unchanged", () => {
-    const src = '{"url":"https://example.com/api,"}';
-    expect(stripTrailingCommas(src)).toBe(src);
-  });
-
   it("does not close a string on an escaped quote, so a comma inside it is not treated as trailing", () => {
     // stripTrailingCommas carries its OWN copy of the backslash-escape branch
     // (it does not reuse stripJsoncComments'), and nothing exercised it. Value

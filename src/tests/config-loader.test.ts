@@ -67,6 +67,9 @@ describe("loadYawMcpConfig — defaults", () => {
   it("returns defaults when no files exist", async () => {
     const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
     expect(r.loadedFiles).toEqual([]);
+    // ENOENT is the normal case for every scope a user hasn't configured;
+    // warning on it would make `doctor` noisy for everyone (contrast: the
+    // unreadable-file test in the fail-open block, which must warn).
     expect(r.warnings).toEqual([]);
     expect(r.projectConfigDir).toBeNull();
     expect(r.servers).toBeUndefined();
@@ -199,6 +202,8 @@ describe("loadYawMcpConfig — schema versioning", () => {
     writeConfig(synthHome, CONFIG_FILENAME, { version: CURRENT_SCHEMA_VERSION, servers: ["x"] });
     const r1 = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
     expect(r1.warnings).toEqual([]);
+    // Also guards the absent-key side of the non-number regression below: a
+    // missing version must not trigger the "'version' must be a number" warning.
     writeConfig(synthHome, CONFIG_FILENAME, { servers: ["x"] });
     const r2 = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
     expect(r2.warnings).toEqual([]);
@@ -219,12 +224,6 @@ describe("loadYawMcpConfig — schema versioning", () => {
     expect(w).toContain("found string");
     // And it is not ALSO reported as an unknown key.
     expect(r.warnings.some((x) => x.includes("unknown key"))).toBe(false);
-  });
-
-  it("does not warn about version when the key is absent", async () => {
-    writeConfig(synthHome, CONFIG_FILENAME, { servers: ["x"] });
-    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
-    expect(r.warnings.some((x) => x.includes("'version'"))).toBe(false);
   });
 });
 
@@ -352,13 +351,6 @@ describe("loadYawMcpConfig — fail-open on bad files", () => {
     const w = r.warnings.find((x) => x.includes("unreadable"));
     expect(w).toBeDefined();
     expect(w).toContain(cfgPath);
-  });
-
-  it("stays silent for a merely absent file", async () => {
-    // ENOENT is the normal case for every scope a user hasn't configured;
-    // warning on it would make `doctor` noisy for everyone.
-    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
-    expect(r.warnings).toEqual([]);
   });
 
   it("non-object root is ignored with a warning", async () => {

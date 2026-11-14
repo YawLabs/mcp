@@ -1456,6 +1456,7 @@ describe("runInstall — collision handling", () => {
     });
     expect(r.exitCode).toBe(2);
     expect(cap.stderr()).toMatch(/already has/);
+    expect(cap.stderr()).toMatch(/stdin is not a TTY/);
     // Original entry untouched.
     const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
     expect(client.mcpServers[ENTRY_NAME]).toEqual({ command: "old" });
@@ -1590,27 +1591,6 @@ describe("runInstall — collision handling", () => {
         null,
         2,
       ),
-    );
-    const cap = captureIo();
-    const r = await runInstall({
-      clientId: "claude-code",
-      scope: "user",
-      os: "linux",
-      home: synthHome,
-      repair: true,
-      io: cap.io,
-      oamProbe: OAM_ABSENT,
-    });
-    expect(r.exitCode).toBe(0);
-    expect(cap.stdout()).toContain(`Kept existing env on the ${ENTRY_NAME} entry: OAM_BIN`);
-    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
-    expect(client.mcpServers[ENTRY_NAME].env).toEqual({ OAM_BIN: "/x/oam" });
-  });
-
-  it("a VALID env on the existing entry still carries into a --repair overwrite", async () => {
-    writeFileSync(
-      join(synthHome, ".claude.json"),
-      JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "old", env: { OAM_BIN: "/x/oam" } } } }, null, 2),
     );
     const cap = captureIo();
     const r = await runInstall({
@@ -1982,6 +1962,8 @@ describe("runInstall — %APPDATA% pointing at a regular file is named (claude-d
 
 describe("runInstall — malformed existing JSON", () => {
   it("refuses to overwrite a malformed client config", async () => {
+    // Exit 1 is deliberately kept apart from the off-TTY collision refusal,
+    // which exits 2: 1 stays "the run tried and failed".
     writeFileSync(join(synthHome, ".claude.json"), "{ this is not json");
     const cap = captureIo();
     const r = await runInstall({
@@ -6341,49 +6323,6 @@ describe("INSTALL_USAGE -- the flags in the synopsis are explained", () => {
       // "  --force   <something>" -- the flag plus prose, not a bare mention.
       expect(line.replace(/^\s+--[a-z-]+\s*/, "").length).toBeGreaterThan(10);
     }
-  });
-});
-
-describe("runInstall -- off-TTY collision exit code", () => {
-  it("refuses with 2, the code every other off-TTY confirmation refusal uses", async () => {
-    // `remove`, `set`, `uninstall` and `secrets remove` all exit 2 when a
-    // confirmation is required and there is no TTY to ask on; install alone
-    // exited 1, so a script could not tell "needs a flag" from "the write
-    // failed" without parsing prose.
-    writeFileSync(
-      join(synthHome, ".claude.json"),
-      JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "old" } } }, null, 2),
-    );
-    const cap = captureIo();
-    const r = await runInstall({
-      clientId: "claude-code",
-      scope: "user",
-      os: "linux",
-      home: synthHome,
-      io: { ...cap.io, isTTY: false },
-      oamProbe: OAM_ABSENT,
-    });
-    expect(r.exitCode).toBe(2);
-    expect(cap.stderr()).toMatch(/stdin is not a TTY/);
-    // Still a refusal, not a write.
-    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
-    expect(client.mcpServers[ENTRY_NAME]).toEqual({ command: "old" });
-  });
-
-  it("keeps a genuine write FAILURE distinguishable at exit 1", async () => {
-    // The point of moving the collision to 2: 1 stays "the run tried and
-    // failed". A malformed client config is that case.
-    writeFileSync(join(synthHome, ".claude.json"), "{ not json");
-    const cap = captureIo();
-    const r = await runInstall({
-      clientId: "claude-code",
-      scope: "user",
-      os: "linux",
-      home: synthHome,
-      io: { ...cap.io, isTTY: false },
-      oamProbe: OAM_ABSENT,
-    });
-    expect(r.exitCode).toBe(1);
   });
 });
 

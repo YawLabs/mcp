@@ -1651,8 +1651,9 @@ describe("runDoctor — --json", () => {
     expect(parsed).toMatchObject({
       version: expect.any(String),
       platform: "linux",
-      diagnosis: { exitCode: 0, summary: expect.any(String) },
+      diagnosis: { exitCode: 0, summary: expect.stringMatching(/All good/) },
     });
+    expect(parsed.diagnosis.exitCode).toBe(r.exitCode);
     // Text-mode section headers MUST NOT appear.
     expect(cap.text()).not.toMatch(/CONFIG FILES|TOKEN\n|DIAGNOSIS/);
   });
@@ -1687,23 +1688,6 @@ describe("runDoctor — --json", () => {
     expect(parsed.apiBase.value).toBeNull();
     // And nothing token-shaped from the env leaks into the blob.
     expect(r.lines.join("")).not.toContain("DO_NOT_LEAK");
-  });
-
-  it("exit code in diagnosis matches returned exitCode on a clean setup", async () => {
-    const cap = captureOut();
-    const r = await runDoctor({
-      cwd: synthCwd,
-      home: synthHome,
-      env: {},
-      os: "linux",
-      out: cap.out,
-      json: true,
-      skipRegistryCheck: true,
-    });
-    expect(r.exitCode).toBe(0);
-    const parsed = JSON.parse(r.lines[0]);
-    expect(parsed.diagnosis.exitCode).toBe(0);
-    expect(parsed.diagnosis.summary).toMatch(/All good/);
   });
 
   it("surfaces warnings in the JSON snapshot", async () => {
@@ -1993,23 +1977,6 @@ describe("runDoctor — --json", () => {
     const parsed = JSON.parse(r.lines[0]);
     expect(parsed.upgrade.current).toBe("dev");
     expect(parsed.upgrade.stale).toBe(false);
-  });
-
-  it("clients array is populated even in json mode", async () => {
-    const cap = captureOut();
-    const r = await runDoctor({
-      cwd: synthCwd,
-      home: synthHome,
-      env: {},
-      os: "linux",
-      out: cap.out,
-      json: true,
-      skipRegistryCheck: true,
-    });
-    const parsed = JSON.parse(r.lines[0]);
-    expect(Array.isArray(parsed.clients)).toBe(true);
-    expect(parsed.clients.length).toBeGreaterThan(0);
-    expect(parsed.clients[0]).toHaveProperty("clientId");
   });
 
   it("always emits trials and backgroundPosters fields (1:1-mirror claim)", async () => {

@@ -1054,11 +1054,6 @@ describe("remove -- byte-exact", () => {
     // analogue of JSON's leftover `{"mcpServers": {}}`.
     expect(removeTomlEntry(fixture("f01-missing", "expected.toml"), CONTAINER, ENTRY)).toBe("");
   });
-
-  it("keeps a sibling server untouched", () => {
-    const next = removeTomlEntry(fixture("f03-siblings", "expected.toml"), CONTAINER, ENTRY);
-    expect(next).toBe(fixture("f03-siblings", "input.toml"));
-  });
 });
 
 describe("round trip", () => {
@@ -1068,11 +1063,6 @@ describe("round trip", () => {
       expect(removeTomlEntry(upsertTomlEntry(input, CONTAINER, ENTRY, BROKER), CONTAINER, ENTRY)).toBe(input);
     });
   }
-
-  it("f01: uninstalling a file we created leaves it empty", () => {
-    const created = upsertTomlEntry(null, CONTAINER, ENTRY, BROKER);
-    expect(removeTomlEntry(created, CONTAINER, ENTRY)).toBe("");
-  });
 
   it("upserting twice is idempotent", () => {
     const once = upsertTomlEntry(fixture("f03-siblings", "input.toml"), CONTAINER, ENTRY, BROKER);
@@ -1290,14 +1280,6 @@ describe("canon and post-write verification", () => {
     expect(() => verifyTomlSplice(after, before, CONTAINER, { removed: [ENTRY] })).not.toThrow();
   });
 
-  it("is unskippable: every exported write verifies its own output", () => {
-    // There is no exported way to obtain spliced text that has not been
-    // checked, which is what makes a hand-rolled splicer safe to ship: a
-    // scanner bug becomes a throw, never a corrupted config.
-    expect(TomlVerifyError.prototype).toBeInstanceOf(Error);
-    expect(() => upsertTomlEntry(fixture("f03-siblings", "input.toml"), CONTAINER, ENTRY, BROKER)).not.toThrow();
-  });
-
   // Each of the three CALL SITES, pinned. "verifyTomlSplice is correct" and
   // "upsertTomlEntry calls it" are different claims: every assertion above
   // this point tests the function, and deleting the call from the writer left
@@ -1315,6 +1297,7 @@ describe("canon and post-write verification", () => {
   it("upsert on an EXISTING file refuses when the entry would not read back as written", () => {
     const input = fixture("f03-siblings", "input.toml");
     const entry = { ...BROKER, request_id: UNSAFE };
+    expect(TomlVerifyError.prototype).toBeInstanceOf(Error);
     expect(() => upsertTomlEntry(input, CONTAINER, ENTRY, entry)).toThrow(TomlVerifyError);
     expect(() => upsertTomlEntry(input, CONTAINER, ENTRY, entry)).toThrow(/did not read back as the value written/);
   });

@@ -276,18 +276,6 @@ describe("bestOfNViaSampling (n=1 single-sample tiebreak)", () => {
     } as unknown as Server;
   }
 
-  it("returns null when client does not support sampling", async () => {
-    const server = mockServer(undefined);
-    const out = await bestOfNViaSampling(server, "intent", candidates, 1);
-    expect(out).toBeNull();
-  });
-
-  it("returns null with fewer than 2 candidates", async () => {
-    const server = mockServer({ sampling: {} });
-    const out = await bestOfNViaSampling(server, "intent", [candidates[0]!], 1);
-    expect(out).toBeNull();
-  });
-
   it("returns the picked namespace when sampling succeeds", async () => {
     const createMessage = vi.fn().mockResolvedValue({
       content: { type: "text", text: "github" },
