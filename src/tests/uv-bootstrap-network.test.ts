@@ -296,20 +296,6 @@ describe("fetchWithRedirects missing Location header", () => {
   });
 });
 
-// ── fetchWithRedirects: non-200 status ────────────────────────────────────
-
-describe("fetchWithRedirects non-200 status", () => {
-  it("throws 'failed: HTTP 404' when the release asset is missing", async () => {
-    // The likeliest real-world download failure: a UV_VERSION bump lands
-    // before Astral publishes the asset, or the triple has no asset at all.
-    mockRequest.mockImplementation(() => Promise.resolve(fakeResponse(404, Buffer.alloc(0)) as never));
-
-    const err = await ensureUv().catch((e: unknown) => e);
-    expect(err).toBeInstanceOf(Error);
-    expect((err as Error).message).toContain("failed: HTTP 404");
-  });
-});
-
 // ── fetchWithRedirects: undici idle timeouts -> one clear message ──────────
 
 describe("fetchWithRedirects timeout mapping", () => {

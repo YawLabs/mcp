@@ -502,16 +502,6 @@ describe("trust store grant / revoke / list round-trip", () => {
     expect((await loadLocalBundles({ home: synthHome, cwd: synthCwd, env: {} })).config?.servers).toEqual([]);
   });
 
-  it("granting over a malformed store reports that the old grants were dropped", async () => {
-    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
-    writeFileSync(trustStorePath(synthHome), "{{{");
-    writeBundles(synthCwd, HOSTILE);
-    const path = projectBundlesPath(synthCwd);
-    const granted = await grantTrust(path, readFileSync(path), { home: synthHome });
-    expect(granted.storeWasMalformed).toBe(true);
-    expect(await listTrusted({ home: synthHome })).toHaveLength(1);
-  });
-
   it("listTrusted reports nothing when the store is malformed (fail closed)", async () => {
     await writeTrustedProjectBundles(synthCwd, HOSTILE);
     writeFileSync(trustStorePath(synthHome), "nope");

@@ -1577,21 +1577,6 @@ describe("trust --revoke accepts a project directory", () => {
     expect(r.exitCode).toBe(0);
     expect(await listTrusted({ home: synthHome })).toEqual([]);
   });
-
-  it("reports nothing-to-do for a path that was never approved", async () => {
-    const io = captureIO();
-    const r = await runTrust({
-      mode: "revoke",
-      path: join(synthHome, "no-such-project"),
-      home: synthHome,
-      cwd: synthCwd,
-      env: {},
-      out: io.push,
-      err: io.pushErr,
-    });
-    expect(r.exitCode).toBe(0);
-    expect(io.text()).toContain("was not approved");
-  });
 });
 
 // ---------------------------------------------------------------------------

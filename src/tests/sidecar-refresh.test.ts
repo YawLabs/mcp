@@ -542,6 +542,7 @@ describe("maybeRefreshSidecars", () => {
     await run;
     expect(h.fetchLatestImpl).toHaveBeenCalledWith("a-mcp");
     expect(h.spawnRefreshImpl).toHaveBeenCalledTimes(1);
+    // NOW is the injected clock, not Date.now().
     expect(h.writeStateImpl).toHaveBeenCalledWith({ lastSidecarRefreshCheck: NOW });
   });
 
@@ -799,12 +800,6 @@ describe("maybeRefreshSidecars", () => {
     expect(h.installedVersionImpl).toHaveBeenCalledWith("a-mcp", HOME);
     // Reddens if the home is dropped -- the check would read the REAL home's
     // tree while the refresh writes the injected one.
-  });
-
-  it("stamps the injected clock, not Date.now()", async () => {
-    const h = harness();
-    await maybeRefreshSidecars(h.deps);
-    expect(h.writeStateImpl).toHaveBeenCalledWith({ lastSidecarRefreshCheck: NOW });
   });
 
   it("resolves instead of rejecting when an injected dep throws", async () => {

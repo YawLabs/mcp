@@ -413,7 +413,9 @@ describe("findProjectConfigDir outside $HOME", () => {
     // geteuid is pinned to the uid stat actually reports for the
     // candidate: on POSIX runners that is this process's own uid; on
     // win32 (no native geteuid, stat reports uid 0) the stub makes the
-    // same ownership gate pass deterministically.
+    // same ownership gate pass deterministically. Also the accepting
+    // companion to the uid-mismatch skip case below: proves the gate
+    // compares ownership rather than rejecting everything outside $HOME.
     const cfgDir = join(project, CONFIG_DIRNAME);
     mkdirSync(cfgDir);
     stubGeteuid(statSync(cfgDir).uid);
@@ -438,16 +440,6 @@ describe("findProjectConfigDir outside $HOME", () => {
     mkdirSync(cfgDir);
     stubGeteuid(999_999_999);
     expect(await findProjectConfigDir(project, home)).toBeNull();
-  });
-
-  it("accepts an outside-$HOME .yaw-mcp/ owned by the current euid", async () => {
-    // Companion to the skip case, with geteuid pinned to the uid stat
-    // actually reports for the candidate -- proves the gate compares
-    // ownership rather than rejecting everything outside $HOME.
-    const cfgDir = join(project, CONFIG_DIRNAME);
-    mkdirSync(cfgDir);
-    stubGeteuid(statSync(cfgDir).uid);
-    expect(await findProjectConfigDir(project, home)).toBe(realpathSync(cfgDir));
   });
 
   it("rejects an outside-$HOME .yaw-mcp/ when ownership is unverifiable (win32 model)", async () => {

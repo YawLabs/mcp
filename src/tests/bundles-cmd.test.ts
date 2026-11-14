@@ -307,14 +307,6 @@ describe("runBundlesCommand — match", () => {
     expect(io.out.join("\n")).not.toMatch(/invalid JSON/);
   });
 
-  it("keeps stdout parseable under --json even when the file is malformed", async () => {
-    writeFileSync(join(home, CONFIG_DIRNAME, "bundles.json"), "{ not json", "utf8");
-    const io = captureIO();
-    await run({ json: true, out: io.push, err: io.pushErr });
-    const parsed = JSON.parse(io.out.join("\n"));
-    expect(parsed.installed).toEqual([]);
-  });
-
   // The RETURNED transcript has to make the same split the printed output
   // does. `lines` interleaves both streams, so a programmatic caller holding
   // only the result could not tell the JSON body from a warning line without

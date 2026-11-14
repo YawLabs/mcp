@@ -455,7 +455,10 @@ describe("release.sh mcp_registry_gh_token", () => {
     return runBash(body, dir, env).out;
   }
 
-  it("prefers GITHUB_TOKEN, then MCP_REGISTRY_TOKEN, then gh", () => {
+  it("prefers GITHUB_TOKEN, then MCP_REGISTRY_TOKEN, then gh, emitting only the token", () => {
+    // Step 5 captures this in a command substitution and uses it AS the
+    // credential, so any stray info()/warn() inside the helper would be
+    // concatenated into the token. Exact toBe proves nothing else is printed.
     expect(resolve({ GITHUB_TOKEN: "G", MCP_REGISTRY_TOKEN: "M" }, "ok")).toBe("G");
     expect(resolve({ MCP_REGISTRY_TOKEN: "M" }, "ok")).toBe("M");
     expect(resolve({}, "ok")).toBe("gh-token");
@@ -464,13 +467,6 @@ describe("release.sh mcp_registry_gh_token", () => {
   it("resolves to nothing when gh errors or is absent", () => {
     expect(resolve({}, "empty")).toBe("");
     expect(resolve({}, "absent")).toBe("");
-  });
-
-  it("emits the token and nothing else on stdout", () => {
-    // Step 5 captures this in a command substitution and uses it AS the
-    // credential, so any stray info()/warn() inside the helper would be
-    // concatenated into the token.
-    expect(resolve({ GITHUB_TOKEN: "G" }, "ok")).toBe("G");
   });
 });
 
@@ -813,7 +809,9 @@ describe("release.sh tag-at-HEAD guard", () => {
   it("refuses to publish a tree the tag does not describe", () => {
     // Tag left behind by an interrupted run, a fix committed on main after it,
     // and the version NOT yet on npm -- step 4 would pack a tree the tag does
-    // not contain, permanently, since npm forbids re-publishing.
+    // not contain, permanently, since npm forbids re-publishing. An unreadable
+    // registry leaves the probe empty too, so this is also the fail-closed
+    // path: an empty probe must never be treated as "already published".
     const r = run({ tagSha: "aaa111", headSha: "bbb222", published: "" });
     expect(r.out).toContain("FAIL Tag v0.81.0 exists at aaa111");
     expect(r.out).toContain("HEAD is bbb222");
@@ -828,13 +826,6 @@ describe("release.sh tag-at-HEAD guard", () => {
     expect(r.out).toContain("WARN Tag v0.81.0 points at aaa111");
     expect(r.out).toContain("already on npm");
     expect(r.out).toContain("CONTINUED");
-  });
-
-  it("fails closed when the registry cannot be read", () => {
-    // An unreadable registry leaves the probe empty, which must NOT be treated
-    // as "already published" in front of an irreversible publish.
-    const r = run({ tagSha: "aaa111", headSha: "bbb222", published: "" });
-    expect(r.out).toContain("FAIL");
   });
 
   it("creates an annotated tag when none exists", () => {

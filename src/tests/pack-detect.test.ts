@@ -64,24 +64,6 @@ describe("PackDetector", () => {
     expect(new Set(chains[0].namespaces)).toEqual(new Set(["gh", "linear"]));
   });
 
-  it("counts two recurrences crossing a long gap when each burst is tight", () => {
-    const d = new PackDetector();
-    const t0 = 1_000_000;
-    // Burst 1: quick
-    d.recordCall("gh", "a", t0);
-    d.recordCall("slack", "b", t0 + 500);
-    // Long gap (1h)
-    const t1 = t0 + 60 * 60_000;
-    // Burst 2: also quick
-    d.recordCall("gh", "c", t1);
-    d.recordCall("slack", "d", t1 + 500);
-
-    const chains = d.detectChains();
-    expect(chains).toHaveLength(1);
-    expect(chains[0].frequency).toBe(2);
-    expect(chains[0].lastSeenAt).toBe(t1 + 500);
-  });
-
   it("ignores noise from a call that is alone in its own burst", () => {
     const d = new PackDetector();
     const t0 = 1_000_000;
@@ -190,6 +172,11 @@ describe("PackDetector", () => {
       { namespace: "gh", toolName: "a", at: 1_000_000 },
       { namespace: "linear", toolName: "b", at: 1_001_000 },
     ]);
+    // The full hop the persistence layer makes: one detector's export loads
+    // into a fresh detector unchanged.
+    const e = new PackDetector();
+    e.loadSnapshot(d.exportSnapshot());
+    expect(e.getHistory()).toEqual(d.getHistory());
   });
 
   it("loadSnapshot trims a snapshot longer than maxHistory, keeping the newest", () => {

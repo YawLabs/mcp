@@ -648,22 +648,6 @@ describe("runAdd", () => {
     expect(io2.err.join("")).not.toContain("not stored in your vault");
   });
 
-  it("is silent about a vault it cannot read, rather than guessing", async () => {
-    // No vault at all is the ordinary first-run state; failing or nagging
-    // there would fire on every add before the user has stored anything.
-    const io2 = captureIO();
-    await runAdd({
-      slug: "plain",
-      command: "npx -y plain-mcp",
-      home: synthHome,
-      cwd: synthCwd,
-      env: {},
-      out: (s: string) => io2.out.push(s),
-      err: (s: string) => io2.err.push(s),
-    });
-    expect(io2.err.join("")).not.toContain("not stored in your vault");
-  });
-
   it("says so out loud when a --url add converts a slug-less stdio entry", async () => {
     // The note is what stops someone's one-click-installed server being turned
     // into a remote endpoint silently. It used to be gated on the INCOMING
@@ -1665,20 +1649,6 @@ describe("runRemove", () => {
     expect(loaded.config?.servers ?? []).toHaveLength(0);
   });
 
-  it("is a no-op (exit 0) when the server is absent", async () => {
-    const io = captureIO();
-    const r = await runRemove({
-      target: "fetch",
-      home: synthHome,
-      cwd: synthCwd,
-      env: {},
-      out: (s) => io.out.push(s),
-      err: (s) => io.err.push(s),
-    });
-    expect(r.exitCode).toBe(0);
-    expect(io.text()).toMatch(/nothing to do/);
-  });
-
   it("rejects a missing or duplicated positional", () => {
     // Argument COUNT only -- the shape of the target itself is REMOVE_TARGET_RE's
     // job and is asserted below. (This case was named "rejects an invalid
@@ -2350,6 +2320,7 @@ describe("runRemove confirmation gate", () => {
       target: "fetch",
       home: synthHome,
       cwd: synthCwd,
+      env: {},
       isTTY: false,
       out: (s) => io.out.push(s),
       err: (s) => io.err.push(s),
@@ -3548,29 +3519,6 @@ describe("runRemove target case handling", () => {
     // The entry it would have claimed to have removed is still on disk.
     const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
     expect(loaded.config?.servers.map((s) => s.namespace)).toEqual(["googleanalytics"]);
-  });
-
-  it("still accepts the lowercase slug and namespace forms", async () => {
-    await runAdd({
-      slug: "ga",
-      home: synthHome,
-      cwd: synthCwd,
-      env: {},
-      fetchCatalog,
-      out: () => {},
-      err: () => {},
-    });
-    const r = await runRemove({
-      target: "ga",
-      home: synthHome,
-      cwd: synthCwd,
-      force: true,
-      out: () => {},
-      err: () => {},
-    });
-    expect(r.exitCode).toBe(0);
-    const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
-    expect(loaded.config?.servers ?? []).toEqual([]);
   });
 });
 

@@ -61,7 +61,12 @@ describe("registerShutdownTriggers", () => {
     expect(stdin.pause).not.toHaveBeenCalled();
   });
 
-  it("routes every trigger to the one shutdown callback", () => {
+  it("routes every trigger to the one shutdown callback, once per event (no latch -- the caller owns idempotency)", () => {
+    // runServer's `shuttingDown` flag is the single latch. Adding a second
+    // one here would mean two places decide what "already shutting down"
+    // means, and the one in index.ts is the one that guards the force-exit
+    // timer. A killed client really can deliver 'end' then 'close', so the
+    // module passes both through.
     const proc = makeTarget();
     const stdin = makeTarget();
     const shutdown = vi.fn();
@@ -75,23 +80,6 @@ describe("registerShutdownTriggers", () => {
     expect(shutdown).toHaveBeenCalledTimes(3);
     stdin.emit("close");
     expect(shutdown).toHaveBeenCalledTimes(4);
-  });
-
-  it("fires the callback again per event rather than latching -- the caller owns idempotency", () => {
-    // runServer's `shuttingDown` flag is the single latch. Adding a second
-    // one here would mean two places decide what "already shutting down"
-    // means, and the one in index.ts is the one that guards the force-exit
-    // timer. A killed client really can deliver 'end' then 'close', so this
-    // documents that the module passes both through.
-    const proc = makeTarget();
-    const stdin = makeTarget();
-    const shutdown = vi.fn();
-    registerShutdownTriggers(shutdown, { proc, stdin });
-
-    stdin.emit("end");
-    stdin.emit("close");
-
-    expect(shutdown).toHaveBeenCalledTimes(2);
   });
 
   it("registers exactly the events its exported constants name", () => {
@@ -109,29 +97,5 @@ describe("registerShutdownTriggers", () => {
     }
     expect(proc.listeners.size).toBe(SIGNAL_SHUTDOWN_EVENTS.length);
     expect(stdin.listeners.size).toBe(STDIN_SHUTDOWN_EVENTS.length);
-  });
-
-  it("binds signals to proc and stream events to stdin, never crossed", () => {
-    const proc = makeTarget();
-    const stdin = makeTarget();
-    registerShutdownTriggers(() => {}, { proc, stdin });
-
-    expect(proc.listeners.has("end")).toBe(false);
-    expect(proc.listeners.has("close")).toBe(false);
-    expect(stdin.listeners.has("SIGTERM")).toBe(false);
-    expect(stdin.listeners.has("SIGINT")).toBe(false);
-  });
-
-  it("accepts the real process and process.stdin shapes", () => {
-    // Compile-time assurance that the loose ShutdownEventTarget really does
-    // admit Node's overloaded `on`. Registering against the live process
-    // would leak listeners into the vitest worker, so this only checks
-    // assignability and never calls the function.
-    const targets: Parameters<typeof registerShutdownTriggers>[1] = {
-      proc: process,
-      stdin: process.stdin,
-    };
-    expect(typeof targets.proc.on).toBe("function");
-    expect(typeof targets.stdin.on).toBe("function");
   });
 });

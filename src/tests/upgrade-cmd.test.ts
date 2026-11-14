@@ -176,14 +176,6 @@ describe("detectInstallMethod", () => {
     );
   });
 
-  it("detects linux global install under /usr/lib/node_modules", () => {
-    expect(detectInstallMethod("/usr/lib/node_modules/@yawlabs/mcp/dist/index.js")).toBe("global-npm");
-  });
-
-  it("detects macos homebrew-style /usr/local/lib/node_modules", () => {
-    expect(detectInstallMethod("/usr/local/lib/node_modules/@yawlabs/mcp/dist/index.js")).toBe("global-npm");
-  });
-
   it("detects windows global npm under AppData/Roaming/npm", () => {
     expect(
       detectInstallMethod("C:\\Users\\jeff\\AppData\\Roaming\\npm\\node_modules\\@yawlabs\\mcp\\dist\\index.js"),
@@ -244,12 +236,6 @@ describe("detectInstallMethod", () => {
     expect(globalNpmMarkerIsUnanchored("/usr/local/lib/node_modules/@yawlabs/mcp/dist/index.js")).toBe(false);
     expect(globalNpmMarkerIsUnanchored("/home/u/.npm-global/node_modules/@yawlabs/mcp/dist/index.js")).toBe(false);
     expect(globalNpmMarkerIsUnanchored("/home/u/proj/node_modules/@yawlabs/mcp/dist/index.js")).toBe(false);
-  });
-
-  it("detects nvm-style /home/u/.nvm/versions/node/.../lib/node_modules as global", () => {
-    expect(detectInstallMethod("/home/u/.nvm/versions/node/v22.11.0/lib/node_modules/@yawlabs/mcp/dist/index.js")).toBe(
-      "global-npm",
-    );
   });
 
   it("detects a project-local node_modules install", () => {

@@ -620,6 +620,7 @@ describe("buildToolRoutes — active-vs-active collisions", () => {
 
 describe("buildResourceList / buildResourceRoutes", () => {
   it("lists resources with namespaced URIs", () => {
+    // No builtins argument: also covers the back-compat default (no builtins listed).
     const connections = new Map<string, UpstreamConnection>();
     connections.set("db", makeConnection("db", [], ["db://tables"]));
     const resources = buildResourceList(connections);
@@ -720,14 +721,6 @@ describe("buildResourceList — builtins", () => {
     expect(resources[0].uri).toBe("yaw-mcp://guide");
     expect(resources[1].uri).toBe("connect://db/db://tables");
   });
-
-  it("omits builtins when none are passed (back-compat)", () => {
-    const connections = new Map<string, UpstreamConnection>();
-    connections.set("db", makeConnection("db", [], ["db://tables"]));
-    const resources = buildResourceList(connections);
-    expect(resources.length).toBe(1);
-    expect(resources[0].uri).toBe("connect://db/db://tables");
-  });
 });
 
 describe("routeResourceRead — builtins", () => {
@@ -777,12 +770,6 @@ describe("routeResourceRead — builtins", () => {
     });
     // No matching upstream route either → the "Unknown resource" text path.
     const result = await routeResourceRead("connect://unknown/x", new Map(), new Map(), builtins);
-    expect(result.contents[0].text).toContain("Unknown resource");
-  });
-
-  it("works with undefined builtins (back-compat)", async () => {
-    const result = await routeResourceRead("yaw-mcp://guide", new Map(), new Map());
-    // No builtins, no upstream route → unknown resource.
     expect(result.contents[0].text).toContain("Unknown resource");
   });
 
@@ -1428,13 +1415,6 @@ describe("buildToolList — gateway exposure", () => {
     expect(explicit.map((t) => t.name)).toContain("db_query");
     expect(explicit.map((t) => t.name)).toContain("tailscale_status");
   });
-
-  it("builds routes for unadvertised tools, so dispatch can still reach them", () => {
-    // The reach guarantee that makes withholding safe.
-    const routes = buildToolRoutes(connections, inactive);
-    expect(routes.has("tailscale_status")).toBe(true);
-    expect(routes.has("db_query")).toBe(true);
-  });
 });
 
 describe("gateway exposure covers resources and prompts too", () => {
@@ -1517,7 +1497,9 @@ describe("buildToolList — lite exposure", () => {
   });
 
   it("leaves routes complete, so the eight unlisted meta-tools' work is still reachable by name", () => {
-    // The reach guarantee lite depends on more than gateway does: with no
+    // The reach guarantee that makes withholding safe, for gateway and lite
+    // alike: a tool left off the list is still routed by buildToolRoutes.
+    // Lite depends on it more than gateway does: with no
     // activate in the list, exec's load-on-first-use through the deferred
     // route is the ONLY way a lite client gets a cold server's tool.
     const routes = buildToolRoutes(connections, inactive);

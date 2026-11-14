@@ -82,6 +82,7 @@ describe("describeDefaultRuntime", () => {
   });
 
   it("falls through to bundles.json defaultRuntime with source 'bundles' + the file path", async () => {
+    // Seam omitted: describeDefaultRuntime loads bundles.json itself.
     writeBundles(synthHome, { version: 1, servers: [], defaultRuntime: "oam" });
     const r = await describeDefaultRuntime({ env: {}, cwd: synthCwd, home: synthHome });
     expect(r).toEqual({
@@ -176,13 +177,6 @@ describe("describeDefaultRuntime", () => {
       writeBundles(synthHome, { version: 1, servers: [], defaultRuntime: "oam" });
       const r = await describeDefaultRuntime({ env: {}, cwd: synthCwd, home: synthHome, bundles: null });
       expect(r).toEqual({ runtime: null, source: null, path: null });
-    });
-
-    it("still loads the file itself when the seam is omitted (sidecars-cmd's shape)", async () => {
-      writeBundles(synthHome, { version: 1, servers: [], defaultRuntime: "oam" });
-      const r = await describeDefaultRuntime({ env: {}, cwd: synthCwd, home: synthHome });
-      expect(r.runtime).toBe("oam");
-      expect(r.source).toBe("bundles");
     });
 
     it("the env var still outranks a handed-in bundles load", async () => {

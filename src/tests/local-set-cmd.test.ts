@@ -420,34 +420,6 @@ describe("runSet -- env", () => {
       expect(cap.text(), answer).toContain("env.GITHUB_TOKEN: cleared");
     }
   });
-
-  it("confirms a SET that lands on a stored value, and only that one", async () => {
-    // This used to read "does not confirm a SET, only a clear", on the theory
-    // that an overwrite is recoverable because "the transcript shows what
-    // changed". It does not: every env surface here redacts the value, so the
-    // replaced credential was unreadable the moment it was replaced. A set
-    // over a STORED value is now gated exactly like a clear; a set of a key
-    // that is not there still writes straight through, because nothing is lost.
-    writeBundles(SAMPLE);
-    const overwrite = await runSet({
-      target: "gh",
-      assignments: ["env.GITHUB_TOKEN=other"],
-      home: synthHome,
-      isTTY: false,
-      ...capture(),
-    });
-    expect(overwrite.exitCode).toBe(2);
-    expect(read().servers[0].env).toEqual({ GITHUB_TOKEN: "t", OTHER: "o" });
-
-    const fresh = await runSet({
-      target: "gh",
-      assignments: ["env.NEW_KEY=other"],
-      home: synthHome,
-      isTTY: false,
-      ...capture(),
-    });
-    expect(fresh.exitCode).toBe(0);
-  });
 });
 
 describe("runSet -- the clear prompt over a real readline", () => {

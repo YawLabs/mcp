@@ -106,23 +106,11 @@ describe("healStaleBrokerEntries", () => {
     // sets for Codex -- heal edits config.toml as it always has, and install
     // is the one command that writes that key.
     expect(after).not.toContain("mcp_optional_startup_grace_ms");
+    // The byte equality also proves the client's own fields survive (Codex
+    // needs startup_timeout_sec to start the server at all, so losing it in a
+    // repair would trade one broken entry for another) and that the sibling
+    // [projects.'/some/repo'] table above the entry is left untouched.
     expect(after).toBe(tomlEntry(liveEntry));
-  });
-
-  it("carries the client's own extra fields through the rewrite", async () => {
-    const p = writeCodexConfig(tomlEntry(DEAD));
-    await heal();
-    // Codex needs this to start the server at all; losing it in a repair
-    // would trade one broken entry for another.
-    expect(readFileSync(p, "utf8")).toContain("startup_timeout_sec");
-  });
-
-  it("leaves a sibling table above the entry untouched", async () => {
-    const p = writeCodexConfig(tomlEntry(DEAD));
-    await heal();
-    const after = readFileSync(p, "utf8");
-    expect(after).toContain("[projects.'/some/repo']");
-    expect(after).toContain('trust_level = "trusted"');
   });
 
   it("does NOT touch an entry that still works", async () => {

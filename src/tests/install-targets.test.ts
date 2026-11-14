@@ -80,13 +80,6 @@ describe("INSTALL_TARGETS metadata", () => {
     expect(seen).toBeGreaterThan(0);
   });
 
-  it("VS Code uses the `servers` root key, not `mcpServers`", () => {
-    // This is the wire contract — getting it wrong silently fails.
-    // code.visualstudio.com/docs/copilot/customization/mcp-servers
-    const vscode = INSTALL_TARGETS.find((t) => t.clientId === "vscode");
-    expect(vscode?.config.root).toBe("servers");
-  });
-
   it("pins the root key of each of the six INLINE clients", () => {
     // Scoped to the six ids whose paths are resolved by the inline `pathFor`
     // switch, which is a CLOSED set -- every new target resolves its own path
@@ -103,6 +96,8 @@ describe("INSTALL_TARGETS metadata", () => {
       "claude-code": "mcpServers",
       "claude-desktop": "mcpServers",
       cursor: "mcpServers",
+      // VS Code's `servers` root key is the wire contract -- getting it wrong
+      // silently fails. code.visualstudio.com/docs/copilot/customization/mcp-servers
       vscode: "servers",
       windsurf: "mcpServers",
       "gemini-cli": "mcpServers",

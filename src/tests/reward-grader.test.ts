@@ -313,10 +313,15 @@ describe("gradeOutcomeViaSampling", () => {
   });
 
   it("returns null (never throws) when createMessage rejects", async () => {
-    const server = mockServer({ sampling: {} }, async () => {
-      throw new Error("declined");
-    });
-    expect(await gradeOutcomeViaSampling(server, ctx)).toBeNull();
+    // "declined" is a client refusal. The SDK message is its request timeout:
+    // it rejects with an McpError(RequestTimeout) after sending
+    // notifications/cancelled, and the grader must swallow that into null too.
+    for (const message of ["declined", "MCP error -32001: Request timed out"]) {
+      const server = mockServer({ sampling: {} }, async () => {
+        throw new Error(message);
+      });
+      expect(await gradeOutcomeViaSampling(server, ctx)).toBeNull();
+    }
   });
 
   it("returns null on timeout", async () => {
@@ -357,14 +362,5 @@ describe("gradeOutcomeViaSampling", () => {
     });
     expect(await gradeOutcomeViaSampling(server, ctx)).toBe(1.0);
     expect(seenParams?.maxTokens).toBeGreaterThanOrEqual(48);
-  });
-
-  it("returns null (never throws) when the SDK's request timeout rejects the call", async () => {
-    // The SDK rejects with an McpError(RequestTimeout) after sending the
-    // cancellation notification; the grader must swallow it into null.
-    const server = mockServer({ sampling: {} }, async () => {
-      throw new Error("MCP error -32001: Request timed out");
-    });
-    expect(await gradeOutcomeViaSampling(server, ctx)).toBeNull();
   });
 });

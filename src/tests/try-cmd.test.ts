@@ -1224,6 +1224,8 @@ describe("runTryCleanup", () => {
     expect(r.exitCode).toBe(0);
     expect(existsSync(trialMarkerPath("demo", synthHome))).toBe(false);
     const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    // Also the positive control for trial provenance: an UNCHANGED entry
+    // (fingerprint matches) is still removed.
     expect(client.mcpServers["yaw-mcp-try-demo"]).toBeUndefined();
     // Cleanup must not seed a machine fingerprint either.
     expect(existsSync(legacyAnonPath(synthHome))).toBe(false);
@@ -3003,21 +3005,6 @@ describe("trial provenance -- the entry at the name may not be OURS any more", (
     // Reported once: the marker is gone, so the next sweep is silent rather
     // than re-failing forever.
     expect(existsSync(markerPath)).toBe(false);
-  });
-
-  it("still removes an UNCHANGED entry", async () => {
-    await wire();
-    const cap = captureIO();
-    const r = await runTryCleanup({
-      slug: "demo",
-      home: synthHome,
-      force: true,
-      out: cap.pushOut,
-      err: cap.pushErr,
-    });
-    expect(r.exitCode).toBe(0);
-    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
-    expect(client.mcpServers["yaw-mcp-try-demo"]).toBeUndefined();
   });
 
   it("still removes when the marker predates fingerprints", async () => {

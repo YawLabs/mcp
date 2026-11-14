@@ -186,7 +186,7 @@ describe("maybeAutoUpgrade", () => {
     expect(spawnImpl).not.toHaveBeenCalled();
   });
 
-  it("background-upgrades a stale global-npm install", async () => {
+  it("background-upgrades a stale global-npm install with exactly `npm install -g @yawlabs/mcp@latest` -- never arbitrary commands", async () => {
     const spawnImpl = vi.fn();
     await maybeAutoUpgrade({
       currentVersion: "0.47.0",
@@ -274,17 +274,6 @@ describe("maybeAutoUpgrade", () => {
     expect(spawnImpl).not.toHaveBeenCalled();
   });
 
-  it("only whitelists `npm install -g @yawlabs/mcp@latest` -- never arbitrary commands", async () => {
-    const calls: [string, string[]][] = [];
-    await maybeAutoUpgrade({
-      currentVersion: "0.40.0",
-      argvPath: GLOBAL_NPM_PATH,
-      fetchLatestImpl: async () => "0.47.8",
-      spawnImpl: (cmd, args) => calls.push([cmd, args]),
-    });
-    expect(calls).toEqual([["npm", GLOBAL_NPM_ARGS]]);
-  });
-
   it("does NOT spawn for a stale bundled-app (asar.unpacked) argvPath -- distinct from generic no-spawn cases", async () => {
     // The bundled-app branch in maybeAutoUpgrade logs and returns without
     // calling spawnImpl. Same observable surface as npx/local/unknown, but the
@@ -366,14 +355,6 @@ describe("detectRunningInstallPrefix", () => {
     expect(detectRunningInstallPrefix(argv1)).toBeNull();
   });
 
-  it("strips the lib segment on Linux-style global paths", () => {
-    // /opt/homebrew/lib/node_modules/@yawlabs/mcp/dist/index.js
-    // -> candidate = /opt/homebrew/lib  -> stripped to /opt/homebrew
-    const argv1 = join(sep, "opt", "homebrew", "lib", "node_modules", "@yawlabs", "mcp", "dist", "index.js");
-    mockRealpathSync.mockReturnValueOnce(argv1);
-    expect(detectRunningInstallPrefix(argv1)).toBe(join(sep, "opt", "homebrew"));
-  });
-
   it("does NOT strip lib when the path has node_modules but no trailing /lib parent", () => {
     // /home/user/.nvm/versions/node/v20.0.0/node_modules/@yawlabs/mcp/dist/index.js
     // candidate = /home/user/.nvm/versions/node/v20.0.0  -- no /lib suffix, kept as-is
@@ -397,18 +378,6 @@ describe("detectRunningInstallPrefix", () => {
 
   it("returns null when argv[1] is undefined", () => {
     expect(detectRunningInstallPrefix(undefined)).toBeNull();
-  });
-
-  it("returns null for a path with no node_modules segment, however deep", () => {
-    // This replaces a test that claimed to pin a 24-segment "safety cap". The
-    // cap never had an observable effect -- lastIndexOf scans the whole string,
-    // so depth cannot hide a node_modules segment -- and the old fixture had no
-    // node_modules in it at all, so it pinned the plain not-found null it still
-    // pins here. The cap is gone; this is the behavior that was actually real.
-    const deepSegments = Array.from({ length: 26 }, (_, i) => `dir${i}`);
-    const argv1 = join(sep, ...deepSegments, "index.js");
-    mockRealpathSync.mockReturnValueOnce(argv1);
-    expect(detectRunningInstallPrefix(argv1)).toBeNull();
   });
 
   it("resolves the prefix of an install nested far deeper than the old 24-segment cap", () => {

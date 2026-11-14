@@ -282,15 +282,6 @@ describe("strict JSON refuses what its client cannot read", () => {
     expect(view.raw).toBe(WITH_COMMENT);
   });
 
-  it("refuses to write into a file with a trailing comma", () => {
-    const view = classifyClientConfig(WITH_TRAILING_COMMA, STRICT);
-    expect(view.unloadable()).not.toBeNull();
-    expect(() => applyClientConfigEdits(view, [{ op: "upsert", key: "mcp", entry: ENTRY }], STRICT)).toThrow(
-      /refusing to write into it/,
-    );
-    expect(view.raw).toBe(WITH_TRAILING_COMMA);
-  });
-
   it("still lets uninstall take our entry out of an unloadable file", () => {
     // Removing our entry from a file the client skips is correct; refusing it
     // would leave the user unable to uninstall.

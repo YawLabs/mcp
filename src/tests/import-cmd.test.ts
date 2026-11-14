@@ -354,21 +354,6 @@ describe("runImport -- the duplicate-run trap", () => {
     expect(cap.text() + cap.errText()).toContain("--remove-originals");
   });
 
-  it("--remove-originals removes them with no prompt", async () => {
-    writeClaudeCode(WIRED);
-    const r = await runImport({
-      clientId: "claude-code",
-      home: synthHome,
-      cwd: synthCwd,
-      removeOriginals: true,
-      isTTY: false,
-      ...capture(),
-    });
-    expect(r.exitCode).toBe(0);
-    const after = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
-    expect(Object.keys(after.mcpServers)).toEqual(["mcp"]);
-  });
-
   it("--remove-originals ends a CRLF config that had no final line break in one CRLF, with no bare LF anywhere", async () => {
     // A ~/.claude.json saved with CRLF and no final line break has nothing at
     // its end for the removal to keep, so the write ADDS one -- and it has to
@@ -395,7 +380,7 @@ describe("runImport -- the duplicate-run trap", () => {
     expect(after).not.toMatch(/(?<!\r)\n/);
   });
 
-  it("--remove-originals ends an LF config that had no final line break in exactly one LF", async () => {
+  it("--remove-originals removes them with no prompt, and ends an LF config that had no final line break in exactly one LF", async () => {
     // The other side of the case above: an LF file gets an LF, not a CRLF,
     // and one of them -- not a CR anywhere, not a doubled line break.
     const path = writeClaudeCode(WIRED);

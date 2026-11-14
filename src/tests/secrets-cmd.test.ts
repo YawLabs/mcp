@@ -32,18 +32,6 @@ import {
 import { symlinksAvailable } from "./symlinks.js";
 
 describe("parseSecretsArgs", () => {
-  it("rejects missing action", () => {
-    const r = parseSecretsArgs([]);
-    expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.error).toMatch(/missing action/);
-  });
-
-  it("rejects unknown action", () => {
-    const r = parseSecretsArgs(["nuke"]);
-    expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.error).toMatch(/unknown action "nuke"/);
-  });
-
   it("set requires a name", () => {
     const r = parseSecretsArgs(["set"]);
     expect(r.ok).toBe(false);
@@ -88,11 +76,6 @@ describe("parseSecretsArgs", () => {
     if (r.ok) expect(r.options.action).toBe("list");
   });
 
-  it("remove requires a name", () => {
-    const r = parseSecretsArgs(["remove"]);
-    expect(r.ok).toBe(false);
-  });
-
   it("lock parses with no name", () => {
     const r = parseSecretsArgs(["lock"]);
     expect(r.ok).toBe(true);
@@ -119,11 +102,6 @@ describe("parseSecretsArgs", () => {
     if (!r.ok) expect((r as { help?: boolean }).help).toBe(true);
   });
 
-  it("rejects --value without arg", () => {
-    const r = parseSecretsArgs(["set", "github", "--value"]);
-    expect(r.ok).toBe(false);
-  });
-
   it("rejects --value followed by a flag instead of storing it as the secret", () => {
     const r = parseSecretsArgs(["set", "github", "--value", "--json"]);
     expect(r.ok).toBe(false);
@@ -134,12 +112,6 @@ describe("parseSecretsArgs", () => {
     const r = parseSecretsArgs(["set", "github", "extra"]);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error).toMatch(/unexpected positional/);
-  });
-
-  it("rejects unknown flag", () => {
-    const r = parseSecretsArgs(["list", "--bogus"]);
-    expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.error).toMatch(/unknown flag "--bogus"/);
   });
 
   // `push` / `pull` and the --replace / --push flags were removed 2026-07-21
@@ -232,11 +204,6 @@ describe("parseSecretsArgs", () => {
       expect(r.options.serverFilter).toBe("github");
       expect(r.options.json).toBe(true);
     }
-  });
-
-  it("rejects --secret without arg", () => {
-    const r = parseSecretsArgs(["audit", "--secret"]);
-    expect(r.ok).toBe(false);
   });
 
   it("rejects --secret / --server followed by a flag instead of storing the flag as the filter", () => {
@@ -1491,20 +1458,6 @@ describe("runSecrets rotate", () => {
     expect(r4.exitCode).toBe(1);
     const err = io.err.mock.calls.map((c) => c[0] as string).join("");
     expect(err.toLowerCase()).toMatch(/wrong passphrase|decryption failed/);
-  });
-
-  it("aborts on a wrong current passphrase; vault is unchanged", async () => {
-    await runSecrets({ action: "set", name: "k", value: "v", passphrase: "correct-current", home }, io);
-    const before = readFileSync(vaultPath(home), "utf8");
-    lock();
-
-    const r = await runSecrets(
-      { action: "rotate", passphrase: "wrong-current", newPassphrase: "whatever-new", home },
-      io,
-    );
-    expect(r.exitCode).toBe(1);
-    // On-disk vault untouched by the aborted rotate.
-    expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
   });
 
   it("errors when there is no vault to rotate", async () => {

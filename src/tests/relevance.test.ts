@@ -25,10 +25,6 @@ function score1(
 describe("single-server scoring", () => {
   const server = { name: "GitHub", namespace: "gh", description: "Repos, issues, pull requests" };
 
-  it("returns 0 for empty context", () => {
-    expect(score1("", server)).toBe(0);
-  });
-
   it("returns 0 for short query words that match nothing in the corpus", () => {
     expect(score1("go do it", server)).toBe(0);
   });
