@@ -253,6 +253,19 @@ function ownedByCurrentUser(st: Awaited<ReturnType<typeof stat>>, env: NodeJS.Pr
   return typeof st.uid === "number" && st.uid === geteuid.call(process);
 }
 
+/** Why the ownership gate above skipped an outside-$HOME `.yaw-mcp/`, in the
+ *  terms of the branch that actually ran: with a geteuid (POSIX) the skip is
+ *  a uid mismatch that never reads ALLOW_UNOWNED_ENV, so naming the variable
+ *  there would send the user to a knob that changes nothing; without one
+ *  (win32) the variable is the only opt-in. Read at call time, like the gate,
+ *  so a test that stubs process.geteuid sees the matching wording. */
+export function untrustedProjectDirReason(): string {
+  const geteuid = (process as { geteuid?: () => number }).geteuid;
+  return typeof geteuid === "function"
+    ? "it is owned by another user"
+    : `its owner cannot be verified on this platform (set ${ALLOW_UNOWNED_ENV}=1 to trust it)`;
+}
+
 // Walks up from `start` looking for a `.yaw-mcp/` directory, stopping
 // just BEFORE $HOME (exclusive) or the filesystem root. Returns the
 // absolute path to the `.yaw-mcp/` directory, or null if none was found.
@@ -263,10 +276,14 @@ function ownedByCurrentUser(st: Awaited<ReturnType<typeof stat>>, env: NodeJS.Pr
 // `env` feeds the ownership gate's ALLOW_UNOWNED_ENV opt-in (see
 // ownedByCurrentUser); callers that probe with a synthetic environment pass
 // theirs, everything else gets process.env.
+// `skipped`, when given, receives the FIRST candidate the ownership gate
+// skipped (left null when none was), so a caller that got null back can tell
+// "no .yaw-mcp/ anywhere" from "one exists but is not trusted".
 export async function findProjectConfigDir(
   start: string,
   home: string = homedir(),
   env: NodeJS.ProcessEnv = process.env,
+  skipped: { first: string | null } | null = null,
 ): Promise<string | null> {
   // os.homedir() is already the USERPROFILE reader on win32, and it is this
   // parameter's own default -- an empty explicit `home` just means "use the
@@ -335,9 +352,10 @@ export async function findProjectConfigDir(
           rememberWarnedUntrustedDir(candidate);
           log("warn", "Skipping an untrusted .yaw-mcp/ dir outside $HOME", {
             candidate,
-            hint: `owned by another user, or ownership is unverifiable on this platform (set ${ALLOW_UNOWNED_ENV}=1 to trust it)`,
+            hint: untrustedProjectDirReason(),
           });
         }
+        if (skipped !== null && skipped.first === null) skipped.first = candidate;
       }
     } catch {
       // Accepted trade-off: we treat ALL errors (ENOENT, EPERM, EACCES,

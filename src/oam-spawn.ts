@@ -2905,12 +2905,16 @@ export function resolveManagedSpawn(
         // one `yaw-mcp sidecars install` writes. Without this check a package
         // first found ambient stayed pinned to that copy for the process
         // lifetime, hiding a later `sidecars install` exactly as a memoized
-        // miss would have. One more existsSync, and only for an ambient memo.
+        // miss would have. Supersession uses packageEntry, the same test
+        // resolveNpmEntry applies to the managed tree: a managed copy with a
+        // package.json but no bin on disk (an interrupted install) is skipped
+        // there, so treating it as a takeover only dropped and re-memoized the
+        // ambient copy on every connect. Only runs for an ambient memo.
         const managedPkgDir = managedRoot === null ? null : join(managedRoot, ...pkg.split("/"));
         const supersededByManaged =
           managedPkgDir !== null &&
           !memoed.startsWith(managedPkgDir + sep) &&
-          existsSync(join(managedPkgDir, "package.json"));
+          packageEntry(managedPkgDir, pkg) !== null;
         if (!supersededByManaged && existsSync(memoed)) return memoed;
         // The memoized copy was removed, or the managed tree now has the
         // package: forget it and rescan below.

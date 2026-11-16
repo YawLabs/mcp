@@ -52,7 +52,13 @@ import { unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { createStreamWriter } from "./logger.js";
 import { userConfigDir } from "./paths.js";
-import { isFileNotFound, isPersistenceDisabled, loadStateClassified, statePath } from "./persistence.js";
+import {
+  isFileNotFound,
+  isPersistenceDisabled,
+  loadStateClassified,
+  STATE_SCHEMA_VERSION,
+  statePath,
+} from "./persistence.js";
 import { askYesNo, isInteractivePrompt, QUESTION_CANCELLED } from "./readline-question.js";
 
 export const RESET_LEARNING_USAGE = `Usage: yaw-mcp reset-learning
@@ -226,7 +232,16 @@ export async function runResetLearning(opts: ResetLearningOptions = {}): Promise
   // whose tool caches had all aged past TOOLCACHE_TTL_MS, or whose learning
   // rows were hand-edited into invalid shapes -- real content, really deleted,
   // reported as nothing.
-  const { parsedCleanly, rawCounts } = await loadStateClassified(filePath);
+  //
+  // Quiet: the loader's own warn would reach stderr ahead of this command's
+  // wording, and for a newer file it says the file is protected right before
+  // this command deletes it. Every outcome is worded below from `failure`.
+  const { parsedCleanly, rawCounts, failure } = await loadStateClassified(filePath, { quiet: true });
+  // A schema version above this build's: another (newer) yaw-mcp's live file,
+  // the same test loadStateClassified applies before flagging it.
+  const writtenByNewer =
+    failure?.kind === "stale-version" && typeof failure.version === "number" && failure.version > STATE_SCHEMA_VERSION;
+  const unreadableNote = writtenByNewer ? "written by a newer yaw-mcp; contents unreadable" : "contents unreadable";
   const learningCount = rawCounts.learning;
   const packCount = rawCounts.packHistory;
   // The v2 file's third section. Deleting it silently was the report
@@ -267,7 +282,7 @@ export async function runResetLearning(opts: ResetLearningOptions = {}): Promise
       print(`  tool caches:          ${toolCacheCount}`);
       print(`  pre-warm failures:    ${prewarmFailureCount}`);
     } else {
-      print("  contents unreadable -- it will be deleted as it is.");
+      print(`  ${unreadableNote} -- it will be deleted as it is.`);
     }
     print("  This cannot be undone.");
     if (!isInteractivePrompt(opts)) {
@@ -307,7 +322,7 @@ export async function runResetLearning(opts: ResetLearningOptions = {}): Promise
   // 0/0 counts would be misleading, so report that the file was cleared
   // without claiming an entry count we never actually read.
   if (!parsedCleanly) {
-    print("yaw-mcp reset-learning: cleared persisted state (contents unreadable).");
+    print(`yaw-mcp reset-learning: cleared persisted state (${unreadableNote}).`);
     print(`  path: ${filePath}`);
     for (const line of RUNNING_SERVE_NOTE) print(line);
     return { exitCode: 0, lines, removed: true, path: filePath };

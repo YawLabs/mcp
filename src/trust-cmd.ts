@@ -44,7 +44,7 @@ import {
 import { localBundlesPath, previewBundlesContent, probeProjectTrust } from "./local-bundles.js";
 import { createStreamWriter } from "./logger.js";
 import { isRegistrySpec, launcherBasename, specConstraint } from "./oam-spawn.js";
-import { ALLOW_UNOWNED_ENV, CONFIG_DIRNAME } from "./paths.js";
+import { CONFIG_DIRNAME, findProjectConfigDir, untrustedProjectDirReason } from "./paths.js";
 import {
   askYesNo,
   isInteractivePrompt,
@@ -219,6 +219,19 @@ export async function runTrust(opts: TrustCommandOptions = {}): Promise<TrustCom
   return runTrustGrant(opts);
 }
 
+/** Why the walk from `cwd` found no usable `.yaw-mcp/`. findProjectConfigDir
+ *  answers null both when there is none and when the ownership gate SKIPPED
+ *  one outside $HOME; a second walk on this failure path only, with the
+ *  `skipped` out-param, tells them apart so neither reads as the other. The
+ *  reason comes from untrustedProjectDirReason, which names the env opt-in
+ *  only where the gate reads it (no geteuid, i.e. win32). */
+async function describeNoProjectDir(cwd: string, home: string, env: NodeJS.ProcessEnv): Promise<string> {
+  const skipped: { first: string | null } = { first: null };
+  await findProjectConfigDir(cwd, home, env, skipped).catch(() => null);
+  if (skipped.first === null) return `no .yaw-mcp/ directory was found by walking up from ${displaySafe(cwd)}`;
+  return `the .yaw-mcp/ at ${displaySafe(skipped.first)} is outside your home directory and was SKIPPED because ${untrustedProjectDirReason()}`;
+}
+
 // --- grant ------------------------------------------------------------------
 
 async function runTrustGrant(opts: TrustCommandOptions): Promise<TrustCommandResult> {
@@ -242,7 +255,7 @@ async function runTrustGrant(opts: TrustCommandOptions): Promise<TrustCommandRes
     // "there is nothing here" and "I am looking straight at one".
     printErr(
       probe.path === null
-        ? `yaw-mcp trust: no .yaw-mcp/ directory that yaw-mcp can use was found by walking up from ${displaySafe(cwd)}. One OUTSIDE your home directory is SKIPPED unless yaw-mcp can verify you own it -- set ${ALLOW_UNOWNED_ENV}=1 to trust this checkout, then re-run. Otherwise there is no project bundles.json to approve; your user-global ~/.yaw-mcp/bundles.json is always loaded.`
+        ? `yaw-mcp trust: ${await describeNoProjectDir(cwd, home, env)}, so there is no project bundles.json to approve. Your user-global ~/.yaw-mcp/bundles.json is always loaded.`
         : `yaw-mcp trust: no project bundles.json at ${displaySafe(probe.path)}. Nothing to approve.`,
     );
     return { exitCode: 1 };
@@ -1055,12 +1068,13 @@ async function runTrustRevoke(opts: TrustCommandOptions): Promise<TrustCommandRe
     const probe = await probeProjectTrust({ cwd, home, env });
     if (probe.path === null) {
       // Not a flat "no .yaw-mcp/ directory found", for the reason the grant
-      // path gives: the walk also SKIPS a `.yaw-mcp/` outside $HOME whose
-      // ownership it cannot verify, and reports it exactly like none at all.
-      // A file approved while the env var was set is then un-findable from
-      // inside its own checkout; the explicit path reaches it either way
-      // (revokeTrust works on the stored path, not on the walk).
-      const msg = `no .yaw-mcp/ directory that yaw-mcp can use was found by walking up from ${displaySafe(cwd)}. One OUTSIDE your home directory is SKIPPED unless yaw-mcp can verify you own it (${ALLOW_UNOWNED_ENV}=1 trusts this checkout); to revoke an approval anyway, pass an explicit path (see \`yaw-mcp trust --list\`)`;
+      // path gives: the walk also SKIPS a `.yaw-mcp/` outside $HOME that
+      // fails the ownership gate, and returns null exactly as for none at all
+      // (describeNoProjectDir tells the two apart). A file approved while it
+      // passed the gate is then un-findable from inside its own checkout; the
+      // explicit path reaches it either way (revokeTrust works on the stored
+      // path, not on the walk).
+      const msg = `${await describeNoProjectDir(cwd, home, env)}; to revoke an approval anyway, pass an explicit path (see \`yaw-mcp trust --list\`)`;
       if (opts.json) out(`${JSON.stringify({ ok: false, error: msg })}\n`);
       else printErr(`yaw-mcp trust --revoke: ${msg}`);
       return { exitCode: 1 };

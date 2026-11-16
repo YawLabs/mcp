@@ -381,6 +381,48 @@ describe("runAudit", () => {
     expect(seen?.args[0]).toBe(join(buildDir, "dist", "index.js"));
   });
 
+  it("refuses a git-sourced server that is not built here, without spawning, and names the build command", async () => {
+    // The loader sets cwd to the build dir whenever a commit is pinned, built
+    // or not. Spawning there failed with `spawn ... ENOENT` from the suite.
+    const commit = "2222222222222222222222222222222222222222";
+    home = realpathSync(mkdtempSync(join(tmpdir(), "yaw-audit-")));
+    mkdirSync(join(home, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(
+      join(home, CONFIG_DIRNAME, "bundles.json"),
+      JSON.stringify({
+        version: 1,
+        servers: [
+          {
+            namespace: "acme",
+            name: "acme",
+            type: "local",
+            transport: "stdio",
+            git: { url: "git@github.com:acme/tools-mcp.git", ref: "main", commit, entry: "dist/index.js" },
+          },
+        ],
+      }),
+    );
+    const io = captureIO();
+    let called = false;
+    const r = await runAudit({
+      namespace: "acme",
+      home,
+      cwd: home,
+      out: io.push,
+      err: io.pushErr,
+      runner: async () => {
+        called = true;
+        return { grade: "A", score: 100 };
+      },
+    });
+    expect(called).toBe(false);
+    expect(r.exitCode).toBe(2);
+    const err = io.err.join("\n");
+    expect(err).toContain('"acme" is not built on this machine');
+    expect(err).toContain("yaw-mcp sidecars install");
+    expect(io.out.join("\n")).toBe("");
+  });
+
   it("gives a plain command server no cwd", async () => {
     home = makeHome([{ namespace: "ctxlint", type: "local", command: "node", args: ["x.js"] }]);
     const io = captureIO();

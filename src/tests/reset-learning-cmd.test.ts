@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CONFIG_DIRNAME } from "../paths.js";
 import { STATE_FILENAME, STATE_SCHEMA_VERSION, TOOLCACHE_TTL_MS } from "../persistence.js";
 import { parseResetLearningArgs, RESET_LEARNING_USAGE, runResetLearning } from "../reset-learning-cmd.js";
@@ -244,8 +244,47 @@ describe("runResetLearning", () => {
     expect(r.removed).toBe(true);
     expect(existsSync(stateFile)).toBe(false);
     const combined = io.out.join("");
-    expect(combined).toContain("cleared persisted state (contents unreadable)");
+    expect(combined).toContain("cleared persisted state (written by a newer yaw-mcp; contents unreadable)");
     expect(combined).not.toContain("learning entries removed:");
+  });
+
+  describe("the loader's own warning stays off stderr", () => {
+    // Only the command words an unusable file. The loader's warn reached
+    // process.stderr ahead of it, and for a newer file said the file was
+    // protected right before this command deleted it.
+    async function stderrOf(content: string): Promise<{ stderr: string; out: string }> {
+      writeFileSync(stateFile, content, "utf8");
+      const io = captureIO();
+      const spy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      try {
+        const r = await runResetLearning({ home, env: {}, force: true, out: io.push, err: io.pushErr });
+        expect(r.exitCode).toBe(0);
+        expect(r.removed).toBe(true);
+        return { stderr: spy.mock.calls.map((c) => String(c[0])).join(""), out: io.out.join("") };
+      } finally {
+        spy.mockRestore();
+      }
+    }
+
+    it("for a newer-version file, which is reported as one", async () => {
+      const { stderr, out } = await stderrOf(
+        JSON.stringify({ version: STATE_SCHEMA_VERSION + 1, savedAt: 1, learning: {}, packHistory: [] }),
+      );
+      expect(stderr).toBe("");
+      expect(out).toContain("cleared persisted state (written by a newer yaw-mcp; contents unreadable)");
+    });
+
+    it("for an older-version file", async () => {
+      const { stderr, out } = await stderrOf(JSON.stringify({ version: 0, savedAt: 1, learning: {} }));
+      expect(stderr).toBe("");
+      expect(out).toContain("cleared persisted state (contents unreadable)");
+    });
+
+    it("for a non-object root", async () => {
+      const { stderr, out } = await stderrOf("[]");
+      expect(stderr).toBe("");
+      expect(out).toContain("cleared persisted state (contents unreadable)");
+    });
   });
 
   it("reports concrete 0/0 counts for a cleanly-parsed empty state file", async () => {

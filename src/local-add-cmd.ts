@@ -44,7 +44,7 @@ import {
   redactGitOutput,
   removeGitCheckout,
   resolveGitRef,
-  scrubRepoUrlUserinfo,
+  scrubStoredGitUrl,
   treeSizeBytes,
 } from "./git-source.js";
 import { type GradesCache, readGradesCache } from "./grades-cache.js";
@@ -523,35 +523,6 @@ function jsonEntry(entry: Partial<UpstreamServerConfig>): Record<string, unknown
     out.git = { ...git, url: scrubStoredGitUrl(git.url) };
   }
   return out;
-}
-
-/** A stored git url for machine output and previews: userinfo that could be a
- *  credential is replaced by `***`, a bare username is left alone.
- *
- *  scrubRepoUrlUserinfo replaces ANY userinfo, which is right for an error
- *  line but wrong here: `ssh://git@github.com/acme/x.git` is a url `add --git`
- *  accepts and stores as typed, and `list --json` reporting it as
- *  `ssh://***@github.com/...` handed a script a url that does not clone and
- *  does not equal what bundles.json holds.
- *
- *  "Bare" is decided on the raw text, as parseGitSpec decides it, and by the
- *  shape git-source.ts's isBareUsername accepts (not exported, so spelled
- *  again here): 1-19 characters of [A-Za-z0-9._-], no ":", and not starting
- *  with a known token prefix. Anything else -- a password, an empty username,
- *  a token where the username goes, a url the pattern below does not match --
- *  goes through scrubRepoUrlUserinfo. That is stricter than parseGitSpec for
- *  ssh://, where it accepts any username without a ":": a longer ssh username
- *  is still shown as `***`, the safe direction. */
-function scrubStoredGitUrl(url: string): string {
-  const userinfo = /^[a-z][a-z0-9+.-]*:\/\/([^/?#\\]*)@/i.exec(url)?.[1];
-  if (
-    userinfo !== undefined &&
-    /^[A-Za-z0-9._-]{1,19}$/.test(userinfo) &&
-    !/^(gh[pousr]_|github_pat_|glpat-|glptt-|xox[abp]-)/i.test(userinfo)
-  ) {
-    return url;
-  }
-  return scrubRepoUrlUserinfo(url);
 }
 
 /** Declared keys with no stored value while the shell HAS one: the value

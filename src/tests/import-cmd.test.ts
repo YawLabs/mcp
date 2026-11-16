@@ -267,7 +267,7 @@ describe("runImport -- reading a client config", () => {
     const cap = capture();
     const r = await runImport({ clientId: "claude-code", home: synthHome, cwd: synthCwd, ...cap });
     expect(r.exitCode).toBe(0);
-    expect(cap.text()).toMatch(/nothing to import|no servers/i);
+    expect(cap.text()).toMatch(/Nothing to import: no servers in .* beyond yaw-mcp's own entry\./);
     expect(r.written).toEqual([]);
   });
 
@@ -300,11 +300,21 @@ describe("runImport -- reading a client config", () => {
         wrapped: { command: "cmd", args: ["/c", "npx", "-y", "@yawlabs/mcp"] },
         bin: { command: "yaw-mcp" },
         shim: { command: "cmd.exe", args: ["/c", "C:\\Users\\me\\AppData\\Roaming\\npm\\yaw-mcp.cmd"] },
+        // cmd's own switches ahead of /c, in any case.
+        switches: { command: "CMD", args: ["/D", "/s", "/C", "yaw-mcp"] },
         hosted: { command: "/opt/oam", args: ["--no-check", "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js"] },
         // A different package of the same scope, and a server that merely has
         // the bin's name as an ordinary argument: both are real servers.
         compliance: { command: "npx", args: ["-y", "@yawlabs/mcp-compliance"] },
         notes: { command: "node", args: ["notes.js", "yaw-mcp"] },
+        // Under `cmd /c`, only the program cmd runs is the broker question: a
+        // directory or a container named yaw-mcp later in the line is that
+        // program's argument.
+        fs: {
+          command: "cmd",
+          args: ["/c", "npx", "-y", "@modelcontextprotocol/server-filesystem", "C:\\src\\yaw-mcp"],
+        },
+        box: { command: "cmd", args: ["/c", "docker", "run", "-i", "--rm", "--name", "yaw-mcp", "img"] },
       },
     });
     const cap = capture();
@@ -313,8 +323,78 @@ describe("runImport -- reading a client config", () => {
       bundles()
         .map((s) => s.namespace)
         .sort(),
-    ).toEqual(["compliance", "notes"]);
-    expect(cap.text()).toMatch(/Skipped yaw-mcp's own entries: yaw, wrapped, bin, shim, hosted/);
+    ).toEqual(["box", "compliance", "fs", "notes"]);
+    expect(cap.text()).toMatch(/Skipped yaw-mcp's own entries: yaw, wrapped, bin, shim, switches, hosted\n/);
+  });
+
+  it("never prints a credential from a stored git url or a dropped client url", async () => {
+    // The stored git url is hand-editable, so it can carry a token in its
+    // userinfo; the "was" line and the launch-change note both render it. The
+    // url an entry with a command loses is printed in its ignoring-note.
+    writeBundles([
+      {
+        id: "local-srv",
+        name: "srv",
+        namespace: "srv",
+        type: "local",
+        transport: "stdio",
+        git: { url: "https://user:ghp_tok123secret@github.com/acme/srv.git", commit: "a".repeat(40) },
+        isActive: true,
+      },
+    ]);
+    writeClaudeCode({
+      mcpServers: {
+        srv: { command: "node", args: ["s.js"] },
+        both: { command: "node", args: ["b.js"], url: "https://u:pw_secret99@mcp.example.com/mcp?key=AIzaKey123" },
+      },
+    });
+    const cap = capture();
+    const r = await runImport({
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      keepOriginals: true,
+      force: true,
+      ...cap,
+    });
+    expect(r.exitCode).toBe(0);
+    const all = cap.text() + cap.errText();
+    expect(all).toContain("was: git https://***@github.com/acme/srv.git");
+    expect(all).toContain("from: git https://***@github.com/acme/srv.git");
+    expect(all).toContain("ignoring 'url' on \"both\"");
+    expect(all).not.toContain("ghp_tok123secret");
+    expect(all).not.toContain("pw_secret99");
+    expect(all).not.toContain("AIzaKey123");
+  });
+
+  it("prints a stored git url's bare username as stored, as add and list --json do", async () => {
+    // `ssh://git@host/...` is the address, not a credential: the "was" line
+    // must show the url bundles.json holds, the same as `add`'s renderer.
+    writeBundles([
+      {
+        id: "local-srv",
+        name: "srv",
+        namespace: "srv",
+        type: "local",
+        transport: "stdio",
+        git: { url: "ssh://git@github.com/acme/srv.git", commit: "a".repeat(40) },
+        isActive: true,
+      },
+    ]);
+    writeClaudeCode({ mcpServers: { srv: { command: "node", args: ["s.js"] } } });
+    const cap = capture();
+    const r = await runImport({
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      keepOriginals: true,
+      force: true,
+      ...cap,
+    });
+    expect(r.exitCode).toBe(0);
+    const all = cap.text() + cap.errText();
+    expect(all).toContain("was: git ssh://git@github.com/acme/srv.git");
+    expect(all).not.toContain("ssh://***@");
   });
 
   it("warns, naming the span and never the value around it, when a ${...} is carried across as text", async () => {

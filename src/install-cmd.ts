@@ -4345,10 +4345,15 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
   if (opts.crossOsPreview) {
     log(`Target: ${target.label} (${scope})`);
     log(`File:   ${plan.resolved.display}`);
+    // The suggested command must inspect the file named above, so it carries
+    // the scope and the user's own --project-dir spelling. Not `projectDir`
+    // from the plan: that was resolved against THIS machine's cwd and
+    // separators, which name a different directory on the other OS.
     log(
       `\nNot inspected: that is ${target.label}'s config on ${os}, and this machine is ${CURRENT_OS} -- uninstall ` +
         "reads only the machine it runs on, so it cannot say whether that file has a yaw-mcp entry. Run " +
-        `\`yaw-mcp uninstall ${target.clientId} --dry-run\` on the ${os} machine itself.`,
+        `\`yaw-mcp uninstall ${target.clientId}${reinstallScopeFlags(target, scope, opts.projectDir, os === "windows" ? "win32" : "linux")} --dry-run\` ` +
+        `on the ${os} machine itself.`,
     );
     return { written: [], wouldWrite: [], messages, exitCode: 0 };
   }
@@ -5019,11 +5024,22 @@ function uninstallDoneLine(
  *  has one, resolveInstallSite), so any other scope names itself, and a scope
  *  that reads a project directory names the one it resolved -- without them a
  *  `--scope project` uninstall would advertise a command that wires the user
- *  scope into a different file. Same shape as yawFreshPaneNote's scopeFlags. */
-function reinstallScopeFlags(target: InstallTarget, scope: InstallScope, projectDir: string | undefined): string {
+ *  scope into a different file. Same shape as yawFreshPaneNote's scopeFlags.
+ *
+ *  `shell` is the platform whose shell the command will be pasted into: this
+ *  machine's by default, the target OS's for a cross-OS preview, so a path
+ *  with a `$` or a quote is quoted for bash on a Linux target even when the
+ *  preview runs on Windows. */
+function reinstallScopeFlags(
+  target: InstallTarget,
+  scope: InstallScope,
+  projectDir: string | undefined,
+  shell: NodeJS.Platform = process.platform,
+): string {
   const bareDefault: InstallScope = target.scopes.some((s) => s.scope === "user") ? "user" : target.scopes[0].scope;
   if (scope === bareDefault && projectDir === undefined) return "";
-  const projectFlag = projectDir === undefined ? "" : ` --project-dir ${quoteArgForDisplay(projectDir) ?? projectDir}`;
+  const projectFlag =
+    projectDir === undefined ? "" : ` --project-dir ${quoteArgForDisplay(projectDir, shell) ?? projectDir}`;
   return ` --scope ${scope}${projectFlag}`;
 }
 
