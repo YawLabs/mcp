@@ -864,11 +864,11 @@ describe("yaw-mcp trust --revoke", () => {
     expect(r.exitCode).toBe(1);
     const parsed = JSON.parse(io.text()) as { ok: boolean; error: string };
     expect(parsed.ok).toBe(false);
-    expect(parsed.error).toContain("no .yaw-mcp/ directory");
-    // Not a flat "none found": a .yaw-mcp/ outside $HOME that cannot be
-    // verified is skipped by the same walk, and the grant path says so.
-    expect(parsed.error).toContain("is SKIPPED unless yaw-mcp can verify you own it");
-    expect(parsed.error).toContain(ALLOW_UNOWNED_ENV);
+    expect(parsed.error).toContain("no .yaw-mcp/ directory was found");
+    // Nothing was skipped here (synthCwd is under synthHome, nothing planted),
+    // so there is no untrusted dir to explain and no opt-in to name.
+    expect(parsed.error).not.toContain("SKIPPED");
+    expect(parsed.error).not.toContain(ALLOW_UNOWNED_ENV);
     expect(parsed.error).toContain("pass an explicit path");
     expect(io.errText()).toBe("");
   });

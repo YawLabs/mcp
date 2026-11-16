@@ -76,7 +76,7 @@
 //     aborts the removal of the others.
 
 import { homedir } from "node:os";
-import { basename, resolve as resolvePath } from "node:path";
+import { basename, sep as pathSep, resolve as resolvePath } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { atomicWriteFile } from "./atomic-write.js";
 import { clientChoices, resolveClientArg } from "./client-aliases.js";
@@ -96,6 +96,8 @@ import {
   terminateWithNewline,
   unloadableConfigProblem,
 } from "./client-config.js";
+import { scrubStoredGitUrl } from "./git-source.js";
+import { scrubForWarning } from "./health-score.js";
 import { deepEqualJson, describeEntryDiff, resolveInstallSite } from "./install-cmd.js";
 import {
   blockedContainerFix,
@@ -153,11 +155,16 @@ export const IMPORT_USAGE = `Usage: yaw-mcp import <client> [flags]
   terminal run asks first -- [o]verwrite, [s]kip or [a]bort, and a bare Enter
   skips that server -- and a run off one writes nothing and exits 2 unless you
   pass --force. A stored entry the merge would leave as it is is not asked
-  about. A server written with a variable its client expands itself is
-  skipped by name: VS Code's \${input:...} and \${env:...}, Cline's and
-  Cursor's \${env:...}, Claude Code's \${VAR} and \${VAR:-default}. yaw-mcp
-  does not expand those, so importing one would produce a server that
-  cannot start.
+  about. A server written with a variable its client expands itself and
+  yaw-mcp cannot is skipped by name: VS Code's \${input:...}, \${env:...} and
+  every other variable except \${workspaceFolder} and
+  \${workspaceFolderBasename} in a workspace file; Cline's \${env:...};
+  Cursor's \${env:...}, plus \${workspaceFolder} and
+  \${workspaceFolderBasename} in the user-scope file; Claude Code's \${VAR}
+  and \${VAR:-default}. yaw-mcp does not expand those, so importing one would
+  produce a server that cannot start. Cursor's \${userHome}, \${pathSeparator}
+  and \${/} are filled in from this machine, and those workspace variables
+  from the project directory.
 
   A client config file that does not exist, or is empty, is not an error:
   the run says there is nothing to import and exits 0. A file that cannot
@@ -378,6 +385,9 @@ interface ClientVars {
   /** The workspace folder, or undefined at a scope that resolves none (VS
    *  Code's user-profile mcp.json belongs to no workspace at all). */
   workspaceFolder?: string;
+  /** The user's home directory, for Cursor's `${userHome}`. Set only under
+   *  "cursor". */
+  userHome?: string;
   /** Which `${...}` spans are the client's OWN variables. "all" is VS Code,
    *  where every span is one (workspace, input, env, ...). "env" is Cline:
    *  `${env:NAME}` is the one spelling its row records it expanding
@@ -429,8 +439,13 @@ function isClientVariable(name: string, spans: ClientVars["spans"]): boolean {
  *  that declares none (its entries are carried across uninterpreted).
  *  `workspaceFolder` is handed only to the two modes in which
  *  `${workspaceFolder}` IS the workspace folder -- under "posix-env" that
- *  span is an environment variable that happens to have the name. */
-function clientVarsFor(hook: TargetHooks["importVariables"], projectDir: string | undefined): ClientVars | null {
+ *  span is an environment variable that happens to have the name. `home` is
+ *  the home directory the run already reads the client config under. */
+function clientVarsFor(
+  hook: TargetHooks["importVariables"],
+  projectDir: string | undefined,
+  home: string,
+): ClientVars | null {
   switch (hook) {
     case undefined:
       return null;
@@ -441,7 +456,7 @@ function clientVarsFor(hook: TargetHooks["importVariables"], projectDir: string 
     case "posix-env":
       return { spans: "posix-env" };
     case "cursor-env":
-      return { workspaceFolder: projectDir, spans: "cursor" };
+      return { workspaceFolder: projectDir, userHome: home, spans: "cursor" };
     default: {
       const _exhaustive: never = hook;
       return _exhaustive;
@@ -477,7 +492,9 @@ function clientVarsFor(hook: TargetHooks["importVariables"], projectDir: string 
  * and is not recorded. "posix-env" (Claude Code's `${VAR}` /
  * `${VAR:-default}`) and "cursor" work the same way over their own variable
  * sets (isClientVariable); Cursor's `${workspaceFolder}` expands like VS
- * Code's when the scope resolved a project directory.
+ * Code's when the scope resolved a project directory, and its `${userHome}`,
+ * `${pathSeparator}` and `${/}` always expand -- to the home directory and to
+ * this host's path separator, the values Cursor on this machine would use.
  *
  * `${secret:NAME}` is left alone and is NOT unresolved -- that is yaw-mcp's own
  * reference, resolved against the vault at spawn (secrets-vault.ts), so a
@@ -492,10 +509,18 @@ function expandClientVars(s: string, vars: ClientVars, unresolved: Set<string>):
       if (name === "workspaceFolder") return vars.workspaceFolder;
       if (name === "workspaceFolderBasename") return basename(vars.workspaceFolder);
     }
+    if (vars.spans === "cursor") {
+      if (name === "userHome" && vars.userHome !== undefined) return vars.userHome;
+      if (name === "pathSeparator" || name === "/") return pathSep;
+    }
     unresolved.add(span);
     return span;
   });
 }
+
+/** Where an unresolvable `${...}` sits, which decides how the server can be
+ *  added by hand instead (unresolvedHint). */
+type UnresolvedSite = "local" | "url" | "headers";
 
 /** One server the import built, or refused to build. */
 interface BuiltEntry {
@@ -505,6 +530,9 @@ interface BuiltEntry {
   /** `${...}` spans this importer cannot resolve. Non-empty means the server is
    *  skipped rather than imported. */
   unresolved: string[];
+  /** Where those spans sit, for the hand-add hint: anywhere in a local entry,
+   *  or a remote entry's url and/or its headers. Empty when `unresolved` is. */
+  unresolvedIn: UnresolvedSite[];
   /** `${...}` spans carried across as the text they are, because the client's
    *  entries are not interpreted (`vars` null). `${secret:NAME}` is not one.
    *  Always empty when `vars` is set. */
@@ -551,11 +579,13 @@ function toEntry(key: string, value: unknown, vars: ClientVars | null): BuiltEnt
   // call -- but SAYS so, naming the url it leaves behind, because the header
   // promises nothing is dropped in silence and the url can be the half the
   // user actually meant. Through `discarded`, so it prints beside the
-  // env/headers notes as a warning naming the client file.
+  // env/headers notes as a warning naming the client file. The url goes
+  // through scrubForWarning first: a `user:key@` or `?key=` in it is a
+  // credential, and this line is printed.
   const dropped: string[] = [];
   if (command && url) {
     dropped.push(
-      `ignoring 'url' on "${displaySafe(key)}" (the entry also has a command, so it is imported as a local stdio server) -- ${displaySafe(url)} was not carried over`,
+      `ignoring 'url' on "${displaySafe(key)}" (the entry also has a command, so it is imported as a local stdio server) -- ${displaySafe(scrubForWarning(url))} was not carried over`,
     );
   }
 
@@ -571,8 +601,23 @@ function toEntry(key: string, value: unknown, vars: ClientVars | null): BuiltEnt
   };
 
   if (!command && url) {
+    // The url was the only thing expanded so far, so every span recorded by
+    // now sits in it.
+    const inUrl = unresolved.size > 0;
     const rawHeaders = readStringMap(v.headers);
     const headers = expandMap(rawHeaders.map);
+    // Asked of each header on its own: a span the url already recorded would
+    // not grow the shared set a second time.
+    const inHeaders =
+      vars !== null &&
+      Object.values(rawHeaders.map ?? {}).some((h) => {
+        const probe = new Set<string>();
+        expandClientVars(h, vars, probe);
+        return probe.size > 0;
+      });
+    const unresolvedIn: UnresolvedSite[] = [];
+    if (inUrl) unresolvedIn.push("url");
+    if (inHeaders) unresolvedIn.push("headers");
     // VS Code's `"type": "sse"`. Anything else (including "http") takes
     // yaw-mcp's own streamable-http default, which validateEntry applies when
     // the field is absent -- so it is left absent rather than being stamped,
@@ -583,6 +628,7 @@ function toEntry(key: string, value: unknown, vars: ClientVars | null): BuiltEnt
       credentialKeys: Object.keys(headers ?? {}),
       discarded: discardNotes("headers", key, rawHeaders),
       unresolved: [...unresolved],
+      unresolvedIn,
       verbatim: [...verbatim],
     };
   }
@@ -604,6 +650,7 @@ function toEntry(key: string, value: unknown, vars: ClientVars | null): BuiltEnt
     credentialKeys: Object.keys(env ?? {}),
     discarded: [...dropped, ...discardNotes("env", key, rawEnv)],
     unresolved: [...unresolved],
+    unresolvedIn: unresolved.size > 0 ? ["local"] : [],
     verbatim: [...verbatim],
   };
 }
@@ -658,12 +705,44 @@ function describeUnresolved(spans: string[], inputs: Map<string, string>): strin
     .join(", ");
 }
 
+/** How to add a skipped server by hand: one sentence when the skipped
+ *  servers share one shape, else one line per shape among them. yaw-mcp
+ *  fills in `${secret:NAME}` in a local server's env and in a remote server's
+ *  headers (upstream.ts resolves both through the vault) but not in a url, so
+ *  a variable in a url has no vault form and the hint says so. */
+function unresolvedHint(sites: ReadonlySet<UnresolvedSite>): string {
+  const hints: Array<[label: string, body: string]> = [];
+  if (sites.has("local")) {
+    hints.push(["a local server", `\`yaw-mcp add <name> --command ... --env KEY='\${secret:NAME}'\``]);
+  }
+  if (sites.has("headers")) {
+    hints.push([
+      "a variable in a header",
+      `\`yaw-mcp add <name> --url <url> --header 'Authorization: Bearer \${secret:NAME}'\``,
+    ]);
+  }
+  if (sites.has("url")) {
+    hints.push([
+      "a variable in a url",
+      "yaw-mcp does not fill in `${secret:NAME}` in a url, so write the value into it (`yaw-mcp add <name> --url <url>`), or send it as a `--header` if the server accepts one",
+    ]);
+  }
+  const lead = "Add each by hand once you know the value:";
+  if (hints.length === 1) return `${lead} ${hints[0][1]}.`;
+  return `${lead}\n${hints.map(([label, body]) => `  ${label}: ${body}`).join("\n")}`;
+}
+
 /** One launch shape as a terminal line -- the same two forms the candidate
  *  list prints, so the "was" line of a replacement reads like the entry above
- *  it. */
+ *  it.
+ *
+ *  A git url comes from bundles.json, which is hand-editable, so it can hold
+ *  `https://user:token@host/...`: a credential in its userinfo is replaced
+ *  by `***` and a bare username such as `ssh://git@...` is kept
+ *  (scrubStoredGitUrl, the same rule `add` uses for the same field). */
 function renderLaunch(shape: LaunchShape): string {
   if (shape.git !== undefined) {
-    return `git ${displaySafe(shape.git.url)}${shape.git.subdir ? ` (subdir ${displayArg(shape.git.subdir)})` : ""}`;
+    return `git ${displaySafe(scrubStoredGitUrl(shape.git.url))}${shape.git.subdir ? ` (subdir ${displayArg(shape.git.subdir)})` : ""}`;
   }
   if (shape.command !== undefined && shape.command !== "") {
     return `$ ${[shape.command, ...(shape.args ?? [])].map(displayArg).join(" ")}`;
@@ -1394,7 +1473,7 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
   // uninterpreted, and a `${...}` in one is named in a warning
   // (verbatimSpanNote) rather than judged.
   const importVariables = target.hooks?.importVariables;
-  const vars = clientVarsFor(importVariables, site.projectDir);
+  const vars = clientVarsFor(importVariables, site.projectDir, home);
   const inputs = importVariables === "vscode-inputs" ? readVsCodeInputs(view.raw ?? "") : new Map<string, string>();
 
   const candidates: ImportCandidate[] = [];
@@ -1403,6 +1482,8 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
   /** Servers refused over a `${...}` this importer cannot resolve, already
    *  rendered as "  <key>: <spans>" lines. */
   const unresolvable: string[] = [];
+  /** Where the spans of those servers sit, which picks the hand-add hints. */
+  const unresolvedSites = new Set<UnresolvedSite>();
   /** Servers the target's `forImport` hook says cannot be imported at all
    *  (`ImportView.skipReason`), already rendered as "  <key>: <reason>"
    *  lines. */
@@ -1449,6 +1530,7 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
     }
     if (built.unresolved.length > 0) {
       unresolvable.push(`  ${displayArg(key)}: ${describeUnresolved(built.unresolved, inputs)}`);
+      for (const s of built.unresolvedIn) unresolvedSites.add(s);
       continue;
     }
     const inactive = importView.disabled === true;
@@ -1479,13 +1561,20 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
     }
     if (unresolvable.length > 0) {
       printErr(
-        `Skipped (${target.label} expands these variables itself and yaw-mcp does not, so the entry would launch with the literal text):\n${unresolvable.join("\n")}\nAdd each by hand once you know the value: \`yaw-mcp add <name> --command ... --env KEY='\${secret:NAME}'\`.`,
+        `Skipped (${target.label} expands these variables itself and yaw-mcp does not, so the entry would launch with the literal text):\n${unresolvable.join("\n")}\n${unresolvedHint(unresolvedSites)}`,
       );
     }
   };
 
   if (candidates.length === 0) {
-    print(`\nNothing to import: no servers in ${displaySafe(resolved.absolute)} beyond yaw-mcp's own entry.`);
+    // "Beyond yaw-mcp's own entry" is true only when nothing else was skipped:
+    // a file whose servers were all refused would read as holding none.
+    const skippedAny = unusable.length + notImportable.length + unresolvable.length > 0;
+    print(
+      skippedAny
+        ? `\nNothing imported: every server in ${displaySafe(resolved.absolute)} was skipped (see the reasons below).`
+        : `\nNothing to import: no servers in ${displaySafe(resolved.absolute)} beyond yaw-mcp's own entry.`,
+    );
     reportSkips();
     return { exitCode: 0, written: [] };
   }

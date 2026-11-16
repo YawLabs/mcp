@@ -287,7 +287,10 @@ function renderMatch(
     // same function, so the CLI's ordering cannot desync from the server's the
     // next time someone tweaks a tie-break.
     const sorted = match.partial.slice().sort(comparePartialBundles);
-    print("Partially installed (install more to complete):");
+    // Remedy-neutral: a row may carry only `disabled:` or `blocked by
+    // profile:` segments, where "install more" is the wrong advice. Each
+    // segment below names its own remedy.
+    print("Partially available:");
     for (const entry of sorted) {
       // One segment per REMEDY, only the non-empty ones: "missing" is a
       // server to `yaw-mcp add`, "disabled" one to `yaw-mcp enable`, and

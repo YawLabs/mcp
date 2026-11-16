@@ -17,7 +17,8 @@
 //   0  audited successfully, grade written
 //   1  no server with that namespace in bundles.json
 //   2  nothing was graded: the server isn't a stdio/command server (nothing
-//      to spawn); on Windows its command/args carry a cmd.exe metacharacter
+//      to spawn); it is a git-sourced server not built on this machine
+//      (upstream.ts gitBuildMissing); on Windows its command/args carry a cmd.exe metacharacter
 //      the shell-spawned suite would split on (findCmdMetacharToken); its
 //      env references a ${secret:NAME} the vault could not resolve (locked,
 //      missing name); or the suite ran and failed
@@ -39,7 +40,7 @@ import { loadLocalBundles } from "./local-bundles.js";
 import { createStreamWriter, log } from "./logger.js";
 import { hasSecretRefs } from "./secrets-vault.js";
 import type { UpstreamServerConfig } from "./types.js";
-import { resolveServerEnv } from "./upstream.js";
+import { gitBuildMissing, resolveServerEnv } from "./upstream.js";
 
 /** What one compliance run reports: the letter, the score, and the suite
  *  version that produced it. Spelled once for the runner seam, the default
@@ -386,6 +387,20 @@ export async function runAudit(opts: AuditCommandOptions = {}): Promise<AuditCom
     } else {
       printErr(`yaw-mcp audit: "${namespace}" has no command to spawn -- it can't be audited as a stdio server.`);
     }
+    return { exitCode: 2 };
+  }
+
+  // A git-sourced server with a pinned commit gets a command and a cwd from
+  // the loader whether or not its build exists (local-bundles.ts), so a server
+  // never built here, pruned, or whose build failed reached the suite and died
+  // as `spawn ... ENOENT`. Same preflight an activation runs (upstream.ts
+  // gitBuildMissing: ready only once the build marker is valid); its message
+  // names the command that builds one. Nothing is graded, so exit 2. Placed
+  // before the vault resolve so a target we will not spawn never unlocks it.
+  const notBuilt = await gitBuildMissing(server, home);
+  if (notBuilt !== null) {
+    printErr(`yaw-mcp audit: ${notBuilt}`);
+    printErr("yaw-mcp audit: nothing was graded; re-run the audit once it is built.");
     return { exitCode: 2 };
   }
 

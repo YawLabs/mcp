@@ -1484,6 +1484,37 @@ describe("resolveManagedSpawn entry memo", () => {
     }
   });
 
+  it("keeps a memoized AMBIENT copy while the managed copy has a package.json but no runnable bin", () => {
+    // resolveNpmEntry skips a managed copy whose declared bin is missing on
+    // disk (packageEntry returns null), so that copy cannot supersede the
+    // ambient memo: dropping it would only rescan back to the ambient copy
+    // on every connect.
+    const { root, managedRoot, cleanup } = fixture();
+    const ambientModules = join(root, "global", "node_modules");
+    mkdirSync(join(ambientModules, "@yawlabs", "mcp", "dist"), { recursive: true });
+    const durableBrokerUrl = pathToFileURL(join(ambientModules, "@yawlabs", "mcp", "dist", "index.js")).href;
+    const ambientDir = join(ambientModules, "some-mcp");
+    writePkg(ambientDir, { name: "some-mcp", version: "1.0.0", bin: { "some-mcp": "dist/index.js" } });
+    const spawn = spawnWith(durableBrokerUrl, managedRoot);
+    try {
+      const ambientEntry = join(ambientDir, "dist", "index.js");
+      expect(spawn(["-y", "some-mcp"])).toEqual({ command: NODE, args: [ambientEntry] });
+      // An interrupted install: the manifest landed, the bin did not.
+      const managedDir = join(managedRoot, "some-mcp");
+      mkdirSync(managedDir, { recursive: true });
+      writeFileSync(
+        join(managedDir, "package.json"),
+        JSON.stringify({ name: "some-mcp", version: "2.0.0", bin: { "some-mcp": "dist/index.js" } }),
+      );
+      // Repoint the ambient bin while the memoized file stays: a rescan would
+      // answer dist/other.js, so only a kept memo answers dist/index.js.
+      writePkg(ambientDir, { name: "some-mcp", version: "1.0.0", bin: { "some-mcp": "dist/other.js" } });
+      expect(spawn(["-y", "some-mcp"])).toEqual({ command: NODE, args: [ambientEntry] });
+    } finally {
+      cleanup();
+    }
+  });
+
   it("does NOT memoize an npx-cache hit: the content-hashed path changes on refresh", () => {
     const { npx, brokerUrl, cleanup } = fixture();
     const dir = join(npx, "bbb", "node_modules", "some-mcp");

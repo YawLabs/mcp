@@ -182,7 +182,7 @@ describe("runBundlesCommand — match", () => {
     expect(combined).toContain("Ready to activate");
     expect(combined).toContain("pr-review");
     expect(combined).toContain("product-release");
-    expect(combined).toContain("Partially installed");
+    expect(combined).toContain("Partially available:");
     expect(combined).toContain("devops-incident");
     expect(combined).toContain("missing: pagerduty");
   });
@@ -394,6 +394,9 @@ describe("runBundlesCommand — match", () => {
       expect(incident).toContain("have: github; missing: pagerduty; blocked by profile: slack");
       const review = lines.find((l) => l.includes("pr-review")) ?? "";
       expect(review).toContain("have: github; disabled: linear");
+      // pr-review's only gap is a disabled server: the section header must not
+      // tell the user to install anything.
+      expect(text.out.join("")).not.toMatch(/install more/i);
       expect(review).not.toContain("missing:");
 
       const io = captureIO();

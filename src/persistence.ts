@@ -707,6 +707,9 @@ export interface StateSyncHooks {
   applyMerged(merged: StateSections): void;
 }
 
+/** How one StateSync save ended (see StateSync.saveWithOutcome). */
+export type StateSaveOutcome = "saved" | "pending" | "newer-file";
+
 export interface StateSyncOptions {
   /** Defaults to statePath(), resolved at each save (not at construction),
    *  matching what saveState's default argument always did. */
@@ -763,11 +766,20 @@ export class StateSync {
 
   /** Save this process's pending changes. Resolves true when they reached
    *  disk, false when they are still pending for the next save. */
-  save(): Promise<boolean> {
+  async save(): Promise<boolean> {
+    return (await this.saveWithOutcome()) === "saved";
+  }
+
+  /** save(), saying why a save did not land: "pending" is a transient miss
+   *  (lock wait, unreadable re-read, failed write) worth retrying soon;
+   *  "newer-file" means state.json was written by a newer yaw-mcp, which
+   *  defers every save for as long as the file stays, so retrying on a
+   *  timer only re-reads it under the lock to the same answer. */
+  saveWithOutcome(): Promise<StateSaveOutcome> {
     return chained(() => this.saveLocked());
   }
 
-  private async saveLocked(): Promise<boolean> {
+  private async saveLocked(): Promise<StateSaveOutcome> {
     const filePath = this.filePath ?? statePath();
     let written: { payload: PersistedState; snapshot: SavableState } | { deferred: StateLoadFailure | null };
     try {
@@ -800,7 +812,7 @@ export class StateSync {
         error: errorMessage(err),
         lockTimeout: err instanceof FileLockTimeoutError,
       });
-      return false;
+      return "pending";
     }
     if ("deferred" in written) {
       const failure = written.deferred;
@@ -815,12 +827,12 @@ export class StateSync {
             { fileVersion: Number(failure.version), reads: STATE_SCHEMA_VERSION },
           );
         }
-        return false;
+        return "newer-file";
       }
       log("warn", "yaw-mcp state save deferred: state.json could not be re-read; pending changes kept", {
         error: failure?.kind === "unreadable" ? failure.message : "unknown",
       });
-      return false;
+      return "pending";
     }
     this.newerFileWarned = false;
     // Synchronous from here: nothing can record between the export and the
@@ -841,7 +853,7 @@ export class StateSync {
       toolCache: written.snapshot.toolCache,
       prewarmFailures: written.snapshot.prewarmFailures,
     });
-    return true;
+    return "saved";
   }
 }
 

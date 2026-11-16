@@ -81,6 +81,7 @@ import { readGradesCache } from "../grades-cache.js";
 import { installNudgeStatePath } from "../install-nudge.js";
 import { META_TOOLS } from "../meta-tools.js";
 import { CONFIG_DIRNAME } from "../paths.js";
+import { STATE_SCHEMA_VERSION, StateSync } from "../persistence.js";
 import { brandCancelled, brandRoutingFault, isRoutingFaultResult, routeToolCall } from "../proxy.js";
 import { capContent } from "../result-cap.js";
 import { resetNoSamplingNotice as resetGraderNotice } from "../reward-grader.js";
@@ -1047,7 +1048,7 @@ describe("ConnectServer", () => {
       priv.config = makeConfig([makeServerConfig({ namespace: "github", name: "GitHub" })]);
       const result = priv.handleDiscover();
       const text = result.content[0].text;
-      expect(text).toContain("Bundle completions (install to unlock curated stacks):");
+      expect(text).toContain("Bundle completions (add, enable or allow these to unlock curated stacks):");
       expect(text).toContain("pr-review");
       expect(text).toContain("have: github");
       expect(text).toContain("add: linear");
@@ -6672,6 +6673,55 @@ describe("shutdown drains and refuses activations", () => {
     priv.scheduleStateSave();
     expect(priv.persistenceReady).toBe(false);
     expect(priv.stateSaveTimer).toBeNull();
+  });
+
+  describe("flushStateSave re-arms a deferred save only when a retry can help", () => {
+    let dir: string;
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), "yaw-mcp-flush-"));
+    });
+    afterEach(() => {
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    async function flushAgainst(target: string): Promise<unknown> {
+      const priv = getPrivate(server);
+      priv.persistenceReady = true;
+      priv.stateSync = new StateSync(
+        { exportCurrent: () => ({ learning: {}, packHistory: [], toolCache: {} }), applyMerged: () => {} },
+        { filePath: target, lock: { lockWaitMs: 200 } },
+      );
+      const spy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      try {
+        await priv.flushStateSave();
+        return priv.stateSaveTimer;
+      } finally {
+        spy.mockRestore();
+        if (priv.stateSaveTimer) clearTimeout(priv.stateSaveTimer);
+        priv.stateSaveTimer = null;
+        priv.persistenceReady = false;
+      }
+    }
+
+    it("does not reschedule while state.json is a newer yaw-mcp's file", async () => {
+      // Written mid-session: every save defers for as long as it stays, so a
+      // re-armed debounce would take the lock and re-read it every second.
+      const file = join(dir, "state.json");
+      writeFileSync(
+        file,
+        JSON.stringify({ version: STATE_SCHEMA_VERSION + 1, savedAt: 1, learning: {}, packHistory: [] }),
+        "utf8",
+      );
+      expect(await flushAgainst(file)).toBeNull();
+    });
+
+    it("still reschedules a transient deferral (state.json exists but cannot be read)", async () => {
+      // A directory where the file should be: EISDIR, the same "exists but
+      // could not be read" class as a win32 EBUSY.
+      const asDir = join(dir, "state-as-dir.json");
+      mkdirSync(asDir);
+      expect(await flushAgainst(asDir)).not.toBeNull();
+    });
   });
 
   it("gives up on a hanging activation instead of outliving the force-exit timer", async () => {

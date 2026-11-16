@@ -5421,7 +5421,7 @@ export class ConnectServer {
     const allInstalled = allProfiled.map((s) => s.namespace);
     const bundleGaps = topPartialBundles(allInstalled, 3);
     if (!focused && bundleGaps.length > 0) {
-      lines.push("\nBundle completions (install to unlock curated stacks):");
+      lines.push("\nBundle completions (add, enable or allow these to unlock curated stacks):");
       for (const { bundle, have, missing } of bundleGaps) {
         // Worded per remedy (see splitBundleMissing): a member that is
         // installed but disabled or profile-blocked is not something to add.
@@ -9736,9 +9736,15 @@ export class ConnectServer {
   // waiting for the next recorded call. Never during shutdown: the shutdown
   // path flushes explicitly and then closes the save path, and a timer armed
   // here would fire after it.
+  //
+  // Not for a state.json written by a newer yaw-mcp either: that defers every
+  // save while the file stays, so a re-armed timer would take the lock and
+  // re-read the whole file every second until exit. The pending delta is
+  // kept; the next recorded change schedules a save as usual, so saving
+  // resumes once the file is gone (reset-learning deletes it).
   private async flushStateSave(): Promise<void> {
-    const saved = await this.stateSync.save();
-    if (!saved && !this.shuttingDown) this.scheduleStateSave();
+    const outcome = await this.stateSync.saveWithOutcome();
+    if (outcome === "pending" && !this.shuttingDown) this.scheduleStateSave();
   }
 
   // Adopt the merged state a save just wrote: this pane now routes on the

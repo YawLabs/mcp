@@ -296,6 +296,30 @@ export function scrubRepoUrlUserinfo(url: string): string {
   return parsed.href;
 }
 
+/** A STORED git url for machine output and previews (`list --json`,
+ *  `add --json`, the removal preview, the launch-change notes of `add` and
+ *  `import`): userinfo that could be a credential is replaced by `***`, a bare
+ *  username is left alone.
+ *
+ *  scrubRepoUrlUserinfo replaces ANY userinfo, which is right for an error
+ *  line but wrong here: `ssh://git@github.com/acme/x.git` is a url `add --git`
+ *  accepts and stores as typed, and `list --json` reporting it as
+ *  `ssh://***@github.com/...` handed a script a url that does not clone and
+ *  does not equal what bundles.json holds.
+ *
+ *  "Bare" is decided on the raw text, as parseGitSpec decides it, by
+ *  isBareUsername: 1-19 characters of [A-Za-z0-9._-] (so no ":") and not
+ *  starting with a known token prefix. Anything else -- a password, an empty
+ *  username, a token where the username goes, a url the pattern below does
+ *  not match -- goes through scrubRepoUrlUserinfo. That is stricter than
+ *  parseGitSpec for ssh://, where it accepts any username without a ":": a
+ *  longer ssh username is still shown as `***`, the safe direction. */
+export function scrubStoredGitUrl(url: string): string {
+  const userinfo = /^[a-z][a-z0-9+.-]*:\/\/([^/?#\\]*)@/i.exec(url)?.[1];
+  if (userinfo !== undefined && isBareUsername(userinfo)) return url;
+  return scrubRepoUrlUserinfo(url);
+}
+
 /** Build output made safe to print, persist in `.failed` or put in an error:
  *  vault and credential-shaped env values by redactSecretsInOutput, then any
  *  URL userinfo. */

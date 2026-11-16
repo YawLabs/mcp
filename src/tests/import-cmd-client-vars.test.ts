@@ -8,7 +8,7 @@
 
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { classifyClientConfig } from "../client-config.js";
@@ -108,18 +108,55 @@ describe("runImport -- client-expanded variables are refused by name, per the ro
     // The span only, never the text around it; and no hedged "carried" note.
     expect(err).not.toContain("prefix-");
     expect(err).not.toContain("as literal text");
+    // A local server and a variable in a url: one hand-add line for each.
+    expect(err).toContain(
+      "Add each by hand once you know the value:\n" +
+        "  a local server: `yaw-mcp add <name> --command ... --env KEY='${secret:NAME}'`\n" +
+        "  a variable in a url: yaw-mcp does not fill in `${secret:NAME}` in a url",
+    );
+    expect(err).not.toContain("a variable in a header");
     // A skipped server is still Claude Code's to launch: it is not removed.
     const after = JSON.parse(readFileSync(path, "utf8"));
     expect(Object.keys(after.mcpServers).sort()).toEqual(["api", "mcp", "remote"]);
   });
 
-  it("Cursor: ${env:NAME} and ${userHome} skip the server; ${workspaceFolder} expands at project scope", async () => {
+  it("a remote server with a variable in a header gets the --url/--header hint, not --command", async () => {
+    writeClient("claude-code", {
+      mcpServers: {
+        mcp: BROKER,
+        api: { url: "https://api.example.com/mcp", headers: { Authorization: "Bearer ${API_KEY}" } },
+      },
+    });
+    const cap = capture();
+    const r = await runImport({ clientId: "claude-code", home: synthHome, cwd: synthCwd, keepOriginals: true, ...cap });
+    expect(r.exitCode).toBe(0);
+    const err = cap.errText();
+    expect(err).toContain("api: ${API_KEY}");
+    expect(err).toContain(
+      "Add each by hand once you know the value: `yaw-mcp add <name> --url <url> --header 'Authorization: Bearer ${secret:NAME}'`.",
+    );
+    expect(err).not.toContain("--command");
+  });
+
+  it("says every server was skipped, not that there were none, when all of them were refused", async () => {
+    writeClient("claude-code", { mcpServers: { mcp: BROKER, api: { command: "node", env: { K: "${API_KEY}" } } } });
+    const cap = capture();
+    const r = await runImport({ clientId: "claude-code", home: synthHome, cwd: synthCwd, keepOriginals: true, ...cap });
+    expect(r.exitCode).toBe(0);
+    expect(r.written).toEqual([]);
+    expect(cap.text()).toMatch(/Nothing imported: every server in .* was skipped \(see the reasons below\)\./);
+    expect(cap.text()).not.toContain("beyond yaw-mcp's own entry");
+    expect(cap.errText()).toContain("api: ${API_KEY}");
+  });
+
+  it("Cursor: ${env:NAME} skips the server; ${workspaceFolder} expands at project scope, ${userHome} and the separators always", async () => {
     writeClient(
       "cursor",
       {
         mcpServers: {
           needsenv: { command: "node", args: ["a.js"], env: { TOKEN: "${env:MY_TOKEN}" } },
           home: { command: "${userHome}/bin/srv" },
+          seps: { command: "node", args: ["a${pathSeparator}b${/}c"] },
           local: { command: "node", args: ["${workspaceFolder}/server.js"] },
           plain: { command: "node", args: ["${NOT_CURSOR}"] },
         },
@@ -139,13 +176,15 @@ describe("runImport -- client-expanded variables are refused by name, per the ro
     });
     expect(r.exitCode).toBe(0);
     const rows = bundles();
-    expect(rows.map((s) => s.namespace).sort()).toEqual(["local", "plain"]);
+    expect(rows.map((s) => s.namespace).sort()).toEqual(["home", "local", "plain", "seps"]);
     expect(rows.find((s) => s.namespace === "local")?.args).toEqual([`${synthCwd}/server.js`]);
     expect(rows.find((s) => s.namespace === "plain")?.args).toEqual(["${NOT_CURSOR}"]);
+    expect(rows.find((s) => s.namespace === "home")?.command).toBe(`${synthHome}/bin/srv`);
+    expect(rows.find((s) => s.namespace === "seps")?.args).toEqual([`a${sep}b${sep}c`]);
     const err = cap.errText();
     expect(err).toMatch(/Skipped \(Cursor expands these variables itself/);
     expect(err).toContain("needsenv: ${env:MY_TOKEN}");
-    expect(err).toContain("home: ${userHome}");
+    expect(err).not.toContain("${userHome}");
   });
 
   it("Cursor at user scope: ${workspaceFolder} has no value here, so the server is skipped", async () => {
@@ -223,6 +262,27 @@ describe("runImport -- a broker wired under another key is wiring", () => {
     const after = JSON.parse(readFileSync(path, "utf8"));
     expect(Object.keys(after.mcpServers)).toEqual(["yaw"]);
     expect(cap.errText()).not.toContain("yaw-mcp install claude-code");
+  });
+
+  it("a `cmd /c` server whose last argument is a directory named yaw-mcp is NOT wiring", async () => {
+    const fs = {
+      command: "cmd",
+      args: ["/c", "npx", "-y", "@modelcontextprotocol/server-filesystem", "C:\\src\\yaw-mcp"],
+    };
+    const path = writeClient("claude-code", { mcpServers: { fs, github: { command: "npx", args: ["-y", "gh"] } } });
+    const cap = capture();
+    await runImport({
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      removeOriginals: true,
+      isTTY: false,
+      ...cap,
+    });
+    expect(bundles().map((s) => s.namespace)).toEqual(["fs", "github"]);
+    const after = JSON.parse(readFileSync(path, "utf8"));
+    expect(Object.keys(after.mcpServers)).toEqual(["fs", "github"]);
+    expect(cap.errText()).toContain("yaw-mcp install claude-code");
   });
 
   it("a `try` trial entry is NOT wiring, even when it launches the package", async () => {

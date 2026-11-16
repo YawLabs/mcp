@@ -915,6 +915,21 @@ const BROKER_ENTRY_FILE = /[\\/]@yawlabs[\\/]mcp[\\/]dist[\\/]index\.js$/;
  *  adds. */
 const BROKER_BIN = /(?:^|[\\/])yaw-mcp(?:\.cmd|\.exe|\.ps1)?$/i;
 const CMD_EXE = /(?:^|[\\/])cmd(?:\.exe)?$/i;
+/** cmd.exe's switch that runs the rest of the line: /c, or /k (run, then stay). */
+const CMD_RUN_SWITCH = /^\/[ck]$/i;
+
+/** The program a `cmd` argv runs: the first argument after `/c` (or `/k`),
+ *  past any of cmd's own switches in front of it (`/d /s /c`, `/q`,
+ *  `/e:on`, ...). Undefined when the argv reaches a non-switch argument, or
+ *  its end, before a `/c` -- cmd then runs nothing from the argv. */
+function cmdProgram(args: readonly string[]): string | undefined {
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (CMD_RUN_SWITCH.test(a)) return args[i + 1];
+    if (!a.startsWith("/")) return undefined;
+  }
+  return undefined;
+}
 
 /** Does this (normalised) entry LAUNCH yaw-mcp, whatever key it sits under?
  *  A broker wired by hand under another name (`claude mcp add yaw -- npx -y
@@ -923,7 +938,10 @@ const CMD_EXE = /(?:^|[\\/])cmd(?:\.exe)?$/i;
  *  Three shapes: the package spec anywhere in the argv (`npx -y
  *  @yawlabs/mcp@latest`, and the `cmd /c npx ...` wrap of it), the package's
  *  own entry file anywhere in the argv, and the `yaw-mcp` bin as the command
- *  -- or as the program a `cmd /c` runs, which is argument 2 or later.
+ *  -- or as the program a `cmd /c` runs (cmdProgram). Only that program: a
+ *  later argument named yaw-mcp (`cmd /c npx -y server-filesystem
+ *  C:\src\yaw-mcp`, a `docker run --name yaw-mcp`) is that program's
+ *  argument, not the broker.
  *
  *  Two readers: `import` skips such an entry rather than import yaw-mcp as a
  *  server of itself, and the view's `otherBrokerKeys` answers the wiring
@@ -933,7 +951,9 @@ export function launchesBroker(entry: Record<string, unknown>): boolean {
   const args = Array.isArray(entry.args) ? entry.args.filter((a): a is string => typeof a === "string") : [];
   if ([command, ...args].some((t) => BROKER_PACKAGE_SPEC.test(t) || BROKER_ENTRY_FILE.test(t))) return true;
   if (BROKER_BIN.test(command)) return true;
-  return CMD_EXE.test(command) && args.some((a) => BROKER_BIN.test(a));
+  if (!CMD_EXE.test(command)) return false;
+  const program = cmdProgram(args);
+  return program !== undefined && BROKER_BIN.test(program);
 }
 
 // ---------------------------------------------------------------------------

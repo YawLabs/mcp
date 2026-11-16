@@ -1,8 +1,8 @@
 // StateSync against a state.json that a NEWER yaw-mcp wrote while this
 // process was already running. Every save is deferred for as long as that
-// file stays, and the server re-arms a deferred save, so anything logged per
-// attempt repeats for the life of the process. Pinned here: the file is left
-// alone, and the deferral is logged once, not twice per attempt.
+// file stays, and every later recorded change tries another save, so anything
+// logged per attempt repeats for the life of the process. Pinned here: the
+// file is left alone, and the deferral is logged once, not twice per attempt.
 
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";

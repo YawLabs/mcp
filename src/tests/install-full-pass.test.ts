@@ -249,6 +249,61 @@ describe("uninstall --os <another OS> --dry-run", () => {
     expect(cap.stderr()).toBe("");
   });
 
+  it("carries --scope and the user's own --project-dir into the suggested command", async () => {
+    // RED with the bare `uninstall <client> --dry-run` suggestion: on the
+    // other machine that reads the USER scope, a different file from the
+    // project one named on the File: line.
+    const parsed = parseUninstallArgs([
+      "claude-code",
+      "--scope",
+      "project",
+      "--project-dir",
+      "/work/repo",
+      "--os",
+      other,
+      "--dry-run",
+    ]);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    const cap = captureIo();
+    const r = await runUninstall({ ...parsed.options, home, io: cap.io });
+    expect(r.exitCode).toBe(0);
+    expect(cap.stdout()).toContain(
+      `\`yaw-mcp uninstall claude-code --scope project --project-dir /work/repo --dry-run\` on the ${other} machine itself.`,
+    );
+
+    // A non-default scope with no --project-dir names the scope alone.
+    const local = parseUninstallArgs(["claude-code", "--scope", "local", "--os", other, "--dry-run"]);
+    expect(local.ok).toBe(true);
+    if (!local.ok) return;
+    const cap2 = captureIo();
+    await runUninstall({ ...local.options, home, io: cap2.io });
+    expect(cap2.stdout()).toContain(`\`yaw-mcp uninstall claude-code --scope local --dry-run\` on the ${other}`);
+  });
+
+  it("quotes the suggested --project-dir for the TARGET OS's shell, not this machine's", async () => {
+    // A `$` means nothing to cmd but expands in bash, so a Linux target needs
+    // the POSIX single quotes whichever OS the preview runs on.
+    const target = CURRENT_OS === "linux" ? "windows" : "linux";
+    const dir = target === "linux" ? "/work/$repo" : "C:\\work\\$repo";
+    const parsed = parseUninstallArgs([
+      "claude-code",
+      "--scope",
+      "project",
+      "--project-dir",
+      dir,
+      "--os",
+      target,
+      "--dry-run",
+    ]);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    const cap = captureIo();
+    await runUninstall({ ...parsed.options, home, io: cap.io });
+    const expected = target === "linux" ? "'/work/$repo'" : "C:\\work\\$repo";
+    expect(cap.stdout()).toContain(`--project-dir ${expected} --dry-run\` on the ${target} machine itself.`);
+  });
+
   it("leaves a direct caller's foreign `os` alone: that pairing is the hermetic test seam", async () => {
     // No crossOsPreview, so the run reads the synthetic home as before.
     const cap = captureIo();
