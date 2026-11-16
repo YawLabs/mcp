@@ -4216,7 +4216,8 @@ describe("runSecrets reset", () => {
       );
       expect(scripted.exitCode).toBe(1);
       const envelope = errEnvelope(io);
-      expect(envelope.error).toContain("could not check YAW_MCP_VAULT_PASSPHRASE against the vault");
+      // opts.passphrase, not the env var, so the env var is not what is named.
+      expect(envelope.error).toContain("could not check the supplied passphrase against the vault");
       expect(envelope.error).toContain("memory limit exceeded");
       expect(envelope.error).toContain("nothing was changed");
 
@@ -4258,6 +4259,19 @@ describe("runSecrets reset", () => {
     expect(errText()).toContain("yaw-mcp secrets rotate");
     // Never asked: the refusal costs no typing.
     expect(promptText(stdout)).toBe("");
+    expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
+    expect(backups()).toEqual([]);
+  });
+
+  it("does not name the env var when the passphrase that already opens the vault came from opts.passphrase", async () => {
+    // An embedder's passphrase is not YAW_MCP_VAULT_PASSPHRASE: the variable
+    // is unset here, and naming it sent the reader to an env that has nothing.
+    const before = await seed();
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    const r = await runSecrets({ action: "reset", home, passphrase: OLD_PASS, force: true }, io);
+    expect(r.exitCode).toBe(1);
+    expect(errText()).toContain("the supplied passphrase already opens the vault");
+    expect(errText()).not.toContain("YAW_MCP_VAULT_PASSPHRASE");
     expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
     expect(backups()).toEqual([]);
   });

@@ -74,7 +74,7 @@
 // see staleProgramWarning.
 import { readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { atomicWriteFile } from "./atomic-write.js";
 import { quoteArgForDisplay } from "./auto-upgrade.js";
@@ -106,13 +106,15 @@ import {
   readClientEnv,
   reloadDoneClause,
   reloadRemovalClause,
+  rootLinePlacement,
   type SyntaxName,
   selectSites,
   siteAt,
+  spellRootValue,
   terminateWithNewline,
   unloadableConfigProblem,
 } from "./client-config.js";
-import { type ClientProbeResult, probeClientsAsync } from "./doctor-cmd.js";
+import { type ClientProbeResult, isLaunchableEntryFile, oamRunEntryPath, probeClientsAsync } from "./doctor-cmd.js";
 import {
   blockedContainerFix,
   buildLaunchEntry,
@@ -252,10 +254,6 @@ export interface InstallCommandOptions {
   };
   /** Override for tests; replaces an interactive prompt with a fixed answer. */
   promptAnswer?: "overwrite" | "skip" | "abort";
-  /** Set by the parser when `--help` / `-h` was passed. Dispatcher prints
-   *  USAGE to stdout and exits 0 -- treated as a successful run, not an
-   *  argv error. Keeps `-h` distinguishable from unknown-flag rejections. */
-  helpRequested?: boolean;
   /** Internal, set by `--all`: suppress the oam-is-absent Runtime note so it
    *  prints once for the run instead of once per client. Same reasoning as the
    *  `token` / `skipYawMcpConfig` stripping at the --all call site -- a
@@ -364,17 +362,6 @@ function spellRootDefault(rootDefault: ConfigRootDefault): string {
   return `${rootDefault.key} = ${JSON.stringify(rootDefault.value)}`;
 }
 
-/** A value the USER's file holds for a top-level key, for the one note,
- *  warning or refusal that names it. A scalar is spelled; anything else is
- *  named by its shape, never echoed (it is the user's, and it can be any
- *  size). */
-function spellRootValue(value: unknown, syntax: SyntaxName): string {
-  if (typeof value === "string") return JSON.stringify(value);
-  if (typeof value === "number" || typeof value === "bigint" || typeof value === "boolean") return String(value);
-  if (value instanceof Date) return value.toISOString();
-  return Array.isArray(value) ? describeValueShape(value) : containerNounFor(syntax);
-}
-
 /** The step that ends the note (or warning) about a top-level key install
  *  left alone, when the key holds a scalar. It names neither the key nor the
  *  file: the message has just said both, and it says the key exactly once.
@@ -382,14 +369,6 @@ function spellRootValue(value: unknown, syntax: SyntaxName): string {
  *  several lines, and editing only the line the key is on would leave the
  *  rest of the string behind as invalid TOML. */
 const KEPT_ROOT_VALUE_STEP = "Edit that value by hand to change it.";
-
-/** Where a top-level line goes when the user adds it by hand. In TOML a
- *  `key = value` line after a `[table]` header is a key OF that table, so
- *  "at the top level" is not enough of an instruction there -- the end of the
- *  file is usually inside the last table. */
-function rootLinePlacement(syntax: SyntaxName): string {
-  return syntax === "TOML" ? "above the first table in the file" : "at the top level of the file";
-}
 
 /** The step in place of KEPT_ROOT_VALUE_STEP when the key holds an array or
  *  a table -- the values spellRootValue names by their shape. Such a value
@@ -722,12 +701,29 @@ export function clientUnavailableMessage(
   return `yaw-mcp ${cmd}: ${target.label} on ${os} is not supported yet.\n  ${reason}.\n  ${fix}`;
 }
 
+/** The refusal install and uninstall both print over a client config that
+ *  does not parse (or whose root is not an object). One builder so the two
+ *  verbs cannot drift on the fix clause; the verb differs because install
+ *  would replace the file's contents and uninstall would only edit them. */
+function malformedConfigRefusal(
+  cmd: "install" | "uninstall",
+  file: string,
+  read: { reason: string; syntax: SyntaxName; detail?: string },
+): string {
+  const refusing = cmd === "install" ? "refusing to overwrite it" : "refusing to edit it";
+  const fix = unparseableConfigFix("re-run", read.syntax);
+  return read.reason === "root"
+    ? `yaw-mcp ${cmd}: ${file} is not a ${read.syntax} object -- ${refusing}; ${fix}.`
+    : `yaw-mcp ${cmd}: ${file} is not valid ${read.syntax} (${read.detail}) -- ${refusing}; ${fix}.`;
+}
+
 /** Warning printed when the retired `--token` flag is passed. Exported so
  *  tests pin the exact wording -- this is the user's only signal that a
  *  scripted `install --all --token mcp_pat_...` is now a no-op. */
 export const TOKEN_FLAG_DEPRECATION =
   "yaw-mcp install: --token is deprecated and ignored -- yaw-mcp is local-only and no longer stores a token. " +
-  "Drop the flag, and revoke that PAT at its source -- dropping it here does not deactivate it.";
+  "Drop the flag. The hosted service that issued that PAT is retired, so there is nowhere left to revoke it: " +
+  "deleting it from your scripts is all there is to do.";
 
 /** Warning printed when the retired `--no-yaw-mcp-config` flag is passed. */
 export const NO_CONFIG_FLAG_DEPRECATION =
@@ -1067,11 +1063,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     // those surfaces cannot disagree about what gets a user past this
     // refusal. `syntax` is the adapter's own name for the file's language, so
     // a non-JSON client says what it actually is.
-    err(
-      read.reason === "root"
-        ? `yaw-mcp install: ${resolved.absolute} is not a ${read.syntax} object -- refusing to overwrite it; ${unparseableConfigFix("re-run", read.syntax)}.`
-        : `yaw-mcp install: ${resolved.absolute} is not valid ${read.syntax} (${read.detail}) -- refusing to overwrite it; ${unparseableConfigFix("re-run", read.syntax)}.`,
-    );
+    err(malformedConfigRefusal("install", resolved.absolute, read));
     return { written: [], wouldWrite: [], messages, exitCode: 1 };
   }
   // Parses for US, not for its client: a strict-JSON site (claude-code's
@@ -1285,7 +1277,17 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   // when it could not be located -- "oam works here but there is no portable
   // path to write", which stays on npx exactly like oam-absent does.
   const oamBinPath = oamProbeResult.binPath;
-  const oamEntry = oamBinPath ? resolveEntry("@yawlabs/mcp") : null;
+  // The durable install comes from the RUNNING copy first. When that copy has
+  // none -- `npx -y @yawlabs/mcp@latest install <client>` runs from the npx
+  // cache, where resolveStableNpmEntry answers null by design -- the entry
+  // file the STORED `oam run` entry already names stands in, provided it is
+  // still a file on this disk. Without that, idempotence depended on how
+  // install was launched: an oam-hosted entry a global `yaw-mcp install` wrote
+  // read as drift from npx, so the documented no-op was exit 2 off a TTY and
+  // --repair rewrote a working absolute entry down to npx while printing
+  // "yaw-mcp is not durably installed". A stored path that is gone still
+  // answers null, so a dead entry is repaired to npx exactly as before.
+  const oamEntry = oamBinPath ? (resolveEntry("@yawlabs/mcp") ?? storedOamEntryFile(storedEntry)) : null;
   // The Windows launch policy is the ROW's, read from `entry.windowsLaunch`
   // rather than from a client-id branch here: `bare` is for a client that
   // resolves the `.cmd` shim itself, and the default stays the `cmd /c` wrap
@@ -1600,8 +1602,20 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     // "overwrite" so this collision path is exercised, but the run returns
     // before any write. Present tense here told a user scanning the transcript
     // that their preview had already mutated the file.
+    //
+    // A bare --dry-run (no --force, no --repair) previews a write the same
+    // command without --dry-run does NOT make on its own: it prompts on a TTY
+    // (default: leave the entry) and refuses off one. The preview below still
+    // shows the overwrite, since that is the only thing there is to preview,
+    // but it says which flag the real run needs rather than promising it.
+    const needsFlag = opts.dryRun === true && !opts.force && !opts.repair;
     log(
-      opts.dryRun ? `Would overwrite existing "${ENTRY_NAME}" entry.` : `Overwriting existing "${ENTRY_NAME}" entry.`,
+      needsFlag
+        ? `Would overwrite existing "${ENTRY_NAME}" entry -- only with --repair or --force. Without one, the real ` +
+            "run asks first on a terminal (default: leave it) and refuses off one. The preview below assumes the flag."
+        : opts.dryRun
+          ? `Would overwrite existing "${ENTRY_NAME}" entry.`
+          : `Overwriting existing "${ENTRY_NAME}" entry.`,
     );
     for (const d of diff) log(`  ${d}`);
   }
@@ -2517,7 +2531,8 @@ async function promptCollision(
  * serialize identically and must compare identically. Object.keys counts such a
  * key, which would otherwise report a difference no writer could ever produce.
  *
- * Exported for tests.
+ * Shared with import-cmd.ts, whose "differs" verdict and still-unchanged check
+ * are this function: changing the undefined-key rule changes `import` too.
  */
 export function deepEqualJson(a: unknown, b: unknown): boolean {
   if (a === b) return true;
@@ -2560,7 +2575,9 @@ function indentDiff(diff: string[], indent: string): string {
  * key by name only -- the same rule DRY_RUN_ENV_PLACEHOLDER enforces for the
  * preview.
  *
- * Exported for tests.
+ * Shared with import-cmd.ts, which prints these lines for an entry that
+ * differs from the one it would import: a wording change here is a change to
+ * `import` output.
  */
 export function describeEntryDiff(stored: unknown, nextEntry: object): string[] {
   if (typeof stored !== "object" || stored === null || Array.isArray(stored)) {
@@ -2882,19 +2899,45 @@ function looksLikeFlag(value: string): boolean {
   return value.startsWith("-");
 }
 
+/** The three flags that say WHICH file a run addresses -- `--scope`, `--os`,
+ *  `--project-dir` -- parsed once for install and uninstall, which take them
+ *  with the same values and must refuse a bad one in the same words. `value`
+ *  is the argv element after the flag (undefined at the end of argv). Sets the
+ *  option and returns null, or returns the error and sets nothing. */
+function parseSiteFlag(
+  flag: "--scope" | "--os" | "--project-dir",
+  value: string | undefined,
+  opts: { scope?: InstallScope; os?: InstallOS; projectDir?: string },
+): string | null {
+  if (flag === "--scope") {
+    if (!value || !["user", "project", "local"].includes(value)) return "--scope requires user|project|local";
+    opts.scope = value as InstallScope;
+    return null;
+  }
+  if (flag === "--os") {
+    if (!value || !["macos", "linux", "windows"].includes(value)) return "--os requires macos|linux|windows";
+    opts.os = value as InstallOS;
+    return null;
+  }
+  if (!value || looksLikeFlag(value)) return "--project-dir requires a value";
+  opts.projectDir = value;
+  return null;
+}
+
 /** CLI argv parser used by index.ts dispatcher. Exported so tests can
  *  exercise flag parsing without spawning a subprocess.
  *
- *  The failure shape carries no `help` field: `--help` / `-h` is a SUCCESSFUL
- *  parse carrying `helpRequested` in the options, so nothing was left to set
- *  the old `ok: false, help: true` spelling -- and the install branch in
- *  index.ts reads `options.helpRequested`, never `.help`. */
+ *  `--help` / `-h` is signalled the way parseUninstallArgs below signals it:
+ *  `{ ok: false, error: USAGE, help: true }`, which the shared
+ *  parse-then-dispatch tail in index.ts (run) prints to stdout with exit 0.
+ *  `help` is what keeps it distinguishable from an argv error, which carries
+ *  no `help` and exits 2. */
 export function parseInstallArgs(argv: string[]):
   | {
       ok: true;
       options: InstallCommandOptions;
     }
-  | { ok: false; error: string } {
+  | { ok: false; error: string; help?: boolean } {
   if (argv.length === 0) return { ok: false, error: USAGE };
   const positional: string[] = [];
   const opts: Partial<InstallCommandOptions> = {};
@@ -2902,18 +2945,11 @@ export function parseInstallArgs(argv: string[]):
     const a = argv[i];
     const next = (): string | undefined => argv[++i];
     switch (a) {
-      case "--scope": {
-        const v = next();
-        if (!v || !["user", "project", "local"].includes(v))
-          return { ok: false, error: "--scope requires user|project|local" };
-        opts.scope = v as InstallScope;
-        break;
-      }
-      case "--os": {
-        const v = next();
-        if (!v || !["macos", "linux", "windows"].includes(v))
-          return { ok: false, error: "--os requires macos|linux|windows" };
-        opts.os = v as InstallOS;
+      case "--scope":
+      case "--os":
+      case "--project-dir": {
+        const error = parseSiteFlag(a, next(), opts);
+        if (error !== null) return { ok: false, error };
         break;
       }
       // DEPRECATED, still parsed. The flag is inert (runInstall warns and
@@ -2926,12 +2962,6 @@ export function parseInstallArgs(argv: string[]):
         // must not set token="--force"), mirroring the enum-flag guards.
         if (!v || looksLikeFlag(v)) return { ok: false, error: "--token requires a value" };
         opts.token = v;
-        break;
-      }
-      case "--project-dir": {
-        const v = next();
-        if (!v || looksLikeFlag(v)) return { ok: false, error: "--project-dir requires a value" };
-        opts.projectDir = v;
         break;
       }
       case "--force":
@@ -2961,7 +2991,7 @@ export function parseInstallArgs(argv: string[]):
         break;
       case "-h":
       case "--help":
-        return { ok: true, options: { helpRequested: true } as InstallCommandOptions };
+        return { ok: false, error: USAGE, help: true };
       default:
         // Single dash included, as parseUninstallArgs refuses it: `-h` is a
         // real flag here, so a mistyped short one (`-f`, `-x`) must be
@@ -3084,8 +3114,8 @@ export function parseInstallArgs(argv: string[]):
 
 /** `yaw-mcp install --list` — print every client/scope combo for the current
  *  OS and whether yaw-mcp is already wired up. Read-only: never
- *  touches a file, never hits the network, works without a token. The
- *  exit code is always 0; this is diagnostic, not gating. */
+ *  touches a file, never hits the network. The exit code is always 0; this
+ *  is diagnostic, not gating. */
 async function runInstallList(
   opts: InstallCommandOptions,
   log: (s: string) => void,
@@ -3117,14 +3147,21 @@ async function runInstallList(
     clientEnv: opts.clientEnv,
     appData: resolveAppData(opts),
   };
-  const probes = await probeClientsAsync(where);
+  // Every copy of each slot's config that this machine has, one row per copy
+  // (`allSites`): install and uninstall act on all of Cline's per-editor
+  // copies, so a list of the shared file alone hid the ones they also write.
+  const probes = await probeClientsAsync({ ...where, allSites: true });
   // What install would do about each row's top-level defaults -- see
   // listRootPlan. Read one row at a time, in row order, like the probe.
   const rootPlans: Array<RootDefaultPlan | null> = [];
   for (const p of probes) rootPlans.push(await listRootPlan(p, where));
 
   const rows = probes.map((p, i) => ({
-    client: INSTALL_TARGETS.find((t) => t.clientId === p.clientId)?.label ?? p.clientId,
+    // `p.site` is set only for a slot with several copies here; it names the
+    // copy, since client and scope are the same on each of its rows.
+    client:
+      (INSTALL_TARGETS.find((t) => t.clientId === p.clientId)?.label ?? p.clientId) +
+      (p.site === undefined ? "" : ` (${p.site})`),
     scope: p.scope,
     path: displayPath(p.path, home, os),
     status: statusFor(p, rootPlans[i]),
@@ -3132,8 +3169,25 @@ async function runInstallList(
 
   // An entry the client cannot load (strict JSON with a comment) is not
   // "configured": its row reads "not loading", so the headline must agree.
-  const installed = probes.filter((p) => p.hasMcpEntry && p.unloadable === null).length;
-  const available = probes.filter((p) => !p.unavailable).length;
+  //
+  // Counted per (client, scope) SLOT, not per row: with `allSites` a slot with
+  // several copies of its config has several rows, and a plain count of rows
+  // put each copy into both numbers under a label that says "scopes". A slot
+  // is configured when every copy listed for it is -- one copy without the
+  // entry is an editor that does not load yaw-mcp, and its row says which.
+  const slots = new Map<string, { configured: boolean; available: boolean }>();
+  for (const p of probes) {
+    const key = `${p.clientId} ${p.scope}`;
+    const configured = p.hasMcpEntry && p.unloadable === null;
+    const slot = slots.get(key);
+    if (slot === undefined) slots.set(key, { configured, available: !p.unavailable });
+    else {
+      slot.configured = slot.configured && configured;
+      slot.available = slot.available || !p.unavailable;
+    }
+  }
+  const installed = [...slots.values()].filter((s) => s.configured).length;
+  const available = [...slots.values()].filter((s) => s.available).length;
   log(`${installed}/${available} client scopes have yaw-mcp configured on ${os}.`);
   log("");
 
@@ -3732,6 +3786,13 @@ export interface UninstallCommandOptions {
   /** Print what would be removed and exit without writing. Implies no prompt --
    *  a preview mutates nothing, so there is nothing to confirm. */
   dryRun?: boolean;
+  /** Set by parseUninstallArgs alone, for `--os <another OS> --dry-run`: the
+   *  run names the file that OS's client reads and says it was not inspected,
+   *  reading nothing. This machine's host-shaped path for another OS is a file
+   *  that is not there, and "nothing to do" over it would be a wrong answer.
+   *  A direct caller that passes a foreign `os` with its own `home` (the test
+   *  seam) leaves this unset and gets the ordinary run. */
+  crossOsPreview?: boolean;
   /** Override for tests; defaults to homedir(). */
   home?: string;
   /** Override for tests; see InstallCommandOptions.appData. */
@@ -3760,24 +3821,11 @@ export function parseUninstallArgs(
     const a = argv[i];
     const next = (): string | undefined => argv[++i];
     switch (a) {
-      case "--scope": {
-        const v = next();
-        if (!v || !["user", "project", "local"].includes(v))
-          return { ok: false, error: "--scope requires user|project|local" };
-        opts.scope = v as InstallScope;
-        break;
-      }
-      case "--os": {
-        const v = next();
-        if (!v || !["macos", "linux", "windows"].includes(v))
-          return { ok: false, error: "--os requires macos|linux|windows" };
-        opts.os = v as InstallOS;
-        break;
-      }
+      case "--scope":
+      case "--os":
       case "--project-dir": {
-        const v = next();
-        if (!v || looksLikeFlag(v)) return { ok: false, error: "--project-dir requires a value" };
-        opts.projectDir = v;
+        const error = parseSiteFlag(a, next(), opts);
+        if (error !== null) return { ok: false, error };
         break;
       }
       // Both spellings, for the reason parseRemoveArgs accepts both: `--force`
@@ -3811,14 +3859,24 @@ export function parseUninstallArgs(
   // file that does not exist is a harmless no-op -- but reporting "nothing to
   // do" for the macOS config while standing on Windows is a WRONG answer, not a
   // harmless one, and that is what the guard prevents.
-  if (opts.os && opts.os !== CURRENT_OS && !opts.dryRun) {
-    return {
-      ok: false,
-      error:
-        `yaw-mcp uninstall: --os ${opts.os} does not match this machine (${CURRENT_OS}), and uninstall can only ` +
-        `resolve config paths for the machine it runs on -- it would report on a ${CURRENT_OS}-shaped junk path. ` +
-        `Add --dry-run to preview, or run uninstall on the ${opts.os} machine itself.`,
-    };
+  //
+  // --dry-run stays accepted, but it is not exempt from that reasoning: a
+  // preview that read the host-shaped path would print the same wrong
+  // "nothing to do". So the parse marks it `crossOsPreview`, and runUninstall
+  // names the target-OS file and says it was not inspected instead of reading
+  // anything. Set HERE and not derived in runUninstall from `os`, because
+  // runUninstall accepts any os/home pairing as its hermetic test seam.
+  if (opts.os && opts.os !== CURRENT_OS) {
+    if (!opts.dryRun) {
+      return {
+        ok: false,
+        error:
+          `yaw-mcp uninstall: --os ${opts.os} does not match this machine (${CURRENT_OS}), and uninstall can only ` +
+          `resolve config paths for the machine it runs on -- it would report on a ${CURRENT_OS}-shaped junk path. ` +
+          `Add --dry-run to see which file that is, or run uninstall on the ${opts.os} machine itself.`,
+      };
+    }
+    opts.crossOsPreview = true;
   }
 
   if (positional.length !== 1)
@@ -3901,6 +3959,11 @@ interface RemovalSite {
    *  removals need naming separately in the preview and the log. */
   sibling: boolean;
   hasEntry: boolean;
+  /** The stored entry as the row's `normalize` hook folds it (undefined when
+   *  absent) -- the shape install's diff reads too. The preview's launch and
+   *  env-keys lines read top-level `command` / `args` / `env`, so the raw value
+   *  would show Cline's nested `{ transport: {...} }` form as "(no command)"
+   *  and hide its env keys. */
   storedEntry: unknown;
   legacyEntry: string | null;
 }
@@ -3949,6 +4012,32 @@ function launchesViaNpx(entry: unknown): boolean {
     typeof args[1] === "string" &&
     nodeLaunchKind(args[1]) === "npx"
   );
+}
+
+/** The entry file a stored `oam run ... <entry>` launch points at, when it is
+ *  an absolute path to a regular file on this disk; null for anything else
+ *  (no entry, not an oam launch, a relative path, a file that is gone).
+ *
+ *  Read with doctor's own two helpers, so "launchable" here is the test
+ *  doctor's launch checks and the heal sweep apply to the same entry. Only the
+ *  PATH is taken from the stored entry: the command and the flags are still
+ *  the ones this run builds, so any other difference reads as drift.
+ *
+ *  Two shape gates keep this to a path install itself could have written: it
+ *  sits inside a `node_modules/@yawlabs/mcp/` tree (the path-shape test the
+ *  heal sweep's isOwnBrokerEntry applies in heal-entries.ts -- an `oam run`
+ *  of somebody else's script under the "mcp" key is not adopted), and it is
+ *  not under an `_npx` cache directory, which resolveStableNpmEntry refuses
+ *  to persist for the reason given there. */
+function storedOamEntryFile(stored: unknown): string | null {
+  if (typeof stored !== "object" || stored === null || Array.isArray(stored)) return null;
+  const { command, args } = stored as { command?: unknown; args?: unknown };
+  if (typeof command !== "string" || !Array.isArray(args) || !args.every((a) => typeof a === "string")) return null;
+  const entry = oamRunEntryPath(command, args as string[]);
+  if (entry === null || !isAbsolute(entry)) return null;
+  const shape = entry.split("\\").join("/");
+  if (!shape.includes("/node_modules/@yawlabs/mcp/") || shape.includes("/_npx/")) return null;
+  return isLaunchableEntryFile(entry) ? entry : null;
 }
 
 /** The resolve inputs a (client, scope) shares across the helpers below. */
@@ -4136,11 +4225,16 @@ function configDirScopedGrantNote(args: {
  *
  *  WHICH FILES. A peer's own sites, plus every file its `hooks.alsoReads`
  *  names (typed also launches an "mcp" entry from ~/.mcp.json,
- *  <configDir>/.mcp.json and both .claude.json maps). For the (row, scope)
- *  being uninstalled, only the `alsoReads` files: its own sites are what this
- *  run is emptying, and `self.sites` keeps any other row's slot on the same
- *  file and container out too -- typed's ~/.claude.json slot IS Claude Code's
- *  user entry, which `uninstall claude-code` is removing.
+ *  <configDir>/.mcp.json and both .claude.json maps). What is left out is
+ *  decided per SITE, never per row: any site that is the same file and
+ *  container as one of `self.sites` is what this run is emptying, whichever
+ *  row names it -- typed's ~/.claude.json slot IS Claude Code's user entry,
+ *  which `uninstall claude-code` is removing. The uninstalled row's own sites
+ *  are NOT skipped wholesale, because a question can be asked under another
+ *  environment than the run's: for a Yaw Mode pane's home grant
+ *  (CLAUDE_CONFIG_DIR unset) the claude-code user row resolves
+ *  ~/.claude.json, a file this run does not touch, and an entry there is a
+ *  holder like any other.
  *
  *  A peer scope that needs a project directory is checked against this run's
  *  project folder, or the HOME when it has none (a user-scope uninstall).
@@ -4183,7 +4277,6 @@ async function sharedGrantHolder(args: {
     if (peer.hooks?.permissionsPatch !== "claude-code") continue;
     if (!peer.availableOn.includes(args.os)) continue;
     for (const spec of peer.scopes) {
-      const isSelf = peer.clientId === args.self.clientId && spec.scope === args.self.scope;
       const peerProjectDir = spec.requiresProjectDir ? (args.projectDir ?? args.home) : undefined;
       const peerSettings = resolveClaudeCodeSettingsPath(spec.scope, {
         home: args.home,
@@ -4203,7 +4296,7 @@ async function sharedGrantHolder(args: {
       };
       let candidates: ConfigSite[];
       try {
-        candidates = [...(isSelf ? [] : selectSites(resolveInstallSites(where))), ...resolveAlsoReadSites(where)];
+        candidates = [...selectSites(resolveInstallSites(where)), ...resolveAlsoReadSites(where)];
       } catch {
         // Unreachable for a row that passed the checks above; a peer whose
         // path cannot be resolved has no file to hold an entry in.
@@ -4243,6 +4336,22 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
   const plan = resolveInstallSite("uninstall", opts, err);
   if (!plan) return { written: [], wouldWrite: [], messages, exitCode: 2 };
   const { target, os, scope, projectDir } = plan;
+
+  // `--os <another OS> --dry-run`, as the parser marked it. Nothing below can
+  // answer for that OS: every read is of THIS machine's disk, at a path built
+  // from this machine's home, so the honest preview is the file's name in the
+  // target OS's own spelling and a line saying it was not looked at. Exit 0
+  // with an empty `wouldWrite`, as a preview that found nothing to report on.
+  if (opts.crossOsPreview) {
+    log(`Target: ${target.label} (${scope})`);
+    log(`File:   ${plan.resolved.display}`);
+    log(
+      `\nNot inspected: that is ${target.label}'s config on ${os}, and this machine is ${CURRENT_OS} -- uninstall ` +
+        "reads only the machine it runs on, so it cannot say whether that file has a yaw-mcp entry. Run " +
+        `\`yaw-mcp uninstall ${target.clientId} --dry-run\` on the ${os} machine itself.`,
+    );
+    return { written: [], wouldWrite: [], messages, exitCode: 0 };
+  }
 
   // Same site selection install makes: the first selected site is the file
   // every message names, and `extraSites` holds each per-editor copy this
@@ -4296,11 +4405,7 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
     return { written: [], wouldWrite: [], messages, exitCode: 1 };
   }
   if (read.kind === "malformed") {
-    err(
-      read.reason === "root"
-        ? `yaw-mcp uninstall: ${resolved.absolute} is not a ${read.syntax} object -- refusing to edit it; ${unparseableConfigFix("re-run", read.syntax)}.`
-        : `yaw-mcp uninstall: ${resolved.absolute} is not valid ${read.syntax} (${read.detail}) -- refusing to edit it; ${unparseableConfigFix("re-run", read.syntax)}.`,
-    );
+    err(malformedConfigRefusal("uninstall", resolved.absolute, read));
     return { written: [], wouldWrite: [], messages, exitCode: 1 };
   }
   // Our entry is there, in a spelling the file's adapter will not edit (for
@@ -4348,7 +4453,7 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
       projectKey: containerPath[0] === "projects" ? variantPath[1] : null,
       sibling,
       hasEntry: entryHere,
-      storedEntry: at.entry()?.value,
+      storedEntry: at.normalized(),
       legacyEntry: legacyHere,
     });
   }

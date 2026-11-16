@@ -111,8 +111,8 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
       "--dry-run",
       "--list",
       "--all",
-      // parseInstallArgs accepts --help/-h (install-cmd.ts returns
-      // helpRequested), so it completes here like every other subcommand.
+      // parseInstallArgs accepts --help/-h, so it completes here like every
+      // other subcommand.
       "--help",
     ],
   },

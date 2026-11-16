@@ -289,10 +289,31 @@ describe("atomicWriteFile", () => {
     expect(existsSync(lookalike)).toBe(true);
   });
 
+  it("lists the directory for the sweep only after the write is published", async () => {
+    // The target's directory can be $HOME or a project root. Listing it
+    // between the tmp write and the rename held the new bytes unpublished for
+    // the length of that listing, so the sweep's readdir has to come AFTER
+    // the rename -- and a write whose rename fails must not sweep at all.
+    const file = join(dir, "state.json");
+    await atomicWriteFile(file, "ok");
+    const renamedAt = vi.mocked(rename).mock.invocationCallOrder[0];
+    const listedAt = vi.mocked(readdir).mock.invocationCallOrder[0];
+    expect(vi.mocked(readdir).mock.calls.map((c) => String(c[0]))).toEqual([dir]);
+    expect(listedAt).toBeGreaterThan(renamedAt);
+
+    vi.mocked(readdir).mockClear();
+    await asPosix(async () => {
+      vi.mocked(rename).mockRejectedValueOnce(errnoError("EACCES"));
+      await expect(atomicWriteFile(file, "next")).rejects.toMatchObject({ code: "EACCES" });
+    });
+    expect(vi.mocked(readdir)).not.toHaveBeenCalled();
+    expect(readFileSync(file, "utf8")).toBe("ok");
+  });
+
   it("does not sweep when the tmp write itself fails, and the sweep's own errors never surface", async () => {
-    // The sweep runs only after the tmp file landed: a write refused by the
-    // directory is not a licence to delete in it. And it is best-effort end
-    // to end: an injected readdir failure changes nothing about the write.
+    // The sweep runs only after the write is published: a write refused by
+    // the directory is not a licence to delete in it. And it is best-effort
+    // end to end: an injected readdir failure changes nothing about the write.
     const file = join(dir, "state.json");
     const stale = `${file}.tmp-1234-1-7`;
     writeFileSync(stale, "orphan");

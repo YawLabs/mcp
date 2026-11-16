@@ -3,11 +3,13 @@ import type { DetectedPack } from "./pack-detect.js";
 
 // Inline usage hints for discover() output. Two signals:
 //
-//   1. Success credit from LearningStore — "you called a tool on this
-//      server N times and it worked." Populated on the proxy path in
-//      handleToolCall through recordOutcome, which banks a GRADED reward
-//      in [0,1] per routed call rather than a binary answered/errored
-//      flag, so the displayed count is a rounded sum (see formatUsageHint).
+//   1. Use recorded by LearningStore — "you called a tool on this server
+//      N times." Populated on the proxy path in handleToolCall through
+//      recordOutcome, which counts the call and banks a GRADED reward in
+//      [0,1] for it rather than a binary answered/errored flag. The line
+//      shows once the banked credit reaches one full success and prints
+//      `dispatched`: the routed calls, failed ones included, plus any
+//      routing misses booked against the server (see formatUsageHint).
 //      Activation alone doesn't contribute.
 //
 //   2. Co-activation peers from PackDetector — "when you loaded X
@@ -16,8 +18,9 @@ import type { DetectedPack } from "./pack-detect.js";
 //
 // Both signals persist across yaw-mcp restarts via ~/.yaw-mcp/state.json
 // (see persistence.ts) so a freshly-started session still knows which
-// servers the user has been relying on. Counts reflect cumulative
-// successful use since persistence started, not just the live process.
+// servers the user has been relying on. Counts are cumulative since
+// persistence started, not just the live process, and are not a count of
+// successes: `dispatched` includes calls that failed and booked misses.
 // Set YAW_MCP_DISABLE_PERSISTENCE=1 to keep signals session-local only.
 
 // Cap on peers per hint. Keeps the discover() line length bounded —
@@ -86,10 +89,19 @@ export function formatUsageHint(usage: NamespaceUsage | undefined, coUsedWith: s
     // count is cumulative (restored from state.json on startup). Tacking
     // "this session" on overclaims freshness; dropping it is both
     // shorter and accurate in both persistence-on and opt-out states.
-    // `succeeded` is a SUM of graded rewards in [0,1] (see learning.ts), not
-    // an integer count, so round before display -- otherwise IEEE-754
-    // accumulation prints "used 3.3000000000000003x" in discover() output.
-    parts.push(`used ${Math.round(usage.succeeded)}x`);
+    // The GATE above reads `succeeded` (a SUM of graded rewards in [0,1], see
+    // learning.ts): a server that never earned one full success of credit
+    // gets no "used" line. The NUMBER printed is `dispatched`, the integer
+    // the reliability line calls "past calls": one per routed call, plus
+    // one per routing miss LearningStore.recordMiss booked against the
+    // server. So it is calls plus booked misses, not strictly calls: one
+    // call followed by one booked miss prints "used 2x". That is accepted
+    // -- it is the same integer the reliability line prints, so the two
+    // lines never disagree -- and it is far closer to what "used Nx" reads
+    // as than the rounded credit it used to print: ten calls that each
+    // earned 0.2 showed "used 2x". How well those calls went is the
+    // reliability line's job (formatReliabilityWarning).
+    parts.push(`used ${usage.dispatched}x`);
   }
   if (coUsedWith.length > 0) {
     const shown = coUsedWith.slice(0, MAX_PEERS);

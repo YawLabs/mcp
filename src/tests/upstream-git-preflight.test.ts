@@ -66,7 +66,8 @@ vi.mock("../default-runtime.js", () => ({ defaultRuntime: vi.fn().mockResolvedVa
 vi.mock("../secrets-audit.js", () => ({ appendAuditEvent: vi.fn().mockResolvedValue(undefined) }));
 vi.mock("../logger.js", () => ({ log: vi.fn() }));
 
-const { ActivationError, connectToUpstream, gitBuildMissing, readGitFailedRecord } = await import("../upstream.js");
+const { ActivationError, connectToUpstream, gitBuildMissing, readGitFailedRecord, shellActivationMessage } =
+  await import("../upstream.js");
 const { resolveUvSpawn } = await import("../uv-bootstrap.js");
 const { gitBuildDir, gitFailedPath } = await import("../paths.js");
 const { fakeFinishedBuild } = await import("./git-fixture.js");
@@ -125,13 +126,19 @@ async function activationError(config: UpstreamServerConfig): Promise<InstanceTy
 }
 
 describe("git build preflight at activation", () => {
-  it("refuses a not-built entry as install_failure with the fix and the config pointer, spawning nothing", async () => {
+  it("refuses a not-built entry as install_failure naming the command to run, spawning nothing", async () => {
     const err = await activationError(gitConfig());
     expect(err.category).toBe("install_failure");
     expect(err.message).toContain(
       '"acme_tools" is not built on this machine (git 9f3c2a1). Run: yaw-mcp sidecars install',
     );
-    expect(err.message).toContain('-> Fix "acme_tools" in');
+    // Nothing in bundles.json is wrong, so the message must not send the
+    // reader to edit the entry: the command above is the whole fix.
+    expect(err.message).not.toContain('Fix "acme_tools" in');
+    expect(err.message).toMatch(/-> then activate it again -- no client restart is needed\.$/);
+    // A shell caller gets its own ending, not the broker's.
+    expect(err.configPointer?.fix).toBeNull();
+    expect(shellActivationMessage(err)).toMatch(/yaw-mcp sidecars install.* -> then run the command again\.$/);
     expect(err.message).not.toContain("last build failed");
     expect(spawnSpy).not.toHaveBeenCalled();
     expect(resolveUvSpawn).not.toHaveBeenCalled();

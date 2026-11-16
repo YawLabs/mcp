@@ -168,6 +168,20 @@ function tokenRefusal(
   loadedTokens: number,
   tokenCap: number,
 ): string {
+  // The candidate is over the ceiling BY ITSELF, so no amount of unloading
+  // makes room. The general message below would list what is loaded (often
+  // nothing: "Loaded, most expensive first: .") and advise a deactivate that
+  // cannot help. Say what is true instead, and name the one meta-tool that
+  // reaches one of its tools without loading the server: read_tool inspects
+  // over a transient connection that never passes through this cap.
+  // mcp_connect_exec is NOT offered: an exec step on an unloaded server
+  // activates it on first use, lands back in this refusal, and advising it
+  // here sent the model round in a circle. A `tools: [...]` filter is not
+  // offered as a way out either: candidateTokens is the caller's estimate,
+  // and whether a filter lowers it is the caller's business.
+  if (candidateTokens > tokenCap) {
+    return `Cannot load "${namespace}" — its ~${candidateTokens} tokens of tools are over the ~${tokenCap}-token ceiling on their own, so unloading other servers cannot make room. Use mcp_connect_read_tool to inspect one of its tools without loading the server; calling one needs the limit raised. Ops can raise the limit via YAW_MCP_TOOL_TOKEN_CAP.`;
+  }
   const sorted = [...loaded].sort((a, b) => {
     const at = a.tokens ?? 0;
     const bt = b.tokens ?? 0;

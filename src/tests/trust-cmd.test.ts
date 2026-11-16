@@ -13,7 +13,7 @@ import { join, sep } from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { localBundlesPath } from "../local-bundles.js";
-import { CONFIG_DIRNAME } from "../paths.js";
+import { ALLOW_UNOWNED_ENV, CONFIG_DIRNAME } from "../paths.js";
 import { grantTrust, hashTrustContent, listTrusted, trustStorePath } from "../trust.js";
 import { displayArg, displaySafe, parseTrustArgs, runTrust, TRUST_USAGE } from "../trust-cmd.js";
 
@@ -865,6 +865,11 @@ describe("yaw-mcp trust --revoke", () => {
     const parsed = JSON.parse(io.text()) as { ok: boolean; error: string };
     expect(parsed.ok).toBe(false);
     expect(parsed.error).toContain("no .yaw-mcp/ directory");
+    // Not a flat "none found": a .yaw-mcp/ outside $HOME that cannot be
+    // verified is skipped by the same walk, and the grant path says so.
+    expect(parsed.error).toContain("is SKIPPED unless yaw-mcp can verify you own it");
+    expect(parsed.error).toContain(ALLOW_UNOWNED_ENV);
+    expect(parsed.error).toContain("pass an explicit path");
     expect(io.errText()).toBe("");
   });
 

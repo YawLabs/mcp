@@ -40,7 +40,7 @@ import {
 } from "./local-bundles.js";
 import { createStreamWriter } from "./logger.js";
 import { userConfigDir } from "./paths.js";
-import { askYesNo, QUESTION_CANCELLED } from "./readline-question.js";
+import { askYesNo, isInteractivePrompt, QUESTION_CANCELLED } from "./readline-question.js";
 import { runSecrets } from "./secrets-cmd.js";
 import { SECRET_NAME_RE, SECRET_REF_RE } from "./secrets-vault.js";
 import { MAX_TIMEOUT_MS } from "./timeouts.js";
@@ -464,12 +464,6 @@ function parseAssignment(raw: string): { ok: true; value: Assignment } | { ok: f
   return { ok: true, value: { field: "description", value: text === "" ? undefined : text, raw } };
 }
 
-function isInteractive(opts: SetCommandOptions): boolean {
-  if (opts.isTTY !== undefined) return opts.isTTY;
-  if (opts.promptAnswer !== undefined) return true;
-  return Boolean(process.stdin.isTTY) && Boolean(process.stdout.isTTY);
-}
-
 function render(value: unknown): string {
   return value === undefined ? "unset" : JSON.stringify(value);
 }
@@ -665,22 +659,34 @@ async function locateEntry(ctx: SetContext, assignments: Assignment[]): Promise<
     return refuse(1);
   }
 
-  // Same resolution order as `remove`, through the SAME helper: the literal
-  // target, then any entry whose stored slug or display name matches, then
-  // the namespace `add` would have derived. Two hand-written copies of that
-  // scan is how the two verbs stopped taking the same target.
+  // Same resolution order as `remove`, through the SAME identity helper: the
+  // literal target, then any entry whose stored slug or display name matches,
+  // then the namespace `add` would have derived (see the note below on when).
+  // Two hand-written copies of that scan is how the two verbs stopped taking
+  // the same target.
   const byIdentity = namespacesForStoredIdentity(target, servers);
-  const candidates = [...new Set([target, ...byIdentity, deriveNamespace(target)])];
+  // The DERIVED candidate is tried only for a target that has the shape of a
+  // slug or namespace. deriveNamespace maps any string onto some namespace
+  // ("???" -> "server", "GitHub" -> "github"), so trying it for every target
+  // let `disable "???"` edit whatever entry held the namespace "server", and
+  // let `enable GitHub` work on an entry `remove GitHub` refuses. `remove`
+  // (runRemove in local-add-cmd.ts) shuts the same door by refusing an
+  // odd-shaped target no stored slug or name answers to before it tries any
+  // candidate. This is one step looser on purpose: the LITERAL target is
+  // still matched whatever its shape, because `set` services hand-edited
+  // files and an entry whose namespace is "my server" has no other handle.
+  const shaped = STORED_TARGET_RE.test(target);
+  const candidates = [...new Set([target, ...byIdentity, ...(shaped ? [deriveNamespace(target)] : [])])];
   let idx = -1;
   for (const cand of candidates) {
     idx = servers.findIndex((s) => (s as { namespace?: unknown } | null)?.namespace === cand);
     if (idx >= 0) break;
   }
-  // Shape gate, demoted below the lookup exactly as `remove`'s is: an
-  // odd-shaped target that no stored entry answers to is a usage error (exit
-  // 2), while one that IS a stored display name resolves. Ordering it before
-  // the read refused every imported server by its own name.
-  if (idx < 0 && !STORED_TARGET_RE.test(target)) {
+  // Shape gate, below the lookup: an odd-shaped target that neither a stored
+  // namespace nor a stored slug or display name answers to is a usage error
+  // (exit 2), while one that IS a stored display name resolves. Ordering it
+  // before the read refused every imported server by its own name.
+  if (idx < 0 && !shaped) {
     // ${verb}, like the two sibling refusals in this runner. This one was
     // missed when those were fixed, so `enable`/`disable` still named `set`
     // here -- a command the user did not type, sending them to the wrong
@@ -885,7 +891,7 @@ async function confirmDestructive(
       }
       printErr("  The old value is gone -- re-adding the server will not bring it back.");
     }
-    if (!isInteractive(opts)) {
+    if (!isInteractivePrompt(opts)) {
       if (opts.json) {
         printErr(
           JSON.stringify({

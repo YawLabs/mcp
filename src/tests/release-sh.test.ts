@@ -100,11 +100,12 @@ const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const releaseShPath = join(repoRoot, "release.sh");
 const releaseSh = readFileSync(releaseShPath, "utf8");
 // release.sh's lockfile-drift guard runs this from its own directory, so every
-// copy of release.sh needs it beside it.
-const depsCheckPath = join(repoRoot, "scripts", "check-installed-deps.mjs");
+// copy of release.sh needs it beside it -- with is-main-module.mjs, the one
+// sibling it imports.
+const DEPS_CHECK_FILES = ["check-installed-deps.mjs", "is-main-module.mjs"];
 function copyDepsCheck(dir: string): void {
   mkdirSync(join(dir, "scripts"), { recursive: true });
-  copyFileSync(depsCheckPath, join(dir, "scripts", "check-installed-deps.mjs"));
+  for (const name of DEPS_CHECK_FILES) copyFileSync(join(repoRoot, "scripts", name), join(dir, "scripts", name));
 }
 
 // The cases that let a real timeout(1) stop a publisher need the coreutils one,
@@ -393,6 +394,15 @@ describe("release.sh lockfile drift guard (fixture run)", () => {
     expect(r.out).toContain("The lockfile drift check could not run");
     expect(r.out).not.toContain("Run `npm ci`");
     expect(r.out).not.toContain("server.json passes the MCP-registry field limits");
+    expect(r.status).not.toBe(0);
+  });
+
+  it("names the module the checker imports when only that is missing, instead of reading node's exit 1 as drift", () => {
+    const dir = withLockedPackage("2.4.0");
+    rmSync(join(dir, "scripts", "is-main-module.mjs"));
+    const r = runRelease(dir);
+    expect(r.out).toContain("The lockfile drift check could not run (scripts/is-main-module.mjs is missing).");
+    expect(r.out).not.toContain("Run `npm ci`");
     expect(r.status).not.toBe(0);
   });
 
@@ -1097,6 +1107,64 @@ describe("release.sh registry_has_version", () => {
     // -f: the lookup's 404 for an unknown version must reach the parser as
     // no body at all, not as a JSON error document.
     expect(args[0]).toMatch(/(^| )-fsSL( |$)/);
+  });
+});
+
+describe("release.sh registry identity guard", () => {
+  const block = extractBlock("# >>> registry identity guard", "# <<< registry identity guard");
+  const dir = newTmp("release-identity-");
+
+  function run(mcpName: string, serverName: string, pkgName: string): RunResult {
+    return runBash(
+      [
+        STUB_HELPERS,
+        `current_pkg_mcp_name() { printf %s "${mcpName}"; }`,
+        `current_server_name() { printf %s "${serverName}"; }`,
+        `current_pkg_name() { printf %s "${pkgName}"; }`,
+        block,
+        'echo "PASSED"',
+      ].join("\n"),
+      dir,
+    );
+  }
+
+  it("passes the names the script's own registry and npm reads spell out", () => {
+    const r = run("io.github.YawLabs/mcp", "io.github.YawLabs/mcp", "@yawlabs/mcp");
+    expect(r.out).toContain("PASSED");
+    expect(r.out).not.toContain("FAIL");
+    // The guard's literals are the ones the probes ask about.
+    expect(extractBlock("registry_has_version() {", "}")).toContain("/v0/servers/io.github.YawLabs%2Fmcp/versions/");
+    expect(extractBlock("npm_version_manifest() {", "}")).toContain("registry.npmjs.org/@yawlabs%2Fmcp/");
+    expect(extractBlock("npm_latest_version() {", "}")).toContain("registry.npmjs.org/@yawlabs%2Fmcp?");
+  });
+
+  it("refuses a mcpName that differs from server.json's name", () => {
+    const r = run("io.github.YawLabs/other", "io.github.YawLabs/mcp", "@yawlabs/mcp");
+    expect(r.out).toContain("FAIL package.json mcpName (io.github.YawLabs/other) != server.json name");
+    expect(r.out).not.toContain("PASSED");
+  });
+
+  it("refuses a rename both files agree on, since every probe would still ask about the old name", () => {
+    const server = run("io.github.YawLabs/broker", "io.github.YawLabs/broker", "@yawlabs/mcp");
+    expect(server.out).toContain("FAIL release.sh is written for io.github.YawLabs/mcp");
+    expect(server.out).toContain("server.json name is io.github.YawLabs/broker");
+    expect(server.out).not.toContain("PASSED");
+
+    const pkg = run("io.github.YawLabs/mcp", "io.github.YawLabs/mcp", "@yawlabs/broker");
+    expect(pkg.out).toContain("package.json name is @yawlabs/broker");
+    expect(pkg.out).not.toContain("PASSED");
+  });
+});
+
+describe("release.sh failure messages", () => {
+  it("never point the operator at a path under the temp dir the EXIT trap deletes", () => {
+    // fail() exits, and cleanup() then runs rm -rf "$WORKDIR": a message that
+    // says "run ${WORKDIR}/mcp-publisher ..." names a file that is gone by the
+    // time it is read.
+    expect(extractBlock("cleanup() {", "}")).toContain('rm -rf "$WORKDIR"');
+    const messages = [...releaseSh.matchAll(/\bfail "((?:[^"\\]|\\.)*)"/g)].map((m) => m[1]);
+    expect(messages.length).toBeGreaterThan(20);
+    expect(messages.filter((m) => m.includes("WORKDIR"))).toEqual([]);
   });
 });
 
@@ -2419,6 +2487,51 @@ describe("release.sh changelog retitle", () => {
       dir,
     );
     expect(r.out).toContain("BODY=[|The notes.||]");
+  });
+
+  it("reads past a fenced `## ` line to the end of the section, where the retitle ends it", () => {
+    // The behaviour-change gate greps this body for the off switch. Ending the
+    // section at a `## ` line inside a code fence hid everything below the
+    // fence, and the gate reported a documented switch as absent.
+    const notes = (heading: string, fence: string) =>
+      [
+        "# Changelog",
+        "",
+        heading,
+        "",
+        fence,
+        "## not a heading",
+        fence,
+        "",
+        "Set `YAW_MCP_NEW_THING=0` to disable it.",
+        "",
+        "## 1.1.0",
+        "",
+        "Old.",
+        "",
+      ].join("\n");
+    const body = (text: string) => {
+      const dir = newTmp("release-fenced-notes-");
+      writeFileSync(join(dir, "CHANGELOG.md"), text);
+      return runBash(
+        [
+          helpers,
+          'changelog_version_heading 1.2.0; echo "HEADING=$?"',
+          "echo \"BODY=[$(changelog_notes_body 1.2.0 | tr '\\n' '|')]\"",
+        ].join("\n"),
+        dir,
+      ).out;
+    };
+    for (const fence of ["```", "~~~~", "   ```"]) {
+      const want = `BODY=[|${fence}|## not a heading|${fence}||Set \`YAW_MCP_NEW_THING=0\` to disable it.||]`;
+      expect(body(notes("## Unreleased", fence)), fence).toContain(want);
+      expect(body(notes("## 1.2.0 -- summary", fence)), fence).toContain(want);
+    }
+    // A version heading that is only an example inside a fence is not one.
+    const fencedOnly = "# Changelog\n\n## Unreleased\n\n```\n## 1.2.0\n```\n\nThe notes.\n\n## 1.1.0\n\nOld.\n";
+    const out = body(fencedOnly);
+    expect(out).toContain("HEADING=1");
+    expect(out).toContain("BODY=[|```|## 1.2.0|```||The notes.||]");
   });
 
   // Step 3's block, in a repo, so the tag check is real. `pkg` commits a

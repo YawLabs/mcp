@@ -1,6 +1,6 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { EntryTransform } from "../client-config.js";
@@ -271,11 +271,99 @@ describe("runImport -- reading a client config", () => {
     expect(r.written).toEqual([]);
   });
 
-  it("reports a missing client config instead of writing an empty import", async () => {
+  it("reports a missing client config as nothing to import, and exits 0", async () => {
+    // The same expected state as a config with no server container, which
+    // already exited 0: exiting 1 here failed a setup script that imports
+    // from every client on the first client the user does not have.
     const cap = capture();
     const r = await runImport({ clientId: "claude-code", home: synthHome, cwd: synthCwd, ...cap });
-    expect(r.exitCode).toBe(1);
-    expect(cap.errText()).toMatch(/does not exist|not found/i);
+    expect(r.exitCode).toBe(0);
+    expect(r.written).toEqual([]);
+    expect(cap.text()).toMatch(/Nothing to import: .*does not exist/);
+  });
+
+  it("reports an empty client config as nothing to import, and exits 0", async () => {
+    writeFileSync(join(synthHome, ".claude.json"), "");
+    const cap = capture();
+    const r = await runImport({ clientId: "claude-code", home: synthHome, cwd: synthCwd, ...cap });
+    expect(r.exitCode).toBe(0);
+    expect(cap.text()).toMatch(/Nothing to import: .*is empty/);
+  });
+
+  it("never imports an entry that LAUNCHES yaw-mcp, whatever key it sits under", async () => {
+    // `claude mcp add yaw -- npx -y @yawlabs/mcp@latest` wires the broker under
+    // a key that is none of its own names. Going by key alone imported it as
+    // a server of itself.
+    writeClaudeCode({
+      mcpServers: {
+        yaw: { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] },
+        wrapped: { command: "cmd", args: ["/c", "npx", "-y", "@yawlabs/mcp"] },
+        bin: { command: "yaw-mcp" },
+        shim: { command: "cmd.exe", args: ["/c", "C:\\Users\\me\\AppData\\Roaming\\npm\\yaw-mcp.cmd"] },
+        hosted: { command: "/opt/oam", args: ["--no-check", "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js"] },
+        // A different package of the same scope, and a server that merely has
+        // the bin's name as an ordinary argument: both are real servers.
+        compliance: { command: "npx", args: ["-y", "@yawlabs/mcp-compliance"] },
+        notes: { command: "node", args: ["notes.js", "yaw-mcp"] },
+      },
+    });
+    const cap = capture();
+    await runImport({ clientId: "claude-code", home: synthHome, cwd: synthCwd, keepOriginals: true, ...cap });
+    expect(
+      bundles()
+        .map((s) => s.namespace)
+        .sort(),
+    ).toEqual(["compliance", "notes"]);
+    expect(cap.text()).toMatch(/Skipped yaw-mcp's own entries: yaw, wrapped, bin, shim, hosted/);
+  });
+
+  it("warns, naming the span and never the value around it, when a ${...} is carried across as text", async () => {
+    // Windsurf's row declares no `hooks.importVariables`, so its entries are
+    // not interpreted, and yaw-mcp fills in only ${secret:NAME} at launch:
+    // the entry lands as written, and the run says which spans it carried so
+    // the original is not removed on trust. (Claude Code, which this case
+    // used to run against, now declares "posix-env" and refuses by name --
+    // import-cmd-client-vars.test.ts.)
+    const windsurf = resolveInstallPath({
+      clientId: "windsurf",
+      scope: "user",
+      os: CURRENT_OS,
+      home: synthHome,
+    }).absolute;
+    mkdirSync(dirname(windsurf), { recursive: true });
+    writeFileSync(
+      windsurf,
+      JSON.stringify({
+        mcpServers: {
+          api: {
+            command: "npx",
+            args: ["-y", "srv", "--root=${HOME}/data"],
+            env: { API_KEY: "prefix-${API_KEY}", VAULTED: "${secret:TOKEN}" },
+          },
+          plain: { command: "npx", args: ["-y", "plain"] },
+        },
+      }),
+    );
+    const cap = capture();
+    const r = await runImport({ clientId: "windsurf", home: synthHome, cwd: synthCwd, keepOriginals: true, ...cap });
+    expect(r.exitCode).toBe(0);
+    // Carried verbatim -- the import itself is unchanged.
+    expect(bundles().find((s) => s.namespace === "api")?.env).toEqual({
+      API_KEY: "prefix-${API_KEY}",
+      VAULTED: "${secret:TOKEN}",
+    });
+    const warning = cap
+      .errText()
+      .split("\n")
+      .filter((l) => l.includes("as literal text"));
+    expect(warning.length).toBe(1);
+    expect(warning[0]).toContain('carrying ${HOME}, ${API_KEY} on "api"');
+    expect(warning[0]).toContain("if Windsurf expands those itself");
+    // yaw-mcp's own reference is resolved at spawn and is not a carried span;
+    // the text a span sat in is never printed.
+    expect(warning[0]).not.toContain("${secret:TOKEN}");
+    expect(warning[0]).not.toContain("prefix-");
+    expect(warning[0]).not.toContain("/data");
   });
 
   it("refuses to act on a client config that is not valid JSON", async () => {
@@ -1571,6 +1659,49 @@ describe("runImport -- the wired-in SEARCH folds the drive-letter case too", () 
     const after = JSON.parse(readFileSync(join(synthCwd, ".mcp.json"), "utf8"));
     expect(Object.keys(after.mcpServers)).toEqual([]);
   });
+
+  it.runIf(process.platform === "win32")(
+    "finds the broker under a drive-case sibling of the IMPORTED container",
+    async () => {
+      // The imported container is searched first, from the view already in
+      // hand -- and that view is ONE sibling. The servers sit under the
+      // canonical key and the broker under the other case of the same
+      // project, in the same file: without the fold on this container too,
+      // the removal was refused over a file that holds the entry.
+      const localPath = resolveInstallPath({
+        clientId: "claude-code",
+        scope: "local",
+        os: CURRENT_OS,
+        projectDir: synthCwd,
+        home: synthHome,
+      });
+      const projectKey = localPath.containerPath[1];
+      expect(projectKey).toMatch(/^[A-Z]:\//);
+      const lowerKey = projectKey[0].toLowerCase() + projectKey.slice(1);
+      writeClaudeCode({
+        projects: {
+          [projectKey]: { mcpServers: { github: { command: "npx", args: ["-y", "gh"] } } },
+          [lowerKey]: { mcpServers: { mcp: { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] } } },
+        },
+      });
+      const cap = capture();
+      const r = await runImport({
+        clientId: "claude-code",
+        scope: "local",
+        projectDir: synthCwd,
+        home: synthHome,
+        cwd: synthCwd,
+        removeOriginals: true,
+        ...cap,
+      });
+      expect(r.exitCode).toBe(0);
+      expect(cap.errText()).not.toMatch(/Not removing the originals/);
+      const after = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+      expect(Object.keys(after.projects[projectKey].mcpServers)).toEqual([]);
+      // The broker's own container is untouched.
+      expect(Object.keys(after.projects[lowerKey].mcpServers)).toEqual(["mcp"]);
+    },
+  );
 });
 
 describe("runImport -- an entry with BOTH command and url is imported as local, and says what it dropped", () => {

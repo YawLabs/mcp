@@ -25,6 +25,9 @@
 //      written (read-only $HOME, no space, permissions). The grade is still
 //      printed on stdout -- only the cache is missing. Deliberately distinct
 //      from 1 and 2, both of which mean nothing was graded at all.
+//   4  bundles.json exists but could not be loaded (unreadable, malformed, a
+//      schema the loader refuses), so the namespace could not be looked up.
+//      Distinct from 1: the namespace may well be configured.
 
 import { homedir } from "node:os";
 import type { ComplianceGrade } from "./compliance.js";
@@ -47,6 +50,17 @@ export interface AuditReport {
   suiteVersion?: string;
 }
 
+/** The stdio target one audit run spawns: the server's spawn config as the
+ *  broker would start it. `cwd` is set only for a server that has one -- a
+ *  git-sourced server, whose build directory the loader derives (types.ts,
+ *  UpstreamServerConfig.cwd) and the broker spawns in. */
+export interface AuditTarget {
+  command: string;
+  args: string[];
+  env?: Record<string, string>;
+  cwd?: string;
+}
+
 export interface AuditCommandOptions {
   /** Positional: the namespace to audit. Required. */
   namespace?: string;
@@ -62,7 +76,7 @@ export interface AuditCommandOptions {
    * real @yawlabs/mcp-compliance runner (loaded lazily so unit tests that
    * inject a runner never spin up a child process).
    */
-  runner?: (target: { command: string; args: string[]; env?: Record<string, string> }) => Promise<AuditReport>;
+  runner?: (target: AuditTarget) => Promise<AuditReport>;
   /**
    * Test hook: which platform's spawn semantics to apply. Only the cmd.exe
    * metacharacter gate reads it (the compliance runner uses `shell: true` on
@@ -287,11 +301,7 @@ export async function resolveComplianceSuiteVersion(fromUrl: string = import.met
 /** Lazily load the real compliance runner. Kept behind a dynamic import so a
  *  test that injects `opts.runner` never resolves @yawlabs/mcp-compliance and
  *  never spawns a child. */
-async function defaultRunner(target: {
-  command: string;
-  args: string[];
-  env?: Record<string, string>;
-}): Promise<AuditReport> {
+async function defaultRunner(target: AuditTarget): Promise<AuditReport> {
   // The compliance PACKAGE version rides along so the cached grade records
   // WHICH rubric produced the letter (see resolveComplianceSuiteVersion for
   // why it is the package version, not the exported SPEC_VERSION) -- read here
@@ -304,6 +314,7 @@ async function defaultRunner(target: {
     command: target.command,
     args: target.args,
     env: target.env,
+    ...(target.cwd !== undefined ? { cwd: target.cwd } : {}),
   });
   return suiteVersion
     ? { grade: report.grade, score: report.score, suiteVersion }
@@ -330,11 +341,21 @@ export async function runAudit(opts: AuditCommandOptions = {}): Promise<AuditCom
   const home = opts.home ?? homedir();
   const { config, path, warnings } = await loadLocalBundles({ cwd: opts.cwd, home });
   // Surface loader diagnostics the way the sibling commands do (list,
-  // sidecars, bundles). Without this, a malformed or unreadable bundles.json
-  // loads as zero servers and gets reported below as `no server named "X"` --
-  // with exit 1, the code the header reserves for a typo'd namespace -- while
-  // the real problem never surfaces. stderr keeps --json stdout pure.
+  // sidecars, bundles). stderr keeps --json stdout pure.
   for (const w of warnings) printErr(`warning: ${w}`);
+  // A bundles.json the loader settled on and could not use (unreadable, not
+  // JSON, a schema it refuses): `path` names the file and `config` is null.
+  // That is not "no server with that namespace" -- whether the namespace is
+  // configured is unknown -- so it gets its own exit code (see the header)
+  // instead of the exit 1 a caller reads as a typo'd namespace. The loader's
+  // warning above says what is wrong with the file. No file at all (`path`
+  // null) is still the ordinary not-found case below.
+  if (config === null && path !== null) {
+    printErr(
+      `yaw-mcp audit: could not load ${path}, so "${namespace}" cannot be looked up. Fix the file (see the warning above), then re-run.`,
+    );
+    return { exitCode: 4 };
+  }
   const servers = config?.servers ?? [];
   const server = findServer(servers, namespace);
 
@@ -352,10 +373,15 @@ export async function runAudit(opts: AuditCommandOptions = {}): Promise<AuditCom
   if (!server.command) {
     if (server.url) {
       // Scrubbed: a remote URL can carry a credential in its query string
-      // (`?api_key=...`), and this line is the one place audit echoes it.
+      // (`?api_key=...`, `?key=...`) or its userinfo (`user:key@host`), all
+      // shapes scrubForWarning covers, and this line is the one place audit
+      // echoes it. The command to run names the url only when the scrub left
+      // it alone: a redacted url pasted back would grade a target that does
+      // not authenticate, so that case gets a placeholder instead.
       const url = scrubForWarning(server.url);
+      const rerun = url === server.url ? url : "<url>";
       printErr(
-        `yaw-mcp audit: "${namespace}" is a remote server (${url}). Audit grades stdio servers; run \`yaw-mcp compliance ${url}\` to grade a remote target.`,
+        `yaw-mcp audit: "${namespace}" is a remote server (${url}). Audit grades stdio servers; run \`yaw-mcp compliance ${rerun}\` to grade a remote target.`,
       );
     } else {
       printErr(`yaw-mcp audit: "${namespace}" has no command to spawn -- it can't be audited as a stdio server.`);
@@ -433,10 +459,16 @@ export async function runAudit(opts: AuditCommandOptions = {}): Promise<AuditCom
   // way to audit a vault-backed server hands the vault passphrase to a
   // third-party server. One-shot CLI, so mutating process.env is safe.
   scrubInternalSecretsFromProcessEnv();
-  const target = {
+  // `cwd` rides along for the same reason the env is resolved above: a
+  // git-sourced server runs in its build directory (upstream.ts passes
+  // config.cwd to the spawn), and one that reads cwd-relative files graded in
+  // the shell's directory instead would cache a letter for a server that was
+  // never really started.
+  const target: AuditTarget = {
     command: server.command,
     args: server.args ?? [],
     env: auditEnv,
+    ...(server.cwd !== undefined ? { cwd: server.cwd } : {}),
   };
 
   // In --json mode stdout must be pure JSON (the Yaw MCP panel parses it), so

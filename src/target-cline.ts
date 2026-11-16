@@ -27,8 +27,8 @@ const SETTINGS_FILE = "cline_mcp_settings.json";
 /** The editors whose Cline extension keeps its own copy of the settings file.
  *  `dir` is the per-editor directory VS Code and its forks put `User/` under,
  *  which is NOT the display label -- "Code - Insiders" against "VS Code
- *  Insiders" -- so the two are separate fields. `id` is what a `--list` or
- *  doctor row names the site. */
+ *  Insiders" -- so the two are separate fields. `id` is the site's stable
+ *  name for tests; nothing prints it. */
 const CLINE_HOSTS = [
   { id: "vscode", label: "VS Code", dir: "Code" },
   { id: "vscode-insiders", label: "VS Code Insiders", dir: "Code - Insiders" },
@@ -54,11 +54,13 @@ function displayPath(base: PathBase, segments: readonly string[]): string {
 /** The directory an editor keeps its User/ tree in, per OS, as BOTH the
  *  absolute path and the display segments naming it, so the two cannot drift.
  *
- *  Linux hardcodes `~/.config`; the vscode row's user path honours an absolute
- *  $XDG_CONFIG_HOME and this function does not yet, so on such a box Cline's
- *  per-editor copies are looked for in the wrong directory. The value is
- *  already threaded as `base.env.xdgConfigHome` (the Zed and vscode rows read
- *  it); this function just does not consult it. */
+ *  On Linux an ABSOLUTE `$XDG_CONFIG_HOME` (surrounding whitespace stripped)
+ *  replaces `~/.config`, the rule the vscode row's user path applies in
+ *  install-targets.ts: these are the same editors' user-data roots, so the two
+ *  rows must agree on where `<Editor>/User` lives. A relative or blank value
+ *  keeps `~/.config` -- the editor would resolve a relative one against the
+ *  cwd it was launched from, which install cannot know. Linux only: Windows
+ *  and macOS do not consult the variable. */
 function editorRoot(base: PathBase, dirName: string): { dir: string; display: string[] } {
   if (base.os === "windows") return { dir: join(base.appData, dirName), display: ["%APPDATA%", dirName] };
   if (base.os === "macos") {
@@ -67,6 +69,8 @@ function editorRoot(base: PathBase, dirName: string): { dir: string; display: st
       display: ["~", "Library", "Application Support", dirName],
     };
   }
+  const xdg = base.env.xdgConfigHome?.trim();
+  if (xdg && isAbsolute(xdg)) return { dir: join(xdg, dirName), display: ["$XDG_CONFIG_HOME", dirName] };
   return { dir: join(base.home, ".config", dirName), display: ["~", ".config", dirName] };
 }
 

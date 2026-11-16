@@ -48,6 +48,8 @@ import { isWin32TransientFsError } from "./atomic-write.js";
 
 /** Sidecar beside the locked file: `<path>.lock`. */
 const LOCK_SUFFIX = ".lock";
+/** Mode for a directory withFileLock has to create; see the mkdir there. */
+const LOCK_DIR_MODE = 0o700;
 /** Age past which a lock is abandoned, not held. See the header above. */
 const DEFAULT_LOCK_STALE_MS = 10_000;
 /** Default wait on a LIVE lock. Longer than the stale age on purpose, so
@@ -258,7 +260,15 @@ export async function withFileLock<T>(
 
   // The lock lives beside the target, so on the first-ever write its
   // directory does not exist yet.
-  await mkdir(dirname(path), { recursive: true });
+  //
+  // 0o700 for a directory this call CREATES (an existing one is left as it
+  // is; the bits mean nothing on Windows). Both callers lock a file in
+  // ~/.yaw-mcp/, and on a fresh machine this mkdir can be the one that makes
+  // that directory: a server's first state save, ahead of any secret-bearing
+  // write. Every such writer asks atomicWriteFile for dirMode 0o700, and
+  // atomicWriteFile never re-chmods a parent that already exists -- so a
+  // plain mkdir here left the directory at the umask default for good.
+  await mkdir(dirname(path), { recursive: true, mode: LOCK_DIR_MODE });
   await sweepStaleLitter(lockPath, staleMs);
   const deadline = Date.now() + waitMs;
   // When the current unbroken run of transient take failures began; null

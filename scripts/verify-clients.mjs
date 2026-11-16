@@ -63,7 +63,7 @@ import { delimiter, dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse as parseJsonc } from "jsonc-parser";
 import { parse as parseToml } from "smol-toml";
-import { isMainModule } from "./verify-oam-floor.mjs";
+import { isMainModule } from "./is-main-module.mjs";
 
 export const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 export const TAG = "[verify:clients]";
@@ -378,6 +378,26 @@ export function startRegistry(tarball, manifest, version) {
 // Main
 // ---------------------------------------------------------------------------
 
+/** Every variable the built CLI reads to relocate a client config or to learn
+ *  where a client runs: a copy of CLIENT_ENV_VARS in src/client-config.ts,
+ *  which this script cannot import (it runs against dist/, a single bundle).
+ *  One left in the child environment sends `install` -- and then step 7's
+ *  `uninstall --force` -- to the operator's REAL file. verify-clients.test.ts
+ *  feeds every CLIENT_ENV_VARS name through sandboxEnv, so a variable added
+ *  there and not here fails the suite. */
+const CLIENT_ENV_NAMES = [
+  "APPDATA",
+  "CLAUDE_CONFIG_DIR",
+  "CLINE_DATA_DIR",
+  "CLINE_DIR",
+  "CLINE_MCP_SETTINGS_PATH",
+  "CODEX_HOME",
+  "CONTINUE_GLOBAL_DIR",
+  "TYPED_CLI_BUNDLE",
+  "XDG_CONFIG_HOME",
+  "YAW_MODE",
+];
+
 export function sandboxEnv(home, source = process.env) {
   const overrides = {
     HOME: home,
@@ -394,12 +414,13 @@ export function sandboxEnv(home, source = process.env) {
   // arrive in whatever case the parent used (under vitest they come through as
   // NPM_CONFIG_USERCONFIG), and a copied `Codex_Home` beside our CODEX_HOME
   // would leave the child with two values and no saying which wins.
-  const drop = new Set(["CLAUDE_CONFIG_DIR", "OAM_BIN", ...Object.keys(overrides)]);
+  const drop = new Set(["OAM_BIN", ...CLIENT_ENV_NAMES, ...Object.keys(overrides)]);
   const env = {};
   for (const [k, v] of Object.entries(source)) {
     // npm run exports npm_config_userconfig / npm_config_cache pointing at the
     // REAL ~/.npmrc and cache; a child that inherited them would bypass the
-    // sandbox registry. Same for a real CLAUDE_CONFIG_DIR / CODEX_HOME and any
+    // sandbox registry. Same for every variable that relocates a client config
+    // (a real CLAUDE_CONFIG_DIR, CLINE_MCP_SETTINGS_PATH, ...) and any
     // YAW_MCP_* tuning the operator has set.
     if (/^(npm_|YAW_MCP_)/i.test(k) || drop.has(k.toUpperCase())) continue;
     env[k] = v;

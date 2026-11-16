@@ -156,6 +156,14 @@
 // YAW_MCP_* opt-out shares (isFeatureDisabled, opt-out-env.ts) -- so it is
 // the same spellings, and the same trim, as YAW_MCP_AUTO_UPGRADE by
 // construction rather than by promise.
+//
+// A second, unintended off switch: VITEST. Every default below is a no-op
+// when that variable is set to anything non-empty (isTestSandbox,
+// opt-out-env.ts), so that a test which forgets to inject an impl cannot
+// reach the network or the real tree. It is read from the process env like
+// any other, so a `serve` whose MCP client was launched from a shell or task
+// runner that exports VITEST never refreshes. maybeRefreshSidecars logs that
+// once per check, at debug, since nothing else would say why.
 
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -167,6 +175,7 @@ import { log } from "./logger.js";
 import { compareVersions } from "./oam-spawn.js";
 import { isFeatureDisabled, isTestSandbox } from "./opt-out-env.js";
 import { CONFIG_DIRNAME, sidecarsRoot } from "./paths.js";
+import { fetchLatestVersion } from "./registry-latest.js";
 import {
   acquireSidecarsLock,
   collectSidecarSpecs,
@@ -532,15 +541,12 @@ function defaultManagedDependencies(home: string): Record<string, string> | null
   }
 }
 
-/** Latest-version probe for one package. Same contract and response validation
- *  as upgrade-cmd's fetchLatestVersion (null on any failure, hard abort at the
- *  budget) but keyed by package -- that one is hardwired to @yawlabs/mcp.
- *
- *  doctor-cmd has a near-identical fetchSidecarLatest, and this is NOT that one
- *  reused: it is unexported, and importing doctor-cmd would drag the entire
- *  diagnostic command onto the serve startup path for one fetch. (oam-spawn's
- *  compareVersions header documents the same dependency-direction rule.) If a
- *  third copy ever wants to exist, promote one to a shared module instead.
+/** Latest-version probe for one package: the shared leaf probe
+ *  (registry-latest.ts fetchLatestVersion -- null on any failure, hard abort
+ *  at the budget) under this module's own unit-test gate and timeout.
+ *  upgrade-cmd's fetchLatestVersion and doctor-cmd's fetchSidecarLatest call
+ *  the same function, which is a leaf so that this one, on the serve startup
+ *  path, imports neither command module for one fetch.
  *
  *  Always registry.npmjs.org, NOT the registry npm is configured with -- the
  *  install that follows (defaultRunNpm) uses the configured one. Resolving it
@@ -550,21 +556,7 @@ function defaultManagedDependencies(home: string): Record<string, string> | null
  *  SIDECAR_REFRESH_UNMOVED_BACKOFF_MS. */
 async function defaultFetchLatest(pkg: string): Promise<string | null> {
   if (inUnitTest()) return null;
-  const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), SIDECAR_REGISTRY_TIMEOUT_MS);
-  try {
-    const res = await fetch(`https://registry.npmjs.org/${pkg}/latest`, {
-      signal: ac.signal,
-      headers: { accept: "application/json" },
-    });
-    if (!res.ok) return null;
-    const body = (await res.json()) as { version?: unknown };
-    return typeof body.version === "string" ? body.version : null;
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timer);
-  }
+  return fetchLatestVersion(pkg, SIDECAR_REGISTRY_TIMEOUT_MS);
 }
 
 /** The lock the serve path actually uses: sidecars-cmd's acquireSidecarsLock,
@@ -655,8 +647,14 @@ export async function unbuiltGitNote(home: string): Promise<{ message: string; n
   } catch {
     return null;
   }
+  // Pinned entries only. gitEntryBuilt is false for an entry with NO commit
+  // too, but `sidecars install` -- the command this note sends the reader to
+  // -- refuses such an entry ("refusing to build a moving ref"), so counting
+  // it here logged, after every refresh, a remedy that cannot work. The same
+  // filter trust-cmd's offerGitBuild applies; the loader's own warning names
+  // the unpinned entry and `yaw-mcp update <namespace>`.
   const namespaces = servers
-    .filter((s) => s.git !== undefined && !gitEntryBuilt(s.namespace, s.git, home))
+    .filter((s) => s.git?.commit !== undefined && !gitEntryBuilt(s.namespace, s.git, home))
     .map((s) => s.namespace);
   if (namespaces.length === 0) return null;
   const one = namespaces.length === 1;
@@ -958,6 +956,18 @@ export async function maybeRefreshSidecars(deps: SidecarRefreshDeps = {}): Promi
 
     const home = deps.home ?? homedir();
     const now = (deps.nowImpl ?? Date.now)();
+
+    // 1b. The test-sandbox gate, said out loud. With the managed-tree probe
+    // left at its default, VITEST in the environment makes step 2 answer
+    // "no tree" on every machine and the check ends there -- correct under a
+    // test harness, and a silent permanent opt-out for a real `serve` that
+    // merely inherited the variable. Debug, because under the harness it is
+    // the expected path; an injected probe is a test driving the real flow
+    // and is not announced.
+    if (deps.hasManagedSidecarsImpl === undefined && inUnitTest()) {
+      log("debug", "sidecar refresh skipped: VITEST is set in the environment, which switches the refresh off");
+      return;
+    }
 
     // 2. No managed tree, nothing to refresh. This is the COMMON case --
     // `sidecars install` is opt-in -- and it is one existsSync, so it comes

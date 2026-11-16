@@ -86,6 +86,21 @@ describe("resolveCatalogSlug", () => {
     );
   });
 
+  // The miss message is printed by `add` and `try`, and the slugs it suggests
+  // come from the fetched catalog, so a control character in one must not
+  // reach the terminal.
+  it("keeps control characters in a suggested slug out of the miss message", async () => {
+    const esc = String.fromCharCode(0x1b);
+    const servers = [{ slug: `sqlite${esc}`, install: { command: "npx -y x" } }] as unknown as CatalogServer[];
+    const message = await resolveCatalogSlug("sqlote", { fetchCatalog: makeFetch(servers) }).then(
+      () => "",
+      (e: Error) => e.message,
+    );
+    // The suggestion has to be there for the next line to mean anything.
+    expect(message).toContain("Did you mean: sqlite??");
+    expect(message).not.toContain(esc);
+  });
+
   // The catalog publishes an A-F grade per server, and until it was carried
   // through here nothing did: `add` wrote no grade, validateEntry dropped one
   // if hand-written, and grades.json (which only `yaw-mcp audit` writes) was

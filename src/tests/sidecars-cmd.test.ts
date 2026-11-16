@@ -105,6 +105,23 @@ describe("collectSidecarSpecs", () => {
     expect(specs[0].conflicting).toEqual(["@yawlabs/postgres-mcp@latest"]);
   });
 
+  it("does not call a bare name and `@latest` a conflict: they are one dependency value", () => {
+    // configuredRange reads both as "latest", so the manifest holds one line
+    // for them and no server starts on anything but what it asked for.
+    for (const [first, second] of [
+      ["@yawlabs/postgres-mcp", "@yawlabs/postgres-mcp@latest"],
+      ["@yawlabs/postgres-mcp@latest", "@yawlabs/postgres-mcp"],
+    ]) {
+      const specs = collectSidecarSpecs([
+        local({ namespace: "a", command: "npx", args: ["-y", first] }),
+        local({ namespace: "b", command: "npx", args: ["-y", second] }),
+      ]);
+      expect(specs).toHaveLength(1);
+      expect(specs[0].namespaces).toEqual(["a", "b"]);
+      expect(specs[0].conflicting, `${first} then ${second}`).toEqual([]);
+    }
+  });
+
   it("recognises npx via the launch classifier, not string equality", () => {
     // `npx.cmd` (the Windows shim) and an absolute npx path are the same
     // launch, and rewriteForOam hosts BOTH on oam through nodeLaunchKind. A
@@ -982,7 +999,32 @@ describe("runSidecarsInstall", () => {
     const res = await runSidecarsInstall({ home, cwd: home, runNpm: async () => 1, out: () => {} });
 
     expect(res.exitCode).toBe(1);
-    expect(res.lines.join("\n")).toContain("npx cache");
+    // No managed node_modules on this machine: the npx cache IS the answer.
+    expect(res.lines.join("\n")).toContain("npm install failed (exit 1). Servers keep resolving from the npx cache.");
+  });
+
+  it("a failed re-run over an existing managed tree says that tree stays in use, not the npx cache alone", async () => {
+    // Resolution looks in the managed tree first, so once a node_modules is
+    // there "keep resolving from the npx cache" described the wrong source.
+    writeBundles([
+      {
+        id: "1",
+        name: "F",
+        namespace: "fetch",
+        type: "local",
+        transport: "stdio",
+        command: "npx",
+        args: ["-y", "@yawlabs/fetch-mcp@latest"],
+      },
+    ]);
+    mkdirSync(sidecarsNodeModules(home), { recursive: true });
+
+    const res = await runSidecarsInstall({ home, cwd: home, runNpm: async () => 1, out: () => {} });
+
+    expect(res.exitCode).toBe(1);
+    const text = res.lines.join("\n");
+    expect(text).toContain(`Servers keep resolving from what is already in ${sidecarsNodeModules(home)}`);
+    expect(text).not.toContain("Servers keep resolving from the npx cache.");
   });
 
   it("fails when npm claims success but nothing landed", async () => {

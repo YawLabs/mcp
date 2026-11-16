@@ -230,15 +230,27 @@ export async function runFoundryExport(opts: FoundryExportOptions): Promise<{ ex
   const home = opts.home ?? homedir();
   const harvestPath = path.join(userConfigDir(home), FOUNDRY_FILENAME);
 
-  const blob = opts.readTraces
-    ? opts.readTraces()
-    : (() => {
-        try {
-          return readFileSync(harvestPath, "utf8");
-        } catch {
-          return null;
-        }
-      })();
+  // Only "there is no file" (ENOENT, or ENOTDIR on a path component) means no
+  // harvest. Any other read error -- EACCES, EISDIR, EBUSY -- is about a file
+  // that EXISTS, and answering it with "set YAW_MCP_FOUNDRY=1 and dispatch
+  // first" sends the maintainer off to produce a harvest they already have.
+  let blob: string | null;
+  if (opts.readTraces) {
+    blob = opts.readTraces();
+  } else {
+    try {
+      blob = readFileSync(harvestPath, "utf8");
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") {
+        printErr(
+          `yaw-mcp foundry: could not read the harvest at ${harvestPath}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        return { exitCode: 1, lines };
+      }
+      blob = null;
+    }
+  }
 
   if (blob === null) {
     printErr(`yaw-mcp foundry: no harvest at ${harvestPath}. Set YAW_MCP_FOUNDRY=1 and dispatch first.`);

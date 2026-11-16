@@ -13,6 +13,7 @@
 // Both `yaw-mcp add <slug>` and `yaw-mcp try <slug>` resolve through here, so
 // a catalog shape change is fixed in one place.
 
+import { withoutControls } from "./ascii.js";
 import { suggestCatalogSlugs } from "./catalog-search.js";
 
 const DEFAULT_CATALOG_URL = "https://yaw.sh/data/mcp-catalog.json";
@@ -408,7 +409,9 @@ export async function resolveCatalogSlug(
     // The catalog is already fetched, so the suggestion costs nothing extra.
     // A miss that only names a URL is a dead end in a terminal: the link is
     // not clickable, and the user cannot see the list without leaving.
-    const near = suggestCatalogSlugs(slug, servers, 3);
+    // withoutControls: a suggested slug is fetched text, and this message is
+    // printed to the terminal by the verb that called.
+    const near = suggestCatalogSlugs(slug, servers, 3).map(withoutControls);
     const hint =
       near.length > 0
         ? ` Did you mean: ${near.join(", ")}? Or run \`yaw-mcp search ${slug}\`.`

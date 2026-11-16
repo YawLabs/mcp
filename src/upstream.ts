@@ -25,11 +25,7 @@ import { bundlesFileHint } from "./bundles-hint.js";
 import { isCredentialEnvName } from "./credentials.js";
 import { defaultRuntime } from "./default-runtime.js";
 import { gitEntryBuilt } from "./git-build-state.js";
-import {
-  INTERNAL_SECRET_ENV_KEYS,
-  scrubInternalSecretsFromProcessEnv,
-  stripInternalSecretsFromEnv,
-} from "./internal-secret-env.js";
+import { stripInternalSecretsFromEnv } from "./internal-secret-env.js";
 import { log } from "./logger.js";
 import { oamHeapOomHint, probeOam, resolveManagedSpawn, resolveOamSpawn } from "./oam-spawn.js";
 import { gitFailedPath } from "./paths.js";
@@ -412,9 +408,8 @@ declare const __VERSION__: string;
 
 // MAX_TIMEOUT_MS lives in timeouts.ts -- a leaf with no imports -- so CLI
 // paths such as local-set-cmd.ts can validate `connectTimeoutMs` without
-// pulling the SDK client graph in through this module. Re-exported here so
-// existing importers keep compiling.
-export { MAX_TIMEOUT_MS } from "./timeouts.js";
+// pulling the SDK client graph in through this module. Import it from there;
+// this module does not re-export it.
 
 /** Shared parser for the three timeout env knobs -- MCP_CONNECT_TIMEOUT here,
  *  MCP_LIST_TIMEOUT below, MCP_CALL_TIMEOUT in proxy.ts. Every one of them
@@ -590,7 +585,16 @@ export type ActivationFailureCategory =
   | "spawn_failure" // command missing (ENOENT), not executable (EACCES), or refused by the OS (EFTYPE / spawn UNKNOWN)
   | "install_failure" // process spawned but exited non-zero before handshake
   | "init_timeout" // process running but didn't complete init within CONNECT_TIMEOUT
-  | "protocol_error" // handshake completed but something downstream failed
+  // Two different failures share this one. For any server: the handshake
+  // completed and something after it failed (the initial tools/list errored,
+  // the server disconnected during initialization). For a REMOTE server it is
+  // also EVERY non-timeout connect failure, including the ones BEFORE a
+  // handshake -- ECONNREFUSED, ENOTFOUND, a 401, a bad certificate
+  // (connectToUpstreamOnce's `config.type !== "local"` arm). So for a remote
+  // entry this does not mean the host was ever reached.
+  | "protocol_error"
+  // Not classified; also the permanent config errors caught before any
+  // connect (no command / no url, an invalid url, an invalid header value).
   | "unknown";
 
 /** The `-> Fix ...` suffix of an activation error, kept as DATA beside the
@@ -603,8 +607,10 @@ export interface ActivationConfigPointer {
   /** The failure itself, with no pointer suffix. */
   summary: string;
   /** Which entry in which file to edit: `Fix "<ns>" in <file hint>`. No
-   *  remediation verb and no trailing punctuation. */
-  fix: string;
+   *  remediation verb and no trailing punctuation. Null when no edit fixes
+   *  the failure and the summary already names the command that does (a git
+   *  entry that is not built) -- see withoutConfigEdit. */
+  fix: string | null;
 }
 
 export class ActivationError extends Error {
@@ -635,7 +641,10 @@ export function shellActivationMessage(err: unknown): string {
   if (!(err instanceof ActivationError) || !err.configPointer) {
     return err instanceof Error ? err.message : String(err);
   }
-  return `${err.configPointer.summary} -> ${err.configPointer.fix}, then run the command again.`;
+  const { summary, fix } = err.configPointer;
+  return fix === null
+    ? `${summary} -> then run the command again.`
+    : `${summary} -> ${fix}, then run the command again.`;
 }
 
 /** True for a value that is itself an unresolved `${secret:NAME}` reference
@@ -1163,7 +1172,12 @@ export function redactSecretsInOutput(text: string, env: Record<string, string>)
     if (isUnresolvedSecretRef(v)) continue;
     // Escape regex metacharacters in the secret value.
     const escaped = v.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    out = out.replace(new RegExp(escaped, "g"), `***${k}***`);
+    // A replacer FUNCTION, not a replacement string: String.replace expands
+    // $&, $` and $' inside a string replacement, and k is an env key or an
+    // HTTP header name from config (`$` and `&` are both legal in a header
+    // name), so a key like `X-$&` would paste the matched secret straight
+    // back into the marker.
+    out = out.replace(new RegExp(escaped, "g"), () => `***${k}***`);
   }
   // Catch unresolved literals too (defense in depth).
   out = out.replace(/\$\{secret:([a-zA-Z0-9_.-]+)\}/g, "${secret:***}");
@@ -1219,6 +1233,39 @@ function withConfigPointer(
     stderrTail,
     cause,
     { summary, fix },
+  );
+}
+
+/**
+ * withConfigPointer for a failure NO edit to bundles.json fixes: the summary
+ * already names the command that does (`yaw-mcp sidecars install` for a git
+ * entry that is not built, `yaw-mcp update <ns>` for one with no pinned
+ * commit). Appending `Fix "<ns>" in <file>` there told the reader to go and
+ * edit an entry with nothing wrong in it, in the sentence they are most likely
+ * to act on. The remediation half stays, minus the edit: run the command, then
+ * activate again.
+ *
+ * Still carries a configPointer (with `fix: null`) so a shell caller gets its
+ * own ending from shellActivationMessage instead of "activate it again".
+ *
+ * Used ONLY for the git preflight. The other two callers the same objection
+ * was raised against keep the file pointer on purpose: a resolver failure (uv
+ * download, checksum, a wedged oam) is caught as one undifferentiated error
+ * and an edit can route around it (`runtime: "node"`, a different command),
+ * and a remote 401 is usually fixed by editing that entry's `headers`.
+ */
+function withoutConfigEdit(
+  summary: string,
+  category: ActivationFailureCategory,
+  stderrTail?: string,
+  cause?: unknown,
+): ActivationError {
+  return new ActivationError(
+    `${summary} -> then activate it again -- no client restart is needed.`,
+    category,
+    stderrTail,
+    cause,
+    { summary, fix: null },
   );
 }
 
@@ -1744,7 +1791,11 @@ export async function connectToUpstream(
         } else {
           log("warn", "node respawn also failed; not pinning this server to node (oam was likely not the cause)", {
             namespace: config.namespace,
-            category: err.category,
+            // Two attempts, two fields: the category of the oam-hosted boot
+            // that started this, and of the node respawn whose message is
+            // logged beside it (null when that one was not an ActivationError).
+            oamCategory: err.category,
+            nodeCategory: nodeErr instanceof ActivationError ? nodeErr.category : null,
             error: nodeErr instanceof Error ? nodeErr.message : String(nodeErr),
           });
         }
@@ -1790,7 +1841,9 @@ export async function connectToUpstream(
             "npx respawn also failed; not pinning this server to npx (the managed sidecar was likely not the cause)",
             {
               namespace: config.namespace,
-              category: err.category,
+              // Same split as the oam->node line above.
+              managedCategory: err.category,
+              npxCategory: npxErr instanceof ActivationError ? npxErr.category : null,
               error: npxErr instanceof Error ? npxErr.message : String(npxErr),
             },
           );
@@ -1802,13 +1855,59 @@ export async function connectToUpstream(
   }
 }
 
-// The internal-secret strip (INTERNAL_SECRET_ENV_KEYS and the two helpers
-// built on it) lives in internal-secret-env.ts now, so the self-upgrade spawns
-// in auto-upgrade.ts / upgrade-cmd.ts can share it without loading the MCP
-// SDK. Re-exported under the same names for upstream's tests, which still
-// reach them through here; every production consumer (server.ts, audit-cmd.ts
-// and the rest) imports internal-secret-env.ts directly.
-export { INTERNAL_SECRET_ENV_KEYS, scrubInternalSecretsFromProcessEnv, stripInternalSecretsFromEnv };
+/**
+ * The env a local child is spawned with: the broker's (already stripped of
+ * yaw-mcp's own secrets) with the server's `env` laid over it.
+ *
+ * Everywhere but Windows that is a plain spread. On WINDOWS env names are
+ * case-insensitive but a JS object's keys are not, so a spread can carry two
+ * spellings of one variable -- the broker's `Path` and a server's `PATH`, or
+ * the reverse -- and Node hands the child only ONE of them, chosen by key
+ * sort order, not by which object was spread last. The SDK makes it worse: its
+ * stdio transport spreads getDefaultEnvironment() UNDER the env it is given,
+ * and that adds UPPERCASE `PATH`, `APPDATA`, `TEMP`... read from process.env.
+ * Measured on Node 22 / win32: `{PATH:"broker", Path:"mine"}` reaches the
+ * child as "broker" in either insertion order, so a server env written
+ * `"Path"` (the Windows-native spelling) lost to the broker's value.
+ *
+ * So on win32 a server key that matches a broker key ignoring case REPLACES
+ * it: every broker spelling is dropped and the server's value is emitted under
+ * the UPPERCASE name. Uppercase because that is the one spelling that also
+ * overwrites the SDK's own default key by plain object spread (the SDK only
+ * adds a default for a variable the broker has, so a server key with no
+ * broker match cannot collide with one and keeps the spelling it was given).
+ * The child cannot tell the difference: its own lookups are case-insensitive.
+ *
+ * `platform` is a parameter for tests; production passes nothing.
+ */
+export function mergeChildEnv(
+  parentEnv: NodeJS.ProcessEnv,
+  serverEnv: Record<string, string>,
+  platform: NodeJS.Platform = process.platform,
+): Record<string, string> {
+  if (platform !== "win32") return { ...parentEnv, ...serverEnv } as Record<string, string>;
+  const out: Record<string, string | undefined> = { ...parentEnv };
+  const spellings = new Map<string, string[]>();
+  for (const key of Object.keys(out)) {
+    const upper = key.toUpperCase();
+    const list = spellings.get(upper);
+    if (list) list.push(key);
+    else spellings.set(upper, [key]);
+  }
+  for (const [key, value] of Object.entries(serverEnv)) {
+    const upper = key.toUpperCase();
+    const existing = spellings.get(upper);
+    if (existing === undefined) {
+      out[key] = value;
+      spellings.set(upper, [key]);
+      continue;
+    }
+    for (const spelling of existing) delete out[spelling];
+    out[upper] = value;
+    spellings.set(upper, [upper]);
+  }
+  return out as Record<string, string>;
+}
 
 async function connectToUpstreamOnce(
   config: UpstreamServerConfig,
@@ -1891,10 +1990,19 @@ async function connectToUpstreamOnce(
     // Ahead of the command check: a git entry with no pinned commit has no
     // derived command, and "command is required" would name the wrong fix.
     const notBuilt = await gitBuildMissing(config, undefined, await gitRepoConsented(config));
-    if (notBuilt !== null) throw withConfigPointer(notBuilt, config, "install_failure");
+    if (notBuilt !== null) throw withoutConfigEdit(notBuilt, "install_failure");
     if (config.git?.commit) await recordActivatedGitPin(config.namespace, config.git.commit);
     if (!config.command) {
-      throw new Error("command is required for local servers");
+      // Reachable: the bundles.json loader deliberately does not enforce
+      // `command` and leaves the refusal to this function. An ActivationError
+      // with the config pointer, like every other permanent config error on
+      // this path (the invalid url below), so the reader is told which entry
+      // to edit rather than handed a bare, uncategorized Error.
+      throw withConfigPointer(
+        `Server "${config.namespace}" has no "command": command is required for local servers`,
+        config,
+        "unknown",
+      );
     }
 
     // Strip yaw-mcp-internal secrets from the child env — see
@@ -1967,7 +2075,21 @@ async function connectToUpstreamOnce(
     // activation handler adds nothing on the raw-Error branch).
     let resolved: { command: string; args: string[] };
     try {
-      resolved = await resolveUvSpawn(config.command, config.args ?? []);
+      // Both resolvers run BEFORE the connect deadline is armed (see the note
+      // at the timer below), so nothing bounds them by MCP_CONNECT_TIMEOUT: a
+      // first `uvx` activation on a cold cache downloads uv (bounded only by
+      // uv-bootstrap's own fetch and extract limits, minutes on a slow link)
+      // and the oam probe can take two of its own timeouts. Each is wrapped
+      // in the same heartbeat the handshake uses, so a long one says what it
+      // is waiting on instead of holding the call silent. A fast resolve --
+      // the usual case, everything cached -- emits nothing.
+      const args = config.args ?? [];
+      resolved = await withHeartbeat(
+        progress,
+        (elapsed) =>
+          `"${config.namespace}" is still resolving its launch command -- ${elapsed}s so far (a first uv/uvx run downloads uv)`,
+        () => resolveUvSpawn(config.command as string, args),
+      );
       // Host on the oam runtime when this server opted in (config.runtime ===
       // "oam") or the config-level default says so (YAW_MCP_DEFAULT_RUNTIME /
       // bundles.json `defaultRuntime`) -- per-server "node" stays an escape
@@ -2000,7 +2122,12 @@ async function connectToUpstreamOnce(
         // Awaited since issue #91: the oam probe is async so a wedged oam binary
         // cannot block the event loop here. The probe result is cached, so only
         // the first connect of the process actually waits on it.
-        const rewritten = await resolveOamSpawn(resolved.command, resolved.args, optedIn);
+        const beforeOam = resolved;
+        const rewritten = await withHeartbeat(
+          progress,
+          (elapsed) => `"${config.namespace}" is still waiting on the oam runtime probe -- ${elapsed}s so far`,
+          () => resolveOamSpawn(beforeOam.command, beforeOam.args, optedIn),
+        );
         if (rewritten.command !== resolved.command) {
           attempt.oamRewriteApplied = true;
           attempt.oamVersion = (await probeOam()).version;
@@ -2041,7 +2168,8 @@ async function connectToUpstreamOnce(
     }
     spawnedCommand = resolved.command;
 
-    // serverEnv wins over parentEnv, PATH included, and a bare command is
+    // serverEnv wins over parentEnv, PATH included -- on Windows whatever case
+    // either side spelled the name in (mergeChildEnv) -- and a bare command is
     // looked up on the CHILD's PATH. For the user's own command that is the
     // point of setting PATH on a server. For a bare `uv` / `oam` a rewrite
     // above produced it is a gap: both were probed against the broker's PATH
@@ -2051,7 +2179,7 @@ async function connectToUpstreamOnce(
     const stdioTransport = new StdioClientTransport({
       command: resolved.command,
       args: resolved.args,
-      env: { ...parentEnv, ...serverEnv } as Record<string, string>,
+      env: mergeChildEnv(parentEnv, serverEnv),
       stderr: "pipe",
       ...(config.cwd !== undefined ? { cwd: config.cwd } : {}),
     });
@@ -2079,7 +2207,12 @@ async function connectToUpstreamOnce(
     transport = stdioTransport;
   } else {
     if (!config.url) {
-      throw new Error("url is required for remote servers");
+      // Same reasoning as the missing `command` on the local branch.
+      throw withConfigPointer(
+        `Server "${config.namespace}" has no "url": url is required for remote servers`,
+        config,
+        "unknown",
+      );
     }
 
     // Remote entries never spawn a child, so there is no process env to fill
@@ -2247,8 +2380,13 @@ async function connectToUpstreamOnce(
   //   - the machine was saturated over the wait (SATURATED_CPU_BUSY), the
   //     one condition under which "slow" is the likelier reading than "hung"
   //     -- or the runtime reports no CPU load at all (see onDeadline);
-  //   - the deadline is the DEFAULT one. A per-server connectTimeoutMs is an
-  //     operator's deliberate number and is honoured exactly.
+  //   - the server has no connectTimeoutMs of its own. A per-server
+  //     connectTimeoutMs is honoured exactly. "Default" here means the
+  //     process-wide fallback, which INCLUDES an operator-set
+  //     MCP_CONNECT_TIMEOUT: that value is extended once like the built-in
+  //     15s, so MCP_CONNECT_TIMEOUT=60000 can wait 120s. README documents it
+  //     that way ("at most twice the value in all"); an operator who needs an
+  //     exact ceiling sets connectTimeoutMs on the server.
   // The hard ceiling is therefore 2x the deadline, and on an idle box that
   // reports its load a hung child still fails at exactly connectTimeoutMs. The deadline is
   // armed here, just before connect() spawns the child -- after the vault,
@@ -2941,10 +3079,15 @@ export async function fetchToolsFromUpstream(
     });
   }
 
-  if (raw.length > MAX_TOOLS_PER_SERVER) {
+  // Measured on `all`, not on the filtered `raw`: fetchAllPages stops following
+  // cursors as soon as MORE than the cap has arrived, so `all` over the cap is
+  // the only evidence the inventory was cut short. Withheld task-required tools
+  // can bring `raw` back to or under the cap, and the truncation then went
+  // unreported although pages were left unfetched.
+  if (all.length > MAX_TOOLS_PER_SERVER) {
     log("warn", "Upstream returned more tools than cap; truncating", {
       namespace,
-      reported: raw.length,
+      reported: all.length,
       cap: MAX_TOOLS_PER_SERVER,
     });
   }

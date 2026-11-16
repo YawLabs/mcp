@@ -185,6 +185,37 @@ describe("runSecrets set -- servers that reference the name", () => {
     expect(err).toContain("OLD value");
   });
 
+  it("counts a git entry's tokenSecret as a reference", async () => {
+    // A git server names its vault secret as a bare NAME in git.tokenSecret,
+    // not as a ${secret:...} ref in env. A replace of that token used to
+    // report "no server references it" and referenced_by: [].
+    await seed("GIT_TOKEN");
+    writeBundles({
+      version: 1,
+      servers: [
+        {
+          namespace: "privrepo",
+          name: "Private repo",
+          git: {
+            url: "https://example.test/acme/server.git",
+            commit: "0123456789abcdef0123456789abcdef01234567",
+            entry: "dist/index.js",
+            tokenSecret: "GIT_TOKEN",
+          },
+        },
+        { namespace: "github", name: "GH", command: "npx", args: ["y"], env: { GH: "${secret:GH}" } },
+      ],
+    });
+    expect(await set("GIT_TOKEN", true)).toBe(0);
+    expect(JSON.parse(outText())).toMatchObject({ referenced_by: ["privrepo"] });
+    io.out.mockReset();
+    io.err.mockReset();
+    lock();
+    expect(await set("GIT_TOKEN")).toBe(0);
+    expect(errText()).toContain("${secret:GIT_TOKEN} is referenced by: privrepo");
+    expect(errText()).not.toContain("no server in");
+  });
+
   it("a replace with no bundles.json at all still says nothing references it", async () => {
     await seed();
     expect(await set("LS", true)).toBe(0);
@@ -259,8 +290,11 @@ describe("runSecrets set -- servers that reference the name", () => {
       spy.mockRestore();
     }
     const stderr = written.join("");
-    // The loader DID warn (so the scan below covers a real line), with a position.
-    expect(stderr).toContain("at line 1, column");
+    // The loader DID warn (so the scan below covers a real line), with a
+    // position -- through io.err now (loadLocalBundles' onWarning), no longer
+    // as a logger line on process.stderr.
+    expect(errText()).toContain("at line 1, column");
+    expect(stderr).not.toContain("bundles.json");
     const everything = `${stderr}\n${errText()}\n${outText()}`;
     for (let i = 0; i + 4 <= token.length; i++) {
       expect(everything).not.toContain(token.slice(i, i + 4));
@@ -330,16 +364,21 @@ describe("runSecrets set -- servers that reference the name", () => {
     expect(err).not.toContain("no server in");
     expect(err).not.toContain("yaw-mcp set <server>");
 
-    // Existing vault, a new name: silent.
+    // Existing vault, a new name: no consumers notice -- only the loader's
+    // own warning about the file, which used to go to process.stderr through
+    // the logger and now arrives on io.err.
     io.out.mockReset();
     io.err.mockReset();
     lock();
     expect(await set("OTHER")).toBe(0);
     expect(outText()).toBe('Stored secret "OTHER".\n');
     err = errText();
-    expect(err).toBe("");
+    expect(err).toBe(
+      `yaw-mcp secrets: warning -- bundles.json is not valid JSON; ignoring (${bundlesPath()}; at line 1, column 3).\n`,
+    );
 
     io.out.mockReset();
+    io.err.mockReset();
     lock();
     expect(await set("THIRD", true)).toBe(0);
     expect(JSON.parse(outText())).toMatchObject({
@@ -347,6 +386,34 @@ describe("runSecrets set -- servers that reference the name", () => {
       referenced_by: null,
       bundles_path: null,
       running_servers_stale: null,
+    });
+  });
+
+  // SECRETS_USAGE promises one JSON object per line on stderr under --json.
+  // The loader's warn line for a broken bundles.json was prose from logger.ts,
+  // written straight to process.stderr: off the io sink and off the contract.
+  it("--json: a broken bundles.json is a JSON warning line on io.err, and nothing reaches process.stderr", async () => {
+    await seed();
+    writeBundles("{ not json");
+    const written: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => {
+      written.push(String(chunk));
+      return true;
+    });
+    try {
+      expect(await set("LS", true)).toBe(0);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(written.join("")).toBe("");
+    const lines = errText().split("\n").filter(Boolean);
+    expect(lines.length).toBeGreaterThan(0);
+    const parsed = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+    expect(parsed).toContainEqual({
+      warning: "bundles-load",
+      message: "bundles.json is not valid JSON; ignoring",
+      path: bundlesPath(),
+      location: "at line 1, column 3",
     });
   });
 });

@@ -51,6 +51,22 @@ const TAB = "\x09"; // HT -- kept only at the secret-value prompt (keepTab)
 const DEL = "\x7f"; // what most terminals send for Backspace
 const ESC = "\x1b"; // opens a key sequence (arrow, Alt chord) -- never input
 
+/**
+ * Everything a terminal may act on rather than print, as a regex character
+ * class: C0 (incl. ESC, BEL, BS, CR), DEL, the C1 block (0x9b is CSI in its
+ * 8-bit form), the zero-width and line/paragraph separators, and the bidi
+ * overrides / isolates, which can visually reorder text without changing a
+ * byte of it.
+ *
+ * Declared here, in the leaf, and imported by trust-cmd.ts for its review
+ * rendering: the reader's echo path below and the review are the two places
+ * these commands write untrusted text to a terminal, and they must agree on
+ * what counts as a control.
+ */
+export const DISPLAY_CONTROL_SOURCE =
+  "[\\u0000-\\u001f\\u007f-\\u009f\\u200b-\\u200f\\u2028\\u2029\\u202a-\\u202e\\u2066-\\u2069]";
+const DISPLAY_CONTROL_RE = new RegExp(DISPLAY_CONTROL_SOURCE);
+
 /** Raw-mode line reader for the controlling TTY. Shared by the passphrase
  *  prompts (echo OFF -- the default), the destructive-action confirmation
  *  (echo ON, so the user can see the y/n they typed), and -- via
@@ -234,10 +250,12 @@ function readLine(
           }
           continue;
         }
-        // Drop every remaining control byte instead of buffering + echoing
+        // Drop every remaining C0 control byte instead of buffering + echoing
         // it. On the echo path (the y/n confirmation) a raw control byte
         // written back is EXECUTED by the terminal rather than displayed.
         // Everything else meaningful (\n \r ^C ^D \b ESC) is handled above.
+        // The echo reads go further, just below: C0 is not the whole set a
+        // terminal acts on.
         // The one byte kept is a Tab at the secret-VALUE prompt (keepTab): a
         // pasted token can carry one, and dropping it stored a different
         // secret behind a green "Stored secret", with nothing on the no-echo
@@ -246,6 +264,15 @@ function readLine(
         // Tab there is keyed under the Tab-less string, and keeping the byte
         // now would stop the same keystrokes opening that vault.
         if (ch < " " && !(keepTab && ch === TAB)) continue;
+        // An ECHO read also drops the rest of the display-control class: the
+        // C1 block (U+009B is an 8-bit CSI, so a pasted one opens a sequence
+        // the terminal runs when it is written back) and the zero-width and
+        // bidi controls, which make the echoed answer read as something other
+        // than what was buffered. Echo reads only: a no-echo read writes
+        // nothing back, and a passphrase or secret value is kept exactly as
+        // typed beyond the C0 drop above -- stripping more there would stop
+        // the same keystrokes opening a vault keyed under them.
+        if (echo && DISPLAY_CONTROL_RE.test(ch)) continue;
         chunks.push(ch);
         if (echoBack) stdout.write(ch);
       }

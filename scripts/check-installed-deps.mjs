@@ -24,9 +24,10 @@
  * Exit 0 when the tree matches, 1 with one line per drifted package (the
  * first MAX_LISTED, then a count), 2 when package-lock.json cannot be read.
  */
-import { readFileSync, realpathSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isMainModule } from "./is-main-module.mjs";
 
 export const MAX_LISTED = 10;
 
@@ -66,17 +67,9 @@ export function formatDrift(drift, max = MAX_LISTED) {
   return lines.join("\n");
 }
 
-export function isMainModule(argv1, moduleUrl) {
-  if (!argv1) return false;
-  const real = (p) => {
-    try {
-      return realpathSync(p);
-    } catch {
-      return p;
-    }
-  };
-  return real(argv1) === real(fileURLToPath(moduleUrl));
-}
+// The one implementation, shared with the verify scripts; re-exported because
+// check-installed-deps.d.mts has always declared it here.
+export { isMainModule };
 
 if (isMainModule(process.argv[1], import.meta.url)) {
   const root = process.argv[2] ?? join(dirname(fileURLToPath(import.meta.url)), "..");

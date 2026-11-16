@@ -67,20 +67,22 @@ describe("formatUsageHint", () => {
     expect(formatUsageHint(usage(0, 4), [])).toBeNull();
   });
 
-  it("renders a success count", () => {
+  it("renders the call count", () => {
     expect(formatUsageHint(usage(4), [])).toBe("usage: used 4x");
   });
 
-  it("rounds a graded-reward sum instead of printing float noise", () => {
+  it("prints the call count, never the float success credit", () => {
     // `succeeded` is a SUM of graded rewards in [0,1] (learning.ts), not an
     // integer count, so IEEE-754 accumulation lands on values like
-    // 3.3000000000000003 -- which rendered verbatim before the Math.round.
-    expect(formatUsageHint(usage(3.3000000000000003, 4), [])).toBe("usage: used 3x");
+    // 3.3000000000000003 -- which once rendered verbatim, and then rendered
+    // rounded ("used 3x") as if it were the number of calls. `dispatched` is.
+    expect(formatUsageHint(usage(3.3000000000000003, 4), [])).toBe("usage: used 4x");
   });
 
-  it("suppresses the count on a sub-1 reward sum rather than rounding it up to 1x", () => {
-    // The MIN_SUCCESS_TO_SHOW floor is checked against the RAW sum: rounding
-    // first would turn 0.6 of one graded success into a confident "used 1x".
+  it("suppresses the line on a sub-1 reward sum even though a call was made", () => {
+    // The MIN_SUCCESS_TO_SHOW floor is checked against the RAW success sum,
+    // not the call count: 0.6 of one graded success must not become a
+    // confident "used 1x".
     expect(formatUsageHint(usage(0.6, 1), [])).toBeNull();
   });
 

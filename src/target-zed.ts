@@ -35,7 +35,7 @@ import { defineTarget, type PathBase, type ResolvedPath } from "./install-target
  *
  *  Not modelled, and named in `notes`: the Flatpak build, which reads
  *  `$FLATPAK_XDG_CONFIG_HOME/zed` instead, and `zed --user-data-dir <dir>`. */
-function zedConfigDir(base: PathBase): { dir: string; display: string } | null {
+function zedConfigDir(base: PathBase): { dir: string; display: string } {
   if (base.os === "windows") {
     return { dir: join(base.appData, "Zed"), display: "%APPDATA%\\Zed" };
   }
@@ -47,23 +47,20 @@ function zedConfigDir(base: PathBase): { dir: string; display: string } | null {
 }
 
 function resolveZedPath(base: PathBase): ResolvedPath {
+  const sep = base.os === "windows" ? "\\" : "/";
   if (base.scope === "project") {
-    const sep = base.os === "windows" ? "\\" : "/";
     return {
       absolute: join(base.projectDir, ".zed", "settings.json"),
       display: ["<project folder>", ".zed", "settings.json"].join(sep),
       containerPath: ["context_servers"],
     };
   }
+  // zedConfigDir is total (its return type has no null), so a future OS branch
+  // that forgets to return is a compile error rather than a runtime guard here.
   const cfg = zedConfigDir(base);
-  // Unreachable: zedConfigDir returns a directory on every OS. Kept as a
-  // total-function guard rather than a non-null assertion, so a future OS
-  // branch that forgets to return cannot resolve to `undefined/settings.json`.
-  if (!cfg) throw new Error(`Zed's settings.json location on ${base.os} is unknown`);
-  const sep = base.os === "windows" ? "\\" : "/";
   return {
     absolute: join(cfg.dir, "settings.json"),
-    display: [cfg.display, "settings.json"].join(base.os === "windows" ? sep : "/"),
+    display: [cfg.display, "settings.json"].join(sep),
     containerPath: ["context_servers"],
   };
 }

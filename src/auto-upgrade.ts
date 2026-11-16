@@ -505,9 +505,22 @@ export function acquireUpgradeLock(
         // whether the owner still lives) AND load-bearing: the release below
         // reads it back before unlinking.
         writeSync(fd, `${mine}\n`);
-      } finally {
-        closeSync(fd);
+      } catch (err) {
+        // The create succeeded and the write did not (ENOSPC, EIO). The outer
+        // catch answers this like a lock that could not be created -- proceed
+        // unlocked -- so the empty file must not stay behind: nobody would
+        // ever release it, it reads as a live holder (lockHolderAlive honours
+        // an unparseable pid), and it would block every other process for the
+        // whole stale window over a lock no one holds.
+        try {
+          closeSync(fd);
+        } catch {}
+        try {
+          unlinkSync(lockPath);
+        } catch {}
+        throw err;
       }
+      closeSync(fd);
       // Idempotent AND ownership-checked, for two different failure modes.
       // Idempotent because both of defaultSpawn's handlers fire for an ENOENT
       // spawn. Ownership-checked because the `released` flag can only see THIS
@@ -1015,6 +1028,27 @@ export async function maybeAutoUpgrade(deps: AutoUpgradeDeps = {}): Promise<void
   // bundled-Node Yaw Terminal ships), in which case installing into
   // npm's reported prefix is a no-op for the running copy.
   const rawPrefix = method === "global-npm" ? detectRunningInstallPrefix(argvPath) : null;
+  // A global-npm verdict with NO prefix: the path that classified sits in a
+  // global node_modules, and the file it resolves to sits in no node_modules
+  // at all, or does not resolve (detectRunningInstallPrefix answers null for a
+  // realpath that throws too). The first is an `npm link`ed checkout reached
+  // through the global shim -- a literal global-npm path is never
+  // re-classified, so the realpath second chance above does not catch it. The
+  // second can be a genuine global install, which is why the log line below
+  // names both causes rather than diagnosing a link.
+  // Without a prefix the spawn below would be a bare `npm install -g`, into
+  // whatever prefix npm is configured with: for the linked checkout that
+  // REPLACES the link with the registry package, and for anything else it is
+  // not provably the tree this copy runs from. Nobody is asked before that
+  // spawn, so do not make it.
+  if (method === "global-npm" && rawPrefix === null) {
+    log(
+      "info",
+      "yaw-mcp is out of date; not upgrading in the background: the running copy could not be traced to a file inside a node_modules tree, so there is no install prefix to upgrade in place. Either it is a linked checkout (`npm link`), which a global install would replace rather than update, or its path could not be resolved. For a linked checkout, update the checkout it links to; otherwise run `npm install -g @yawlabs/mcp@latest` to install the published package.",
+      { current, latest, method },
+    );
+    return;
+  }
   // The `npm` and `bin` path markers classify on a directory NAME alone, so a
   // project directory called `npm` or `bin` that holds
   // node_modules/@yawlabs/mcp reads as a global install and rawPrefix is that
@@ -1062,8 +1096,9 @@ export async function maybeAutoUpgrade(deps: AutoUpgradeDeps = {}): Promise<void
     // only when they would actually collide. pnpm/bun have no detected prefix
     // (that walk is global-npm only), so they fall back to the temp dir -- and
     // there the NAME has to carry the scope the directory no longer does. With
-    // one fixed name, pnpm, bun and a prefix-less global npm all contended on a
-    // single `${tmpdir()}/.yaw-mcp-upgrade.lock`, and on a shared POSIX box
+    // one fixed name, pnpm, bun and a prefix-less global npm (which no longer
+    // reaches this spawn at all -- see the rawPrefix check above) all contended
+    // on a single `${tmpdir()}/.yaw-mcp-upgrade.lock`, and on a shared POSIX box
     // another user's lock could be neither taken nor stolen. Tool + uid in the
     // filename restores "one lock per tool family per user".
     //

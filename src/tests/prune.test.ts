@@ -258,19 +258,21 @@ describe("pruneContent", () => {
     expect(parsed[2]).toEqual({ keep: "another" });
   });
 
-  it("replaces fully-pruned NON-object array elements with null (fix 6)", () => {
-    // Non-object elements (null, empty array) that prune away still become
-    // null placeholders so indices stay stable. The first element carries
-    // droppable fields so the overall result still clears the min-savings
-    // gate (null is wider than [], so without real savings elsewhere the
-    // pruner would keep the original unchanged).
-    const raw = JSON.stringify([{ keep: "value", a: null, b: null, c: null }, null, []]);
+  it("keeps a null element null and an empty ARRAY element [], so indices and types both hold", () => {
+    // A null element stays a null placeholder so indices stay stable. An
+    // empty array element stays `[]`: turning it into null changed the
+    // element's type, and a rows-as-arrays result (`[[1,2],[]]`) reached the
+    // model with a null row the server never sent. The first element carries
+    // droppable fields so the overall result clears the min-savings gate.
+    const raw = JSON.stringify([{ keep: "value", a: null, b: null, c: null }, null, [], [[]], [1, 2]]);
     const r = pruneContent([{ type: "text", text: raw }]);
     const parsed = JSON.parse(r.content[0].text);
-    expect(parsed).toHaveLength(3);
+    expect(parsed).toHaveLength(5);
     expect(parsed[0]).toEqual({ keep: "value" });
     expect(parsed[1]).toBeNull();
-    expect(parsed[2]).toBeNull();
+    expect(parsed[2]).toEqual([]);
+    expect(parsed[3]).toEqual([[]]);
+    expect(parsed[4]).toEqual([1, 2]);
   });
 
   it("still returns undefined for a zero-length array (empty array = no info, fix 4)", () => {

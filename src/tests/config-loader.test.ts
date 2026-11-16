@@ -100,14 +100,17 @@ describe("loadYawMcpConfig — deprecated token / apiBase keys", () => {
 
     const w = r.warnings.find((x) => x.includes("'token'"));
     expect(w).toBeDefined();
-    // Says what changed, where to fix it, and to revoke the PAT.
+    // Says what changed, where to fix it, and that the token is inert: the
+    // service that issued it is retired, so there is no revoke step to send
+    // the user looking for.
     expect(w).toMatch(/no longer used/);
     expect(w).toMatch(/local-only/);
     expect(w).toContain(join(synthHome, CONFIG_DIRNAME, CONFIG_FILENAME));
-    expect(w).toMatch(/[Rr]evoke that PAT/);
+    expect(w).toMatch(/nowhere left to revoke that PAT: the hosted service that issued it is retired/);
+    expect(w).not.toMatch(/at its source/);
   });
 
-  it("warns for apiBase, without the PAT-revocation clause", async () => {
+  it("warns for apiBase, without the PAT clause", async () => {
     writeConfig(synthHome, CONFIG_FILENAME, { apiBase: "https://corp.example" });
     const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
     const w = r.warnings.find((x) => x.includes("'apiBase'"));
@@ -121,7 +124,7 @@ describe("loadYawMcpConfig — deprecated token / apiBase keys", () => {
     const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
     expect(r.warnings).toHaveLength(1);
     expect(r.warnings[0]).toContain("'token' and 'apiBase'");
-    expect(r.warnings[0]).toMatch(/[Rr]evoke that PAT/);
+    expect(r.warnings[0]).toMatch(/nowhere left to revoke that PAT/);
   });
 
   it("warns per file, so every scope holding a stale key gets named", async () => {

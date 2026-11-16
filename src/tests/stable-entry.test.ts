@@ -62,6 +62,67 @@ describe("stableSpellingOf", () => {
     );
   });
 
+  describe("an argv[1] that names the same file through a per-session directory", () => {
+    // fnm puts a fresh `fnm_multishells/<pid>_<ts>` link on PATH for every
+    // shell, so a globally installed yaw-mcp is launched as
+    // `<that dir>/bin/yaw-mcp` -- the same file, by realpath, as the durable
+    // `node-versions/...` path, and gone when the shell's directory is
+    // cleaned. Identity alone accepted it and it was persisted into a
+    // machine-global client config.
+    const DURABLE = "/home/u/.local/share/fnm/node-versions/v22.1.0/installation/lib/node_modules/@yawlabs/mcp";
+    const ENTRY = `${DURABLE}/dist/index.js`;
+    const CASES: Array<[string, string, string]> = [
+      [
+        "fnm on Linux, under $XDG_RUNTIME_DIR",
+        "/run/user/1000/fnm_multishells/4242_1700000000000/bin/yaw-mcp",
+        "/run/user/1000/fnm_multishells/4242_1700000000000",
+      ],
+      [
+        "fnm on macOS, under its state dir",
+        "/Users/u/.local/state/fnm_multishells/4242_1700000000000/bin/yaw-mcp",
+        "/Users/u/.local/state/fnm_multishells/4242_1700000000000",
+      ],
+      [
+        "fnm on Windows, a junction under %LOCALAPPDATA%",
+        "C:\\Users\\u\\AppData\\Local\\fnm_multishells\\4242_1700000000000\\node_modules\\@yawlabs\\mcp\\dist\\index.js",
+        "C:\\Users\\u\\AppData\\Local\\fnm_multishells\\4242_1700000000000",
+      ],
+      ["any link under /run/user/<uid>", "/run/user/1000/some-tool/bin/yaw-mcp", "/run/user/1000/some-tool"],
+      ["an AppImage mount", "/tmp/.mount_Yaw8xKq1/bin/yaw-mcp", "/tmp/.mount_Yaw8xKq1"],
+    ];
+    for (const [name, argv1, sessionDir] of CASES) {
+      // A drive-letter argv[1] is absolute only under win32 path rules. On a
+      // POSIX host stableSpellingOf resolves it against the cwd, the stub
+      // realpath below no longer maps it to ENTRY, and the case would pass
+      // with or without the session-directory refusal -- so it runs only
+      // where it can fail.
+      const run = /^[A-Za-z]:\\/.test(argv1) ? it.runIf(process.platform === "win32") : it;
+      run(`keeps the durable entry: ${name}`, () => {
+        const deps: StableSpellingDeps = {
+          argv1,
+          // Everything under the session dir resolves to the one real file.
+          realpath: (p: string): string => (p.startsWith(sessionDir) ? ENTRY : p),
+          readdir: () => [],
+          isSymlink: () => false,
+        };
+        expect(stableSpellingOf(ENTRY, deps)).toBe(ENTRY);
+      });
+    }
+
+    it("still takes an argv[1] that is merely NEAR such a name", () => {
+      // The refusal is for the session directories themselves, not for any
+      // path that happens to contain the letters.
+      const argv1 = "/opt/fnm_multishells_backup/current/dist/index.js";
+      const deps: StableSpellingDeps = {
+        argv1,
+        realpath: (p: string): string => (p === argv1 ? ENTRY : p),
+        readdir: () => [],
+        isSymlink: () => false,
+      };
+      expect(stableSpellingOf(ENTRY, deps)).toBe(argv1);
+    });
+  });
+
   it("finds a sibling link pointing at an ancestor when argv[1] is useless", () => {
     const deps = fakeDeps({ argv1: undefined });
     expect(stableSpellingOf("C:\\app\\1.0.0\\node_modules\\@y\\m\\dist\\index.js", deps)).toBe(

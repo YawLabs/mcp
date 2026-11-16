@@ -42,8 +42,8 @@ export interface RankedResult {
 }
 
 // Default BM25 constants. k1 controls term-frequency saturation; b controls
-// length normalization. 1.2 / 0.75 are the canonical defaults — tuning them
-// for our corpus would be premature given we have no usage data yet.
+// length normalization. 1.2 / 0.75 are the canonical defaults, and nothing
+// here has measured a better pair for this corpus.
 const K1 = 1.2;
 const B = 0.75;
 
@@ -59,9 +59,12 @@ const FIELD_WEIGHTS = {
   toolDescription: 1.0,
 } as const;
 
-// Drop tokens shorter than 3 chars — kills most noise words (a, an, of,
-// the, to, is) without needing a stopword list. This is the PROSE floor:
-// it applies to descriptions, where noise words actually live.
+// Drop tokens shorter than 3 chars. That removes the 1-2 character noise
+// words (a, an, of, to, is) and nothing longer: "the", "what" and "with" are
+// 3+ characters and pass. Those are handled by word list instead: the rankers
+// strip QUERY_FUNCTION_WORDS from a query, and SUB_FLOOR_STOPWORDS covers the
+// 1-2 character words that tokenizeQuery's lower floor would otherwise admit.
+// This is the PROSE floor: it applies to descriptions, where noise words live.
 const MIN_TOKEN_LEN = 3;
 
 // Identifier fields (namespace, server name, tool name) use a length-1
@@ -204,8 +207,15 @@ export function tokenizeQuery(text: string | undefined): string[] {
  *  harmful are deliberately absent: http -> fetch (every URL in a prompt
  *  carries "http", so "with playwright, open http://localhost:5173 and take a
  *  screenshot" went to a fetch server) and folder -> directory (it sent "my
- *  cloud folder" to a local filesystem server instead of the cloud drive). */
-const ABBREVIATIONS: Readonly<Record<string, readonly string[]>> = {
+ *  cloud folder" to a local filesystem server instead of the cloud drive).
+ *
+ *  NULL-PROTOTYPE on purpose: every lookup below indexes this with a token
+ *  taken from a query or from a tool's name / description, and splitTokens
+ *  lowercases, so the word "constructor" arrives intact. On an ordinary object
+ *  literal that resolved to Object.prototype.constructor -- truthy, not
+ *  iterable -- and the expansion loop threw, taking down every rankServers /
+ *  rankTools / queryCoverage call over a corpus (or query) containing it. */
+const ABBREVIATIONS: Readonly<Record<string, readonly string[]>> = Object.assign(Object.create(null), {
   pr: ["pull", "request"],
   prs: ["pull", "request"],
   k8s: ["kubernetes"],
@@ -249,7 +259,7 @@ const ABBREVIATIONS: Readonly<Record<string, readonly string[]>> = {
   js: ["javascript"],
   ts: ["typescript"],
   py: ["python"],
-};
+});
 
 /** Words the plural / suffix fold below would mangle into a different word
  *  ("news" -> "new", "series" -> "sery"), plus singulars ending in -as whose

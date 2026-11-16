@@ -1497,6 +1497,31 @@ describe("rollback guards, host rebuild, state and lock edges", () => {
     expect(text).not.toContain("Nothing was changed");
   }, 180_000);
 
+  it("a failed --to rebuild for a project file words its remedy for that file (--project)", async () => {
+    // The ordinary update path tells the builder the pin file is a project
+    // file; the --to rebuild did not, so its remedy was the user-file one and
+    // the command it printed re-added the server to the wrong bundles.json.
+    // The initial commit has no package.json, which is the builder failure
+    // whose remedy names the file.
+    const repo = makeRepo({ "README.md": "no package here\n" });
+    const foreign = git(repo.work, ["rev-parse", "HEAD"]);
+    const first = repo.commit(NPM_FILES);
+    await recordRepoConsent(repo.url, home);
+    fakeFinishedBuild(gitBuildDir("fx", foreign, home), foreign, {
+      marker: { url: repo.url, platform: process.platform === "win32" ? "linux" : "win32" },
+    });
+    const { cwd, path } = projectFile("proj");
+    writeFileSync(path, bundlesText(repo.url, first));
+    await grantTrust(path, readFileSync(path), { home });
+
+    const r = await update(["fx", "--to", foreign.slice(0, 7), "--project"], { cwd });
+    expect(r.exitCode).toBe(1);
+    expect(pinned(path).commit).toBe(first);
+    const text = err.join("");
+    expect(text).toContain("the repo root has no package.json");
+    expect(text).toMatch(/Re-add it with the subdir: yaw-mcp add fx --git \S+ --subdir <path> --project/);
+  }, 120_000);
+
   /** ENV with a PATH that holds no git: every PATH spelling dropped (Windows
    *  carries `Path`), then one empty directory. */
   function envWithoutGit(): NodeJS.ProcessEnv {

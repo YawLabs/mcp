@@ -52,7 +52,14 @@
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { JSON_ADAPTER, JSONC_ADAPTER } from "./client-config-json.js";
-import { canonicalJson, isRecord, normalizeEntry, positionAt, stringMap } from "./client-config-values.js";
+import {
+  canonicalJson,
+  describeValueShape,
+  isRecord,
+  normalizeEntry,
+  positionAt,
+  stringMap,
+} from "./client-config-values.js";
 import {
   ENTRY_NAME,
   type InstallOS,
@@ -112,6 +119,26 @@ export function syntaxNameFor(format: ConfigFormat): SyntaxName {
  *  article too, so a template cannot double a word. */
 export function containerNounFor(syntax: SyntaxName): string {
   return syntax === "TOML" ? "a TOML table" : "a JSON object";
+}
+
+/** A value the USER's file holds for a top-level key, for the one note,
+ *  warning, refusal or doctor line that names it. A scalar is spelled;
+ *  anything else is named by its shape, never echoed (it is the user's, and
+ *  it can be any size). One function for install-cmd.ts and doctor-cmd.ts,
+ *  which used to hold a hand-twinned copy each. */
+export function spellRootValue(value: unknown, syntax: SyntaxName): string {
+  if (typeof value === "string") return JSON.stringify(value);
+  if (typeof value === "number" || typeof value === "bigint" || typeof value === "boolean") return String(value);
+  if (value instanceof Date) return value.toISOString();
+  return Array.isArray(value) ? describeValueShape(value) : containerNounFor(syntax);
+}
+
+/** Where a top-level line goes when the user adds it by hand. In TOML a
+ *  `key = value` line after a `[table]` header is a key OF that table, so
+ *  "at the top level" is not enough of an instruction there -- the end of the
+ *  file is usually inside the last table. Shared by install and doctor. */
+export function rootLinePlacement(syntax: SyntaxName): string {
+  return syntax === "TOML" ? "above the first table in the file" : "at the top level of the file";
 }
 
 /** Where a client keeps its server map, as data.
@@ -877,6 +904,38 @@ export function findLegacyKey(keys: readonly string[]): string | null {
   return LEGACY_ENTRY_NAMES.find((name) => keys.includes(name)) ?? null;
 }
 
+/** The npm spec of this package as an argv token: bare, or with a version or
+ *  dist-tag. Anchored at both ends, so `@yawlabs/mcp-compliance` and every
+ *  other `@yawlabs/mcp-*` package is a different token. */
+const BROKER_PACKAGE_SPEC = /^@yawlabs\/mcp(?:@[^/\s]*)?$/;
+/** This package's entry file inside a node_modules tree, as a launcher is
+ *  handed it (`node <path>`, or the oam-hosted entry install writes). */
+const BROKER_ENTRY_FILE = /[\\/]@yawlabs[\\/]mcp[\\/]dist[\\/]index\.js$/;
+/** The `yaw-mcp` bin, bare or as a path, with the shim extensions Windows
+ *  adds. */
+const BROKER_BIN = /(?:^|[\\/])yaw-mcp(?:\.cmd|\.exe|\.ps1)?$/i;
+const CMD_EXE = /(?:^|[\\/])cmd(?:\.exe)?$/i;
+
+/** Does this (normalised) entry LAUNCH yaw-mcp, whatever key it sits under?
+ *  A broker wired by hand under another name (`claude mcp add yaw -- npx -y
+ *  @yawlabs/mcp@latest`) is one.
+ *
+ *  Three shapes: the package spec anywhere in the argv (`npx -y
+ *  @yawlabs/mcp@latest`, and the `cmd /c npx ...` wrap of it), the package's
+ *  own entry file anywhere in the argv, and the `yaw-mcp` bin as the command
+ *  -- or as the program a `cmd /c` runs, which is argument 2 or later.
+ *
+ *  Two readers: `import` skips such an entry rather than import yaw-mcp as a
+ *  server of itself, and the view's `otherBrokerKeys` answers the wiring
+ *  question with it. */
+export function launchesBroker(entry: Record<string, unknown>): boolean {
+  const command = typeof entry.command === "string" ? entry.command : "";
+  const args = Array.isArray(entry.args) ? entry.args.filter((a): a is string => typeof a === "string") : [];
+  if ([command, ...args].some((t) => BROKER_PACKAGE_SPEC.test(t) || BROKER_ENTRY_FILE.test(t))) return true;
+  if (BROKER_BIN.test(command)) return true;
+  return CMD_EXE.test(command) && args.some((a) => BROKER_BIN.test(a));
+}
+
 // ---------------------------------------------------------------------------
 // The view every consumer reads
 // ---------------------------------------------------------------------------
@@ -918,6 +977,13 @@ export interface ClientConfigView {
   /** Other servers configured directly in this container: every key that is
    *  neither ours nor legacy and whose value is an object. */
   otherServerKeys(): string[];
+  /** The `otherServerKeys` whose entry, as the target's `normalize` hook
+   *  folds it, LAUNCHES yaw-mcp (`launchesBroker`): the broker wired by hand
+   *  under a name that is neither ours nor legacy. `entry()` and
+   *  `legacyKey()` go by key alone and do not see these. A `try` trial key is
+   *  not filtered here -- a caller for whom a false "wired" is destructive
+   *  excludes those itself (import's isWiredIn does). */
+  otherBrokerKeys(): string[];
   /** How many entries the container holds, ours and any legacy one included.
    *  0 for every read that is not `ok`. */
   count(): number;
@@ -997,6 +1063,10 @@ function makeView(
 ): ClientConfigView {
   const entries = read.kind === "ok" ? read.entries : [];
   const at = (key: string | undefined): EntryView | undefined => entries.find((e) => e.key === (key ?? ENTRY_NAME));
+  const others = (): EntryView[] => {
+    const skip = new Set<string>([ENTRY_NAME, ...LEGACY_ENTRY_NAMES]);
+    return entries.filter((e) => !skip.has(e.key) && isRecord(e.value));
+  };
   return {
     read,
     raw,
@@ -1010,10 +1080,14 @@ function makeView(
       return found === undefined ? undefined : normalizeEntry(found.value, opts.transform);
     },
     legacyKey: () => findLegacyKey(entries.map((e) => e.key)),
-    otherServerKeys: () => {
-      const skip = new Set<string>([ENTRY_NAME, ...LEGACY_ENTRY_NAMES]);
-      return entries.filter((e) => !skip.has(e.key) && isRecord(e.value)).map((e) => e.key);
-    },
+    otherServerKeys: () => others().map((e) => e.key),
+    otherBrokerKeys: () =>
+      others()
+        .filter((e) => {
+          const normalized = normalizeEntry(e.value, opts.transform);
+          return isRecord(normalized) && launchesBroker(normalized);
+        })
+        .map((e) => e.key),
     count: () => entries.length,
     carryableEnv: (key?: string) => carryableEnvOf(at(key)?.value, opts.transform),
     carried: (key?: string) => carriedFieldsOf(at(key)?.value, opts.transform),
@@ -1372,10 +1446,10 @@ export function applyClientConfigEdits(
     // is what the repair exists to prevent.
     const repair = edits.find((edit) => edit.op === "repair" && sameSegments(edit.path, read.path));
     if (repair === undefined || !read.reparable || edits[0] !== repair) {
-      throw new ClientConfigWriteError(refusalFor(read, where, edits));
+      throw new ClientConfigWriteError(refusalFor(read, where, edits, adapter.syntax));
     }
   } else if (read.kind !== "ok") {
-    throw new ClientConfigWriteError(refusalFor(read, where, edits));
+    throw new ClientConfigWriteError(refusalFor(read, where, edits, adapter.syntax));
   } else {
     // An entry the read flagged as one the splicer will not edit refuses only
     // the edit that names it -- with the same words, and the same by-hand
@@ -1384,7 +1458,7 @@ export function applyClientConfigEdits(
       if (edit.op !== "upsert" && edit.op !== "remove") continue;
       const stuck = read.unspliceableEntries?.find((e) => e.key === edit.key);
       if (stuck !== undefined) {
-        throw new ClientConfigWriteError(refusalFor({ kind: "unspliceable", ...stuck }, where, edits));
+        throw new ClientConfigWriteError(refusalFor({ kind: "unspliceable", ...stuck }, where, edits, adapter.syntax));
       }
     }
   }
@@ -1436,7 +1510,7 @@ export function configPositionClause(position: ConfigPosition | null): string {
   return position === null ? "" : ` at line ${position.line} column ${position.column}`;
 }
 
-function refusalFor(read: ConfigRead, where: string, edits: readonly ClientConfigEdit[]): string {
+function refusalFor(read: ConfigRead, where: string, edits: readonly ClientConfigEdit[], syntax: SyntaxName): string {
   if (read.kind === "unreadable") return `${where} could not be read (${read.message})`;
   if (read.kind === "malformed") {
     const at = configPositionClause(read.position);
@@ -1444,7 +1518,7 @@ function refusalFor(read: ConfigRead, where: string, edits: readonly ClientConfi
     // gives it up here, so the position is printed once, in its usual place.
     const detail = at !== "" && read.detail.endsWith(at) ? read.detail.slice(0, -at.length) : read.detail;
     return read.reason === "root"
-      ? `${where} is not a ${read.syntax} object (it is ${read.detail})`
+      ? `${where} is not ${containerNounFor(read.syntax)} (it is ${read.detail})`
       : `${where} is not valid ${read.syntax}${at} (${detail})`;
   }
   if (read.kind === "unspliceable") {
@@ -1461,8 +1535,8 @@ function refusalFor(read: ConfigRead, where: string, edits: readonly ClientConfi
       return `"${key}" in ${where} is ${read.shape}: its repair has to be the FIRST edit, before anything is spliced in`;
     }
     return read.reparable
-      ? `"${key}" in ${where} is ${read.shape}, not an object -- it has to be repaired before an entry can be written`
-      : `"${key}" in ${where} is ${read.shape}, not an object -- refusing to overwrite it`;
+      ? `"${key}" in ${where} is ${read.shape}, not ${containerNounFor(syntax)} -- it has to be repaired before an entry can be written`
+      : `"${key}" in ${where} is ${read.shape}, not ${containerNounFor(syntax)} -- refusing to overwrite it`;
   }
   return `${where} cannot be edited`;
 }

@@ -112,6 +112,15 @@ describe("detectMissingCredentials", () => {
     expect(detectMissingCredentials("Missing environment: OPENAI_API_KEY")).toEqual(["OPENAI_API_KEY"]);
   });
 
+  it("matches a colon directly after 'required'", () => {
+    // "required" took a bare gap, so the capture landed on the lowercase word
+    // itself, the ALL_CAPS filter dropped it, and nothing was elicited.
+    expect(detectMissingCredentials("Missing required: GITHUB_TOKEN")).toEqual(["GITHUB_TOKEN"]);
+    expect(detectMissingCredentials("Missing required: API key GITHUB_TOKEN")).toEqual(["GITHUB_TOKEN"]);
+    // An underscore is still not a separator: the name keeps its front.
+    expect(detectMissingCredentials("Missing REQUIRED_TOKEN")).toEqual(["REQUIRED_TOKEN"]);
+  });
+
   it("reads past a credential noun in front of the name ('Missing API key: X')", () => {
     // Pattern 1 used to commit to the noun as the name -- "API" (not
     // credential-shaped) or lowercase "credentials" -- and nothing elicited.

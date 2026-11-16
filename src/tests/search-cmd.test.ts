@@ -405,6 +405,58 @@ describe("runSearch with optional env", () => {
   });
 });
 
+describe("runSearch -- catalog text on the terminal", () => {
+  // Built from char codes so no raw control byte sits in this file.
+  const ESC = String.fromCharCode(0x1b);
+  const BEL = String.fromCharCode(0x07);
+  const CSI_C1 = String.fromCharCode(0x9b);
+  const RLO = String.fromCharCode(0x202e);
+  const OSC52 = `${ESC}]52;c;ZXZpbA==${BEL}`;
+  const HOSTILE = [
+    {
+      slug: `evil${ESC}[2J`,
+      name: `Evil${OSC52}`,
+      description: `Clears${CSI_C1}2J the screen.\nSecond line ${RLO}desrever. Café — kept.`,
+      install: { command: "npx -y evil", runtime: `node${ESC}[31m` },
+      requiredEnv: [{ key: `EVIL_KEY${ESC}[0m` }],
+    },
+  ] as unknown as CatalogServer[];
+  const hostile = async (): Promise<CatalogServer[]> => HOSTILE;
+  const controls = (s: string): string[] =>
+    [...s].filter((ch) => {
+      const c = ch.codePointAt(0) as number;
+      return (c < 0x20 && ch !== "\n") || (c >= 0x7f && c <= 0x9f) || c === 0x202e;
+    });
+
+  it("prints no control or bidi-override character from a hostile catalog's listing", async () => {
+    const cap = capture();
+    const r = await runSearch({ query: "", fetchCatalog: hostile, env: {}, ...cap });
+    expect(r.exitCode).toBe(0);
+    const text = cap.text();
+    expect(controls(text)).toEqual([]);
+    // Replaced, not dropped, and the rest of each field still reads.
+    expect(text).toContain("evil?[2J  (Evil?]52;c;ZXZpbA==?)");
+    // The env key is not listed at all: catalogEnvKeys drops a key that is
+    // not env-name shaped before the renderer sees it.
+    expect(text).toContain("runtime node?[31m | no credentials\n");
+    // The description stays ONE line, and text that is not a control is kept.
+    expect(text).toContain("  Clears?2J the screen. Second line ?desrever. Café — kept.\n");
+  });
+
+  it("keeps them out of the near-miss suggestion too", async () => {
+    const cap = capture();
+    const near = async (): Promise<CatalogServer[]> =>
+      [
+        { slug: `sqlite${ESC}`, name: "x", install: { command: "npx -y x", runtime: "node" } },
+      ] as unknown as CatalogServer[];
+    const r = await runSearch({ query: "sqlote", fetchCatalog: near, env: {}, ...cap });
+    expect(r.exitCode).toBe(0);
+    // The suggestion has to be there for the next line to mean anything.
+    expect(cap.text()).toContain("Did you mean: sqlite??");
+    expect(controls(cap.text())).toEqual([]);
+  });
+});
+
 describe("runSearch -- the default fetcher's staleness note goes to the injected err writer", () => {
   afterEach(() => {
     vi.unstubAllGlobals();

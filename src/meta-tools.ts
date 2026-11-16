@@ -453,6 +453,9 @@ export function computeSecretsReport(
     url?: string;
     env?: Record<string, string>;
     headers?: Record<string, string>;
+    /** A git entry's `git.tokenSecret` is a vault NAME too (types.ts), read
+     *  at clone time rather than injected into the child. */
+    git?: { tokenSecret?: string };
   }>,
   vaultKeys: Set<string>,
 ): SecretsReportRow[] {
@@ -473,6 +476,11 @@ export function computeSecretsReport(
     // refused fail-closed for a missing name.
     const credentials = isRemoteEntry(server) ? server.headers : server.env;
     const referenced = collectSecretRefNames(credentials);
+    // The clone token of a git entry is named outside both maps, as a bare
+    // vault name. Counted like a ref, as doctor's vault section and `secrets
+    // set` count it: a name the vault lacks fails that server's clone, and
+    // omitting it read as "this server needs no secrets".
+    if (server.git?.tokenSecret) referenced.add(server.git.tokenSecret);
     // The strict scanner above cannot see a reference a typo has put outside
     // SECRET_REF_RE, while resolveServerEnv refuses the spawn over it. Without
     // this column the report said "gh: injected" about a server that will not

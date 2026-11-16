@@ -282,9 +282,76 @@ describe("defaultRuntime (cached hot-path variant)", () => {
 
     expect(await defaultRuntime({ cwd: synthCwd, home: synthHome })).toBe("node");
 
-    // Cached: a later change to the global file must NOT be picked up.
-    writeBundles(synthHome, { version: 1, servers: [], defaultRuntime: "oam" });
+    // Cached: with nothing changed on disk, the next call does not read again.
+    loadCalls.n = 0;
     expect(await defaultRuntime({ cwd: synthCwd, home: synthHome })).toBe("node");
+    expect(loadCalls.n).toBe(0);
+  });
+
+  it("picks up an edited defaultRuntime on the next call, without a restart", async () => {
+    // The answer used to be cached for the process lifetime, so a user who
+    // set `defaultRuntime: "node"` to get a misbehaving sidecar off oam saw
+    // no change until the broker restarted -- while every activation error
+    // told them a bundles.json edit is picked up on the next call. The cache
+    // is keyed on the stat signature of the files the read consulted, so the
+    // edit invalidates it and an untouched file still costs no read.
+    writeBundles(synthHome, { version: 1, servers: [], defaultRuntime: "oam" });
+    const opts = { cwd: synthCwd, home: synthHome };
+    expect(await defaultRuntime(opts)).toBe("oam");
+
+    loadCalls.n = 0;
+    expect(await defaultRuntime(opts)).toBe("oam");
+    expect(loadCalls.n, "an unchanged file must not be re-read per connect").toBe(0);
+
+    // "node" and "oam" differ in length, so the size half of the signature
+    // moves even when both writes land in one mtime tick.
+    writeBundles(synthHome, { version: 1, servers: [], defaultRuntime: "node" });
+    expect(await defaultRuntime(opts)).toBe("node");
+    expect(loadCalls.n).toBe(1);
+
+    // ...and removing the knob is an edit too.
+    writeBundles(synthHome, { version: 1, servers: [] });
+    expect(await defaultRuntime(opts)).toBeNull();
+  });
+
+  it("keeps the last good defaultRuntime while an edit leaves bundles.json unparseable", async () => {
+    // A half-finished edit saved with a JSON syntax error changes the stat
+    // signature, so the cached "node" is re-read -- and the re-read is
+    // degraded and empty. Answering null there hands the connect path its
+    // oam-when-installed fallback: an explicit `defaultRuntime: "node"`
+    // inverted for as long as the file stays broken, which is the failure the
+    // degraded exemption exists to prevent. The last good value is served
+    // instead, and the file is still re-read once it is fixed.
+    writeBundles(synthHome, { version: 1, servers: [], defaultRuntime: "node" });
+    const file = localBundlesPath(join(synthHome, CONFIG_DIRNAME));
+    const t0 = Date.now();
+    const opts = { cwd: synthCwd, home: synthHome, now: () => t0 };
+    expect(await defaultRuntime(opts)).toBe("node");
+
+    writeFileSync(file, '{ "version": 1, "servers": [], "defaultRuntime": "node"');
+    expect(await defaultRuntime(opts)).toBe("node");
+
+    // The still-broken file answers from the stat gate, with the same value
+    // and without another load.
+    loadCalls.n = 0;
+    expect(await defaultRuntime(opts)).toBe("node");
+    expect(loadCalls.n).toBe(0);
+
+    // Fixed with a different value: the kept answer must not outlive the
+    // broken file. "oam" differs in length, so the signature moves.
+    writeBundles(synthHome, { version: 1, servers: [], defaultRuntime: "oam" });
+    expect(await defaultRuntime(opts)).toBe("oam");
+  });
+
+  it("drops the last good defaultRuntime when bundles.json is deleted", async () => {
+    // Deleting the file is not a degraded read -- the loader reports no path
+    // -- so it is an answer ("nothing configured") and replaces the old one.
+    writeBundles(synthHome, { version: 1, servers: [], defaultRuntime: "node" });
+    const opts = { cwd: synthCwd, home: synthHome };
+    expect(await defaultRuntime(opts)).toBe("node");
+
+    rmSync(localBundlesPath(join(synthHome, CONFIG_DIRNAME)));
+    expect(await defaultRuntime(opts)).toBeNull();
   });
 
   it("picks up a user-global defaultRuntime written after a broken PROJECT file armed the cache", async () => {
@@ -360,8 +427,14 @@ describe("defaultRuntime (cached hot-path variant)", () => {
     // spawn -- pin that the exemption did not swallow the cache whole.
     expect(await defaultRuntime({ cwd: synthCwd, home: synthHome })).toBeNull();
 
-    writeBundles(synthHome, { version: 1, servers: [], defaultRuntime: "oam" });
+    loadCalls.n = 0;
     expect(await defaultRuntime({ cwd: synthCwd, home: synthHome })).toBeNull();
+    expect(loadCalls.n).toBe(0);
+
+    // The absence of the user-global file is part of that answer, so
+    // CREATING it is a change the cache has to see.
+    writeBundles(synthHome, { version: 1, servers: [], defaultRuntime: "oam" });
+    expect(await defaultRuntime({ cwd: synthCwd, home: synthHome })).toBe("oam");
   });
 
   it("collapses a CONCURRENT burst of calls into one bundles.json read", async () => {

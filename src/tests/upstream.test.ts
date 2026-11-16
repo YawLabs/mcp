@@ -8,6 +8,8 @@ import {
   ToolListChangedNotificationSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { scrubInternalSecretsFromProcessEnv, stripInternalSecretsFromEnv } from "../internal-secret-env.js";
+import { MAX_TIMEOUT_MS } from "../timeouts.js";
 import {
   ActivationError,
   clearSessionVaultPassphrase,
@@ -21,17 +23,16 @@ import {
   MAX_LIST_PAGES,
   MAX_PROMPTS_PER_SERVER,
   MAX_RESOURCES_PER_SERVER,
-  MAX_TIMEOUT_MS,
   MAX_TOOLS_PER_SERVER,
+  mergeChildEnv,
+  redactSecretsInOutput,
   resetManagedDowngrades,
   resetOamDowngrades,
   resolveTimeoutEnv,
   SATURATED_CPU_BUSY,
-  scrubInternalSecretsFromProcessEnv,
   setCpuTimesReaderForTests,
   setSessionVaultPassphrase,
   shellActivationMessage,
-  stripInternalSecretsFromEnv,
   VaultPassphraseRequiredError,
   vaultPassphrase,
   verifyVaultPassphrase,
@@ -331,6 +332,53 @@ describe("fetchToolsFromUpstream size cap", () => {
     // Derived from the cap, not a literal: moving MAX_TOOLS_PER_SERVER must
     // not break this test for a reason unrelated to truncation.
     expect(stderr.writes.some((w) => w.includes("truncating") && w.includes(`"reported":${reported}`))).toBe(true);
+  });
+
+  it("still warns when withheld task-required tools bring the count back under the cap", async () => {
+    // Pagination stops once MORE than the cap has arrived, so an over-cap raw
+    // list is the only sign pages were left unfetched. Enough task-required
+    // tools in it to land the filtered list under the cap used to silence the
+    // warning while the inventory was still cut mid-pagination.
+    const reported = MAX_TOOLS_PER_SERVER + 5;
+    const tools = Array.from({ length: reported }, (_, i) => ({
+      name: `t${i}`,
+      inputSchema: { type: "object" },
+      ...(i < 10 ? { execution: { taskSupport: "required" } } : {}),
+    }));
+    const client = makeClient({ listTools: vi.fn().mockResolvedValue({ tools, nextCursor: "more" }) });
+
+    const out = await fetchToolsFromUpstream(client, "ns");
+    expect(out).toHaveLength(reported - 10);
+    expect(client.listTools).toHaveBeenCalledTimes(1);
+    expect(stderr.writes.some((w) => w.includes("truncating") && w.includes(`"reported":${reported}`))).toBe(true);
+  });
+});
+
+describe("mergeChildEnv", () => {
+  it("is a plain spread off Windows, where env names are case-sensitive", () => {
+    expect(mergeChildEnv({ PATH: "/broker", Path: "other" }, { path: "/mine", FOO: "1" }, "linux")).toEqual({
+      PATH: "/broker",
+      Path: "other",
+      path: "/mine",
+      FOO: "1",
+    });
+  });
+
+  it("on Windows a server key replaces the broker's variable whatever case either side used", () => {
+    // Node hands a Windows child ONE of two case-variant keys, picked by key
+    // order rather than by which was spread last, and the SDK adds an uppercase
+    // PATH of its own underneath. So the merged env must carry exactly one
+    // spelling, and it must be the uppercase one.
+    const merged = mergeChildEnv(
+      { Path: "C:\\broker", FOO_HOME: "parent", Untouched: "keep" },
+      { Path: "C:\\mine", foo_home: "mine", brand_new: "x" },
+      "win32",
+    );
+    expect(merged).toEqual({ PATH: "C:\\mine", FOO_HOME: "mine", Untouched: "keep", brand_new: "x" });
+    // Uppercase server key against a mixed-case broker key: same outcome.
+    expect(mergeChildEnv({ Path: "C:\\broker" }, { PATH: "C:\\mine" }, "win32")).toEqual({ PATH: "C:\\mine" });
+    // Two server spellings of one name collapse too; the later one wins.
+    expect(mergeChildEnv({}, { tok: "a", TOK: "b" }, "win32")).toEqual({ TOK: "b" });
   });
 });
 
@@ -959,6 +1007,19 @@ describe("redactSecretsInOutput", () => {
     expect(err!.stderrTail).not.toContain(secretValue);
     // It should be replaced with the ***KEY*** pattern.
     expect(err!.stderrTail).toContain("***MY_TOKEN***");
+  });
+
+  it("does not expand $-patterns in a key name back into the secret", () => {
+    // The marker embeds the env key / header name, and String.replace expands
+    // $&, $` and $' in a replacement STRING. `$` and `&` are legal in an HTTP
+    // header name, so a header called `X-$&` put the matched secret straight
+    // back into the text it was being removed from.
+    const secret = "sk-live-0123456789abcdef";
+    const body = `denied for key ${secret} (tail)`;
+    for (const key of ["X-$&", "X-$'", "X-$`", "X-$$"]) {
+      const out = redactSecretsInOutput(body, { [key]: secret });
+      expect(out, key).toBe(`denied for key ***${key}*** (tail)`);
+    }
   });
 
   it("is a no-op when env is empty -- output passes through unchanged", async () => {
@@ -4219,18 +4280,23 @@ describe("connectToUpstream activation failure categories", () => {
   it("rejects a local config with no command before anything is spawned", async () => {
     const err = await connectToUpstream(makeLocalConfig({ command: undefined })).catch((e) => e);
 
-    expect(err).toBeInstanceOf(Error);
-    expect(err).not.toBeInstanceOf(ActivationError);
-    expect((err as Error).message).toBe("command is required for local servers");
+    // The bundles.json loader leaves a missing command for this function to
+    // refuse, so the refusal has to be as usable as every other config error:
+    // categorized, and pointing at the entry to edit.
+    expect(err).toBeInstanceOf(ActivationError);
+    expect((err as ActivationError).category).toBe("unknown");
+    expect((err as Error).message).toContain("command is required for local servers");
+    expect((err as Error).message).toContain(CONFIG_POINTER);
     expect(_sdkBehavior.stdioConstructions).toHaveLength(0);
   });
 
   it("rejects a remote config with no url before any transport is built", async () => {
     const err = await connectToUpstream(makeRemoteConfig({ url: undefined })).catch((e) => e);
 
-    expect(err).toBeInstanceOf(Error);
-    expect(err).not.toBeInstanceOf(ActivationError);
-    expect((err as Error).message).toBe("url is required for remote servers");
+    expect(err).toBeInstanceOf(ActivationError);
+    expect((err as ActivationError).category).toBe("unknown");
+    expect((err as Error).message).toContain("url is required for remote servers");
+    expect((err as Error).message).toContain(CONFIG_POINTER);
     expect(_sdkBehavior.remoteConstructions).toHaveLength(0);
   });
 
@@ -5152,6 +5218,60 @@ describe("connectToUpstream progress reporting", () => {
     await vi.advanceTimersByTimeAsync(30_000);
     expect(messages).toHaveLength(afterFailure);
   });
+
+  it("reports a slow launch-command resolve, which runs before the connect deadline is armed", async () => {
+    // The uv bootstrap (a download on a cold cache) and the oam probe are
+    // awaited BEFORE the handshake timer exists, so neither MCP_CONNECT_TIMEOUT
+    // nor the handshake heartbeat covered them: a first uvx activation on a
+    // slow link held the call silent for as long as the download took.
+    vi.useFakeTimers();
+    const messages: string[] = [];
+    let release: (v: { command: string; args: string[] }) => void = () => {};
+    vi.mocked(resolveUvSpawn).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+    );
+
+    const connecting = connectToUpstream(
+      makeLocalConfig({ namespace: "py", command: "uvx", args: ["mcp-server-git"] }),
+      undefined,
+      undefined,
+      undefined,
+      (m: string) => messages.push(m),
+    );
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(messages).toEqual([]);
+    await vi.advanceTimersByTimeAsync(6_000);
+    expect(messages).toHaveLength(2);
+    expect(messages[0]).toContain('"py" is still resolving its launch command -- 5s so far');
+    expect(messages[1]).toContain("10s so far");
+
+    release({ command: "uvx", args: ["mcp-server-git"] });
+    await vi.advanceTimersByTimeAsync(0);
+    await connecting;
+    // The resolve heartbeat stops with the resolve.
+    const resolving = messages.filter((m) => m.includes("resolving its launch command")).length;
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(messages.filter((m) => m.includes("resolving its launch command"))).toHaveLength(resolving);
+  });
+
+  it.runIf(process.platform === "win32")(
+    "hands the child the server's value for a variable the broker spells in another case",
+    async () => {
+      vi.stubEnv("YAW_MCP_TEST_CASE_VAR", "from-broker");
+      try {
+        await connectToUpstream(makeLocalConfig({ env: { yaw_mcp_test_case_var: "from-server" } }));
+        const env = _sdkBehavior.lastStdioArgs?.env ?? {};
+        const spellings = Object.keys(env).filter((k) => k.toUpperCase() === "YAW_MCP_TEST_CASE_VAR");
+        expect(spellings).toEqual(["YAW_MCP_TEST_CASE_VAR"]);
+        expect(env.YAW_MCP_TEST_CASE_VAR).toBe("from-server");
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    },
+  );
 
   it("marks the handshake/inventory boundary, so a slow tool list is not read as a slow spawn", async () => {
     const messages: string[] = [];

@@ -110,8 +110,8 @@ const RULES: Rule[] = [
       "src/doctor-cmd.ts": NOT_YET_MIGRATED,
       "src/import-cmd.ts":
         "ONE parse, in readVsCodeInputs, for VS Code's document-level `inputs` ARRAY -- variable " +
-        "declarations, not a server container, and the core models entry maps. The vscode row declares " +
-        'hooks.importVariables "vscode-inputs" for the handler that will own it; this line goes with that',
+        "declarations, not a server container, and the core models entry maps. Reached only for a row " +
+        'that declares hooks.importVariables "vscode-inputs"',
     },
     positive: ["const v = parseJsonc(raw);", "editJsoncPath(src, ['servers', 3], v)"],
     negative: ["/* parseJsonc( */", "const parseJsoncish = 1;"],
@@ -194,9 +194,6 @@ const RULES: Rule[] = [
         '(`target.clientId === "claude-code" && scope === "project"`), which names Claude Code\'s own ' +
         ".mcp.json approval prompt. Install's and uninstall's settings patches read hooks.permissionsPatch " +
         "now; this line goes when that clause becomes data on the row too",
-      "src/import-cmd.ts":
-        'one `target.clientId === "vscode"` branch, the input-variable expansion that ' +
-        "hooks.importVariables is declared to replace -- it goes when import reads the hook instead",
     },
     positive: ['if (t.clientId === "vscode") {', "const c = x as InstallClientId;"],
     negative: ["if (t.clientId === id) {", "resolveClientArg('install', arg)"],

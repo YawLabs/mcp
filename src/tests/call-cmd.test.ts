@@ -52,7 +52,7 @@ const CR = String.fromCharCode(0x0d);
  *  overwrite yaw-mcp's own diagnostic with text of its choosing. */
 const INJECTION = `safe${ESC}[31m${ESC}[2K${CR}INJECTED`;
 
-/** Every code point DISPLAY_CONTROL_SOURCE (trust-cmd.ts) neuters, minus tab
+/** Every code point DISPLAY_CONTROL_SOURCE (tty-reader.ts) neuters, minus tab
  *  and newline, which a stderr line legitimately carries. A code point scan
  *  rather than a character class so a failure names what got through. */
 function rawControls(text: string): string[] {

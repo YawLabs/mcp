@@ -64,6 +64,11 @@ const GIT_DIRNAME = "git";
 /** Length of the commit prefix that names a build directory. */
 export const GIT_BUILD_SHA_LEN = 12;
 
+/** Appended to a build directory's path to name its finished-build marker.
+ *  The one spelling behind gitBuiltPath (below) and builtMarkerPath
+ *  (git-build-state.ts). */
+export const GIT_BUILT_SUFFIX = ".built";
+
 export function gitRoot(home: string = homedir()): string {
   return path.join(userConfigDir(home), GIT_DIRNAME);
 }
@@ -75,9 +80,13 @@ export function gitBuildDir(namespace: string, commit: string, home: string = ho
 
 /** `~/.yaw-mcp/git/<namespace>/<sha12>.built`: the marker a finished build
  *  leaves, written last and OUTSIDE the checkout so the repo cannot ship one
- *  (git-build-state.ts readBuildMarker). */
+ *  (git-build-state.ts readBuildMarker).
+ *
+ *  Only tests call this. Production code spells the same path as
+ *  `builtMarkerPath(dir)` (git-build-state.ts), which appends the same
+ *  GIT_BUILT_SUFFIX to a build dir it already holds. */
 export function gitBuiltPath(namespace: string, commit: string, home: string = homedir()): string {
-  return `${gitBuildDir(namespace, commit, home)}.built`;
+  return `${gitBuildDir(namespace, commit, home)}${GIT_BUILT_SUFFIX}`;
 }
 
 /** `~/.yaw-mcp/git/<namespace>/<sha12>.failed`: the record a failed build leaves. */

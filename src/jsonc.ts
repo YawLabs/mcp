@@ -143,6 +143,18 @@ export function stripTrailingCommas(src: string): string {
   return out;
 }
 
+/** `src` without a leading BOM (U+FEFF). Every entry point in this file
+ *  strips it the same way before it parses or computes an offset, so the
+ *  offsets an edit carries are offsets into the text this returns.
+ *
+ *  Exported as the BOM strip the client-config adapters share: the JSON and
+ *  TOML adapters build their own `stripBom` on it rather than each
+ *  re-deriving "one leading U+FEFF". It strips exactly ONE -- a second stays in the
+ *  result, which the TOML adapter relies on to refuse a doubled BOM. */
+export function debom(src: string): string {
+  return src.charCodeAt(0) === 0xfeff ? src.slice(1) : src;
+}
+
 // Parse JSONC -> unknown. On malformed input it rethrows JSON.parse's own
 // SyntaxError, raised against the comment-STRIPPED text -- there is no
 // re-mapping step and no excerpt of the user's original source in the
@@ -156,7 +168,7 @@ export function parseJsonc(src: string): unknown {
   // BOM-prefixed UTF-8, so a user who hand-edits ~/.claude.json there and
   // saves it back produces a file JSON.parse rejects. The strip lives in the
   // wrapper so stripJsoncComments stays focused on comments/strings.
-  const debommed = src.charCodeAt(0) === 0xfeff ? src.slice(1) : src;
+  const debommed = debom(src);
   const stripped = stripTrailingCommas(stripJsoncComments(debommed));
   return JSON.parse(stripped);
 }
@@ -443,6 +455,15 @@ function insertMember(text: string, container: Node, key: string | null, value: 
     });
     return edits;
   }
+  // Defensive, and by reading not reachable: both callers hand over a tree
+  // that parsed with zero errors, and in such a document what follows the
+  // last member (and its optional comma) on its line is trivia and then
+  // either a line break or the container's close token -- the two branches
+  // above. It stays as a way out rather than a throw so that a shape this
+  // reading missed costs the caller its fallback (jsonc-parser's `modify`, or
+  // the whole-array write) instead of a failed edit.
+  // jsonc-insert-shapes.test.ts sweeps what can follow an array's last
+  // element and holds each shape to the comment-preserving splice.
   return null;
 }
 
@@ -572,7 +593,7 @@ export function duplicateJsoncKeyOnPath(
   src: string,
   path: readonly string[],
 ): { path: string[]; count: number } | null {
-  const debommed = src.charCodeAt(0) === 0xfeff ? src.slice(1) : src;
+  const debommed = debom(src);
   let node = parseTree(debommed, [], { allowTrailingComma: true });
   for (let i = 0; i < path.length; i++) {
     if (node === undefined || node.type !== "object") return null;
@@ -610,7 +631,7 @@ export function editJsoncEntry(src: string, containerPath: string[], entryName: 
   if (entryName === "") {
     throw new Error("editJsoncEntry: entryName must be a non-empty key");
   }
-  const debommed = src.charCodeAt(0) === 0xfeff ? src.slice(1) : src;
+  const debommed = debom(src);
   return applyEdits(debommed, computeEdits(debommed, [...containerPath, entryName], value));
 }
 
@@ -643,7 +664,7 @@ export function removeJsoncEntry(src: string, containerPath: string[], entryName
   if (entryName === "") {
     throw new Error("removeJsoncEntry: entryName must be a non-empty key");
   }
-  const debommed = src.charCodeAt(0) === 0xfeff ? src.slice(1) : src;
+  const debommed = debom(src);
   const edits = computeEdits(debommed, [...containerPath, entryName], undefined);
   // Nothing to remove -> return the ORIGINAL bytes, not the de-BOM'd copy.
   // Returning `debommed` for a BOM-prefixed file made the no-op look like a
@@ -688,7 +709,7 @@ export function editJsoncPath(src: string, path: Array<string | number>, value: 
   if (path.some((seg) => seg === "")) {
     throw new Error("editJsoncPath: path segments must be non-empty");
   }
-  const debommed = src.charCodeAt(0) === 0xfeff ? src.slice(1) : src;
+  const debommed = debom(src);
   const edits = computeEdits(debommed, path, value);
   if (edits.length === 0) return src;
   return applyEdits(debommed, edits);
@@ -752,7 +773,7 @@ function arrayNodeAt(text: string, path: Array<string | number>): Node | null {
  *  there, and the caller is better placed to name the key in its message. */
 export function addJsoncArrayElement(src: string, path: Array<string | number>, value: unknown): string {
   if (path.length === 0) throw new Error("addJsoncArrayElement: path must not be empty");
-  const debommed = src.charCodeAt(0) === 0xfeff ? src.slice(1) : src;
+  const debommed = debom(src);
   const array = arrayNodeAt(debommed, path);
   if (array === null) {
     const errors: ParseError[] = [];
@@ -782,9 +803,11 @@ export function addJsoncArrayElement(src: string, path: Array<string | number>, 
   }
   const edits = insertMember(debommed, array, null, value);
   // `insertMember` returns null only for a container shape its scanner cannot
-  // place a member in. Falling back to the whole-array write keeps the edit
-  // working (it is what this function replaces) at the cost of the comments
-  // inside -- strictly better than refusing, and the caller cannot do more.
+  // place a member in, and no such shape is known for the cleanly parsed
+  // array this branch is reached with (see the note at its `return null`).
+  // The fallback is kept for one that was missed: the whole-array write keeps
+  // the edit working (it is what this function replaces) at the cost of the
+  // comments inside -- better than refusing, and the caller cannot do more.
   if (edits === null) {
     const next = [...(array.children ?? []).map(elementValue), value];
     return editJsoncPath(debommed, path, next);
@@ -818,7 +841,7 @@ export function removeJsoncArrayElements(
   matches: (value: unknown) => boolean,
 ): string {
   if (path.length === 0) throw new Error("removeJsoncArrayElements: path must not be empty");
-  const debommed = src.charCodeAt(0) === 0xfeff ? src.slice(1) : src;
+  const debommed = debom(src);
   const array = arrayNodeAt(debommed, path);
   if (array === null) {
     // The same recoverable-parse-error case `addJsoncArrayElement` falls back

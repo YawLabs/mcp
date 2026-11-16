@@ -12,7 +12,11 @@
 //   * used ONLY when the server has no real list: no live connection, no
 //     list learned in this or an earlier session (an EMPTY learned list is a
 //     real observation and also wins). The first successful load replaces
-//     it for good (see rankableFor in server.ts, the one reader).
+//     it for good. fallbackToolsFor has two readers, and both apply that
+//     same order: ConnectServer.rankableTools in server.ts (the live
+//     ranker's view of a cold server) and coldToolsFor in foundry-cmd.ts
+//     (the catalog snapshot `yaw-mcp foundry export` scores a corpus
+//     against). Change the shape of a list here and both see it.
 //   * keyed by the server's IDENTITY -- the docker image or the binary its
 //     command runs -- never by the namespace the user chose, so a server
 //     someone named "github" that runs something else gets nothing.

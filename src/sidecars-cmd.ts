@@ -67,7 +67,7 @@ import {
   specConstraint,
 } from "./oam-spawn.js";
 import { sidecarsNodeModules, sidecarsRoot, userConfigDir } from "./paths.js";
-import type { YesNoOptions } from "./readline-question.js";
+import { isInteractivePrompt, type YesNoOptions } from "./readline-question.js";
 import type { UpstreamServerConfig } from "./types.js";
 
 // paths.ts owns these; they are re-exported for the callers that think of them
@@ -185,9 +185,13 @@ export function collectSidecarSpecs(servers: Array<Partial<UpstreamServerConfig>
     const existing = byPkg.get(pkg);
     if (existing) {
       if (s.namespace && !existing.namespaces.includes(s.namespace)) existing.namespaces.push(s.namespace);
-      // Only a DIFFERENT spec is a conflict; the same package pinned the same
-      // way by two servers is the common case and says nothing.
-      if (spec !== existing.spec && !existing.conflicting.includes(spec)) existing.conflicting.push(spec);
+      // Only a DIFFERENT version request is a conflict; the same package
+      // pinned the same way by two servers is the common case and says
+      // nothing. Compared as configuredRange, not as raw strings: a bare
+      // `pkg` and `pkg@latest` are the one dependency value in the manifest,
+      // so reporting them as a conflict named a loser that does not exist.
+      const range = configuredRange({ pkg, spec, namespaces: [], conflicting: [] });
+      if (range !== configuredRange(existing) && !existing.conflicting.includes(spec)) existing.conflicting.push(spec);
       continue;
     }
     byPkg.set(pkg, { pkg, spec, namespaces: s.namespace ? [s.namespace] : [], conflicting: [] });
@@ -836,12 +840,15 @@ async function unhostedReasons(
   return [...new Set(verdicts.map((v) => v.reason))];
 }
 
-/** Both ends a TTY, and never under --json, whose stdout is the document. */
+/** Both ends a TTY, and never under --json, whose stdout is the document.
+ *  The ends judged are the ones the consent prompt would use: askYesNo (under
+ *  scriptConsentConfirm) asks on opts.io when it is given, so the verdict
+ *  reads those streams before process.std* -- the shared rule,
+ *  isInteractivePrompt in readline-question.ts. Judging process.std* alone
+ *  refused to ask on an injected terminal, and would have asked on injected
+ *  pipes from a real one. */
 function gitInteractive(opts: SidecarsInstallOptions): boolean {
-  if (opts.json) return false;
-  if (opts.isTTY !== undefined) return opts.isTTY;
-  if (opts.promptAnswer !== undefined) return true;
-  return Boolean(process.stdin.isTTY) && Boolean(process.stdout.isTTY);
+  return !opts.json && isInteractivePrompt(opts);
 }
 
 /** The git half of the install: the same builder `trust` offers after a grant.
@@ -950,13 +957,22 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
     lines,
     updateError,
   });
+  // What a failed run leaves servers resolving from. Read at the moment of
+  // the failure, not up front: resolveNpmEntry (oam-spawn.ts) looks in the
+  // managed tree FIRST, so once a node_modules exists there -- from an earlier
+  // install, or half-filled by the npm run that just failed -- "the npx
+  // cache" alone is the wrong answer for every package that tree holds.
+  const afterFailure = (): string =>
+    existsSync(sidecarsNodeModules(home))
+      ? `Servers keep resolving from what is already in ${sidecarsNodeModules(home)} (a failed install can leave it incomplete), and from the npx cache for any package not there.`
+      : "Servers keep resolving from the npx cache.";
   // Guarded: on EACCES/EROFS/ENOSPC these used to reject out of the command,
   // and the dispatcher printed `yaw-mcp sidecars: <errno>` on stderr with
   // NOTHING on stdout -- breaking the one-shape-on-every-path --json contract
   // the MCP panel relies on (it shells out to `sidecars install --json`).
   const couldNotPrepare = (err: unknown): SidecarsInstallResult => {
     const msg = err instanceof Error ? err.message : String(err);
-    print(`Could not prepare ${root}: ${msg}. Servers keep resolving from the npx cache.`);
+    print(`Could not prepare ${root}: ${msg}. ${afterFailure()}`);
     if (opts.json) write(doc({ error: `manifest write failed: ${msg}`, conflicts, skipped }));
     return done(1);
   };
@@ -1171,7 +1187,7 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
     // strategy=nested` is NOT used -- a flat tree is what resolveNpmEntry walks.
     const code = await runNpm(["install", "--no-audit", "--no-fund"], root);
     if (code !== 0) {
-      print(`npm install failed (exit ${code}). Servers keep resolving from the npx cache.`);
+      print(`npm install failed (exit ${code}). ${afterFailure()}`);
       if (opts.json) write(doc({ error: `npm exited ${code}`, conflicts, skipped }));
       return done(1);
     }

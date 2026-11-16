@@ -147,6 +147,30 @@ describe("readLineFromTTY -- control bytes and echo", () => {
     expect(await readLineFromTTY(asStream(kept), fakeStdout().stream, "v: ", false, true)).toBe("a\tbc");
   });
 
+  it("an echo read drops C1 and bidi controls too, so none is written back to the terminal", async () => {
+    // U+009B is the 8-bit CSI and U+202E a right-to-left override: both are
+    // past the C0 block, and both used to be buffered AND echoed.
+    // U+200B (zero-width space) rides along. All three are built from their
+    // code points so no invisible character sits in this source.
+    const csi = String.fromCharCode(0x9b);
+    const rlo = String.fromCharCode(0x202e);
+    const zwsp = String.fromCharCode(0x200b);
+    const stdin = new FakeTTYStdin([`${rlo}y${csi}8m${zwsp}\n`]);
+    const { stream, text } = fakeStdout();
+    expect(await readLineFromTTY(asStream(stdin), stream, "? ", true)).toBe("y8m");
+    expect(text()).toBe("? y8m\n");
+  });
+
+  it("a no-echo read keeps what lies past C0: a passphrase is stored as typed", async () => {
+    // Zero-width space, built from its code point (see the case above).
+    const zwsp = String.fromCharCode(0x200b);
+    const stdin = new FakeTTYStdin([`a${zwsp}b\n`]);
+    const { stream } = fakeStdout();
+    const line = await readLineFromTTY(asStream(stdin), stream);
+    expect(line).toBe(`a${zwsp}b`);
+    expect(line).toHaveLength(3);
+  });
+
   it("a pasted CRLF is one Enter, and what follows the terminator is re-buffered for the next read", async () => {
     const stdin = new FakeTTYStdin(["first\r\nsecond\n"]);
     const { stream } = fakeStdout();

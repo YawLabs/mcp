@@ -412,6 +412,43 @@ describe("cline resolves one (client, scope) to a shared file plus a site per ed
     );
   });
 
+  it("looks for the editor copies under an absolute XDG_CONFIG_HOME on Linux, as the vscode row does", () => {
+    // The MUTATION this pins: drop the xdg branch from editorRoot in
+    // target-cline.ts and the first assertion goes red -- every editor copy is
+    // then looked for under ~/.config, `detectDir` never exists on a box that
+    // moved its config root, and install / uninstall skip the copies silently.
+    const xdg = join(ROOT, "xdg-root");
+    const base = machine("linux", { xdgConfigHome: ` ${xdg} ` });
+    const sites = sitesOf(base);
+    const storage = join(xdg, "Code", "User", "globalStorage", STORAGE);
+    expect(sites[1].resolved.absolute).toBe(join(storage, "settings", SETTINGS_FILE));
+    expect(sites[1].detectDir).toBe(storage);
+    expect(sites[1].resolved.display).toBe(
+      `$XDG_CONFIG_HOME/Code/User/globalStorage/${STORAGE}/settings/${SETTINGS_FILE}`,
+    );
+    // The shared copy is Cline's own directory, which the variable does not move.
+    expect(sites[0].resolved.absolute).toBe(join(base.home, ".cline", "data", "settings", SETTINGS_FILE));
+
+    // Detection follows: the storage directory under the XDG root is what
+    // makes the editor copy a site.
+    mkdirSync(storage, { recursive: true });
+    expect(detectedSites(base).map((s) => s.id)).toEqual(["shared", "vscode"]);
+
+    // A relative or blank value keeps ~/.config, and so does any other OS.
+    for (const value of ["rel/cfg", "   "]) {
+      const fallback = machine("linux", { xdgConfigHome: value });
+      expect(sitesOf(fallback)[1].detectDir, JSON.stringify(value)).toBe(
+        join(fallback.home, ".config", "Code", "User", "globalStorage", STORAGE),
+      );
+    }
+    const mac = machine("macos", { xdgConfigHome: xdg });
+    expect(sitesOf(mac)[1].detectDir).toBe(
+      join(mac.home, "Library", "Application Support", "Code", "User", "globalStorage", STORAGE),
+    );
+    const win = machine("windows", { xdgConfigHome: xdg });
+    expect(sitesOf(win)[1].detectDir).toBe(join(win.appData, "Code", "User", "globalStorage", STORAGE));
+  });
+
   it("follows Cline's own env precedence for the shared copy, and only for it", () => {
     const shared = (env: PathBase["env"]): ConfigSite => sitesOf(machine("linux", env))[0];
     expect(shared({ clineMcpSettingsPath: "/exact/file.json" }).resolved.absolute).toBe("/exact/file.json");

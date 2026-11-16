@@ -823,6 +823,27 @@ describe("maybeRefreshSidecars", () => {
     expect(existsSync(sidecarRefreshStatePath(home))).toBe(false);
   });
 
+  it("says, at debug, that VITEST switched the refresh off when the tree probe is the default", async () => {
+    // A real `serve` that inherited VITEST from the shell its client was
+    // launched in never refreshes; this line is the only thing that says why.
+    const saved = process.env.YAW_MCP_LOG_LEVEL;
+    process.env.YAW_MCP_LOG_LEVEL = "debug";
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    try {
+      await maybeRefreshSidecars({ home: tempHome() });
+      const written = spy.mock.calls.map((c) => String(c[0])).join("");
+      expect(written).toContain("sidecar refresh skipped: VITEST is set");
+      spy.mockClear();
+      // An injected probe is a test driving the real flow: not announced.
+      await maybeRefreshSidecars({ home: tempHome(), hasManagedSidecarsImpl: () => false });
+      expect(spy.mock.calls.map((c) => String(c[0])).join("")).not.toContain("VITEST is set");
+    } finally {
+      spy.mockRestore();
+      if (saved === undefined) delete process.env.YAW_MCP_LOG_LEVEL;
+      else process.env.YAW_MCP_LOG_LEVEL = saved;
+    }
+  });
+
   it("reads NOTHING outside the injected home -- no real bundles.json, no real sidecars tree", async () => {
     // The assertion above is satisfied by defaultWriteState's guard ALONE, so
     // it stayed green while defaultSpecs, hasManagedSidecars and
@@ -1408,6 +1429,21 @@ describe("unbuiltGitNote", () => {
     writeUser(home, [gitEntry("acme_git")]);
     fakeFinishedBuild(gitBuildDir("acme_git", COMMIT, home), COMMIT);
     expect(await unbuiltGitNote(home)).toBeNull();
+  });
+
+  it("does not count an entry with no pinned commit: `sidecars install` refuses to build one", async () => {
+    // gitEntryBuilt is false for a commit-less entry too, so an unfiltered
+    // count sent the reader to a command that cannot build it.
+    const unpinned = { ...gitEntry("moving"), git: { url: GIT, ref: "main", entry: "dist/index.js" } };
+    const only = userHome();
+    writeUser(only, [unpinned]);
+    expect(await unbuiltGitNote(only)).toBeNull();
+
+    const mixed = userHome();
+    writeUser(mixed, [unpinned, gitEntry("acme_git")]);
+    const note = await unbuiltGitNote(mixed);
+    expect(note?.namespaces).toEqual(["acme_git"]);
+    expect(note?.message).toContain("1 git server is");
   });
 
   it("stays null when there is no git entry or no config at all", async () => {

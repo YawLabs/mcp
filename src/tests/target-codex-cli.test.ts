@@ -719,7 +719,10 @@ describe("install refuses rather than corrupt a file", () => {
         site,
       ),
     );
-    expect(refusal).toContain("is an array of 1, not an object -- refusing to overwrite it");
+    // "a TOML table", the adapter's own noun for the container (containerNounFor
+    // in client-config.ts) -- the wording install's own refusal over this file
+    // already used; the facade said "an object" about a TOML file.
+    expect(refusal).toContain("is an array of 1, not a TOML table -- refusing to overwrite it");
     expect(() => view.adapter.repairContainer(fixture("f11-array-container"), view.address, ["mcp_servers"])).toThrow(
       /cannot be repaired in place/,
     );

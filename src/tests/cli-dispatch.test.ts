@@ -131,9 +131,9 @@ describe("CLI dispatch -- help goes to stdout and exits 0", () => {
     expect(r.stderr, "usage went to stderr").toBe("");
   });
 
-  it("prints install's usage, which rides a SUCCESSFUL parse instead", () => {
-    // install signals --help via helpRequested on the ok branch, so it has its
-    // own branch rather than the shared tail -- a second shape to keep right.
+  it("prints install's multi-KB usage on the shared parse tail too", () => {
+    // install signals --help as `{ ok: false, error: USAGE, help: true }` like
+    // every sibling (it used to ride a successful parse and a branch of its own).
     const r = runCli(["install", "--help"]);
     expect(r.code).toBe(0);
     // DERIVED: a literal synopsis here would have to be edited by every

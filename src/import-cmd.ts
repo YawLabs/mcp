@@ -62,10 +62,15 @@
 //     collision and is not asked about.
 //   * The plan prints the namespace the file will actually hold, which is not
 //     always the derived one: a stored entry matched by NAME keeps its own.
-//   * For VS Code and Cline, a `${...}` the client expands itself is expanded
-//     here, or the server is refused BY NAME. yaw-mcp does not expand them at
-//     spawn, so importing one verbatim produces an entry that cannot work
-//     while looking imported. No other client's entries are interpreted.
+//   * For a client whose row declares `hooks.importVariables` (VS Code,
+//     Cline, Claude Code, Cursor), a `${...}` the client expands itself is
+//     expanded here, or the server is refused BY NAME. yaw-mcp does not
+//     expand them at spawn, so importing one verbatim produces an entry that
+//     cannot work while looking imported. No other client's entries are
+//     interpreted: a
+//     `${...}` in one is carried across as the text it is, and a warning
+//     names the span (never the string around it), because this command does
+//     not know whether that client would have filled it in.
 //   * Nothing is dropped in silence: an `env` / `headers` shape the loader
 //     would refuse is named (key names only), and one un-removable key never
 //     aborts the removal of the others.
@@ -85,6 +90,7 @@ import {
   containerNounFor,
   type EntryTransform,
   importViewOf,
+  launchesBroker,
   readClientConfigFile,
   siteAt,
   terminateWithNewline,
@@ -102,6 +108,7 @@ import {
   LEGACY_ENTRY_NAMES,
   resolveAppDataDir,
   resolveInstallSites,
+  type TargetHooks,
   unloadableConfigFix,
   unparseableConfigFix,
 } from "./install-targets.js";
@@ -115,7 +122,7 @@ import {
 } from "./local-bundles.js";
 import { createStreamWriter } from "./logger.js";
 import { userConfigDir } from "./paths.js";
-import { askYesNo, QUESTION_CANCELLED, questionOrEmpty } from "./readline-question.js";
+import { askYesNo, isInteractivePrompt, QUESTION_CANCELLED, questionOrEmpty } from "./readline-question.js";
 import { displayArg, displaySafe } from "./trust-cmd.js";
 import { TRIAL_ENTRY_PREFIX } from "./try-cmd.js";
 import type { UpstreamServerConfig } from "./types.js";
@@ -146,10 +153,15 @@ export const IMPORT_USAGE = `Usage: yaw-mcp import <client> [flags]
   terminal run asks first -- [o]verwrite, [s]kip or [a]bort, and a bare Enter
   skips that server -- and a run off one writes nothing and exits 2 unless you
   pass --force. A stored entry the merge would leave as it is is not asked
-  about. A VS Code server written with a \${input:...} or
-  \${env:...} variable is skipped by name, and so is a Cline server written
-  with \${env:...}: the client expands those itself and yaw-mcp does not, so
-  importing one would produce a server that cannot start.
+  about. A server written with a variable its client expands itself is
+  skipped by name: VS Code's \${input:...} and \${env:...}, Cline's and
+  Cursor's \${env:...}, Claude Code's \${VAR} and \${VAR:-default}. yaw-mcp
+  does not expand those, so importing one would produce a server that
+  cannot start.
+
+  A client config file that does not exist, or is empty, is not an error:
+  the run says there is nothing to import and exits 0. A file that cannot
+  be read or does not parse exits 1.
 
   AFTER AN IMPORT THE CLIENT STILL LAUNCHES THOSE SERVERS ITSELF, so you would
   be running each of them twice -- once directly, once through yaw-mcp. This
@@ -205,9 +217,9 @@ export interface ImportCommandOptions {
    *  question (o / s / a, applied to every entry asked about). One answer
    *  serves both because a test that sets it has opted out of stdin
    *  entirely; a test that needs per-entry answers, or the real readline
-   *  path, drives `io` instead and leaves this unset. `isInteractive` reads a
-   *  set value as "there is a terminal", so neither question falls through
-   *  to the off-TTY refusal. */
+   *  path, drives `io` instead and leaves this unset. `isInteractivePrompt`
+   *  (readline-question.ts) reads a set value as "there is a terminal", so
+   *  neither question falls through to the off-TTY refusal. */
   promptAnswer?: string;
   /** The streams both questions are asked on when `promptAnswer` is unset;
    *  process.stdin / process.stdout when absent. */
@@ -235,6 +247,14 @@ function isSelfEntry(key: string): boolean {
   return SELF_ENTRY_NAMES.has(key) || key.startsWith(TRIAL_ENTRY_PREFIX);
 }
 
+// `launchesBroker` -- does this entry LAUNCH yaw-mcp, whatever key it sits
+// under -- lives in client-config.ts now. isSelfEntry goes by key alone, so a
+// broker wired by hand under another name (`claude mcp add yaw -- npx -y
+// @yawlabs/mcp@latest`) was imported as a server of itself, the recursion
+// SELF_ENTRY_NAMES exists to prevent; runImport skips such an entry with it,
+// and the wiring question (isWiredIn) reads the same rule through the view's
+// `otherBrokerKeys`.
+
 /** One server read out of a client config, before it becomes a bundles entry. */
 interface ImportCandidate {
   /** The key as it appears in the client config -- the name the user knows. */
@@ -247,8 +267,11 @@ interface ImportCandidate {
   credentialKeys: string[];
   /** Loader-worded notes about what a malformed `env` / `headers` lost, key
    *  NAMES only, plus one per key the target's `forImport` hook reported in
-   *  `discardedKeys` (discardedKeyNotes). Empty for the overwhelmingly common
-   *  well-formed case. */
+   *  `discardedKeys` (discardedKeyNotes), plus one naming the `${...}` spans
+   *  carried across uninterpreted (verbatimSpanNote) -- that last one drops
+   *  nothing, and rides here because this is the list printed as warnings
+   *  against the client file. Empty for the overwhelmingly common well-formed
+   *  case. */
   discarded: string[];
   /** The client stores this server switched off (`ImportView.disabled`), so
    *  its entry is written `"isActive": false` and the transcript says how to
@@ -332,6 +355,24 @@ function discardedKeyNotes(key: string, keys: string[] | undefined, label: strin
   );
 }
 
+/** One `${...}` span. Global, and used only through String.prototype.replace
+ *  and .match, neither of which carries `lastIndex` between calls. */
+const CLIENT_VAR_SPAN = /\$\{[^{}]*\}/g;
+
+/** The warning for a server whose `${...}` spans were carried across as text,
+ *  from a client whose entries are not interpreted (toEntry's `vars: null`).
+ *  yaw-mcp resolves only `${secret:NAME}` at spawn, so if the client fills
+ *  such a span in itself, the imported copy launches with the literal text
+ *  while the original still works -- and removing the original is then the
+ *  step that breaks the server. Hedged, because this command does not know
+ *  whether the client expands anything: a client that does not passes the
+ *  same text to the server either way. The SPANS only, never the strings
+ *  they sat in. */
+function verbatimSpanNote(key: string, spans: string[], label: string): string {
+  const one = spans.length === 1;
+  return `carrying ${spans.map(displaySafe).join(", ")} on "${displaySafe(key)}" across as literal text -- yaw-mcp fills in only \${secret:NAME} at launch, so if ${label} expands ${one ? "that" : "those"} itself the imported server gets the text, not the value. Check that it starts through yaw-mcp before removing the original`;
+}
+
 /** The values a `${...}` span can be resolved against at import time. */
 interface ClientVars {
   /** The workspace folder, or undefined at a scope that resolves none (VS
@@ -341,8 +382,71 @@ interface ClientVars {
    *  where every span is one (workspace, input, env, ...). "env" is Cline:
    *  `${env:NAME}` is the one spelling its row records it expanding
    *  (target-cline.ts), so only that is treated as a variable and any other
-   *  span is carried across as the text it is. */
-  spans: "all" | "env";
+   *  span is carried across as the text it is. "posix-env" is Claude Code:
+   *  `${VAR}` and `${VAR:-default}`, an environment variable by its bare
+   *  name. "cursor" is Cursor's config interpolation: `${env:NAME}` plus the
+   *  fixed names in CURSOR_VARIABLES. Under every mode but "all", a span that
+   *  is not one of the client's variables is literal text to the client too,
+   *  so it is carried across unchanged and unreported. */
+  spans: "all" | "env" | "posix-env" | "cursor";
+}
+
+/** A bare environment-variable name, optionally with the `:-default` Claude
+ *  Code accepts. The span regex excludes braces, so a default cannot nest. */
+const POSIX_ENV_SPAN_NAME = /^[A-Za-z_][A-Za-z0-9_]*(?::-.*)?$/s;
+
+/** The fixed names Cursor's mcp.json interpolation resolves besides
+ *  `${env:NAME}` (cursor.com/docs/mcp, "Config interpolation", read
+ *  2026-11-15). */
+const CURSOR_VARIABLES: ReadonlySet<string> = new Set([
+  "userHome",
+  "workspaceFolder",
+  "workspaceFolderBasename",
+  "pathSeparator",
+  "/",
+]);
+
+/** Is this span (its text between `${` and `}`) one of the client's own
+ *  variables under the given mode? */
+function isClientVariable(name: string, spans: ClientVars["spans"]): boolean {
+  switch (spans) {
+    case "all":
+      return true;
+    case "env":
+      return name.startsWith("env:");
+    case "posix-env":
+      return POSIX_ENV_SPAN_NAME.test(name);
+    case "cursor":
+      return name.startsWith("env:") || CURSOR_VARIABLES.has(name);
+    default: {
+      const _exhaustive: never = spans;
+      return _exhaustive;
+    }
+  }
+}
+
+/** The expansion rules for a row's `hooks.importVariables`, or null for a row
+ *  that declares none (its entries are carried across uninterpreted).
+ *  `workspaceFolder` is handed only to the two modes in which
+ *  `${workspaceFolder}` IS the workspace folder -- under "posix-env" that
+ *  span is an environment variable that happens to have the name. */
+function clientVarsFor(hook: TargetHooks["importVariables"], projectDir: string | undefined): ClientVars | null {
+  switch (hook) {
+    case undefined:
+      return null;
+    case "vscode-inputs":
+      return { workspaceFolder: projectDir, spans: "all" };
+    case "cline-env":
+      return { spans: "env" };
+    case "posix-env":
+      return { spans: "posix-env" };
+    case "cursor-env":
+      return { workspaceFolder: projectDir, spans: "cursor" };
+    default: {
+      const _exhaustive: never = hook;
+      return _exhaustive;
+    }
+  }
 }
 
 /**
@@ -370,17 +474,20 @@ interface ClientVars {
  *
  * Under `spans: "env"` (Cline) only `${env:VAR}` is a variable at all: it is
  * unresolved for the reason above, and every other span is returned untouched
- * and is not recorded.
+ * and is not recorded. "posix-env" (Claude Code's `${VAR}` /
+ * `${VAR:-default}`) and "cursor" work the same way over their own variable
+ * sets (isClientVariable); Cursor's `${workspaceFolder}` expands like VS
+ * Code's when the scope resolved a project directory.
  *
  * `${secret:NAME}` is left alone and is NOT unresolved -- that is yaw-mcp's own
  * reference, resolved against the vault at spawn (secrets-vault.ts), so a
  * hand-written one in a client config still means here what it says.
  */
 function expandClientVars(s: string, vars: ClientVars, unresolved: Set<string>): string {
-  return s.replace(/\$\{[^{}]*\}/g, (span) => {
+  return s.replace(CLIENT_VAR_SPAN, (span) => {
     const name = span.slice(2, -1);
     if (name.startsWith("secret:")) return span;
-    if (vars.spans === "env" && !name.startsWith("env:")) return span;
+    if (!isClientVariable(name, vars.spans)) return span;
     if (vars.workspaceFolder !== undefined) {
       if (name === "workspaceFolder") return vars.workspaceFolder;
       if (name === "workspaceFolderBasename") return basename(vars.workspaceFolder);
@@ -398,6 +505,10 @@ interface BuiltEntry {
   /** `${...}` spans this importer cannot resolve. Non-empty means the server is
    *  skipped rather than imported. */
   unresolved: string[];
+  /** `${...}` spans carried across as the text they are, because the client's
+   *  entries are not interpreted (`vars` null). `${secret:NAME}` is not one.
+   *  Always empty when `vars` is set. */
+  verbatim: string[];
 }
 
 /**
@@ -414,16 +525,21 @@ interface BuiltEntry {
  *
  * `vars` is null for a client whose expansion rules this command does not
  * know, and then nothing is interpreted at all. Guessing one would refuse
- * strings that work today, so only two clients get the treatment: VS Code,
- * whose own file DECLARES its variables (the `inputs` block in that same
- * mcp.json), and Cline, whose row declares `hooks.importVariables:
- * "cline-env"` -- see the caller.
+ * strings that work today, so only a row that declares
+ * `hooks.importVariables` gets the treatment (clientVarsFor maps the hook to
+ * the rules) -- see the caller. Uninterpreted is not unreported: the spans
+ * such an entry carries come back in `verbatim`, for the caller to warn about.
  */
 function toEntry(key: string, value: unknown, vars: ClientVars | null): BuiltEntry | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const v = value as Record<string, unknown>;
   const unresolved = new Set<string>();
-  const expand = (s: string): string => (vars === null ? s : expandClientVars(s, vars, unresolved));
+  const verbatim = new Set<string>();
+  const expand = (s: string): string => {
+    if (vars !== null) return expandClientVars(s, vars, unresolved);
+    for (const span of s.match(CLIENT_VAR_SPAN) ?? []) if (!span.startsWith("${secret:")) verbatim.add(span);
+    return s;
+  };
   const expandMap = (m: Record<string, string> | undefined): Record<string, string> | undefined =>
     m === undefined ? undefined : Object.fromEntries(Object.entries(m).map(([k, val]) => [k, expand(val)]));
 
@@ -467,6 +583,7 @@ function toEntry(key: string, value: unknown, vars: ClientVars | null): BuiltEnt
       credentialKeys: Object.keys(headers ?? {}),
       discarded: discardNotes("headers", key, rawHeaders),
       unresolved: [...unresolved],
+      verbatim: [...verbatim],
     };
   }
 
@@ -487,6 +604,7 @@ function toEntry(key: string, value: unknown, vars: ClientVars | null): BuiltEnt
     credentialKeys: Object.keys(env ?? {}),
     discarded: [...dropped, ...discardNotes("env", key, rawEnv)],
     unresolved: [...unresolved],
+    verbatim: [...verbatim],
   };
 }
 
@@ -502,10 +620,10 @@ function toEntry(key: string, value: unknown, vars: ClientVars | null): BuiltEnt
  *  container. It is a document-level ARRAY of variable declarations that only
  *  VS Code writes, and the core models entry MAPS -- asking it for the keys at
  *  `["inputs"]` would report an array as a blocked container, which is neither
- *  true nor useful here. The vscode row declares `hooks.importVariables:
- *  "vscode-inputs"` for the handler that will own this; until that handler
- *  exists, the parse stays here, reaching for nothing but `inputs`, and is
- *  allow-listed by name in the boundary scan. Unparseable bytes yield no
+ *  true nor useful here. runImport calls this for a row that declares
+ *  `hooks.importVariables: "vscode-inputs"` (the vscode row); the parse
+ *  stays here, reaching for nothing but `inputs`, and is allow-listed by
+ *  name in the boundary scan. Unparseable bytes yield no
  *  declarations rather than throwing: the caller has already classified the
  *  file through the core and would not be here if it did not parse. */
 function readVsCodeInputs(raw: string): Map<string, string> {
@@ -681,12 +799,26 @@ function describeContainer(ref: ContainerRef): string {
   return `${displaySafe(ref.resolved.absolute)} (${ref.resolved.containerPath.join(".")})`;
 }
 
-/** Is yaw-mcp itself wired into this container -- under its own entry key or a
- *  pre-rename one? Asked of the VIEW rather than of a parsed object, so the
- *  answer comes from the site's own adapter and the legacy list has one
- *  reader. */
+/** Is yaw-mcp itself wired into this container -- under its own entry key, a
+ *  pre-rename one, or any other key whose entry launches it (a broker added
+ *  by hand as `yaw`)? Asked of the VIEW rather than of a parsed object, so
+ *  the answer comes from the site's own adapter and the legacy list has one
+ *  reader.
+ *
+ *  The by-launch half is the rule runImport skips self entries with
+ *  (launchesBroker), so an entry that is skipped as "yaw-mcp's own" is meant
+ *  to count as the wiring that makes --remove-originals safe. Nothing
+ *  enforces that the two agree: runImport applies launchesBroker to the
+ *  row's forImport entry, while otherBrokerKeys normalises each entry with
+ *  the view's own transform, and readContainer and the drive-case fold build
+ *  their views with none. Every shipped row's raw entry already carries the
+ *  command and args, so the answers match today; a row where they did not
+ *  would read as not wired here, which refuses the removal -- the safe
+ *  direction. A `try` trial key never counts -- a false "wired" is the destructive
+ *  direction, and a trial entry is removed again when the trial ends. */
 function isWiredIn(view: ClientConfigView): boolean {
-  return view.entry() !== undefined || view.legacyKey() !== null;
+  if (view.entry() !== undefined || view.legacyKey() !== null) return true;
+  return view.otherBrokerKeys().some((key) => !key.startsWith(TRIAL_ENTRY_PREFIX));
 }
 
 /** What one searched container turned out to be. Only `container` can hold a
@@ -916,14 +1048,6 @@ export function parseImportArgs(
   return { ok: true, options: opts };
 }
 
-/** Both ends must be a TTY: stdin to read the answer, stdout to show the
- *  question. Mirrors runRemove's isInteractive. */
-function isInteractive(opts: ImportCommandOptions): boolean {
-  if (opts.isTTY !== undefined) return opts.isTTY;
-  if (opts.promptAnswer !== undefined) return true;
-  return Boolean(process.stdin.isTTY) && Boolean(process.stdout.isTTY);
-}
-
 /** One candidate that actually reached bundles.json. */
 interface ImportedEntry {
   candidate: ImportCandidate;
@@ -1026,8 +1150,24 @@ async function searchForBroker(
   for (let i = 0; i < searched.length; i++) {
     // The imported container is FIRST and is the VIEW already in hand, so the
     // single-scope clients read no extra files at all.
+    // Its wiring question folds across the drive-letter-case siblings exactly
+    // as readContainer's does for every other container: `source` is the ONE
+    // sibling the servers were read from, and a broker entry an older version
+    // wrote under the other case of that same project wires the client just
+    // as much.
     const read: ContainerRead =
-      i === 0 ? { state: "container", wired: isWiredIn(source) } : await readContainer(searched[i]);
+      i === 0
+        ? {
+            state: "container",
+            wired:
+              isWiredIn(source) ||
+              isWiredIn(
+                classifyClientConfig(source.raw, searched[0], {
+                  containerPaths: driveCaseVariants(searched[0], source.raw),
+                }),
+              ),
+          }
+        : await readContainer(searched[i]);
     if (read.state === "container" && read.wired) {
       wiredIn = searched[i];
       break;
@@ -1178,12 +1318,17 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
     // the same reason install writes an empty file as if it were absent. Both
     // mean "no servers to import", and each says which it is: the previous
     // wording told a user with an empty config that it was invalid JSON.
-    printErr(
+    //
+    // Exit 0, on stdout, like the two "Nothing to import" answers below: a
+    // client with no config file is the same expected state as one whose file
+    // holds no server container, and exiting 1 for it failed a setup script
+    // that imports from every client on the first one the user does not have.
+    print(
       view.raw === null
-        ? `yaw-mcp import: ${displaySafe(resolved.absolute)} does not exist -- ${target.label} has no MCP servers configured at this scope.`
-        : `yaw-mcp import: ${displaySafe(resolved.absolute)} is empty -- ${target.label} has no MCP servers configured at this scope.`,
+        ? `\nNothing to import: ${displaySafe(resolved.absolute)} does not exist -- ${target.label} has no MCP servers configured at this scope.`
+        : `\nNothing to import: ${displaySafe(resolved.absolute)} is empty -- ${target.label} has no MCP servers configured at this scope.`,
     );
-    return { exitCode: 1, written: [] };
+    return { exitCode: 0, written: [] };
   }
   // `read.syntax` is the adapter's own name for the file's language: "JSON"
   // for every JSON-family client, where both lines are byte-identical to the
@@ -1237,21 +1382,20 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
     return { exitCode: 0, written: [] };
   }
 
-  // Two clients have their `${...}` spans interpreted here -- see toEntry.
-  // VS Code declares its own variables in the file being read (the `inputs`
-  // block) and every span in its file is one of its variables. Cline's row
-  // declares `hooks.importVariables: "cline-env"`: Cline expands `${env:NAME}`
-  // itself, there is no value to substitute from here, and so a server
-  // carrying one is refused by name while every other span in a Cline entry
-  // is carried across as it is. Every other client's entries are carried
-  // across uninterpreted.
-  const isVsCode = target.clientId === "vscode";
-  const vars: ClientVars | null = isVsCode
-    ? { workspaceFolder: site.projectDir, spans: "all" }
-    : target.hooks?.importVariables === "cline-env"
-      ? { spans: "env" }
-      : null;
-  const inputs = isVsCode ? readVsCodeInputs(view.raw ?? "") : new Map<string, string>();
+  // A row that declares `hooks.importVariables` has its `${...}` spans
+  // interpreted here -- see toEntry and clientVarsFor. The row says by NAME
+  // which rules apply, never this command by testing a client id:
+  // "vscode-inputs" (every span is a VS Code variable, and the file being
+  // read declares its `inputs`), "cline-env" (`${env:NAME}`), "posix-env"
+  // (Claude Code's `${VAR}` / `${VAR:-default}`) and "cursor-env" (Cursor's
+  // config interpolation). In each the client expands the variable itself and
+  // there is no value to substitute from here, so a server carrying one is
+  // refused by name. Every other client's entries are carried across
+  // uninterpreted, and a `${...}` in one is named in a warning
+  // (verbatimSpanNote) rather than judged.
+  const importVariables = target.hooks?.importVariables;
+  const vars = clientVarsFor(importVariables, site.projectDir);
+  const inputs = importVariables === "vscode-inputs" ? readVsCodeInputs(view.raw ?? "") : new Map<string, string>();
 
   const candidates: ImportCandidate[] = [];
   const skippedSelf: string[] = [];
@@ -1292,6 +1436,12 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
       notImportable.push(`  ${displayArg(key)}: ${displaySafe(importView.skipReason)}`);
       continue;
     }
+    // yaw-mcp under a key that is not one of its own: asked of the entry as
+    // the row normalises it, so a client that nests the launch still answers.
+    if (launchesBroker(importView.entry)) {
+      skippedSelf.push(key);
+      continue;
+    }
     const built = toEntry(key, importView.entry, vars);
     if (!built) {
       unusable.push(key);
@@ -1308,7 +1458,11 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
       namespace: built.entry.namespace as string,
       entry: built.entry,
       credentialKeys: built.credentialKeys,
-      discarded: [...built.discarded, ...discardedKeyNotes(key, importView.discardedKeys, target.label)],
+      discarded: [
+        ...built.discarded,
+        ...discardedKeyNotes(key, importView.discardedKeys, target.label),
+        ...(built.verbatim.length > 0 ? [verbatimSpanNote(key, built.verbatim, target.label)] : []),
+      ],
       inactive,
       plannedNamespace: built.entry.namespace as string,
     });
@@ -1512,7 +1666,7 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
     /** Null under --force, which answers every question "overwrite". */
     let answers: Map<ImportCandidate, "overwrite" | "skip"> | null = null;
     if (!opts.force) {
-      if (!isInteractive(opts)) {
+      if (!isInteractivePrompt(opts)) {
         // Off a TTY, silence is not consent here either. install refuses to
         // replace its own differing entry with exit 2 -- the code `remove` and
         // `uninstall` also use for a confirmation that could not be asked for,
@@ -1594,6 +1748,16 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
       if (res.launchChanged) {
         printErr(
           `Note: importing ${displayArg(c.key)} CHANGED the entry's launch command:\n  from: ${renderLaunch(res.launchChanged.from)}\n    to: ${renderLaunch(res.launchChanged.to)}\nIf the previous entry was a different server you meant to keep, restore it from the app or edit bundles.json.`,
+        );
+      }
+      // The other thing that swap can do: a stdio entry replaced by a remote
+      // one loses its stored env VALUES (a remote server spawns no process),
+      // and the launch note above names only the command and the url. Names
+      // only, as `add` reports it (local-add-cmd.ts droppedEnvNote).
+      if (res.droppedEnvKeys) {
+        const one = res.droppedEnvKeys.length === 1;
+        printErr(
+          `Note: importing ${displayArg(c.key)} deleted the env value${one ? "" : "s"} stored on the entry (${res.droppedEnvKeys.map(displayArg).join(", ")}): a remote server spawns no process, so nothing would read ${one ? "it" : "them"}.`,
         );
       }
       results.push({ candidate: c, landed });
@@ -1706,7 +1870,7 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
   }
 
   if (!opts.removeOriginals) {
-    if (!isInteractive(opts)) {
+    if (!isInteractivePrompt(opts)) {
       // Off a TTY, silence is NOT consent. The import stands; the client
       // config is untouched and the user is told exactly what to run.
       printErr(

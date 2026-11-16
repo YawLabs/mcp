@@ -627,3 +627,84 @@ describe("formatHealthWarning -- credential scrubbing", () => {
     expect(w).not.toContain("token=x");
   });
 });
+
+describe("scrubForWarning -- credentials in a url", () => {
+  it("redacts a url's userinfo and keeps the host and path", () => {
+    // No NAME for the name/value rule to anchor on, so `user:key@` used to be
+    // echoed whole by every url echo that goes through this scrubber (audit's
+    // remote-server line, compliance's Target line).
+    expect(scrubForWarning("https://user:s3cr3tpw@mcp.example.com/mcp")).toBe("https://<redacted>@mcp.example.com/mcp");
+    expect(scrubForWarning("connect failed: https://sk3yonly@host.example/mcp (401)")).toBe(
+      "connect failed: https://<redacted>@host.example/mcp (401)",
+    );
+  });
+
+  it("keeps the host when the userinfo is spelled like a NAME: value pair", () => {
+    // Rule order: with the name/value rule first, `token:abc@host/mcp` is one
+    // pair and the host goes with the value.
+    expect(scrubForWarning("https://token:abcdef@mcp.example.com/mcp")).toBe("https://<redacted>@mcp.example.com/mcp");
+  });
+
+  it("leaves a url with no userinfo alone, an @ later in it included", () => {
+    expect(scrubForWarning("https://mcp.example.com/mcp")).toBe("https://mcp.example.com/mcp");
+    expect(scrubForWarning("https://mcp.example.com/users/a@b.example")).toBe(
+      "https://mcp.example.com/users/a@b.example",
+    );
+    expect(scrubForWarning("GET https://mcp.example.com/mcp?user=a@b.example")).toBe(
+      "GET https://mcp.example.com/mcp?user=a@b.example",
+    );
+  });
+
+  it("keeps the host of a path-less url that an @ follows without whitespace", () => {
+    // A quote, angle bracket or comma ends the url, so the `@` of a later
+    // email is not this url's userinfo delimiter. Each of these used to come
+    // out as `https://<redacted>@<the email's domain>`.
+    const json = '{"url":"https://api.example.com","email":"bob@example.com"}';
+    expect(scrubForWarning(json)).toBe(json);
+    const single = "{'url':'https://api.example.com','email':'bob@example.com'}";
+    expect(scrubForWarning(single)).toBe(single);
+    const list = "POST https://api.example.com:443,contact=ops@example.com";
+    expect(scrubForWarning(list)).toBe(list);
+    const html = '<a href="https://x.example.com">mailto:me@x.com</a>';
+    expect(scrubForWarning(html)).toBe(html);
+    const autolink = "see <https://x.example.com><me@x.com>";
+    expect(scrubForWarning(autolink)).toBe(autolink);
+    const code = "run `curl https://x.example.com`@latest";
+    expect(scrubForWarning(code)).toBe(code);
+    // A real userinfo inside the same quoting is still redacted.
+    expect(scrubForWarning('{"url":"https://user:s3cr3tpw@api.example.com","email":"bob@example.com"}')).toBe(
+      '{"url":"https://<redacted>@api.example.com","email":"bob@example.com"}',
+    );
+  });
+
+  it("redacts a bare key= query parameter, in query position only", () => {
+    expect(scrubForWarning("https://mcp.example.com/mcp?key=AIzaSyD4example")).toBe(
+      "https://mcp.example.com/mcp?key=<redacted>",
+    );
+    expect(scrubForWarning("https://mcp.example.com/mcp?v=1&KEY=AIzaSyD4example&alt=json")).toBe(
+      "https://mcp.example.com/mcp?v=1&KEY=<redacted>&alt=json",
+    );
+    // `key` as an ordinary NAME: pair is prose and stays readable.
+    expect(scrubForWarning("primary key: id")).toBe("primary key: id");
+    expect(scrubForWarning("sort key=name")).toBe("sort key=name");
+  });
+
+  it("stays linear on a long run with no userinfo", () => {
+    // The rule is anchored on `://` and bounded, so a long alphanumeric run
+    // (or a long run of `://`) is not rescanned from each of its positions.
+    const started = Date.now();
+    scrubForWarning(`${"a".repeat(200_000)} ${"://x".repeat(50_000)}`);
+    expect(Date.now() - started).toBeLessThan(2000);
+  });
+});
+
+describe("scrubForWarning -- bearer/hmac in prose (accepted cost)", () => {
+  it("redacts an 8+ char word after bearer or hmac even in prose", () => {
+    // Pinned so the comment on rule 1 stays true: these two schemes carry no
+    // shape gate, and the price is the word after them in a prose error.
+    expect(scrubForWarning("401: Bearer authentication required")).toBe("401: <redacted> required");
+    expect(scrubForWarning("invalid bearer credentials")).toBe("invalid <redacted>");
+    // Under 8 chars nothing matches.
+    expect(scrubForWarning("bearer token rejected")).toBe("bearer token rejected");
+  });
+});

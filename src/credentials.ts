@@ -22,7 +22,7 @@ const NAME = "[A-Z_][A-Z0-9_]{2,}";
 // from vault") -- a prompt for a key the server never asked for.
 const GAP = "[^\\S\\r\\n]+";
 // The separator after a word that may end in a colon -- pattern 1's
-// "missing", and the env / variable words of LEADING_ENV_WORDS (below): a
+// "missing" and "required", and the env / variable words of LEADING_ENV_WORDS (below): a
 // same-line gap, OR a colon followed by any whitespace. The colon is the one
 // marker that a break continues the phrase -- "Missing:\n  OPENAI_API_KEY"
 // is a list, and it still elicits.
@@ -70,9 +70,10 @@ const LEADING_CREDENTIAL_NOUN = `(?:api(?:${GAP}|-)?keys?|tokens?|credentials?|s
 // Pattern 1 tolerates these words around the name: an optional "required",
 // then LEADING_ENV_WORDS -- an optional "env"/"environment" and an optional
 // "var"/"variable" (plural too, "Missing environment variables: X") -- and an
-// optional COLON after ANY of "missing", "env"/"environment" or
+// optional COLON after ANY of "missing", "required", "env"/"environment" or
 // "var"/"variable" -- "Missing env var: OPENAI_API_KEY" (this file's own
-// header example), "Missing env: X" and "missing: X" all elicit. It captures
+// header example), "Missing env: X", "Missing required: X" and "missing: X"
+// all elicit. It captures
 // only the FIRST name of a comma-separated list.
 //
 // Pattern 1b is pattern 1 with a LEADING_CREDENTIAL_NOUN required in front of
@@ -103,9 +104,9 @@ const LEADING_CREDENTIAL_NOUN = `(?:api(?:${GAP}|-)?keys?|tokens?|credentials?|s
 // lastIndex across calls: no .test() or .exec() may ever touch these, or a
 // hit on one message makes the next scan start mid-string and miss.
 const MISSING_PATTERNS: RegExp[] = [
-  new RegExp(`\\bmissing${SEP}(?:required${GAP})?${LEADING_ENV_WORDS}${QUOTE}(${NAME})\\b`, "gi"),
+  new RegExp(`\\bmissing${SEP}(?:required${SEP})?${LEADING_ENV_WORDS}${QUOTE}(${NAME})\\b`, "gi"),
   new RegExp(
-    `\\bmissing${SEP}(?:required${GAP})?${LEADING_ENV_WORDS}${LEADING_CREDENTIAL_NOUN}${QUOTE}(${NAME})\\b`,
+    `\\bmissing${SEP}(?:required${SEP})?${LEADING_ENV_WORDS}${LEADING_CREDENTIAL_NOUN}${QUOTE}(${NAME})\\b`,
     "gi",
   ),
   new RegExp(

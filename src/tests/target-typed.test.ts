@@ -1036,6 +1036,30 @@ describe("a Yaw Mode pane: the grant outlives the pane", () => {
       expect(allowOf(overlaySettings())).toEqual([CLAUDE_CODE_ALLOW_PATTERN]);
       expect(allowOf(userSettings())).toEqual([CLAUDE_CODE_ALLOW_PATTERN]);
     });
+
+    it("names Claude Code's own ~/.claude.json as the home grant's holder on `uninstall claude-code`", async () => {
+      // Installed from a normal shell first (~/.claude.json), then again in
+      // the pane (the overlay's .claude.json). The pane's uninstall empties the
+      // OVERLAY file only. For the home grant the question is asked with
+      // CLAUDE_CONFIG_DIR unset, where the claude-code user row resolves
+      // ~/.claude.json -- a file this run does not touch, so that row is the
+      // holder. The uninstalled row used to be skipped wholesale there, and
+      // the grant survived only because typed's alsoReads lists the same
+      // file: the line blamed "typed (user)" for Claude Code's own entry.
+      await install("claude-code");
+      await install("claude-code", pane("augment"));
+      const { result, stdout } = await uninstall("claude-code", pane("augment"));
+      expect(result.exitCode).toBe(0);
+      expect(result.written).toEqual([overlayClaudeJson()]);
+      expect(allowOf(overlaySettings())).toEqual([CLAUDE_CODE_ALLOW_PATTERN]);
+      expect(allowOf(userSettings())).toEqual([CLAUDE_CODE_ALLOW_PATTERN]);
+      expect(stdout.split(LF).filter((l) => l.startsWith("Keeping "))).toEqual([
+        // Under the overlay the row's own site IS the file being emptied, so
+        // it stays out; typed in this pane still loads ~/.claude.json.
+        `Keeping ${CLAUDE_CODE_ALLOW_PATTERN} in ${overlaySettings()}: typed (user) still launches yaw-mcp from ${claudeJson()} and reads that grant.`,
+        `Keeping ${CLAUDE_CODE_ALLOW_PATTERN} in ${userSettings()}: Claude Code (user) still launches yaw-mcp from ${claudeJson()} and reads that grant.`,
+      ]);
+    });
   });
 
   describe("fresh", () => {

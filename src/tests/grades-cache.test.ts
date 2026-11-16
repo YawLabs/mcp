@@ -23,8 +23,9 @@ vi.mock("node:fs/promises", async (importOriginal) => {
 });
 
 import { utimes as utimesMock } from "node:fs/promises";
+import { stealStaleLock } from "../file-lock.js";
 import type { CachedGrade } from "../grades-cache.js";
-import { gradesCachePath, readGradesCache, stealStaleLock, writeGrade } from "../grades-cache.js";
+import { gradesCachePath, readGradesCache, writeGrade } from "../grades-cache.js";
 import { CONFIG_DIRNAME } from "../paths.js";
 
 // ---------------------------------------------------------------------------

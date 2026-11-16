@@ -1,5 +1,32 @@
 import { describe, expect, it } from "vitest";
-import { editJsoncEntry, parseJsonc, removeJsoncEntry, stripJsoncComments, stripTrailingCommas } from "../jsonc.js";
+import {
+  debom,
+  editJsoncEntry,
+  parseJsonc,
+  removeJsoncEntry,
+  stripJsoncComments,
+  stripTrailingCommas,
+} from "../jsonc.js";
+
+describe("debom", () => {
+  // Built from the code point: a typed escape is one backslash level away
+  // from being a real control byte in this file.
+  const BOM = String.fromCharCode(0xfeff);
+
+  it("strips exactly one leading U+FEFF and nothing else", () => {
+    expect(debom(`${BOM}{"a":1}`)).toBe('{"a":1}');
+    // A second BOM survives: the TOML adapter refuses a doubled BOM by
+    // finding it at the head of the stripped text.
+    expect(debom(`${BOM}${BOM}x`)).toBe(`${BOM}x`);
+    expect(debom(BOM)).toBe("");
+  });
+
+  it("returns a BOM-less string unchanged, including an interior U+FEFF", () => {
+    expect(debom("")).toBe("");
+    expect(debom('{"a":1}')).toBe('{"a":1}');
+    expect(debom(`a${BOM}b`)).toBe(`a${BOM}b`);
+  });
+});
 
 describe("stripJsoncComments", () => {
   it("leaves plain JSON untouched", () => {

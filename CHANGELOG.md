@@ -4,6 +4,50 @@ All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented 
 
 ## Unreleased
 
+**Breaking -- exit codes, refusals and what `import` brings across**
+
+`yaw-mcp import <client>` on a client config that does not exist or is empty now prints `Nothing to import: <file> does not exist` (or `is empty`) on stdout and exits 0; it used to print an error on stderr and exit 1. A client with no config is the same expected state as one whose file holds no servers, and exit 1 failed a setup script that imports from every client on the first one the user does not have. A script that used the exit code to detect a missing config (or a mistyped `--project-dir`) must read the output instead. A config that cannot be read or does not parse still exits 1.
+
+`yaw-mcp import claude-code` and `import cursor` now skip a server written with a variable the client expands itself -- Claude Code's `${VAR}` and `${VAR:-default}`, Cursor's `${env:NAME}` and its own interpolation names -- as `import vscode` and `import cline` already did for theirs. Each skipped server is named on stderr with the spans that caused it, and the exit code is unchanged. These used to be imported with the literal text, which gave a server that could not start; add such a server by hand with the value (`yaw-mcp add <name> --command ... --env KEY='${secret:NAME}'`). For a client with no such rule (Windsurf, for one) an entry carrying `${...}` is still imported as it stands, now with a warning naming the spans. `import` also skips, as yaw-mcp's own, any entry that launches yaw-mcp under another key (`claude mcp add yaw -- npx -y @yawlabs/mcp@latest`); it used to import it as a server of itself, and such an entry now counts as the wiring `--remove-originals` requires. On Windows an entry stored under the other drive-letter case of the project path counts as that wiring too.
+
+`yaw-mcp enable`, `disable` and `set` no longer resolve a target that matched only after being reshaped into a namespace: `disable "???"` used to edit whatever entry held the namespace `server`, and `enable GitHub` reached `github` where `remove GitHub` refused. Such a target now exits 2. A stored namespace, slug or name still resolves exactly as before, which is what the README documents.
+
+`yaw-mcp audit <namespace>` exits 4, with `could not load <path>`, when bundles.json exists but cannot be loaded; it used to exit 1, the code for "no server with that namespace". No bundles.json at all is still exit 1. The README now lists `audit`'s exit codes.
+
+`yaw-mcp doctor` exits 2 in two cases it used to pass. A client entry for yaw-mcp with no launch command and no url (`"mcp": {}`) is reported as `has "mcp" entry, but it has no launch command`, and `doctor --json` client probes gain a `launchNoCommand` field. And the launch checks now run on the entry as the client's own format normalises it, so a Cline entry in the nested `transport` form is checked (a bare `oam`, a missing entry file) where it was passed unread.
+
+The secret vault refuses a vault file whose `version` is not a whole number of 1 or more, as corrupt; version 1 and a file with no version still load. A `state.json` written at a schema version newer than this build's is no longer overwritten: yaw-mcp persists no learning state for that session and says so once at load and once when it first skips a save, so an older copy running beside a newer one cannot erase its state.
+
+`yaw-mcp try` and `try-cleanup` answer `Unknown flag: -x` for an unknown single-dash argument, which used to be taken as a positional.
+
+**Changed -- routing, discovery and the meta-tools**
+
+`mcp_connect_exec` references read a numeric segment on a plain object as a key, so `a.byYear.2024` and `a.ids.007` resolve; a missing one reports `no property "2024"`. Bracket `[n]` is still for arrays only. `mcp_connect_discover`'s usage line prints the number of calls (`used 4x`), not the rounded success credit, and a blank `server` argument is treated as no focus. `mcp_connect_read_tool` and a focused `discover` now count as use of that server for idle eviction. `mcp_connect_bundles` and discover's completions line no longer list a disabled or profile-blocked member as missing: they say `disabled: ... (installed; enable with: yaw-mcp enable ...)` and `blocked by the project profile`. `mcp_connect_health` shows at most five tool names per loaded server, then `(+N more)`. The token-cap refusal says so when one server alone exceeds the ceiling, and points at `mcp_connect_read_tool` and `YAW_MCP_TOOL_TOKEN_CAP` instead of advising a deactivate.
+
+Routing learns differently in two places. A re-dispatch is compared with the earlier query after function words are dropped from both, which changes which re-dispatches count as a miss against the first server. The reward grader takes a bare verdict word only when it is in capitals, opens a line or ends one; a lowercase verdict in mid-sentence now gives no grade instead of a guess. The CLI shadow table gains `npm info`, `whoami`, `profile` and `token`, and `mongodump`.
+
+**Changed -- spawning and proxying**
+
+`MCP_CALL_TIMEOUT` now bounds proxied `resources/read` and `prompts/get` as well as `tools/call`; those two used the SDK default with no override. An edit to `defaultRuntime` in bundles.json is picked up by a running yaw-mcp on the next connect instead of being cached for the life of the process. On Windows, a server env key that matches one of yaw-mcp's own ignoring case (`Path` against `PATH`) replaces every spelling, so the server's value wins. A server entry with no `command` or `url` fails activation with the `Fix "<namespace>" in <file>` pointer, and a git server that is not built yet says to build it and activate again, with no client restart. A slow uv or oam runtime resolution prints a progress line every 5 seconds. The two "also failed" warnings log `oamCategory` and `nodeCategory`, or `managedCategory` and `npxCategory`, in place of a single `category` field. Default result pruning keeps an array that prunes to nothing as `[]` rather than `null`.
+
+**Changed -- `install`, `uninstall` and client configs**
+
+`install` run from a temporary copy (npx) keeps the entry file a stored `oam run` entry already names when that file is a real installed copy, instead of rewriting the entry to npx. Cline targets on Linux follow an absolute `$XDG_CONFIG_HOME`. A bare `install --dry-run` over a differing entry says the overwrite happens `only with --repair or --force` and that the preview assumes the flag. `uninstall --os <other> --dry-run` prints the target path and a `Not inspected` line instead of `Nothing to do`, and `uninstall`'s preview shows the launch and env keys of a Cline entry in the nested `transport` form. A refused client config is described as `not a JSON object` or `not a TOML table`. The `--token` and config `token` deprecation notes, and `--help`, no longer send you to revoke the token: the hosted service that issued it is retired, so deleting it is all there is to do. The stable entry path is no longer taken from a per-session directory (`fnm_multishells/`, `/run/user/<uid>/`), so an install under fnm writes a path that survives the shell. A `~/.yaw-mcp/` that yaw-mcp creates is created mode `0700`.
+
+**Changed -- `add`, `update`, `secrets` and `sidecars`**
+
+`add <slug> --description` now applies on a catalog add, where it was ignored. Re-adding a server with a different launch drops its stored compliance grade, and converting an entry to git drops its stored optional-env marker. `add` names the stored env keys a conversion to a remote server deletes, on a real run and under `--dry-run`. An `add --git` whose start check throws now writes the entry and exits 1 with `"started":false`, as for any failed check; the throw used to escape and leave a build with no entry. A git build that fails before its build step records the step as `layout`, which `doctor` prints. A stored git url that carries a credential in its userinfo is printed with it replaced by `***` in `list --json`, `add --json`, the removal preview and the launch-change note; a bare username (`ssh://git@host/...`) is printed as stored. `update` on an invalid bundles.json reports the line and column and that nothing was written. Warning text from `audit`, `discover` and `health` redacts URL userinfo and `key=` query values.
+
+`secrets` counts a git entry's `git.tokenSecret` as a use of that secret, and `secrets reset` names the passphrase's real source. `sidecars` no longer reports a bare package name and `name@latest` as a version conflict, and its failure lines say whether an existing managed install stays in use. A malformed `${secret:...}` reference is quoted up to 27 characters (was 40). `search` prints control characters in catalog text as `?`, and a newline or tab as a space. `foundry export` reports a harvest it cannot read as such instead of as absent.
+
+**Fixed -- background upgrade and shutdown**
+
+The background self-upgrade does nothing for a global npm install whose prefix it cannot resolve, where it used to run npm without `--prefix`, and it removes an upgrade lock it created but could not finish writing, which used to block later upgrades. When `server.shutdown()` rejects, yaw-mcp logs `Shutdown failed` and exits 1 at once instead of waiting for the 10-second watchdog. Activating over a connection in an error state closes the displaced upstream, so its child process does not linger, and a failed background tool-list refresh backs off instead of retrying on every sweep.
+
+**Internal -- `release.sh` and the verify scripts**
+
+Not part of the published package. `release.sh` ignores a `## ` line inside a fenced code block when it reads CHANGELOG.md, refuses to push when `server.json` or `package.json` no longer carries the registry identity (`io.github.YawLabs/mcp`, `@yawlabs/mcp`), requires `scripts/is-main-module.mjs` in its pre-flight, and no longer suggests a login command under a directory it deletes on exit. `.oam-eval-*.cjs` is ignored by git.
+
 ## 1.1.13
 
 **Changed -- MCP SDK moves to `@modelcontextprotocol/server` 2.4.0 and `@modelcontextprotocol/sdk` 1.32.2**

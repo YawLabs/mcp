@@ -58,10 +58,12 @@
 //     `{ command: "cmd", args: ["/c", "npx", "-y", "@yawlabs/mcp@latest"] }`.
 //     (`@latest` is what buildLaunchEntry actually writes -- see the `pkg`
 //     default there; the unpinned spelling here read as a second, wrong shape.)
-//     Continue is the one exception, and it is the CLIENT's rule, not ours:
-//     it adds the cmd.exe wrapper itself, and a pre-wrapped entry breaks it
-//     under a WSL remote. That is `entry.windowsLaunch.broker: "bare"` on
-//     its row, never a client-id branch in a consumer.
+//     The exceptions are the rows that declare
+//     `entry.windowsLaunch.broker: "bare"` -- Continue, Codex CLI and typed
+//     today -- and each is the CLIENT's rule, not ours, stated on its own row
+//     (Continue adds the cmd.exe wrapper itself, and a pre-wrapped entry
+//     breaks it under a WSL remote). It is row data, never a client-id branch
+//     in a consumer.
 //   • Zed's container key is `context_servers`, not `mcpServers`, and on Linux
 //     its directory follows $XDG_CONFIG_HOME -- but only when that value is
 //     ABSOLUTE, the rule Zed inherits from the dirs crate.
@@ -90,6 +92,7 @@ import { type ConfigSite, effectiveConfigFormat, type SyntaxName, siteAt } from 
 import {
   type ClientEnvValues,
   defineTarget,
+  type ImportView,
   type InlineClientId,
   type InlineTarget,
   type InstallOS,
@@ -112,13 +115,37 @@ import { ZED_TARGET } from "./target-zed.js";
 // `from "./install-targets.js"` import path keeps resolving to the same name.
 export * from "./install-target-model.js";
 
+/** Gemini CLI's entry as `import` reads it. Gemini spells a streamable-HTTP
+ *  remote `httpUrl`, a key the importer does not know (it reads `url`), so a
+ *  server stored that way used to be skipped as "no command or url to
+ *  launch". Mapped here, on the row, per ImportView's rule.
+ *
+ *  `httpUrl` wins over a `url` beside it and is streamable-HTTP whatever
+ *  `type` says -- Gemini CLI's own precedence (createTransport in its
+ *  packages/core/src/tools/mcp-client.ts, read 2026-11-15: "Priority 1:
+ *  httpUrl") -- so both are dropped from the view and the importer's default
+ *  transport (streamable-http) applies. An entry with no `httpUrl` is
+ *  returned as stored: a `url` with `type: "sse"` already imports as SSE, and
+ *  a bare `url` as streamable-http, which is that same function's default
+ *  for a `url` without a `type`. */
+function geminiImportView(stored: Record<string, unknown>): ImportView {
+  if (typeof stored.httpUrl !== "string" || stored.httpUrl.trim() === "") return { entry: stored };
+  const { httpUrl, url: _url, type: _type, ...rest } = stored;
+  return { entry: { ...rest, url: httpUrl } };
+}
+
 const TARGET_ROWS = [
   defineTarget({
     clientId: "claude-code",
     label: "Claude Code",
     config: { format: "jsonc", root: "mcpServers" },
     availableOn: ["macos", "linux", "windows"],
-    hooks: { permissionsPatch: "claude-code" },
+    // importVariables: Claude Code expands `${VAR}` and `${VAR:-default}` in
+    // an entry's command, args, env, url and headers, in `.mcp.json` and in
+    // `~/.claude.json` alike (code.claude.com/docs/en/mcp, "Environment
+    // variable expansion in .mcp.json", read 2026-11-15), so `import` refuses
+    // a server carrying one rather than copy the literal text.
+    hooks: { permissionsPatch: "claude-code", importVariables: "posix-env" },
     scopes: [
       {
         scope: "user",
@@ -179,6 +206,11 @@ const TARGET_ROWS = [
     label: "Cursor",
     config: { format: "jsonc", root: "mcpServers" },
     availableOn: ["macos", "linux", "windows"],
+    // Cursor resolves `${env:NAME}`, `${userHome}`, `${workspaceFolder}`,
+    // `${workspaceFolderBasename}`, `${pathSeparator}` and `${/}` in command,
+    // args, env, url and headers (cursor.com/docs/mcp, "Config
+    // interpolation", read 2026-11-15).
+    hooks: { importVariables: "cursor-env" },
     scopes: [
       {
         scope: "user",
@@ -244,6 +276,9 @@ const TARGET_ROWS = [
     label: "Gemini CLI",
     config: { format: "jsonc", root: "mcpServers" },
     availableOn: ["macos", "linux", "windows"],
+    // `url` + `type` and a bare `url` import as they are; `httpUrl` is the one
+    // Gemini spelling the importer cannot read -- see geminiImportView.
+    entry: { forImport: geminiImportView },
     // The folder-trust sentence was measured on Gemini CLI 0.66.0 (Linux,
     // 2026-10-31): in a folder not yet trusted, `gemini mcp list` showed a
     // working user-level server as "Disabled", with "MCP servers are
@@ -976,7 +1011,9 @@ export interface BuildLaunchEntryOptions {
    *  both are resolved by the caller: `oamBinPath` from the version-gated
    *  probe's `binPath`, `oamEntry` from resolveStableNpmEntry (durable installs
    *  only -- never the npx cache, which a config file must not point at).
-   *  Either being null keeps the npx entry.
+   *  install-cmd.ts falls back, when that resolver answers null, to the entry
+   *  file a stored `oam run` entry already names if it is still a file (its
+   *  storedOamEntryFile). Either being null keeps the npx entry.
    *
    *  `binPath`, NOT the probe's `bin`. The two differ for the same reason
    *  resolveNpmEntry and resolveStableNpmEntry do: `bin` is what THIS process
@@ -985,9 +1022,9 @@ export interface BuildLaunchEntryOptions {
    *  some other process reads. On macOS and Linux, oam's install.sh installs to
    *  `$HOME/.oam/bin` and only prints an `export PATH=...` line for the shell
    *  profile, so a GUI-launched client (Claude Desktop, Cursor from Finder)
-   *  inherits no such PATH -- a bare `oam` there is an ENOENT with no fallback,
-   *  and doctor cannot even see it (it flags a missing command only when
-   *  isAbsolute(command)). On Windows, install.ps1 installs to
+   *  inherits no such PATH -- a bare `oam` there is an ENOENT with no fallback
+   *  (doctor does report one that is already on disk: launchOamNotAbsolute in
+   *  doctor-cmd.ts's launchChecks). On Windows, install.ps1 installs to
    *  `%LOCALAPPDATA%\oam\bin` by default and does add its install dir to the
    *  user PATH -- but a client started before that change still lacks it, and
    *  an oam that install.ps1 did not put on disk gets no such entry. A
@@ -1001,20 +1038,24 @@ export interface BuildLaunchEntryOptions {
    *
    *  Scope of the safety claim: taking this path is an upgrade AT WRITE TIME.
    *  It cannot replace a launcher that works right now -- but the entry is
-   *  baked, never re-resolved, and the client spawns `oam run --no-check <path>`
-   *  verbatim, so none of the sidecar protections apply later (no
-   *  MIN_OAM_VERSION gate, no ENOENT-to-npx retry, no boot-failure downgrade).
-   *  A subsequent `npm rm -g @yawlabs/mcp` or oam uninstall breaks every client,
-   *  and doctor reports a clean bill of health because it never checks the entry
-   *  path in `args`.
+   *  baked, and the client spawns `oam run --no-check <path>` verbatim, so
+   *  none of the sidecar protections apply at launch (no MIN_OAM_VERSION gate,
+   *  no ENOENT-to-npx retry, no boot-failure downgrade). A subsequent
+   *  `npm rm -g @yawlabs/mcp` or oam uninstall breaks every client until
+   *  something rewrites the entry. Two things already look for that, so do
+   *  not add a third: doctor's launchChecks (doctor-cmd.ts) reports an entry
+   *  file that is gone or not a file as launchOamEntryMissing, and the heal
+   *  sweep (heal-entries.ts) rewrites such an entry when its path sits in a
+   *  `node_modules/@yawlabs/mcp/` tree.
    *
    *  Note this is a DIFFERENT axis from `runtime: "oam"` in bundles.json:
    *  that hosts the sidecars the broker spawns, this hosts the broker. */
   oamBinPath?: string | null;
   oamEntry?: string | null;
   /** Wrap the default broker entry in `cmd /c` on Windows. Defaults to TRUE,
-   *  which is what every client but Continue needs -- `npx` is a `.cmd` shim
-   *  and a client that spawns it directly gets ENOENT.
+   *  which is what every row needs except one declaring
+   *  `entry.windowsLaunch.broker: "bare"` -- `npx` is a `.cmd` shim and a
+   *  client that spawns it directly gets ENOENT.
    *
    *  Only the DEFAULT branch reads it. The `upstream` branch always wraps (a
    *  third-party launcher's args have to survive cmd's parse, which is what
@@ -1247,11 +1288,12 @@ export function buildLaunchEntry(opts: BuildLaunchEntryOptions): LaunchEntry {
   // No `env` on the default entry: yaw-mcp is local-only, so there is no
   // token to inject. Servers come from ~/.yaw-mcp/bundles.json.
   //
-  // `windowsWrap: false` emits the BARE launcher on Windows, for a client that
-  // resolves the `.cmd` shim itself (Continue does, and pre-wrapping breaks it
-  // under a WSL remote). The policy is the target row's -- `entry.windowsLaunch`
-  // -- and the caller reads it off the row; this function only applies it, so
-  // the default stays the `cmd /c` wrap every other client needs.
+  // `windowsWrap: false` emits the BARE launcher on Windows, for a row that
+  // declares `entry.windowsLaunch.broker: "bare"` because its client launches
+  // the `.cmd` shim itself (Continue, for one: pre-wrapping breaks it under a
+  // WSL remote). The policy is the target row's and the caller reads it off
+  // the row; this function only applies it, so the default stays the `cmd /c`
+  // wrap every other row needs.
   return opts.os === "windows" && opts.windowsWrap !== false
     ? { command: "cmd", args: ["/c", "npx", "-y", pkg] }
     : { command: "npx", args: ["-y", pkg] };

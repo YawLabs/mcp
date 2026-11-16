@@ -98,7 +98,7 @@ import {
 } from "./install-targets.js";
 import { createStreamWriter, log } from "./logger.js";
 import { CONFIG_DIRNAME } from "./paths.js";
-import { askYesNo, QUESTION_CANCELLED } from "./readline-question.js";
+import { askYesNo, isInteractivePrompt, QUESTION_CANCELLED } from "./readline-question.js";
 
 // The --client line is derived from the same table parseTryArgs validates
 // against (and that completion-cmd builds INSTALL_CLIENTS from), not a
@@ -182,7 +182,7 @@ export const TRY_CLEANUP_USAGE = `Usage: yaw-mcp try-cleanup <slug> [--force]
                       is not a TTY (there is nothing to ask on).`;
 
 export const TRIAL_SCHEMA_VERSION = 1;
-export const TRIALS_DIRNAME = "trials";
+const TRIALS_DIRNAME = "trials";
 
 /** Every entry `try` writes is named `yaw-mcp-try-<slug>`. The cleanup and GC
  *  paths delete `marker.entryName` from `marker.clientPath` using values read
@@ -395,11 +395,14 @@ export function parseTryArgs(
       case "--help":
         return { ok: false, error: TRY_USAGE, help: true };
       default:
-        if (a.startsWith("--")) return { ok: false, error: `Unknown flag: ${a}\n${TRY_USAGE}` };
         // A bare "-" is not a valid slug; reject it here with a clear
         // arg-parse error rather than letting it slip to the slug regex,
         // which would only reject it later with a generic "invalid slug".
         if (a === "-") return { ok: false, error: `Invalid argument "-".\n${TRY_USAGE}` };
+        // ONE dash is enough to be a flag, as in import's parser: a slug
+        // never starts with one, and counting `-n` as the slug answered a
+        // mistyped flag with "Expected exactly one server slug, got 2".
+        if (a.startsWith("-")) return { ok: false, error: `Unknown flag: ${a}\n${TRY_USAGE}` };
         positional.push(a);
     }
   }
@@ -427,10 +430,12 @@ export function parseTryCleanupArgs(
       opts.force = true;
       continue;
     }
-    if (a.startsWith("--")) return { ok: false, error: `Unknown flag: ${a}\n${TRY_CLEANUP_USAGE}` };
     // Reject a bare "-" with a clear arg-parse error rather than deferring
     // to the slug regex's generic "invalid slug" message.
     if (a === "-") return { ok: false, error: `Invalid argument "-".\n${TRY_CLEANUP_USAGE}` };
+    // One dash is a flag here too (see parseTryArgs): `try-cleanup -f demo`
+    // is an unknown flag, not a second slug.
+    if (a.startsWith("-")) return { ok: false, error: `Unknown flag: ${a}\n${TRY_CLEANUP_USAGE}` };
     positional.push(a);
   }
   if (positional.length !== 1) {
@@ -1194,11 +1199,12 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   // whenever the client has one and every shipped target does, so `scope`
   // is always "user" by the time control arrives here. It last fired while
   // VS Code was project-only. Keeping it is what makes a project-only client
-  // added later refuse rather than silently commit the secret; there is no
-  // test that exercises the refusal firing, because no shipped target can
-  // reach it -- the sibling suite pins the AVOIDANCE instead (a trial lands
-  // in the private user file while a committed .vscode/mcp.json sits beside
-  // it, untouched and unwarned about).
+  // added later refuse rather than silently commit the secret. No shipped
+  // target can reach it, so the test that exercises it (try-cmd.test.ts, "a
+  // project-only client") makes one: it takes the user scope off the vscode
+  // row for the length of the test. The sibling suite pins the AVOIDANCE (a
+  // trial lands in the private user file while a committed .vscode/mcp.json
+  // sits beside it, untouched and unwarned about).
   if (scope === "project" && entryHasSecrets) {
     const target = INSTALL_TARGETS.find((t) => t.clientId === clientId);
     const scopeSpec = target?.scopes.find((s) => s.scope === scope);
@@ -1578,14 +1584,6 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   return { exitCode: 0, written, marker };
 }
 
-/** Both ends must be a TTY: stdin to read the answer, stdout to show the
- *  question. Same predicate, and the same test seams, as `remove` and `set`. */
-function isInteractive(opts: TryCleanupOptions): boolean {
-  if (opts.isTTY !== undefined) return opts.isTTY;
-  if (opts.promptAnswer !== undefined) return true;
-  return Boolean(process.stdin.isTTY) && Boolean(process.stdout.isTTY);
-}
-
 export async function runTryCleanup(opts: TryCleanupOptions): Promise<TryCommandResult> {
   const out = opts.out ?? createStreamWriter(process.stdout);
   const err = opts.err ?? createStreamWriter(process.stderr);
@@ -1655,7 +1653,7 @@ export async function runTryCleanup(opts: TryCleanupOptions): Promise<TryCommand
     print("  The entry stops launching, and any value stored inline on it goes");
     print("  with it. Your other entries in that file are untouched.");
     print("");
-    if (!isInteractive(opts)) {
+    if (!isInteractivePrompt(opts)) {
       // Exit 2, the code every off-TTY confirmation refusal in this CLI uses
       // (`remove`, `set`, `uninstall`, `secrets remove`).
       printErr(

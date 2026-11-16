@@ -128,8 +128,9 @@ export function formatHealthWarning(
 // "unauthorized: api_key=<redacted>" still tells the model what went wrong,
 // which is the whole point of surfacing the excerpt at all.
 //
-// ORDER IS LOAD-BEARING. The auth-scheme rule runs FIRST: with the
-// name/value rule ahead of it, `Authorization: Bearer <blob>` matched
+// ORDER IS LOAD-BEARING. The auth-scheme rule (1) runs BEFORE the name/value
+// rule (2), and the URL-userinfo rule (0) before both, for the reason given
+// on it. With the name/value rule ahead of the auth-scheme one, `Authorization: Bearer <blob>` matched
 // name=Authorization value=`Bearer`, so the SCHEME WORD was redacted and the
 // actual token survived into the output. Scheme-first collapses the whole
 // `Bearer <blob>` run to the marker, and because the name/value rule's value
@@ -224,6 +225,28 @@ const ABSENCE_VALUE =
 const ABSENCE_TAIL_VALUE = /(?<![^ \t])(?=[^ \t]{16}|[^ \t]*[0-9])[^ \t]{8,}/g;
 
 const SECRET_PATTERNS: ReadonlyArray<{ re: RegExp; replace: (match: string, ...groups: string[]) => string }> = [
+  // 0. A URL's userinfo (`https://user:key@host/mcp`, `https://key@host`).
+  // There is no NAME here for rule 2 to anchor on, and both halves can be the
+  // credential, so the whole userinfo goes and the host stays. Runs BEFORE
+  // the rules below so that a userinfo spelled `token:abc@host` is not taken
+  // by rule 2 as a NAME: value pair, which would redact the host with it.
+  //
+  // Anchored on `://` rather than on a scheme pattern, and BOUNDED: a
+  // `[a-z][a-z0-9+.-]*://` prefix rescans every long alphanumeric run from
+  // each of its positions (the quadratic shape rule 2's prefix bound exists
+  // for). Accepted costs: a non-secret user (`ssh://git@github.com`) is
+  // hidden too, a userinfo over 512 chars is not matched, and neither is an
+  // unencoded credential holding `/`, `?` or `#` (upstream.ts's
+  // displayRemoteUrl handles that shape for the urls it echoes).
+  //
+  // The class also stops at a quote, backtick, angle bracket or comma: the
+  // characters that END a path-less url inside an echoed body. Without them
+  // `{"url":"https://api.example.com","email":"bob@example.com"}` read
+  // everything up to the email's `@` as userinfo and came out as
+  // `https://<redacted>@example.com` -- the real host gone, a mail domain in
+  // its place. Accepted cost, same kind as above: a userinfo holding one of
+  // those characters unencoded is not matched.
+  { re: /(:\/\/)[^\s/?#@"'`<>,]{1,512}@/g, replace: (_m: string, lead: string) => `${lead}${REDACTED}@` },
   // 1. An HTTP `Authorization: Bearer <blob>` / `Basic <blob>` header value.
   // Scheme list is not just bearer/basic: any other scheme fell through to
   // rule 2, which then captured the SCHEME WORD as the value and left the
@@ -238,8 +261,14 @@ const SECRET_PATTERNS: ReadonlyArray<{ re: RegExp; replace: (match: string, ...g
   // the blob has to LOOK like a credential -- carry a digit, or run 16+ chars
   // -- which no English word following "key" / "token" / "basic" / "digest"
   // does, while a real token nearly always does. `bearer` and `hmac` are
-  // scheme names, not prose, so they stay unanchored and a short all-letter
-  // bearer token is still caught. A short letters-only blob after a bare-word
+  // rarely anything but scheme names, so they stay ungated and a short
+  // all-letter bearer token is still caught. ACCEPTED COST: they do occur in
+  // prose, and any 8+ char word after one goes with it -- "401: Bearer
+  // authentication required" reads "401: <redacted> required" and "invalid
+  // bearer credentials" reads "invalid <redacted>", the same over-scrub the
+  // shape gate removes for the bare-word schemes. Kept because a leaked
+  // short bearer token is the worse outcome; the tests pin both sides. A
+  // short letters-only blob after a bare-word
   // scheme in PROSE is the accepted miss -- but in header position, right
   // after `Authorization:` (or any `-Authorization:` header spelling), the
   // word after the scheme is a credential by construction, so there the shape
@@ -326,6 +355,12 @@ const SECRET_PATTERNS: ReadonlyArray<{ re: RegExp; replace: (match: string, ...g
     replace: () => REDACTED,
   },
   { re: /\bAKIA[0-9A-Z]{16}\b/g, replace: () => REDACTED },
+  // 4. A bare `key` QUERY PARAMETER (`?key=AIza...`, the Google API spelling).
+  // `key` is deliberately not in SECRET_KEY_NAMES -- as a NAME: pair it is
+  // ordinary prose ("primary key: id") -- so it is redacted only in query
+  // position, right after `?` or `&`. A harmless `?key=` (a lookup key) is
+  // hidden with it, the over-redaction SECRET_KEY_NAMES accepts for `sig=`.
+  { re: /([?&]key=)[^\s&#"'<]+/gi, replace: (_m: string, lead: string) => `${lead}${REDACTED}` },
 ];
 
 /** Blank out credential-shaped substrings before an upstream error excerpt
@@ -335,7 +370,7 @@ const SECRET_PATTERNS: ReadonlyArray<{ re: RegExp; replace: (match: string, ...g
  *  points here as the one, shape-specific scrubber. This is not a general
  *  scrubber and does not pretend to be one -- it cannot know a third-party server's
  *  private encoding. It closes the shapes actually observed leaking (URLs
- *  with `?api_key=`, echoed request bodies, `Authorization:` header dumps,
+ *  with `?api_key=`, `?key=` or a `user:key@` userinfo, echoed request bodies, `Authorization:` header dumps,
  *  vendor-prefixed keys), so the excerpt that IS load-bearing for the model
  *  ("502 bad gateway", "spawn ENOENT npx") survives while the value next to a
  *  credential-shaped name does not. Anything it misses is still bounded by

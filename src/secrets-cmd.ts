@@ -24,6 +24,7 @@ import { chmod, copyFile, constants as fsConstants, readFile, unlink } from "nod
 import { homedir } from "node:os";
 import { loadLocalBundles } from "./local-bundles.js";
 import { createStreamWriter } from "./logger.js";
+import { isInteractivePrompt } from "./readline-question.js";
 import { type AuditEvent, readAuditLog } from "./secrets-audit.js";
 import {
   checkVaultPassphrase,
@@ -137,8 +138,9 @@ Flags:
                           schema-behind file, a malformed check marker, a
                           short passphrase, a vault just created, rotated
                           or reset, a value printed in cleartext to a
-                          terminal) and, on failure, the
-                          {"ok":false,"error":...} envelope last -- an
+                          terminal, a bundles.json or trust store that
+                          \`set\` could not read or parse) and, on failure,
+                          the {"ok":false,"error":...} envelope last -- an
                           argument error too (exit 2, no usage text). Key
                           on "warning" vs "ok", never on line position. An
                           argument error also puts one line on stdout,
@@ -246,8 +248,13 @@ export interface SecretsCommandOptions {
 /** The ONE output sink for everything that is not a prompt: results on
  *  `out`, and every error envelope, warning and nudge on `err`. Declared
  *  once and threaded through every helper, so an embedder that supplies
- *  the pair captures the whole command -- no helper reaches for
- *  process.stderr (or a stream in `opts.io`) on its own. */
+ *  the pair captures the whole command -- no helper IN THIS FILE reaches for
+ *  process.stderr (or a stream in `opts.io`) on its own.
+ *
+ *  That includes the loader secretConsumers calls after a successful `set`:
+ *  loadLocalBundles' own warn lines for an unreadable or invalid bundles.json
+ *  arrive through its `onWarning` (as loadVault's do) and are written to
+ *  `err` -- as a JSON line under --json -- rather than by logger.ts. */
 export interface SecretsIo {
   out: (s: string) => void;
   err: (s: string) => void;
@@ -681,10 +688,12 @@ function ttyEnds(opts: SecretsCommandOptions): { stdin: boolean; stdout: boolean
 }
 
 /** Can we prompt? Both ends must be a TTY: stdin to read the answer,
- *  stdout to show the question. */
+ *  stdout to show the question -- the shared verdict (isInteractivePrompt in
+ *  readline-question.ts) over this command's injected streams. `secrets` has
+ *  no isTTY / promptAnswer seam, so only `io` is handed on; ttyEnds above
+ *  stays for the refusal that names WHICH end failed. */
 function isInteractiveTTY(opts: SecretsCommandOptions): boolean {
-  const ends = ttyEnds(opts);
-  return ends.stdin && ends.stdout;
+  return isInteractivePrompt({ io: opts.io });
 }
 
 /** Name the end(s) that are not a TTY, for the non-interactive refusal.
@@ -835,6 +844,80 @@ function freshVaultNudge(io: SecretsIo, path: string, json: boolean | undefined)
   io.err(`yaw-mcp secrets: created the vault at ${path}.\n${lines.join("\n")}\n`);
 }
 
+/** One `err` line for a warning loadLocalBundles raised while secretConsumers
+ *  read bundles.json. Under --json it is its own JSON line with `warning` as
+ *  the discriminator, like vaultLoadWarningNotice's; `path` and the loader's
+ *  other fields (a position, an errno -- never file content) ride along. */
+function bundlesLoadWarningNotice(
+  io: SecretsIo,
+  warning: { message: string; data?: Record<string, unknown> },
+  json: boolean | undefined,
+): void {
+  if (json) {
+    io.err(`${JSON.stringify({ warning: "bundles-load", message: warning.message, ...warning.data })}\n`);
+    return;
+  }
+  // The path, then where or why: the parse position bare (it already reads
+  // "at line L, column C"), every other field as key=value (error=, code=).
+  // Without them this line said a file was ignored and not where it broke.
+  const data = warning.data ?? {};
+  const details: string[] = [];
+  if (typeof data.path === "string") details.push(data.path);
+  if (typeof data.location === "string") details.push(data.location);
+  for (const [k, v] of Object.entries(data)) {
+    if (k === "path" || k === "location") continue;
+    if (typeof v === "string" || typeof v === "number") details.push(`${k}=${v}`);
+  }
+  io.err(`yaw-mcp secrets: warning -- ${warning.message}${details.length > 0 ? ` (${details.join("; ")})` : ""}.\n`);
+}
+
+/** Run `fn` with everything written to process.stderr held back, and return
+ *  it as lines alongside the result. For the one call below whose callee logs
+ *  through logger.ts on paths that take no warning sink. The real write is
+ *  restored before this returns, whether `fn` resolved or threw. */
+async function withStderrHeld<T>(fn: () => Promise<T>): Promise<{ value: T; lines: string[] }> {
+  const real = process.stderr.write;
+  let held = "";
+  process.stderr.write = ((chunk: unknown, ...rest: unknown[]): boolean => {
+    held += typeof chunk === "string" ? chunk : Buffer.from(chunk as Uint8Array).toString("utf8");
+    const done = rest[rest.length - 1];
+    if (typeof done === "function") (done as () => void)();
+    return true;
+  }) as typeof process.stderr.write;
+  try {
+    const value = await fn();
+    return { value, lines: held.split("\n").filter((l) => l !== "") };
+  } finally {
+    process.stderr.write = real;
+  }
+}
+
+/** One `err` line, under --json, for a line the bundles load wrote to
+ *  process.stderr itself. A logger.ts warn or error -- its plain CLI sentence
+ *  (`yaw-mcp: warning: ...`) or its structured record ({level, msg, ...}) --
+ *  becomes a {"warning":"bundles-load"} line like bundlesLoadWarningNotice's.
+ *  Any other JSON object (a line that notice already wrote through a default
+ *  `io.err`, a debug record the operator asked for) passes through as it is. */
+function heldStderrLineNotice(io: SecretsIo, line: string): void {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    parsed = undefined;
+  }
+  if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+    const { level, msg, ts: _ts, ...data } = parsed as Record<string, unknown>;
+    if ((level === "warn" || level === "error") && typeof msg === "string") {
+      io.err(`${JSON.stringify({ ...data, warning: "bundles-load", message: msg })}\n`);
+    } else {
+      io.err(`${line}\n`);
+    }
+    return;
+  }
+  const message = line.replace(/^yaw-mcp: (?:warning|error): /, "");
+  io.err(`${JSON.stringify({ warning: "bundles-load", message })}\n`);
+}
+
 /** Which configured servers reference `${secret:NAME}`, from the bundles.json
  *  every other CLI command loads (an approved project file, else the
  *  user-global one). `namespaces` is sorted and empty when nothing references
@@ -848,6 +931,9 @@ function freshVaultNudge(io: SecretsIo, path: string, json: boolean | undefined)
  *  the same reason: a local server's refs ride in `env`, a remote one's in
  *  `headers` (its `env` is never sent). The scan itself is secrets-vault's
  *  shared collectSecretRefNames, never a local matchAll over SECRET_REF_RE.
+ *  A git entry also names a vault secret OUTSIDE those maps, as the bare
+ *  NAME in `git.tokenSecret` (types.ts), and that counts as a reference too:
+ *  the token is read at clone time, so a replaced one matters to that server.
  *
  *  This is the bundles.json THIS process resolves from ITS cwd. A running
  *  yaw-mcp resolved its own from the cwd its client launched it in, so the
@@ -857,12 +943,37 @@ async function secretConsumers(
   name: string,
   home: string,
   cwd: string | undefined,
+  io: SecretsIo,
+  json: boolean | undefined,
 ): Promise<{ path: string | null; namespaces: string[] } | null> {
-  const loaded = await loadLocalBundles({ cwd: cwd ?? process.cwd(), home, env: process.env }).catch(() => null);
+  const load = () =>
+    loadLocalBundles({
+      cwd: cwd ?? process.cwd(),
+      home,
+      env: process.env,
+      // The loader's own warn lines (an unreadable or invalid bundles.json),
+      // taken through `io.err` instead of logger.ts: a prose line written
+      // straight to process.stderr bypassed the sink, and under --json it broke
+      // the one-JSON-object-per-line stderr SECRETS_USAGE describes.
+      onWarning: (w) => bundlesLoadWarningNotice(io, w, json),
+    }).catch(() => null);
+  let loaded: Awaited<ReturnType<typeof load>>;
+  if (json) {
+    // That sink does not reach the load's project-dir walk or its trust-store
+    // read: both still log through logger.ts (an untrusted .yaw-mcp/ outside
+    // $HOME, a corrupt trust store), as prose on the CLI. Under --json those
+    // lines are held and re-issued as JSON, so the contract above holds for
+    // them too. In text mode they are left exactly where they were.
+    const held = await withStderrHeld(load);
+    for (const line of held.lines) heldStderrLineNotice(io, line);
+    loaded = held.value;
+  } else {
+    loaded = await load();
+  }
   if (loaded === null) return null;
   if (loaded.config === null) return loaded.path === null ? { path: null, namespaces: [] } : null;
   const namespaces = loaded.config.servers
-    .filter((s) => collectSecretRefNames(isRemoteEntry(s) ? s.headers : s.env).has(name))
+    .filter((s) => s.git?.tokenSecret === name || collectSecretRefNames(isRemoteEntry(s) ? s.headers : s.env).has(name))
     .map((s) => s.namespace)
     .sort();
   return { path: loaded.path, namespaces };
@@ -1492,7 +1603,7 @@ export async function runSecrets(
       // Read AFTER the save: the vault write is the command, and a
       // bundles.json that will not load must never turn a stored secret into
       // a failed run. See secretConsumers for what null means.
-      const consumers = await secretConsumers(name, home, opts.cwd);
+      const consumers = await secretConsumers(name, home, opts.cwd, io, opts.json);
       if (opts.json) {
         io.out(
           `${JSON.stringify({
@@ -2054,9 +2165,13 @@ async function runSecretsReset(opts: SecretsCommandOptions, io: SecretsIo): Prom
   // (resolvePassphrase returns null for it), not "fall through to the env".
   const scripted = opts.passphrase ?? process.env.YAW_MCP_VAULT_PASSPHRASE ?? "";
   if (guardable && vault !== null && scripted.length > 0) {
+    // Named for where it came from: an embedder's opts.passphrase is not the
+    // env var (which may not even be set), the rule the options doc states
+    // and envKeyed below follows.
+    const subject = opts.passphrase === undefined ? "YAW_MCP_VAULT_PASSPHRASE" : "the supplied passphrase";
     const verdict = await resetGuardVerdict(vault, scripted);
-    if (typeof verdict === "object") return fail(guardFailedMessage("YAW_MCP_VAULT_PASSPHRASE", path, verdict.failed));
-    if (verdict !== "wrong") return fail(alreadyOpensMessage(verdict, "YAW_MCP_VAULT_PASSPHRASE", path));
+    if (typeof verdict === "object") return fail(guardFailedMessage(subject, path, verdict.failed));
+    if (verdict !== "wrong") return fail(alreadyOpensMessage(verdict, subject, path));
   }
 
   // Named once, before the preamble, so the path the user is shown is the

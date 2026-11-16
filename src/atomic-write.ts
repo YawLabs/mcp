@@ -181,10 +181,6 @@ export async function atomicWriteFile(
   const birthMode = mode ?? preserved;
   try {
     await writeFile(tmp, contents, birthMode === undefined ? { encoding } : { encoding, mode: birthMode });
-    // Only once the tmp write has landed: a directory that refused the write
-    // is not one to go deleting in, and the sweep's own errors never reach
-    // the caller (see sweepStaleTmpSiblings).
-    await sweepStaleTmpSiblings(dir, path.basename(target), tmp);
     if (preserved !== undefined) {
       try {
         // writeFile's mode is masked by the process umask, so a preserved
@@ -205,6 +201,15 @@ export async function atomicWriteFile(
     await unlink(tmp).catch(() => undefined);
     throw err;
   }
+  // Only once the write is PUBLISHED. The sweep lists the target's whole
+  // directory -- $HOME for ~/.claude.json, a project root for .mcp.json --
+  // and that listing used to sit between the tmp write and the rename, so a
+  // large or network-mounted directory held the new bytes unpublished for as
+  // long as the listing took. Here the caller still waits for it, but the
+  // write does not. A write that failed never gets here: a directory that
+  // refused the tmp file or the rename is not one to go deleting in. The
+  // sweep's own errors never reach the caller (see sweepStaleTmpSiblings).
+  await sweepStaleTmpSiblings(dir, path.basename(target), tmp);
 }
 
 /**

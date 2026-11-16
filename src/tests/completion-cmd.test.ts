@@ -664,7 +664,7 @@ describe("SUBCOMMAND_SPEC coverage", () => {
 
   it("offers --help on every subcommand that carries flags", () => {
     // `install` was the lone flag-carrying entry without --help even though
-    // parseInstallArgs accepts it (install-cmd.ts returns helpRequested), so
+    // parseInstallArgs accepts it, so
     // `yaw-mcp install --<TAB>` was the only one that hid it.
     const missing = SUBCOMMAND_SPEC.filter((s) => s.flags.length > 0 && !s.flags.includes("--help")).map((s) => s.name);
     expect(missing).toEqual([]);
