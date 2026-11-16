@@ -15,11 +15,29 @@
 // ("[0]") and dot-numeric (".0") array indexing. Returns null if the
 // path is malformed.
 //
+// A dot-numeric segment comes back as a NUMBER here, but that is the parsed
+// shape, not the last word: resolveRef reads it as an object key instead
+// when the value at that point is a plain object (see parseRefSegments).
+//
 // NOTE: the first segment is always the step id. Subsequent segments
 // drill into the bound value. An empty trailing bracket, unbalanced
 // brackets, or a leading dot (other than via the expected shape) all
 // return null so callers fail loudly instead of silently reading `undefined`.
 export function parseRefPath(raw: string): Array<string | number> | null {
+  return parseRefSegments(raw)?.tokens ?? null;
+}
+
+// parseRefPath plus, for each token, the text a DOT-numeric segment was
+// written as (`dotText[j]` is "2024" for `.2024` and "007" for `.007`;
+// undefined for a key segment, a bracket index and the step id).
+//
+// resolveRef needs that text because the number alone cannot say what the
+// author meant: `.2024` is an array index when the value there is an array,
+// and the object key "2024" when it is an object keyed by year or id. The
+// conversion to a number also drops leading zeros, so "007" could never be
+// recovered from the token. A bracket index carries no text on purpose: `[n]`
+// stays array-only.
+function parseRefSegments(raw: string): { tokens: Array<string | number>; dotText: Array<string | undefined> } | null {
   if (typeof raw !== "string" || raw.length === 0) return null;
 
   const tokens: Array<string | number> = [];
@@ -85,15 +103,18 @@ export function parseRefPath(raw: string): Array<string | number> | null {
   // Post-pass: convert dot-numeric segments ("foo.0.bar") into numeric
   // indices so downstream resolution uses Array[n] uniformly. The first
   // token (step id) is always treated as a string even if it looks
-  // numeric, since step ids may be any string.
+  // numeric, since step ids may be any string. The written text is kept
+  // beside the number for resolveRef's object-key case (see above).
+  const dotText: Array<string | undefined> = tokens.map(() => undefined);
   for (let j = 1; j < tokens.length; j++) {
     const tok = tokens[j];
     if (typeof tok === "string" && /^\d+$/.test(tok)) {
+      dotText[j] = tok;
       tokens[j] = Number(tok);
     }
   }
 
-  return tokens;
+  return { tokens, dotText };
 }
 
 export interface RefResolutionError {
@@ -125,10 +146,11 @@ export function isRefNode(node: unknown): node is { $ref: string } {
 // attempt to drill into a primitive). The thrown error carries the
 // original ref string so the caller can surface it to the user.
 export function resolveRef(refRaw: string, bindings: Record<string, unknown>): unknown {
-  const tokens = parseRefPath(refRaw);
-  if (!tokens) throw new RefError({ ref: refRaw, reason: "malformed path" });
+  const parsed = parseRefSegments(refRaw);
+  if (!parsed) throw new RefError({ ref: refRaw, reason: "malformed path" });
+  const { tokens, dotText } = parsed;
 
-  const [stepIdToken, ...rest] = tokens;
+  const stepIdToken = tokens[0];
   if (typeof stepIdToken !== "string") {
     // LOAD-BEARING -- do not delete as "unreachable". parseRefPath does NOT
     // always emit a string first: a bracket-leading ref like "[0]" parses to
@@ -142,10 +164,19 @@ export function resolveRef(refRaw: string, bindings: Record<string, unknown>): u
   }
 
   let cursor: unknown = bindings[stepIdToken];
-  for (const seg of rest) {
+  for (let j = 1; j < tokens.length; j++) {
+    let seg = tokens[j];
     if (cursor === null || cursor === undefined) {
-      throw new RefError({ ref: refRaw, reason: `cannot read "${String(seg)}" of ${String(cursor)}` });
+      throw new RefError({ ref: refRaw, reason: `cannot read "${String(dotText[j] ?? seg)}" of ${String(cursor)}` });
     }
+    // A dot-numeric segment on a plain object is that object's KEY, read as
+    // the text it was written with: `{byYear: {"2024": 5}}` is reachable as
+    // `a.byYear.2024`, and an id-keyed map keeps its leading zeros. Only an
+    // array turns the segment into an index. Without this a digit-only key
+    // could not be addressed at all -- brackets take digits only -- and the
+    // failure surfaced at run time, after earlier steps had already run.
+    const written = dotText[j];
+    if (written !== undefined && typeof cursor === "object" && !Array.isArray(cursor)) seg = written;
     if (typeof seg === "number") {
       if (!Array.isArray(cursor)) {
         throw new RefError({ ref: refRaw, reason: `index [${seg}] applied to non-array` });
@@ -157,9 +188,9 @@ export function resolveRef(refRaw: string, bindings: Record<string, unknown>): u
       continue;
     }
     // String segment: only valid on a plain object. Arrays can only be
-    // indexed by numeric segments — `.length` / `.0` on an array would
-    // be ambiguous otherwise, and the numeric-dot canonicalization in
-    // parseRefPath already takes care of `.0`.
+    // indexed by numeric segments -- `.length` on an array is refused, and
+    // `.0` reaches one as a number through the numeric-dot canonicalization
+    // in parseRefSegments.
     if (typeof cursor !== "object" || Array.isArray(cursor)) {
       throw new RefError({ ref: refRaw, reason: `cannot read "${seg}" of non-object` });
     }

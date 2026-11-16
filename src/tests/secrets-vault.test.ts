@@ -1195,6 +1195,24 @@ describe("secrets-vault: loadVault error shapes", () => {
     await expect(loadVault(path)).rejects.toThrow(/"version" must be a number/);
   });
 
+  it("refuses a version that names no schema: 0, a negative, a fraction", async () => {
+    // These loaded under the legacy (unbound) rules, and the next setSecret
+    // wrote the bogus number back.
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    const path = vaultPath(synthHome);
+    for (const version of [0, -1, 1.5]) {
+      const bad = { version, salt: generateSalt().toString("base64"), entries: {} };
+      writeFileSync(path, `${JSON.stringify(bad)}\n`);
+      await expect(loadVault(path), String(version)).rejects.toThrow(/is corrupt: invalid "version"/);
+    }
+    // 1 and an absent version are the real legacy shapes and still load.
+    for (const body of [{ version: 1 }, {}]) {
+      writeFileSync(path, `${JSON.stringify({ ...body, salt: generateSalt().toString("base64"), entries: {} })}\n`);
+      await expect(loadVault(path)).resolves.toMatchObject({ version: 1 });
+    }
+  });
+
   it("refuses an ARRAY `entries` like a missing one, as the lenient reader in secrets-cmd.ts does", async () => {
     // `[]` used to load as an empty vault, and `["x"]` failed as "vault
     // corrupt at entry 0" -- naming a key that is not in the file.

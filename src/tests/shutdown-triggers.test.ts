@@ -1,5 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
-import { registerShutdownTriggers, SIGNAL_SHUTDOWN_EVENTS, STDIN_SHUTDOWN_EVENTS } from "../shutdown-triggers.js";
+import {
+  registerShutdownTriggers,
+  runShutdown,
+  SHUTDOWN_FORCE_EXIT_MS,
+  SIGNAL_SHUTDOWN_EVENTS,
+  STDIN_SHUTDOWN_EVENTS,
+} from "../shutdown-triggers.js";
 
 /** A recording stand-in for `process` / `process.stdin`.
  *
@@ -97,5 +103,85 @@ describe("registerShutdownTriggers", () => {
     }
     expect(proc.listeners.size).toBe(SIGNAL_SHUTDOWN_EVENTS.length);
     expect(stdin.listeners.size).toBe(STDIN_SHUTDOWN_EVENTS.length);
+  });
+});
+
+describe("runShutdown", () => {
+  // The body of index.ts's shutdown closure. It used to be reachable only by
+  // reading index.ts's source (index-source-shape.test.ts); called here, with
+  // a recording exit and a real clock unless a case says otherwise.
+  const deps = () => {
+    const exit = vi.fn();
+    const log = vi.fn();
+    return { exit, log };
+  };
+
+  it("exits 0 when the teardown resolves, and logs nothing", async () => {
+    const d = deps();
+    await runShutdown(async () => {}, d);
+    expect(d.exit.mock.calls).toEqual([[0]]);
+    expect(d.log).not.toHaveBeenCalled();
+  });
+
+  it("a REJECTING teardown is one error log and exit(1) at once -- not a wait for the watchdog", async () => {
+    // Uncaught, the rejection reached the unhandledRejection handler, which
+    // only logs, and the process idled out the full 10 s before exit(1).
+    // Fake clock, never advanced: the exit below cannot be the watchdog's,
+    // and no wall-clock budget is needed to say so.
+    vi.useFakeTimers();
+    try {
+      const d = deps();
+      await runShutdown(async () => {
+        throw new Error("transport already closed");
+      }, d);
+      expect(d.log.mock.calls).toEqual([["error", "Shutdown failed", { error: "transport already closed" }]]);
+      expect(d.exit.mock.calls).toEqual([[1]]);
+      // The watchdog is cleared, so it cannot fire a second exit later.
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("names a non-Error rejection by its string form", async () => {
+    const d = deps();
+    await runShutdown(() => Promise.reject("nope"), d);
+    expect(d.log.mock.calls).toEqual([["error", "Shutdown failed", { error: "nope" }]]);
+    expect(d.exit.mock.calls).toEqual([[1]]);
+  });
+
+  it("force-exits 1 when the teardown never settles, at the watchdog budget (10 s by default)", async () => {
+    expect(SHUTDOWN_FORCE_EXIT_MS).toBe(10_000);
+    vi.useFakeTimers();
+    try {
+      const d = deps();
+      void runShutdown(() => new Promise<void>(() => {}), d);
+      await vi.advanceTimersByTimeAsync(SHUTDOWN_FORCE_EXIT_MS - 1);
+      expect(d.exit).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(d.exit.mock.calls).toEqual([[1]]);
+      expect(d.log).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("honours forceAfterMs, and a settled teardown leaves no watchdog behind to fire a second exit", async () => {
+    vi.useFakeTimers();
+    try {
+      const hung = deps();
+      void runShutdown(() => new Promise<void>(() => {}), { ...hung, forceAfterMs: 50 });
+      await vi.advanceTimersByTimeAsync(50);
+      expect(hung.exit.mock.calls).toEqual([[1]]);
+
+      for (const teardown of [async () => {}, () => Promise.reject(new Error("x"))]) {
+        const d = deps();
+        await runShutdown(teardown, { ...d, forceAfterMs: 50 });
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(d.exit).toHaveBeenCalledTimes(1);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

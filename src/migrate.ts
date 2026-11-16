@@ -154,7 +154,14 @@ async function migrateFile(
   }
 
   try {
-    await mkdir(dirname(target), { recursive: true });
+    // The global target's directory is ~/.yaw-mcp/ itself, and on an upgraded
+    // machine this mkdir is often what creates it. It is born 0o700 here for
+    // the same reason every secret-bearing writer passes atomicWriteFile a
+    // dirMode of 0o700: that helper never re-chmods a parent that already
+    // exists, so a directory made at the umask default here would stay
+    // listable. A project's `.yaw-mcp/` is a directory the user shares
+    // through their checkout and keeps the default.
+    await mkdir(dirname(target), scope === "global" ? { recursive: true, mode: 0o700 } : { recursive: true });
     await rename(legacy, target);
     log("info", "yaw-mcp config: migrated legacy file into .yaw-mcp/ directory", {
       scope,

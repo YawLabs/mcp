@@ -21,6 +21,8 @@
 // the gate (src/tests/foundry-routing.test.ts) consumes it. Until a fixture
 // exists the gate is DORMANT, and says so: a passing banner test plus a `todo`
 // row, not a skip. A fixture that exists but does not validate FAILS the gate.
+// No fixture is checked in yet (see FOUNDRY_TOP3_FLOOR), so dormant is the
+// current state, not a hypothetical one.
 
 import { readFileSync } from "node:fs";
 import { type RankableServer, type RankableTool, rankServers } from "./relevance.js";
@@ -34,6 +36,13 @@ export const DEFAULT_CORPUS_CAP = 500;
 // Minimum weighted top-3 accuracy the gate requires. Starts conservative;
 // ratchet UP toward the last green measurement as the corpus matures so the
 // gate tightens with the data instead of rubber-stamping a regression.
+//
+// NOT ENFORCED until a corpus is checked in. The gate reads
+// src/tests/fixtures/foundry-corpus.json (foundry-cmd.ts DEFAULT_OUT), and as
+// of 2026-11-15 the repo has no such file, so the gate is in the dormant
+// state the header describes and this number checks nothing: a BM25 weight
+// or tokenizer change is not gated by real intents today. Look for the
+// fixture before leaning on this floor.
 export const FOUNDRY_TOP3_FLOOR = 0.7;
 
 // One harvested trace as written by foundry.ts/appendFoundryTrace.

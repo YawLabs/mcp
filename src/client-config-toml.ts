@@ -70,6 +70,9 @@ import { parse as parseTomlText, TomlDate, TomlError } from "smol-toml";
 // never imports this module (the codex-cli row registers it).
 import { detectLineEnding } from "./client-config.js";
 import { setJsonKey } from "./json-key.js";
+// For `debom` alone -- the shared one-leading-U+FEFF strip. Nothing else in
+// jsonc.ts applies to TOML.
+import { debom } from "./jsonc.js";
 
 /** The syntax word for user-facing messages ("is not valid TOML"). */
 export const TOML_SYNTAX = "TOML" as const;
@@ -158,7 +161,7 @@ function bomOffset(text: string): number {
  *  keeps the byte, which is why every offset below is taken against the
  *  ORIGINAL text. */
 function stripBom(raw: string): string {
-  return raw.slice(bomOffset(raw));
+  return debom(raw);
 }
 
 /** Parse a config.toml text. Throws `TomlConfigError` -- never smol-toml's own
@@ -1528,9 +1531,13 @@ function deleteSectionEdits(text: string, sections: readonly TomlSection[]): Spa
  *  tests alone.
  *
  *  Throws `TomlConfigError` when `raw` does not parse, `TomlSpliceRefusal` for
- *  a spelling the splice will not edit (naming it and what to do), and
- *  `TomlVerifyError` when the result would have changed anything else. The
- *  returned text has always passed `verifyTomlSplice`. */
+ *  a spelling the splice will not edit (naming it and what to do),
+ *  `TomlRenderError` when `entry` holds something `renderTomlEntry` has no
+ *  spelling for (a table-valued field outside `SUBTABLE_FIELDS`, a number
+ *  that is not finite, a lone surrogate in a string), and `TomlVerifyError`
+ *  when the result would have changed anything else. The four share no base
+ *  class but `Error`, so a caller that wants them all catches `Error`, as the
+ *  write facade does. The returned text has always passed `verifyTomlSplice`. */
 export function upsertTomlEntry(
   raw: string | null,
   containerPath: readonly string[],
@@ -1927,7 +1934,9 @@ function rootValueSpelling(raw: string, key: string): string | null {
  *
  *  The line uses the file's own line ending. Throws `TomlConfigError` when
  *  `raw` does not parse, `TomlSpliceRefusal` when the key is already set at
- *  the root, and `TomlVerifyError` when the result would not be exactly
+ *  the root, `TomlRenderError` when `rootKeyLine` cannot spell the key or the
+ *  value (a number that is not finite, a lone surrogate in a string -- thrown
+ *  before `raw` is looked at), and `TomlVerifyError` when the result would not be exactly
  *  `raw` plus that key (see `verifyTomlRootInsert`, which every return below
  *  has passed). That check holds an integer `value` to an integer readback,
  *  so an integral value this writer spells as a float -- on a `FLOAT_FIELDS`

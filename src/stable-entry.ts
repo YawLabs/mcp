@@ -20,7 +20,10 @@
  * So the job here is to recover a spelling of the same file that the app's
  * updater MAINTAINS rather than deletes. Two strategies, cheapest first, and
  * both gated on realpath identity so a wrong guess can never redirect the
- * entry at a different file.
+ * entry at a different file. Identity is necessary and not sufficient: each
+ * strategy has a second gate against a same-file spelling that does not last
+ * (a per-session launcher directory for the first, a non-version ancestor for
+ * the second).
  */
 import { lstatSync, readdirSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
@@ -75,6 +78,30 @@ export function isEphemeralMountPath(p: string): boolean {
 }
 
 /**
+ * Launcher spellings that last only as long as a shell or a login session,
+ * so `process.argv[1]` must not be persisted when it runs through one.
+ *
+ * Wider than `isEphemeralMountPath` on purpose, and used only on argv[1]: a
+ * module that LIVES in an ephemeral mount has no durable spelling at all,
+ * while these directories hold LINKS to a module that does, so the answer
+ * is to keep the realpathed entry rather than to persist nothing.
+ *
+ *  - `fnm_multishells/<pid>_<ts>`: fnm puts a fresh one on PATH for every
+ *    shell (a symlink dir on POSIX, a junction on Windows) and a globally
+ *    installed bin is launched through it. Matched on the directory NAME,
+ *    because its parent differs per platform (inferred from fnm's layout,
+ *    not run here: $XDG_RUNTIME_DIR on Linux, a state dir on macOS,
+ *    %LOCALAPPDATA% on Windows).
+ *  - `/run/user/<uid>/`: the per-login runtime directory on a systemd
+ *    machine, removed when the user's last session ends.
+ */
+function isSessionScopedPath(p: string): boolean {
+  if (isEphemeralMountPath(p)) return true;
+  const posix = p.replace(/\\/g, "/");
+  return /(^|\/)fnm_multishells\//.test(posix) || /^\/run\/user\/[0-9]+\//.test(posix);
+}
+
+/**
  * The spelling of `entry` that is most likely to survive its owner's next
  * update, or `entry` itself when there is nothing better.
  *
@@ -100,11 +127,18 @@ export function stableSpellingOf(entry: string, deps: StableSpellingDeps = {}): 
   // spelling and no directory scanning is needed. The realpath-identity gate
   // is what makes this safe to apply blindly: when this function is called for
   // some OTHER package, argv[1] is a different file and the check simply fails.
+  //
+  // Identity is not the whole gate, for the reason aliasSpellingOf's header
+  // gives: it proves the spelling names the same file, not that the spelling
+  // lasts. A launcher's path can run through a directory that exists for one
+  // shell or one process (isSessionScopedPath), and that spelling is worse
+  // than the realpathed `entry` it would replace, so it is passed over and
+  // the alias walk below gets its turn on `entry`.
   const argv1 = deps.argv1 === undefined ? process.argv[1] : deps.argv1;
   if (typeof argv1 === "string" && argv1.length > 0) {
     try {
       const abs = isAbsolute(argv1) ? argv1 : resolve(argv1);
-      if (abs !== entry && realpath(abs) === target) return abs;
+      if (abs !== entry && !isSessionScopedPath(abs) && realpath(abs) === target) return abs;
     } catch {
       // argv[1] is not a readable path (a REPL, an eval, a deleted script).
     }

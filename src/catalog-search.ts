@@ -18,14 +18,15 @@ export interface CatalogMatch {
   tier: 0 | 1 | 2 | 3;
 }
 
-/** Extra fields the live catalog carries that CatalogServer does not declare.
- *  Read defensively -- this is third-party JSON, and a `tags: "web"` string
- *  where an array was expected must not throw inside a search. */
+/** The undeclared catalog fields THIS module reads (CatalogServer does not
+ *  declare them). Read defensively -- this is third-party JSON, and a
+ *  `tags: "web"` string where an array was expected must not throw inside a
+ *  search. Not a list of everything the live catalog carries: `toolCount` and
+ *  `estimatedTokens` used to be declared here and were never read; search-cmd.ts
+ *  is the one consumer of those and casts for them itself. */
 interface CatalogExtras {
   category?: unknown;
   tags?: unknown;
-  toolCount?: unknown;
-  estimatedTokens?: unknown;
 }
 
 const str = (v: unknown): string | undefined => (typeof v === "string" ? v : undefined);

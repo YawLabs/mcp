@@ -28,6 +28,7 @@ import {
   DOCTOR_USAGE,
   formatRelativeAge,
   isForeignAbsoluteLaunch,
+  oamLaunchParts,
   oamRunEntryPath,
   parseDoctorArgs,
   probeClientsAsync,
@@ -46,7 +47,7 @@ import {
   unloadableConfigFix,
   unparseableConfigFix,
 } from "../install-targets.js";
-import { isOamLaunch, MIN_OAM_VERSION, OAM_INSTALL_PS1, OAM_INSTALL_SH } from "../oam-spawn.js";
+import { isOamLaunch, MIN_OAM_VERSION, OAM_INSTALL_PS1, OAM_INSTALL_SH, unwrapOamLaunch } from "../oam-spawn.js";
 import { STATE_FILENAME, STATE_SCHEMA_VERSION } from "../persistence.js";
 import { REGISTRY_CACHE_FILENAME } from "../registry-cache.js";
 import {
@@ -934,7 +935,11 @@ describe("runDoctor — surfaces config-loader warnings", () => {
     // Both surfaces carry it: the human WARNINGS section on stdout, and the
     // always-on stderr stream for stdout-capturing pipelines.
     expect(cap.text()).toMatch(/'token' is no longer used/);
-    expect(cap.text()).toMatch(/revoke that PAT/i);
+    // The remedy clause is relayed whole, not just the first sentence (the
+    // wording is config-loader's deprecatedKeyWarning; doctor only relays it).
+    expect(cap.text()).toMatch(/Delete it from .*config\.json/);
+    // ...through the token-specific last clause, which only a `token` key gets.
+    expect(cap.text()).toMatch(/nowhere left to revoke that PAT/);
     expect(errs.join("")).toMatch(/'token' is no longer used/);
     expect(r.exitCode).toBe(2);
   });
@@ -6823,35 +6828,55 @@ describe("declared twins stay twins", () => {
     return m[0];
   };
 
-  it("spellRootValue and rootLinePlacement are byte-identical in doctor-cmd.ts and install-cmd.ts", () => {
-    // Declared twins (doctor cannot import install-cmd, which imports it).
-    // The runtime pin -- install over the same file -- covers one value and
-    // one syntax; this holds every branch to one spelling.
-    const d = src("doctor-cmd.ts");
-    const i = src("install-cmd.ts");
-    expect(body(d, "spellRootValue")).toBe(body(i, "spellRootValue"));
-    expect(body(d, "rootLinePlacement")).toBe(body(i, "rootLinePlacement"));
+  it("spellRootValue and rootLinePlacement have ONE definition, in client-config.ts", () => {
+    // They were hand-twinned in doctor-cmd.ts and install-cmd.ts (doctor
+    // cannot import install-cmd, which imports it). client-config.ts is below
+    // both, so each now imports the one copy; a private redefinition in
+    // either file would be a twin again.
+    const c = src("client-config.ts");
+    for (const fn of ["spellRootValue", "rootLinePlacement"]) {
+      expect(body(c, fn)).toContain(`export function ${fn}(`);
+      for (const file of ["doctor-cmd.ts", "install-cmd.ts"]) {
+        expect(src(file), `${file} redefines ${fn}`).not.toMatch(new RegExp(`function ${fn}\\(`));
+      }
+    }
   });
 
-  it("fetchSidecarLatest validates the registry answer exactly as upgrade-cmd's fetchLatestVersion does", () => {
-    const d = body(src("doctor-cmd.ts"), "fetchSidecarLatest");
-    const u = body(src("upgrade-cmd.ts"), "fetchLatestVersion");
+  it("the registry latest probe has ONE implementation, in registry-latest.ts", () => {
+    // doctor's fetchSidecarLatest, upgrade-cmd's fetchLatestVersion and
+    // sidecar-refresh's defaultFetchLatest each carried the request and its
+    // response validation; they are callers of one leaf function now, so a
+    // registry URL anywhere else in the three is a copy growing back.
+    const leaf = body(src("registry-latest.ts"), "fetchLatestVersion");
     for (const line of [
+      "fetch(`https://registry.npmjs.org/${pkg}/latest`, {",
       'headers: { accept: "application/json" }',
       "if (!res.ok) return null;",
       "const body = (await res.json()) as { version?: unknown };",
       'return typeof body.version === "string" ? body.version : null;',
     ]) {
-      expect(d).toContain(line);
-      expect(u).toContain(line);
+      expect(leaf).toContain(line);
+    }
+    expect(body(src("doctor-cmd.ts"), "fetchSidecarLatest")).toContain(
+      "fetchRegistryLatest(pkg, DOCTOR_REGISTRY_TIMEOUT_MS)",
+    );
+    expect(body(src("upgrade-cmd.ts"), "fetchLatestVersion")).toContain('fetchRegistryLatest("@yawlabs/mcp"');
+    expect(body(src("sidecar-refresh.ts"), "defaultFetchLatest")).toContain(
+      "fetchLatestVersion(pkg, SIDECAR_REGISTRY_TIMEOUT_MS)",
+    );
+    for (const file of ["doctor-cmd.ts", "upgrade-cmd.ts", "sidecar-refresh.ts"]) {
+      expect(src(file), `${file} builds its own registry request`).not.toMatch(
+        /fetch\(\s*[`"']https:\/\/registry\.npmjs\.org/,
+      );
     }
   });
 
-  it("oamArgvTokens unwraps every wrapper shape isOamLaunch accepts, and no other", () => {
-    // isOamLaunch decides `launchRuntime === "oam"`; oamArgvTokens (through
-    // oamRunEntryPath) is what the entry scan then reads. A wrapper one
-    // accepts and the other does not reads the wrapper's own switches as an
-    // oam path.
+  it("the entry scan unwraps every wrapper shape isOamLaunch accepts, and no other", () => {
+    // isOamLaunch decides `launchRuntime === "oam"`; oamRunEntryPath is what
+    // the entry scan then reads. Both go through oam-spawn.ts's
+    // unwrapOamLaunch now (they were two tokenizers), so for a payload with
+    // no quote in it they cannot disagree -- a wrapper one accepted and the
+    // other did not read the wrapper's own switches as an oam path.
     const shapes: ReadonlyArray<readonly [string, readonly string[]]> = [
       ["oam", ["run", "--no-check", "/p/index.js"]],
       ["/usr/local/bin/oam", ["run", "/p/index.js"]],
@@ -6873,5 +6898,31 @@ describe("declared twins stay twins", () => {
     for (const [cmd, args] of shapes) {
       expect(oamRunEntryPath(cmd, args) !== null, `${cmd} ${args.join(" ")}`).toBe(isOamLaunch(cmd, args));
     }
+  });
+
+  it("the quote rule is the ONE place the two readers differ", () => {
+    // "strip-edge" (isOamLaunch) judges the first token with one quote
+    // stripped from each end; "refuse" (the entry scan, and the heal pass
+    // behind it) gives up on any quote in a shell payload, because it goes on
+    // to read a path out of the tokens. Kept as it was before the two shared
+    // a tokenizer -- pinned here so a change to either is a decision.
+    for (const [cmd, args] of [
+      ["sh", ["-c", '"oam" run /p/index.js']],
+      ["bash", ["-c", "oam run '/p/my dir/index.js'"]],
+      ["pwsh", ["-Command", "'oam' run /p/index.js"]],
+    ] as ReadonlyArray<readonly [string, readonly string[]]>) {
+      expect(isOamLaunch(cmd, args), `${cmd} ${args.join(" ")}`).toBe(true);
+      expect(unwrapOamLaunch(cmd, args, "strip-edge")?.oam).toBe("oam");
+      expect(unwrapOamLaunch(cmd, args, "refuse")).toBeNull();
+      expect(oamLaunchParts(cmd, args)).toBeNull();
+    }
+    // cmd carries its payload as separate argv entries: no shell string, so
+    // no quote rule, and both rules read it the same.
+    const viaCmd = ["/d", "/s", "/c", "C:\\Program Files\\oam\\oam.exe", "run", "C:\\p\\index.js"];
+    expect(unwrapOamLaunch("cmd", viaCmd, "refuse")).toEqual(unwrapOamLaunch("cmd", viaCmd, "strip-edge"));
+    expect(unwrapOamLaunch("cmd", viaCmd, "refuse")).toEqual({
+      oam: "C:\\Program Files\\oam\\oam.exe",
+      rest: ["run", "C:\\p\\index.js"],
+    });
   });
 });

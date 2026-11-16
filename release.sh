@@ -126,9 +126,10 @@
 #                                    installed entry starts.
 #   GITHUB_TOKEN=<pat>               GitHub token for the step-5 MCP-registry
 #                                    login (needs publish rights on
-#                                    io.github.YawLabs/*). Step 5 reads it only
+#                                    io.github.YawLabs/*). Step 5 reads it
 #                                    when the persisted registry JWT is
-#                                    missing/expired.
+#                                    missing/expired -- in practice every
+#                                    run, since that JWT lasts 300 seconds.
 #   MCP_REGISTRY_TOKEN=<pat>         second-choice spelling of the same token;
 #                                    read only when GITHUB_TOKEN is unset. If
 #                                    neither is set, `gh auth token` is tried.
@@ -141,11 +142,12 @@
 # fallback, used whenever GITHUB_TOKEN and MCP_REGISTRY_TOKEN are unset, which
 # is every release on this workstation, since the persisted registry JWT's
 # 300-second TTL never survives steps 1-4.
-# The first run also needs `mcp-publisher` (downloaded to a temp dir on
-# demand, sha256-verified against the registry's per-release
-# `registry_<ver>_checksums.txt`) and a one-time `mcp-publisher login
-# github` (interactive device flow) which persists a JWT at
-# ~/.config/mcp-publisher/token.json for subsequent runs.
+# Step 5 also needs `mcp-publisher`: it is downloaded to a temp dir on every
+# run that reaches the registry publish, sha256-verified against the registry's
+# per-release `registry_<ver>_checksums.txt`, and deleted on exit. Step 5 runs
+# `mcp-publisher login github` with the GitHub token above each time; the JWT
+# that writes to ~/.config/mcp-publisher/token.json lasts 300 seconds, so
+# nothing carries over to the next release.
 #
 # If interrupted, re-run with the same version -- each step is idempotent.
 #
@@ -230,8 +232,10 @@ fail() { FAIL_LINE="${BASH_LINENO[0]}"; echo -e "${RED}  [x] $1${NC}"; exit 1; }
 #
 # `login github-oidc` is GitHub-Actions-only (requires `id-token: write`), so
 # the script's workstation path uses the regular `login github` OAuth device
-# flow. One-time interactive setup: `mcp-publisher login github` -- the JWT
-# persists at ~/.config/mcp-publisher/token.json for every subsequent run.
+# flow, which step 5 runs itself with a GitHub token on EVERY release (see
+# mcp_registry_gh_token): the JWT a login writes to
+# ~/.config/mcp-publisher/token.json lasts 300 seconds, so there is no
+# one-time setup that carries over to a later run.
 MCP_PUBLISHER_VERSION="v1.7.9"
 
 # MINGW64 on Windows ARM64 intermittently segfaults in npm's exit cleanup AFTER
@@ -523,9 +527,12 @@ fi
 # something `npm ci` fixes. Without a lockfile there is nothing to compare
 # against.
 if [ -f package-lock.json ]; then
-  # node exits 1 on a missing script too, which would read as drift.
-  [ -f scripts/check-installed-deps.mjs ] \
-    || fail "The lockfile drift check could not run (scripts/check-installed-deps.mjs is missing)."
+  # node exits 1 on a missing script too -- or a missing module the script
+  # imports -- which would read as drift. is-main-module.mjs is its one import.
+  for DEPS_FILE in scripts/check-installed-deps.mjs scripts/is-main-module.mjs; do
+    [ -f "$DEPS_FILE" ] \
+      || fail "The lockfile drift check could not run (${DEPS_FILE} is missing)."
+  done
   DEPS_RC=0
   DEPS_DRIFT=$(node scripts/check-installed-deps.mjs 2>&1) || DEPS_RC=$?
   if [ "$DEPS_RC" -eq 1 ]; then
@@ -599,6 +606,9 @@ current_server_version() { node -p "require('./server.json').version"; }
 # step 5 -- after the irreversible npm publish.
 current_pkg_mcp_name() { node -p "require('./package.json').mcpName || ''"; }
 current_server_name() { node -p "require('./server.json').name || ''"; }
+# The npm name, for the step-3 guard that this script's literal
+# @yawlabs/mcp URLs still name the package being released.
+current_pkg_name() { node -p "require('./package.json').name || ''"; }
 current_head_sha() { git rev-parse HEAD; }
 current_branch() { git rev-parse --abbrev-ref HEAD; }
 
@@ -849,8 +859,45 @@ write_server_version() {
 # `## $1\r` (Git for Windows' gawk drops the CR in text mode), and the exact
 # compare missed it there (changelog_retitle below keeps CRLF files working
 # too).
+#
+# CHANGELOG_AWK_PRELUDE is the first rule of every awk helper here. Per line it
+# drops that carriage return and sets `heading`: 1 when the line starts with
+# `## ` OUTSIDE a code fence. Fences open and close by the rule
+# changelog_retitle's node code uses below (up to three spaces, then three or
+# more backticks or tildes; closed by a line that is only the same character,
+# at least as many of them), so the helpers that READ a section and the one
+# that DEFINES it agree on where it ends. Before this the notes body ended at
+# the first `## ` line of any kind, and a fenced example holding one cut the
+# section short: the behaviour-change gate then reported an off switch named
+# below that fence as absent. Written without interval expressions (`{0,3}`),
+# which not every awk has.
+CHANGELOG_AWK_PRELUDE='
+function fence_marker(l,    c, n) {
+  sub(/^ ? ? ?/, "", l)
+  c = substr(l, 1, 1)
+  if (c != "`" && c != "~") return ""
+  n = 1
+  while (substr(l, n + 1, 1) == c) n++
+  return n >= 3 ? substr(l, 1, n) : ""
+}
+{
+  sub(/\r$/, "")
+  fenced = 0
+  mark = fence_marker($0)
+  if (fence != "") {
+    fenced = 1
+    trimmed = $0
+    gsub(/^[ \t]+|[ \t]+$/, "", trimmed)
+    if (mark != "" && substr(mark, 1, 1) == substr(fence, 1, 1) && length(mark) >= length(fence) && trimmed == mark) fence = ""
+  } else if (mark != "") {
+    fence = mark
+    fenced = 1
+  }
+  heading = !fenced && index($0, "## ") == 1
+}
+'
 changelog_version_heading() {
-  awk -v h="## $1" '{ sub(/\r$/, "") } $0 == h || index($0, h " -- ") == 1 { found = 1; exit } END { exit !found }' CHANGELOG.md 2>/dev/null
+  awk -v h="## $1" "$CHANGELOG_AWK_PRELUDE"'heading && ($0 == h || index($0, h " -- ") == 1) { found = 1; exit } END { exit !found }' CHANGELOG.md 2>/dev/null
 }
 
 # The body of the section that holds v$1's notes: the `## $1` section once it
@@ -859,9 +906,9 @@ changelog_version_heading() {
 # run) and after it (a resume whose bump commit is made but not tagged).
 changelog_notes_body() {
   if changelog_version_heading "$1"; then
-    awk -v h="## $1" '{ sub(/\r$/, "") } inside && /^## / { exit } $0 == h || index($0, h " -- ") == 1 { inside = 1; next } inside { print }' CHANGELOG.md 2>/dev/null || true
+    awk -v h="## $1" "$CHANGELOG_AWK_PRELUDE"'inside && heading { exit } heading && ($0 == h || index($0, h " -- ") == 1) { inside = 1; next } inside { print }' CHANGELOG.md 2>/dev/null || true
   else
-    awk '{ sub(/\r$/, "") } /^## [Uu]nreleased/ { inside = 1; next } inside && /^## / { exit } inside { print }' CHANGELOG.md 2>/dev/null || true
+    awk "$CHANGELOG_AWK_PRELUDE"'heading && /^## [Uu]nreleased/ { inside = 1; next } inside && heading { exit } inside { print }' CHANGELOG.md 2>/dev/null || true
   fi
 }
 
@@ -1440,10 +1487,14 @@ step 2 "Build"
 # step runs before step 3's bump, and tsup.config.ts bakes package.json's
 # version into the bundle as __VERSION__, so the gated build carries the
 # PREVIOUS version string; the published one is prepublishOnly's rebuild, after
-# the bump, which nothing launches. The two differ by that one `define` as
-# long as the tree does not change between them -- step 3 touches only
-# package.json, package-lock.json and server.json. (On a resume the bump is
-# already in package.json, so both builds carry the new version.)
+# the bump, which nothing launches. The two dist/ builds differ by that one
+# `define` as long as the tree does not change between them -- step 3 touches
+# only package.json, package-lock.json, server.json and CHANGELOG.md, and none
+# of the other three feeds the bundle. The TARBALL differs by one file more:
+# CHANGELOG.md ships (package.json `files`), so the tarball the client matrix
+# packs below carries the notes under `## Unreleased` and the published one
+# carries them under the version heading step 3 writes. (On a resume the bump
+# is already in package.json, so both builds carry the new version.)
 #
 # Same ARM64 tolerance as run_npm_check, applied to the ARTIFACT rather than to
 # a log marker: MINGW64 on Windows ARM64 can segfault (139/134) in npm's exit
@@ -1635,11 +1686,24 @@ fi
 # mismatch is only surfaced in step 5, which runs AFTER the irreversible npm
 # publish -- stranding the release with a version on npm that can never be
 # registered. Version drift already fails here; name drift now does too.
+# >>> registry identity guard
 MCPNAME_NOW=$(current_pkg_mcp_name)
 SERVER_NAME_NOW=$(current_server_name)
 if [ "$MCPNAME_NOW" != "$SERVER_NAME_NOW" ]; then
   fail "package.json mcpName (${MCPNAME_NOW:-<unset>}) != server.json name (${SERVER_NAME_NOW:-<unset>}) -- refusing to push. The MCP registry would reject the ownership check in step 5, after npm publish has already gone out."
 fi
+# Both names agreeing is not enough: this script spells the identity out
+# itself. registry_has_version, npm_version_manifest and npm_latest_version ask
+# about io.github.YawLabs/mcp and @yawlabs/mcp by literal URL, and every
+# message names them. After a rename that updates both files consistently, each
+# of those reads would ask about the OLD name: step 4 would publish, and step 5
+# would then wait for a package npm will never serve under that name. Stop
+# here, before the push and the publish, until the script is renamed with them.
+PKG_NAME_NOW=$(current_pkg_name)
+if [ "$SERVER_NAME_NOW" != "io.github.YawLabs/mcp" ] || [ "$PKG_NAME_NOW" != "@yawlabs/mcp" ]; then
+  fail "release.sh is written for io.github.YawLabs/mcp on the MCP registry and @yawlabs/mcp on npm, but server.json name is ${SERVER_NAME_NOW:-<unset>} and package.json name is ${PKG_NAME_NOW:-<unset>} -- refusing to push. Its registry and npm reads would ask about the old names; update every io.github.YawLabs/mcp, io.github.YawLabs%2Fmcp, @yawlabs/mcp and @yawlabs%2Fmcp in release.sh first."
+fi
+# <<< registry identity guard
 
 # Re-read the branch here (not at script start -- it can change between steps)
 # and refuse to run the push from anywhere but main. `git push origin main`
@@ -2067,9 +2131,10 @@ else
       #   3. `gh auth token` (works on any host that has the `gh` CLI
       #      authenticated -- the established fallback for the parallel
       #      ssh-mcp / npmjs-mcp release scripts per their memory)
-      # The mcp-publisher binary only needs a GitHub token at login time; it
-      # persists its own registry JWT to ${TOKEN_FILE} afterward, so the
-      # GitHub token does NOT need to be in env for subsequent releases.
+      # mcp-publisher reads the GitHub token only at login and writes the
+      # registry JWT it gets back to ${TOKEN_FILE}. That JWT lasts 300 seconds,
+      # so it covers this step's publish and retries and nothing later: every
+      # release needs a GitHub token here again (see mcp_registry_gh_token).
       # Same resolution the pre-flight probe ran, through the shared helper so
       # the two cannot drift. The info() stays HERE rather than inside the
       # helper: the helper's stdout is captured, so anything printed in it would
@@ -2079,7 +2144,11 @@ else
         info "MCP-registry auth: using \`gh auth token\` (fallback)"
       fi
       if [ -z "$REGISTRY_GH_TOKEN" ]; then
-        fail "mcp-publisher token ${TOKEN_STATE} and no GitHub token available. Set GITHUB_TOKEN (a PAT with publish rights on io.github.YawLabs/*), or run \`gh auth login\` so the \`gh auth token\` fallback works, or run once interactively: ${WORKDIR}/${BIN_NAME} login github"
+        # No "log in by hand with the downloaded binary" option here: fail()
+        # exits, and the EXIT trap deletes ${WORKDIR} with the binary in it;
+        # and a JWT from a manual login would expire (300 s) while the re-run
+        # repeats steps 1-2.
+        fail "mcp-publisher token ${TOKEN_STATE} and no GitHub token available. Set GITHUB_TOKEN (a PAT with publish rights on io.github.YawLabs/*), or run \`gh auth login\` so the \`gh auth token\` fallback works, then re-run ./release.sh ${VERSION}: steps 1-2 repeat their gates and build, steps 3-4 skip what is done."
       fi
       info "MCP-registry token ${TOKEN_STATE} -- refreshing via \`mcp-publisher login github\`"
       # A login the limit stopped is the registry not answering. Any other

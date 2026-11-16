@@ -1454,6 +1454,36 @@ describe("resolveManagedSpawn entry memo", () => {
     }
   });
 
+  it("drops a memoized AMBIENT durable copy once the managed tree has the package", () => {
+    // A sidecar first found in the broker's own (durable, non-_npx)
+    // node_modules is memoized like any stable hit. The managed tree outranks
+    // that copy in resolveNpmEntry, so a `sidecars install` run afterwards has
+    // to take over on the next connect -- the memo used to keep answering with
+    // the ambient copy for the rest of the process, as long as its file existed.
+    const { root, managedRoot, cleanup } = fixture();
+    const ambientModules = join(root, "global", "node_modules");
+    mkdirSync(join(ambientModules, "@yawlabs", "mcp", "dist"), { recursive: true });
+    const durableBrokerUrl = pathToFileURL(join(ambientModules, "@yawlabs", "mcp", "dist", "index.js")).href;
+    const ambientDir = join(ambientModules, "some-mcp");
+    writePkg(ambientDir, { name: "some-mcp", version: "1.0.0", bin: { "some-mcp": "dist/index.js" } });
+    const spawn = spawnWith(durableBrokerUrl, managedRoot);
+    try {
+      const ambientEntry = join(ambientDir, "dist", "index.js");
+      expect(spawn(["-y", "some-mcp"])).toEqual({ command: NODE, args: [ambientEntry] });
+      // Memoized: repointing the ambient bin is not seen (same proof as the
+      // managed-tree memo test above).
+      writePkg(ambientDir, { name: "some-mcp", version: "1.0.0", bin: { "some-mcp": "dist/other.js" } });
+      expect(spawn(["-y", "some-mcp"])).toEqual({ command: NODE, args: [ambientEntry] });
+
+      // `yaw-mcp sidecars install` lands a managed copy while the broker runs.
+      const managedDir = join(managedRoot, "some-mcp");
+      writePkg(managedDir, { name: "some-mcp", version: "2.0.0", bin: { "some-mcp": "dist/index.js" } });
+      expect(spawn(["-y", "some-mcp"])).toEqual({ command: NODE, args: [join(managedDir, "dist", "index.js")] });
+    } finally {
+      cleanup();
+    }
+  });
+
   it("does NOT memoize an npx-cache hit: the content-hashed path changes on refresh", () => {
     const { npx, brokerUrl, cleanup } = fixture();
     const dir = join(npx, "bbb", "node_modules", "some-mcp");

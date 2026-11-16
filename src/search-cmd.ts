@@ -10,6 +10,7 @@
 // is what writes, and the closing line says so, because a search that quietly
 // installed would be a surprise in the wrong direction.
 
+import { withoutControls } from "./ascii.js";
 import {
   type CatalogRequiredEnv,
   type CatalogServer,
@@ -171,7 +172,36 @@ function metaLine(entry: CatalogServer): string {
   return parts.join(" | ");
 }
 
+// What JSON.stringify leaves raw and a terminal must not get: DEL, the C1
+// controls (0x9b is a one-byte CSI), and the Unicode format characters (the
+// bidi overrides) -- the set ascii.ts's withoutControls replaces beyond C0,
+// which JSON.stringify already escapes.
+const JSON_UNSAFE_FOR_TERMINAL = /[\x7f-\x9f]|\p{Cf}/gu;
+
+/** JSON text with each such character written as its \uXXXX escape(s). They
+ *  can only sit inside a string literal, where the escape parses back to the
+ *  same character, so the document's VALUE is unchanged -- unlike the text
+ *  listing, which replaces them with "?". */
+function escapeJsonForTerminal(json: string): string {
+  return json.replace(JSON_UNSAFE_FOR_TERMINAL, (ch) => {
+    let out = "";
+    // Per UTF-16 unit: a format character above the BMP is a surrogate pair.
+    for (let i = 0; i < ch.length; i++) out += `\\u${ch.charCodeAt(i).toString(16).padStart(4, "0")}`;
+    return out;
+  });
+}
+
 function renderJson(
+  opts: SearchCommandOptions,
+  catalogUrl: string,
+  matches: CatalogMatch[],
+  shown: CatalogMatch[],
+  suggested: string[],
+): string {
+  return escapeJsonForTerminal(renderJsonRaw(opts, catalogUrl, matches, shown, suggested));
+}
+
+function renderJsonRaw(
   opts: SearchCommandOptions,
   catalogUrl: string,
   matches: CatalogMatch[],
@@ -266,7 +296,8 @@ export async function runSearch(opts: SearchCommandOptions): Promise<SearchComma
     // Exit 0, not grep's 1: this matches `list`'s empty state. "Nothing found"
     // is an answer, and a non-zero code would make a shell `&&` chain treat a
     // successful search as a failure.
-    const near = suggestCatalogSlugs(query, servers, 3);
+    // Catalog slugs: fetched text, so made terminal-safe like the listing below.
+    const near = suggestCatalogSlugs(query, servers, 3).map(withoutControls);
     print(
       near.length > 0
         ? `No catalog server matches "${query}". Did you mean: ${near.join(", ")}?`
@@ -282,12 +313,20 @@ export async function runSearch(opts: SearchCommandOptions): Promise<SearchComma
       : `${matches.length} ${matches.length === 1 ? "match" : "matches"} for "${query}":`,
   );
   print();
+  // Everything printed per entry is the FETCHED catalog's text, and the catalog
+  // can be anyone's (--catalog, $YAW_MCP_CATALOG_URL): the loader checks only
+  // that a slug is a string. withoutControls keeps an ESC / OSC sequence in a
+  // slug, name, description or runtime from reaching the terminal as one (env
+  // key names are already shape-checked by catalogEnvKeys). The --json body
+  // is not passed through it: JSON.stringify escapes the C0 controls, and
+  // renderJson escapes the rest of that set (escapeJsonForTerminal), so the
+  // values a script parses out are the catalog's own.
   for (const { entry } of shown) {
-    print(`${entry.slug}  (${entry.name ?? entry.slug})`);
+    print(withoutControls(`${entry.slug}  (${entry.name ?? entry.slug})`));
     if (typeof entry.description === "string" && entry.description !== "") {
-      print(`  ${truncate(entry.description, DESCRIPTION_CAP)}`);
+      print(`  ${withoutControls(truncate(entry.description, DESCRIPTION_CAP))}`);
     }
-    print(`  ${metaLine(entry)}`);
+    print(`  ${withoutControls(metaLine(entry))}`);
     print();
   }
   if (shown.length < matches.length) {

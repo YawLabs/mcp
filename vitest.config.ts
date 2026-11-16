@@ -33,6 +33,9 @@ const TIMING_SENSITIVE = [
   // "eventually" -- which makes it exactly the kind of assertion that must be
   // measured on an idle box.
   "src/tests/shutdown-on-stdin-close.test.ts",
+  // Two "stays linear" budgets on the secret scrubber: elapsed time is the
+  // only observable for a quadratic regex, so they are measured serialized.
+  "src/tests/health-score.test.ts",
 ];
 
 // Worker cap on Windows, the cap typed's root vitest.config.ts applies there

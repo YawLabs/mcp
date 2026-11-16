@@ -575,15 +575,18 @@ function pruneJson(value: unknown): unknown {
     if (value.length === 0) return undefined;
     // Never drop array elements — dropping shifts indices and breaks any
     // caller that relies on positional access (e.g. list data returned to
-    // the model). Pruned elements stay in place: an OBJECT that prunes to
-    // empty is preserved as `{}` so the row/object SHAPE survives (a list of
-    // rows stays a list of objects, not a list of nulls); anything else that
-    // prunes away (null/undefined/empty primitive collection) becomes null.
+    // the model). Pruned elements stay in place, and keep their TYPE: an
+    // object that prunes to empty is preserved as `{}` and an array that does
+    // as `[]`, so a list of rows stays a list of objects and a list of
+    // row-arrays (`[[1,2],[]]`, the SQL/CSV shape) stays a list of arrays
+    // rather than gaining a null the server never sent. Only an element that
+    // was null to begin with is null afterwards.
     const cleaned: unknown[] = value.map((el) => {
       const pv = pruneJson(el);
       if (pv !== undefined) return pv;
-      // el pruned to "no information": keep {} for objects to preserve shape.
-      if (el !== null && typeof el === "object" && !Array.isArray(el)) return {};
+      // el pruned to "no information": keep the empty container of its kind.
+      if (Array.isArray(el)) return [];
+      if (el !== null && typeof el === "object") return {};
       return null;
     });
     return cleaned;

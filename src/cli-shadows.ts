@@ -79,16 +79,44 @@ export interface CliShadow {
 // inferring a wrong shadow from the tool-name prefix.
 const EMPTY: readonly CliShadow[] = [];
 
+// One list per server, shared by every key that names it. The rows used to
+// be copied out per key and drifted: `npm` listed six subcommands where
+// `npmjs` listed ten, and `mongo` had lost the `mongodump` that `mongodb`
+// carried, so the same server gave a narrower hint purely because of the
+// namespace the user picked. Sharing the array is safe: resolveShadowedClis
+// deep-copies what it returns and cliToNamespaces copies its index.
+const GH: readonly CliShadow[] = [{ cli: "gh" }];
+const GLAB: readonly CliShadow[] = [{ cli: "glab" }];
+const NPM: readonly CliShadow[] = [
+  {
+    cli: "npm",
+    subcommands: ["search", "view", "info", "audit", "owner", "deprecate", "dist-tag", "whoami", "profile", "token"],
+  },
+];
+const POSTGRES: readonly CliShadow[] = [{ cli: "psql" }, { cli: "pg_dump" }];
+const MONGO: readonly CliShadow[] = [{ cli: "mongosh" }, { cli: "mongodump" }];
+const REDIS: readonly CliShadow[] = [{ cli: "redis-cli" }];
+const BIGQUERY: readonly CliShadow[] = [{ cli: "bq", subcommands: ["query", "ls", "show"] }];
+const KUBECTL: readonly CliShadow[] = [{ cli: "kubectl" }];
+const WRANGLER: readonly CliShadow[] = [{ cli: "wrangler" }];
+const AWS: readonly CliShadow[] = [{ cli: "aws" }];
+const AZ: readonly CliShadow[] = [{ cli: "az" }];
+const DOCTL: readonly CliShadow[] = [{ cli: "doctl" }];
+const TERRAFORM_CWD: readonly CliShadow[] = [{ cli: "terraform", subcommands: ["state", "show", "providers"] }];
+const MCP_COMPLIANCE: readonly CliShadow[] = [{ cli: "mcp-compliance" }];
+const SF: readonly CliShadow[] = [{ cli: "sf", subcommands: ["data", "sobject", "apex"] }];
+const OP: readonly CliShadow[] = [{ cli: "op" }];
+
 // Namespace → shadowed CLI(s). Keys are catalog slugs (not all of them;
 // see the coverage note in the header) plus common aliases. Subcommand lists are only filled in where the MCP
 // server meaningfully restricts itself to a subset (e.g. npmjs is a
 // read/admin-only surface, not `npm install`).
 const NAMESPACE_REGISTRY: Record<string, readonly CliShadow[]> = {
   // —— Dev / code —————————————————————————————————————————————
-  github: [{ cli: "gh" }],
-  gh: [{ cli: "gh" }],
-  gitlab: [{ cli: "glab" }],
-  glab: [{ cli: "glab" }],
+  github: GH,
+  gh: GH,
+  gitlab: GLAB,
+  glab: GLAB,
   ssh: [{ cli: "ssh" }, { cli: "scp" }],
   playwright: [{ cli: "playwright" }],
   puppeteer: EMPTY,
@@ -97,53 +125,43 @@ const NAMESPACE_REGISTRY: Record<string, readonly CliShadow[]> = {
   docker: [{ cli: "docker" }],
 
   // —— npm / package registries ——————————————————————————————————
-  npmjs: [
-    {
-      cli: "npm",
-      subcommands: ["search", "view", "info", "audit", "owner", "deprecate", "dist-tag", "whoami", "profile", "token"],
-    },
-  ],
-  npm: [
-    {
-      cli: "npm",
-      subcommands: ["search", "view", "audit", "owner", "deprecate", "dist-tag"],
-    },
-  ],
+  npmjs: NPM,
+  npm: NPM,
 
   // —— Databases ——————————————————————————————————————————————
-  postgres: [{ cli: "psql" }, { cli: "pg_dump" }],
-  pg: [{ cli: "psql" }, { cli: "pg_dump" }],
+  postgres: POSTGRES,
+  pg: POSTGRES,
   sqlite: [{ cli: "sqlite3" }],
-  mongodb: [{ cli: "mongosh" }, { cli: "mongodump" }],
-  mongo: [{ cli: "mongosh" }],
+  mongodb: MONGO,
+  mongo: MONGO,
   supabase: [{ cli: "supabase" }],
   mysql: [{ cli: "mysql" }],
   // Two catalog servers derive `redis` (Redis's own and @yawlabs/redis-mcp,
   // both named "Redis"); `redis-yawlabs` is the second one's slug.
-  redis: [{ cli: "redis-cli" }],
-  "redis-yawlabs": [{ cli: "redis-cli" }],
-  bigquery: [{ cli: "bq", subcommands: ["query", "ls", "show"] }],
-  bq: [{ cli: "bq", subcommands: ["query", "ls", "show"] }],
+  redis: REDIS,
+  "redis-yawlabs": REDIS,
+  bigquery: BIGQUERY,
+  bq: BIGQUERY,
 
   // —— Infra / ops ————————————————————————————————————————————
   tailscale: [{ cli: "tailscale" }],
-  kubernetes: [{ cli: "kubectl" }],
-  kubectl: [{ cli: "kubectl" }],
-  k8s: [{ cli: "kubectl" }],
+  kubernetes: KUBECTL,
+  kubectl: KUBECTL,
+  k8s: KUBECTL,
   caddy: [{ cli: "caddy" }],
-  cloudflare: [{ cli: "wrangler" }],
-  wrangler: [{ cli: "wrangler" }],
+  cloudflare: WRANGLER,
+  wrangler: WRANGLER,
   vercel: [{ cli: "vercel" }],
-  "aws-api": [{ cli: "aws" }],
-  awsapi: [{ cli: "aws" }],
-  aws: [{ cli: "aws" }],
+  "aws-api": AWS,
+  awsapi: AWS,
+  aws: AWS,
   awsknowledge: EMPTY,
   awspricing: EMPTY,
   grafana: EMPTY,
-  azure: [{ cli: "az" }],
-  az: [{ cli: "az" }],
-  digitalocean: [{ cli: "doctl" }],
-  doctl: [{ cli: "doctl" }],
+  azure: AZ,
+  az: AZ,
+  digitalocean: DOCTL,
+  doctl: DOCTL,
   vault: [{ cli: "vault" }],
   consul: [{ cli: "consul" }],
   // terraform-cwd answers what these read-only subcommands would (`state
@@ -151,14 +169,14 @@ const NAMESPACE_REGISTRY: Record<string, readonly CliShadow[]> = {
   // server is deliberately absent: per its catalog entry it searches the
   // Registry and drives HCP Terraform workspaces and runs over the API, not a
   // local working directory, so which `terraform` call it replaces is unclear.
-  "terraform-cwd": [{ cli: "terraform", subcommands: ["state", "show", "providers"] }],
-  terraformcwd: [{ cli: "terraform", subcommands: ["state", "show", "providers"] }],
+  "terraform-cwd": TERRAFORM_CWD,
+  terraformcwd: TERRAFORM_CWD,
   ansible: [{ cli: "ansible-doc" }, { cli: "ansible-inventory" }, { cli: "ansible-config" }],
 
   // —— YawLabs tools —————————————————————————————————————————
   ctxlint: [{ cli: "ctxlint" }],
-  "mcp-compliance": [{ cli: "mcp-compliance" }],
-  mcpcompliance: [{ cli: "mcp-compliance" }],
+  "mcp-compliance": MCP_COMPLIANCE,
+  mcpcompliance: MCP_COMPLIANCE,
 
   // —— Data / observability —————————————————————————————————————
   posthog: EMPTY,
@@ -188,8 +206,8 @@ const NAMESPACE_REGISTRY: Record<string, readonly CliShadow[]> = {
   // read/write/execute-anonymous -- the `sf data`, `sf sobject` and `sf apex`
   // work an agent shells out for. It has no project deploy/retrieve and no org
   // login, hence the subcommand list.
-  salesforce: [{ cli: "sf", subcommands: ["data", "sobject", "apex"] }],
-  sf: [{ cli: "sf", subcommands: ["data", "sobject", "apex"] }],
+  salesforce: SF,
+  sf: SF,
 
   // —— Search / web —————————————————————————————————————————————
   bravesearch: EMPTY,
@@ -207,9 +225,9 @@ const NAMESPACE_REGISTRY: Record<string, readonly CliShadow[]> = {
   // —— Identity / secrets ————————————————————————————————————————
   // "1Password" cannot BE a namespace (NAMESPACE_RE bars the leading digit);
   // deriveNamespace 's'-prefixes it, so s1password is the one that ever matches.
-  "1password": [{ cli: "op" }],
-  s1password: [{ cli: "op" }],
-  op: [{ cli: "op" }],
+  "1password": OP,
+  s1password: OP,
+  op: OP,
 };
 
 // Prefixes the tool-name heuristic will trust. A tool cache whose

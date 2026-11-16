@@ -16,7 +16,9 @@
 // yaw-mcp is local-only and never contacts a hosted API. A file carrying
 // either key still loads (soft deprecation: rejecting it would break every
 // existing install), but the loader emits a warning telling the user to
-// delete the key and revoke the PAT. Deleting the apiBase precedence chain
+// delete the key. For `token` it adds that there is nothing to revoke: the
+// hosted backend that issued those PATs is retired (migrate.ts's header says
+// the same of the legacy flat file's token). Deleting the apiBase precedence chain
 // also closes a real hole: a committed project-scope `apiBase` could
 // redirect the API base while a global-scope token was attached, sending
 // that token to an attacker-chosen host.
@@ -195,7 +197,12 @@ function deprecatedKeyWarning(path: string, keys: string[]): string {
   const isAre = keys.length > 1 ? "are" : "is";
   const them = keys.length > 1 ? "them" : "it";
   const revoke = keys.includes("token")
-    ? ` Revoke that PAT at its source -- deleting it here does not deactivate it.`
+    ? // Not "revoke it at its source": the hosted service that issued these
+      // tokens is retired (see the DEPRECATED KEYS note in this file's
+      // header), so that sent the user looking for a page that is gone.
+      // config-loader.test.ts matches "nowhere left to revoke that PAT";
+      // doctor-cmd.test.ts matches the "Delete it from <path>" half below.
+      ` There is nowhere left to revoke that PAT: the hosted service that issued it is retired, so deleting it from the file is all there is to do.`
     : "";
   return (
     `${path}: ${quoted} ${isAre} no longer used -- yaw-mcp is local-only and never contacts a hosted API. ` +
@@ -540,12 +547,15 @@ export async function loadYawMcpConfig(opts: LoadConfigOptions = {}): Promise<Re
   const local = localPath ? await readConfigAt(localPath, "local", warnings) : null;
   if (local) loadedFiles.push(local);
 
-  // Avoid double-loading when the discovered project dir IS the user-global dir.
-  // findProjectConfigDir excludes $HOME, so this only triggers if someone passes
-  // a non-homedir `home` override that happens to equal the walk-up match.
-  // Normalize through resolve() and paths.ts normalizeForCompare (case-fold on
-  // win32 and darwin, the same rule the walk applies) so a case-variant or
-  // unnormalized home override doesn't byte-mismatch and double-load.
+  // Belt and braces against double-loading the user-global dir as project
+  // config. With the real findProjectConfigDir this cannot fire: the walk gets
+  // the same `home`, never returns $HOME's own `.yaw-mcp/` when it starts at or
+  // under $HOME, and skips any candidate whose realpath is the user-global dir.
+  // It is kept so that a change to the walk cannot turn into one file loaded
+  // under two scopes, and config-loader-project-is-global.test.ts reaches it
+  // by mocking the walk. Normalize through resolve() and paths.ts
+  // normalizeForCompare (case-fold on win32 and darwin, the same rule the walk
+  // applies) so a case-variant or unnormalized spelling still compares equal.
   const normalizeDir = (d: string): string => normalizeForCompare(resolve(d));
   const projectIsGlobal = projectConfigDir !== null && normalizeDir(projectConfigDir) === normalizeDir(globalDir);
   const project = projectIsGlobal || !projectPath ? null : await readConfigAt(projectPath, "project", warnings);

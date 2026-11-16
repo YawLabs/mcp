@@ -5,15 +5,20 @@
 // merging save needs. ConnectServer owns the load/save lifecycle.
 //
 // Design principles:
-//   - Silent failure. A corrupt or unreadable state file must never
-//     prevent yaw-mcp from starting. Missing file returns empty state;
-//     parse errors log once and also return empty state.
-//   - Schema-versioned. An UNREADABLE version drops the old state
+//   - Never fatal. A corrupt or unreadable state file must never
+//     prevent yaw-mcp from starting. Missing file returns empty state,
+//     silently; every other fallback to empty (a read error, a parse error,
+//     a non-object root, an unreadable schema version) also returns empty
+//     state and logs one warn per load, unless the caller asked for `quiet`.
+//   - Schema-versioned. An unreadable OLDER version drops the old state
 //     entirely rather than trying to migrate — the signal is small and
 //     cheap to rebuild, and migration bugs would corrupt fresh data. A
 //     purely ADDITIVE bump (v1 -> v2 added `toolCache`) is the one case
 //     that migrates instead, since there is no field to reinterpret:
 //     the missing key simply reads as empty. See READABLE_STATE_VERSIONS.
+//     A NEWER version is another yaw-mcp's live file: it is neither read
+//     nor overwritten (see `loadFailed`), so an older broker still running
+//     in one pane cannot wipe what an upgraded one saved from another.
 //   - Privacy-conserving. Only namespace names, tool names, and tool
 //     descriptions (all schema identifiers published by the upstream
 //     server, not user inputs) are persisted. No tool arguments,
@@ -185,15 +190,18 @@ export interface PersistedState {
    *  running in another pane would discard the WHOLE file. Absent when
    *  empty. */
   prewarmFailures?: Record<string, PersistedPrewarmFailure>;
-  /** Set by loadState when the file EXISTS but could not be READ (EACCES,
-   *  EBUSY, EISDIR, ...). The state on disk is presumed healthy, so the
-   *  caller must not save over it with the empty state returned alongside
-   *  this flag -- server.ts leaves persistenceReady false for the session.
-   *  Never set for ENOENT/ENOTDIR (no file to protect) or for a
-   *  parse/version failure (the file is genuinely unusable; overwriting it
-   *  with fresh state is the documented start-over behavior). Never
-   *  persisted: saveState builds its own object from the fields it is
-   *  handed. */
+  /** Set by loadState when the file EXISTS and holds state this process must
+   *  not replace: it could not be READ (EACCES, EBUSY, EISDIR, ...), or it
+   *  parsed at a schema version NEWER than this build's (another, newer
+   *  yaw-mcp owns it). Either way the state on disk is presumed healthy, so
+   *  the caller must not save over it with the empty state returned alongside
+   *  this flag -- server.ts leaves persistenceReady false for the session,
+   *  and StateSync defers any save that re-reads such a file.
+   *  Never set for ENOENT/ENOTDIR (no file to protect), for a parse failure,
+   *  or for an older / absent / non-numeric version (the file is genuinely
+   *  unusable; overwriting it with fresh state is the documented start-over
+   *  behavior). Never persisted: saveState builds its own object from the
+   *  fields it is handed. */
   loadFailed?: boolean;
 }
 
@@ -276,7 +284,8 @@ export type StateLoadFailure =
 
 // Load persisted state from disk. Always returns a PersistedState
 // object — on any failure (missing file, bad JSON, version mismatch,
-// sanitization drops everything) we silently fall through to empty.
+// sanitization drops everything) we fall through to empty without throwing;
+// loadStateClassified logs the failures that are not a plain missing file.
 export async function loadState(filePath: string = statePath()): Promise<PersistedState> {
   return (await loadStateClassified(filePath)).state;
 }
@@ -285,7 +294,7 @@ export async function loadState(filePath: string = statePath()): Promise<Persist
 // the state file: loadState is a thin wrapper over this, so a caller that
 // needs both cannot end up with two parsers that disagree.
 //
-// `quiet` suppresses the two warn logs below, and nothing else: the returned
+// `quiet` suppresses the warn logs below, and nothing else: the returned
 // classification is identical. It is for a caller that reports the failure in
 // its own words from `failure` (doctor's STATE section) -- on the cli surface
 // a warn goes straight to stderr, and "starting fresh" is untrue of a command
@@ -340,7 +349,8 @@ export async function loadStateClassified(
     // `[]` fell through to the version check and was classified as a schema
     // mismatch. The returned state is the same empty fallback either way; only
     // the named failure differs.
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      if (!quiet) log("warn", "yaw-mcp state file is not a JSON object; not read");
       return {
         state: emptyState(),
         rawCounts: NO_RAW_COUNTS,
@@ -348,19 +358,49 @@ export async function loadStateClassified(
         missing: false,
         failure: { kind: "malformed", message: "top-level value is not an object" },
       };
+    }
     const version = (parsed as { version?: unknown }).version;
     // Any version loadState can READ counts as clean, not just the current
     // one: v1 MIGRATES (see READABLE_STATE_VERSIONS), so treating it as
     // unreadable would discard real counts for the one session before the
     // first save rewrites the file.
-    if (!isReadableStateVersion(version))
+    if (!isReadableStateVersion(version)) {
+      // A version ABOVE this build's is not a stale file, it is another
+      // yaw-mcp's live one: a newer broker in another pane (or the release
+      // this install is about to be upgraded to) wrote it and is still using
+      // it. Flag it exactly like an unreadable file, so neither the caller's
+      // first save nor StateSync's re-read-and-merge replaces it with this
+      // older process's view -- that would wipe the newer broker's learning,
+      // pack history and tool cache on the first debounced save. Every other
+      // unreadable version (older, absent, not a number) carries nothing a
+      // current build still wants and keeps the documented start-over.
+      //
+      // The cost, accepted knowingly: the OLDER process persists nothing while
+      // the newer file is there. A broker that starts on it never enables
+      // saving (server.ts leaves persistenceReady false on loadFailed), and
+      // one already running defers every save (StateSync.saveLocked). No
+      // file written today is above the current version, so this first bites
+      // at the next schema bump, when an older copy runs beside a newer one;
+      // its learning for that run is lost until it is upgraded. That is the
+      // better trade than the older copy erasing the newer one's file.
+      const newer = typeof version === "number" && version > STATE_SCHEMA_VERSION;
+      if (!quiet) {
+        log(
+          "warn",
+          newer
+            ? "yaw-mcp state file was written by a newer yaw-mcp; not read, and flagged so a save cannot overwrite it"
+            : "yaw-mcp state file has an unreadable schema version; not read",
+          { fileVersion: typeof version === "number" ? version : String(version), reads: STATE_SCHEMA_VERSION },
+        );
+      }
       return {
-        state: emptyState(),
+        state: newer ? { ...emptyState(), loadFailed: true } : emptyState(),
         rawCounts: NO_RAW_COUNTS,
         parsedCleanly: false,
         missing: false,
         failure: { kind: "stale-version", version },
       };
+    }
     const p = parsed as Record<string, unknown>;
     return {
       state: {
@@ -459,12 +499,19 @@ export type SavableState = Pick<PersistedState, "learning" | "packHistory"> &
   Partial<Pick<PersistedState, "toolCache" | "prewarmFailures">>;
 
 /**
+ * TEST-ONLY: no production code calls this. Every caller is a test seeding a
+ * state.json fixture (persistence.test.ts and
+ * persistence-shared-toolcache.test.ts); the broker saves through StateSync,
+ * which merges. It is
+ * exported from here, rather than living in a test helper, because it is
+ * built from this module's private payload and lock plumbing.
+ *
  * OVERWRITE state.json with `state`, under the cross-process lock. The caller
  * owns the WHOLE document: an omitted cache persists as `{}`, and whatever
- * another process saved is replaced. That is the right primitive for a writer
- * that genuinely means "this is the file now" (tests seeding a fixture) and
- * the wrong one for a running broker -- the server process saves through
- * StateSync, which merges instead. Best-effort: failures log but never throw.
+ * another process saved is replaced -- including a file a newer yaw-mcp wrote,
+ * which StateSync refuses to touch. Do not reach for it from a command: a
+ * whole-file overwrite is exactly the lost-update StateSync exists to
+ * prevent. Best-effort: failures log but never throw.
  */
 export function saveState(
   state: SavableState,
@@ -686,9 +733,17 @@ export interface StateSyncOptions {
  * transient read error, the write failed -- logs ONE line and leaves the
  * baseline where it was, so the whole pending delta rides on the next save.
  * Nothing is dropped and nothing is counted twice. save() never throws.
+ *
+ * One of those is not transient: a state.json written by a NEWER yaw-mcp
+ * defers every save for as long as the file stays, and a caller that retries
+ * a deferred save would repeat the line without end. That one is logged once
+ * per stretch of deferrals (newerFileWarned), not once per attempt.
  */
 export class StateSync {
   private baseline: SavableState = { learning: {}, packHistory: [], toolCache: {} };
+  /** The "written by a newer yaw-mcp" deferral has been logged and no save
+   *  has completed since. */
+  private newerFileWarned = false;
   private readonly filePath: string | undefined;
   private readonly lock: FileLockOptions;
   private readonly hooks: StateSyncHooks;
@@ -714,17 +769,25 @@ export class StateSync {
 
   private async saveLocked(): Promise<boolean> {
     const filePath = this.filePath ?? statePath();
-    let written: { payload: PersistedState; snapshot: SavableState } | null;
+    let written: { payload: PersistedState; snapshot: SavableState } | { deferred: StateLoadFailure | null };
     try {
       written = await withFileLock(filePath, lockOptions(this.lock), stateLockTimeoutMessage, async () => {
-        const onDisk = await loadStateClassified(filePath);
-        // The file exists but could not be read (EBUSY/EACCES): merging into
-        // the empty stand-in would overwrite real data. Defer.
-        if (onDisk.state.loadFailed) return null;
+        // Quiet: every outcome of this re-read is reported below in this
+        // save's own words, once, so the loader's line would be a second one.
+        const onDisk = await loadStateClassified(filePath, { quiet: true });
+        // The file exists but could not be read (EBUSY/EACCES), or a newer
+        // yaw-mcp wrote it: merging into the empty stand-in would overwrite
+        // real data. Defer.
+        if (onDisk.state.loadFailed) return { deferred: onDisk.failure };
+        if (onDisk.failure) {
+          log("warn", "yaw-mcp state file was unusable at save time; replacing it with this process's state", {
+            reason: onDisk.failure.kind,
+          });
+        }
         const snapshot = cloneSavable(this.hooks.exportCurrent());
         // A file that parsed cleanly (or does not exist) is the base. One that
-        // is corrupt or at an unreadable version carries nothing usable, so
-        // this process's full view replaces it -- the documented start-over.
+        // is corrupt or at an OLDER unreadable version carries nothing usable,
+        // so this process's full view replaces it -- the documented start-over.
         const merged = onDisk.parsedCleanly
           ? mergeStateDelta(onDisk.state, this.baseline, snapshot)
           : mergeStateDelta(emptyState(), { learning: {}, packHistory: [] }, snapshot);
@@ -739,10 +802,27 @@ export class StateSync {
       });
       return false;
     }
-    if (written === null) {
-      log("warn", "yaw-mcp state save deferred: state.json could not be re-read; pending changes kept");
+    if ("deferred" in written) {
+      const failure = written.deferred;
+      if (failure?.kind === "stale-version") {
+        // loadFailed with a stale-version failure is the newer-file case only
+        // (loadStateClassified). Permanent while the file stays: say it once.
+        if (!this.newerFileWarned) {
+          this.newerFileWarned = true;
+          log(
+            "warn",
+            "yaw-mcp state save deferred: state.json was written by a newer yaw-mcp and will not be overwritten; nothing is saved until this install is upgraded (logged once)",
+            { fileVersion: Number(failure.version), reads: STATE_SCHEMA_VERSION },
+          );
+        }
+        return false;
+      }
+      log("warn", "yaw-mcp state save deferred: state.json could not be re-read; pending changes kept", {
+        error: failure?.kind === "unreadable" ? failure.message : "unknown",
+      });
       return false;
     }
+    this.newerFileWarned = false;
     // Synchronous from here: nothing can record between the export and the
     // apply, so "recorded while the save was in flight" is exact.
     const refreshed = mergeStateDelta(written.payload, written.snapshot, this.hooks.exportCurrent());

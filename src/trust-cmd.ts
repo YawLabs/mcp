@@ -47,6 +47,7 @@ import { isRegistrySpec, launcherBasename, specConstraint } from "./oam-spawn.js
 import { ALLOW_UNOWNED_ENV, CONFIG_DIRNAME } from "./paths.js";
 import {
   askYesNo,
+  isInteractivePrompt,
   QUESTION_CANCELLED,
   QUESTION_EOF,
   type QuestionCancelled,
@@ -66,7 +67,7 @@ import {
 // One prompt reader shared with `secrets` -- see readTrustAnswer at the bottom
 // of this file for why. A leaf module, so sharing it does not pull the
 // secret-vault graph into a command that never opens the vault.
-import { ANSWER_EOF, readAnswerFromTTY } from "./tty-reader.js";
+import { ANSWER_EOF, DISPLAY_CONTROL_SOURCE, readAnswerFromTTY } from "./tty-reader.js";
 import type { UpstreamServerConfig } from "./types.js";
 
 export const TRUST_USAGE = `Usage: yaw-mcp trust [--yes]
@@ -365,7 +366,7 @@ async function runTrustGrant(opts: TrustCommandOptions): Promise<TrustCommandRes
   print("");
 
   if (!opts.yes) {
-    if (!isInteractive(opts)) {
+    if (!isInteractivePrompt(opts)) {
       printErr(
         "yaw-mcp trust: refusing to approve without a confirmation -- stdin/stdout is not a TTY. Review the commands above, then re-run with --yes.",
       );
@@ -477,7 +478,7 @@ async function offerGitBuild(
   if (notBuilt.length === 0) return 0;
   const one = notBuilt.length === 1;
   const what = one ? "1 git server is" : `${notBuilt.length} git servers are`;
-  if (opts.yes || !isInteractive(opts)) {
+  if (opts.yes || !isInteractivePrompt(opts)) {
     // ONE self-contained line, naming the command that works HERE. Off a TTY
     // the bare `sidecars install` refuses a repo with no stored grant, so the
     // old pair -- bare command, then a second line about adding --yes to that
@@ -622,14 +623,10 @@ function renderLaunch(s: UpstreamServerConfig, home: string): string {
 // anything the terminal ACTS on instead of PRINTING has to be turned into
 // visible text first.
 
-/**
- * Everything a terminal may act on rather than print: C0 (incl. ESC, BEL,
- * BS, CR), DEL, the C1 block (0x9b is CSI in its 8-bit form), and the bidi
- * overrides / isolates, which can visually reorder an argv without changing
- * a byte of it.
- */
-const DISPLAY_CONTROL_SOURCE =
-  "[\\u0000-\\u001f\\u007f-\\u009f\\u200b-\\u200f\\u2028\\u2029\\u202a-\\u202e\\u2066-\\u2069]";
+// DISPLAY_CONTROL_SOURCE (tty-reader.ts) is everything a terminal may act on
+// rather than print: C0, DEL, the C1 block, and the zero-width and bidi
+// controls, which can visually reorder an argv without changing a byte of it.
+// One class, shared with the prompt reader's echo path.
 const DISPLAY_CONTROL_RE = new RegExp(DISPLAY_CONTROL_SOURCE);
 const DISPLAY_CONTROL_RE_G = new RegExp(DISPLAY_CONTROL_SOURCE, "g");
 
@@ -828,9 +825,15 @@ function gitTokenTarget(s: UpstreamServerConfig): { name: string; to: string; se
   return { name, to: displaySafe(parsed.spec.host), sent: true };
 }
 
-/** The lines naming content the SHA-256 does not cover: at most two for a
- *  command entry, and for a git entry the lifecycle-scripts line plus, with no
- *  pinned commit, the moving-ref line. */
+/** The `!` lines under an entry in the review: at most two for a command
+ *  entry, both naming content the SHA-256 does not cover. For a git entry, up
+ *  to three: with no pinned commit the moving-ref line, always the
+ *  lifecycle-scripts line, and -- when the entry's tokenSecret would really be
+ *  sent (an https URL) -- a line saying that approving lets yaw-mcp read that
+ *  vault secret and send it to the host. That last one restates, as a
+ *  consequence, the `token:` row the review prints just above these lines;
+ *  both are printed on purpose (git-sources-lifecycle.test.ts pins the pair),
+ *  and the row alone covers the not-sent cases. */
 function pinGaps(s: UpstreamServerConfig): string[] {
   if (s.git) {
     const lines: string[] = [];
@@ -1051,7 +1054,13 @@ async function runTrustRevoke(opts: TrustCommandOptions): Promise<TrustCommandRe
   } else {
     const probe = await probeProjectTrust({ cwd, home, env });
     if (probe.path === null) {
-      const msg = `no .yaw-mcp/ directory found by walking up from ${displaySafe(cwd)}; pass an explicit path (see \`yaw-mcp trust --list\`)`;
+      // Not a flat "no .yaw-mcp/ directory found", for the reason the grant
+      // path gives: the walk also SKIPS a `.yaw-mcp/` outside $HOME whose
+      // ownership it cannot verify, and reports it exactly like none at all.
+      // A file approved while the env var was set is then un-findable from
+      // inside its own checkout; the explicit path reaches it either way
+      // (revokeTrust works on the stored path, not on the walk).
+      const msg = `no .yaw-mcp/ directory that yaw-mcp can use was found by walking up from ${displaySafe(cwd)}. One OUTSIDE your home directory is SKIPPED unless yaw-mcp can verify you own it (${ALLOW_UNOWNED_ENV}=1 trusts this checkout); to revoke an approval anyway, pass an explicit path (see \`yaw-mcp trust --list\`)`;
       if (opts.json) out(`${JSON.stringify({ ok: false, error: msg })}\n`);
       else printErr(`yaw-mcp trust --revoke: ${msg}`);
       return { exitCode: 1 };
@@ -1120,20 +1129,10 @@ async function runTrustRevoke(opts: TrustCommandOptions): Promise<TrustCommandRe
 
 // --- prompt -----------------------------------------------------------------
 
-/** Both ends must be a TTY: stdin to read the answer, stdout to show the
- *  question. The same rule as secrets-cmd.ts:isInteractiveTTY, and like it
- *  this reads the INJECTED streams (opts.io) before process.std*: askYesNo
- *  asks on opts.io, so the verdict has to be about the streams the prompt
- *  would actually use. The two test hooks come first: isTTY forces the
- *  verdict outright, and a canned promptAnswer never reads anything, so
- *  there is nothing that needs to be a TTY. */
-function isInteractive(opts: TrustCommandOptions): boolean {
-  if (opts.isTTY !== undefined) return opts.isTTY;
-  if (opts.promptAnswer !== undefined) return true;
-  const stdin = opts.io?.stdin ?? process.stdin;
-  const stdout = opts.io?.stdout ?? process.stdout;
-  return (stdin as { isTTY?: boolean }).isTTY === true && (stdout as { isTTY?: boolean }).isTTY === true;
-}
+// The TTY verdict for all three prompts is the shared isInteractivePrompt
+// (readline-question.ts): both ends a TTY, judged on the injected streams
+// (opts.io) before process.std*, with the isTTY and promptAnswer test hooks
+// first. This file's own copy of it is where that rule came from.
 
 /** The reader all three trust prompts hand askYesNo in place of its readline
  *  default; askYesNo still owns the promptAnswer short-circuit and the

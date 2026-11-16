@@ -79,7 +79,7 @@ import {
 } from "./local-bundles.js";
 import { createStreamWriter } from "./logger.js";
 import { findProjectConfigDir, userConfigDir } from "./paths.js";
-import type { YesNoOptions } from "./readline-question.js";
+import { isInteractivePrompt, type YesNoOptions } from "./readline-question.js";
 import { SECRET_NAME_RE } from "./secrets-vault.js";
 import type { GitSource, UpstreamServerConfig } from "./types.js";
 
@@ -276,7 +276,7 @@ export function readGitEntries(path: string, configDir?: string): GitEntriesFile
 }
 
 /** The user's bundles.json, or with `project` the project's. */
-export async function targetBundlesFile(
+async function targetBundlesFile(
   project: boolean,
   home: string,
   cwd: string,
@@ -360,11 +360,10 @@ export interface UpdateReport {
 
 const sha7 = (c: string | null | undefined): string => (c ? c.slice(0, 7) : "(none)");
 
+/** Never under --json, whose stdout is the document; otherwise the shared
+ *  TTY verdict (isInteractivePrompt in readline-question.ts). */
 function interactiveFor(opts: UpdateCommandOptions): boolean {
-  if (opts.json) return false;
-  if (opts.isTTY !== undefined) return opts.isTTY;
-  if (opts.promptAnswer !== undefined) return true;
-  return Boolean(process.stdin.isTTY) && Boolean(process.stdout.isTTY);
+  return !opts.json && isInteractivePrompt(opts);
 }
 
 function statusText(r: UpdateReport): string {
@@ -509,7 +508,15 @@ export async function runUpdate(opts: UpdateCommandOptions = {}): Promise<{ exit
     // A rollback to a build on disk needs no remote, so no token either: the
     // vault is read only when the kept build must be rebuilt for this host.
     if (opts.to !== undefined) {
-      const r = await rollBack(e, parsed.spec, opts.to, tokenSecret, buildCtx(), file.path, { cwd, env });
+      const r = await rollBack(
+        e,
+        parsed.spec,
+        opts.to,
+        tokenSecret,
+        buildCtx(),
+        { path: file.path, shared: file.configDir !== undefined },
+        { cwd, env },
+      );
       if (!r.ok) {
         // Same exit 2 and same document as the gate the other modes pass
         // before the loop. Nothing has been touched when no entry has been
@@ -832,14 +839,17 @@ async function startCheck(
  *  is discarded, so a machine without git keeps the build it has. The discard
  *  has to come first (the builder would otherwise reuse the foreign build), so
  *  a rebuild that then fails says the foreign build is gone, instead of the
- *  builder's own "Nothing was changed". */
+ *  builder's own "Nothing was changed". `pin.shared` is the same flag the
+ *  ordinary update path hands the builder (the pin file is a project file),
+ *  so a rebuild that fails on access or on a moved package gets the remedy
+ *  worded for that file -- `--project` included. */
 async function rollBack(
   e: RawGitEntry,
   spec: GitSpec,
   prefix: string,
   tokenSecret: string | undefined,
   ctx: GitBuildContext,
-  pinFile: string,
+  pin: { path: string; shared: boolean },
   where: { cwd: string; env: NodeJS.ProcessEnv },
 ): Promise<
   { ok: true; commit: string; rebuilt: boolean } | { ok: false; message: string; gitMissing?: true; cancelled?: true }
@@ -879,7 +889,8 @@ async function rollBack(
       subdir: e.git.subdir ?? "",
       entry: e.git.entry,
       ...(tokenSecret ? { tokenSecret } : {}),
-      pinFile,
+      shared: pin.shared,
+      pinFile: pin.path,
       unchanged: gone,
     },
     ctx,

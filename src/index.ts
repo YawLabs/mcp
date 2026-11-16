@@ -10,7 +10,7 @@ import { parseDoctorArgs, runDoctor } from "./doctor-cmd.js";
 import { parseFoundryArgs, runFoundryExport } from "./foundry-cmd.js";
 import { parseHealArgs, runHeal } from "./heal-cmd.js";
 import { parseImportArgs, runImport } from "./import-cmd.js";
-import { INSTALL_USAGE, parseInstallArgs, parseUninstallArgs, runInstall, runUninstall } from "./install-cmd.js";
+import { parseInstallArgs, parseUninstallArgs, runInstall, runUninstall } from "./install-cmd.js";
 import { parseAddArgs, parseListArgs, parseRemoveArgs, runAdd, runList, runRemove } from "./local-add-cmd.js";
 import { parseSetArgs, parseToggleArgs, runEnableDisable, runSet } from "./local-set-cmd.js";
 import { log, setLogSurface } from "./logger.js";
@@ -20,7 +20,7 @@ import { parseSecretsArgs, runSecrets } from "./secrets-cmd.js";
 import { decideServeMode } from "./serve-gate.js";
 import { ConnectServer } from "./server.js";
 import { parseShareArgs, runShare } from "./share-cmd.js";
-import { registerShutdownTriggers } from "./shutdown-triggers.js";
+import { registerShutdownTriggers, runShutdown } from "./shutdown-triggers.js";
 import { parseSidecarsArgs, runSidecarsInstall } from "./sidecars-cmd.js";
 import { parseStatusArgs, runStatus } from "./status-cmd.js";
 import { retiredSubcommandReplacement, suggestFlag, suggestSubcommand } from "./subcommands.js";
@@ -199,25 +199,16 @@ if (subcommand === "compliance") {
   // sent `foundry --help` to stderr with exit 2.
   run("foundry", parseFoundryArgs(process.argv.slice(3)), runFoundryExport);
 } else if (subcommand === "install") {
-  const parsed = parseInstallArgs(process.argv.slice(3));
-  // --help is now a successful parse with helpRequested=true (parser
-  // returns { ok: true, options: { helpRequested: true } }); print USAGE
-  // and exit 0. Real argv errors still come back as ok:false -> stderr + 2.
-  if (parsed.ok && parsed.options.helpRequested) {
-    // Help is a SUCCESSFUL parse here, so it cannot ride the shared tail --
-    // but INSTALL_USAGE is multi-KB, so it still must not process.exit().
-    process.stdout.write(`${INSTALL_USAGE}\n`);
-    process.exitCode = 0;
-  } else {
-    const clientEnv = clientEnvForVerb();
-    run("install", parsed, (options) =>
-      runInstall({ ...options, claudeConfigDir: clientEnv.claudeConfigDir, clientEnv }),
-    );
-  }
+  // Rides the shared parse-then-dispatch tail, --help included:
+  // parseInstallArgs signals it as `{ ok: false, error: USAGE, help: true }`
+  // like parseUninstallArgs, so run() prints the usage to stdout with exit 0
+  // (via process.exitCode -- the usage is multi-KB and must drain).
+  const clientEnv = clientEnvForVerb();
+  run("install", parseInstallArgs(process.argv.slice(3)), (options) =>
+    runInstall({ ...options, claudeConfigDir: clientEnv.claudeConfigDir, clientEnv }),
+  );
 } else if (subcommand === "uninstall") {
-  // Rides the shared parse-then-dispatch tail: parseUninstallArgs signals
-  // --help the ordinary way (`{ ok: false, error: USAGE, help: true }`), so
-  // unlike `install` it needs no branch of its own for it.
+  // Rides the shared parse-then-dispatch tail, as `install` above does.
   //
   // The env comes from the ONE reader above, not from a read of its own. It
   // matters as much on the subtract side -- under a Yaw Mode overlay the entry
@@ -680,7 +671,8 @@ if (subcommand === "compliance") {
                                is reported instead of moved into .yaw-mcp/
                                (default: off; \`status\` never writes).
     YAW_MCP_CATALOG_URL          Override the catalog \`add\`/\`try\` resolve slugs
-                               against (default https://yaw.sh/data/mcp-catalog.json).
+                               against and \`search\` reads (default
+                               https://yaw.sh/data/mcp-catalog.json).
     YAW_MCP_LOG_LEVEL             Same values as LOG_LEVEL (below), and wins
                                over it when both are set. Also makes
                                subcommands (\`list\`, \`doctor\`, ...) print the
@@ -726,7 +718,8 @@ if (subcommand === "compliance") {
                                resource/prompt inventory calls after the
                                handshake (default 15000).
     MCP_CALL_TIMEOUT              Milliseconds to wait for a single proxied
-                               tools/call (default 60000, the SDK's own
+                               tools/call, resources/read or prompts/get
+                               (default 60000, the SDK's own
                                bound) -- the last leg of a request that had
                                no override. Raise it for a server that is
                                legitimately slow (browser automation, a
@@ -858,7 +851,9 @@ if (subcommand === "compliance") {
   \`--no-yaw-mcp-config\` install flags, are deprecated and ignored -- yaw-mcp
   no longer contacts a hosted API. They are still accepted, with a warning,
   so an old config file or setup script keeps working.
-  If you have a token on disk, delete it and revoke it at its source.
+  If you have a token on disk, delete it. There is nowhere left to revoke
+  it: the hosted service that issued it is retired, so deleting it is all
+  there is to do.
 
   Docs:   https://yaw.sh/mcp
   Source: https://github.com/YawLabs/mcp
@@ -1014,17 +1009,11 @@ async function runServer(): Promise<void> {
   const shutdown = async (): Promise<void> => {
     if (shuttingDown) return;
     shuttingDown = true;
-    // Deliberately REF'd. This watchdog exists for exactly one case -- a
-    // server.shutdown() that never settles -- and an unref'd timer stops
-    // holding the event loop open, so in that case Node would either exit
-    // on its own (whatever else is pending decides) or hang forever, and
-    // the force-exit would never fire: the guard was disarmed precisely
-    // when it was needed. It costs nothing on the healthy path, because
-    // the process.exit(0) below runs the moment shutdown resolves and
-    // takes the pending timer with it.
-    setTimeout(() => process.exit(1), 10_000);
-    await server.shutdown();
-    process.exit(0);
+    // The watchdog (ref'd, 10 s), the catch for a REJECTING
+    // server.shutdown() and the two exit codes are runShutdown's, in
+    // shutdown-triggers.ts -- a module a test can import, which this file is
+    // not (it dispatches at import time).
+    await runShutdown(() => server.shutdown(), { exit: (code) => process.exit(code), log });
   };
 
   // SIGTERM/SIGINT plus stdin end/close. The stdin half is what makes this

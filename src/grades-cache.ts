@@ -20,7 +20,7 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { atomicWriteFile } from "./atomic-write.js";
-import { type FileLockOptions, stealStaleLock, withFileLock } from "./file-lock.js";
+import { type FileLockOptions, withFileLock } from "./file-lock.js";
 import { setJsonKey } from "./json-key.js";
 import { parseJsonc } from "./jsonc.js";
 import { log } from "./logger.js";
@@ -191,9 +191,6 @@ async function readGradesCacheImpl(home: string, opts: { strictRead: boolean }):
 
 /** Test hooks for the lock's timing. Production callers pass nothing. */
 export type WriteGradeOptions = FileLockOptions;
-
-/** Re-exported for the grades-cache test that pins the live-restore path. */
-export { stealStaleLock };
 
 // Names the LOCK file only: audit-cmd's exit-3 wrapper already prefixes the
 // grades.json path, and the lock sits beside it, so repeating the cache path

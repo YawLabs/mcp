@@ -953,6 +953,20 @@ describe("top-level defaults through the write facade (ConfigShape.rootDefaults)
     expect(applyClientConfigEdits(view, [GRACE_EDIT], codex())).toBe(`model = "gpt-5"\n${GRACE} = 0\n\n${TABLE}`);
   });
 
+  it("names a blocked container in the file's own syntax: a TOML table, a JSON object", () => {
+    // The facade's refusal is printed verbatim by some surfaces, and it used
+    // to say "not an object" for a config.toml, which has no objects.
+    const entry = { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] };
+    const toml = classifyClientConfig("mcp_servers = 1\n", codex());
+    expect(() => applyClientConfigEdits(toml, [{ op: "upsert", key: "mcp", entry }], codex())).toThrow(
+      `"mcp_servers" in ${CODEX_FILE} is a number, not a TOML table -- refusing to overwrite it`,
+    );
+    const json = classifyClientConfig('{"mcpServers": null}\n', site());
+    expect(() => applyClientConfigEdits(json, [{ op: "upsert", key: "mcp", entry }], site())).toThrow(
+      '"mcpServers" in /home/u/cfg.json is null, not a JSON object -- it has to be repaired before an entry can be written',
+    );
+  });
+
   it("creates a missing file with the entry AND the key in one write", () => {
     const view = classifyClientConfig(null, codex());
     const entry = { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] };

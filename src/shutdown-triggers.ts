@@ -18,8 +18,9 @@
 // upstream teardown still hangs off stdin here. (The v1 transport had no
 // 'end' listener at all, which is why this module exists.)
 //
-// TIMING CONSTRAINT the callback runs under. index.ts arms a 10s force-exit
-// (`setTimeout(() => process.exit(1), 10_000)`, ref'd on purpose) the moment
+// TIMING CONSTRAINT the callback runs under. runShutdown below (called from
+// index.ts's shutdown closure) arms a 10s force-exit (SHUTDOWN_FORCE_EXIT_MS,
+// ref'd on purpose) the moment
 // shutdown starts, and the teardown it bounds is the SDK's STAGED stdio close
 // per upstream: end stdin, wait up to 2s, SIGTERM, wait up to 2s, SIGKILL
 // (StdioClientTransport.close) -- up to 4s per child that ignores EOF, run
@@ -29,7 +30,7 @@
 // drain 2s + staged close 4s + headroom. Anything new that a shutdown
 // trigger makes the callback wait on comes out of that headroom, and past it
 // the process exits 1 instead of 0 -- which a desktop client then reports
-// as a crashed server. The number itself is index.ts's to change.
+// as a crashed server. The number is SHUTDOWN_FORCE_EXIT_MS below.
 
 /** Structural minimum of an EventEmitter this module attaches to. Kept
  *  deliberately loose (rather than Pick<NodeJS.Process, "on">) because
@@ -85,4 +86,56 @@ export function registerShutdownTriggers(shutdown: () => void, targets: Shutdown
   for (const event of STDIN_SHUTDOWN_EVENTS) {
     targets.stdin.on(event, shutdown);
   }
+}
+
+/** How long a teardown gets before the process is force-exited with 1. See
+ *  the TIMING CONSTRAINT note in this file's header for what is sized
+ *  against it. */
+export const SHUTDOWN_FORCE_EXIT_MS = 10_000;
+
+export interface RunShutdownDeps {
+  /** `process.exit` in production. */
+  exit(code: number): void;
+  /** logger.ts's `log` in production; only ever called at "error". */
+  log(level: "error", message: string, data: Record<string, unknown>): void;
+  /** The watchdog budget; SHUTDOWN_FORCE_EXIT_MS when absent. */
+  forceAfterMs?: number;
+}
+
+/**
+ * Run one teardown to the process exit: 0 when `shutdown` resolves, 1 when it
+ * rejects or does not settle within the watchdog budget.
+ *
+ * The body of index.ts's shutdown closure, moved here because index.ts
+ * dispatches at import time and nothing can import it to call that closure.
+ * The caller still owns the "already shutting down" latch (see
+ * registerShutdownTriggers); this runs once per call.
+ *
+ * The watchdog is deliberately REF'd. It exists for exactly one case -- a
+ * `shutdown` that never settles -- and an unref'd timer stops holding the
+ * event loop open, so in that case Node would either exit on its own
+ * (whatever else is pending decides) or hang forever, and the force-exit
+ * would never fire: the guard disarmed precisely when it was needed. It costs
+ * nothing on the healthy path: it is cleared the moment `shutdown` settles,
+ * just before the exit that would have taken it anyway.
+ *
+ * A REJECTING `shutdown` is the other way teardown can fail to finish, and
+ * the watchdog is the wrong answer to it: uncaught, the rejection went to
+ * index.ts's unhandledRejection handler, which only logs, and the process
+ * then sat out the full budget before the timer's exit(1). Nothing is left
+ * to wait for once shutdown has thrown, so say why and exit now, with the
+ * code the watchdog would have used.
+ */
+export async function runShutdown(shutdown: () => Promise<void>, deps: RunShutdownDeps): Promise<void> {
+  const watchdog = setTimeout(() => deps.exit(1), deps.forceAfterMs ?? SHUTDOWN_FORCE_EXIT_MS);
+  try {
+    await shutdown();
+  } catch (err: unknown) {
+    clearTimeout(watchdog);
+    deps.log("error", "Shutdown failed", { error: err instanceof Error ? err.message : String(err) });
+    deps.exit(1);
+    return;
+  }
+  clearTimeout(watchdog);
+  deps.exit(0);
 }

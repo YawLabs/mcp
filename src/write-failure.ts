@@ -18,8 +18,8 @@
 // it never says less than the raw error did.
 //
 // Its own module, not a function inside install-cmd.ts, because more than
-// one command writes a client config: install and uninstall use it now, and
-// heal's writes (heal-entries.ts) fail the same way.
+// one command writes a client config: install, uninstall and heal
+// (heal-entries.ts) all word a refused write through it.
 
 import { statSync } from "node:fs";
 import { posix, win32 } from "node:path";

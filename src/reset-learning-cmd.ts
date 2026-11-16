@@ -53,7 +53,7 @@ import { homedir } from "node:os";
 import { createStreamWriter } from "./logger.js";
 import { userConfigDir } from "./paths.js";
 import { isFileNotFound, isPersistenceDisabled, loadStateClassified, statePath } from "./persistence.js";
-import { askYesNo, QUESTION_CANCELLED } from "./readline-question.js";
+import { askYesNo, isInteractivePrompt, QUESTION_CANCELLED } from "./readline-question.js";
 
 export const RESET_LEARNING_USAGE = `Usage: yaw-mcp reset-learning
 
@@ -160,14 +160,6 @@ export interface ResetLearningResult {
   removed: boolean;
   /** Absolute path we targeted — useful for the "nothing to reset" message. */
   path: string;
-}
-
-/** Both ends must be a TTY: stdin to read the answer, stdout to show the
- *  question. Same predicate (and the same test seams) as `remove` and `set`. */
-function isInteractive(opts: ResetLearningOptions): boolean {
-  if (opts.isTTY !== undefined) return opts.isTTY;
-  if (opts.promptAnswer !== undefined) return true;
-  return Boolean(process.stdin.isTTY) && Boolean(process.stdout.isTTY);
 }
 
 export async function runResetLearning(opts: ResetLearningOptions = {}): Promise<ResetLearningResult> {
@@ -278,7 +270,7 @@ export async function runResetLearning(opts: ResetLearningOptions = {}): Promise
       print("  contents unreadable -- it will be deleted as it is.");
     }
     print("  This cannot be undone.");
-    if (!isInteractive(opts)) {
+    if (!isInteractivePrompt(opts)) {
       printErr(
         `yaw-mcp reset-learning: refusing to delete ${filePath} without a confirmation -- stdin/stdout is not a TTY.`,
       );

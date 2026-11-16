@@ -60,6 +60,7 @@ import { compareVersions, packageEntry, resolveBinAbsolute } from "./oam-spawn.j
 import {
   findProjectConfigDir,
   GIT_BUILD_SHA_LEN,
+  GIT_BUILT_SUFFIX,
   gitBuildDir,
   gitFailedPath,
   gitRoot,
@@ -84,6 +85,7 @@ export interface GitSpec {
   username?: string;
 }
 
+/** Exported for tests only; parseGitSpec is its one user. */
 export const GIT_CREDENTIALS_REFUSAL =
   "--git: the URL carries credentials. Remove them -- yaw-mcp uses your ssh-agent or git credential helper; a token here would be written into bundles.json and .git/config.";
 
@@ -307,8 +309,16 @@ export const GIT_MISSING_MESSAGE =
   "git is not installed or not on PATH. Install: winget install Git.Git / xcode-select --install / apt install git";
 
 /** The env a git child runs under, minus yaw-mcp's own secrets. Off a TTY
- *  nothing may prompt: git fails fast instead of hanging a `--json` run or
- *  the panel. */
+ *  git and Git Credential Manager may not prompt (gitOverlay): an HTTPS
+ *  remote fails fast instead of hanging a `--json` run or the panel.
+ *
+ *  That covers git's and GCM's own prompts only. ssh asks its questions (an
+ *  unknown host key, a key passphrase) on the controlling terminal whatever
+ *  stdin is, and nothing here stops it: `add --git git@host:x --json` typed
+ *  in a terminal can still wait on one. Forcing `ssh -o BatchMode=yes`
+ *  through GIT_SSH_COMMAND would close that, but it also replaces the user's
+ *  `core.sshCommand` (the Windows OpenSSH setting gitAuthMessage recommends)
+ *  and breaks a plink-style ssh, so it is not done. */
 export interface GitRunContext {
   env: NodeJS.ProcessEnv;
   interactive: boolean;
@@ -436,7 +446,8 @@ export function gitAuthMessage(spec: GitSpec, tokenSecret?: string, shared = fal
 }
 
 /** ssh refusing the host itself, which no credential fixes. Never accepted
- *  for the user: a changed key can be an interception. */
+ *  for the user: a changed key can be an interception. Exported for tests
+ *  only; gitAccessFailure is its one user. */
 export function gitHostKeyMessage(spec: GitSpec, stderr: string): string | null {
   const host = spec.host || "the remote";
   if (HOST_KEY_CHANGED_RE.test(stderr)) {
@@ -1115,7 +1126,9 @@ export function readGitManifest(repoDir: string, subdirFlag?: string): { manifes
   if (subdir === undefined || subdir === "") return { manifest: root, warnings };
   const label = `${subdir.replace(/\\/g, "/").replace(/\/+$/, "")}/${GIT_MANIFEST_FILENAME}`;
   const sub = readManifestFile(join(repoDir, ...subdir.split(/[\\/]/), GIT_MANIFEST_FILENAME), label, warnings, false);
-  return { manifest: { ...root, ...sub, ...(root.subdir ? { subdir: root.subdir } : {}) }, warnings };
+  // `sub` never carries a subdir (allowSubdir is false above), so the root's
+  // survives the spread.
+  return { manifest: { ...root, ...sub }, warnings };
 }
 
 // --- consent ------------------------------------------------------------------
@@ -1140,6 +1153,12 @@ export function hasRepoConsent(url: string, home: string): boolean {
   return Object.hasOwn(readConsentRepos(home), normalizeRepoUrl(url));
 }
 
+/** The only writer of consent.json, and there is no revoke: a grant outlives
+ *  the entry it was given for. `yaw-mcp remove` deletes the entry and its
+ *  builds and leaves the grant (REMOVE_USAGE in local-add-cmd.ts says so), so
+ *  a later add, update or trust build of the same repo -- any commit, any new
+ *  lifecycle script -- runs unasked. Taking it back is a hand edit of
+ *  gitConsentPath(home). */
 export async function recordRepoConsent(url: string, home: string, now: Date = new Date()): Promise<void> {
   const repos = { ...readConsentRepos(home), [normalizeRepoUrl(url)]: { grantedAt: now.toISOString() } };
   await atomicWriteFile(
@@ -1164,7 +1183,8 @@ export function tokenUsername(spec: GitSpec): string {
  *  env vars set only on that git child, so the token never touches a file.
  *  One sh script everywhere: Git for Windows runs a `#!/bin/sh` file through
  *  its own sh, where a .cmd helper went through cmd.exe, which splits an
- *  unquoted home path at & ( ) % or ^. */
+ *  unquoted home path at & ( ) % or ^. Exported for tests only; prepareGit
+ *  is its one user. */
 export function writeAskpassHelper(home: string): string {
   const root = gitRoot(home);
   mkdirSync(root, { recursive: true, mode: 0o700 });
@@ -1190,7 +1210,7 @@ export function writeAskpassHelper(home: string): string {
 
 /** Read a vault secret for a git token. The passphrase comes from the env (or
  *  this session), never a prompt: a failure names the secret and the fix. */
-export async function readVaultSecret(name: string, home: string): Promise<string> {
+async function readVaultSecret(name: string, home: string): Promise<string> {
   const vault = await loadVault(vaultPath(home));
   if (!vault || !Object.hasOwn(vault.entries, name)) {
     throw new Error(`secret "${name}" is not in your vault. Store it: yaw-mcp secrets set ${name}`);
@@ -1215,7 +1235,9 @@ export const GIT_LOCK_NAME = ".lock";
 export { type GitBuildMarker, gitEntryBuilt, type PackageManagerName, readBuildMarker };
 
 /** rmSync over a tree that can hold pnpm's junctions: rmSync unlinks a link
- *  rather than walking into its target. */
+ *  rather than walking into its target. This one, tryRemoveTree and
+ *  sweepStaging are exported for tests only; nothing outside this file calls
+ *  them. */
 export function removeTree(path: string): void {
   rmSync(path, { recursive: true, force: true, maxRetries: 3 });
 }
@@ -1690,6 +1712,10 @@ async function buildLocked(
     if (Number.isInteger(count)) ahead = count;
   }
 
+  // The commit is checked out and verified. What can fail from here to the
+  // install (no package.json, a package manager refusal, the move into place)
+  // is recorded as its own step, not as a checkout that worked.
+  step = "layout";
   const { manifest, warnings: manifestWarnings } = readGitManifest(work, reqSubdir);
   for (const w of manifestWarnings) warn(w);
   namespace = namespace ?? manifest.namespace;
@@ -2013,16 +2039,17 @@ export function treeSizeBytes(path: string): number {
 
 // --- references: which bundles.json pins which build -------------------------
 
-export const GIT_REFS_FILENAME = "refs.json";
+const GIT_REFS_FILENAME = "refs.json";
 
 /** How long recordGitPin waits for the git lock before it skips the record. */
-export const GIT_PIN_LOCK_WAIT_MS = 5_000;
+const GIT_PIN_LOCK_WAIT_MS = 5_000;
 
 /** `~/.yaw-mcp/git/<ns>/refs.json`, `{ "<absolute bundles.json>": "<commit>" }`:
  *  files seen pinning a build of this namespace. A HINT, not the truth: GC and
  *  remove derive what is live from the files themselves (see gitLiveness), and
  *  this record only adds the files they could not otherwise find -- a project
- *  loaded under YAW_MCP_TRUST_PROJECT outside the cwd, say. */
+ *  loaded under YAW_MCP_TRUST_PROJECT outside the cwd, say. The path helper is
+ *  exported for tests only. */
 export function gitRefsPath(namespace: string, home: string): string {
   return join(gitCheckoutDir(namespace, home), GIT_REFS_FILENAME);
 }
@@ -2085,8 +2112,10 @@ async function writeRefs(namespace: string, home: string, refs: Record<string, s
  *  DURING a build does not -- the build's own GC reads refs.json straight
  *  afterwards, and consuming the corrupt file there would turn "unreadable
  *  source: delete nothing" into a clean file that names only what this build
- *  just added, letting the GC delete everything the corrupt file held. Those
- *  callers repair upfront instead (see buildGitSource). */
+ *  just added, letting the GC delete everything the corrupt file held. That
+ *  caller (buildGitSource, `repair` false) leaves the corrupt file where it
+ *  is: the next GC or remove (gitLiveness with `repair: true`) reports it as
+ *  an unreadable source, deletes nothing, and moves it aside. */
 async function writePinRecord(
   namespace: string,
   file: string,
@@ -2414,15 +2443,20 @@ async function collectLocked(
   const errors: string[] = [];
   // `.built` sorts after its directory, so delete every unkept marker first: a
   // directory a held-open file stops half-way through never reads as built.
-  const names = readdirSync(dir).sort((a, b) => Number(b.endsWith(".built")) - Number(a.endsWith(".built")));
+  const isBuiltMarker = (n: string): boolean => n.endsWith(GIT_BUILT_SUFFIX);
+  const names = readdirSync(dir).sort((a, b) => Number(isBuiltMarker(b)) - Number(isBuiltMarker(a)));
   for (const n of names) {
-    const sha = /^([0-9a-f]{12})(\.failed|\.built)?$/.exec(n);
-    if (!sha?.[1] || kept.has(sha[1])) continue;
+    // A build directory, or one of its two sibling records. The marker suffix
+    // is paths.ts's constant, so this pass keeps recognising markers if the
+    // spelling ever changes.
+    const suffix = isBuiltMarker(n) ? GIT_BUILT_SUFFIX : n.endsWith(".failed") ? ".failed" : "";
+    const sha12 = suffix ? n.slice(0, -suffix.length) : n;
+    if (!/^[0-9a-f]{12}$/.test(sha12) || kept.has(sha12)) continue;
     try {
       removeTree(join(dir, n));
-      if (!sha[2]) removed.push(sha[1]);
+      if (!suffix) removed.push(sha12);
     } catch (e) {
-      if (!sha[2]) failed.push(sha[1]);
+      if (!suffix) failed.push(sha12);
       errors.push(`${n}: ${asciiLines((e as Error).message)}`);
     }
   }
@@ -2539,8 +2573,15 @@ export async function gcGitBuilds(
   const release = acquireSidecarsLock(root, GIT_LOCK_NAME);
   if (release === null) return { locked: true, message: lockedMessage(root, "old builds were left in place.") };
   try {
+    // Asked again under the lock: a `remove` that held it may have deleted the
+    // namespace directory since the check above.
+    if (!existsSync(gitCheckoutDir(namespace, home))) return { removed: [], errors: [], unreadable: [], notes: [] };
     const res = await collectLocked(namespace, keep, home, opts);
     return { removed: res.removed, errors: res.errors, unreadable: res.unreadable, notes: res.notes };
+  } catch (e) {
+    // As removeGitCheckout: a GC that could not finish is a result, not a
+    // throw out of `update`.
+    return { removed: [], errors: [asciiLines((e as Error).message)], unreadable: [], notes: [] };
   } finally {
     release();
   }
@@ -2624,7 +2665,7 @@ export async function discardUnpinnedBuild(
 
 // --- update --check state ---------------------------------------------------------
 
-export const GIT_STATE_FILENAME = "state.json";
+const GIT_STATE_FILENAME = "state.json";
 
 /** The last ls-remote verdict for one entry. doctor reads it offline: a
  *  private SSH remote can prompt or hang, so doctor never asks the remote. */
@@ -2639,6 +2680,7 @@ export interface GitStateEntry {
   checkedAt: string;
 }
 
+/** Exported for tests only; readGitState and writeGitState are its users. */
 export function gitStatePath(home: string): string {
   return join(gitRoot(home), GIT_STATE_FILENAME);
 }

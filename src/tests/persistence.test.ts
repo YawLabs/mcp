@@ -236,10 +236,19 @@ describe("persistence.loadState", () => {
       writeFileSync(file, JSON.stringify([1, 2, 3]), "utf8");
       expect((await loadStateClassified(file)).parsedCleanly).toBe(false);
 
-      writeFileSync(file, JSON.stringify({ version: 99, learning: {}, packHistory: [] }), "utf8");
+      // An unreadable version BELOW the current one: the documented start-over.
+      writeFileSync(file, JSON.stringify({ version: 0, learning: {}, packHistory: [] }), "utf8");
       const c = await loadStateClassified(file);
       expect(c.parsedCleanly).toBe(false);
       expect(c.state).toEqual(emptyState());
+
+      // One ABOVE it is not clean either, but it is a newer yaw-mcp's live
+      // file, so the empty stand-in carries loadFailed and nothing saves over
+      // it (routing-learning-fixes.test.ts pins the save side).
+      writeFileSync(file, JSON.stringify({ version: 99, learning: {}, packHistory: [] }), "utf8");
+      const newer = await loadStateClassified(file);
+      expect(newer.parsedCleanly).toBe(false);
+      expect(newer.state).toEqual({ ...emptyState(), loadFailed: true });
     });
 
     it("names the failure, and tells a missing file from a healthy one", async () => {
@@ -452,16 +461,20 @@ describe("persistence state schema v1 -> v2 migration", () => {
     expect(s.version).toBe(STATE_SCHEMA_VERSION);
   });
 
-  it("still drops a file whose version is not readable at all", async () => {
-    const future = {
-      version: STATE_SCHEMA_VERSION + 1,
+  it("still reads nothing from a file whose version is not readable at all", async () => {
+    const body = {
       savedAt: 0,
       learning: { gh: { dispatched: 1, succeeded: 1, lastUsedAt: 1 } },
       packHistory: [],
       toolCache: {},
     };
-    writeFileSync(file, JSON.stringify(future), "utf8");
+    // Below the readable set: dropped, and free to be overwritten.
+    writeFileSync(file, JSON.stringify({ version: 0, ...body }), "utf8");
     expect(await loadState(file)).toEqual(emptyState());
+    // Above it: equally unread (no field is trusted from a schema this build
+    // does not know), but flagged so this process never saves over it.
+    writeFileSync(file, JSON.stringify({ version: STATE_SCHEMA_VERSION + 1, ...body }), "utf8");
+    expect(await loadState(file)).toEqual({ ...emptyState(), loadFailed: true });
   });
 });
 

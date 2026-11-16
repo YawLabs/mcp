@@ -107,6 +107,43 @@ export function matchBundles(installedNamespaces: Iterable<string>): BundleMatch
   return { ready, partial };
 }
 
+export interface BundleMissingSplit {
+  notInstalled: string[];
+  disabled: string[];
+  blocked: string[];
+}
+
+/**
+ * Split a partial bundle's `missing` members by what would make each one
+ * available. Both callers (server.ts's private splitBundleMissing, and
+ * bundles-cmd.ts `match`) feed matchBundles the servers that can load right
+ * now -- active AND allowed by the config.json profile -- so "missing" there
+ * means "cannot load now", which is three different situations: not in
+ * bundles.json at all (add it), in it with "isActive": false (enable it), or
+ * in it and active, which leaves the profile as the only filter that can
+ * have kept it out (blocked).
+ *
+ * Pure: `configured` is every server bundles.json holds, active or not.
+ */
+export function splitBundleMissing(
+  missing: readonly string[],
+  configured: Iterable<{ namespace: string; isActive: boolean }>,
+): BundleMissingSplit {
+  const byNamespace = new Map<string, boolean>();
+  // First occurrence wins, matching the `find` this replaced.
+  for (const s of configured) if (!byNamespace.has(s.namespace)) byNamespace.set(s.namespace, s.isActive);
+  const notInstalled: string[] = [];
+  const disabled: string[] = [];
+  const blocked: string[] = [];
+  for (const namespace of missing) {
+    const isActive = byNamespace.get(namespace);
+    if (isActive === undefined) notInstalled.push(namespace);
+    else if (!isActive) disabled.push(namespace);
+    else blocked.push(namespace);
+  }
+  return { notInstalled, disabled, blocked };
+}
+
 /**
  * One-line "how to activate" snippet per bundle. Used by the `list` action
  * so the model has a ready-to-run call site without a second round-trip.

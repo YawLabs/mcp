@@ -8,9 +8,11 @@
 // "loser" of that miss.
 //
 // This is a pure in-memory ring buffer. It does NO I/O, holds no SDK
-// handles, and never calls Date.now() -- the caller always passes `now` in.
-// That keeps it trivially testable and resume-safe (a snapshot/restore of
-// the session can replay timestamps without the clock drifting).
+// handles, and never calls Date.now() -- the caller always passes `now` in,
+// so a test controls the clock. Nothing here is persisted or restorable: the
+// ring lives and dies with the process.
+
+import { QUERY_FUNCTION_WORDS } from "./relevance.js";
 
 export interface RedispatchMiss {
   loser: string;
@@ -19,8 +21,9 @@ export interface RedispatchMiss {
 // One dispatch decision in the ring.
 interface DispatchRecord {
   namespace: string;
-  // Pre-tokenized intent (caller passes tokenize(intent)) -- stored as a Set
-  // so similarity is a straight set operation with no re-tokenizing.
+  // Pre-tokenized intent (caller passes tokenize(intent)), minus function
+  // words (see contentTokens) -- stored as a Set so similarity is a straight
+  // set operation with no re-tokenizing.
   tokens: Set<string>;
   time: number;
   // True once ANY reply (clean or not) has been observed for this record.
@@ -54,6 +57,22 @@ const JACCARD_THRESHOLD = 0.4;
 // common word ("list", "get") on two short intents can't trip a false miss.
 const MIN_SHARED_TOKENS = 3;
 
+// The intent's CONTENT tokens. The caller tokenizes with relevance.ts's
+// tokenize, which has a 3-character floor and no stopword list, so "what",
+// "are", "the" and "for" arrive here as tokens. Counted, they satisfied both
+// thresholds on their own: "what are the alerts for today" and "what are the
+// meetings for today" share 5 of 7 tokens (0.71), and the first server took a
+// persisted recordMiss for an unrelated task. Dropping the same closed-class
+// list the rankers drop from a query leaves only words that can name a task.
+// Done here, on both sides of the comparison, so no caller can forget it.
+function contentTokens(intentTokens: readonly string[]): Set<string> {
+  const out = new Set<string>();
+  for (const t of intentTokens) {
+    if (!QUERY_FUNCTION_WORDS.has(t)) out.add(t);
+  }
+  return out;
+}
+
 function jaccard(a: Set<string>, b: Set<string>): { score: number; shared: number } {
   if (a.size === 0 || b.size === 0) return { score: 0, shared: 0 };
   let shared = 0;
@@ -81,7 +100,7 @@ export class RedispatchTracker {
     }
     this.ring.push({
       namespace,
-      tokens: new Set(intentTokens),
+      tokens: contentTokens(intentTokens),
       time: now,
       replied: false,
       cleanReply: false,
@@ -152,7 +171,7 @@ export class RedispatchTracker {
     now: number,
     isExcluded: (a: string, b: string) => boolean,
   ): RedispatchMiss | null {
-    const newSet = new Set(newTokens);
+    const newSet = contentTokens(newTokens);
 
     // Scan newest-first so we return the MOST-RECENT qualifying record.
     for (let i = this.ring.length - 1; i >= 0; i--) {

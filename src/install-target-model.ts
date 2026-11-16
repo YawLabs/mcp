@@ -34,8 +34,9 @@ export interface ResolvedPath {
   /** Absolute path to the config file (with ~ / env vars expanded). */
   absolute: string;
   /** Human-friendly display path with ~ / env-var form preserved.
-   *  Its one runtime reader is uninstall's Done line, and only for a row that
-   *  declares `uninstallNote` (typed); `--list` re-derives a display from
+   *  Two runtime readers, both in uninstall: the Done line, and only for a row
+   *  that declares `uninstallNote` (typed), and the `--os <another OS>
+   *  --dry-run` preview, which names the file by it; `--list` re-derives a display from
    *  `absolute` (tildePath); doctor prints `absolute` itself. Every other per-row spelling is pinned by
    *  tests only -- keep them honest, but do not assume a surface prints them. */
   display: string;
@@ -142,7 +143,8 @@ export interface ProgramCapabilityProbe {
 /** One copy of a target's config file. A target with no `sites` hook has
  *  exactly one, `detectDir: null`, at its `resolvePath` result. */
 export interface SiteSpec {
-  /** Stable per-target id, used in `--list` / doctor rows and in messages. */
+  /** Stable per-target id. Read by TESTS only: no command prints it -- a run,
+   *  a `--list` row and a doctor line each name a copy by `label`. */
   id: string;
   /** What the run prints for this copy ("shared settings", "VS Code"). */
   label: string;
@@ -154,11 +156,10 @@ export interface SiteSpec {
 
 /** Behaviour a row opts into by NAME rather than by the consumer testing its
  *  `clientId`. The "a client-id branch or an unchecked cast to a client id"
- *  rule in client-config-boundary.test.ts forbids new clientId branches; two older ones remain allow-listed by name until each becomes
- *  row data -- install's project-scope approval clause in the Done line
- *  (`clientId === "claude-code" && scope === "project"`) and import's VS Code
- *  inputs expansion (`clientId === "vscode"`, which `importVariables` below is
- *  declared to replace but does not yet). */
+ *  rule in client-config-boundary.test.ts forbids new clientId branches; one
+ *  older one remains allow-listed by name until it becomes row data --
+ *  install's project-scope approval clause in the Done line
+ *  (`clientId === "claude-code" && scope === "project"`). */
 export interface TargetHooks {
   /** Patch the permission file this client reads alongside the launch entry.
    *  "claude-code" is the only scheme there is -- `permissions.allow` in
@@ -181,13 +182,19 @@ export interface TargetHooks {
    *  row's own format -- the one the client parses them with. */
   alsoReads?: (base: PathBase) => ResolvedPath[];
   /** Which `${...}` expansion rules `import` should apply to this client's
-   *  entries. import-cmd.ts reads it for "cline-env": a Cline `${env:NAME}`
-   *  makes the server unresolved and it is skipped by name; other spans are
-   *  carried verbatim. "vscode-inputs" is still DECLARED, NOT YET READ:
-   *  import-cmd.ts selects that logic (inputs block + `${workspaceFolder}`)
-   *  by `clientId === "vscode"` -- allow-listed in the boundary test until
-   *  import reads this hook instead. */
-  importVariables?: "vscode-inputs" | "cline-env";
+   *  entries (import-cmd.ts clientVarsFor reads it). In every scheme a span
+   *  the client would expand itself, and whose value is not knowable at
+   *  import time, makes the server unresolved: it is skipped by name rather
+   *  than imported with the literal text.
+   *    "vscode-inputs"  every span is a VS Code variable; the file's own
+   *                     `inputs` block names the `${input:id}` ones, and
+   *                     `${workspaceFolder}` expands at a workspace scope.
+   *    "cline-env"      `${env:NAME}` only; other spans are carried verbatim.
+   *    "posix-env"      `${VAR}` and `${VAR:-default}` (Claude Code).
+   *    "cursor-env"     `${env:NAME}` plus Cursor's fixed interpolation names
+   *                     (`${userHome}`, `${workspaceFolder}`, ...);
+   *                     `${workspaceFolder}` expands at project scope. */
+  importVariables?: "vscode-inputs" | "cline-env" | "posix-env" | "cursor-env";
 }
 
 /** Every field of a row, with `clientId: string` so the literal ids can be

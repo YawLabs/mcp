@@ -52,8 +52,15 @@ import type {
   EntryView,
   StrictViolation,
 } from "./client-config.js";
-import { canonicalJson, describeValueShape, launchOf, normalizeEntry, positionAt } from "./client-config-values.js";
-import { duplicateJsoncKeyOnPath, editJsoncEntry, parseJsonc, removeJsoncEntry } from "./jsonc.js";
+import {
+  canonicalJson,
+  describeValueShape,
+  isRecord,
+  launchOf,
+  normalizeEntry,
+  positionAt,
+} from "./client-config-values.js";
+import { debom, duplicateJsoncKeyOnPath, editJsoncEntry, parseJsonc, removeJsoncEntry } from "./jsonc.js";
 
 /** U+FEFF, built from its code point rather than written as an escape: a
  *  typed escape sequence in a source file is one backslash level away from
@@ -62,11 +69,8 @@ import { duplicateJsoncKeyOnPath, editJsoncEntry, parseJsonc, removeJsoncEntry }
 const BOM = String.fromCharCode(0xfeff);
 
 function stripBom(raw: string): { text: string; had: boolean } {
-  return raw.charCodeAt(0) === 0xfeff ? { text: raw.slice(1), had: true } : { text: raw, had: false };
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+  const text = debom(raw);
+  return { text, had: text.length !== raw.length };
 }
 
 /** The object at `segments`, or null when any segment is missing or holds a

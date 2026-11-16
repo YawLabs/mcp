@@ -204,6 +204,17 @@ describe("parseTryArgs", () => {
     if (!r.ok) expect(r.error).toMatch(/Invalid argument "-"/);
   });
 
+  it("calls an unknown SINGLE-dash flag an unknown flag, not a second slug", () => {
+    // Only `--` was tested, so `-n` was pushed as a positional and answered
+    // "Expected exactly one server slug, got 2".
+    const r = parseTryArgs(["demo", "-n"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/^Unknown flag: -n\n/);
+    // The two single-dash flags the command does have still parse.
+    expect(parseTryArgs(["demo", "-y"]).ok).toBe(true);
+    expect(parseTryArgs(["-h"])).toMatchObject({ ok: false, help: true });
+  });
+
   it("names in TRY_USAGE every client --client accepts", () => {
     // --help is the only place a user learns which clients `try` takes, and
     // that line used to be a hand-kept literal listing four of them. It was
@@ -268,6 +279,16 @@ describe("parseTryCleanupArgs", () => {
     const r = parseTryCleanupArgs(["-"]);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error).toMatch(/Invalid argument "-"/);
+  });
+
+  it("calls an unknown SINGLE-dash flag an unknown flag, not a second slug", () => {
+    const r = parseTryCleanupArgs(["-f", "demo"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/^Unknown flag: -f\n/);
+    const alone = parseTryCleanupArgs(["-f"]);
+    expect(alone.ok).toBe(false);
+    if (!alone.ok) expect(alone.error).toMatch(/^Unknown flag: -f\n/);
+    expect(parseTryCleanupArgs(["demo", "-y"])).toMatchObject({ ok: true, options: { force: true } });
   });
 });
 
@@ -2327,6 +2348,71 @@ describe("runTry -- a trial never lands in a commit-to-share file when a private
     expect(r.exitCode).toBe(0);
     expect(cap.errText()).not.toContain("Committing that file publishes the value");
     expect(cap.errText()).not.toContain("refusing to write it without --yes");
+  });
+
+  describe("a project-only client", () => {
+    // No shipped row is project-only, so runTry's step-5b refusal -- and the
+    // --yes flag that lifts it -- cannot fire for any real client. This takes
+    // the user scope off the vscode row for the length of a test, which is
+    // the shape the refusal is kept for: the trial then has nowhere to go but
+    // the committed workspace file.
+    const vscode = INSTALL_TARGETS.find((t) => t.clientId === "vscode") as unknown as { scopes: unknown[] };
+    const allScopes = vscode.scopes;
+    beforeEach(() => {
+      vscode.scopes = allScopes.filter((s) => (s as { scope: string }).scope === "project");
+      expect(vscode.scopes.length, "the vscode row lost its project scope").toBe(1);
+    });
+    afterEach(() => {
+      vscode.scopes = allScopes;
+    });
+
+    const run = (cap: ReturnType<typeof captureIO>, yes: boolean, token: string | undefined) =>
+      runTry({
+        slug: "demo",
+        clientId: "vscode",
+        home: synthHome,
+        cwd: synthCwd,
+        os: "linux",
+        env: {},
+        ...(token === undefined ? {} : { envOverrides: { FOO_TOKEN: token } }),
+        ...(yes ? { yes: true } : {}),
+        out: cap.pushOut,
+        err: cap.pushErr,
+        resolveServer: async () => ({ ...SAMPLE, ...(token === undefined ? {} : { requiredEnvVars: ["FOO_TOKEN"] }) }),
+      });
+
+    it("refuses to write an inline secret into the workspace file without --yes", async () => {
+      const cap = captureIO();
+      const r = await run(cap, false, "secret");
+      expect(r.exitCode).toBe(1);
+      expect(r.written).toEqual([]);
+      expect(existsSync(workspacePath())).toBe(false);
+      expect(existsSync(trialMarkerPath("demo", synthHome))).toBe(false);
+      expect(cap.errText()).toContain(`${workspacePath()} is VS Code's`);
+      expect(cap.errText()).toContain("writes FOO_TOKEN into it in plaintext");
+      expect(cap.errText()).toContain("refusing to write it without --yes");
+      // The value itself is never printed.
+      expect(cap.errText() + cap.text()).not.toContain("secret");
+    });
+
+    it("writes it with --yes, and still warns", async () => {
+      const cap = captureIO();
+      const r = await run(cap, true, "secret");
+      expect(r.exitCode).toBe(0);
+      expect(r.written).toContain(workspacePath());
+      const config = JSON.parse(readFileSync(workspacePath(), "utf8"));
+      expect(config.servers["yaw-mcp-try-demo"].env).toEqual({ FOO_TOKEN: "secret" });
+      expect(cap.errText()).toContain("Committing that file publishes the value");
+      expect(cap.errText()).not.toContain("refusing to write it without --yes");
+    });
+
+    it("needs no --yes for an entry that carries no secret", async () => {
+      const cap = captureIO();
+      const r = await run(cap, false, undefined);
+      expect(r.exitCode).toBe(0);
+      expect(r.written).toContain(workspacePath());
+      expect(cap.errText()).not.toContain("Committing that file publishes the value");
+    });
   });
 });
 describe("runTry — previous marker the real peel refuses", () => {

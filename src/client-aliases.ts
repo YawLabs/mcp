@@ -37,7 +37,10 @@ export interface ClientAlias {
   /** The scope the alias pins. When absent the alias only renames the client
    *  and the caller's own `--scope` (or its default) still applies. */
   scope?: InstallScope;
-  /** One clause naming what the alias is, for help and completion output. */
+  /** One clause naming what the alias is. DECLARED, NOT YET PRINTED: no help
+   *  text, completion script or message reads it (they list ids only, from
+   *  `clientChoices`); its one reader is client-aliases.test.ts. Kept so a
+   *  surface that later describes its choices has the wording in the table. */
   label: string;
 }
 
@@ -92,7 +95,9 @@ export interface ResolvedClientArg {
    *  an alias would silently override the flag beside it. */
   scope?: InstallScope;
   /** The alias id the user typed, or null when they typed a canonical id.
-   *  Messages name the canonical client either way; this is for a caller that
+   *  No caller reads it today: every caller takes `clientId` (and `scope`)
+   *  only, so each message names the canonical client and never the alias.
+   *  Its one reader is client-aliases.test.ts. It is here for a caller that
    *  wants to echo what was typed. */
   via: string | null;
 }

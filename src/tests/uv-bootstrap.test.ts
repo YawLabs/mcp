@@ -149,6 +149,73 @@ describe("uvTarget", () => {
       if (originalPlatform) Object.defineProperty(process, "platform", originalPlatform);
     }
   });
+
+  // The flag is newer than the oldest Node `engines` admits (>=20). On a
+  // runtime without it uv-bootstrap.ts takes its no-flag path, which the next
+  // test covers by hiding the flag; this one can only observe the flag where
+  // it exists, so it is skipped there rather than failed.
+  const hasExcludeNetwork =
+    typeof (process.report as { excludeNetwork?: unknown } | undefined)?.excludeNetwork === "boolean";
+
+  it.skipIf(!hasExcludeNetwork)(
+    "on linux reads the libc ONCE, with the report's network section switched off",
+    async () => {
+      // getReport() is synchronous and, by default, resolves the endpoints of
+      // every open socket -- a stall on the connect path in a broker holding
+      // remote upstreams. The libc cannot change under a running process, so
+      // one reading is enough, and that one is taken with excludeNetwork set
+      // (and put back afterwards). A fresh module instance, because the memo is
+      // module state and an earlier test on a linux host would already hold it.
+      const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+      const report = process.report as (NodeJS.ProcessReport & { excludeNetwork?: boolean }) | undefined;
+      if (!report || typeof report.excludeNetwork !== "boolean") {
+        throw new Error("process.report.excludeNetwork is unavailable; this test cannot observe the flag");
+      }
+      const before = report.excludeNetwork;
+      const seenDuringRead: Array<boolean | undefined> = [];
+      Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+      const spy = vi.spyOn(report, "getReport").mockImplementation(() => {
+        seenDuringRead.push(report.excludeNetwork);
+        return { header: {} };
+      });
+      try {
+        vi.resetModules();
+        const fresh = await import("../uv-bootstrap.js");
+        expect(fresh.uvTarget("linux", "x64")).toBe("x86_64-unknown-linux-musl");
+        expect(fresh.uvTarget("linux", "arm64")).toBe("aarch64-unknown-linux-musl");
+        expect(spy).toHaveBeenCalledTimes(1);
+        expect(seenDuringRead).toEqual([true]);
+        expect(report.excludeNetwork).toBe(before);
+      } finally {
+        spy.mockRestore();
+        if (originalPlatform) Object.defineProperty(process, "platform", originalPlatform);
+      }
+    },
+  );
+
+  it("on linux still reads the libc ONCE on a runtime with no excludeNetwork flag, and invents none", async () => {
+    // The half of the test above that needs no flag, run on every runtime by
+    // handing the module a report object that has getReport and nothing else
+    // -- what an early Node 20 exposes.
+    const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+    const originalReport = Object.getOwnPropertyDescriptor(process, "report");
+    const getReport = vi.fn(() => ({ header: { glibcVersionRuntime: "2.39" } }));
+    const flagless: { getReport: typeof getReport; excludeNetwork?: boolean } = { getReport };
+    Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+    Object.defineProperty(process, "report", { value: flagless, configurable: true });
+    try {
+      vi.resetModules();
+      const fresh = await import("../uv-bootstrap.js");
+      expect(fresh.uvTarget("linux", "x64")).toBe("x86_64-unknown-linux-gnu");
+      expect(fresh.uvTarget("linux", "arm64")).toBe("aarch64-unknown-linux-gnu");
+      expect(getReport).toHaveBeenCalledTimes(1);
+      expect("excludeNetwork" in flagless).toBe(false);
+    } finally {
+      if (originalReport) Object.defineProperty(process, "report", originalReport);
+      else Reflect.deleteProperty(process, "report");
+      if (originalPlatform) Object.defineProperty(process, "platform", originalPlatform);
+    }
+  });
 });
 
 describe("UV_VERSION freshness floor", () => {

@@ -1059,6 +1059,8 @@ describe("ConnectServer", () => {
       // and `yaw-mcp bundles match` give (both filter to active+allowed).
       // Feeding ALL configured servers here made the bundle read complete
       // in discover while the other two surfaces called it partial.
+      // The gap is worded as the remedy it needs: github is installed, so it
+      // is something to enable, not something to add.
       const priv = getPrivate(server);
       priv.config = makeConfig([
         makeServerConfig({ namespace: "github", name: "GitHub", isActive: false }),
@@ -1068,7 +1070,8 @@ describe("ConnectServer", () => {
       const text = result.content[0].text;
       expect(text).toContain("pr-review");
       expect(text).toContain("have: linear");
-      expect(text).toContain("add: github");
+      expect(text).toContain("pr-review — have: linear; enable (installed, disabled): github");
+      expect(text).not.toContain("add: github");
     });
 
     it("suppresses the bundle-completions block when no bundle has any overlap", () => {

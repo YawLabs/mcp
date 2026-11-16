@@ -371,7 +371,43 @@ describe("runBundlesCommand — match", () => {
       const combined = io.out.join("\n");
       expect(combined).toContain("2 available servers: github, linear");
       expect(combined).toMatch(/Excluded by your config\.json allow\/deny profile: slack/);
-      expect(combined).toContain("missing: slack");
+      // slack IS installed -- the profile keeps it out. Calling it "missing"
+      // sent the user to `yaw-mcp add` a server they already have.
+      expect(combined).toContain("blocked by profile: slack");
+      expect(combined).not.toContain("missing: slack");
+    });
+
+    it("splits a partial bundle's missing members by remedy, text and --json", async () => {
+      // devops-incident = github + pagerduty + slack: github available,
+      // pagerduty not installed, slack blocked. pr-review = github + linear:
+      // linear installed but disabled.
+      seedBundles([
+        makeServer({ namespace: "github", name: "GitHub" }),
+        makeServer({ namespace: "linear", name: "Linear", isActive: false }),
+        makeServer({ namespace: "slack", name: "Slack" }),
+      ]);
+      seedConfig({ blocked: ["slack"] });
+      const text = captureIO();
+      await run({ out: text.push, err: text.pushErr });
+      const lines = text.out.join("").split("\n");
+      const incident = lines.find((l) => l.includes("devops-incident")) ?? "";
+      expect(incident).toContain("have: github; missing: pagerduty; blocked by profile: slack");
+      const review = lines.find((l) => l.includes("pr-review")) ?? "";
+      expect(review).toContain("have: github; disabled: linear");
+      expect(review).not.toContain("missing:");
+
+      const io = captureIO();
+      await run({ json: true, out: io.push, err: io.pushErr });
+      const parsed = JSON.parse(io.out.join("\n"));
+      const entry = parsed.partial.find((p: { bundle: { id: string } }) => p.bundle.id === "devops-incident");
+      // `missing` keeps its meaning (cannot load now); the split is additive.
+      expect(entry.missing).toEqual(["pagerduty", "slack"]);
+      expect(entry.notInstalled).toEqual(["pagerduty"]);
+      expect(entry.disabled).toEqual([]);
+      expect(entry.blocked).toEqual(["slack"]);
+      const pr = parsed.partial.find((p: { bundle: { id: string } }) => p.bundle.id === "pr-review");
+      expect(pr.missing).toEqual(["linear"]);
+      expect(pr.disabled).toEqual(["linear"]);
     });
 
     it("honours an allow-list, not just the deny-list", async () => {

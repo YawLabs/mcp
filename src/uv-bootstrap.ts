@@ -5,6 +5,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
 import { request } from "undici";
+import { killAndDetach } from "./bounded-child.js";
 import { stripInternalSecretsFromEnv } from "./internal-secret-env.js";
 import { log } from "./logger.js";
 import { launcherBasename } from "./oam-spawn.js";
@@ -62,15 +63,40 @@ const RELEASE_BASE = `https://github.com/astral-sh/uv/releases/download/${UV_VER
 // derived from a libc reading that machine never had. Refusing to answer off
 // linux keeps the default meaning "a real libc reading", and a caller who
 // genuinely knows the target's libc still passes `musl` explicitly.
+//
+// The answer is memoized, and the report is taken with its network section
+// switched off. getReport() is SYNCHRONOUS and by default walks every open
+// handle, resolving the endpoints of each socket -- in a broker holding
+// connections to remote upstreams that is a stall on the connect path (this
+// runs on a uv activation whenever uv is not on PATH), which is why
+// detect-libc sets process.report.excludeNetwork before it asks. The libc of
+// a running process cannot change, so once is enough. Not measured on linux
+// from here (the function is gated to it); the flag is restored afterwards so
+// a report someone else takes later is unchanged.
+let muslLibcMemo: boolean | undefined;
 function isMuslLibc(): boolean {
   if (process.platform !== "linux") return false;
+  if (muslLibcMemo !== undefined) return muslLibcMemo;
+  muslLibcMemo = readMuslLibc();
+  return muslLibcMemo;
+}
+
+function readMuslLibc(): boolean {
+  const report = process.report as (NodeJS.ProcessReport & { excludeNetwork?: boolean }) | undefined;
+  // A runtime that predates the flag (it arrived in Node 20.13 / 22.0) has
+  // nothing to set or restore; the report is then taken as before.
+  const hadExclude = report?.excludeNetwork;
+  const hasFlag = report !== undefined && typeof hadExclude === "boolean";
   try {
-    const raw: unknown = process.report?.getReport();
-    const report = typeof raw === "string" ? (JSON.parse(raw) as unknown) : raw;
-    const header = (report as { header?: { glibcVersionRuntime?: unknown } } | null)?.header;
+    if (hasFlag) report.excludeNetwork = true;
+    const raw: unknown = report?.getReport();
+    const parsed = typeof raw === "string" ? (JSON.parse(raw) as unknown) : raw;
+    const header = (parsed as { header?: { glibcVersionRuntime?: unknown } } | null)?.header;
     return typeof header?.glibcVersionRuntime !== "string";
   } catch {
     return false;
+  } finally {
+    if (hasFlag) report.excludeNetwork = hadExclude;
   }
 }
 
@@ -140,11 +166,12 @@ type PathProbe = "present" | "absent" | "unknown";
 // is a child on the activation path, which the PATH_PROBE_TIMEOUT_MS
 // cap bounds. resolveUv is the production caller.
 //
-// The settle / timer / SIGKILL / unref skeleton below is written out
-// three times: here, in runCommand further down, and in
-// spawnVersionProbe in oam-spawn.ts. They differ in stdio, in what a
-// non-zero exit means and in what expiry settles to, and share no
-// helper, so a fix to the teardown has to be made in all three.
+// The settle / timer skeleton below is written out three times: here,
+// in runCommand further down, and in spawnVersionProbe in oam-spawn.ts.
+// They differ in stdio, in what a non-zero exit means and in what
+// expiry settles to. All three share their expiry TEARDOWN: killAndDetach
+// in the leaf module bounded-child.ts, which exists because this module
+// imports oam-spawn.ts and the reverse import would be a cycle.
 async function probePath(cmd: string): Promise<PathProbe> {
   return new Promise((resolve) => {
     let settled = false;
@@ -179,22 +206,10 @@ async function probePath(cmd: string): Promise<PathProbe> {
     }
 
     const timer = setTimeout(() => {
-      // SIGKILL, not the SIGTERM default a trapping child ignores -- and on
-      // win32 the shell:true wrapper means the kill lands on cmd.exe, not on
-      // uv itself, so the kill alone proves nothing either way. unref is the
-      // guarantee: a still-live child no longer holds the broker's event loop
-      // open at shutdown. Mirrors runCommand below and spawnVersionProbe in
-      // oam-spawn.ts.
-      try {
-        child.kill("SIGKILL");
-      } catch {
-        /* already gone */
-      }
-      try {
-        child.unref();
-      } catch {
-        /* already gone */
-      }
+      // On win32 the shell:true wrapper means the kill lands on cmd.exe, not
+      // on uv itself, so the kill alone proves nothing either way; the unref
+      // inside killAndDetach is the guarantee.
+      killAndDetach(child);
       // NOT "absent": nothing was learned. The caller decides what an
       // inconclusive probe is worth.
       settle("unknown");
@@ -455,20 +470,7 @@ export function runCommand(cmd: string, args: string[], timeoutMs: number = UV_E
 
     timer = setTimeout(() => {
       settle(() => {
-        try {
-          child.kill("SIGKILL");
-        } catch {
-          /* already gone */
-        }
-        // Detach, do not merely kill: a live child with an open pipe keeps the
-        // PARENT's event loop alive, so settling the promise without this
-        // trades an activation hang for a shutdown hang.
-        try {
-          child.stderr?.destroy();
-          child.unref();
-        } catch {
-          /* already gone */
-        }
+        killAndDetach(child);
         reject(new Error(`${cmd} did not finish within ${timeoutMs}ms`));
       });
     }, timeoutMs);

@@ -110,6 +110,11 @@ describe("classifyError", () => {
       'Server "ssh" disconnected and auto-reconnect failed: ECONNREFUSED. Use mcp_connect_activate with server "ssh" to reload it manually.',
       "connection_lost",
     ],
+    ["the MCP client SDK's dropped-transport message", "MCP error -32000: Connection closed", "connection_lost"],
+    // The price of matching that phrase as a substring, owned in the comment
+    // on the branch: ordinary upstream prose reads as a lost connection too.
+    ["upstream prose that only says the words", "Query ok. Connection closed cleanly.", "connection_lost"],
+    ["a bare 'disconnected' is not matched", "The client disconnected from the room.", "upstream_error"],
     [
       "unknown upstream falls through to upstream_error",
       "TypeError: Cannot read properties of undefined (reading 'foo')",

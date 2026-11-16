@@ -413,7 +413,12 @@ export function trustStatusFor(
 
 /** Serialize + atomically persist a store. Mode 0600 (the file records
  *  which paths on this machine are allowed to spawn processes; another
- *  local user must not be able to append to it), parent dir 0700. */
+ *  local user must not be able to append to it). The parent dir is created
+ *  0700 when this write is what creates it, and ONLY then: atomicWriteFile's
+ *  dirMode does not touch a directory that already exists, and unlike
+ *  saveVault (secrets-vault.ts) nothing here chmods one afterwards, so a
+ *  ~/.yaw-mcp born at the umask default by an earlier non-secret write keeps
+ *  that mode. The 0600 on the file is what protects the store either way. */
 async function writeTrustStore(home: string, entries: Record<string, TrustRecord>): Promise<string> {
   const path = trustStorePath(home);
   const body = { version: TRUST_SCHEMA_VERSION, trusted: entries };

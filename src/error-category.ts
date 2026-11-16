@@ -243,9 +243,16 @@ export function classifyError(text: string | undefined | null): ErrorCategory {
     return "unknown_tool";
   }
 
-  // Connection lost: yaw-mcp's auto-reconnect failure string -- this one
-  // is precise enough that we don't need a generic "disconnected"
-  // catch (which would also match upstream tool descriptions).
+  // Connection lost: two phrases. yaw-mcp's own auto-reconnect failure
+  // string is precise. "connection closed" is not: it is there for the MCP
+  // client SDK's "Connection closed" error (its message when a transport
+  // drops with a request in flight), and as a bare substring it also takes
+  // any upstream text that says the words -- a database tool's "connection
+  // closed cleanly" on a SUCCESSFUL reply is graded error-shaped by
+  // reward.ts, which runs this over the head of every non-isError result.
+  // That is the same substring trade every branch here makes (see the
+  // HEURISTIC note on computeOutcomeReward). What is deliberately left out is
+  // a bare "disconnected", which upstream tool descriptions use freely.
   if (t.includes("auto-reconnect failed") || t.includes("connection closed")) {
     return "connection_lost";
   }

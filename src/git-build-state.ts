@@ -11,7 +11,7 @@
 
 import { readFileSync, statSync, writeFileSync } from "node:fs";
 import { basename, join, relative, resolve } from "node:path";
-import { GIT_BUILD_SHA_LEN, gitBuildDir } from "./paths.js";
+import { GIT_BUILD_SHA_LEN, GIT_BUILT_SUFFIX, gitBuildDir } from "./paths.js";
 import type { GitSource } from "./types.js";
 
 export type PackageManagerName = "npm" | "pnpm" | "yarn";
@@ -31,7 +31,7 @@ export interface GitBuildMarker {
 
 /** The `.built` file of the build directory `dir`. */
 export function builtMarkerPath(dir: string): string {
-  return `${dir}.built`;
+  return `${dir}${GIT_BUILT_SUFFIX}`;
 }
 
 function mtimeMs(file: string): number | null {

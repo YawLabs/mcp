@@ -33,9 +33,11 @@ import { type StdioServerHandle, StdioServerTransport, serveStdio } from "@model
 import { maybeAutoUpgrade } from "./auto-upgrade.js";
 import {
   activateServersCall,
+  type BundleMissingSplit,
   bundleActivateHint,
   CURATED_BUNDLES,
   matchBundles,
+  splitBundleMissing,
   topPartialBundles,
 } from "./bundles.js";
 import { bundlesFileHint } from "./bundles-hint.js";
@@ -205,13 +207,11 @@ declare const __VERSION__: string;
 // the shared one reads process.env by default, which is exactly what the call
 // site below wants.
 
-// resolveMinCompliance and complianceRefusalReason moved to spawn-gate.ts,
+// resolveMinCompliance and complianceRefusalReason live in spawn-gate.ts,
 // beside the verdict that consumes them: the CLI's `call` has to apply the
 // same floor and cannot import this module for it (see the header of
-// spawn-gate.ts). Only resolveMinCompliance is re-exported below, so
-// server.test.ts keeps its existing import; complianceRefusalReason is
-// imported for the in-file caller and not re-exported.
-export { resolveMinCompliance };
+// spawn-gate.ts). Both are imported above for the in-file callers; neither
+// is re-exported from here.
 
 // Opt-in auto-load. Set YAW_MCP_AUTO_LOAD=1 (or "true") to pre-activate the
 // top recurring pack from persisted history on startup — no LLM round
@@ -227,7 +227,7 @@ export function isAutoLoadEnabled(): boolean {
 }
 
 /** Which protocol eras the downstream face serves. */
-export type ProtocolMode = "auto" | "legacy";
+type ProtocolMode = "auto" | "legacy";
 
 // The escape hatch for the dual-era serving entry. Unset or "auto" serves
 // both eras: a 2026-07-28 client that opens with server/discover gets the
@@ -347,7 +347,7 @@ export function clientRelistsTools(clientInfo?: { name?: string }): boolean {
  *  protocol. False on 2026-07-28, which has no server-to-client request
  *  channel: the SDK throws on those calls there, so every push path checks
  *  this first and takes its "client cannot be asked" branch instead. */
-export interface ClientSession {
+interface ClientSession {
   era: ProtocolEra;
   clientInfo?: Implementation;
   capabilities?: ClientCapabilities;
@@ -431,6 +431,24 @@ export const MAX_VAULT_PASSPHRASE_PROMPTS = 2;
  *  the page and the code reading its submission see it -- no client dialog
  *  ever carries a field for the passphrase. */
 const VAULT_PAGE_FIELD = "passphrase";
+
+/** Can this entry not be launched AS WRITTEN, whatever the machine's state --
+ *  a local entry with no command, or a remote one with no url or a url that
+ *  does not parse? Those are the refusals connectToUpstream (upstream.ts)
+ *  makes from the entry alone, before it spawns or dials anything, so a
+ *  second attempt a moment later cannot differ. Local-vs-remote is decided as
+ *  it is there: `type === "local"`, everything else remote. Exported for
+ *  tests. */
+export function hasUnlaunchableShape(entry: UpstreamServerConfig): boolean {
+  if (entry.type === "local") return !entry.command;
+  if (!entry.url) return true;
+  try {
+    new URL(entry.url);
+    return false;
+  } catch {
+    return true;
+  }
+}
 
 /** Fingerprint of everything in a server entry that decides WHICH tool list
  *  it serves: the process (type, transport, command, args, runtime) or the
@@ -888,7 +906,7 @@ export function formatToolSignature(name: string, inputSchema: unknown, maxArgs 
 }
 
 /** What checkToolArgs found wrong with a call's arguments. */
-export interface ToolArgsMismatch {
+interface ToolArgsMismatch {
   /** Required properties the call does not supply. */
   missing: string[];
   /** Keys the schema does not list, each with the property it most likely
@@ -973,9 +991,9 @@ export function checkToolArgs(inputSchema: unknown, args: Record<string, unknown
 // TOOL_GONE / RECONNECT_FAILED / LOAD_FAILED are emitted by handleToolCall
 // below; DISCONNECTED / UNKNOWN_TOOL by routeToolCall in proxy.ts
 // (see the guard test in tests/server.test.ts that pins those two).
-export const ROUTING_FAULT_TOOL_GONE = "no longer available";
+const ROUTING_FAULT_TOOL_GONE = "no longer available";
 export const ROUTING_FAULT_DISCONNECTED = "no longer connected";
-export const ROUTING_FAULT_RECONNECT_FAILED = "auto-reconnect failed";
+const ROUTING_FAULT_RECONNECT_FAILED = "auto-reconnect failed";
 export const ROUTING_FAULT_UNKNOWN_TOOL = "Unknown tool:";
 // A deferred first-call activation that fails is an ACTIVATION result, and
 // activation is deliberately not a learning signal (see handleDispatch) --
@@ -987,7 +1005,7 @@ export const ROUTING_FAULT_UNKNOWN_TOOL = "Unknown tool:";
 // refusal or a genuine spawn failure (its policy refusals are decided before
 // step 0), while a direct tools/call on a deferred route still gets here on
 // any of them.
-export const ROUTING_FAULT_LOAD_FAILED = "could not be loaded on first call";
+const ROUTING_FAULT_LOAD_FAILED = "could not be loaded on first call";
 export const ROUTING_FAULT_MARKERS: readonly string[] = [
   ROUTING_FAULT_TOOL_GONE,
   ROUTING_FAULT_DISCONNECTED,
@@ -2082,13 +2100,18 @@ export class ConnectServer {
       resourceTemplates: [],
     }));
 
-    handle("resources/read", async (request) => {
+    // resources/read and prompts/get forward the client's abort signal
+    // (`ctx.mcpReq.signal`, the one tools/call forwards) as proxy.ts's
+    // RouteReadOptions, so a client cancel reaches the upstream instead of
+    // leaving the proxied request to run out its timeout.
+    handle("resources/read", async (request, ctx) => {
       await this.ready;
       return (await routeResourceRead(
         request.params.uri,
         this.resourceRoutes,
         this.connections,
         this.getBuiltinResourceMap(),
+        { signal: ctx?.mcpReq?.signal },
       )) as ReadResourceResult;
     });
 
@@ -2103,13 +2126,14 @@ export class ConnectServer {
       };
     });
 
-    handle("prompts/get", async (request) => {
+    handle("prompts/get", async (request, ctx) => {
       await this.ready;
       return (await routePromptGet(
         request.params.name,
         request.params.arguments as Record<string, string> | undefined,
         this.promptRoutes,
         this.connections,
+        { signal: ctx?.mcpReq?.signal },
       )) as GetPromptResult;
     });
   }
@@ -3131,7 +3155,9 @@ export class ConnectServer {
         prewarmFailures: this.exportPrewarmFailures(),
       });
       // loadFailed means the state file exists but could not be READ (a
-      // transient handle error, not a missing or corrupt file). The empty
+      // transient handle error, not a missing or corrupt file), or was
+      // written by a newer yaw-mcp (persistence.ts: a stale-version file
+      // whose version is above STATE_SCHEMA_VERSION). The empty
       // snapshot we just hydrated is a stand-in, not the truth -- leaving
       // persistenceReady false keeps scheduleStateSave and the shutdown
       // flush from overwriting the real file with it. Session-local
@@ -3508,7 +3534,9 @@ export class ConnectServer {
     // credential prompt, a missing binary) costs a spawn, a retry delay and
     // possibly a prompt in every new pane, and the answer will be the same.
     // Said once per startup, with when it retries, so the missing tools are
-    // never a mystery; discover() carries the same note on the server.
+    // never a mystery; discover() carries the same note on a server whose
+    // list still has to be learned (prewarmMustLearn). A backed-off
+    // REVALIDATION gets no note there: its learned list is still served.
     const backedOff = available.flatMap((s) => {
       const failure = this.prewarmBackoffFor(s);
       return failure === null ? [] : [{ namespace: s.namespace, failure }];
@@ -3600,6 +3628,15 @@ export class ConnectServer {
                   namespace: server.namespace,
                   message: result.message,
                 });
+                // Banked like a failed cold learn (same refusal exemption):
+                // the list stays past its refresh window, so without this the
+                // server is a revalidation candidate again in every new pane
+                // -- two spawns, the retry sleep and possibly a credential
+                // prompt each time, for as long as it stays down. The backoff
+                // only suppresses the sweep; the served list, discover (whose
+                // failure note is gated on prewarmMustLearn) and an explicit
+                // activate are untouched.
+                if (!result.refused) this.recordPrewarmFailure(server.namespace, result.message);
                 return;
               }
               // A failed prewarm of a server with no list leaves it without
@@ -3682,12 +3719,13 @@ export class ConnectServer {
               namespace: server.namespace,
               error,
             });
-            // Recorded only for a cold learn that did not learn: a failed
-            // background revalidation keeps its served list (as above), a
-            // throw AFTER the list landed (teardown) is not a failed spawn,
-            // and a shutdown mid-sweep is not the server's fault.
+            // Recorded only for an attempt that did not learn -- a cold learn
+            // or a background revalidation alike (see the `isRefresh` branch
+            // above for why a refresh is banked too): a throw AFTER the list
+            // landed (teardown) is not a failed spawn, and a shutdown
+            // mid-sweep is not the server's fault.
             const learned = this.toolCacheLearnedAt.get(server.namespace) !== learnedAtBefore;
-            if (!isRefresh && !learned && !this.shuttingDown) this.recordPrewarmFailure(server.namespace, error);
+            if (!learned && !this.shuttingDown) this.recordPrewarmFailure(server.namespace, error);
           }
         }),
       );
@@ -3792,10 +3830,16 @@ export class ConnectServer {
       // typeof-guarded args: the low-level Server does not validate input
       // against inputSchema, and a stray truthy string must not silently
       // switch a model's discover onto the side-effect-free path.
+      // A blank `server` is NO focus, not a focus on the namespace "": a model
+      // that fills every optional string arg with "" must get the listing, and
+      // handleDiscover tests the focus by `!== undefined` (unlike `context`,
+      // which it tests by truthiness), so the coercion has to happen here.
+      // Trimmed for the same reason -- no namespace is whitespace.
+      const focus = typeof args.server === "string" && args.server.trim().length > 0 ? args.server : undefined;
       if (args.listOnly === true) {
         return this.handleDiscover(
           typeof args.context === "string" ? args.context : undefined,
-          typeof args.server === "string" ? args.server : undefined,
+          focus,
           /* listOnly */ true,
         );
       }
@@ -3816,23 +3860,29 @@ export class ConnectServer {
       // its own discover one tick idle, and the already-connected shortcut
       // (no activation, nothing reset) aged it like any bystander.
       const warmed: string[] = [];
-      return this.observed(
-        this.attachGuideNudge(
-          await this.handleDiscoverWithAutoWarm(
-            typeof args.context === "string" ? args.context : undefined,
-            progress,
-            // Single-server focus is a RENDER filter (see the param doc on
-            // handleDiscoverWithAutoWarm): it bounds which cards and tool
-            // names get printed without touching the ranker or the auto-warm
-            // decision, so it composes with the observation tick above rather
-            // than competing with it -- a focused discover still ages the
-            // other namespaces exactly like an unfocused one.
-            typeof args.server === "string" ? args.server : undefined,
-            (ns) => warmed.push(ns),
-          ),
+      const discovered = this.attachGuideNudge(
+        await this.handleDiscoverWithAutoWarm(
+          typeof args.context === "string" ? args.context : undefined,
+          progress,
+          // Single-server focus is a RENDER filter (see the param doc on
+          // handleDiscoverWithAutoWarm): it bounds which cards and tool
+          // names get printed without touching the ranker or the auto-warm
+          // decision, so it composes with the observation tick above rather
+          // than competing with it -- a focused discover still ages the
+          // OTHER namespaces exactly like an unfocused one.
+          focus,
+          (ns) => warmed.push(ns),
         ),
-        warmed,
       );
+      // The focused namespace itself is credited when it is loaded: reading
+      // one server's full tool list is inspecting THAT server, and without
+      // the credit a model studying the server it just activated aged it
+      // toward eviction with its own inspection calls. Read after the handler
+      // (the loaded set can move under it), and only for a namespace actually
+      // in the map -- crediting an unloaded one would start an idle count for
+      // a connection that does not exist.
+      if (focus !== undefined && this.connections.has(focus) && !warmed.includes(focus)) warmed.push(focus);
+      return this.observed(discovered, warmed);
     }
     if (name === META_TOOLS.dispatch.name) {
       const intent = typeof args.intent === "string" ? args.intent : "";
@@ -3877,7 +3927,11 @@ export class ConnectServer {
       const serverArg = typeof args.server === "string" ? args.server : "";
       const toolArg = typeof args.tool === "string" ? args.tool : "";
       const result = await this.handleReadTool(serverArg, toolArg, progress);
-      return this.observed(this.attachGuideNudge(result));
+      // Credits the server it read when that server is LOADED, for the same
+      // reason a focused discover does (above): reading a loaded server's
+      // schemas must not age it. A transient read of an unloaded server
+      // registers nothing in this.connections, so there is nothing to credit.
+      return this.observed(this.attachGuideNudge(result), this.connections.has(serverArg) ? [serverArg] : []);
     }
     if (name === META_TOOLS.suggest.name) {
       return this.observed(this.attachGuideNudge(this.handleSuggest()));
@@ -4033,9 +4087,10 @@ export class ConnectServer {
           // mid-reconnect. Leaving the error-state entry in the map keeps
           // every concurrent caller entering THIS branch, where
           // activateOne's dedup makes them all await the one shared
-          // respawn. runActivateOne replaces the map entry on success
-          // without closing the old client, so the close below is the old
-          // transport's only teardown.
+          // respawn. On success runActivateOne replaces the map entry and
+          // starts a close of the one it displaced without awaiting it; the
+          // close below is the AWAITED one (and the only one on the failure
+          // path, where nothing is displaced).
           const staleConn = conn;
           // Sampled BEFORE activateOne: false means we are about to START
           // the activation (its initiator); true means we will JOIN one
@@ -4453,8 +4508,9 @@ export class ConnectServer {
   // entry (an EMPTY learned list counts: the server was spawned and offered
   // nothing) -- does it fall back to the bundled
   // list fallback-tools.ts keeps for a few well-known servers, matched by
-  // the image or binary the entry launches. That fallback lives here and
-  // nowhere else: it feeds ranking (dispatch, discover, find_tool) but never
+  // the image or binary the entry launches. That fallback is read here and
+  // in foundry export's snapshot (foundry-cmd.ts coldToolsFor), nowhere
+  // else: in the broker it feeds ranking (dispatch, discover, find_tool) but never
   // hasKnownTools, getDeferredServers or a route, so pre-warm keeps trying to
   // learn the real list and no call is ever built from the bundled one.
   private rankableFor(server: UpstreamServerConfig): RankableServer {
@@ -5367,7 +5423,15 @@ export class ConnectServer {
     if (!focused && bundleGaps.length > 0) {
       lines.push("\nBundle completions (install to unlock curated stacks):");
       for (const { bundle, have, missing } of bundleGaps) {
-        lines.push(`  ${bundle.id} — have: ${have.join(", ")}; add: ${missing.join(", ")}`);
+        // Worded per remedy (see splitBundleMissing): a member that is
+        // installed but disabled or profile-blocked is not something to add.
+        const { notInstalled, disabled, blocked } = this.splitBundleMissing(missing);
+        const gaps = [
+          notInstalled.length > 0 ? `add: ${notInstalled.join(", ")}` : "",
+          disabled.length > 0 ? `enable (installed, disabled): ${disabled.join(", ")}` : "",
+          blocked.length > 0 ? `blocked by the project profile: ${blocked.join(", ")}` : "",
+        ].filter((part) => part.length > 0);
+        lines.push(`  ${bundle.id} — have: ${have.join(", ")}; ${gaps.join("; ")}`);
       }
     }
 
@@ -6094,7 +6158,32 @@ export class ConnectServer {
           progress?.(
             `"${namespace}" loaded ${connection.tools.length} ${connection.tools.length === 1 ? "tool" : "tools"}`,
           );
+          // Whatever this insert displaces is closed here, so EVERY path into
+          // an activation gets the teardown -- not only handleToolCall's
+          // auto-reconnect, which used to be the one caller that closed the
+          // entry it replaced. An explicit activate, dispatch, auto-warm,
+          // auto-load and pre-warm landing on an "error"-state entry all
+          // overwrite it too, and that was safe only while "error" always
+          // meant the transport had already closed; a child that closed
+          // stdout and kept running would have been orphaned, referenced by
+          // nothing shutdown() sweeps. A "connected" entry took the early
+          // return at the top of this method, so what is displaced here is
+          // an "error" or mid-close "disconnected" one; and
+          // disconnectFromUpstream is idempotent and swallows close errors,
+          // so the close such an entry may already have coming (the
+          // auto-reconnect's own, or the teardown that is mid-close) can run
+          // as well.
+          //
+          // NOT awaited, and read before the set: the staleness check above
+          // and this insert must stay one synchronous block (see the comment
+          // there), and the SDK's close can spend seconds on a child that
+          // will not exit -- time the caller of a successful activation has
+          // no reason to wait out.
+          const displaced = this.connections.get(namespace);
           this.connections.set(namespace, connection);
+          if (displaced !== undefined && displaced !== connection) {
+            void disconnectFromUpstream(displaced).catch(() => {});
+          }
           this.idleCallCounts.set(namespace, 0);
           const toolMeta = connection.tools.map((t) => ({ name: t.name, description: t.description }));
           this.toolCache.set(namespace, toolMeta);
@@ -6142,6 +6231,23 @@ export class ConnectServer {
           // dead time on the connect path. Go straight to the elicitation
           // branch below, which is the only thing that CAN change the outcome.
           if (err instanceof VaultPassphraseRequiredError) break;
+          // An entry that cannot be launched AS WRITTEN (no command, no url,
+          // a url that does not parse) fails identically on the retry: the
+          // refusal is made from the entry alone, before anything is spawned
+          // or dialled. Skip the retry and its sleep.
+          //
+          // The shape test is what makes this permanent, not the error's
+          // category: connectToUpstream's catch-all also reports "unknown"
+          // with a config pointer for a failure it could not classify, and
+          // that one may well be transient, so it keeps its retry.
+          if (
+            err instanceof ActivationError &&
+            err.category === "unknown" &&
+            err.configPointer &&
+            hasUnlaunchableShape(effectiveConfig)
+          ) {
+            break;
+          }
           if (attempt === 0) {
             const msg = err instanceof Error ? err.message : String(err);
             log("warn", "Activation attempt failed, retrying", { namespace, error: msg });
@@ -7836,10 +7942,22 @@ export class ConnectServer {
   // activation: it spawns a child and connections.set()s it under the same
   // key. An unconditional delete here then dropped THAT entry -- and its
   // sessionActivated / toolFilters -- leaving a live child nothing
-  // referenced and shutdown() never closed. Returns whether it forgot, so a
-  // caller can tell "unloaded" from "superseded" in its reply.
+  // referenced and shutdown() never closed. Returns false only for that
+  // case -- a DIFFERENT connection holds the key -- so a caller can tell
+  // "unloaded" from "superseded" in its reply.
+  //
+  // An ABSENT entry is the other way to lose the identity check, and it is
+  // not a supersede: two teardowns of the same connection overlapped (the
+  // idle reaper mid-close when an explicit deactivate arrives, or two
+  // concurrent idle ticks), both awaited the close, and the first one here
+  // already forgot it. The namespace IS unloaded, so that returns true.
+  // Nothing else is cleared on that path: the first teardown cleared it all,
+  // and an activation in flight may already have installed its toolFilters
+  // entry ahead of its connections.set.
   private forgetNamespace(namespace: string, connection: UpstreamConnection): boolean {
-    if (this.connections.get(namespace) !== connection) {
+    const current = this.connections.get(namespace);
+    if (current === undefined) return true;
+    if (current !== connection) {
       log("info", "Teardown skipped the map delete -- namespace was re-activated during the close", {
         namespace,
       });
@@ -7921,9 +8039,10 @@ export class ConnectServer {
    *  namespace not in `credited` ages by one, and those in it are treated as
    *  freshly used. Awaits the handler FIRST -- read_tool can connect a server
    *  for the length of the call, and ticking before it returns would age a
-   *  set the handler is still changing. Only discover's auto-warm credits
-   *  anything (the namespace it just picked); every other observation
-   *  meta-tool passes nothing and ages everything.
+   *  set the handler is still changing. Three callers credit something:
+   *  discover's auto-warm (the namespace it just picked), a focused discover
+   *  and read_tool (the loaded server they inspected). Every other
+   *  observation meta-tool passes nothing and ages everything.
    *
    *  The idle clock used to advance only on PROXIED calls, so a session that
    *  spoke exclusively to the broker -- discover, find_tool, health, secrets --
@@ -7933,19 +8052,26 @@ export class ConnectServer {
    *
    *  Only the observation meta-tools go through here. `activate` and
    *  `deactivate` do not: they ARE the loaded set, and activate resets the
-   *  namespace it just loaded. `dispatch` and `exec` do not: they route to
-   *  real servers and tick through their own paths, exec deliberately once
-   *  for a whole pipeline.
+   *  namespace it just loaded. `exec` does not: it ticks through its own
+   *  path (handleExec's settleIdleTracking), deliberately once for a whole
+   *  pipeline. `dispatch` does not either, and it does not tick AT ALL --
+   *  neither here nor in handleDispatch -- so a session that only dispatches
+   *  never ages the servers it loaded earlier; the idle clock moves for them
+   *  on the next proxied call, exec or observation meta-tool.
    *
-   *  A server evicted this way is not lost -- it keeps its learned toolCache,
-   *  stays advertised as a deferred route, and re-activates lazily on the
-   *  first call to one of its tools. The cost of being wrong here is one
-   *  re-spawn, which is the trade the reaper already makes everywhere else. */
+   *  A server evicted this way is not lost -- it keeps its learned toolCache
+   *  and its deferred ROUTE, so the first call to one of its tools
+   *  re-activates it lazily. It is not necessarily still LISTED:
+   *  forgetNamespace drops it from sessionActivated, and buildToolList
+   *  (proxy.ts) withholds an unloaded server's placeholders unless the tool
+   *  exposure in effect is "full". Under any other exposure its tools
+   *  leave tools/list, and a client that only calls listed tools has to
+   *  re-activate (or dispatch) rather than getting the re-spawn for free. */
   private async observed<T>(result: T | Promise<T>, credited: string[] = []): Promise<T> {
     const resolved = await result;
-    // The default empty array is the whole point for every caller but
-    // discover: `called` is empty, so no namespace is credited and every
-    // connected one ages by one.
+    // The default empty array is the whole point for every caller that
+    // inspected no particular loaded server: `called` is empty, so no
+    // namespace is credited and every connected one ages by one.
     await this.trackUsageForNamespaces(credited);
     return resolved;
   }
@@ -8275,6 +8401,9 @@ export class ConnectServer {
       url: s.url,
       env: s.env,
       headers: s.headers,
+      // The clone token's vault name (git.tokenSecret), which sits in neither
+      // map above -- computeSecretsReport counts it as a reference.
+      git: s.git,
     }));
     if (serverArg) servers = servers.filter((s) => s.namespace === serverArg);
 
@@ -8363,6 +8492,7 @@ export class ConnectServer {
     } else {
       lines.push("Session health:\n");
 
+      let omittedToolNames = false;
       for (const [namespace, conn] of this.connections) {
         const h = conn.health;
         const avgLatency = h.totalCalls > 0 ? Math.round(h.totalLatencyMs / h.totalCalls) : 0;
@@ -8371,9 +8501,24 @@ export class ConnectServer {
         const idleLimit = adaptiveThreshold(namespace, this.recentToolCalls, resolveIdleThreshold());
         // Same `[blocked]` label discover uses: a denied tool is still in
         // the upstream list, but calling it is refused.
-        const toolNames = conn.tools
-          .map((t) => (this.isToolDenied(`${namespace}_${t.name}`) ? `${t.name} [blocked]` : t.name))
-          .join(", ");
+        //
+        // Capped like discover's card (DISCOVER_TOOL_NAME_CAP), and for the
+        // same reason: the names of a loaded server are already in the
+        // client's tools/list, and a few 60-100 tool servers made this line
+        // several KB of every health reply. The count stays exact, and a
+        // blocked tool hidden by the cap is still counted in the tail so the
+        // deny never goes unreported.
+        const label = (t: { name: string }): string =>
+          this.isToolDenied(`${namespace}_${t.name}`) ? `${t.name} [blocked]` : t.name;
+        const shownTools = conn.tools.slice(0, ConnectServer.DISCOVER_TOOL_NAME_CAP);
+        const hiddenTools = conn.tools.slice(shownTools.length);
+        const hiddenBlocked = hiddenTools.filter((t) => this.isToolDenied(`${namespace}_${t.name}`)).length;
+        const moreTools =
+          hiddenTools.length > 0
+            ? ` (+${hiddenTools.length} more${hiddenBlocked > 0 ? `, ${hiddenBlocked} [blocked]` : ""})`
+            : "";
+        if (hiddenTools.length > 0) omittedToolNames = true;
+        const toolNames = `${shownTools.map(label).join(", ")}${moreTools}`;
 
         lines.push(`  ${namespace} [${conn.status}] (${conn.config.type})`);
         lines.push(`    tools: ${conn.tools.length} — ${toolNames}`);
@@ -8417,6 +8562,13 @@ export class ConnectServer {
           // this reuse.
           lines.push(`    last error: ${scrubForWarning(h.lastErrorMessage)} at ${h.lastErrorAt}`);
         }
+      }
+      // One footer, only when a list was actually cut -- the same shape and
+      // the same recovery path as discover's.
+      if (omittedToolNames) {
+        lines.push(
+          `\nTool lists show the first ${ConnectServer.DISCOVER_TOOL_NAME_CAP} names; call mcp_connect_discover(server: "<namespace>") for one server's full list.`,
+        );
       }
     }
 
@@ -8786,11 +8938,37 @@ export class ConnectServer {
         const { bundle, have, missing } = entry;
         lines.push(`  ${bundle.id} — ${bundle.description}`);
         lines.push(`    have: ${have.join(", ")}`);
-        lines.push(`    missing: ${missing.join(", ")} (add with: yaw-mcp add ${missing.join(" && yaw-mcp add ")})`);
+        // One line per REMEDY. `missing` is measured against the servers that
+        // can load right now, so it also holds members that are in
+        // bundles.json already -- and telling the user to `yaw-mcp add` one
+        // of those is the wrong fix.
+        const { notInstalled, disabled, blocked } = this.splitBundleMissing(missing);
+        if (notInstalled.length > 0) {
+          lines.push(
+            `    missing: ${notInstalled.join(", ")} (add with: yaw-mcp add ${notInstalled.join(" && yaw-mcp add ")})`,
+          );
+        }
+        if (disabled.length > 0) {
+          lines.push(
+            `    disabled: ${disabled.join(", ")} (installed; enable with: yaw-mcp enable ${disabled.join(" && yaw-mcp enable ")})`,
+          );
+        }
+        if (blocked.length > 0) {
+          lines.push(`    blocked: ${blocked.join(", ")} (installed; not allowed by the project profile in effect)`);
+        }
       }
     }
 
     return { content: [{ type: "text", text: lines.join("\n") }] };
+  }
+
+  /** Split a partial bundle's `missing` members by what would make each one
+   *  available: the shared splitBundleMissing (bundles.ts, also used by
+   *  `yaw-mcp bundles match`) over this session's configured servers.
+   *  matchBundles / topPartialBundles are fed getProfiledActiveServers here,
+   *  which is the "cannot load now" reading that function assumes. */
+  private splitBundleMissing(missing: string[]): BundleMissingSplit {
+    return splitBundleMissing(missing, this.config?.servers ?? []);
   }
 
   // Extract the semantic payload from a successful MCP tool result for use
@@ -8954,9 +9132,13 @@ export class ConnectServer {
     // process's env. The profile is read once, in start().
     //
     // The config is NOT fixed for the session, though. maybeReloadBundles
-    // re-reads bundles.json (and re-overlays grades.json) at every meta-tool
-    // boundary, and a CONCURRENT meta-tool call from the client can land that
-    // reload between this pass and step N. So this pass is a best-effort early
+    // stats bundles.json at every meta-tool boundary and, when its
+    // fingerprint has moved, re-reads it and re-overlays grades.json
+    // (applyReloadedBundles). grades.json is not itself watched: a
+    // `yaw-mcp audit` mid-session changes no verdict here until bundles.json
+    // is next written or the client restarts. A CONCURRENT meta-tool call
+    // from the client can land that reload between this pass and step N. So
+    // this pass is a best-effort early
     // refusal, not the authority. The authority is the same gate re-run at the
     // step: runActivateOne calls spawnGateRefusal on every activation,
     // including the deferred lazy-activation a step triggers. A reload inside
@@ -9389,7 +9571,11 @@ export class ConnectServer {
     const skipped = Object.fromEntries(Object.entries(echoed).filter(([k]) => k !== returnKey));
     const body = !explicitReturn
       ? { ok: true, result: finalResult, steps: echoed }
-      : JSON.stringify(skipped).length > EXEC_ECHO_BUDGET_BYTES
+      : // serializedBytes, not JSON.stringify(...).length: the budget is in
+        // BYTES, and a UTF-16 length undercounts CJK or emoji-heavy step
+        // output by up to 3x. An unserializable set measures as Infinity and
+        // falls back to names only.
+        serializedBytes(skipped) > EXEC_ECHO_BUDGET_BYTES
         ? { ok: true, result: finalResult, stepKeys }
         : { ok: true, result: finalResult, stepKeys, steps: skipped };
 

@@ -24,34 +24,49 @@
 // is exactly the wrong trade.
 //
 // The bundles.json read is cached after the first call -- the connect path must
-// not re-read the file per spawn. ONE shape is exempt: a bundles.json that
-// exists but yielded no config (a degraded read with nothing configured) does
-// not cache its verdict, so a file that gets FIXED is picked up by the next
-// connect. It is negative-cached on the stat signature of EVERY file the
-// verdict read instead, so a tree that stays broken costs a couple of stats
-// per connect rather than a full read-hash-parse. See the inline note in
-// defaultRuntime below.
+// not re-read the file per spawn. The cache is keyed on the stat signature
+// (local-bundles.ts bundlesSignature) of every file the load consulted, so it
+// costs a stat or two per connect and an EDIT to `defaultRuntime` is picked up
+// by the next connect, like every other bundles.json edit -- it used to hold
+// for the process lifetime, while each activation error promised the edit was
+// live. ONE shape is handled differently: a bundles.json that exists but
+// yielded no config (a degraded read with nothing configured) does not cache
+// its verdict as an answer; it is negative-cached on the same signature AND a
+// short time bound. See the inline notes in defaultRuntime below.
 
-import { statSync } from "node:fs";
-import { type LoadLocalBundlesResult, loadLocalBundles } from "./local-bundles.js";
+import { bundlesSignature, type LoadLocalBundlesResult, loadLocalBundles } from "./local-bundles.js";
 import { log } from "./logger.js";
 import {
+  classifyNpxLaunch,
   describeNodeFlagRefusal,
-  isRegistrySpec,
   MIN_OAM_VERSION,
   nodeLaunchKind,
-  npxSpecIndex,
   type OamProbe,
   oamFailureLabel,
   scanNodeLaunchFlags,
-  specConstraint,
 } from "./oam-spawn.js";
 import type { UpstreamServerConfig } from "./types.js";
 
 export type RuntimeChoice = "oam" | "node";
 
-// undefined = bundles.json not probed yet; null = probed, nothing configured.
-let bundlesDefaultCache: RuntimeChoice | null | undefined;
+/** The last usable bundles.json answer (`value` null = read, nothing
+ *  configured), with the files that read consulted and the stat signature they
+ *  had. undefined = not probed yet. The answer is served only while the
+ *  signature still matches, so an edit to any consulted file -- or the
+ *  creation of one that was absent -- re-reads on the next connect.
+ *
+ *  One exception keeps a stale entry in use: when that re-read is degraded
+ *  and empty (the edit left a file that will not parse), the entry is kept
+ *  and its value is still the answer, until a later read succeeds -- see the
+ *  degraded branch of resolveBundlesDefault.
+ *
+ *  What a stat cannot see stays stale until one of those files moves or the
+ *  broker restarts: a project `.yaw-mcp/` created where the load's directory
+ *  walk found none (it is not in consultedPaths, so nothing watches for it),
+ *  and the same-size, same-mtime rewrite bundlesSignature documents. server.ts
+ *  watches the same set the same way for its own reload, so the two agree
+ *  about when bundles.json has changed. */
+let bundlesDefaultCache: { value: RuntimeChoice | null; watched: string[]; signature: string } | undefined;
 let warnedInvalidEnv = false;
 
 /** The read currently in flight, so a BURST of connects collapses into one.
@@ -66,9 +81,10 @@ let warnedInvalidEnv = false;
  *  read (which deliberately caches no answer) stays retryable. */
 let inflight: Promise<RuntimeChoice | null> | null = null;
 
-/** Every file the previous degraded verdict depended on, with the stat
- *  signature each had at the time. While they ALL still carry those
- *  signatures the verdict cannot have changed, so the re-read is skipped --
+/** Every file the previous degraded verdict depended on, with the joint stat
+ *  signature they had at the time (bundlesSignature -- the same detector the
+ *  positive cache and server.ts use, not a second one kept here). While it
+ *  still matches the verdict cannot have changed, so the re-read is skipped --
  *  see defaultRuntime. Null once any call reaches a usable answer.
  *
  *  Plural because the verdict is not a function of one file. A broken
@@ -76,9 +92,9 @@ let inflight: Promise<RuntimeChoice | null> | null = null;
  *  `defaultRuntime` (local-bundles.ts, LoadLocalBundlesResult), so keying
  *  only on the broken project file meant an explicit user-global
  *  `defaultRuntime: "node"` written afterwards was never picked up -- the
- *  exact silent inversion this exemption exists to prevent. A `null`
- *  signature records "absent", so CREATING a file invalidates too. */
-let degradedProbe: { files: Array<{ path: string; signature: string | null }>; at: number } | null = null;
+ *  exact silent inversion this exemption exists to prevent. The signature
+ *  records an absent file as absent, so CREATING a file invalidates too. */
+let degradedProbe: { watched: string[]; signature: string; at: number } | null = null;
 
 /** How long a degraded verdict may be reused before it is re-derived, even
  *  when every watched file is byte-identical.
@@ -95,22 +111,6 @@ let degradedProbe: { files: Array<{ path: string; signature: string | null }>; a
  *  connects into a single read. */
 const DEGRADED_RECHECK_MS = 5_000;
 let warnedDegradedBundles = false;
-
-/** mtime + size of a file, or null when it cannot be stat'ed (deleted, or the
- *  directory became unreadable) -- null forces the full re-read, which is the
- *  right answer for a file that is no longer the one we looked at.
- *
- *  Size rides along with mtime because filesystem timestamp granularity is
- *  coarse (~15ms on NTFS): two writes inside one tick can share an mtime, and
- *  the pair is far less likely to collide than mtime alone. */
-function statSignature(path: string): string | null {
-  try {
-    const s = statSync(path);
-    return `${s.mtimeMs}:${s.size}`;
-  } catch {
-    return null;
-  }
-}
 
 /** Reset the cached bundles.json default (test hook). */
 export function resetDefaultRuntimeCache(): void {
@@ -207,38 +207,41 @@ export async function describeDefaultRuntime(
  * at or above MIN_OAM_VERSION, and to node otherwise (step 4 in the header).
  * Env is checked on every call
  * (cheap, and lets a respawned broker pick up a change); the bundles.json
- * top-level `defaultRuntime` is read once and cached -- this sits on the
- * upstream connect path. Once really means once: a concurrent burst (prewarm
- * connects every active server at the same moment) joins the read already in
- * flight rather than each starting its own -- see `inflight`.
+ * top-level `defaultRuntime` is read once and cached until a file that read
+ * consulted changes on disk (see `bundlesDefaultCache`) -- this sits on the
+ * upstream connect path, so the steady state is a stat per consulted file,
+ * not a read. One read per change really means one: a concurrent burst
+ * (prewarm connects every active server at the same moment) joins the read
+ * already in flight rather than each starting its own -- see `inflight`.
  *
  * `cwd`/`home`/`env` default to the real process values (production passes
  * nothing); they exist so the bundles path is testable without depending on
- * the machine the suite runs on. They seed the ONE-TIME read only: the cache
- * below is a single unkeyed slot, so a later call passing different values
- * gets the first call's answer rather than its own. Production resolves one
- * cwd for the process, so this is a test-ergonomics parameter, NOT a
- * per-call override -- key the cache before treating it as one.
+ * the machine the suite runs on. They seed a READ only: the cache below is a
+ * single slot keyed on the files the last read consulted, not on these
+ * arguments, so a later call passing different values gets the cached answer
+ * rather than its own for as long as those files are unchanged. Production
+ * resolves one cwd for the process, so this is a test-ergonomics parameter,
+ * NOT a per-call override -- key the cache before treating it as one.
  */
 export async function defaultRuntime(
   opts: { cwd?: string; home?: string; now?: () => number; env?: NodeJS.ProcessEnv } = {},
 ): Promise<RuntimeChoice | null> {
   const fromEnv = readEnvChoice(opts.env ?? process.env);
   if (fromEnv !== null) return fromEnv;
-  if (bundlesDefaultCache === undefined) {
-    // Join the read already in flight rather than starting a second one. The
-    // memo is assigned BEFORE the first await inside the load, so every
-    // connect in a prewarm burst lands on this branch and gets the same
-    // promise; it is cleared when that promise settles, which is what keeps
-    // the uncached degraded verdict retryable on the NEXT burst.
-    if (inflight === null) {
-      inflight = resolveBundlesDefault(opts).finally(() => {
-        inflight = null;
-      });
-    }
-    return inflight;
+  const cached = bundlesDefaultCache;
+  if (cached !== undefined && bundlesSignature(cached.watched) === cached.signature) return cached.value;
+  // Never read, or a consulted file changed since. Join the read already in
+  // flight rather than starting a second one. The memo is assigned BEFORE the
+  // first await inside the load, so every connect in a prewarm burst lands
+  // here and gets the same promise; it is cleared when that promise settles,
+  // which is what keeps the uncached degraded verdict retryable on the NEXT
+  // burst.
+  if (inflight === null) {
+    inflight = resolveBundlesDefault(opts).finally(() => {
+      inflight = null;
+    });
   }
-  return bundlesDefaultCache;
+  return inflight;
 }
 
 /** The uncached miss path of defaultRuntime: the degraded-probe gate, the
@@ -258,9 +261,11 @@ async function resolveBundlesDefault(opts: {
   if (
     degradedProbe !== null &&
     now() - degradedProbe.at < DEGRADED_RECHECK_MS &&
-    degradedProbe.files.every((f) => statSignature(f.path) === f.signature)
+    bundlesSignature(degradedProbe.watched) === degradedProbe.signature
   ) {
-    return null;
+    // The last good answer when there is one (see the degraded branch below),
+    // null when this process never read a usable file.
+    return bundlesDefaultCache?.value ?? null;
   }
   // `env` is threaded through for the same reason describeDefaultRuntime
   // passes it: loadLocalBundles's project-trust probe reads the env it is
@@ -284,17 +289,29 @@ async function resolveBundlesDefault(opts: {
   const degraded = bundles === null || (bundles.config === null && bundles.path !== null);
   const resolved = bundles?.defaultRuntime ?? null;
   if (degraded && resolved === null) {
-    // Remember WHICH file was broken and how it looked, so the next connect
-    // can answer with a stat. A signature taken after the read can, in the
-    // narrow case of the file being fixed mid-read, describe content this
-    // call never saw -- the fix is then picked up on the following edit or
-    // restart rather than the next connect. That is a strictly smaller
-    // staleness window than the positive cache, which holds for the process
-    // lifetime. `bundles === null` (the loader itself threw) leaves no path
-    // to stat, so that shape keeps re-reading as before.
+    // An earlier usable answer is KEPT, not dropped. Its files changed (that
+    // is how this call got here), but what replaced them cannot be read --
+    // typically a half-finished edit saved with a JSON syntax error. Dropping
+    // it would answer null, which the connect path resolves to oam when oam is
+    // installed: an explicit `defaultRuntime: "node"` inverted mid-edit, the
+    // one failure this exemption exists to prevent. The entry's signature is
+    // now stale, so defaultRuntime's fast path no longer serves it; every call
+    // comes through here (or the stat gate above) and the file is re-read as
+    // soon as it changes again or the recheck window lapses. A file that is
+    // DELETED is not degraded (the loader reports no path) and replaces the
+    // answer normally.
+    const lastGood = bundlesDefaultCache?.value ?? null;
+    // Remember WHICH files were consulted and how they looked, so the next
+    // connect can answer with a stat. A signature taken after the read can,
+    // in the narrow case of the file being fixed mid-read, describe content
+    // this call never saw -- the fix is then picked up when the recheck
+    // window below lapses rather than on the next connect. `bundles === null`
+    // (the loader itself threw) leaves no path to stat, so that shape keeps
+    // re-reading as before. A broken file that has since become unstat-able
+    // is recorded as absent, and so is re-read once it reappears or the
+    // window lapses.
     const path = bundles?.path ?? null;
-    const signature = path === null ? null : statSignature(path);
-    if (path === null || signature === null) {
+    if (path === null) {
       degradedProbe = null;
     } else {
       // Watch every file the load CONSULTED, as reported by the loader --
@@ -308,24 +325,31 @@ async function resolveBundlesDefault(opts: {
       // above covers what it still cannot list -- a project `.yaw-mcp/`
       // that does not exist yet.
       const watched = bundles?.consultedPaths?.length ? bundles.consultedPaths : [path];
-      degradedProbe = {
-        files: watched.map((f) => ({ path: f, signature: statSignature(f) })),
-        at: now(),
-      };
+      degradedProbe = { watched, signature: bundlesSignature(watched), at: now() };
     }
     if (!warnedDegradedBundles) {
       warnedDegradedBundles = true;
       // Once, not per connect: the loader's own parse diagnostic stops
       // firing as soon as the re-read stops, so without this line the last
       // word on a broken bundles.json would be a single startup warning.
-      log("warn", "bundles.json could not be read for the default runtime; using the fallback until the file changes", {
-        path: path ?? "(unknown)",
-      });
+      log(
+        "warn",
+        lastGood === null
+          ? "bundles.json could not be read for the default runtime; using the fallback until the file changes"
+          : `bundles.json could not be read for the default runtime; keeping the last value read ("${lastGood}") until the file changes`,
+        { path: path ?? "(unknown)" },
+      );
     }
-    return null;
+    return lastGood;
   }
   degradedProbe = null;
-  bundlesDefaultCache = resolved;
+  // `bundles` is non-null here (a null load is degraded-and-empty, handled
+  // above). The signature is taken after the read, with the same narrow
+  // mid-read caveat as the degraded probe's: an edit that lands between the
+  // read and this stat is described by the signature without having been
+  // read, and stays unseen until the file moves again.
+  const watched = bundles?.consultedPaths ?? [];
+  bundlesDefaultCache = { value: resolved, watched, signature: bundlesSignature(watched) };
   return resolved;
 }
 
@@ -388,9 +412,9 @@ export interface ServerRuntimeInfo {
  * argv, no disk lookup, no probe. Null when the shape is one the rewrite
  * accepts.
  *
- * Split out, and expressed with oam-spawn's own exported predicates
- * (scanNodeLaunchFlags / npxSpecIndex / isRegistrySpec / specConstraint) rather
- * than re-derived here,
+ * Split out, and expressed with oam-spawn's own exported classifiers
+ * (scanNodeLaunchFlags for a node launch, classifyNpxLaunch for an npx one)
+ * rather than re-derived here,
  * for the reason the nodeLaunchKind comment below gives: doctor answering a
  * spawn-time question a SECOND way is how doctor ends up printing a runtime the
  * spawn does not produce. These gates are deterministic -- a config that trips
@@ -421,31 +445,31 @@ function describeLaunchShape(
     return null;
   }
   if (kind === "npx") {
-    // Same index the rewrite slices the server's own args at -- only -y/--yes
-    // are npx's own, and only ahead of the spec.
-    const idx = npxSpecIndex(args);
-    const spec = idx === -1 ? undefined : args[idx];
-    if (!spec) return { code: "npx-no-spec", detail: "the npx launch names no package" };
-    if (spec.startsWith("-")) {
-      return {
-        code: "npx-flag-spec",
-        detail: `the npx launch carries ${spec}, a flag yaw-mcp does not parse`,
-      };
+    // The SAME classification both rewrites run (classifyNpxLaunch), not a
+    // second copy of its gate sequence -- only -y/--yes are npx's own, and
+    // only ahead of the spec.
+    const launch = classifyNpxLaunch(args);
+    switch (launch.kind) {
+      case "no-spec":
+        return { code: "npx-no-spec", detail: "the npx launch names no package" };
+      case "flag-spec":
+        return {
+          code: "npx-flag-spec",
+          detail: `the npx launch carries ${launch.flag}, a flag yaw-mcp does not parse`,
+        };
+      case "non-registry-spec":
+        return {
+          code: "npx-non-registry-spec",
+          detail: `the npx spec ${launch.spec} is a git/path target, not a registry package`,
+        };
+      case "version-range":
+        return {
+          code: "npx-version-range",
+          detail: `the npx spec pins the range ${launch.range}, which yaw-mcp cannot evaluate`,
+        };
+      case "hostable":
+        return null;
     }
-    if (!isRegistrySpec(spec)) {
-      return {
-        code: "npx-non-registry-spec",
-        detail: `the npx spec ${spec} is a git/path target, not a registry package`,
-      };
-    }
-    const constraint = specConstraint(spec);
-    if (constraint.kind === "range") {
-      return {
-        code: "npx-version-range",
-        detail: `the npx spec pins the range ${constraint.raw}, which yaw-mcp cannot evaluate`,
-      };
-    }
-    return null;
   }
   return null;
 }

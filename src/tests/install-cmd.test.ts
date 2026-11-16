@@ -150,22 +150,20 @@ describe("parseInstallArgs", () => {
     if (!r.ok) expect(r.error).toContain("Usage:");
   });
 
-  it("--help returns ok:true with helpRequested so dispatcher routes to stdout+exit0", () => {
-    // Parser shape changed: --help is now a SUCCESSFUL parse carrying
-    // helpRequested in options (was ok:false + help:true, a spelling whose
-    // `help` field is gone from the failure type entirely -- nothing set it
-    // and nothing read it). The dispatcher in index.ts checks
-    // `parsed.ok && parsed.options.helpRequested` and prints USAGE to
-    // stdout + exit 0.
-    const r = parseInstallArgs(["--help"]);
-    expect(r.ok).toBe(true);
-    if (r.ok) expect(r.options.helpRequested).toBe(true);
-  });
-
-  it("-h returns ok:true with helpRequested", () => {
-    const r = parseInstallArgs(["-h"]);
-    expect(r.ok).toBe(true);
-    if (r.ok) expect(r.options.helpRequested).toBe(true);
+  it("--help / -h use the shared help signal: ok:false, the usage, help:true", () => {
+    // ONE --help spelling for install and uninstall. install used to return
+    // a successful parse carrying `helpRequested`, which needed its own
+    // dispatcher branch in index.ts; it now rides the shared run() tail,
+    // which prints `error` to stdout with exit 0 when `help` is set.
+    for (const flag of ["--help", "-h"]) {
+      const r = parseInstallArgs([flag]);
+      expect(r).toEqual({ ok: false, error: INSTALL_USAGE, help: true });
+      expect(parseUninstallArgs([flag])).toMatchObject({ ok: false, help: true });
+    }
+    // An argv error stays distinguishable: no `help`, so run() exits 2.
+    const bad = parseInstallArgs(["--nope"]);
+    expect(bad.ok).toBe(false);
+    if (!bad.ok) expect(bad.help).toBeUndefined();
   });
 
   it("parses positional client", () => {
@@ -1499,7 +1497,13 @@ describe("runInstall — collision handling", () => {
       oamProbe: OAM_ABSENT,
     });
     expect(r.exitCode).toBe(0);
-    expect(cap.stdout()).toContain(`Would overwrite existing "${ENTRY_NAME}" entry.`);
+    // A BARE --dry-run: the same command without it would prompt or refuse,
+    // so the line names the flag the overwrite needs instead of promising it.
+    expect(cap.stdout()).toContain(
+      `Would overwrite existing "${ENTRY_NAME}" entry -- only with --repair or --force. Without one, the real run ` +
+        "asks first on a terminal (default: leave it) and refuses off one. The preview below assumes the flag.\n",
+    );
+    expect(cap.stdout()).not.toContain(`Would overwrite existing "${ENTRY_NAME}" entry.`);
     expect(cap.stdout()).not.toContain(`Overwriting existing "${ENTRY_NAME}" entry.`);
     expect(r.written).toEqual([]);
     // And the claim is true: the file is byte-identical.
@@ -2192,10 +2196,15 @@ describe("runInstall — deprecated --token / --no-yaw-mcp-config", () => {
     expect(existsSync(join(synthHome, ".yaw-mcp", "config.json"))).toBe(false);
   });
 
-  it("names the deprecation reason and tells the user to revoke the PAT", () => {
+  it("names the deprecation reason and sends the user nowhere to revoke the PAT", () => {
     expect(TOKEN_FLAG_DEPRECATION).toMatch(/deprecated and ignored/);
     expect(TOKEN_FLAG_DEPRECATION).toMatch(/local-only/);
-    expect(TOKEN_FLAG_DEPRECATION).toMatch(/revoke that PAT/);
+    // The service that issued the token is retired: "revoke it at its source"
+    // was advice with no surface left to act on. config-loader.ts words the
+    // same fact the same way for a `token` key left in config.json.
+    expect(TOKEN_FLAG_DEPRECATION).toMatch(/is retired, so there is nowhere left to revoke it/);
+    expect(TOKEN_FLAG_DEPRECATION).toMatch(/deleting it from your scripts is all there is to do/);
+    expect(TOKEN_FLAG_DEPRECATION).not.toMatch(/at its source/);
   });
 
   it("accepts --no-yaw-mcp-config, warns, and exits 0", async () => {
@@ -5296,7 +5305,10 @@ describe("runInstall --all -- a DRIFTED entry off a TTY", () => {
     const before = readFileSync(cursorPath(), "utf8");
     const { r, stdout } = await rerun({ dryRun: true });
     expect(r.exitCode).toBe(0);
-    expect(stdout).toContain(`Would overwrite existing "${ENTRY_NAME}" entry.\n  ${DIFF}\n`);
+    // No --repair / --force on this run, so the line says the overwrite needs
+    // one; the diff still follows it directly.
+    expect(stdout).toContain(`Would overwrite existing "${ENTRY_NAME}" entry -- only with --repair or --force.`);
+    expect(stdout).toContain(` The preview below assumes the flag.\n  ${DIFF}\n`);
     expect(readFileSync(cursorPath(), "utf8")).toBe(before);
   });
 

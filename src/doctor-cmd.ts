@@ -93,13 +93,16 @@ import {
   classifyClientConfig,
   containerNounFor,
   decodeClientConfigBytes,
-  describeValueShape,
   type EntryTransform,
   effectiveConfigFormat,
+  normalizeEntry,
   planRootDefaults,
   type RootDefaultValue,
   readClientEnv,
+  rootLinePlacement,
   type SyntaxName,
+  selectSites,
+  spellRootValue,
   syntaxNameFor,
   unloadableConfigProblem,
 } from "./client-config.js";
@@ -160,7 +163,6 @@ import {
 import { createStreamWriter } from "./logger.js";
 import {
   compareVersions,
-  isOamCommand,
   isOamLaunch,
   launcherBasename,
   MIN_OAM_VERSION,
@@ -170,10 +172,8 @@ import {
   type OamProbeFailure,
   oamBuildTreeFix,
   oamInstallAdvice,
-  POSIX_SHELL,
-  POWERSHELL,
-  powershellPayload,
   probeOam,
+  unwrapOamLaunch,
 } from "./oam-spawn.js";
 import { isTestSandbox } from "./opt-out-env.js";
 import { gitBuildDir, gitFailedPath, normalizeForCompare, userConfigDir } from "./paths.js";
@@ -186,6 +186,7 @@ import {
   STATE_SCHEMA_VERSION,
 } from "./persistence.js";
 import { cachedRegistryLatest, type RegistryCacheOptions } from "./registry-cache.js";
+import { fetchLatestVersion as fetchRegistryLatest } from "./registry-latest.js";
 import {
   checkVaultPassphrase,
   collectMalformedSecretRefs,
@@ -310,7 +311,9 @@ export interface DoctorOptions {
    *  same wrapper as `out`). Used for the always-on warning stream so
    *  pipelines that capture stdout still see config warnings. */
   err?: (s: string) => void;
-  /** Disable the npm registry freshness check (tests, offline use). */
+  /** Test hook: disable the npm registry freshness check. Reachable from
+   *  tests only -- no CLI flag or environment variable sets it (see Network in
+   *  the file header), so a user cannot turn the registry GETs off with it. */
   skipRegistryCheck?: boolean;
   /** Test hook: return the latest-version string for @yawlabs/mcp. Stands in
    *  for the request only: the 24 h registry cache under `home` is still
@@ -327,8 +330,10 @@ export interface DoctorOptions {
   sidecarRegistryFetch?: (pkg: string) => Promise<string | null>;
   /** Emit a single JSON blob instead of the human-readable text report. */
   json?: boolean;
-  /** Test hook: override Date.now() used by the trial GC pass and by the
-   *  STATE section's "last saved ... ago" age. */
+  /** Test hook: override Date.now() for the trial scan and GC pass, the
+   *  registry cache's freshness window, and every age the text report prints
+   *  -- STATE's "last saved ... ago", RELIABILITY's "last used ... ago" and
+   *  the git sources' "as of ... ago" -- so one report reads one clock. */
   now?: () => number;
   /** Test hook: override the current version used for the staleness comparison
    *  and UPGRADE AVAILABLE hint. Defaults to VERSION (the build-time constant).
@@ -627,6 +632,12 @@ export interface ClientProbeResult {
   clientId: InstallClientId;
   scope: InstallScope;
   path: string;
+  /** Which copy of the slot's config this row is ("shared settings",
+   *  "VS Code"), from the site's own label. Present ONLY when the probe was
+   *  asked for every copy (ProbeOptions.allSites) and this (client, scope)
+   *  has more than one on this machine -- Cline with an editor copy. Absent
+   *  on every other row, so their JSON is unchanged. Additive JSON field. */
+  site?: string;
   /** Where inside the file this slot's entry lives (`mcpServers`;
    *  `servers` for VS Code; `projects[<dir>].mcpServers` for Claude Code's
    *  local scope; `mcp_servers` for Codex CLI).
@@ -811,6 +822,17 @@ export interface ClientProbeResult {
    *  (see isForeignAbsoluteLaunch). Not a cannot-launch state: the OS the
    *  entry was written for may well run it fine. */
   launchForeignPath: string | null;
+  /** True when the "mcp" entry is present and readable but gives its client
+   *  nothing to start: it is not an object, or it is one with no string
+   *  `command` and no string endpoint key (`url`, `httpUrl`, `serverUrl`) --
+   *  a hand-edited `"mcp": {}` or `"mcp": null`. An object `command` with a
+   *  string `path` (Zed's older spelling) counts as a command. Judged on the entry as the
+   *  row's normalize hook presents it, so Cline's nested `transport` form
+   *  counts as having a command. A cannot-launch state (clientCannotLaunch):
+   *  the row used to read `OK -- has "mcp" entry`. False with no entry, and
+   *  on an `entryUnspliceable` row, whose entry is never read. Additive JSON
+   *  field. */
+  launchNoCommand: boolean;
   /** The `projects[...]` key the reported entry was actually found under, when
    *  that key is NOT the canonical spelling for this directory -- otherwise
    *  null, which is every non-Windows checkout, every other client, and every
@@ -1034,7 +1056,10 @@ async function collectStateStatus(opts: { env: NodeJS.ProcessEnv; home: string }
 function describeClient(c: ClientProbeResult): { client: string; label: string; status: string } {
   const installCmd = installCommandFor(c);
   const client = INSTALL_TARGETS.find((t) => t.clientId === c.clientId)?.label ?? c.clientId;
-  return { client, label: `${client} (${c.scope})`, status: renderClientStatus(c, installCmd, client) };
+  // A slot with several copies on this machine names the copy beside the
+  // scope, or its rows would read as the same line printed twice.
+  const where = c.site === undefined ? c.scope : `${c.scope}, ${c.site}`;
+  return { client, label: `${client} (${where})`, status: renderClientStatus(c, installCmd, client) };
 }
 
 /** The install run that (re)writes one probe's slot: its client, and its
@@ -1144,7 +1169,10 @@ function clientCannotLaunch(c: ClientProbeResult): boolean {
     (c.hasMcpEntry && c.rootDefaults.some((d) => d.state === "refused" || d.state === "refused-every-release")) ||
     c.launchCommandMissing !== null ||
     c.launchOamEntryMissing !== null ||
-    c.launchOamNotAbsolute !== null
+    c.launchOamNotAbsolute !== null ||
+    // An entry with neither a command to spawn nor an endpoint to connect to
+    // (`"mcp": {}`): the client has nothing to start from it.
+    c.launchNoCommand
   );
 }
 
@@ -1346,7 +1374,13 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
     ...foldBundleWarnings(oamStatus.bundleWarnings, trustProbe),
     ...oamStatus.git.warnings,
   ];
-  renderOamRuntimeSection({ status: oamStatus, print, os, now: opts.now ?? Date.now });
+  renderOamRuntimeSection({
+    status: oamStatus,
+    print,
+    os,
+    now: opts.now ?? Date.now,
+    platform: opts.platform ?? process.platform,
+  });
 
   // Secret vault: what is stored, which servers reference it, and whether a
   // passphrase is available to unlock it. This is the only surface that
@@ -1387,7 +1421,7 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   // state.json the STATE section introspected. Same definition as the
   // cross-session block in mcp_connect_health, so "flaky" means the
   // same thing whether you check via the LLM or via the CLI.
-  renderReliabilitySection({ disabled: persistenceDisabled, persisted: persistedState, print });
+  renderReliabilitySection({ disabled: persistenceDisabled, persisted: persistedState, print, now: opts.now });
 
   // Trial GC + live-trial readout. Runs the expired-trial sweep first
   // so the readout shows the post-GC state (no stale "expired" rows
@@ -1413,6 +1447,7 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
     appData,
     platform: opts.platform,
     readClientConfig: opts.readClientConfig,
+    allSites: true,
   });
   print("INSTALLED CLIENTS (probed config files)");
   for (const c of clients) {
@@ -1592,6 +1627,7 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
     appData,
     platform: opts.platform,
     readClientConfig: opts.readClientConfig,
+    allSites: true,
   });
 
   // Same project-guide probe as the text path's PROJECT GUIDE section.
@@ -2006,7 +2042,15 @@ export interface VaultStatus {
    *  false`. Additive JSON field. */
   checkMarkerCorrupt: boolean;
   /** Servers whose configured env carries `${secret:NAME}` refs. */
-  refs: Array<{ namespace: string; secretNames: string[] }>;
+  refs: Array<{
+    namespace: string;
+    secretNames: string[];
+    /** Set when one of `secretNames` comes from the entry's `git.tokenSecret`
+     *  ALONE (no env or header ref spells the same name): a bare vault name
+     *  read to clone or update the source, never to start an already-built
+     *  server. Absent on every other row. Additive JSON field. */
+    gitTokenSecret?: string;
+  }>;
   /** Servers whose credential map (env for a local server, headers for a
    *  remote one) carries a ${secret:...} span that does not parse (a space in
    *  the name, a missing `}`), each as secrets-vault's
@@ -2215,7 +2259,28 @@ async function collectVaultStatus(opts: {
     // a hand copy of collectSecretRefNames re-deriving that rule, as did
     // meta-tools.ts's and upstream.ts's.
     const names = collectSecretRefNames(refSource);
-    if (names.size > 0) refs.push({ namespace: s.namespace, secretNames: [...names].sort() });
+    // A git entry also names a vault secret OUTSIDE those maps: the bare NAME
+    // in `git.tokenSecret` (types.ts), read from the vault at clone time. It
+    // is a reference like any other -- `secrets set` counts it (secrets-cmd.ts
+    // secretConsumers) -- and leaving it out reported a token the vault does
+    // not hold as nothing missing.
+    //
+    // It is TAGGED on the row, though, because it differs from a placeholder
+    // in the two ways the text below would otherwise get wrong: the entry
+    // holds a bare name, not `${secret:NAME}`, and the vault is read for it
+    // only on the build path (git-source.ts prepareGit, from the first-use
+    // build and from `yaw-mcp update`) -- an already-built entry starts with
+    // the vault locked. A name an env or header ref ALSO spells is a
+    // start-time reference like any other, so it is left untagged.
+    const gitTokenOnly = s.gitTokenSecret && !names.has(s.gitTokenSecret) ? s.gitTokenSecret : undefined;
+    if (s.gitTokenSecret) names.add(s.gitTokenSecret);
+    if (names.size > 0) {
+      refs.push({
+        namespace: s.namespace,
+        secretNames: [...names].sort(),
+        ...(gitTokenOnly ? { gitTokenSecret: gitTokenOnly } : {}),
+      });
+    }
     const malformedRefs = collectMalformedSecretRefs(refSource);
     if (malformedRefs.length > 0) malformed.push({ namespace: s.namespace, refs: malformedRefs });
     // Plaintext credentials on the SAME channel, for the same reason the refs
@@ -2273,6 +2338,18 @@ async function collectVaultStatus(opts: {
  *  a terminal run: it belongs in the env your MCP client spawns yaw-mcp with,
  *  which doctor -- running as its own process from a shell -- cannot see. A
  *  warning would take a perfectly healthy machine to exit 2.
+ *
+ *  KNOWN GAP, not covered by that reason: three states printed here refuse a
+ *  server's spawn or connect in ANY environment -- a malformed ${secret:...}
+ *  ref, a referenced name the vault does not hold (names are readable without
+ *  the passphrase), and an unreadable vault that servers reference. They are
+ *  informational too, so a report can say "refs the spawn or connect is
+ *  REFUSED over" here and "All good. yaw-mcp should start cleanly." under
+ *  DIAGNOSIS, exit 0, on --json as well. yaw-mcp itself does start; the named
+ *  server does not. Folding them would move the exit code and the panel's
+ *  `doctor --json` summary for every machine in the paste-the-ref-before-
+ *  `secrets set` state, which the tests pin at exit 0, so it is left as a
+ *  product decision rather than changed in passing.
  *
  *  Omitted entirely when there is no vault, nothing references one, no server
  *  carries a malformed ${secret:...} ref, and no server carries a plaintext
@@ -2356,11 +2433,17 @@ function renderVaultSection(opts: {
     // claimed BOTH maps were read on every server, which the shape-selective
     // scan above does not do -- a ref sitting in the map its shape skips made
     // that sentence flatly false.
-    print("  refs:       no server references ${secret:NAME} on the channel it uses (env local, headers remote)");
+    print(
+      "  refs:       no server references ${secret:NAME} on the channel it uses (env local, headers remote), or names one in git.tokenSecret",
+    );
   } else {
     print("  refs:");
     for (const r of status.refs) {
-      print(`    ${r.namespace}: ${r.secretNames.map((n) => `\${secret:${n}}`).join(", ")}`);
+      // The clone token is a bare name in `git.tokenSecret`, not a
+      // placeholder: spelled as the key it sits under, and last.
+      const parts = r.secretNames.filter((n) => n !== r.gitTokenSecret).map((n) => `\${secret:${n}}`);
+      if (r.gitTokenSecret) parts.push(`git.tokenSecret: ${r.gitTokenSecret} (needed to clone or update)`);
+      print(`    ${r.namespace}: ${parts.join(", ")}`);
     }
   }
   // A ref the strict regex could not parse is refused at spawn exactly like a
@@ -2372,11 +2455,18 @@ function renderVaultSection(opts: {
       print(`    ${m.namespace}: ${m.refs.join(", ")}`);
     }
   }
-  if (status.refs.length > 0 && !status.passphraseSet) {
+  // Only rows with a ref the START needs. A row whose one reference is its
+  // clone token is not refused at spawn by a locked vault (see the tagging in
+  // collectVaultStatus), so it neither triggers this note nor is covered by it.
+  const startRefs = status.refs.filter((r) => r.secretNames.some((n) => n !== r.gitTokenSecret));
+  if (startRefs.length > 0 && !status.passphraseSet) {
     // "start or connect", because the section now covers both shapes: a local
     // server is refused at SPAWN and a remote one at CONNECT, and naming only
     // the spawn would read as not applying to the remote entries listed above.
-    print("  note:       the servers above FAIL TO START OR CONNECT while the vault is locked -- yaw-mcp");
+    const which =
+      startRefs.length === status.refs.length ? "the servers above" : startRefs.map((r) => r.namespace).join(", ");
+    const verb = startRefs.length === 1 && which !== "the servers above" ? "FAILS" : "FAIL";
+    print(`  note:       ${which} ${verb} TO START OR CONNECT while the vault is locked -- yaw-mcp`);
     print("              refuses it rather than passing the literal placeholder through.");
     print("              Set YAW_MCP_VAULT_PASSPHRASE in yaw-mcp's OWN env (the `env` block of");
     print("              the yaw-mcp entry in your MCP client config), NOT in the upstream");
@@ -2573,6 +2663,9 @@ interface OamRuntimeStatus {
      *  silently ignores the only credential it has. */
     url: string | undefined;
     type: "local" | "remote";
+    /** The clone token's vault NAME on a git entry (`git.tokenSecret`), for
+     *  the vault section's reference scan. Undefined on every other entry. */
+    gitTokenSecret: string | undefined;
     info: ServerRuntimeInfo;
   }>;
   /** The managed install (`yaw-mcp sidecars install`): where it is, the
@@ -2624,29 +2717,13 @@ interface OamRuntimeStatus {
   bundlesUnreadable: string | null;
 }
 
-// Latest-version probe for a managed sidecar package. Same contract and
-// response validation as upgrade-cmd's fetchLatestVersion (null on any
-// failure, hard abort at doctor's budget) but keyed by package -- that one is
-// hardwired to @yawlabs/mcp itself, and doctor is the only caller that asks
-// about arbitrary packages, so it lives here rather than generalizing the
-// shared probe. The unencoded scoped-name URL matches the shape upgrade-cmd
-// has always used against this registry.
-async function fetchSidecarLatest(pkg: string): Promise<string | null> {
-  const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), DOCTOR_REGISTRY_TIMEOUT_MS);
-  try {
-    const res = await fetch(`https://registry.npmjs.org/${pkg}/latest`, {
-      signal: ac.signal,
-      headers: { accept: "application/json" },
-    });
-    if (!res.ok) return null;
-    const body = (await res.json()) as { version?: unknown };
-    return typeof body.version === "string" ? body.version : null;
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timer);
-  }
+// Latest-version probe for a managed sidecar package: the shared leaf probe
+// (registry-latest.ts -- null on any failure, hard abort at the budget) at
+// doctor's own budget. upgrade-cmd's fetchLatestVersion, which answers for
+// @yawlabs/mcp itself, and sidecar-refresh's serve-time check call the same
+// function.
+function fetchSidecarLatest(pkg: string): Promise<string | null> {
+  return fetchRegistryLatest(pkg, DOCTOR_REGISTRY_TIMEOUT_MS);
 }
 
 /** THE registry-probe gate, in one place. doctor makes three network probes
@@ -2893,6 +2970,7 @@ async function collectOamRuntimeStatus(opts: {
     headers: s.headers,
     url: s.url,
     type: s.type,
+    gitTokenSecret: s.git?.tokenSecret,
     info: describeServerRuntime(s, dflt.runtime, probe),
   }));
   // Report the version actually installed for each package the config asks
@@ -3016,6 +3094,10 @@ function renderOamRuntimeSection(opts: {
   os: InstallOS;
   /** Clock for the git sources "as of ... ago" age. */
   now: () => number;
+  /** The platform the managed tree's mismatch was judged against
+   *  (collectOamRuntimeStatus's hostPlatform: DoctorOptions.platform, else
+   *  process.platform), so the mismatch line names the platform it compared. */
+  platform: NodeJS.Platform;
 }): void {
   const { status, print } = opts;
   const { probe, dflt, servers } = status;
@@ -3206,7 +3288,7 @@ function renderOamRuntimeSection(opts: {
       // installedPlatform in sidecars-cmd.ts).
       if (managed.platformMismatch && managed.installedFor !== null) {
         print(
-          `    ! installed on ${managed.installedFor.platform}/${managed.installedFor.arch}; this process is ${process.platform}/${process.arch}.`,
+          `    ! installed on ${managed.installedFor.platform}/${managed.installedFor.arch}; this process is ${opts.platform}/${process.arch}.`,
         );
         print("      Native bindings resolve for the installing machine, so these packages can fail");
         print("      at spawn here -- re-run `yaw-mcp sidecars install` on this machine.");
@@ -3305,7 +3387,15 @@ function renderStateSection(opts: {
   }
   if (peek.kind === "stale-version") {
     print(`  status: schema mismatch (file is v${peek.version ?? "?"}, this yaw-mcp reads v${peek.expected})`);
-    print("  fix:    `yaw-mcp reset-learning` to drop the old file -- learning will rebuild on use");
+    // A version ABOVE this build's is not an old file to drop: persistence.ts
+    // flags it loadFailed so this process never saves over it, and the remedy
+    // is upgrading this install. Advising reset-learning there would delete
+    // the newer yaw-mcp's live learning.
+    if (typeof peek.version === "number" && peek.version > peek.expected) {
+      print("  fix:    written by a newer yaw-mcp -- upgrade this install; this process will not save over it");
+    } else {
+      print("  fix:    `yaw-mcp reset-learning` to drop the old file -- learning will rebuild on use");
+    }
     print("");
     return;
   }
@@ -3381,6 +3471,9 @@ function renderReliabilitySection(opts: {
    *  rather than trusting `disabled` alone. */
   persisted: PersistedState | null;
   print: (s?: string) => void;
+  /** Clock for the "last used ... ago" ages (DoctorOptions.now), the one the
+   *  STATE section above it reads. */
+  now?: () => number;
 }): void {
   const { disabled, persisted, print } = opts;
   if (disabled || !persisted) return;
@@ -3394,7 +3487,7 @@ function renderReliabilitySection(opts: {
   // block, while `yaw-mcp status` lists every flaky namespace under the same
   // definition -- a reader comparing the two must be able to see the cap.
   print("RELIABILITY (top 5 dormant, <80% success)");
-  const now = Date.now();
+  const now = (opts.now ?? Date.now)();
   for (const { namespace, usage } of flaky) {
     const rate = Math.round((usage.succeeded / usage.dispatched) * 100);
     const age = formatRelativeAge(now - usage.lastUsedAt);
@@ -3754,6 +3847,12 @@ function renderClientStatus(c: ClientProbeResult, installCmd: string, client: st
   if (c.launchCommandMissing) {
     return `has "${ENTRY_NAME}" entry, but its launch command does not exist: ${c.launchCommandMissing} -- the client cannot start yaw-mcp; rerun \`${installCmd}\`${legacy}${rootClause("rerun")}${keyNote}`;
   }
+  // The entry is there and holds nothing to start (`"mcp": {}`, `"mcp":
+  // null`): ranked with the missing command above, since both mean the client
+  // starts nothing. It used to fall through to `OK -- has "mcp" entry`.
+  if (c.launchNoCommand) {
+    return `has "${ENTRY_NAME}" entry, but it has no launch command -- the client cannot start yaw-mcp; rerun \`${installCmd}\`${legacy}${rootClause("rerun")}${keyNote}`;
+  }
   // Both oam-specific states below are "the entry looks fine and will not
   // start", so they rank with launchCommandMissing rather than with the OK
   // branches -- reporting "OK (runs on oam)" for either is the wrong answer.
@@ -3887,6 +3986,15 @@ interface ProbeOptions {
    *  default read returns bytes, so no UTF-8 check applies to what it returns
    *  (see classifyProbeRead). */
   readClientConfig?: (path: string) => string;
+  /** Probe EVERY copy of a (client, scope)'s config that this machine has
+   *  (`selectSites` over `resolveInstallSites`), one result per copy, instead
+   *  of the first site alone. Only Cline has more than one: a shared file
+   *  plus one copy per editor its extension has run in. install and uninstall
+   *  act on all of them, so the two REPORTS -- doctor and `install --list` --
+   *  set this; a copy holding a stale or missing entry was invisible to both.
+   *  Left off by the callers that only ask "which client" (`try`'s
+   *  auto-detect, add's wiring nudge), whose answer must not move. */
+  allSites?: boolean;
 }
 
 /** One (client, scope) probe slot: the result skeleton plus, when a config
@@ -3950,6 +4058,7 @@ const EMPTY_PROBE: Readonly<ProbeClassification> = {
   launchOamNotAbsolute: null,
   launchOamEntryMissing: null,
   launchForeignPath: null,
+  launchNoCommand: false,
   entryProjectKey: null,
   entryUnspliceable: null,
   containerUnspliceable: null,
@@ -4013,15 +4122,21 @@ function* enumerateProbeSlots(opts: ProbeOptions): Generator<ProbeSlot> {
     // know the path; for project/local we use cwd (typical: the user
     // ran doctor inside the repo they care about).
     for (const scope of target.scopes) {
-      // The FIRST site install resolves for this (client, scope), not a
-      // ConfigSite built by hand: its format is the one install reads and
-      // writes with, so doctor cannot classify a file in a syntax install does
-      // not. `sites[0].resolved` is byte-for-byte what resolveInstallPath
-      // answers for every row (Cline's resolvePath is clineSites(base)[0]
-      // .resolved) -- Cline's per-editor copies are still not probed here.
-      let site: ConfigSite;
+      // The sites install resolves for this (client, scope), not a ConfigSite
+      // built by hand: a site's format is the one install reads and writes
+      // with, so doctor cannot classify a file in a syntax install does not.
+      // `sites[0].resolved` is byte-for-byte what resolveInstallPath answers
+      // for every row (Cline's resolvePath is clineSites(base)[0].resolved).
+      //
+      // By default only that FIRST site is probed. With `allSites`, every
+      // site this machine has is (selectSites: the unconditional ones plus
+      // each conditional one whose detectDir exists) -- the set install and
+      // uninstall act on. The first site is unconditional for every row
+      // today; the fallback keeps one row per slot even if a row ever
+      // declares only conditional sites and none is present.
+      let sites: ConfigSite[];
       try {
-        site = resolveInstallSites({
+        const declared = resolveInstallSites({
           clientId: target.clientId,
           scope: scope.scope,
           os: opts.os,
@@ -4030,33 +4145,40 @@ function* enumerateProbeSlots(opts: ProbeOptions): Generator<ProbeSlot> {
           projectDir: scope.requiresProjectDir ? opts.cwd : undefined,
           claudeConfigDir: opts.claudeConfigDir,
           clientEnv: opts.clientEnv,
-        })[0];
+        });
+        const selected = opts.allSites === true ? selectSites(declared) : [];
+        sites = selected.length > 0 ? selected : [declared[0]];
       } catch {
         // resolveInstallSites throws when project is required but missing —
         // shouldn't happen here since we always pass cwd, but defensive.
         continue;
       }
-      // existsSync, not the core's read: the core reads a whitespace-only
-      // file as absent, and this row must still say the file exists.
-      const exists = existsSync(site.resolved.absolute);
-      yield {
-        result: {
-          clientId: target.clientId,
-          scope: scope.scope,
-          path: site.resolved.absolute,
-          exists,
-          unavailable: false,
-          ...EMPTY_PROBE,
-          // The site's own format, resolved the one way the write path
-          // resolves it -- a row added to INSTALL_TARGETS is picked up here
-          // without touching this file.
-          syntax: syntaxNameFor(site.format),
-          containerPath: addressOf(site).containerPath,
-        },
-        read: exists
-          ? { path: site.resolved.absolute, site, transform: target.entry, rootDefaults: target.config.rootDefaults }
-          : null,
-      };
+      for (const site of sites) {
+        // existsSync, not the core's read: the core reads a whitespace-only
+        // file as absent, and this row must still say the file exists.
+        const exists = existsSync(site.resolved.absolute);
+        yield {
+          result: {
+            clientId: target.clientId,
+            scope: scope.scope,
+            path: site.resolved.absolute,
+            exists,
+            unavailable: false,
+            ...EMPTY_PROBE,
+            // The site's own format, resolved the one way the write path
+            // resolves it -- a row added to INSTALL_TARGETS is picked up here
+            // without touching this file.
+            syntax: syntaxNameFor(site.format),
+            containerPath: addressOf(site).containerPath,
+            // Named only when the slot has several copies on this machine, so
+            // a single-copy slot's result is exactly what it always was.
+            ...(sites.length > 1 ? { site: site.label } : {}),
+          },
+          read: exists
+            ? { path: site.resolved.absolute, site, transform: target.entry, rootDefaults: target.config.rootDefaults }
+            : null,
+        };
+      }
     }
   }
 }
@@ -4096,77 +4218,16 @@ function walkContainer(root: Record<string, unknown>, path: string[]): Record<st
   return cur as Record<string, unknown>;
 }
 
-/**
- * The oam a launch entry ultimately runs and the argv it runs it with, with
- * any shell wrapper peeled off -- or null when this entry is not an oam launch
- * we can read.
- *
- * `oam` is the token the client will actually resolve (`"oam"`, `"oam.exe"`,
- * an absolute path), which inside a wrapper is NOT `command`: the bare-oam
- * check in classifyProbeContent used to test `command` alone, so
- * `cmd /d /s /c oam run ...` -- which isOamLaunch accepts and which resolves
- * against the GUI client's PATH exactly like a bare `"command": "oam"` --
- * read as "OK (runs on oam)". `rest` is what oamRunEntryPath scans.
- *
- * DELIBERATE DUPLICATION of the unwrap in `isOamLaunch` (oam-spawn.ts). That
- * function answers "is this oam?" and throws the unwrapped tokens away;
- * everything after the wrapper is what THIS needs. The two must stay in step:
- * `isOamLaunch` is what sets `launchRuntime === "oam"`, so any wrapper shape it
- * starts accepting has to be added here too, or the entry scan below falls back
- * to reading the wrapper's own switches as an oam path.
- */
-function oamArgvTokens(command: string, args: readonly string[]): { oam: string; rest: readonly string[] } | null {
-  if (isOamCommand(command)) return { oam: command, rest: args };
-  const base = command.split(/[\\/]/).pop() ?? command;
-
-  if (/^cmd(\.exe)?$/i.test(base)) {
-    // cmd's payload is separate argv entries after its own switches, and the
-    // everyday shape is `/d /s /c` (what npm emits), not just `/c`. Matching
-    // "slash + ONE letter" keeps a POSIX path like /usr/local/bin/oam out of
-    // the switch set.
-    const i = args.findIndex((a) => !/^\/[a-z]$/i.test(a));
-    if (i < 0 || !isOamCommand(args[i])) return null;
-    return { oam: args[i], rest: args.slice(i + 1) };
-  }
-
-  if (POSIX_SHELL.test(base)) {
-    // A POSIX shell carries the whole command as one string after -c, so the
-    // payload has to be tokenised on whitespace. fish is in this set because
-    // its `-c` packages the payload the same way; the quoting rules that make
-    // fish fish are only a parser's problem, and this does not parse.
-    const dashC = args.indexOf("-c");
-    const payload = dashC >= 0 ? args[dashC + 1] : args[0];
-    if (payload === undefined) return null;
-    // A quote anywhere in the payload means whitespace tokenising can cut a
-    // path in half, and half a path fails the exists() check below -- doctor
-    // would report a healthy entry as missing. Under-reporting is the safe
-    // direction here (isOamLaunch takes the same position), so bail instead.
-    if (/["']/.test(payload)) return null;
-    const tokens = payload.trim().split(/\s+/);
-    if (tokens[0] === undefined || !isOamCommand(tokens[0])) return null;
-    return { oam: tokens[0], rest: tokens.slice(1) };
-  }
-
-  if (POWERSHELL.test(base)) {
-    // PowerShell's `-Command` takes the REST of the line rather than one
-    // argument, so powershellPayload rejoins the tail before this tokenises it.
-    // A launch with no `-Command` (-File, -EncodedCommand, a bare script) is
-    // not the shape install writes and comes back null.
-    const payload = powershellPayload(args);
-    if (payload === null) return null;
-    // Same bail as the POSIX branch, and it matters more here: a caller that
-    // mis-extracts a token gets a path that does not exist, which reads as a
-    // BROKEN entry -- and the heal pass rewrites those. Refusing to guess is
-    // what keeps a working pwsh entry from being repaired out from under
-    // someone.
-    if (/["']/.test(payload)) return null;
-    const tokens = payload.trim().split(/\s+/);
-    if (tokens[0] === undefined || !isOamCommand(tokens[0])) return null;
-    return { oam: tokens[0], rest: tokens.slice(1) };
-  }
-
-  return null;
-}
+// The wrapper unwrap that used to live here (oamArgvTokens) is oam-spawn.ts's
+// unwrapOamLaunch now: one tokenizer for isOamLaunch -- which sets
+// `launchRuntime === "oam"` -- and for the entry scan below, so a wrapper
+// shape one accepts cannot be one the other reads the wrapper's own switches
+// from as an oam path. oamLaunchParts asks for the "refuse" quote rule: a
+// quote anywhere in a shell payload means whitespace tokenising can cut a
+// path in half, half a path fails the exists() check -- doctor would report a
+// healthy entry as missing -- and the heal pass REWRITES an entry that reads
+// as broken. Refusing to guess is what keeps a working `pwsh -Command` entry
+// from being repaired out from under someone.
 
 /** True when a launch command is an absolute path for ANOTHER operating
  *  system -- today, a drive-letter path (`C:\...\oam.exe`) seen by a doctor
@@ -4227,7 +4288,7 @@ export function oamRunEntryPath(command: string, args: readonly string[]): strin
  * about the binary or the entry that will really be launched.
  */
 export function oamLaunchParts(command: string, args: readonly string[]): { oam: string; entry: string | null } | null {
-  const unwrapped = oamArgvTokens(command, args);
+  const unwrapped = unwrapOamLaunch(command, args, "refuse");
   return unwrapped === null ? null : { oam: unwrapped.oam, entry: oamRunEntryFromTokens(unwrapped.rest) };
 }
 
@@ -4321,7 +4382,7 @@ function classifyProbe(
   platform: NodeJS.Platform,
 ): ProbeClassification {
   return JSON_PROBE_FORMATS.has(read.site.format)
-    ? classifyProbeContent(raw, read.site, read.site.format === "json", exists, platform)
+    ? classifyProbeContent(raw, read.site, read.site.format === "json", read.transform, exists, platform)
     : classifyProbeViaAdapter(raw, read.site, read.transform, read.rootDefaults, exists, platform);
 }
 
@@ -4355,7 +4416,10 @@ function classifyProbeViaAdapter(
   platform: NodeJS.Platform,
 ): ProbeClassification {
   const view = classifyClientConfig(raw, site, { transform });
-  return { ...classifyAdapterView(view, exists, platform), rootDefaults: probeRootDefaults(view, rootDefaults) };
+  return {
+    ...classifyAdapterView(view, transform, exists, platform),
+    rootDefaults: probeRootDefaults(view, rootDefaults),
+  };
 }
 
 /** Everything classifyProbeViaAdapter reports but the top-level defaults:
@@ -4363,6 +4427,7 @@ function classifyProbeViaAdapter(
  *  entry, and the launch checks on that entry. */
 function classifyAdapterView(
   view: ClientConfigView,
+  transform: EntryTransform | undefined,
   exists: (p: string) => boolean,
   platform: NodeJS.Platform,
 ): ProbeClassification {
@@ -4421,9 +4486,11 @@ function classifyAdapterView(
       };
       if (entry === undefined) return base;
       try {
-        // The RAW stored value, not EntryView.launch: the launch checks read
-        // `command`/`args` off the stored entry exactly as the JSON walk does.
-        return { ...base, ...launchChecks(entry.value, exists, platform) };
+        // The stored value through the row's normalize hook, not
+        // EntryView.launch: the launch checks read `command`/`args` (and tell
+        // a command-less entry from a remote one) off the normalised entry,
+        // exactly as the JSON walk does.
+        return { ...base, ...launchChecks(normalizeEntry(entry.value, transform), exists, platform) };
       } catch (e) {
         return { ...base, unreadable: `launch check failed: ${(e as Error).message}`, unreadableCode: null };
       }
@@ -4449,7 +4516,8 @@ function classifyAdapterView(
  *  the adapter (planRootDefaults' own rule), so a row that declares none runs
  *  as before.
  *
- *  The value is spelled here, once, as install spells it (spellRootValue),
+ *  The value is spelled here, once, by the function install spells it with
+ *  (client-config.ts spellRootValue),
  *  and the by-hand step is decided here from the value's own shape -- the
  *  same scalar test install's loop makes -- because the item carries the
  *  value only as that spelling. */
@@ -4514,53 +4582,48 @@ function probeRootDefaults(
   return out;
 }
 
-/** A value the USER's file holds for a top-level key, as the probe's item
- *  (and so every doctor line) spells it: a scalar as itself, anything else by
- *  its shape, never echoed (it is the user's, and it can be any size).
+/** cmd.exe's default PATHEXT, lowercased: the suffixes Windows tries on an
+ *  extensionless launch path. A fixed list rather than process.env.PATHEXT --
+ *  the client's environment, not doctor's, is what resolves the launch. */
+const WIN_PATHEXT = [".com", ".exe", ".bat", ".cmd"];
+
+/** The keys a client config spells a REMOTE server's endpoint with (`url`
+ *  everywhere; Gemini CLI also `httpUrl`, Windsurf `serverUrl`). An "mcp"
+ *  entry carrying one as a string is something its client connects to rather
+ *  than spawns, so the absence of a `command` on it is not a launch fault
+ *  (see ClientProbeResult.launchNoCommand). */
+const REMOTE_ENTRY_URL_KEYS = ["url", "httpUrl", "serverUrl"];
+
+/** The launch checks for one entry value: what runtime it launches on and
+ *  whether its command (or the oam it wraps, and that oam's entry file) can
+ *  start at all. Every launch field is null when `entry` is not an object
+ *  with a string `command`, and `launchNoCommand` then says whether that
+ *  leaves the client nothing to start. Shared by the JSON walk and the
+ *  adapter path, so a TOML entry is checked by the same rules as a JSON one.
  *
- *  A deliberate twin of install-cmd.ts's spellRootValue, which spells the
- *  same value in install's note, warning and refusal: doctor cannot import
- *  install-cmd.ts, which imports this module. The doctor tests hold the two
- *  to one spelling by running install over the same file. */
-function spellRootValue(value: unknown, syntax: SyntaxName): string {
-  if (typeof value === "string") return JSON.stringify(value);
-  if (typeof value === "number" || typeof value === "bigint" || typeof value === "boolean") return String(value);
-  if (value instanceof Date) return value.toISOString();
-  return Array.isArray(value) ? describeValueShape(value) : containerNounFor(syntax);
-}
-
-/** Where a top-level line goes when the user adds it by hand. In TOML a
- *  `key = value` line after a `[table]` header is a key OF that table, so "at
- *  the top level" is not enough of an instruction there -- the end of the
- *  file is usually inside the last table. A twin of install-cmd.ts's
- *  rootLinePlacement, for the reason spellRootValue gives. */
-function rootLinePlacement(syntax: SyntaxName): string {
-  return syntax === "TOML" ? "above the first table in the file" : "at the top level of the file";
-}
-
-/** The launch checks for one stored entry value: what runtime it launches on
- *  and whether its command (or the oam it wraps, and that oam's entry file)
- *  can start at all. All-null when `entry` is not an object with a string
- *  `command`. Shared by the JSON walk and the adapter path, so a TOML entry is
- *  checked by the same rules as a JSON one.
+ *  `entry` is the stored value AFTER the row's normalize transform (both
+ *  callers pass `normalizeEntry(stored, transform)`), which is the view the
+ *  heal sweep reads its launch from -- so a Cline entry in its nested
+ *  `{ transport: { command, args } }` spelling is checked here, not passed
+ *  over as command-less.
  *
  *  `platform` picks the path semantics for every check (see
  *  ProbeOptions.platform): node:path's bare `isAbsolute` is bound to the
  *  running platform, and with it the foreign-path branches could only ever
  *  execute on a POSIX runner and the native-drive-letter one only on win32
  *  -- so on a Windows-only maintainer box the WSL wiring here never ran. */
-/** cmd.exe's default PATHEXT, lowercased: the suffixes Windows tries on an
- *  extensionless launch path. A fixed list rather than process.env.PATHEXT --
- *  the client's environment, not doctor's, is what resolves the launch. */
-const WIN_PATHEXT = [".com", ".exe", ".bat", ".cmd"];
-
 function launchChecks(
   entry: unknown,
   exists: (p: string) => boolean,
   platform: NodeJS.Platform,
 ): Pick<
   ProbeClassification,
-  "launchCommandMissing" | "launchRuntime" | "launchOamNotAbsolute" | "launchOamEntryMissing" | "launchForeignPath"
+  | "launchCommandMissing"
+  | "launchRuntime"
+  | "launchOamNotAbsolute"
+  | "launchOamEntryMissing"
+  | "launchForeignPath"
+  | "launchNoCommand"
 > {
   const isAbsolute = platform === "win32" ? win32.isAbsolute : posix.isAbsolute;
   // Whether a launch path resolves to a file. On Windows an extensionless
@@ -4574,13 +4637,33 @@ function launchChecks(
   let launchOamNotAbsolute: string | null = null;
   let launchOamEntryMissing: string | null = null;
   let launchForeignPath: string | null = null;
+  // True until a string `command` (something to spawn) or a string endpoint
+  // key (something to connect to) is found on the entry. `{}`, `null`, a
+  // scalar and `{ "args": [...] }` all leave it set.
+  let launchNoCommand = true;
   if (typeof entry === "object" && entry !== null && !Array.isArray(entry)) {
     const command = (entry as { command?: unknown }).command;
+    if (REMOTE_ENTRY_URL_KEYS.some((k) => typeof (entry as Record<string, unknown>)[k] === "string")) {
+      launchNoCommand = false;
+    }
+    // `command: { path, args }` is the spelling Zed's context_servers took
+    // before it accepted the flat one, and an older Zed still starts it. No
+    // row's normalize hook folds it flat, so none of the launch checks below
+    // can read it -- but it is something to start, not an empty entry.
+    if (
+      typeof command === "object" &&
+      command !== null &&
+      !Array.isArray(command) &&
+      typeof (command as { path?: unknown }).path === "string"
+    ) {
+      launchNoCommand = false;
+    }
     if (typeof command === "string") {
+      launchNoCommand = false;
       const entryArgs = (entry as { args?: unknown }).args;
       // FILTERED to strings, not cast to them. A hand-edited config whose
       // args carry a number or a null parses fine, but every consumer below
-      // (isOamLaunch, oamArgvTokens) calls string methods on each token --
+      // (isOamLaunch, unwrapOamLaunch) calls string methods on each token --
       // so the old `as string[]` threw a TypeError into the JSON classifier's
       // outer catch and reported a perfectly parseable file as "exists but JSON is
       // malformed", sending the user to fix a syntax error that isn't there.
@@ -4651,7 +4734,14 @@ function launchChecks(
       }
     }
   }
-  return { launchCommandMissing, launchRuntime, launchOamNotAbsolute, launchOamEntryMissing, launchForeignPath };
+  return {
+    launchCommandMissing,
+    launchRuntime,
+    launchOamNotAbsolute,
+    launchOamEntryMissing,
+    launchForeignPath,
+    launchNoCommand,
+  };
 }
 
 /** The JSON-family classifier: raw JSON or JSONC content for a probe result.
@@ -4673,14 +4763,20 @@ function launchChecks(
  *  and it is what the JSON adapter is asked with when no container is found
  *  (see the blocked-container branch below).
  *
+ *  `transform` is the row's entry transform (ProbeSlot.read). Only its
+ *  `normalize` hook is used, and only on our own entry before the launch
+ *  checks -- the view the heal sweep reads its launch from, so doctor does
+ *  not report OK for a nested-form Cline entry that sweep rewrites.
+ *
  *  `platform` picks the path semantics for the launch checks (see
  *  launchChecks and ProbeOptions.platform). */
 function classifyProbeContent(
   raw: string,
   site: ConfigSite,
   strict: boolean,
-  exists: (p: string) => boolean = existsSync,
-  platform: NodeJS.Platform = process.platform,
+  transform: EntryTransform | undefined,
+  exists: (p: string) => boolean,
+  platform: NodeJS.Platform,
 ): ProbeClassification {
   const containerPath = site.resolved.containerPath;
   if (raw.trim().length === 0) {
@@ -4788,10 +4884,17 @@ function classifyProbeContent(
       // one only on a format whose adapter does (ConfigShape.rootDefaults).
       rootDefaults: [],
     };
+    // No entry, nothing to check: launchChecks would call an absent value
+    // command-less.
+    if (!(ENTRY_NAME in container)) return base;
     // launchChecks filters args to strings, which was the one throw seen
     // here. Any other is reported exactly as the adapter path reports its own.
+    //
+    // On the NORMALISED value (the row's transform, as the adapter path and
+    // the heal sweep read it), inside the try: the row's normalize hook runs
+    // on a hand-edited value here too.
     try {
-      return { ...base, ...launchChecks(container[ENTRY_NAME], exists, platform) };
+      return { ...base, ...launchChecks(normalizeEntry(container[ENTRY_NAME], transform), exists, platform) };
     } catch (e) {
       return { ...base, unreadable: `launch check failed: ${(e as Error).message}`, unreadableCode: null };
     }
@@ -5017,7 +5120,8 @@ function shellHistorySources(opts: { home: string; env: NodeJS.ProcessEnv }): Sh
  *
  *  The whole-file read this replaces made the "without loading massive
  *  archives into memory" claim above false: it allocated the entire file PLUS
- *  a line array for every one of the three sources on every doctor run, and on
+ *  a line array for each history source on every scan (a doctor run, and the
+ *  broker's own shadow scan in server.ts), and on
  *  a multi-hundred-MB history readFileSync throws ERR_STRING_TOO_LONG -- which
  *  the catch swallowed, so the SHADOWED CLI section silently disappeared with
  *  no diagnostic. Any I/O error still yields [] (purely diagnostic section).

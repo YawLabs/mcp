@@ -1220,6 +1220,60 @@ describe("routeToolCall — request options", () => {
     }
   });
 
+  it("bounds resources/read and prompts/get with the same ceiling, and forwards a cancel signal", async () => {
+    // Both went out with NO options: the SDK's fixed 60s whatever
+    // MCP_CALL_TIMEOUT said, and no signal, so a downstream cancel left the
+    // upstream request running. The second argument is the options slot for
+    // these two methods (they take no result schema, unlike callTool).
+    const reads: unknown[][] = [];
+    const db = makeConnection("db", [], ["db://tables"]);
+    (db as any).client = {
+      readResource: async (...a: unknown[]) => {
+        reads.push(a);
+        return { contents: [] };
+      },
+    };
+    const dbConnections = new Map([["db", db]]);
+    const abort = new AbortController();
+    await routeResourceRead("connect://db/db://tables", buildResourceRoutes(dbConnections), dbConnections);
+    await routeResourceRead("connect://db/db://tables", buildResourceRoutes(dbConnections), dbConnections, undefined, {
+      signal: abort.signal,
+    });
+    expect(reads.map((a) => a[1])).toEqual([{ timeout: 60_000 }, { timeout: 60_000, signal: abort.signal }]);
+
+    const gets: unknown[][] = [];
+    const gh = makeConnection("gh", [], [], ["review_pr"]);
+    (gh as any).client = {
+      getPrompt: async (...a: unknown[]) => {
+        gets.push(a);
+        return { messages: [] };
+      },
+    };
+    const ghConnections = new Map([["gh", gh]]);
+    await routePromptGet("gh_review_pr", undefined, buildPromptRoutes(ghConnections), ghConnections);
+    await routePromptGet("gh_review_pr", undefined, buildPromptRoutes(ghConnections), ghConnections, {
+      signal: abort.signal,
+    });
+    expect(gets.map((a) => a[1])).toEqual([{ timeout: 60_000 }, { timeout: 60_000, signal: abort.signal }]);
+
+    // ...and the ceiling follows the knob, like tools/call.
+    try {
+      vi.stubEnv("MCP_CALL_TIMEOUT", "5000");
+      vi.resetModules();
+      const fresh = await import("../proxy.js");
+      reads.length = 0;
+      await fresh.routeResourceRead(
+        "connect://db/db://tables",
+        fresh.buildResourceRoutes(dbConnections),
+        dbConnections,
+      );
+      expect(reads[0][1]).toEqual({ timeout: 5000 });
+    } finally {
+      vi.unstubAllEnvs();
+      vi.resetModules();
+    }
+  });
+
   // The two fields below used to stop at routeToolCall's parameter list. The
   // CallToolRequest handler holds the client's abort signal and its progress
   // token, but the call was `routeToolCall(name, args, routes, connections)`

@@ -214,6 +214,15 @@ export async function loadVault(path: string, opts?: LoadVaultOptions): Promise<
   if (obj.version !== undefined && typeof obj.version !== "number") {
     throw new Error(`vault at ${path} is corrupt: "version" must be a number`);
   }
+  // Two-sided, like the trust store's check (trust.ts readTrustStore): 0, a
+  // negative or a fraction names a schema that has never existed, so the file
+  // is corrupt rather than old. Letting those through read `"version": 0`
+  // under the legacy rules (an unbound decrypt allowed) on the strength of a
+  // field that says it is not v1, and setSecret then wrote the bogus number
+  // back.
+  if (typeof obj.version === "number" && (!Number.isInteger(obj.version) || obj.version < 1)) {
+    throw new Error(`vault at ${path} is corrupt: invalid "version" (${obj.version})`);
+  }
   if (typeof obj.version === "number" && obj.version > SECRETS_SCHEMA_VERSION) {
     throw new Error(
       `vault at ${path} was written by a newer yaw-mcp (schema version ${obj.version} > ${SECRETS_SCHEMA_VERSION}); upgrade yaw-mcp to read it`,
@@ -966,15 +975,6 @@ const SECRET_REF_OPENER = "${secret:";
  *  in the vault" without inspecting the rest of the string. */
 export const MALFORMED_REF_MARKER = "<malformed ref>";
 
-/** Upper bound on how much of a malformed span `display` can quote, pinned
- *  by the tests (meta-tools.test.ts relies on it too). An unterminated
- *  reference runs to the end of the env value, which is unbounded. The
- *  actual cut (describeMalformedSecretRef) is the opener plus
- *  MALFORMED_REF_NAME_CHARS + 1 code points -- 26 characters at most, well
- *  inside this -- so this is the contract a consumer may rely on, not the
- *  mechanism; nothing slices to it. */
-export const MALFORMED_REF_MAX_CHARS = 40;
-
 /** A `${secret:...}` span SECRET_REF_RE could not parse, reduced to the two
  *  bounded forms the callers need. The raw span is deliberately NOT a field:
  *  it is a slice of an env VALUE, not a name, and can carry whatever followed
@@ -986,8 +986,8 @@ export interface MalformedSecretRef {
    *  the typo itself -- with control characters stripped and a `...`
    *  appended whenever anything followed that character. Quotes the typo so
    *  the user can find it in their config, and never more: past that point
-   *  is env-value text that may be a credential. Always shorter than
-   *  MALFORMED_REF_MAX_CHARS of span text. */
+   *  is env-value text that may be a credential. Never more than
+   *  MALFORMED_REF_MAX_CHARS of span text (the `...` not counted). */
   display: string;
   /** For the audit trail, whose `secret` field is a names-only contract:
    *  MALFORMED_REF_MARKER plus the longest prefix of the span's body that IS
@@ -1011,6 +1011,17 @@ const SECRET_NAME_PREFIX_RE = new RegExp(`^${SECRET_NAME_CLASS}`);
  *  is enough to recognise which reference is meant and too few to be the
  *  credential. */
 const MALFORMED_REF_NAME_CHARS = 16;
+
+/** Upper bound, in UTF-16 units (what `.length` counts), on how much of a
+ *  malformed span `display` can quote. An unterminated reference runs to the
+ *  end of the env value, which is unbounded; describeMalformedSecretRef cuts
+ *  it to the opener, at most MALFORMED_REF_NAME_CHARS of name (ASCII, one
+ *  unit each) and ONE further code point (up to two units). DERIVED from
+ *  those, so it is the figure the cut really produces rather than a looser
+ *  number beside it; nothing slices to it. Production code does not read it:
+ *  it is exported for the tests that pin the bound (secrets-vault.test.ts,
+ *  meta-tools.test.ts). */
+export const MALFORMED_REF_MAX_CHARS = SECRET_REF_OPENER.length + MALFORMED_REF_NAME_CHARS + 2;
 
 function describeMalformedSecretRef(span: string): MalformedSecretRef {
   // Control characters dropped rather than escaped: this string is headed

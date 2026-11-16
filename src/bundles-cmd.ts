@@ -42,11 +42,13 @@
 
 import {
   type BundleMatchResult,
+  type BundleMissingSplit,
   bundleActivateHint,
   CURATED_BUNDLES,
   type CuratedBundle,
   comparePartialBundles,
   matchBundles,
+  splitBundleMissing,
 } from "./bundles.js";
 import { isAllowed, isReadOnlyDiagnostics, loadYawMcpConfig } from "./config-loader.js";
 import { loadLocalBundles } from "./local-bundles.js";
@@ -191,7 +193,17 @@ export async function runBundlesCommand(opts: BundlesCommandOptions = {}): Promi
   // hard-refuses -- the one thing this command exists to get right.
   const installed = enabled.filter((ns) => isAllowed(config, ns));
   const excluded = enabled.filter((ns) => !isAllowed(config, ns));
-  const match = matchBundles(installed);
+  const matched = matchBundles(installed);
+  // `missing` is measured against what can load NOW, so it also holds members
+  // that are already in bundles.json: disabled ("isActive": false) or kept
+  // out by the profile. Split it by remedy with the same function the
+  // LLM-facing mcp_connect_bundles uses. `missing` itself is unchanged (a
+  // --json consumer reads it); the three lists are additive and partition it.
+  const configured = loaded.config?.servers ?? [];
+  const match: MatchWithSplit = {
+    ready: matched.ready,
+    partial: matched.partial.map((entry) => ({ ...entry, ...splitBundleMissing(entry.missing, configured) })),
+  };
 
   if (opts.json) {
     print(JSON.stringify({ installed, excluded, ...match }, null, 2));
@@ -226,8 +238,15 @@ function renderList(print: (s?: string) => void): void {
   }
 }
 
+/** matchBundles' result with each partial entry's `missing` also split by
+ *  remedy (splitBundleMissing). */
+interface MatchWithSplit {
+  ready: BundleMatchResult["ready"];
+  partial: Array<BundleMatchResult["partial"][number] & BundleMissingSplit>;
+}
+
 function renderMatch(
-  match: BundleMatchResult,
+  match: MatchWithSplit,
   installed: string[],
   excluded: string[],
   print: (s?: string) => void,
@@ -270,9 +289,15 @@ function renderMatch(
     const sorted = match.partial.slice().sort(comparePartialBundles);
     print("Partially installed (install more to complete):");
     for (const entry of sorted) {
-      const have = entry.have.join(", ");
-      const missing = entry.missing.join(", ");
-      print(`  ${entry.bundle.id.padEnd(18)} have: ${have}; missing: ${missing}`);
+      // One segment per REMEDY, only the non-empty ones: "missing" is a
+      // server to `yaw-mcp add`, "disabled" one to `yaw-mcp enable`, and
+      // "blocked" one the config.json profile keeps out. Printing all three
+      // as "missing" sent the user to install a server they already have.
+      const parts = [`have: ${entry.have.join(", ")}`];
+      if (entry.notInstalled.length > 0) parts.push(`missing: ${entry.notInstalled.join(", ")}`);
+      if (entry.disabled.length > 0) parts.push(`disabled: ${entry.disabled.join(", ")}`);
+      if (entry.blocked.length > 0) parts.push(`blocked by profile: ${entry.blocked.join(", ")}`);
+      print(`  ${entry.bundle.id.padEnd(18)} ${parts.join("; ")}`);
     }
     print("");
   }

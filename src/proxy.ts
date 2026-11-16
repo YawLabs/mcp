@@ -535,11 +535,22 @@ export function buildPromptRoutes(
   return routes;
 }
 
+/** What a proxied resources/read or prompts/get takes from the DOWNSTREAM
+ *  request: its abort signal, so a client cancel reaches the upstream instead
+ *  of leaving the request running to its timeout. Both calls run under
+ *  callTimeout() (MCP_CALL_TIMEOUT, the tools/call knob) whether or not a
+ *  signal is supplied -- the default is the same 60s the SDK applies when
+ *  given no options, so only an operator who set the knob sees a difference. */
+export interface RouteReadOptions {
+  signal?: AbortSignal;
+}
+
 export async function routeResourceRead(
   uri: string,
   resourceRoutes: Map<string, ResourceRoute>,
   activeConnections: Map<string, UpstreamConnection>,
   builtins?: Map<string, BuiltinResource>,
+  options?: RouteReadOptions,
 ): Promise<ResourceContents> {
   // Builtin resources are served directly by yaw-mcp and never route to an
   // upstream — check them first. A builtin's URI intentionally SHADOWS
@@ -583,7 +594,10 @@ export async function routeResourceRead(
   }
 
   try {
-    const result = (await connection.client.readResource({ uri: route.originalUri })) as ResourceContents;
+    const result = (await connection.client.readResource(
+      { uri: route.originalUri },
+      { timeout: callTimeout(), signal: options?.signal },
+    )) as ResourceContents;
     // Re-namespace every uri on the way out. resources/list, the route table
     // and this function's own error arms all speak the `connect://<ns>/<uri>`
     // form, so returning the upstream's raw uri handed the client back a
@@ -610,6 +624,7 @@ export async function routePromptGet(
   args: Record<string, string> | undefined,
   promptRoutes: Map<string, PromptRoute>,
   activeConnections: Map<string, UpstreamConnection>,
+  options?: RouteReadOptions,
 ): Promise<{ messages: Array<{ role: string; content: { type: string; text: string } }> }> {
   const route = promptRoutes.get(name);
   if (!route) {
@@ -624,7 +639,10 @@ export async function routePromptGet(
   }
 
   try {
-    const result = await connection.client.getPrompt({ name: route.originalName, arguments: args });
+    const result = await connection.client.getPrompt(
+      { name: route.originalName, arguments: args },
+      { timeout: callTimeout(), signal: options?.signal },
+    );
     return result as { messages: Array<{ role: string; content: { type: string; text: string } }> };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

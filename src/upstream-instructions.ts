@@ -4,10 +4,17 @@
 // WHY THIS EXISTS: the MCP initialize response carries an optional
 // `instructions` string -- free-text guidance a server writes about how to use
 // its own tools. A client connected to that server directly receives it in the
-// handshake. yaw-mcp fronts the server, and forwards it nowhere: nothing in
-// this codebase reads the field (the SDK's getInstructions() had no caller
-// before this module), so the broker structurally swallows the one thing the
-// upstream wanted to say about itself, and the model then guesses.
+// handshake. yaw-mcp fronts the server, and before this module it forwarded
+// the field nowhere: nothing in the codebase read it (the SDK's
+// getInstructions() had no caller), so the broker structurally swallowed the
+// one thing the upstream wanted to say about itself, and the model then
+// guessed.
+//
+// It is LIVE now, through two call sites. upstream.ts captures the field on
+// every successful connect -- sanitizeUpstreamInstructions(
+// client.getInstructions()), stored on the connection as `instructions` --
+// and server.ts renders it with fenceUpstreamInstructions, skipping a
+// namespace already recorded in its instructionsShown set.
 //
 // WHY IT IS DANGEROUS: it is attacker-controlled text, from a third party, on
 // a path that ends in an LLM context. The threat model here is prompt

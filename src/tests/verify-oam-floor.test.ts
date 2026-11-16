@@ -27,7 +27,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { pathToFileURL } from "node:url";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
+import { isMainModule as depsIsMainModule } from "../../scripts/check-installed-deps.mjs";
 import {
   BLOCK_HEAD,
   compareVersions,
@@ -490,6 +491,27 @@ process.stdin.resume();
       'tools/list answered ["other"], not the probe\'s ["ping"]',
     );
   });
+
+  it.each([
+    "2025-11-25",
+    "2026-07-28",
+  ])("hands the %s child this process's whole environment, so both eras fail or pass on the same one", async (era) => {
+    // The 2025 path spawns through the SDK transport, which without an `env`
+    // passes only a short default list: a variable outside it (an oam heap
+    // cap, NODE_OPTIONS) reached the 2026 child and not the 2025 one. The
+    // child reports what it saw on stderr and exits, and the probe's
+    // rejection carries that tail.
+    const name = "VERIFY_OAM_FLOOR_TEST_MARK";
+    const src = `process.stderr.write("SEEN=" + (process.env.${name} ?? "unset") + "\\n"); process.exit(3);`;
+    vi.stubEnv(name, "inherited");
+    try {
+      await expect(
+        probeHosting({ command: process.execPath, args: ["-e", src], timeoutMs: 10_000, era }),
+      ).rejects.toThrow("SEEN=inherited");
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
 });
 
 /** Drive verifyOamFloor over an in-memory repo. Returns the lines it printed,
@@ -799,6 +821,9 @@ describe("verify-oam-floor as a script", () => {
       expect(isMainModule(viaLink, pathToFileURL(script).href)).toBe(true);
       expect(isMainModule(undefined, pathToFileURL(script).href)).toBe(false);
       expect(isMainModule(join(REPO_ROOT, "package.json"), pathToFileURL(script).href)).toBe(false);
+      // ONE implementation: check-installed-deps.mjs runs the same function,
+      // so a fix to the link handling cannot reach one script and miss another.
+      expect(depsIsMainModule).toBe(isMainModule);
       const r = spawnSync(process.execPath, [viaLink, "--nope"], {
         cwd: root,
         encoding: "utf8",

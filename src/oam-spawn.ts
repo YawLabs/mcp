@@ -112,6 +112,7 @@ import { accessSync, constants, existsSync, readdirSync, readFileSync, statSync 
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { killAndDetach } from "./bounded-child.js";
 import { CURRENT_OS, type InstallOS } from "./install-targets.js";
 import { stripInternalSecretsFromEnv } from "./internal-secret-env.js";
 import { log } from "./logger.js";
@@ -574,9 +575,16 @@ export interface OamProbe {
   /**
    * The same binary as an ABSOLUTE path, or null when it could not be located.
    *
-   * `bin` is what to SPAWN -- a bare name is correct there, because this
-   * process already resolved it against its own PATH by successfully running
-   * it. That holds for a child spawned with this process's PATH, which is
+   * `bin` is what to SPAWN -- a bare name, left for the OS to look up at
+   * spawn time. What stands behind it is weaker than "this process ran it":
+   * on a verdict-cache hit (readOamVerdict) `--version` is not run in this
+   * process at all, and the answer rests on resolveBinAbsolute's PATH x
+   * PATHEXT walk plus a stat of the file it found. That walk is not the OS
+   * loader's search (for a bare name Windows also looks in the application
+   * directory and the cwd), so the file a spawn of the bare name starts can
+   * differ from the one the build-tree gate and the cached version describe.
+   * Even the uncached case holds only for a child spawned with this process's
+   * PATH, which is
    * every server but one kind: upstream.ts spawns with the server's own `env`
    * merged OVER the broker's, so an entry that sets PATH has the bare name
    * looked up again on ITS path -- not found there (the launch fails and the
@@ -1148,28 +1156,20 @@ function spawnVersionProbe(bin: string): Promise<string> {
 
     timer = setTimeout(() => {
       settle(() => {
-        // Best-effort. A D-state child ignores this, which is exactly why the
-        // promise is settled independently rather than waiting on the kill.
-        try {
-          child.kill(OAM_PROBE_KILL_SIGNAL);
-        } catch {
-          /* already gone */
-        }
-        // DETACH, do not merely kill. A live child with a piped stdout keeps
-        // the PARENT's event loop alive -- verified: a parent with an unkilled
-        // child and nothing else pending was still running after 6s. So when
-        // the kill above does not take effect (the D-state case this whole
-        // probe exists for, or a grandchild inheriting the pipe), settling the
-        // promise unblocks the connect path but the broker can then never
-        // exit. Trading a connect-path hang for a shutdown hang is not a fix.
-        // unref drops the child from the loop's handle count; destroying stdout
-        // releases the pipe the grandchild case would otherwise hold open.
-        try {
-          child.stdout?.destroy();
-          child.unref();
-        } catch {
-          /* already gone */
-        }
+        // Kill, best-effort -- a D-state child ignores it, which is exactly
+        // why the promise is settled independently rather than waiting on the
+        // kill -- and then DETACH, do not merely kill. A live child with a
+        // piped stdout keeps the PARENT's event loop alive -- verified: a
+        // parent with an unkilled child and nothing else pending was still
+        // running after 6s. So when the kill does not take effect (the
+        // D-state case this whole probe exists for, or a grandchild
+        // inheriting the pipe), settling the promise unblocks the connect
+        // path but the broker can then never exit. Trading a connect-path
+        // hang for a shutdown hang is not a fix. unref drops the child from
+        // the loop's handle count; destroying stdout releases the pipe the
+        // grandchild case would otherwise hold open. The steps are
+        // bounded-child.ts's killAndDetach, shared with uv-bootstrap.ts.
+        killAndDetach(child, OAM_PROBE_KILL_SIGNAL);
         const err = new Error(`oam --version exceeded ${OAM_PROBE_TIMEOUT_MS}ms`) as Error & { code?: string };
         err.code = "ETIMEDOUT";
         reject(err);
@@ -1395,9 +1395,10 @@ async function probeOamUncached(run: (bin: string) => Promise<string>, generatio
     }
     return publish({
       bin,
-      // Resolved once (absResolved, above), alongside the probe that proved the
-      // name spawns, so the install path never has to re-derive it (or spawn
-      // `where`/`which`).
+      // Resolved once (absResolved, above), alongside the probe, so the install
+      // path never has to re-derive it (or spawn `where`/`which`). The probe
+      // ran the bare name only on a verdict-cache miss; on a hit nothing was
+      // spawned here and this path is the whole evidence (see OamProbe.bin).
       binPath: absResolved,
       version,
       belowMin: false,
@@ -1849,11 +1850,12 @@ export function rewriteForOam(
     // the oam launch and the npx fallback handed the child different
     // arguments -- the one thing this rewrite promises never to do. The scan
     // itself lives in npxSpecIndex so sidecars-cmd's two collectors cannot
-    // drift from it.
-    const specIdx = npxSpecIndex(args);
-    const spec = specIdx === -1 ? undefined : args[specIdx];
-    if (!spec) return { command, args };
-    if (spec.startsWith("-")) {
+    // drift from it, and the gate sequence built on it lives in
+    // classifyNpxLaunch so neither the managed rewrite below nor doctor's
+    // report can drift from this one.
+    const launch = classifyNpxLaunch(args);
+    if (launch.kind === "no-spec") return { command, args };
+    if (launch.kind === "flag-spec") {
       // The flag and the argv LENGTH, never the argv itself: everything after
       // the flag belongs to the server, and a server's args are where a token
       // rides (`--token <secret>`). The logger does no redaction, and
@@ -1861,33 +1863,28 @@ export function rewriteForOam(
       // sending the client's log files over -- this was the one line in the
       // broker that copied a server's whole command line into them.
       log("debug", "npx launch carries flags yaw-mcp does not parse; staying on npx instead of oam", {
-        flag: spec,
+        flag: launch.flag,
         argc: args.length,
       });
       return { command, args };
     }
-    // A git or path spec (`github:owner/repo`, `./local-server`) is not a
-    // package NAME, and resolveNpmEntry would look it up as one -- path.join
-    // collapses the "." so `./local-server` becomes a top-level `local-server`,
-    // i.e. a different program than the directory the config points at. See
-    // isRegistrySpec.
-    if (!isRegistrySpec(spec)) {
-      log("debug", "npx spec is a git/path target, not a registry package; staying on npx instead of oam", { spec });
-      return { command, args };
-    }
-    const pkg = packageName(spec);
-    // What the spec asks for version-wise. `oam run <entry>` runs whatever sits
-    // at that path, so anything the resolver cannot prove has to keep npx --
-    // npx re-resolves the spec against the registry and therefore honours it.
-    const constraint = specConstraint(spec);
-    if (constraint.kind === "range") {
-      log("debug", "npx spec constrains the version with a range yaw-mcp cannot evaluate; staying on npx", {
-        package: pkg,
-        range: constraint.raw,
+    if (launch.kind === "non-registry-spec") {
+      log("debug", "npx spec is a git/path target, not a registry package; staying on npx instead of oam", {
+        spec: launch.spec,
       });
       return { command, args };
     }
-    const wantVersion = constraint.kind === "exact" ? constraint.version : null;
+    // What the spec asks for version-wise. `oam run <entry>` runs whatever sits
+    // at that path, so anything the resolver cannot prove has to keep npx --
+    // npx re-resolves the spec against the registry and therefore honours it.
+    if (launch.kind === "version-range") {
+      log("debug", "npx spec constrains the version with a range yaw-mcp cannot evaluate; staying on npx", {
+        package: launch.pkg,
+        range: launch.range,
+      });
+      return { command, args };
+    }
+    const { pkg, wantVersion } = launch;
     const entry = deps.resolveEntry(pkg, wantVersion);
     if (!entry) {
       // oam run needs a real on-disk entry; it can't reproduce npx's
@@ -1908,10 +1905,60 @@ export function rewriteForOam(
       }
       return { command, args };
     }
-    return toOam(entry, args.slice(specIdx + 1));
+    return toOam(entry, launch.rest);
   }
 
   return { command, args };
+}
+
+/** What an npx launch's argv asks for, as far as the argv alone can say. */
+export type NpxLaunch =
+  /** No package named at all. */
+  | { kind: "no-spec" }
+  /** The first non -y/--yes token is a flag (--package, -p, --node-options...). */
+  | { kind: "flag-spec"; flag: string }
+  /** A git or path target (`github:owner/repo`, `./local-server`). */
+  | { kind: "non-registry-spec"; spec: string }
+  /** A registry package pinned to a version RANGE nothing here can evaluate. */
+  | { kind: "version-range"; pkg: string; range: string }
+  /** A registry package, unpinned or pinned exactly: the one shape a rewrite
+   *  may replace with an on-disk entry. `rest` is the server's own argv tail,
+   *  sliced after the spec and never filtered. */
+  | { kind: "hostable"; pkg: string; wantVersion: string | null; rest: string[] };
+
+/**
+ * The launch-shape gates of an npx argv, in ONE place: npxSpecIndex -> flag
+ * spec -> isRegistrySpec -> specConstraint. Three callers consume it --
+ * rewriteForOam and rewriteNpmToManagedNode here, and describeLaunchShape in
+ * default-runtime.ts (doctor's and `sidecars install`'s report) -- and they
+ * have to agree gate for gate, or a server is reported on one runtime and
+ * spawned on another. They used to each write the sequence out, sharing only
+ * the predicates. Each caller still owns what it does with a refusal (its log
+ * line, or its report code), and the disk lookup that follows "hostable".
+ *
+ * Only -y/--yes are recognized as npx's own flags, and only ahead of the spec
+ * (npxSpecIndex), so any other npx flag lands in the spec slot and is reported
+ * as "flag-spec" rather than parsed.
+ */
+export function classifyNpxLaunch(args: readonly string[]): NpxLaunch {
+  const specIdx = npxSpecIndex(args);
+  const spec = specIdx === -1 ? undefined : args[specIdx];
+  if (!spec) return { kind: "no-spec" };
+  if (spec.startsWith("-")) return { kind: "flag-spec", flag: spec };
+  // A git or path spec is not a package NAME, and resolveNpmEntry would look
+  // it up as one -- path.join collapses the "." so `./local-server` becomes a
+  // top-level `local-server`, a different program than the directory the
+  // config points at. See isRegistrySpec.
+  if (!isRegistrySpec(spec)) return { kind: "non-registry-spec", spec };
+  const pkg = packageName(spec);
+  const constraint = specConstraint(spec);
+  if (constraint.kind === "range") return { kind: "version-range", pkg, range: constraint.raw };
+  return {
+    kind: "hostable",
+    pkg,
+    wantVersion: constraint.kind === "exact" ? constraint.version : null,
+    rest: args.slice(specIdx + 1),
+  };
 }
 
 /**
@@ -1958,9 +2005,9 @@ export interface ManagedRewriteDeps {
  *
  *   npx [-y] <pkg> [...rest]  -> <nodeBin> <resolved entry> [...rest]
  *
- * Refuses exactly what rewriteForOam refuses, through the SAME shared
- * predicates in the same order (npxSpecIndex -> flag spec -> isRegistrySpec
- * -> specConstraint -> resolveEntry null), because sidecars-cmd's collectors
+ * Refuses exactly what rewriteForOam refuses, through the SAME gate sequence
+ * (classifyNpxLaunch: npxSpecIndex -> flag spec -> isRegistrySpec ->
+ * specConstraint; then resolveEntry null), because sidecars-cmd's collectors
  * partition the server set on those answers and a rule that lives in two
  * places can drop a server out of both reports (see collectNonRegistrySpecs).
  * In particular a version RANGE stays on npx: nothing here can evaluate
@@ -1990,39 +2037,37 @@ export function rewriteNpmToManagedNode(
     log("debug", "no node binary located for the managed sidecar spawn; staying on npx", { command });
     return { command, args };
   }
-  const specIdx = npxSpecIndex(args);
-  const spec = specIdx === -1 ? undefined : args[specIdx];
-  if (!spec) return { command, args };
-  if (spec.startsWith("-")) {
+  const launch = classifyNpxLaunch(args);
+  if (launch.kind === "no-spec") return { command, args };
+  if (launch.kind === "flag-spec") {
     // The flag and the argv LENGTH, never the argv: everything after the flag
     // belongs to the server, and a server's args are where a token rides
     // (rewriteForOam's redaction rule, mirrored -- the logger does no
     // redaction and debug logs reach support tickets).
     log("debug", "npx launch carries flags yaw-mcp does not parse; staying on npx instead of the managed tree", {
-      flag: spec,
+      flag: launch.flag,
       argc: args.length,
     });
     return { command, args };
   }
-  if (!isRegistrySpec(spec)) {
+  if (launch.kind === "non-registry-spec") {
     log("debug", "npx spec is a git/path target, not a registry package; staying on npx instead of the managed tree", {
-      spec,
+      spec: launch.spec,
     });
     return { command, args };
   }
-  const constraint = specConstraint(spec);
   // A range needs an evaluator this module deliberately does not carry --
   // see the doc comment. npx re-resolves it and honours it; `node <entry>`
   // runs whatever sits at the path.
-  if (constraint.kind === "range") {
+  if (launch.kind === "version-range") {
     log("debug", "npx spec constrains the version with a range yaw-mcp cannot evaluate; staying on npx", {
-      package: packageName(spec),
-      range: constraint.raw,
+      package: launch.pkg,
+      range: launch.range,
     });
     return { command, args };
   }
-  const wantVersion = constraint.kind === "exact" ? constraint.version : null;
-  const entry = deps.resolveEntry(packageName(spec), wantVersion);
+  const { pkg, wantVersion } = launch;
+  const entry = deps.resolveEntry(pkg, wantVersion);
   if (!entry) {
     // Two reasons, two lines -- same split as rewriteForOam: nothing on disk
     // at all (install it: `yaw-mcp sidecars install`) versus nothing AT THE
@@ -2030,17 +2075,17 @@ export function rewriteNpmToManagedNode(
     // can honour the pin).
     if (wantVersion !== null) {
       log("debug", "no on-disk copy declares the pinned version; staying on npx so the pin is honoured", {
-        package: packageName(spec),
+        package: pkg,
         version: wantVersion,
       });
     } else {
       log("debug", "npx package has no on-disk entry; staying on npx instead of the managed tree", {
-        package: packageName(spec),
+        package: pkg,
       });
     }
     return { command, args };
   }
-  return { command: deps.nodeBin, args: [entry, ...args.slice(specIdx + 1)] };
+  return { command: deps.nodeBin, args: [entry, ...launch.rest] };
 }
 
 /** The path fragment that marks an npm `_npx` cache directory. Derived once:
@@ -2793,6 +2838,11 @@ export async function resolveOamSpawn(
  * Keyed by package name only: the everyday lookup this exists for is the
  * no-pin one, and a pinned lookup is rare enough to stay unmemoized.
  *
+ * A memo hit from an AMBIENT durable copy (outside the managed tree) is
+ * dropped as soon as the managed tree holds the package: the managed tree
+ * outranks it in resolveNpmEntry, so keeping the memo would hide a
+ * `sidecars install` run after the first connect.
+ *
  * A memo hit is only trusted while its file still exists: one existsSync per
  * connect, far cheaper than the walk it replaces. A copy UNINSTALLED while
  * the broker runs drops its entry and re-resolves on the spot -- to another
@@ -2848,8 +2898,22 @@ export function resolveManagedSpawn(
       if (wantVersion !== null) return resolveNpmEntry(pkg, fromUrl, npmCache, managedRoot, wantVersion);
       const memoed = managedEntryMemo.get(pkg);
       if (memoed !== undefined) {
-        if (existsSync(memoed)) return memoed;
-        // The memoized copy was removed: forget it and rescan below.
+        // A memo that points OUTSIDE the managed tree (an ambient durable
+        // copy, e.g. one in the broker's own node_modules) is only the best
+        // answer while the managed tree has no copy of its own: the managed
+        // tree outranks every other source in resolveNpmEntry, and it is the
+        // one `yaw-mcp sidecars install` writes. Without this check a package
+        // first found ambient stayed pinned to that copy for the process
+        // lifetime, hiding a later `sidecars install` exactly as a memoized
+        // miss would have. One more existsSync, and only for an ambient memo.
+        const managedPkgDir = managedRoot === null ? null : join(managedRoot, ...pkg.split("/"));
+        const supersededByManaged =
+          managedPkgDir !== null &&
+          !memoed.startsWith(managedPkgDir + sep) &&
+          existsSync(join(managedPkgDir, "package.json"));
+        if (!supersededByManaged && existsSync(memoed)) return memoed;
+        // The memoized copy was removed, or the managed tree now has the
+        // package: forget it and rescan below.
         managedEntryMemo.delete(pkg);
       }
       const hit = resolveNpmEntry(pkg, fromUrl, npmCache, managedRoot, null);
@@ -2882,56 +2946,114 @@ export function isOamCommand(command: string): boolean {
  * oam is worse than not reporting at all.
  */
 export function isOamLaunch(command: string, args: readonly string[] = []): boolean {
-  if (isOamCommand(command)) return true;
+  return unwrapOamLaunch(command, args, "strip-edge") !== null;
+}
+
+/** What unwrapOamLaunch does with a QUOTE in a shell wrapper's payload (the
+ *  one string a POSIX `-c` or a PowerShell `-Command` carries). The two
+ *  readers want different things, and this parameter is the whole of the
+ *  difference between them:
+ *
+ *    "strip-edge"  one quote is stripped from each end of the FIRST token,
+ *                  and that token alone is judged. For a caller that only
+ *                  asks "is this oam?" (isOamLaunch): `sh -c '"oam" run x'`
+ *                  launches oam.
+ *    "refuse"      a quote anywhere in the payload returns null. For a caller
+ *                  that goes on to read the tokens AFTER the command
+ *                  (doctor's entry-path check, the heal pass): whitespace
+ *                  tokenising can cut a quoted path in half, and half a path
+ *                  reads as a broken entry.
+ *
+ *  So for `sh -c '"oam" run /x/index.js'` isOamLaunch says "launches oam"
+ *  and the entry reader gets null. That disagreement predates this function
+ *  and is kept, not resolved, here; it is now one argument rather than two
+ *  tokenizers. */
+export type ShellQuoteRule = "strip-edge" | "refuse";
+
+/**
+ * The oam a launch entry ultimately runs and the argv it runs it with, with
+ * any shell wrapper peeled off -- or null when this is not an oam launch this
+ * can read. THE wrapper tokenizer: isOamLaunch above is `!== null` on it, and
+ * doctor-cmd.ts's oamLaunchParts reads `rest` off it, so a wrapper shape one
+ * accepts cannot be a shape the other reads the wrapper's own switches from.
+ *
+ * `oam` is the token the client will actually resolve (`"oam"`, `"oam.exe"`,
+ * an absolute path), which inside a wrapper is NOT `command`. `rest` is every
+ * token after it, as whitespace split them (never unquoted).
+ *
+ * cmd and POSIX shells package their payload DIFFERENTLY, and treating them
+ * alike is why the first version of this recognised neither real shape.
+ */
+export function unwrapOamLaunch(
+  command: string,
+  args: readonly string[],
+  quotes: ShellQuoteRule,
+): { oam: string; rest: readonly string[] } | null {
+  if (isOamCommand(command)) return { oam: command, rest: args };
   const base = command.split(/[\\/]/).pop() ?? command;
 
-  // cmd and POSIX shells package their payload DIFFERENTLY, and treating them
-  // alike is why the first version of this recognised neither real shape.
   if (/^cmd(\.exe)?$/i.test(base)) {
     // cmd takes the command as separate argv entries. Skip its own switches:
     // `/d /s /c` is the everyday shape (npm emits it), not just `/c`. The
     // pattern is deliberately "slash + ONE letter" so a POSIX path argument
     // like /usr/local/bin/oam is never mistaken for a switch.
-    const first = args.find((a) => !/^\/[a-z]$/i.test(a));
-    return first !== undefined && isOamCommand(first);
+    const i = args.findIndex((a) => !/^\/[a-z]$/i.test(a));
+    if (i < 0 || !isOamCommand(args[i])) return null;
+    return { oam: args[i], rest: args.slice(i + 1) };
   }
 
   if (POSIX_SHELL.test(base)) {
     // A POSIX shell takes the WHOLE command as one string after -c
     // ("oam run /path/index.js"), so the payload has to be tokenised. Reading
-    // it as a bare command name is what made this return false for every
+    // it as a bare command name is what made this return null for every
     // realistic `sh -c` entry.
     //
     // fish rides in this branch rather than getting one of its own: its `-c`
     // takes a single command string exactly like the Bourne family, and the
     // things that make fish different (its own quoting and expansion rules)
-    // only matter to a parser that tries to UNDERSTAND the payload. This reads
-    // the first whitespace token and nothing more.
+    // only matter to a parser that tries to UNDERSTAND the payload. This
+    // splits on whitespace and nothing more.
     const dashC = args.indexOf("-c");
     const payload = dashC >= 0 ? args[dashC + 1] : args[0];
-    if (payload === undefined) return false;
-    // Strip quotes that do not hide a space. Tokenising on whitespace cannot
-    // recover a quoted path that CONTAINS one, and a display marker does not
-    // justify a shell parser -- such an entry reports "node". Under-reporting
-    // is the safe direction: it never claims oam for something that is not.
-    const firstToken = payload
-      .trim()
-      .split(/\s+/)[0]
-      ?.replace(/^["']|["']$/g, "");
-    return firstToken !== undefined && firstToken.length > 0 && isOamCommand(firstToken);
+    return payload === undefined ? null : shellPayloadTokens(payload, quotes);
   }
 
   if (POWERSHELL.test(base)) {
+    // PowerShell's `-Command` takes the REST of the line rather than one
+    // argument, so powershellPayload rejoins the tail before it is tokenised.
+    // A launch with no `-Command` (-File, -EncodedCommand, a bare script) is
+    // not the shape install writes and comes back null.
     const payload = powershellPayload(args);
-    if (payload === null) return false;
-    const firstToken = payload
-      .trim()
-      .split(/\s+/)[0]
-      ?.replace(/^["']|["']$/g, "");
-    return firstToken !== undefined && firstToken.length > 0 && isOamCommand(firstToken);
+    return payload === null ? null : shellPayloadTokens(payload, quotes);
   }
 
-  return false;
+  return null;
+}
+
+/** One shell command string, split on whitespace, as an oam launch -- or null
+ *  when its first token is not oam, or when the quote rule refuses it. The
+ *  one tokenizer both payload branches of unwrapOamLaunch use.
+ *
+ *  Tokenising on whitespace cannot recover a quoted path that CONTAINS a
+ *  space, and neither a display marker nor a health check justifies a shell
+ *  parser. Under "strip-edge" such an entry reports "node"; under "refuse" it
+ *  is not read at all. Under-reporting is the safe direction both ways: it
+ *  never claims oam, or a missing entry file, for something that is not. */
+function shellPayloadTokens(payload: string, quotes: ShellQuoteRule): { oam: string; rest: readonly string[] } | null {
+  if (quotes === "refuse" && /["']/.test(payload)) return null;
+  const tokens = payload.trim().split(/\s+/);
+  const first = firstShellToken(payload);
+  return isOamCommand(first) ? { oam: first, rest: tokens.slice(1) } : null;
+}
+
+/**
+ * The first whitespace token of a shell command string, with one quote
+ * stripped from each end -- "" when there is none. The rule a command name is
+ * read by under the "strip-edge" quote rule; under "refuse" no payload that
+ * reaches it holds a quote, so the strip is a no-op there.
+ */
+function firstShellToken(payload: string): string {
+  return (payload.trim().split(/\s+/)[0] ?? "").replace(/^["']|["']$/g, "");
 }
 
 /** The shells whose `-c` carries the whole command as ONE string. */

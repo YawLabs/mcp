@@ -263,8 +263,7 @@ export function parseStatusArgs(
 
 /** Rounding denominator for successRate. `succeeded` is an accumulated sum of
  *  floats, so the raw quotient prints as 0.30000000000000004 in JSON; four
- *  decimals is finer than any panel renders and kills the artifact. Same
- *  hazard formatUsageHint rounds away for its "used Nx" line. */
+ *  decimals is finer than any panel renders and kills the artifact. */
 const RATE_PRECISION = 10_000;
 
 function successRateOf(usage: NamespaceUsage | undefined): number | null {

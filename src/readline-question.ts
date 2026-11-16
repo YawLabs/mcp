@@ -106,6 +106,41 @@ export interface YesNoOptions {
   io?: { stdin?: NodeJS.ReadableStream; stdout?: NodeJS.WritableStream; terminal?: boolean };
 }
 
+/** What isInteractivePrompt reads from a command's options: YesNoOptions'
+ *  two fields plus the `isTTY` override the commands carry beside them. */
+export interface InteractiveVerdictOptions {
+  /** Forces the verdict outright -- the commands' test seam. */
+  isTTY?: boolean;
+  promptAnswer?: string;
+  io?: { stdin?: NodeJS.ReadableStream; stdout?: NodeJS.WritableStream };
+}
+
+/** May this command ask a question? THE TTY verdict for every confirmation
+ *  askYesNo asks, in one place: nine command files used to carry a private
+ *  copy (`isInteractive`, `gitInteractive`, `isInteractiveTTY`), and the
+ *  copies had drifted on which streams they judged.
+ *
+ *  `isTTY` forces the verdict. A canned `promptAnswer` never reads anything,
+ *  so nothing needs to be a TTY. Otherwise BOTH ends must be one -- stdin to
+ *  read the answer, stdout to show the question -- and the ends judged are
+ *  the ones the prompt would use: askYesNo asks on `opts.io` when it is
+ *  given, so those streams are read before process.std*. (Most of the old
+ *  copies judged process.std* even then, so a caller that injects plain
+ *  non-TTY streams now gets false unless it also passes `isTTY` or
+ *  `promptAnswer`. The CLI injects no `io` into those commands.)
+ *
+ *  A caller with a rule of its own on top keeps it at the call site: `--json`
+ *  (stdout is the document) is `!opts.json && isInteractivePrompt(opts)`, and
+ *  a caller that must not treat promptAnswer as consent to ask passes the
+ *  fields it does honour instead of its whole options. */
+export function isInteractivePrompt(opts: InteractiveVerdictOptions): boolean {
+  if (opts.isTTY !== undefined) return opts.isTTY;
+  if (opts.promptAnswer !== undefined) return true;
+  const stdin = opts.io?.stdin ?? process.stdin;
+  const stdout = opts.io?.stdout ?? process.stdout;
+  return (stdin as { isTTY?: boolean }).isTTY === true && (stdout as { isTTY?: boolean }).isTTY === true;
+}
+
 /** Reads one answer to `question` for askYesNo. The default is readlineAnswer
  *  below; `trust` passes a reader built on tty-reader.ts's raw-mode one. */
 export type AnswerReader = (

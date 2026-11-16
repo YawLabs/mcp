@@ -87,6 +87,7 @@ import { stripInternalSecretsFromEnv } from "./internal-secret-env.js";
 import { createStreamWriter } from "./logger.js";
 import { compareVersions, MIN_OAM_VERSION, type OamProbe, probeOam } from "./oam-spawn.js";
 import { isTestSandbox } from "./opt-out-env.js";
+import { fetchLatestVersion as fetchRegistryLatest } from "./registry-latest.js";
 
 declare const __VERSION__: string;
 
@@ -364,7 +365,9 @@ export function detectInstallMethod(
 }
 
 /** The path-marker pass behind detectInstallMethod, run once on the literal
- *  argv path and (only when that says `unknown`) once on its realpath. */
+ *  argv path and -- only when that answer is one the caller listed in
+ *  `resolveWhen` (`unknown` for the CLI; `unknown` and `local-node-modules`
+ *  for the background upgrader) -- once on its realpath. */
 function classifyEntrypoint(argvPath: string): InstallMethod {
   const normalized = argvPath.replace(/\\/g, "/");
   // `npx -y @yawlabs/mcp` stages packages under ~/.npm/_npx/<hex>/
@@ -563,8 +566,10 @@ type TreeKillSpawn = (
  *  child.kill() still runs afterwards so the probe's close/error handler
  *  resolves either way.
  *
- *  Exported for tests: npmGlobalPrefix short-circuits under VITEST, so this is
- *  the only reachable surface for the timeout path. */
+ *  Exported for tests, which call it directly with a fake child, platform and
+ *  spawn. npmGlobalPrefix's timeout is the one production caller; a test can
+ *  reach that through an injected ProbeSpawn (which bypasses the test-harness
+ *  short-circuit there), but only by waiting out the real timer. */
 export function killProcessTree(
   child: KillableChild,
   platform: NodeJS.Platform = process.platform,
@@ -876,21 +881,11 @@ export async function fetchLatestVersion(opts: FetchLatestVersionOptions = {}): 
       return null;
     }
   }
-  const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), opts.timeoutMs ?? REGISTRY_FETCH_TIMEOUT_MS);
-  try {
-    const res = await fetch("https://registry.npmjs.org/@yawlabs/mcp/latest", {
-      signal: ac.signal,
-      headers: { accept: "application/json" },
-    });
-    if (!res.ok) return null;
-    const body = (await res.json()) as { version?: unknown };
-    return typeof body.version === "string" ? body.version : null;
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timer);
-  }
+  // The request and its response validation are registry-latest.ts's, shared
+  // with the two per-package probes (doctor's sidecar check, the serve-time
+  // sidecar refresh); what is this function's own is the package, the default
+  // budget and the override above.
+  return fetchRegistryLatest("@yawlabs/mcp", opts.timeoutMs ?? REGISTRY_FETCH_TIMEOUT_MS);
 }
 
 /** probeOam's below-floor branch emits a broker-flavoured JSON warn on stderr
@@ -995,8 +990,10 @@ async function defaultConfirmGlobalPrefix(argvPath: string | undefined, prefix: 
 /** The lock a global-npm `--run` takes in the running install's prefix before
  *  it spawns `npm install -g`. auto-upgrade's acquireUpgradeLock under its
  *  default name, so this command contends with the background self-upgrade
- *  (and with sidecar-refresh, whose lock name deliberately equals it) on the
- *  SAME file: two npm reify passes into one prefix retire and extract the
+ *  on the SAME file. (Not with sidecar-refresh: it takes its own lock in the
+ *  sidecars root, a different directory and so a different file, and nothing
+ *  serializes an `upgrade --run` against a sidecar install.) Two npm reify
+ *  passes into one prefix retire and extract the
  *  same package dir concurrently, and until this lock existed `upgrade --run`
  *  was the one writer of that tree that never took it. Dynamic import for the
  *  same cycle reason as defaultRunningPrefix. Auto-skips under a test harness

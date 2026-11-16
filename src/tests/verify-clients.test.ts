@@ -11,6 +11,7 @@ import {
   sandboxEnv,
 } from "../../scripts/verify-clients.mjs";
 import { CLIENT_ALIASES, clientChoices } from "../client-aliases.js";
+import { CLIENT_ENV_VARS } from "../client-config.js";
 import { INSTALL_TARGETS } from "../install-targets.js";
 
 // The pure half of scripts/verify-clients.mjs, the release gate that installs
@@ -114,5 +115,15 @@ describe("verify-clients: the sandbox environment", () => {
     expect(named(/^npm_/i)).toEqual([]);
     expect(named(/^(claude_config_dir|oam_bin|yaw_mcp_trust_project)$/i)).toEqual([]);
     expect(env.YAW_MCP_AUTO_HEAL).toBe("0");
+  });
+
+  it("lets no variable that relocates a client config through with the operator's value", () => {
+    // install and `uninstall --force` run with this environment. One of these
+    // names surviving sends them to the operator's real Cline / Continue /
+    // Claude Code file instead of the sandbox.
+    const real = "/real/operator/value";
+    const env = sandboxEnv("/sb/home", Object.fromEntries(CLIENT_ENV_VARS.map((name) => [name, real])));
+    const leaked = CLIENT_ENV_VARS.filter((name) => env[name] === real);
+    expect(leaked).toEqual([]);
   });
 });

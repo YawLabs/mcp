@@ -44,6 +44,7 @@ import {
   redactGitOutput,
   removeGitCheckout,
   resolveGitRef,
+  scrubRepoUrlUserinfo,
   treeSizeBytes,
 } from "./git-source.js";
 import { type GradesCache, readGradesCache } from "./grades-cache.js";
@@ -76,7 +77,7 @@ import {
 } from "./local-bundles.js";
 import { createStreamWriter } from "./logger.js";
 import { CONFIG_DIRNAME, findProjectConfigDir, userConfigDir } from "./paths.js";
-import { askYesNo, QUESTION_CANCELLED } from "./readline-question.js";
+import { askYesNo, isInteractivePrompt, QUESTION_CANCELLED } from "./readline-question.js";
 import { runSecrets, type SecretsCommandOptions } from "./secrets-cmd.js";
 import {
   collectMalformedSecretRefs,
@@ -125,7 +126,8 @@ export const ADD_USAGE = `Usage: yaw-mcp add <slug> [flags]
                     --header 'Authorization: Bearer \${secret:NAME}'
   --transport <t>   streamable-http (default) or sse, for --url.
   --description <s> Free text describing what the server is for. Worth
-                    setting: dispatch ranks servers on it.
+                    setting: dispatch ranks servers on it. On a catalog or
+                    --git add it replaces the catalog's or the repo's own.
 
   Building a server from a git repository (--git):
 
@@ -512,7 +514,44 @@ function jsonEntry(entry: Partial<UpstreamServerConfig>): Record<string, unknown
   // the reader which one it holds without printing it.
   const headerNames = Object.keys(headers ?? {});
   if (headerNames.length > 0) out.headerNames = headerNames;
+  // A STORED git url is not one parseGitSpec vetted: the loader only refuses
+  // control characters and a leading "-" in it, so a hand edit can leave
+  // `https://user:token@host/...` there. A credential in the userinfo is
+  // replaced (scrubStoredGitUrl); the rest of the block goes out as stored.
+  const git = rest.git as { url?: unknown } | undefined;
+  if (git && typeof git === "object" && typeof git.url === "string") {
+    out.git = { ...git, url: scrubStoredGitUrl(git.url) };
+  }
   return out;
+}
+
+/** A stored git url for machine output and previews: userinfo that could be a
+ *  credential is replaced by `***`, a bare username is left alone.
+ *
+ *  scrubRepoUrlUserinfo replaces ANY userinfo, which is right for an error
+ *  line but wrong here: `ssh://git@github.com/acme/x.git` is a url `add --git`
+ *  accepts and stores as typed, and `list --json` reporting it as
+ *  `ssh://***@github.com/...` handed a script a url that does not clone and
+ *  does not equal what bundles.json holds.
+ *
+ *  "Bare" is decided on the raw text, as parseGitSpec decides it, and by the
+ *  shape git-source.ts's isBareUsername accepts (not exported, so spelled
+ *  again here): 1-19 characters of [A-Za-z0-9._-], no ":", and not starting
+ *  with a known token prefix. Anything else -- a password, an empty username,
+ *  a token where the username goes, a url the pattern below does not match --
+ *  goes through scrubRepoUrlUserinfo. That is stricter than parseGitSpec for
+ *  ssh://, where it accepts any username without a ":": a longer ssh username
+ *  is still shown as `***`, the safe direction. */
+function scrubStoredGitUrl(url: string): string {
+  const userinfo = /^[a-z][a-z0-9+.-]*:\/\/([^/?#\\]*)@/i.exec(url)?.[1];
+  if (
+    userinfo !== undefined &&
+    /^[A-Za-z0-9._-]{1,19}$/.test(userinfo) &&
+    !/^(gh[pousr]_|github_pat_|glpat-|glptt-|xox[abp]-)/i.test(userinfo)
+  ) {
+    return url;
+  }
+  return scrubRepoUrlUserinfo(url);
 }
 
 /** Declared keys with no stored value while the shell HAS one: the value
@@ -812,6 +851,18 @@ function renderLaunchChange(change: LaunchChange): string {
   return `  from: ${renderLaunch(change.from)}\n    to: ${renderLaunch(change.to)}`;
 }
 
+/** The stored env VALUES a write deleted (or, on a dry run, would delete), by
+ *  key name only. A conversion to a remote entry is what does it: the launch
+ *  note above names the command and the url, and said nothing about the
+ *  credentials that went with the command. On stderr, so it survives --json. */
+function droppedEnvNote(keys: string[], dryRun: boolean): string {
+  const names = keys.map(displayArg).join(", ");
+  const one = keys.length === 1;
+  return dryRun
+    ? `Note: this would DELETE the env value${one ? "" : "s"} stored on the entry (${names}): a remote server spawns no process, so nothing would read ${one ? "it" : "them"}. Copy ${one ? "it" : "them"} out of bundles.json first if you still need ${one ? "it" : "them"}.`
+    : `Note: the env value${one ? "" : "s"} stored on the entry (${names}) ${one ? "was" : "were"} deleted: a remote server spawns no process, so nothing would read ${one ? "it" : "them"}. Send a credential with --header instead.`;
+}
+
 /** The `add --json` failure document, one layout for every add path (catalog,
  *  --command, --url and --git): `{ok:false,error,exitCode}`, pretty-printed
  *  like the success document, with `error` the stderr line's text,
@@ -1069,7 +1120,9 @@ async function runAddDirect(opts: AddCommandOptions): Promise<AddCommandResult> 
           optionalEnvKeys: server.optionalEnvKeys,
         }),
     isActive: true,
-    description: server.description,
+    // --description wins in every mode. On a catalog add `server.description`
+    // is the catalog's; on a --command / --url add it is the flag already.
+    description: opts.description ?? server.description,
     // The catalog's published grade, recorded at add time so the
     // YAW_MCP_MIN_COMPLIANCE gate has something to read on a fresh install.
     // Without it the gate was inert for every catalog server: grades.json is
@@ -1127,6 +1180,7 @@ async function runAddDirect(opts: AddCommandOptions): Promise<AddCommandResult> 
         `Note: this would CHANGE the entry's launch command:\n${renderLaunchChange(preview.launchChanged)}\nIf the existing entry is a different server you meant to keep, remove/re-add via the app or edit bundles.json instead.`,
       );
     }
+    if (preview.droppedEnvKeys) printErr(droppedEnvNote(preview.droppedEnvKeys, true));
     if (opts.json) {
       // Same wrapper shape as the real add below, with dryRun:true, so a
       // script parsing `add --json` sees one consistent shape either way --
@@ -1237,6 +1291,7 @@ async function runAddDirect(opts: AddCommandOptions): Promise<AddCommandResult> 
       `Note: the entry's launch command changed:\n${renderLaunchChange(res.launchChanged)}\nIf the previous entry was a different server you meant to keep, restore it from the app or edit bundles.json.`,
     );
   }
+  if (res.droppedEnvKeys) printErr(droppedEnvNote(res.droppedEnvKeys, false));
 
   if (opts.json) {
     print(
@@ -1294,11 +1349,11 @@ async function runAddDirect(opts: AddCommandOptions): Promise<AddCommandResult> 
 // --- add --git ----------------------------------------------------------------
 
 /** Both ends a TTY, as for `remove` -- and never under --json, whose stdout is
- *  the document. */
+ *  the document. The shared verdict (isInteractivePrompt), handed only
+ *  `isTTY` and `io`: unlike `remove`, a canned promptAnswer has never made
+ *  `add --git` interactive, and passing it here would change that. */
 function gitInteractive(opts: AddCommandOptions): boolean {
-  if (opts.json) return false;
-  if (opts.isTTY !== undefined) return opts.isTTY;
-  return Boolean(process.stdin.isTTY) && Boolean(process.stdout.isTTY);
+  return !opts.json && isInteractivePrompt({ isTTY: opts.isTTY, io: opts.io });
 }
 
 /** The env a git entry is written with: each declared secret as a
@@ -1616,18 +1671,25 @@ async function runAddGit(opts: AddCommandOptions, spec: GitSpec): Promise<AddCom
     const checkEnv = willStore.env && Object.keys(willStore.env).length > 0 ? willStore.env : undefined;
     // No `git` on this config: its activation preflight looks under the real
     // home, and the build it would look for is the one just made.
-    started = await (opts.startCheck ?? defaultStartCheck)({
-      id: `local-${namespace}`,
-      name,
-      namespace,
-      type: "local",
-      transport: "stdio",
-      command: gitNodeCommand(),
-      args: [join(pkgDir, ...build.entry.split(/[\\/]/)), ...storedArgs],
-      cwd: pkgDir,
-      ...(checkEnv ? { env: checkEnv } : {}),
-      isActive: true,
-    });
+    // A check that throws is a check that failed (defaultStartCheck rethrows
+    // anything that is not a connect failure). Escaping here would skip the
+    // write below and leave the build on disk with no entry pinning it.
+    try {
+      started = await (opts.startCheck ?? defaultStartCheck)({
+        id: `local-${namespace}`,
+        name,
+        namespace,
+        type: "local",
+        transport: "stdio",
+        command: gitNodeCommand(),
+        args: [join(pkgDir, ...build.entry.split(/[\\/]/)), ...storedArgs],
+        cwd: pkgDir,
+        ...(checkEnv ? { env: checkEnv } : {}),
+        isActive: true,
+      });
+    } catch (e) {
+      started = { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
     progress(`Checking it starts ... ${started.ok ? `ok -- ${started.tools} tools` : "failed"}`);
   }
 
@@ -1716,7 +1778,10 @@ export const REMOVE_USAGE = `Usage: yaw-mcp remove <slug-or-namespace> [--force]
 
   A git server's builds under ~/.yaw-mcp/git/<namespace> are deleted with it,
   except a build another bundles.json on this machine still pins; the
-  confirmation names each one it keeps.
+  confirmation names each one it keeps. The consent you gave for that repo's
+  install and build scripts is NOT withdrawn: adding the same repo again
+  builds it without asking. To be asked again, delete the repo's entry from
+  ~/.yaw-mcp/git/consent.json.
 
   --force, -y, --yes  Skip the confirmation. Required when stdin or stdout
                       is not a TTY (there is nothing to ask on).
@@ -1947,7 +2012,10 @@ function renderLaunch(entry: { command?: unknown; args?: unknown; url?: unknown;
     const subdir = typeof git.subdir === "string" && git.subdir.length > 0 ? ` (subdir ${displayArg(git.subdir)})` : "";
     const at =
       typeof git.commit === "string" && git.commit.length > 0 ? ` @ ${displayArg(git.commit.slice(0, 12))}` : "";
-    return `git ${displaySafe(git.url)}${at}${subdir}`;
+    // A credential in the userinfo is scrubbed: a stored url can be a hand
+    // edit holding one (see jsonEntry), and this line is the removal preview
+    // and the launch-change note. A bare username stays (scrubStoredGitUrl).
+    return `git ${displaySafe(scrubStoredGitUrl(git.url))}${at}${subdir}`;
   }
   const command = typeof entry.command === "string" ? entry.command : "";
   const args = Array.isArray(entry.args) ? entry.args.filter((a): a is string => typeof a === "string") : [];
@@ -1999,14 +2067,6 @@ function printRemovalPreview(print: (s?: string) => void, path: string, t: Remov
   print("  entry goes with it -- and for a remote server the header IS the");
   print("  credential. Re-adding it will not bring those values back.");
   print("");
-}
-
-/** Both ends must be a TTY: stdin to read the answer, stdout to show the
- *  question. Mirrors trust-cmd.ts:isInteractive. */
-function isInteractive(opts: RemoveCommandOptions): boolean {
-  if (opts.isTTY !== undefined) return opts.isTTY;
-  if (opts.promptAnswer !== undefined) return true;
-  return Boolean(process.stdin.isTTY) && Boolean(process.stdout.isTTY);
 }
 
 export async function runRemove(opts: RemoveCommandOptions): Promise<AddCommandResult> {
@@ -2078,7 +2138,7 @@ export async function runRemove(opts: RemoveCommandOptions): Promise<AddCommandR
     const doomed = await findRemovalTarget(candidates, rawServers, home, { cwd, env });
     if (doomed) {
       printRemovalPreview(print, path, doomed, opts.keepCheckout === true);
-      if (!isInteractive(opts)) {
+      if (!isInteractivePrompt(opts)) {
         // Exit 2, matching `secrets remove`'s off-TTY refusal: a required flag
         // is missing, which is this CLI's usage-error code. (A DECLINED prompt
         // is exit 1 below -- the argv was fine, the user said no.)
@@ -2337,8 +2397,7 @@ export async function runList(opts: ListCommandOptions): Promise<AddCommandResul
   const unreadablePath = loaded.config === null ? loaded.path : null;
 
   // Overlay the compliance grades `yaw-mcp audit` cached in ~/.yaw-mcp/
-  // grades.json. This is the ONLY reader of that cache in local mode -- without
-  // it, `audit` would be write-only and the grade would never reach a human.
+  // grades.json, so the letter `audit` measured reaches a human here.
   // A bundles.json entry can also carry a grade now (`yaw-mcp add` records the
   // catalog's published one), so the map below is a genuine precedence
   // decision rather than a fill-in: a cache hit REPLACES the config value,

@@ -21,7 +21,7 @@ import type { GitBuildContext } from "./git-source.js";
 import { type AnswerReader, askYesNo, QUESTION_CANCELLED, type YesNoOptions } from "./readline-question.js";
 
 /** The question itself, after the consent screen's lines. */
-export const SCRIPT_CONSENT_QUESTION = "Proceed? [Y/n] ";
+const SCRIPT_CONSENT_QUESTION = "Proceed? [Y/n] ";
 
 /** The `confirm` for a GitBuildContext: print the consent screen, ask, and
  *  map the answer as the header above says. */

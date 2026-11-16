@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,6 +6,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   AUDIT_USAGE,
+  type AuditTarget,
   findCmdMetacharToken,
   parseAuditArgs,
   redactSecretArgs,
@@ -13,7 +14,8 @@ import {
   runAudit,
 } from "../audit-cmd.js";
 import { readGradesCache } from "../grades-cache.js";
-import { CONFIG_DIRNAME } from "../paths.js";
+import { CONFIG_DIRNAME, gitBuildDir } from "../paths.js";
+import { fakeFinishedBuild } from "./git-fixture.js";
 
 function captureIO() {
   const out: string[] = [];
@@ -292,12 +294,13 @@ describe("runAudit", () => {
     expect(io.err.join("\n")).toContain('no server named "ctxlint"');
   });
 
-  it("surfaces loader warnings for a malformed bundles.json instead of a bare not-found", async () => {
-    // A malformed (or unreadable) bundles.json loads as zero servers. The
-    // loader's diagnostic used to be discarded, so the user saw only
-    // `no server named "X"` with exit 1 -- the code the header reserves for a
-    // typo'd namespace -- and nothing pointed at the broken file. The exit
-    // code stays 1 (nothing was graded); the warning is what changes.
+  it("exits 4, not the not-found 1, when bundles.json exists but cannot be loaded", async () => {
+    // A malformed (or unreadable) bundles.json loads as zero servers. It used
+    // to be reported as `no server named "X"` with exit 1 -- the code the
+    // header reserves for a typo'd namespace -- so a caller branching on the
+    // exit code read a broken config as a typo. Whether the namespace is
+    // configured is unknown here, so it gets its own code and message, with
+    // the loader's warning saying what is wrong with the file.
     home = mkdtempSync(join(tmpdir(), "yaw-audit-"));
     mkdirSync(join(home, CONFIG_DIRNAME), { recursive: true });
     writeFileSync(join(home, CONFIG_DIRNAME, "bundles.json"), "{ not json");
@@ -310,10 +313,91 @@ describe("runAudit", () => {
       err: io.pushErr,
       runner: async () => ({ grade: "A", score: 100 }),
     });
-    expect(r.exitCode).toBe(1);
+    expect(r.exitCode).toBe(4);
     const stderr = io.err.join("\n");
     expect(stderr).toMatch(/warning: .*invalid JSON/);
-    expect(stderr).toContain('no server named "ctxlint"');
+    expect(stderr).toContain("could not load");
+    expect(stderr).toContain(join(home, CONFIG_DIRNAME, "bundles.json"));
+    expect(stderr).not.toContain('no server named "ctxlint"');
+  });
+
+  it("still exits 1 when there is no bundles.json at all", async () => {
+    // No file is the ordinary not-found case: nothing is broken, the
+    // namespace is simply not configured.
+    home = mkdtempSync(join(tmpdir(), "yaw-audit-"));
+    const io = captureIO();
+    const r = await runAudit({
+      namespace: "ctxlint",
+      home,
+      cwd: home,
+      out: io.push,
+      err: io.pushErr,
+      runner: async () => ({ grade: "A", score: 100 }),
+    });
+    expect(r.exitCode).toBe(1);
+    expect(io.err.join("\n")).toContain('no server named "ctxlint"');
+  });
+
+  it("hands the runner a git-sourced server's build directory as cwd", async () => {
+    // The loader derives `cwd` for a git entry and the broker spawns in it.
+    // audit built its target from command/args/env alone, so the suite ran
+    // such a server in the shell's directory and cached a letter for a
+    // process the broker never starts that way.
+    const commit = "1111111111111111111111111111111111111111";
+    home = realpathSync(mkdtempSync(join(tmpdir(), "yaw-audit-")));
+    mkdirSync(join(home, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(
+      join(home, CONFIG_DIRNAME, "bundles.json"),
+      JSON.stringify({
+        version: 1,
+        servers: [
+          {
+            namespace: "acme",
+            name: "acme",
+            type: "local",
+            transport: "stdio",
+            git: { url: "git@github.com:acme/tools-mcp.git", ref: "main", commit, entry: "dist/index.js" },
+          },
+        ],
+      }),
+    );
+    const buildDir = fakeFinishedBuild(gitBuildDir("acme", commit, home), commit, { entry: "dist/index.js" });
+    const io = captureIO();
+    let seen: AuditTarget | undefined;
+    const r = await runAudit({
+      namespace: "acme",
+      home,
+      cwd: home,
+      out: io.push,
+      err: io.pushErr,
+      runner: async (target) => {
+        seen = target;
+        return { grade: "A", score: 100 };
+      },
+    });
+    expect(io.err.join("\n")).toBe("");
+    expect(r.exitCode).toBe(0);
+    expect(seen?.cwd).toBe(buildDir);
+    expect(seen?.args[0]).toBe(join(buildDir, "dist", "index.js"));
+  });
+
+  it("gives a plain command server no cwd", async () => {
+    home = makeHome([{ namespace: "ctxlint", type: "local", command: "node", args: ["x.js"] }]);
+    const io = captureIO();
+    let seen: AuditTarget | undefined;
+    await runAudit({
+      namespace: "ctxlint",
+      home,
+      cwd: home,
+      out: io.push,
+      err: io.pushErr,
+      runner: async (target) => {
+        seen = target;
+        return { grade: "A", score: 100 };
+      },
+    });
+    expect(seen).toBeDefined();
+    expect(seen && "cwd" in seen).toBe(false);
   });
 
   it("keeps warnings off stdout in --json mode (stderr only)", async () => {
@@ -996,5 +1080,23 @@ describe("runAudit -- scrubbed echoes", () => {
     const err = io.err.join("");
     expect(err).toContain('"remote" is a remote server (https://mcp.example.com/sse?');
     expect(err).not.toContain("sekret123");
+    // A redacted url is not one to paste back, so the command names a
+    // placeholder instead of repeating it.
+    expect(err).toContain("run `yaw-mcp compliance <url>`");
+  });
+
+  it.each([
+    ["a userinfo password", "https://user:s3cr3tpw@mcp.example.com/mcp", "s3cr3tpw"],
+    ["a bare ?key= parameter", "https://mcp.example.com/mcp?key=AIzaSyD4exampleexample", "AIzaSyD4exampleexample"],
+  ])("scrubs %s out of the remote-server line", async (_label, url, secret) => {
+    // Neither shape has a NAME the name/value rule knows (`key` alone is not
+    // one), so both used to be printed verbatim, twice.
+    home = makeHome([{ namespace: "remote", type: "remote", url }]);
+    const io = captureIO();
+    const r = await runAudit({ namespace: "remote", home, cwd: home, out: io.push, err: io.pushErr });
+    expect(r.exitCode).toBe(2);
+    const err = io.err.join("");
+    expect(err).toContain("mcp.example.com/mcp");
+    expect(err).not.toContain(secret);
   });
 });

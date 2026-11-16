@@ -690,17 +690,29 @@ const READ_FAILURE_MARKER = "could not read file (";
  *   - { exists: true,  file: null } when present-but-malformed (warnings
  *     populated). Caller must NOT fall through in this case -- see
  *     loadLocalBundles. */
-async function readBundlesAt(path: string, warnings: string[]): Promise<ReadResult> {
+async function readBundlesAt(path: string, warnings: string[], onWarning?: LoadWarningSink): Promise<ReadResult> {
   const r = await readBundlesRawAt(path);
   if (r.kind === "absent") return { exists: false, file: null };
   if (r.kind === "error") {
     // Return exists:true so the caller stays committed to this path instead
     // of silently falling through to the user-global file.
     warnings.push(`${path}: ${READ_FAILURE_MARKER}${r.message}) -- skipping`);
-    log("warn", "Could not read bundles.json", { path, error: r.message, code: r.code });
+    warnLoad(onWarning, "Could not read bundles.json", { path, error: r.message, code: r.code });
     return { exists: true, file: null };
   }
-  return { exists: true, file: parseBundlesContent(path, r.raw, warnings) };
+  return { exists: true, file: parseBundlesContent(path, r.raw, warnings, onWarning) };
+}
+
+/** Receives what the loader would otherwise send to logger.ts's
+ *  log("warn"): the message and the structured data that line carries. See
+ *  loadLocalBundles' `onWarning`. */
+export type LoadWarningSink = (warning: { message: string; data?: Record<string, unknown> }) => void;
+
+/** One loader warn line: to the caller's sink when it gave one, else to
+ *  log("warn") exactly as before. Never both. */
+function warnLoad(sink: LoadWarningSink | undefined, message: string, data: Record<string, unknown>): void {
+  if (sink !== undefined) sink({ message, data });
+  else log("warn", message, data);
 }
 
 /** Where a bundles.json parse failed, as "at line L, column C" (1-based, in
@@ -741,7 +753,12 @@ export function jsonErrorLocation(raw: string, err: unknown): string {
  *  trust gate can decide whether to parse at all -- an untrusted file must
  *  produce ONLY the untrusted warning, not a pile of schema diagnostics
  *  about content we are refusing to look at. */
-function parseBundlesContent(path: string, rawBytes: Buffer, warnings: string[]): LocalBundlesFile | null {
+function parseBundlesContent(
+  path: string,
+  rawBytes: Buffer,
+  warnings: string[],
+  onWarning?: LoadWarningSink,
+): LocalBundlesFile | null {
   const raw = rawBytes.toString("utf8");
   let parsed: unknown;
   try {
@@ -755,7 +772,7 @@ function parseBundlesContent(path: string, rawBytes: Buffer, warnings: string[])
     // after every save. A position is all either gets.
     const where = jsonErrorLocation(raw, err);
     warnings.push(`${path}: invalid JSON ${where} -- file ignored`);
-    log("warn", "bundles.json is not valid JSON; ignoring", { path, location: where });
+    warnLoad(onWarning, "bundles.json is not valid JSON; ignoring", { path, location: where });
     return null;
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
@@ -1129,10 +1146,8 @@ export interface LoadLocalBundlesResult {
  *  gates, and the callers are on a request path where an extra microtask per
  *  path buys nothing.
  *
- *  A near-identical private helper lives in default-runtime.ts. It is NOT
- *  imported here and this is not an oversight: default-runtime.ts imports
- *  loadLocalBundles from this module, so the reverse import would close a
- *  cycle. */
+ *  default-runtime.ts imports this function for its own bundles.json cache
+ *  (it used to keep a near-identical private copy). */
 export function bundlesSignature(paths: string[]): string {
   return paths
     .map((path) => {
@@ -1152,12 +1167,23 @@ export function bundlesSignature(paths: string[]): string {
  *  excepted; see LoadLocalBundlesResult). An unapproved project file is
  *  ignored entirely and the user-global file loads as if it weren't there.
  *  Returns null config when neither file exists, so the caller can render
- *  the empty-state hint. */
+ *  the empty-state hint.
+ *
+ *  `onWarning`, when given, receives the warn-level lines THIS MODULE would
+ *  otherwise send to log("warn") during the load -- a bundles.json that
+ *  could not be read (either location) or is not valid JSON -- INSTEAD of
+ *  them being logged. For a caller that owns its stderr format (`secrets --json`, one
+ *  JSON object per line), where the logger's prose line is a contract break.
+ *  The same conditions are in the returned `warnings` either way, with one
+ *  exception: when a project file wins, the user-global file is read again
+ *  for its defaultRuntime alone, and a failure of THAT read reaches the sink
+ *  (or the log) but is kept out of `warnings`, since its servers are shadowed. */
 export async function loadLocalBundles(
-  opts: { cwd?: string; home?: string; env?: NodeJS.ProcessEnv } = {},
+  opts: { cwd?: string; home?: string; env?: NodeJS.ProcessEnv; onWarning?: LoadWarningSink } = {},
 ): Promise<LoadLocalBundlesResult> {
   const cwd = opts.cwd ?? process.cwd();
   const home = opts.home ?? homedir();
+  const onWarning = opts.onWarning;
   const warnings: string[] = [];
 
   const globalPath = localBundlesPath(userConfigDir(home));
@@ -1199,11 +1225,14 @@ export async function loadLocalBundles(
   if (projectPath !== null) {
     if (probe.status === "unreadable") {
       warnings.push(`${projectPath}: ${READ_FAILURE_MARKER}${probe.error}) -- skipping`);
-      log("warn", "Could not read bundles.json", { path: projectPath, error: probe.error });
+      warnLoad(onWarning, "Could not read bundles.json", { path: projectPath, error: probe.error });
       projectResult = { exists: true, file: null };
     } else {
       // probe.raw is non-null for every non-"none"/non-"unreadable" status.
-      projectResult = { exists: true, file: parseBundlesContent(projectPath, probe.raw as Buffer, warnings) };
+      projectResult = {
+        exists: true,
+        file: parseBundlesContent(projectPath, probe.raw as Buffer, warnings, onWarning),
+      };
     }
   }
 
@@ -1213,7 +1242,7 @@ export async function loadLocalBundles(
     file = projectResult.file;
     sourcePath = projectPath;
   } else {
-    const globalResult = await readBundlesAt(globalPath, warnings);
+    const globalResult = await readBundlesAt(globalPath, warnings, onWarning);
     file = globalResult.file;
     sourcePath = globalResult.exists ? globalPath : null;
   }
@@ -1226,7 +1255,7 @@ export async function loadLocalBundles(
     // diagnostics out of the result (its servers are shadowed either way).
     if (sourcePath === projectPath && projectPath !== null) {
       const scratch: string[] = [];
-      const globalResult = await readBundlesAt(globalPath, scratch);
+      const globalResult = await readBundlesAt(globalPath, scratch, onWarning);
       if (globalResult.file?.defaultRuntime !== undefined) {
         return {
           config: null,
@@ -1256,7 +1285,7 @@ export async function loadLocalBundles(
   let defaultRuntimePath = defaultRuntime !== undefined ? (sourcePath ?? undefined) : undefined;
   if (defaultRuntime === undefined && sourcePath === projectPath && projectPath !== null) {
     const scratch: string[] = [];
-    const globalResult = await readBundlesAt(globalPath, scratch);
+    const globalResult = await readBundlesAt(globalPath, scratch, onWarning);
     if (globalResult.file?.defaultRuntime !== undefined) {
       defaultRuntime = globalResult.file.defaultRuntime;
       defaultRuntimePath = globalPath;
@@ -1353,8 +1382,10 @@ export function serializeBundleWrite<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 /** Sidecar the cross-process write lock is taken on, inside the user config
- *  dir next to bundles.json. Exported by NAME so the other writer of that
- *  file (the Yaw Terminal app) can take the same lock. */
+ *  dir next to bundles.json. The other writer of that file (the Yaw Terminal
+ *  app) takes the same lock by spelling this same file name: this package
+ *  ships a CLI bin and no library exports, so the app cannot import the
+ *  constant. Exported for this repo's tests only. */
 export const BUNDLES_LOCK_NAME = `${BUNDLES_FILENAME}.lock`;
 
 /** How long a writer waits for another process to let go before giving up.
@@ -1572,9 +1603,10 @@ function envStrings(raw: unknown): Record<string, string> | undefined {
  *      (see the env block below).
  *   3. An incoming `isActive: true` does NOT re-enable an entry the user
  *      explicitly disabled. `true` is boilerplate every writer stamps;
- *      `"isActive": false` is a deliberate hand-edit, and there is no `enable`
- *      verb for `add` to be the accidental inverse of. An explicit `false`
- *      still disables.
+ *      `"isActive": false` is a deliberate choice -- a hand-edit or `yaw-mcp
+ *      disable` -- and `yaw-mcp enable` (local-set-cmd.ts) is the verb that
+ *      undoes it, which `add` names in its output rather than doing it
+ *      implicitly. An explicit `false` still disables.
  *   4. An incoming STDIO launch (command + transport "stdio") replaces the
  *      WHOLE launch shape: a stored `url` is dropped rather than carried
  *      along as a stale remote endpoint beside the new command. The one
@@ -1582,6 +1614,11 @@ function envStrings(raw: unknown): Record<string, string> | undefined {
  *      to state the user put there separately, and the entry it used to
  *      describe (a hand-added remote server) is reported through
  *      launchChanged so the swap is never silent.
+ *   5. A `complianceGrade` the incoming entry does not restate is dropped when
+ *      the merge changes the launch shape (launchShapeOf). The second
+ *      exception to rule 1: the grade describes the program the entry used to
+ *      launch, so keeping it would put the catalog's published letter on
+ *      whatever `--command` / `--url` / `--git` put in its place.
  */
 function mergeServerEntry(
   existing: Partial<UpstreamServerConfig>,
@@ -1648,6 +1685,13 @@ function mergeServerEntry(
     delete merged.headers;
     if (merged.transport !== undefined && merged.transport !== "stdio") delete merged.transport;
     if (incoming.type === undefined && merged.type === "remote") delete merged.type;
+    // A conversion INTO git (not a git-over-git re-add) also drops the marker
+    // for the replaced launch's optional blank env seeds: a git add sends no
+    // marker of its own, and the env block below drops every stored blank
+    // seed the git entry does not itself carry.
+    if (base.git === undefined && (incoming as Record<string, unknown>).optionalEnvKeys === undefined) {
+      delete merged.optionalEnvKeys;
+    }
   } else if (typeof incoming.command === "string" || typeof incoming.url === "string") {
     delete merged.git;
   }
@@ -1680,6 +1724,11 @@ function mergeServerEntry(
     // Undefined rather than {} when nothing survives, so a re-add of a server
     // whose last required key was dropped leaves no empty husk on disk.
     merged.env = Object.keys(env).length > 0 ? env : undefined;
+  }
+  // Rule 5. Compared after every conversion above, so `merged` is the launch
+  // the write lands.
+  if (incoming.complianceGrade === undefined && !sameLaunch(launchShapeOf(base), launchShapeOf(merged))) {
+    delete merged.complianceGrade;
   }
   return merged as Partial<UpstreamServerConfig>;
 }
@@ -1802,6 +1851,9 @@ export interface UpsertUserBundleResult {
   replaced: boolean;
   entry: Partial<UpstreamServerConfig>;
   launchChanged?: LaunchChange;
+  /** Env keys whose stored VALUE this write deleted (droppedEnvValueKeys).
+   *  Names only; absent when it deleted none. */
+  droppedEnvKeys?: string[];
   /** Non-fatal read diagnostics (see readRawUserBundles); print as `warning: ...`. */
   warnings: string[];
   /** Only for a `configDir` (project) write: "regranted" when the file was
@@ -1997,6 +2049,20 @@ function mergedUpsertEntry(
   return { ...written, namespace: target.namespace ?? written.namespace, id: target.id ?? written.id };
 }
 
+/** The env keys of `stored` that hold a non-blank value and are gone from
+ *  `written`: the stored values a merge deleted. Today that is a conversion
+ *  to a remote entry, which drops the whole env (mergeServerEntry); every
+ *  other merge keeps a non-blank stored value. A blank seed is not counted --
+ *  it is a requirement marker, not a value. Key NAMES only. */
+function droppedEnvValueKeys(
+  stored: Partial<UpstreamServerConfig> | undefined,
+  written: Partial<UpstreamServerConfig>,
+): string[] {
+  const before = envStrings((stored as Record<string, unknown> | undefined)?.env) ?? {};
+  const after = envStrings((written as Record<string, unknown>).env) ?? {};
+  return Object.keys(before).filter((k) => (before[k] ?? "").trim() !== "" && !Object.hasOwn(after, k));
+}
+
 /** Read-only preview of what upsertUserBundle would do -- the refusal it
  *  would throw (if any), the namespace the file would actually hold, and the
  *  MERGED entry the write would land (mergedUpsertEntry, the same fold the
@@ -2025,6 +2091,8 @@ export async function previewUpsertUserBundle(
    *  stored entry has neither a command nor a url; absent when nothing is
    *  being replaced. */
   replacing?: LaunchShape;
+  /** As on UpsertUserBundleResult: the stored env values the write would delete. */
+  droppedEnvKeys?: string[];
   /** Same read diagnostics the real run would surface (see readRawUserBundles). */
   warnings: string[];
 }> {
@@ -2034,12 +2102,15 @@ export async function previewUpsertUserBundle(
   const path = opts.configDir !== undefined ? localBundlesPath(opts.configDir) : undefined;
   const file = await readRawUserBundles(home, warnings, path);
   const target = resolveUpsertTarget(file.servers, entry, opts.origin ?? "catalog");
+  const merged = mergedUpsertEntry(file.servers, entry, target);
+  const dropped = target.idx >= 0 ? droppedEnvValueKeys(file.servers[target.idx], merged) : [];
   return {
     replaced: target.idx >= 0,
     refusal: target.refusal,
     namespace: target.namespace ?? entry.namespace,
-    entry: mergedUpsertEntry(file.servers, entry, target),
+    entry: merged,
     launchChanged: target.launchChanged,
+    ...(dropped.length > 0 ? { droppedEnvKeys: dropped } : {}),
     replacing: target.idx >= 0 ? launchShapeOf((file.servers[target.idx] ?? {}) as Record<string, unknown>) : undefined,
     warnings,
   };
@@ -2070,6 +2141,7 @@ async function doUpsertUserBundle(
       // The fold itself lives in mergedUpsertEntry so `add --dry-run` runs the
       // identical merge -- see previewUpsertUserBundle.
       const written = mergedUpsertEntry(file.servers, entry, target);
+      const dropped = replaced ? droppedEnvValueKeys(file.servers[idx], written) : [];
       if (replaced) file.servers[idx] = written;
       else file.servers.push(written);
       // `file.version` is written back exactly as readRawUserBundles produced
@@ -2092,6 +2164,7 @@ async function doUpsertUserBundle(
         replaced,
         entry: written,
         launchChanged: target.launchChanged,
+        ...(dropped.length > 0 ? { droppedEnvKeys: dropped } : {}),
         warnings,
         ...(projectTrust ? { projectTrust } : {}),
       };
@@ -2136,7 +2209,15 @@ export function updateGitPin(
       async () => {
         const trustedBefore = opts.configDir !== undefined && (await bytesAreTrusted(path, home));
         const raw = await readFile(path, "utf8");
-        const servers = (parseJsonc(raw) as { servers?: unknown } | null)?.servers;
+        let parsed: unknown;
+        try {
+          parsed = parseJsonc(raw);
+        } catch (err) {
+          // A position only, never err.message -- see parseBundlesContent. The
+          // caller (update) prints this message.
+          throw new Error(`${path} is not valid JSON ${jsonErrorLocation(raw, err)}; nothing was written.`);
+        }
+        const servers = (parsed as { servers?: unknown } | null)?.servers;
         if (!Array.isArray(servers)) throw new Error(`${path} has no "servers" array; nothing was written.`);
         const idx = servers.findIndex((s) => (s as { namespace?: unknown } | null)?.namespace === namespace);
         const git = (servers[idx] as { git?: unknown } | undefined)?.git;
