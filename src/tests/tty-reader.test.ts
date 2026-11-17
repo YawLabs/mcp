@@ -17,27 +17,32 @@ class FakeTTYStdin {
   isTTY = true;
   isRaw = false;
   rawModeCalls: boolean[] = [];
-  private listener: ((chunk: string) => void) | null = null;
-  private queue: string[];
+  private listener: ((chunk: string | Buffer) => void) | null = null;
+  private queue: (string | Buffer)[];
   setRawMode?: (v: boolean) => this = (v) => {
     this.isRaw = v;
     this.rawModeCalls.push(v);
     return this;
   };
-  constructor(chunks: string[]) {
+  constructor(chunks: (string | Buffer)[]) {
     this.queue = [...chunks];
+  }
+  get queued(): readonly (string | Buffer)[] {
+    return this.queue;
   }
   get pending(): number {
     return this.queue.length;
   }
+  setEncodingCalls = 0;
   setEncoding(): this {
+    this.setEncodingCalls += 1;
     return this;
   }
-  on(event: string, cb: (chunk: string) => void): this {
+  on(event: string, cb: (chunk: string | Buffer) => void): this {
     if (event === "data") this.listener = cb;
     return this;
   }
-  removeListener(event: string, cb: (chunk: string) => void): this {
+  removeListener(event: string, cb: (chunk: string | Buffer) => void): this {
     if (event === "data" && this.listener === cb) this.listener = null;
     return this;
   }
@@ -49,7 +54,7 @@ class FakeTTYStdin {
   pause(): this {
     return this;
   }
-  unshift(chunk: string): void {
+  unshift(chunk: string | Buffer): void {
     this.queue.unshift(chunk);
   }
 }
@@ -274,5 +279,202 @@ describe("readAnswerFromTTY", () => {
     );
     const enter = new FakeTTYStdin(["\n"]);
     expect(await readAnswerFromTTY(enter as unknown as NodeJS.ReadableStream, fakeStdout().stream, "? ")).toBe("");
+  });
+});
+
+describe("readLineFromTTY -- setup failure restores raw mode", () => {
+  it("rejects and restores raw mode when stdin.resume() throws after raw mode is on", async () => {
+    const stdin = new FakeTTYStdin(["x\n"]);
+    stdin.resume = () => {
+      throw new Error("EBADF: resume");
+    };
+    await expect(readLineFromTTY(asStream(stdin), fakeStdout().stream)).rejects.toThrow("EBADF: resume");
+    expect(stdin.rawModeCalls).toEqual([true, false]);
+    expect(stdin.isRaw).toBe(false);
+  });
+
+  it("rejects and restores raw mode when writing the prompt throws", async () => {
+    const stdin = new FakeTTYStdin(["x\n"]);
+    const stdout = {
+      write: () => {
+        throw new Error("EPIPE: write");
+      },
+    } as unknown as NodeJS.WritableStream;
+    await expect(readLineFromTTY(asStream(stdin), stdout, "? ", true)).rejects.toThrow("EPIPE: write");
+    expect(stdin.rawModeCalls).toEqual([true, false]);
+    // Nothing was read: the queued input is still there for whoever asks next.
+    expect(stdin.pending).toBe(1);
+  });
+
+  it("rejects and restores raw mode when writing the closing newline throws", async () => {
+    const stdin = new FakeTTYStdin(["x\n"]);
+    const stdout = {
+      write: (s: string) => {
+        if (s === "\n") throw new Error("EPIPE: newline");
+        return true;
+      },
+    } as unknown as NodeJS.WritableStream;
+    await expect(readLineFromTTY(asStream(stdin), stdout)).rejects.toThrow("EPIPE: newline");
+    expect(stdin.rawModeCalls).toEqual([true, false]);
+  });
+});
+
+describe("readLineFromTTY -- decoding without setEncoding", () => {
+  it("never calls setEncoding, so the caller's stdin is not left in string mode", async () => {
+    const stdin = new FakeTTYStdin(["x\n"]);
+    await readLineFromTTY(asStream(stdin), fakeStdout().stream);
+    expect(stdin.setEncodingCalls).toBe(0);
+  });
+
+  it("a real stream keeps its (null) encoding after a read", async () => {
+    const stdin = Object.assign(new PassThrough(), { isRaw: false, setRawMode: () => undefined });
+    const read = readLineFromTTY(stdin as unknown as NodeJS.ReadStream, fakeStdout().stream);
+    stdin.write(Buffer.from("pw\n"));
+    expect(await read).toBe("pw");
+    expect(stdin.readableEncoding).toBe(null);
+  });
+
+  it("decodes a UTF-8 character whose bytes are split across two Buffer chunks", async () => {
+    const bytes = Buffer.from("aéb\n", "utf8"); // 61 c3 a9 62 0a
+    const stdin = new FakeTTYStdin([bytes.subarray(0, 2), bytes.subarray(2)]);
+    const read = readLineFromTTY(asStream(stdin), fakeStdout().stream);
+    await new Promise((r) => setTimeout(r, 0));
+    stdin.resume();
+    expect(await read).toBe("aéb");
+  });
+
+  it("re-buffers the rest of a Buffer chunk as bytes, including a held-back partial character", async () => {
+    const euro = Buffer.from("€", "utf8"); // e2 82 ac
+    // One chunk: the first line, then "x" and the first two bytes of a euro sign.
+    const stdin = new FakeTTYStdin([Buffer.concat([Buffer.from("one\nx"), euro.subarray(0, 2)]), euro.subarray(2)]);
+    expect(await readLineFromTTY(asStream(stdin), fakeStdout().stream)).toBe("one");
+    const back = stdin.queued[0];
+    expect(Buffer.isBuffer(back)).toBe(true);
+    expect((back as Buffer).equals(Buffer.concat([Buffer.from("x"), euro.subarray(0, 2)]))).toBe(true);
+    // The second read gets the held bytes back and completes the character.
+    const second = readLineFromTTY(asStream(stdin), fakeStdout().stream);
+    await new Promise((r) => setTimeout(r, 0));
+    stdin.unshift("\n");
+    stdin.unshift(euro.subarray(2));
+    stdin.resume();
+    await new Promise((r) => setTimeout(r, 0));
+    stdin.resume();
+    expect(await second).toBe("x€");
+  });
+
+  it("re-buffers invalid UTF-8 after Enter as the original bytes, not as a re-encoded U+FFFD", async () => {
+    const stdin = new FakeTTYStdin([Buffer.concat([Buffer.from("y\n"), Buffer.from([0xff]), Buffer.from("z")])]);
+    expect(await readLineFromTTY(asStream(stdin), fakeStdout().stream)).toBe("y");
+    const back = stdin.queued[0];
+    expect(Buffer.isBuffer(back)).toBe(true);
+    expect([...(back as Buffer)]).toEqual([0xff, 0x7a]);
+  });
+
+  it("maps the byte offset past invalid UTF-8 BEFORE Enter too", async () => {
+    // 0xc3 is a lead byte cut off by "a": it decodes as one U+FFFD plus "a".
+    const stdin = new FakeTTYStdin([
+      Buffer.concat([Buffer.from([0xc3]), Buffer.from("a\r\n"), Buffer.from([0xfe, 0x62])]),
+    ]);
+    expect(await readLineFromTTY(asStream(stdin), fakeStdout().stream)).toBe("\ufffda");
+    expect([...(stdin.queued[0] as Buffer)]).toEqual([0xfe, 0x62]);
+  });
+
+  it("hands a string chunk's leftover back as a string", async () => {
+    const stdin = new FakeTTYStdin(["a\nb"]);
+    expect(await readLineFromTTY(asStream(stdin), fakeStdout().stream)).toBe("a");
+    expect(stdin.queued[0]).toBe("b");
+  });
+
+  it("still accepts string chunks", async () => {
+    const stdin = new FakeTTYStdin(["str\n"]);
+    expect(await readLineFromTTY(asStream(stdin), fakeStdout().stream)).toBe("str");
+  });
+});
+
+describe("readLineFromTTY -- ECMA-48 sequence bounds", () => {
+  it("a non-ASCII character after ESC [ ends the sequence and is kept (Alt+[ then a passphrase)", async () => {
+    const stdin = new FakeTTYStdin(["\x1b[été\n"]);
+    expect(await readLineFromTTY(asStream(stdin), fakeStdout().stream)).toBe("été");
+  });
+
+  it("parameter and intermediate bytes (0x20-0x3f) stay in the sequence; the final byte ends it", async () => {
+    const stdin = new FakeTTYStdin(["a\x1b[1;5 ~b\n"]);
+    expect(await readLineFromTTY(asStream(stdin), fakeStdout().stream)).toBe("ab");
+  });
+
+  it("DEL after ESC [ ends the sequence and still erases", async () => {
+    const stdin = new FakeTTYStdin(["ab\x1b[\x7fc\n"]);
+    expect(await readLineFromTTY(asStream(stdin), fakeStdout().stream)).toBe("ac");
+  });
+});
+
+describe("readLineFromTTY -- CRLF split across reads", () => {
+  // The split-CRLF swallow is armed only off raw mode: a pipe, or the cooked
+  // echo fallback. No setRawMode is the cooked fallback, so these are echo reads.
+  const cooked = (chunks: (string | Buffer)[]): FakeTTYStdin => {
+    const stdin = new FakeTTYStdin(chunks);
+    stdin.setRawMode = undefined;
+    return stdin;
+  };
+  const read = (stdin: FakeTTYStdin) => readLineFromTTY(asStream(stdin), fakeStdout().stream, "? ", true);
+
+  it("a \\r ending one chunk and a \\n starting the next is one Enter, not an empty next submission", async () => {
+    const stdin = cooked(["first\r", "\nsecond\n"]);
+    expect(await read(stdin)).toBe("first");
+    expect(await read(stdin)).toBe("second");
+  });
+
+  it("only a LEADING \\n is swallowed: a \\r then another key leaves the next read intact", async () => {
+    const stdin = cooked(["first\r", "b\n", "\n"]);
+    expect(await read(stdin)).toBe("first");
+    expect(await read(stdin)).toBe("b");
+    // The flag was consumed by the second read: this bare Enter submits "".
+    expect(await read(stdin)).toBe("");
+  });
+
+  it("re-buffered leftover ending in \\r carries the flag to the read after it", async () => {
+    const stdin = cooked(["one\rtwo\r", "\nthree\n"]);
+    expect(await read(stdin)).toBe("one");
+    expect(await read(stdin)).toBe("two");
+    expect(await read(stdin)).toBe("three");
+  });
+
+  it("a submit on \\n sets no flag: a following bare Enter still submits empty", async () => {
+    const stdin = cooked(["x\n", "\n"]);
+    expect(await read(stdin)).toBe("x");
+    expect(await read(stdin)).toBe("");
+  });
+
+  it("is never armed in raw mode: a raw TTY's lone \\r Enter does not eat a Ctrl+J at the next prompt", async () => {
+    // A raw TTY sends "\r" alone for every Enter. Arming the flag there ate a
+    // \n (Ctrl+J) typed first at the next prompt, which then took "x".
+    const stdin = new FakeTTYStdin(["abc\r", "\nx\r"]);
+    expect(await readLineFromTTY(asStream(stdin), fakeStdout().stream)).toBe("abc");
+    expect(await readLineFromTTY(asStream(stdin), fakeStdout().stream)).toBe("");
+  });
+
+  it("the flag covers only the very next chunk: a \\n after an intervening (empty) chunk is a real Enter", async () => {
+    const stdin = cooked(["first\r", Buffer.alloc(0), "\nx\n"]);
+    expect(await read(stdin)).toBe("first");
+    const second = read(stdin);
+    await new Promise((r) => setTimeout(r, 0));
+    stdin.resume();
+    expect(await second).toBe("");
+  });
+});
+
+describe("readLineFromTTY -- signals", () => {
+  it("installs no SIGTERM/SIGHUP/SIGINT listener during a prompt, leaving node's own terminal reset in charge", async () => {
+    // node's default SIGINT/SIGTERM handler resets the tty and re-raises; a
+    // JS listener would replace it. See the teardown comment in tty-reader.ts.
+    const counts = () => ["SIGTERM", "SIGHUP", "SIGINT"].map((s) => process.listenerCount(s));
+    const before = counts();
+    const stdin = new FakeTTYStdin([]);
+    const read = readLineFromTTY(asStream(stdin), fakeStdout().stream);
+    expect(counts()).toEqual(before);
+    stdin.unshift("\x03");
+    stdin.resume();
+    expect(await read).toBe(CANCELLED);
+    expect(counts()).toEqual(before);
   });
 });

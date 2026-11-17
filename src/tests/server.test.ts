@@ -34,7 +34,7 @@ vi.mock("../upstream.js", async (importOriginal) => {
     // have -- green on a machine with no vault, red on one with a real vault
     // whose passphrase is not the test string. Its own behaviour is covered in
     // upstream.test.ts, where secrets-vault is mocked.
-    verifyVaultPassphrase: vi.fn().mockResolvedValue(true),
+    verifyVaultPassphrase: vi.fn().mockResolvedValue("verified"),
   };
 });
 
@@ -7699,7 +7699,7 @@ describe("vault passphrase elicitation", () => {
     // than passed to vi.fn(): a case that sets a persistent `false` here (the
     // attempt-budget one) would otherwise make every later case's passphrase
     // fail verification.
-    vi.mocked(verifyVaultPassphrase).mockReset().mockResolvedValue(true);
+    vi.mocked(verifyVaultPassphrase).mockReset().mockResolvedValue("verified");
     vi.clearAllMocks();
     // vaultPassphrase() falls back to the real env when no session value is
     // set, and exporting YAW_MCP_VAULT_PASSPHRASE is the product's own
@@ -8192,7 +8192,7 @@ describe("vault passphrase elicitation", () => {
     priv.server.getClientCapabilities = () => ({ elicitation: {} });
     priv.server.elicitInput = accept();
     passphrasePages(priv, "typo", "the-right-one");
-    vi.mocked(verifyVaultPassphrase).mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+    vi.mocked(verifyVaultPassphrase).mockResolvedValueOnce("wrong").mockResolvedValueOnce("verified");
     vi.mocked(connectToUpstream)
       .mockRejectedValueOnce(lockedVaultError("gh"))
       .mockRejectedValueOnce(lockedVaultError("gh"))
@@ -8215,7 +8215,7 @@ describe("vault passphrase elicitation", () => {
     priv.server.getClientCapabilities = () => ({ elicitation: {} });
     priv.server.elicitInput = accept();
     const opened = passphrasePages(priv, "still-wrong", "still-wrong", "still-wrong");
-    vi.mocked(verifyVaultPassphrase).mockResolvedValue(false);
+    vi.mocked(verifyVaultPassphrase).mockResolvedValue("wrong");
     vi.mocked(connectToUpstream).mockRejectedValue(lockedVaultError("gh"));
 
     await priv.activateOne("gh");
@@ -8519,7 +8519,7 @@ describe("vault passphrase elicitation", () => {
       answer = resolve;
     });
     priv.server.elicitInput = vi.fn().mockReturnValue(answered);
-    vi.mocked(verifyVaultPassphrase).mockResolvedValue(false);
+    vi.mocked(verifyVaultPassphrase).mockResolvedValue("wrong");
     vi.mocked(connectToUpstream).mockImplementation((async (cfg: UpstreamServerConfig) => {
       throw lockedVaultError(cfg.namespace);
     }) as unknown as typeof connectToUpstream);

@@ -167,7 +167,7 @@ import {
   type SecretEntryPage,
   type SecretEntryPageOptions,
 } from "./secret-entry-page.js";
-import { listKeys, loadVault, vaultPath } from "./secrets-vault.js";
+import { listKeys, loadVault, lock as lockVault, vaultPath } from "./secrets-vault.js";
 import {
   type CapDecision,
   evaluateServerCap,
@@ -1188,12 +1188,31 @@ export function computeToolOverlaps(
  *  caller a retry is still on offer. UNREACHABLE is the masked-entry page's
  *  own failure: the page could not start, no browser could be opened for it,
  *  or it expired with nothing submitted. The user may have said yes to the
- *  prompt and then had nowhere to type, so it gets words of its own too. */
+ *  prompt and then had nowhere to type, so it gets words of its own too.
+ *  UNVERIFIABLE means a passphrase was typed but the vault gave it nothing to
+ *  be checked against: the value is NOT kept and the asking is NOT latched, so
+ *  a vault created later under a different passphrase can still be unlocked.
+ *  resolveServerEnv refuses a missing, unreadable or entry-less vault before
+ *  any prompt is raised, so this is reachable only when the vault CHANGED
+ *  while the prompt was open -- deleted, made unreadable, or (no check marker)
+ *  emptied of its last entry by another process. The page can stay open for
+ *  its whole TTL, so that window is real, not theoretical. */
 type VaultPromptOutcome =
   | { kind: "unlocked" }
   | { kind: "rejected" }
+  | { kind: "unverifiable" }
   | { kind: "unavailable" }
   | { kind: "unreachable"; reason: SecretPageFailure };
+
+/** "its env (A, B)" or "its headers (Authorization)": which map of the
+ *  server's entry holds the `${secret:...}` refs a vault refusal is about.
+ *  resolveServerEnv names the map in `subject` ("server env" / "remote
+ *  server headers"); a remote server's refs live in its headers, and calling
+ *  them "env" sent the user to the wrong field of bundles.json. */
+function vaultRefsClause(err: VaultPassphraseRequiredError): string {
+  const noun = /\bheaders\b/i.test(err.subject) ? "headers" : "env";
+  return `its ${noun} (${err.refKeys.join(", ")})`;
+}
 
 /** Why the masked-entry page could not take a secret. See
  *  collectSecretOnLoopbackPage. */
@@ -1494,6 +1513,12 @@ export class ConnectServer {
   // does NOT set it: the value is verified before it is stored, so a slip
   // costs one retry instead of every vault-backed server for the session.
   private vaultPassphraseElicited = false;
+  // Set alongside the latch when the latch was set by a VERIFIED passphrase
+  // (as opposed to a decline, an unreachable page, or the spent budget). Lets
+  // a later "invalid" refusal be read for what it is -- the vault was
+  // re-keyed (rotated or reset by another process) after this session
+  // unlocked it -- instead of as a generic activation failure.
+  private vaultPassphraseVerified = false;
   // How many times we have ASKED this session, across every namespace.
   // Separate from the latch so a wrong entry stays re-askable while still
   // being bounded -- the pestering maybeElicitAndRetry exists to avoid.
@@ -6690,9 +6715,15 @@ export class ConnectServer {
   // is typed by a human into a masked field: a single transposed character
   // otherwise cost the entire session. Each entry is VERIFIED against the
   // vault before it is stored (see verifyVaultPassphrase), so a wrong one is
-  // rejected without ever becoming the session passphrase, and the user gets
-  // MAX_VAULT_PASSPHRASE_PROMPTS tries in total across every server. A
-  // decline still ends it immediately -- that is an answer, not a typo.
+  // rejected without ever becoming the session passphrase -- and so is one
+  // the vault gives nothing to check against (only reachable when the vault
+  // was deleted, made unreadable, or emptied while the prompt was open: see
+  // VaultPromptOutcome), which is neither stored nor latched:
+  // storing it would let a vault created later under a different passphrase
+  // fail every vault-backed server until restart, with the latch preventing
+  // the re-ask that could fix it. The user gets MAX_VAULT_PASSPHRASE_PROMPTS
+  // tries in total across every server. A decline still ends it immediately
+  // -- that is an answer, not a typo.
   //
   // Concurrency: the prompt itself is deduped through vaultElicitInflight.
   // Prewarm runs three activations at once, so several namespaces can reach a
@@ -6715,6 +6746,7 @@ export class ConnectServer {
     if (answer?.kind === "vault") {
       if (this.shuttingDown) return this.shuttingDownRefusal(namespace);
       if (answer.outcome.kind === "rejected") return this.vaultPassphraseRejected(namespace, lastError);
+      if (answer.outcome.kind === "unverifiable") return this.vaultPassphraseUnverifiable(namespace, lastError);
       if (answer.outcome.kind === "unreachable") {
         return this.vaultPassphraseUnreachable(namespace, lastError, answer.outcome.reason);
       }
@@ -6762,13 +6794,27 @@ export class ConnectServer {
       // YAW_MCP_VAULT_PASSPHRASE was not set when they had just typed one --
       // for every namespace in the batch but the winner.
       if (outcome.kind === "rejected") return this.vaultPassphraseRejected(namespace, lastError);
+      if (outcome.kind === "unverifiable") return this.vaultPassphraseUnverifiable(namespace, lastError);
       // Same reasoning for a page that never took the passphrase: the
       // follower was waiting on that very page.
       if (outcome.kind === "unreachable") return this.vaultPassphraseUnreachable(namespace, lastError, outcome.reason);
       return null;
     }
 
-    if (this.vaultPassphraseElicited) return null;
+    if (this.vaultPassphraseElicited) {
+      // The latch was set by a passphrase that VERIFIED, and the same session
+      // passphrase (it shadows the env var) now does not open the vault: the
+      // vault was re-keyed -- rotated, or reset -- by another process since
+      // this session unlocked it. Not a fault of this server, and nothing a
+      // retry or the dispatch penalty can help with, so say what happened
+      // instead of falling into the give-up path. Re-prompting is not offered:
+      // the latch is what bounds the asking, and a fresh prompt here would
+      // reopen it for every vault-backed server on every refusal.
+      if (this.vaultPassphraseVerified && lastError.reason === "invalid") {
+        return this.vaultRekeyedRefusal(namespace, lastError);
+      }
+      return null;
+    }
 
     if (this.noRequestToAskOn(leg)) {
       log("info", "Vault is locked and no client request to ask on; the next explicit activate will ask", {
@@ -6844,9 +6890,46 @@ export class ConnectServer {
     }
 
     if (outcome.kind === "rejected") return this.vaultPassphraseRejected(namespace, lastError);
+    if (outcome.kind === "unverifiable") return this.vaultPassphraseUnverifiable(namespace, lastError);
     if (outcome.kind === "unreachable") return this.vaultPassphraseUnreachable(namespace, lastError, outcome.reason);
 
     return null;
+  }
+
+  // The result for a passphrase the user typed that the vault gave nothing to
+  // be checked against. Still reachable, though only by a race: the prompt is
+  // raised only for a vault that exists, reads, and holds an entry (see
+  // resolveServerEnv), so this means the vault was deleted, made unreadable,
+  // or emptied while the prompt was open. It was neither stored nor latched
+  // -- see promptForVaultPassphrase -- and like vaultPassphraseRejected it
+  // skips runActivateOne's give-up path: the server never got to run.
+  private vaultPassphraseUnverifiable(
+    namespace: string,
+    lastError: VaultPassphraseRequiredError,
+  ): { ok: false; message: string; isChanged: false } {
+    return {
+      ok: false,
+      isChanged: false,
+      message: `Could not load "${namespace}": your local secret vault, which ${vaultRefsClause(lastError)} references, has nothing to check the passphrase entered against -- it was deleted, became unreadable, or lost its last secret while the prompt was open -- so the passphrase was not kept. Store the referenced secrets with \`yaw-mcp secrets set <name>\` (run \`yaw-mcp doctor\` if the vault cannot be read), then activate "${namespace}" again.`,
+    };
+  }
+
+  // The result for an "invalid" refusal after this session already unlocked
+  // the vault with a VERIFIED passphrase: the vault was re-keyed since. No
+  // activationFailures penalty -- the server is fine, the vault moved.
+  private vaultRekeyedRefusal(
+    namespace: string,
+    lastError: VaultPassphraseRequiredError,
+  ): { ok: false; message: string; isChanged: false } {
+    log("info", "Vault passphrase verified earlier this session no longer unlocks the vault (re-keyed)", {
+      namespace,
+      refKeys: lastError.refKeys,
+    });
+    return {
+      ok: false,
+      isChanged: false,
+      message: `Could not load "${namespace}": the passphrase this session unlocked your local secret vault with no longer opens it -- the vault was re-keyed (rotated or reset) after it was unlocked. The vault is referenced by ${vaultRefsClause(lastError)}. Restart this MCP client to be asked for the current passphrase, or set YAW_MCP_VAULT_PASSPHRASE in yaw-mcp's own env to it and restart.`,
+    };
   }
 
   // The result for a vault passphrase the user typed that did not verify.
@@ -6867,7 +6950,7 @@ export class ConnectServer {
     return {
       ok: false,
       isChanged: false,
-      message: `Could not load "${namespace}": the passphrase entered does not unlock your local secret vault, which its env (${lastError.refKeys.join(", ")}) references.${retryHint}`,
+      message: `Could not load "${namespace}": the passphrase entered does not unlock your local secret vault, which ${vaultRefsClause(lastError)} references.${retryHint}`,
     };
   }
 
@@ -6895,7 +6978,7 @@ export class ConnectServer {
     return {
       ok: false,
       isChanged: false,
-      message: `Could not load "${namespace}": ${what}, so your local secret vault, which its env (${lastError.refKeys.join(", ")}) references, is still locked.${retryHint}`,
+      message: `Could not load "${namespace}": ${what}, so your local secret vault, which ${vaultRefsClause(lastError)} references, is still locked.${retryHint}`,
     };
   }
 
@@ -7176,7 +7259,7 @@ export class ConnectServer {
     const keys = lastError.refKeys.join(", ");
     const why = invalid
       ? `"${namespace}" cannot start: the vault passphrase yaw-mcp has does not unlock your local secret vault (${keys} reference it). The value in YAW_MCP_VAULT_PASSPHRASE is wrong or belongs to a different vault -- fix it there to stop this recurring.`
-      : `"${namespace}" cannot start: its env (${keys}) references your local secret vault, which is locked. Set YAW_MCP_VAULT_PASSPHRASE in yaw-mcp's own env to skip this prompt in future sessions.`;
+      : `"${namespace}" cannot start: ${vaultRefsClause(lastError)} references your local secret vault, which is locked. Set YAW_MCP_VAULT_PASSPHRASE in yaw-mcp's own env to skip this prompt in future sessions.`;
     const keep =
       "yaw-mcp keeps it in memory for this session only -- it is never written to disk, and never passed to the server being started.";
 
@@ -7226,7 +7309,19 @@ export class ConnectServer {
     // state that shadows the env var for every later resolve, so an unverified
     // value does not merely fail once -- it replaces a possibly-correct
     // YAW_MCP_VAULT_PASSPHRASE with a typo for the rest of the process.
-    if (!(await verifyVaultPassphrase(value))) {
+    const verdict = await verifyVaultPassphrase(value);
+    if (verdict === "unverifiable") {
+      // Nothing to check it against. NOT stored and NOT latched: a vault
+      // created later under a different passphrase would otherwise fail every
+      // vault-backed server until restart, with no prompt left to fix it.
+      log("info", "Elicited vault passphrase could not be verified (no vault to check against); not kept", {
+        namespace,
+        attempt: this.vaultPassphrasePrompts,
+      });
+      progress?.("Nothing in the vault to check that passphrase against -- not kept");
+      return { kind: "unverifiable" };
+    }
+    if (verdict !== "verified") {
       log("info", "Elicited vault passphrase did not unlock the vault", {
         namespace,
         attempt: this.vaultPassphrasePrompts,
@@ -7242,6 +7337,7 @@ export class ConnectServer {
     setSessionVaultPassphrase(value);
     // Verified, so no further asking is warranted whatever happens next.
     this.vaultPassphraseElicited = true;
+    this.vaultPassphraseVerified = true;
     return { kind: "unlocked" };
   }
 
@@ -8378,11 +8474,26 @@ export class ConnectServer {
   private async handleSecretsReport(
     serverArg?: string,
   ): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
-    // Vault key list only -- no unlock, no decryption. A missing/unreadable
-    // vault yields an empty key set, so every referenced name reports as
-    // missing rather than erroring.
-    const vault = await loadVault(vaultPath()).catch(() => null);
-    const vaultKeys = new Set(vault ? listKeys(vault) : []);
+    // Vault key list only -- no unlock, no decryption. The vault's own state
+    // is reported alongside the rows rather than folded into them: an absent
+    // vault genuinely lacks every name (and `secrets set` creates it), but an
+    // UNREADABLE one says nothing about which names it holds -- reading it as
+    // an empty key set told the model every name was missing and to
+    // `secrets set` values the vault may well already have.
+    const path = vaultPath();
+    let vaultState: { kind: "present" } | { kind: "absent" } | { kind: "unreadable"; cause: string };
+    let vaultKeys = new Set<string>();
+    try {
+      const vault = await loadVault(path);
+      if (vault) {
+        vaultKeys = new Set(listKeys(vault));
+        vaultState = { kind: "present" };
+      } else {
+        vaultState = { kind: "absent" };
+      }
+    } catch (err) {
+      vaultState = { kind: "unreadable", cause: err instanceof Error ? err.message : String(err) };
+    }
 
     // `type` and `headers` ride along so computeSecretsReport can pick the
     // channel that server actually uses. Dropping them here is what made the
@@ -8457,10 +8568,40 @@ export class ConnectServer {
       };
     }
 
-    // Names only -- no value ever appears in this payload.
-    return {
-      content: [{ type: "text", text: JSON.stringify(rows, null, 2) }],
-    };
+    // An unreadable vault: the referenced names are known, which of them the
+    // vault holds is not. Report the cause and the references, and claim
+    // nothing about `missing` -- that column would be a guess. Same layout as
+    // the absent case: JSON rows alone in content[0] (so a caller can
+    // JSON.parse it in every case), the status prose in content[1].
+    if (vaultState.kind === "unreadable") {
+      const refs = rows.map((r) => ({
+        server: r.server,
+        referenced: [...r.injectedSecrets, ...r.missing].sort(),
+        malformed: r.malformed,
+      }));
+      return {
+        content: [
+          { type: "text", text: JSON.stringify(refs, null, 2) },
+          {
+            type: "text",
+            text: `Vault status: unreadable: ${vaultState.cause}\nThe vault at ${path} exists but could not be read, so which referenced names it holds is unknown -- each row lists its references under \`referenced\`; do not \`yaw-mcp secrets set\` them on this basis. Run \`yaw-mcp doctor\` to diagnose the file.`,
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    // Names only -- no value ever appears in this payload. The rows stay the
+    // first content item (JSON, as before); an absent vault adds a status
+    // line saying why every name is missing.
+    const content = [{ type: "text", text: JSON.stringify(rows, null, 2) }];
+    if (vaultState.kind === "absent") {
+      content.push({
+        type: "text",
+        text: `Vault status: absent -- no vault exists yet at ${path}, so every referenced name is missing. \`yaw-mcp secrets set <name>\` creates the vault and stores the first value.`,
+      });
+    }
+    return { content };
   }
 
   private handleHealth(): { content: Array<{ type: string; text: string }> } {
@@ -9709,6 +9850,10 @@ export class ConnectServer {
     // makes the passphrase's lifetime the SERVER's, which is what the prompt
     // that collected it ("for this session") told the user.
     clearSessionVaultPassphrase();
+    // ...and the DERIVED key secrets-vault caches after an unlock: dropping the
+    // passphrase alone left the key that passphrase produced in module memory
+    // for the rest of the process, past the session it was unlocked for.
+    lockVault();
     this.inflightCalls.clear();
 
     log("info", "yaw-mcp shutdown complete");

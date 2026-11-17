@@ -512,10 +512,14 @@ function errEnvelope(io: { err: ReturnType<typeof vi.fn> }): Record<string, unkn
 function nonTTYIo(): {
   stdin: NodeJS.ReadableStream;
   stdout: NodeJS.WritableStream;
+  stderr: NodeJS.WritableStream;
 } {
+  // stderr too: under --json it is the end the prompts are judged on, and an
+  // uninjected one would be the real process.stderr (a TTY at a terminal).
   return {
     stdin: { isTTY: false } as unknown as NodeJS.ReadableStream,
     stdout: { isTTY: false, write: vi.fn() } as unknown as NodeJS.WritableStream,
+    stderr: { isTTY: false, write: vi.fn() } as unknown as NodeJS.WritableStream,
   };
 }
 
@@ -787,7 +791,8 @@ describe("readLineFromTTY -- a terminal that will not turn echo off", () => {
         value: "ghp_abc",
         json: true,
         home,
-        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout },
+        // --json shows the prompt on stderr, so that end is the terminal too.
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr: stdout },
       },
       io,
     );
@@ -906,7 +911,12 @@ describe("readLineFromTTY -- a terminal that will not turn echo off", () => {
     process.env.YAW_MCP_VAULT_PASSPHRASE = "a-long-passphrase";
     const stdin = new RawRefusingTTYStdin(["new-in-the-clear\n"]);
     const r = await runSecrets(
-      { action: "rotate", json: true, home, io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout } },
+      {
+        action: "rotate",
+        json: true,
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr: stdout },
+      },
       io,
     );
     expect(r.exitCode).toBe(1);
@@ -1051,7 +1061,7 @@ describe("passphrase-required message under Git Bash / MSYS", () => {
     const r = await runSecrets({ action: "set", name: "github", value: "ghp_abc", home, io: { stdin, stdout } }, io);
     expect(r.exitCode).toBe(1);
     expect(errText()).toContain(
-      "Passphrase required. Set YAW_MCP_VAULT_PASSPHRASE or run from a TTY so we can prompt.",
+      "Passphrase required. Set YAW_MCP_VAULT_PASSPHRASE or run from a TTY so we can prompt (neither stdin nor stdout is a TTY).",
     );
     expect(errText()).not.toContain("winpty");
   });
@@ -1839,7 +1849,8 @@ describe("runSecrets remove -- confirmation gate", () => {
     expect(r.exitCode).toBe(2);
     expect(errJsonLines(io)).toHaveLength(1);
     const envelope = errEnvelope(io);
-    expect(envelope.error).toContain("neither stdin nor stdout is a TTY");
+    // --json judges stderr (where its prompts go), not stdout.
+    expect(envelope.error).toContain("neither stdin nor stderr is a TTY (--json writes the prompts there)");
     expect(envelope.error).toContain("Re-run with --force to delete it.");
     expect(outText()).toBe("");
     expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
@@ -3239,7 +3250,13 @@ describe("readLineFromTTY -- key sequences never reach a no-echo prompt's value"
     io.out.mockReset();
     const stdin = new FakeTTYStdin([`a-long-${TAB}passphrase\r`]);
     const r = await runSecrets(
-      { action: "get", name: "GH", home, json: true, io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout } },
+      {
+        action: "get",
+        name: "GH",
+        home,
+        json: true,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr: stdout },
+      },
       io,
     );
     expect(r.exitCode).toBe(0);
@@ -3263,7 +3280,13 @@ describe("readLineFromTTY -- key sequences never reach a no-echo prompt's value"
     io.out.mockReset();
     const stdin = new FakeTTYStdin([`a-long-pass${ESC}[Dphrase\r`]);
     const r = await runSecrets(
-      { action: "get", name: "GH", home, json: true, io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout } },
+      {
+        action: "get",
+        name: "GH",
+        home,
+        json: true,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr: stdout },
+      },
       io,
     );
     expect(r.exitCode).toBe(0);
@@ -4577,9 +4600,12 @@ describe("runSecrets --json -- every stderr line is a JSON object", () => {
   const outText = (): string => io.out.mock.calls.map((c) => c[0] as string).join("");
   const errText = (): string => io.err.mock.calls.map((c) => c[0] as string).join("");
   const errLines = (): Array<Record<string, unknown>> => errJsonLines(io);
+  // stderr too: under --json the prompts are written there (stdout carries
+  // only the envelope), so it has to be a terminal for them to be shown.
   const ttyIo = (stdin: FakeTTYStdin): NonNullable<Parameters<typeof runSecrets>[0]["io"]> => ({
     stdin: stdin as unknown as NodeJS.ReadableStream,
     stdout: { isTTY: true, write: vi.fn() } as unknown as NodeJS.WritableStream,
+    stderr: { isTTY: true, write: vi.fn() } as unknown as NodeJS.WritableStream,
   });
 
   beforeEach(async () => {

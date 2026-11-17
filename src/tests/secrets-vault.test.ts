@@ -5,12 +5,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_KDF,
   decryptEntry,
+  defaultKdf,
   deriveKey,
   type EncryptedEntry,
   encryptEntry,
   generateSalt,
   KEY_LEN,
   LEGACY_KDF,
+  setDefaultKdfForTesting,
 } from "../secrets-crypto.js";
 import {
   checkVaultPassphrase,
@@ -54,6 +56,7 @@ beforeEach(() => {
 afterEach(() => {
   rmSync(synthHome, { recursive: true, force: true });
   lock();
+  setDefaultKdfForTesting(null);
   vi.restoreAllMocks();
 });
 
@@ -984,19 +987,19 @@ describe("secrets-vault v2: recorded KDF parameters", () => {
       entries: { github: encryptEntry("ghp_legacy", legacyKey) },
     };
 
-    // Stand in for a future release raising the cost factor. The in-place
-    // mutation is what lets this test fail: while DEFAULT_KDF equals
-    // LEGACY_KDF, an unlock() that fell back to DEFAULT_KDF would pass. That
-    // is why DEFAULT_KDF is left unfrozen (see its doc in secrets-crypto.ts).
-    const originalN = DEFAULT_KDF.N;
-    DEFAULT_KDF.N = 1 << 14;
+    // Stand in for a future release raising the cost factor. Moving the
+    // default is what lets this test fail: while the default equals
+    // LEGACY_KDF, an unlock() that fell back to the default would pass.
+    // DEFAULT_KDF itself is frozen, so the move goes through the test hook
+    // every vault-writing path reads (defaultKdf()).
+    setDefaultKdfForTesting({ N: 1 << 14, r: 8, p: 1 });
     try {
-      expect(DEFAULT_KDF.N).not.toBe(LEGACY_KDF.N);
+      expect(defaultKdf().N).not.toBe(LEGACY_KDF.N);
       lock();
       const key = await unlock(legacy, "hunter2");
       expect(getSecret(legacy, key, "github")).toBe("ghp_legacy");
     } finally {
-      DEFAULT_KDF.N = originalN;
+      setDefaultKdfForTesting(null);
       lock();
     }
   });
@@ -1327,12 +1330,13 @@ describe("checkVaultPassphrase", () => {
   });
 
   it("THROWS a key-derivation failure instead of calling the passphrase wrong", async () => {
-    // Nothing about the passphrase is known when scrypt itself fails, and
-    // "wrong" made doctor print "does NOT unlock" and `secrets reset` treat the
-    // vault as one to move aside. The kdf here is refused by node's scrypt
-    // (r=1 caps N below 2^16); loadVault would never hand it over, which is
-    // why the vault is built in memory -- it stands in for any derivation
-    // failure (the host out of memory is the realistic one).
+    // Nothing about the passphrase is known when the derivation itself fails,
+    // and "wrong" made doctor print "does NOT unlock" and `secrets reset`
+    // treat the vault as one to move aside. The kdf here is one node's scrypt
+    // refuses (r=1 caps N below 2^16); loadVault would never hand it over,
+    // which is why the vault is built in memory, and deriveKey now refuses it
+    // too, before scrypt runs -- it stands in for any derivation failure (the
+    // host out of memory is the realistic one).
     const vault: VaultFile = {
       version: 2,
       salt: generateSalt().toString("base64"),
@@ -1342,7 +1346,7 @@ describe("checkVaultPassphrase", () => {
     const err = await checkVaultPassphrase(vault, "hunter2").catch((e: unknown) => e);
     expect(err).toBeInstanceOf(Error);
     expect((err as Error).message).not.toBe(VAULT_WRONG_PASSPHRASE_ERROR);
-    expect((err as NodeJS.ErrnoException).code).toBe("ERR_CRYPTO_INVALID_SCRYPT_PARAMS");
+    expect((err as Error).message).toMatch(/^invalid kdf parameters \(N=65536 must be below 2\^\(16\*r\) for r=1\)$/);
     expect(isUnlocked()).toBe(false);
   });
 });
@@ -1443,8 +1447,19 @@ describe("KDF parameters: the CPU axis has a bound and a diagnostic", () => {
     }) as typeof process.stderr.write);
     try {
       // p=2 at the default N and r: twice the CPU, same memory -- legal, and
-      // exactly the shape the memory bound never notices.
-      const slow: VaultFile = { ...newVault(), kdf: { N: 1 << 15, r: 8, p: 2 } };
+      // exactly the shape the memory bound never notices. The vault carries a
+      // check marker under those params: an EMPTY marker-less vault is derived
+      // under the build default instead of its own kdf (establishKey), so it
+      // would never log.
+      const slowKdf = { N: 1 << 15, r: 8, p: 2 };
+      const slowSalt = generateSalt();
+      const slowKey = await deriveKey("slow-vault-passphrase", slowSalt, slowKdf);
+      const slow: VaultFile = {
+        ...newVault(),
+        salt: slowSalt.toString("base64"),
+        kdf: slowKdf,
+        check: encryptEntry(VAULT_CHECK_PLAINTEXT, slowKey, VAULT_CHECK_AAD),
+      };
       await unlock(slow, "slow-vault-passphrase");
       const debug = lines.filter((l) => l.includes("Vault KDF parameters exceed"));
       expect(debug).toHaveLength(1);
@@ -1459,5 +1474,249 @@ describe("KDF parameters: the CPU axis has a bound and a diagnostic", () => {
       if (priorLevel === undefined) delete process.env.LOG_LEVEL;
       else process.env.LOG_LEVEL = priorLevel;
     }
+  });
+});
+
+describe("unlock: key hygiene", () => {
+  /** Record every 32-byte target Buffer.prototype.copy writes into during
+   *  `fn` -- copyKey's dedicated key allocations -- so a test can check what
+   *  was left holding key bytes afterwards. */
+  async function keyCopiesDuring(fn: () => Promise<unknown>): Promise<Buffer[]> {
+    const targets: Buffer[] = [];
+    const original = Buffer.prototype.copy as (this: Buffer, ...args: unknown[]) => number;
+    const spy = vi
+      .spyOn(Buffer.prototype as unknown as { copy: (...args: unknown[]) => number }, "copy")
+      .mockImplementation(function (this: Buffer, ...args: unknown[]) {
+        const [target] = args;
+        if (target instanceof Uint8Array && target.length === KEY_LEN) targets.push(target as Buffer);
+        return original.apply(this, args);
+      });
+    try {
+      await fn().catch(() => undefined);
+      // Let the shared-derivation cleanup (a .then) run.
+      await new Promise((r) => setImmediate(r));
+    } finally {
+      spy.mockRestore();
+    }
+    return targets;
+  }
+
+  const isZero = (b: Buffer): boolean => b.every((x) => x === 0);
+
+  it("returns keys in their own allocation, on a cache miss and a cache hit", async () => {
+    let vault = newVault();
+    const first = await unlock(vault, "hunter2");
+    vault = setSecret(vault, first, "github", "ghp_abc");
+    lock();
+    const miss = await unlock(vault, "hunter2");
+    const hit = await unlock(vault, "hunter2");
+    for (const k of [first, miss, hit]) {
+      expect(k.byteOffset).toBe(0);
+      expect(k.buffer.byteLength).toBe(KEY_LEN);
+    }
+    expect(hit.buffer).not.toBe(miss.buffer);
+  });
+
+  it("zeroes every key copy a WRONG-passphrase unlock made (NFC passphrase, no retry)", async () => {
+    let vault = newVault();
+    vault = setSecret(vault, await unlock(vault, "hunter2"), "github", "ghp_abc");
+    lock();
+    const copies = await keyCopiesDuring(() => unlock(vault, "hunter3"));
+    expect(copies.length).toBeGreaterThan(0);
+    for (const c of copies) expect(isZero(c)).toBe(true);
+    expect(isUnlocked()).toBe(false);
+  });
+
+  it("zeroes the legacy-retry keys too when every form fails", async () => {
+    const DECOMPOSED = `cafe${String.fromCharCode(0x301)}-x`;
+    let vault = newVault();
+    vault = setSecret(vault, await unlock(vault, "hunter2"), "github", "ghp_abc");
+    lock();
+    const copies = await keyCopiesDuring(() => unlock(vault, DECOMPOSED));
+    // NFC, raw: at least two derivations' worth of copies.
+    expect(copies.length).toBeGreaterThanOrEqual(2);
+    for (const c of copies) expect(isZero(c)).toBe(true);
+  });
+
+  it("zero-fills the cached key it REPLACES when a different vault is unlocked", async () => {
+    let a = newVault();
+    a = setSecret(a, await unlock(a, "pass-a"), "x", "1");
+    lock();
+    let returnedA: Buffer | undefined;
+    const copies = await keyCopiesDuring(async () => {
+      returnedA = await unlock(a, "pass-a");
+    });
+    const keyA = returnedA as Buffer;
+    // The cache's own copy of A's key: every copy holding A's bytes that is
+    // not the one handed back.
+    const cachedA = copies.filter((c) => c !== keyA && c.equals(keyA));
+    expect(cachedA.length).toBeGreaterThan(0);
+
+    let b = newVault();
+    b = setSecret(b, await unlock(b, "pass-b"), "y", "2");
+    await unlock(b, "pass-b");
+    for (const c of cachedA) expect(isZero(c)).toBe(true);
+    // The caller's own copy of A is untouched.
+    expect(isZero(keyA)).toBe(false);
+    expect(getSecret(a, keyA, "x")).toBe("1");
+  });
+
+  it("lock() zero-fills the cached passphrase fingerprint as well as the key", async () => {
+    let vault = newVault();
+    vault = setSecret(vault, await unlock(vault, "hunter2"), "github", "ghp_abc");
+    lock();
+    await unlock(vault, "hunter2");
+    const filled: Buffer[] = [];
+    const original = Buffer.prototype.fill as (this: Buffer, ...args: unknown[]) => Buffer;
+    const spy = vi
+      .spyOn(Buffer.prototype as unknown as { fill: (...args: unknown[]) => Buffer }, "fill")
+      .mockImplementation(function (this: Buffer, ...args: unknown[]) {
+        if (args[0] === 0) filled.push(this);
+        return original.apply(this, args);
+      });
+    try {
+      lock();
+    } finally {
+      spy.mockRestore();
+    }
+    // The key and the fingerprint: two distinct 32-byte buffers.
+    const distinct = new Set(filled.filter((b) => b.length === 32));
+    expect(distinct.size).toBe(2);
+    for (const b of distinct) expect(isZero(b)).toBe(true);
+  });
+});
+
+describe("unlock: lock() during an in-flight derivation", () => {
+  it("is not undone when the derivation resolves; the caller still gets a working key", async () => {
+    let vault = newVault();
+    vault = setSecret(vault, await unlock(vault, "hunter2"), "github", "ghp_abc");
+    lock();
+    const pending = unlock(vault, "hunter2");
+    lock();
+    const key = await pending;
+    expect(getSecret(vault, key, "github")).toBe("ghp_abc");
+    expect(isUnlocked()).toBe(false);
+  });
+
+  it("applies to establishing a fresh vault too", async () => {
+    const pending = unlock(newVault(), "hunter2");
+    lock();
+    await pending;
+    expect(isUnlocked()).toBe(false);
+  });
+});
+
+describe("unlock: the legacy normalization retries", () => {
+  const COMPOSED = `caf${String.fromCharCode(0xe9)}-passphrase`;
+  const DECOMPOSED = `cafe${String.fromCharCode(0x301)}-passphrase`;
+
+  it("opens a legacy vault keyed on the DECOMPOSED form when given the composed one (NFD retry)", async () => {
+    // The raw-bytes retry only covers the opposite direction: COMPOSED is its
+    // own NFC form, so without an NFD attempt this vault never opens.
+    const salt = generateSalt();
+    const legacyKey = await deriveKey(DECOMPOSED, salt, LEGACY_KDF, false);
+    const vault: VaultFile = {
+      version: 1,
+      salt: salt.toString("base64"),
+      entries: { github: encryptEntry("ghp_legacy", legacyKey) },
+    };
+    const key = await unlock(vault, COMPOSED);
+    expect(getSecret(vault, key, "github")).toBe("ghp_legacy");
+  });
+
+  it("reports a corrupt MARKER, not a wrong passphrase, when a retry form opens an entry", async () => {
+    // Keyed on the raw decomposed bytes, with a damaged marker: the NFC key
+    // opens nothing (wrong), the raw retry opens the entry but not the marker.
+    // The passphrase is right, so the user must be sent to the marker fix,
+    // not to `secrets reset`.
+    const salt = generateSalt();
+    const legacyKey = await deriveKey(DECOMPOSED, salt, LEGACY_KDF, false);
+    const good = encryptEntry(VAULT_CHECK_PLAINTEXT, legacyKey, VAULT_CHECK_AAD);
+    const vault: VaultFile = {
+      version: 2,
+      salt: salt.toString("base64"),
+      kdf: { ...LEGACY_KDF },
+      entries: { github: encryptEntry("ghp_legacy", legacyKey, "github") },
+      check: { ...good, ciphertext: Buffer.from("tampered-marker").toString("base64") },
+    };
+    await expect(unlock(vault, DECOMPOSED)).rejects.toThrow(VAULT_CHECK_CORRUPT_ERROR);
+    expect(isUnlocked()).toBe(false);
+  });
+});
+
+describe("unlock + setSecret: an empty, marker-less vault is re-keyed under the build default", () => {
+  async function plantCheapEmptyVault(): Promise<string> {
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    const path = vaultPath(synthHome);
+    const planted = { version: 2, salt: generateSalt().toString("base64"), kdf: { N: 2, r: 1, p: 1 }, entries: {} };
+    writeFileSync(path, `${JSON.stringify(planted)}\n`);
+    return path;
+  }
+
+  it("does not keep a planted N=2 kdf or its salt on the first set", async () => {
+    const path = await plantCheapEmptyVault();
+    const planted = (await loadVault(path)) as VaultFile;
+    expect(planted.kdf).toEqual({ N: 2, r: 1, p: 1 });
+    const key = await unlock(planted, "hunter2");
+    const written = setSecret(planted, key, "github", "ghp_abc");
+    expect(written.kdf).toEqual(DEFAULT_KDF);
+    expect(written.salt).not.toBe(planted.salt);
+    expect(written.check).toBeDefined();
+    await saveVault(path, written);
+
+    // Round trip from disk on a cold cache: the recorded salt/kdf ARE the
+    // ones the key was derived under.
+    lock();
+    const reloaded = (await loadVault(path)) as VaultFile;
+    expect(reloaded.kdf).toEqual(DEFAULT_KDF);
+    const k2 = await unlock(reloaded, "hunter2");
+    expect(getSecret(reloaded, k2, "github")).toBe("ghp_abc");
+    lock();
+    await expect(unlock(reloaded, "hunter3")).rejects.toThrow(VAULT_WRONG_PASSPHRASE_ERROR);
+  });
+
+  it("follows the KEY, so a copy of the vault object is re-keyed the same way", async () => {
+    const vault: VaultFile = { ...newVault(), kdf: { N: 2, r: 1, p: 1 } };
+    const key = await unlock(vault, "hunter2");
+    const a = setSecret({ ...vault }, key, "a", "1");
+    const b = setSecret(vault, key, "b", "2");
+    expect(a.salt).toBe(b.salt);
+    expect(a.kdf).toEqual(DEFAULT_KDF);
+    lock();
+    const fresh = await unlock(a, "hunter2");
+    expect(getSecret(a, fresh, "a")).toBe("1");
+    expect(getSecret(b, fresh, "b")).toBe("2");
+  });
+
+  it("keeps the vault's own salt and kdf for a key that did not come from unlock", async () => {
+    const vault: VaultFile = { ...newVault(), kdf: { N: 1 << 10, r: 8, p: 1 } };
+    const key = await deriveKey("hunter2", Buffer.from(vault.salt, "base64"), { N: 1 << 10, r: 8, p: 1 });
+    const written = setSecret(vault, key, "github", "ghp_abc");
+    expect(written.salt).toBe(vault.salt);
+    expect(written.kdf).toEqual({ N: 1 << 10, r: 8, p: 1 });
+  });
+
+  it("writes the (test-overridden) build default, so it is the default that is recorded", async () => {
+    setDefaultKdfForTesting({ N: 1 << 12, r: 8, p: 1 });
+    const vault = newVault();
+    expect(vault.kdf).toEqual({ N: 1 << 12, r: 8, p: 1 });
+    const cheap: VaultFile = { ...vault, kdf: { N: 2, r: 1, p: 1 } };
+    const written = setSecret(cheap, await unlock(cheap, "pw"), "x", "1");
+    expect(written.kdf).toEqual({ N: 1 << 12, r: 8, p: 1 });
+  });
+});
+
+describe("rotateVault: a derivation failure still clears the plaintext map", () => {
+  it("clears it when deriveKey throws for the new key", async () => {
+    let vault = newVault();
+    const key = await unlock(vault, "hunter2");
+    vault = setSecret(vault, key, "github", "ghp_abc");
+    // An invalid default makes the new-key derivation throw (deriveKey
+    // validates its params) after every entry has been decrypted.
+    setDefaultKdfForTesting({ N: 3, r: 8, p: 1 });
+    const clear = vi.spyOn(Map.prototype, "clear");
+    await expect(rotateVault(vault, key, "new-pass")).rejects.toThrow(/invalid kdf parameters/);
+    expect(clear).toHaveBeenCalled();
   });
 });

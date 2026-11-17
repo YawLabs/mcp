@@ -19,6 +19,8 @@
 // test or an embedder must not be able to kill the host process by feeding
 // it a 0x03 byte. The reader resolves CANCELLED and the caller owns the exit.
 
+import { StringDecoder } from "node:string_decoder";
+
 /** Returned by the readers when the user hits ^C at a prompt. Distinct from
  *  "" (empty submission -> the caller re-prompts or takes its default) and
  *  from null (no prompt was possible). secrets-cmd maps it to exitCode 130
@@ -103,9 +105,50 @@ export function readLineFromTTY(
   return readLine(stdin, stdout, prompt, echo, keepTab).then((value) => (value === ANSWER_EOF ? "" : value));
 }
 
+/** Streams whose last read submitted on a \r that was the FINAL byte of its
+ *  chunk, on a stream that was NOT in raw mode (a pipe, or the cooked echo
+ *  fallback). A writer there can send the CRLF of one line as "\r" in one
+ *  read and "\n" at the head of the next; the next read swallows that
+ *  leading \n instead of taking it for an empty submission -- but only when
+ *  it is the first byte of the very next chunk. Never armed in raw mode: a
+ *  raw TTY sends a lone \r for every Enter, so the flag would be set after
+ *  nearly every prompt and eat a Ctrl+J (\n) typed first at the next one.
+ *  Weak, so a stream that goes away takes its flag with it. */
+const crAwaitingLf = new WeakSet<object>();
+
+/** How many leading bytes of `bytes` decode to the first `chars` UTF-16
+ *  code units of their UTF-8 decoding. Decodes one byte at a time, so a
+ *  malformed sequence maps to the bytes that really carried it rather than
+ *  to the 3-byte re-encoding of the U+FFFD it decoded as. `chars` always ends
+ *  on an ASCII terminator here, which the decoder emits on its own byte. */
+function byteOffsetOfChars(bytes: Buffer, chars: number): number {
+  const decoder = new StringDecoder("utf8");
+  let decoded = 0;
+  for (let i = 0; i < bytes.length; i++) {
+    decoded += decoder.write(bytes.subarray(i, i + 1)).length;
+    if (decoded >= chars) return i + 1;
+  }
+  return bytes.length;
+}
+
+/** How many trailing bytes of `buf` are the start of a UTF-8 sequence whose
+ *  remaining bytes have not arrived yet -- the bytes a StringDecoder holds
+ *  back. Tracked so the next chunk can be mapped back to its bytes. */
+function incompleteUtf8Tail(buf: Buffer): number {
+  for (let back = 1; back <= Math.min(3, buf.length); back++) {
+    const b = buf[buf.length - back] as number;
+    if ((b & 0xc0) === 0x80) continue; // continuation byte: keep looking for the lead
+    const need = b >= 0xf8 ? 1 : b >= 0xf0 ? 4 : b >= 0xe0 ? 3 : b >= 0xc0 ? 2 : 1;
+    return need > back ? back : 0;
+  }
+  return 0;
+}
+
 /** The reader itself. Resolves ANSWER_EOF for ^D, and for a stream that ends
  *  or closes before a line is submitted, so readAnswerFromTTY can tell it
- *  from a bare Enter; readLineFromTTY folds it into "". */
+ *  from a bare Enter; readLineFromTTY folds it into "". Rejects only when
+ *  writing the prompt, resuming stdin, or writing the closing newline in
+ *  finish() throws -- in every case after raw mode has been restored. */
 function readLine(
   stdin: NodeJS.ReadStream,
   stdout: NodeJS.WritableStream,
@@ -113,7 +156,14 @@ function readLine(
   echo: boolean,
   keepTab: boolean,
 ): Promise<string | Cancelled | NoEcho | AnswerEof> {
-  return new Promise<string | Cancelled | NoEcho | AnswerEof>((resolve) => {
+  return new Promise<string | Cancelled | NoEcho | AnswerEof>((resolve, reject) => {
+    // The entry is collected as JS strings, one per character, and joined at
+    // the end. JS strings are immutable and garbage-collected: none of these
+    // (nor the joined passphrase handed to the caller) can be zeroed, so a
+    // typed passphrase or secret value stays in the heap until the GC reuses
+    // that memory. A Buffer could be wiped, but every consumer downstream
+    // (scrypt's password argument, the vault cache) takes a string anyway, so
+    // wiping here alone would buy nothing. A known limitation, not an oversight.
     const chunks: string[] = [];
     const wasRaw = stdin.isRaw === true;
     // Raw mode BEFORE the prompt is written, so a refused no-echo read leaves
@@ -139,14 +189,32 @@ function readLine(
     // every keystroke and the Enter before the line reaches us, so echoing
     // again showed the answer twice.
     const echoBack = echo && raw;
-    stdout.write(prompt);
-    stdin.resume();
-    stdin.setEncoding("utf8");
-    // Single teardown path: detach the listeners, restore the previous raw
-    // mode, pause stdin, then settle. Every exit from onData goes through it,
-    // and so does a stream that ends (onEnd).
-    const finish = (value: string | Cancelled | AnswerEof): void => {
-      if (raw) stdout.write("\n");
+    // Decoded here rather than with stdin.setEncoding("utf8"): setEncoding
+    // cannot be undone, and it left the CALLER's stdin in string mode after
+    // the prompt. The decoder keeps the split-UTF-8 safety (a character whose
+    // bytes straddle two reads is held until it is complete). A stream that
+    // already delivers strings (the caller set an encoding, or a test pushes
+    // them) is taken as is.
+    const decoder = new StringDecoder("utf8");
+    // The undecoded bytes the decoder is holding, tracked so they can be
+    // re-buffered with the rest of the chunk when this read ends.
+    let held: Buffer = Buffer.alloc(0);
+    // The previous read on this stream submitted on a \r that ended its
+    // chunk: a \n that is the FIRST byte of the first chunk here is that
+    // Enter's other half. onData clears it after that one chunk.
+    let swallowLeadingLf = crAwaitingLf.delete(stdin);
+    // Undo everything the read set up: detach the listeners, restore the
+    // previous raw mode, pause stdin. Never throws, so it can run on the
+    // failure path below as well as on every settle.
+    // No signal handler is installed here, on purpose. A SIGTERM or SIGINT
+    // during a prompt already restores the terminal: on POSIX, node's own
+    // default handler (SignalExit in src/node.cc) calls ResetStdio(), which
+    // re-applies the termios captured at startup, then re-raises the signal;
+    // and ResetStdio also runs atexit, so a JS handler that exits does too.
+    // SIGHUP means the terminal itself is gone, so there is nothing to
+    // restore. A listener here would only replace node's handler with a
+    // weaker copy of it.
+    const teardown = (): void => {
       stdin.removeListener("data", onData);
       stdin.removeListener("end", onEnd);
       stdin.removeListener("close", onEnd);
@@ -155,9 +223,43 @@ function readLine(
       } catch {
         // ignore
       }
-      stdin.pause();
+      try {
+        stdin.pause();
+      } catch {
+        // ignore
+      }
+    };
+    // Single settle path: the closing newline, teardown, then settle. Every
+    // exit from onData goes through it, and so does a stream that ends
+    // (onEnd). `endedOnCr` marks a submit on a \r that was the last byte of
+    // its chunk (see crAwaitingLf).
+    let settled = false;
+    const finish = (value: string | Cancelled | AnswerEof, endedOnCr = false): void => {
+      if (settled) return;
+      settled = true;
+      try {
+        if (raw) stdout.write("\n");
+      } catch (err) {
+        teardown();
+        reject(err);
+        return;
+      }
+      if (endedOnCr && !raw) crAwaitingLf.add(stdin);
+      teardown();
       resolve(value);
     };
+    // Setup after raw mode is ON: a throw from either call used to escape
+    // the executor with the terminal still in raw mode (the promise rejected,
+    // but nothing restored the mode). Now it runs the same teardown first.
+    try {
+      stdout.write(prompt);
+      stdin.resume();
+    } catch (err) {
+      settled = true;
+      teardown();
+      reject(err);
+      return;
+    }
     // Escape-sequence parser state, carried ACROSS chunks: a terminal can
     // split an arrow key's bytes over two reads, and the tail of one must
     // not be taken for typed text.
@@ -171,37 +273,62 @@ function readLine(
     function onEnd(): void {
       finish(ANSWER_EOF);
     }
-    // Hoisted declaration so `finish` above can name it.
-    function onData(chunk: string): void {
+    // Hoisted declaration so `teardown` above can name it.
+    function onData(chunk: string | Buffer): void {
+      let text: string;
+      // For a Buffer chunk: the decoder's held bytes from the previous chunk
+      // followed by this one -- exactly the bytes `text` (plus the new held
+      // tail) decodes from, so a char offset in `text` maps back into it.
+      let bytes: Buffer | null = null;
+      if (typeof chunk === "string") {
+        text = chunk;
+      } else {
+        bytes = held.length > 0 ? Buffer.concat([held, chunk]) : chunk;
+        held = Buffer.from(bytes.subarray(bytes.length - incompleteUtf8Tail(bytes)));
+        text = decoder.write(chunk);
+      }
       let consumed = 0;
+      // The split-CRLF swallow applies to the first byte of this one chunk
+      // only; whatever this chunk holds, the flag does not outlive it.
+      const lfMayLead = swallowLeadingLf;
+      swallowLeadingLf = false;
+      if (lfMayLead && text.startsWith("\n")) consumed = 1;
       // Settle, then RE-BUFFER whatever follows the byte that ended this
       // read. A terminal paste arrives as one chunk, so without this,
       // pasting "passphrase\nvalue\n" consumed the passphrase and silently
       // dropped the value line -- the next prompt then hung waiting for
       // input the user believes they already gave. unshift() puts the
       // residual at the head of the stream (finish() has already paused
-      // it), so the NEXT reader's resume() picks it up. Optional call: the
+      // it), so the NEXT reader's resume() picks it up. A string chunk is
+      // handed back as a string. A Buffer chunk is handed back as the
+      // ORIGINAL bytes past the terminator (sliced, never re-encoded from the
+      // decoded text, so an invalid byte is not turned into EF BF BD), the
+      // decoder's held-back partial character included. Optional call: the
       // injectable io contract only promises a ReadableStream shape.
-      const finishAndRebuffer = (value: string | Cancelled | AnswerEof): void => {
-        finish(value);
-        const rest = chunk.slice(consumed);
-        if (rest.length > 0) (stdin as { unshift?: (c: string) => void }).unshift?.(rest);
+      const finishAndRebuffer = (value: string | Cancelled | AnswerEof, endedOnCr = false): void => {
+        finish(value, endedOnCr);
+        const back: string | Buffer =
+          bytes === null ? text.slice(consumed) : bytes.subarray(byteOffsetOfChars(bytes, consumed));
+        if (back.length > 0) (stdin as { unshift?: (c: string | Buffer) => void }).unshift?.(back);
       };
-      for (const ch of chunk) {
+      for (const ch of text.slice(consumed)) {
         consumed += ch.length;
         // ESC "[" (CSI) and ESC "O" (SS3) open a key sequence the terminal
         // sent on the user's behalf -- an arrow, Home/End, a function key --
-        // and NONE of its bytes is input: it runs through a final byte in
-        // 0x40-0x7e. Dropping only the 0x1b byte and buffering the rest
-        // inserted "[D" / "[A" into the NO-ECHO value and passphrase prompts,
-        // where the user could not see the corruption: a Left arrow to fix a
-        // typo in a pasted token stored `ghp_abc[D`, and the server later
-        // failed auth with nothing pointing at the vault. Any OTHER byte
-        // after an ESC is handled as typed: the ESC was a lone Escape key,
-        // or the meta prefix of an Alt chord, and neither is a reason to
-        // lose the keystroke that follows -- so Escape-then-Enter still
-        // submits, and Escape-then-y at a [y/N] prompt is still a y. A
-        // control byte never continues a sequence either.
+        // and NONE of its bytes is input. Dropping only the 0x1b byte and
+        // buffering the rest inserted "[D" / "[A" into the NO-ECHO value and
+        // passphrase prompts, where the user could not see the corruption: a
+        // Left arrow to fix a typo in a pasted token stored `ghp_abc[D`, and
+        // the server later failed auth with nothing pointing at the vault.
+        // Per ECMA-48 a sequence is parameter/intermediate bytes 0x20-0x3f,
+        // then ONE final byte 0x40-0x7e; anything else (a control byte, DEL,
+        // a non-ASCII character) ends the sequence and is handled as typed.
+        // Dropping every byte >= 0x20 until a final byte lost an Alt+[ chord
+        // followed by a non-ASCII passphrase. Any OTHER byte after an ESC is
+        // handled as typed too: the ESC was a lone Escape key, or the meta
+        // prefix of an Alt chord, and neither is a reason to lose the
+        // keystroke that follows -- so Escape-then-Enter still submits, and
+        // Escape-then-y at a [y/N] prompt is still a y.
         if (esc === "esc") {
           esc = "none";
           if (ch === "[" || ch === "O") {
@@ -209,11 +336,9 @@ function readLine(
             continue;
           }
         } else if (esc === "seq") {
-          if (ch >= " ") {
-            if (ch >= "@" && ch <= "~") esc = "none";
-            continue;
-          }
+          if (ch >= " " && ch <= "?") continue; // parameter / intermediate byte
           esc = "none";
+          if (ch >= "@" && ch <= "~") continue; // final byte: the sequence is over
         }
         if (ch === ESC) {
           esc = "esc";
@@ -221,9 +346,15 @@ function readLine(
         }
         if (ch === "\n" || ch === "\r") {
           // A pasted CRLF is ONE Enter: swallow the \n so it cannot be
-          // re-buffered and submit the next prompt as empty.
-          if (ch === "\r" && chunk[consumed] === "\n") consumed += 1;
-          finishAndRebuffer(chunks.join(""));
+          // re-buffered and submit the next prompt as empty. When the \r is
+          // the last byte of the chunk, the \n may still be on its way: the
+          // next read on this stream swallows it (crAwaitingLf).
+          let endedOnCr = false;
+          if (ch === "\r") {
+            if (text[consumed] === "\n") consumed += 1;
+            else endedOnCr = consumed === text.length && held.length === 0;
+          }
+          finishAndRebuffer(chunks.join(""), endedOnCr);
           return;
         }
         if (ch === CTRL_D) {

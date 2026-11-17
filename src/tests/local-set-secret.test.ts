@@ -587,6 +587,40 @@ describe("runSet --secret -- interactive, --json and reference edges", () => {
     expect(t.shown()).not.toContain(VALUE);
   });
 
+  it("--json: the value prompt is shown on the injected stderr, never stdout or process.stderr", async () => {
+    writeBundles(SAMPLE);
+    const stdin = Object.assign(new PassThrough(), {
+      isTTY: true,
+      isRaw: false,
+      setRawMode(v: boolean) {
+        stdin.isRaw = v;
+        return stdin;
+      },
+    });
+    // stdout redirected (`--json > out.json`), stderr the terminal.
+    const stdout = Object.assign(new PassThrough(), { isTTY: false });
+    const stderr = Object.assign(new PassThrough(), { isTTY: true, columns: 80 });
+    let onStdout = "";
+    stdout.on("data", (b: Buffer) => {
+      onStdout += b.toString("utf8");
+    });
+    let onStderr = "";
+    let answered = false;
+    stderr.on("data", (b: Buffer) => {
+      onStderr += b.toString("utf8");
+      if (!answered && onStderr.includes("Secret value: ")) {
+        answered = true;
+        setImmediate(() => stdin.write(`${VALUE}\r`));
+      }
+    });
+    const r = await secretSet("gh", "env.GITHUB_TOKEN", { json: true, io: { stdin, stdout, stderr } });
+    expect(r.exitCode, r.err).toBe(0);
+    expect(onStderr).toContain("Secret value: ");
+    expect(onStdout).toBe("");
+    expect(envOf("gh")).toEqual({ OTHER: "o", GITHUB_TOKEN: "${secret:gh_github_token}" });
+    expect(await readBack("gh_github_token")).toBe(VALUE);
+  });
+
   it("--json: a vault-step failure is runSecrets's one envelope, with no prose and an empty stdout", async () => {
     writeBundles(SAMPLE);
     const empty = await secretSet("gh", "env.GITHUB_TOKEN", { json: true }, "\n");
@@ -596,9 +630,11 @@ describe("runSet --secret -- interactive, --json and reference edges", () => {
     const seeded = readFileSync(bundlesPath(), "utf8");
     const wrong = await secretSet("pg", "env.NEWKEY", { json: true, passphrase: "not-the-passphrase" });
     const ttyIn = Object.assign(new PassThrough(), { isTTY: true });
+    // stderr injected too: under --json that is the end the prompt is judged
+    // on, and leaving it out would judge the real process.stderr instead.
     const noPrompt = await secretSet("gh", "env.GITHUB_TOKEN", {
       json: true,
-      io: { stdin: ttyIn, stdout: new PassThrough() },
+      io: { stdin: ttyIn, stdout: new PassThrough(), stderr: new PassThrough() },
     });
     for (const [label, r] of [
       ["empty", empty],

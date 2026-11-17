@@ -52,7 +52,17 @@ import {
 import { parseAddArgs } from "../local-add-cmd.js";
 import { resolveBinAbsolute } from "../oam-spawn.js";
 import { gitRoot } from "../paths.js";
-import { createEmptyVault, lock, saveVault, setSecret, unlock, vaultPath } from "../secrets-vault.js";
+import {
+  createEmptyVault,
+  isUnlocked,
+  lock,
+  saveVault,
+  setSecret,
+  unlock,
+  VAULT_CHECK_CORRUPT_ERROR,
+  vaultCheckCorruptHint,
+  vaultPath,
+} from "../secrets-vault.js";
 import { fakeFinishedBuild } from "./git-fixture.js";
 
 let dir: string;
@@ -1105,6 +1115,18 @@ describe("prepareGit", () => {
       expect(r.message).toContain('secret "GH_READ" is not in your vault');
     });
 
+    it("an EMPTY vault fails naming the secret without unlocking (no scrypt, no cache eviction)", async () => {
+      // A legacy vault emptied by `remove`: no marker, no entries. unlock()
+      // would re-key it under a fresh salt; the entry check must come first.
+      await saveVault(vaultPath(dir), { version: 2, salt: "AAAAAAAAAAAAAAAAAAAAAA==", entries: {} } as any);
+      process.env.YAW_MCP_VAULT_PASSPHRASE = PASS;
+      const r = await prepare();
+      expect(r).toMatchObject({ ok: false, exitCode: 1 });
+      if (r.ok) return;
+      expect(r.message).toBe('secret "GH_READ" is not in your vault. Store it: yaw-mcp secrets set GH_READ');
+      expect(isUnlocked()).toBe(false);
+    });
+
     it("fails naming the secret when the vault is locked", async () => {
       await seedVault({ GH_READ: "ghp_vaultvalue" });
       const r = await prepare();
@@ -1122,6 +1144,21 @@ describe("prepareGit", () => {
       if (!r.ok) throw new Error(r.message);
       expect(r.run.token?.value).toBe("ghp_vaultvalue");
       expect(r.secrets).toEqual({ GH_READ: "ghp_vaultvalue" });
+    });
+
+    it("carries the hand-fix when the vault's check marker is corrupt", async () => {
+      await seedVault({ GH_READ: "ghp_vaultvalue" });
+      const path = vaultPath(dir);
+      const raw = JSON.parse(readFileSync(path, "utf8"));
+      raw.check = { ...raw.check, ciphertext: Buffer.from("tampered-marker").toString("base64") };
+      writeFileSync(path, JSON.stringify(raw));
+      process.env.YAW_MCP_VAULT_PASSPHRASE = PASS;
+      const r = await prepare();
+      expect(r).toMatchObject({ ok: false });
+      if (r.ok) return;
+      expect(r.message).toContain(VAULT_CHECK_CORRUPT_ERROR);
+      expect(r.message).toContain(vaultCheckCorruptHint(path));
+      expect(r.message).not.toContain("ghp_vaultvalue");
     });
   });
 });
