@@ -1,41 +1,69 @@
 // On-disk vault for Yaw MCP secrets. Stores per-entry encrypted blobs
 // at ~/.yaw-mcp/secrets.json -- user-global only. Unlike bundles.json there
 // is NO project-local override: vaultPath() below is the single location,
-// and nothing walks up from cwd looking for one. The salt sits at the vault
-// level so the passphrase-derived key is computed once per session.
+// and nothing walks up from cwd looking for one.
 //
-// File format:
+// File format (schema v3, what this build writes):
 //   {
-//     "version": 2,
-//     "salt": "<base64>",           // 16 bytes, vault-level
-//     "kdf": { "N": 32768, "r": 8, "p": 1 },   // scrypt cost, vault-level
-//     "entries": {
-//       "<secret-name>": { iv, ciphertext, authTag }  // per-entry
+//     "version": 3,
+//     "vault_id": "<base64 16>",     // random; regenerated on every re-key
+//     "salt": "<base64 16>",         // INERT placeholder, never read by v3
+//                                    // code: shipped builds >= 0.73.1 check
+//                                    // salt/entries before the version, so
+//                                    // without it they would call the file
+//                                    // corrupt instead of "newer yaw-mcp"
+//     "keyslots": {
+//       "passphrase": { salt, kdf: {N,r,p}, wrapped: {iv,ciphertext,authTag}, digest },
+//       "recovery":   { salt, kdf: "hkdf-sha256", created, wrapped }   // optional
 //     },
-//     "check": { iv, ciphertext, authTag }  // vault-level verification marker
-//                                           // (VAULT_CHECK_PLAINTEXT under the
-//                                           // derived key; absent on a vault
-//                                           // written before it existed)
+//     "check": { iv, ciphertext, authTag },   // VAULT_CHECK_PLAINTEXT under the DEK
+//     "entries": { "<secret-name>": { iv, ciphertext, authTag } }
 //   }
 //
+// Key hierarchy (v3): a random 32-byte data-encryption key (DEK) encrypts
+// every entry and the check marker. Each key SLOT wraps the DEK (AES-256-GCM)
+// under a key-encryption key: scrypt(NFC(passphrase)) for the passphrase
+// slot, HKDF-SHA256(recovery code secret) for the optional recovery slot.
+// Every AAD carries vault_id, so an entry, marker or slot copied in from
+// another vault fails authentication:
+//   entry AAD: "yaw-mcp:v3:entry:" + vault_id + ":" + name
+//   check AAD: "yaw-mcp:v3:check:" + vault_id
+//   slot AAD:  canonical JSON of {role, vault_id, version: 3, kdf, salt,
+//              created (recovery only)}
+// The passphrase slot's `digest` (SHA-256 over the slot AAD -- so vault_id,
+// kdf and salt -- followed by iv||ciphertext||authTag; see slotDigest) covers
+// every field the unwrap depends on, so it tells a damaged slot apart from a
+// wrong passphrase.
+//
+// Every operation that changes who can open the vault -- rotate, recover,
+// `recovery new`, `recovery remove`, and the v1/v2 -> v3 migration -- goes
+// through rekeyVault: a FRESH DEK and vault_id, every entry re-encrypted. No
+// path re-wraps an existing DEK, so an old passphrase, an old recovery code or
+// an old backup only ever opens the old copy.
+//
 // SCHEMA HISTORY
-//   v1 -- no `kdf` (the scrypt parameters were a compile-time constant), and
-//         entry ciphertexts carried no additional authenticated data, so a
-//         blob could be moved between entry names and still decrypt.
+//   v1 -- {version?, salt, entries, check?}: no `kdf` (the scrypt parameters
+//         were a compile-time constant), the key is scrypt(passphrase, salt)
+//         directly, and entry ciphertexts carried no additional authenticated
+//         data, so a blob could be moved between entry names and still
+//         decrypt.
 //   v2 -- `kdf` recorded in the file, and every ciphertext is bound to the
 //         name it is stored under (AAD). A v1 vault is still read: its
-//         entries are decrypted without the binding (see decryptBound), and
-//         it stays v1 on disk until `secrets rotate` rewrites it. A v2 vault
-//         does NOT accept unbound blobs -- that is the point of the bump.
+//         entries are decrypted without the binding (see decryptBound). A v2
+//         vault does NOT accept unbound blobs -- that is the point of the bump
+//         (FIRST_BOUND_SCHEMA_VERSION).
+//   v3 -- the DEK + key-slot layout above. v1 and v2 files keep loading and
+//         unlocking exactly as before and stay on their schema until
+//         rekeyVault (rotate, `recovery new`) rewrites them as v3.
 //
-// Process lifetime: the derived key is cached in module-scoped memory
-// so subsequent operations within the same yaw-mcp process don't
-// re-prompt. lock() clears the cache of THE CALLING PROCESS ONLY -- so a
-// `yaw-mcp secrets lock` CLI run, being its own short-lived process, cannot
-// reach the cache of a yaw-mcp server that is already running (that one
-// keeps its key until it exits; see the `lock` entry in secrets-cmd.ts's
-// help). Otherwise the cache dies with the process, and nothing persists
-// across processes.
+// Process lifetime: the unlocked key (the DEK on v3, the derived key on
+// v1/v2) is cached in module-scoped memory so subsequent operations within
+// the same yaw-mcp process don't re-prompt. lock() clears the cache of THE
+// CALLING PROCESS ONLY -- so a `yaw-mcp secrets lock` CLI run, being its own
+// short-lived process, cannot reach the cache of a yaw-mcp server that is
+// already running (that one keeps its key until it exits; see the `lock`
+// entry in secrets-cmd.ts's help). Otherwise the cache dies with the process,
+// and nothing persists across processes.
 //
 // The vault is local-only: it is never uploaded anywhere. Every
 // operation reads and writes the on-disk file above.
@@ -49,13 +77,24 @@ import { setJsonKey } from "./json-key.js";
 import { log } from "./logger.js";
 import { CONFIG_DIRNAME } from "./paths.js";
 import {
+  formatRecoveryCode,
+  generateRecoverySecret,
+  parseRecoveryCode,
+  RECOVERY_CODE_WRONG_VAULT_ERROR,
+  RECOVERY_SECRET_LEN,
+} from "./recovery-code.js";
+import {
+  canonicalJson,
   copyKey,
   decryptEntry,
   defaultKdf,
   deriveKey,
+  deriveRecoveryKek,
   type EncryptedEntry,
   encryptEntry,
+  generateDek,
   generateSalt,
+  generateVaultId,
   invalidKdfParamsReason,
   isValidKdfParams,
   type KdfParams,
@@ -63,6 +102,11 @@ import {
   LEGACY_KDF,
   normalizePassphrase,
   SALT_LEN,
+  SLOT_DIGEST_LEN,
+  slotDigest,
+  unwrapKey,
+  VAULT_ID_LEN,
+  wrapKey,
 } from "./secrets-crypto.js";
 
 /** The message of a thrown value, for comparing against the exported
@@ -72,13 +116,33 @@ function errorMessage(err: unknown): string {
 }
 
 export const SECRETS_FILENAME = "secrets.json";
-export const SECRETS_SCHEMA_VERSION = 2;
+/** The schema this build WRITES (rekeyVault, createVaultV3) and the newest it
+ *  reads. v1 and v2 files are still read; see SCHEMA HISTORY above. */
+export const SECRETS_SCHEMA_VERSION = 3;
+
+/** The first schema whose ciphertexts are all bound to their names. A vault
+ *  below it (v1) may hold unbound blobs and gets the unbound decrypt fallback;
+ *  one at or above it never does. Pinned separately from
+ *  SECRETS_SCHEMA_VERSION on purpose: comparing against the CURRENT version
+ *  would hand v2 the fallback back the day v3 shipped. */
+export const FIRST_BOUND_SCHEMA_VERSION = 2;
+
+/** The key-slot layout's schema. */
+const KEYSLOT_SCHEMA_VERSION = 3;
+
+/** The last schema keyed directly by scrypt(passphrase, salt) -- what
+ *  newVault() still builds (see there). */
+const LAST_SCRYPT_SCHEMA_VERSION = 2;
 
 /** What a vault that declares NO version is assumed to be. Absent means
  *  "written before the field existed", i.e. the OLDEST schema -- never the
  *  current one, or a v1 vault's unbound ciphertexts would be read under v2
  *  rules and every entry would look corrupt. */
 const LEGACY_SCHEMA_VERSION = 1;
+
+/** The recovery slot's `kdf` field: a literal, since HKDF has no cost
+ *  parameters to record. */
+export const RECOVERY_SLOT_KDF = "hkdf-sha256";
 
 /** AAD for the vault-level `check` marker. setSecret refuses a colon in a
  *  name (SECRET_NAME_RE), so no vault this build writes can carry an entry
@@ -89,20 +153,117 @@ const LEGACY_SCHEMA_VERSION = 1;
  *  the way this module does instead of re-deriving the constant. */
 export const VAULT_CHECK_AAD = "yaw-mcp:vault-check";
 
+/** A v3 passphrase slot: the DEK wrapped under scrypt(NFC(passphrase)). */
+export interface PassphraseSlot {
+  /** base64, SALT_LEN bytes; fresh on every write of the slot. */
+  salt: string;
+  /** scrypt parameters the slot's key-encryption key is derived under. */
+  kdf: KdfParams;
+  wrapped: EncryptedEntry;
+  /** base64 SHA-256 over the slot's canonical AAD (vault_id, kdf, salt) and
+   *  the decoded iv || ciphertext || authTag of `wrapped`
+   *  (passphraseSlotDigest). */
+  digest: string;
+}
+
+/** A v3 recovery slot: the DEK wrapped under HKDF-SHA256(code secret). */
+export interface RecoverySlot {
+  salt: string;
+  kdf: typeof RECOVERY_SLOT_KDF;
+  /** ISO-8601 UTC date-time the slot (and its code) was created. */
+  created: string;
+  wrapped: EncryptedEntry;
+}
+
+export interface VaultKeyslots {
+  passphrase: PassphraseSlot;
+  recovery?: RecoverySlot;
+}
+
 export interface VaultFile {
   version: number;
-  salt: string; // base64
+  /** base64. On v1/v2 the scrypt salt the vault key is derived under; on v3
+   *  an inert random placeholder (see the file-format note at the top). */
+  salt: string;
   /** scrypt parameters the vault's key is derived under. Absent on v1
    *  vaults, which were all written with LEGACY_KDF -- the pinned historical
-   *  value, NOT whatever DEFAULT_KDF happens to be at read time. */
+   *  value, NOT whatever DEFAULT_KDF happens to be at read time. Never
+   *  present on v3 (each passphrase slot records its own). */
   kdf?: KdfParams;
+  /** v3 only: base64, VAULT_ID_LEN bytes, bound into every AAD. */
+  vault_id?: string;
+  /** v3 only: the slots that wrap the DEK. */
+  keyslots?: VaultKeyslots;
+  /** IN MEMORY ONLY, never written (saveVault strips it): loadVault found a
+   *  recovery slot it could not use and dropped it -- see VaultLoadWarning's
+   *  "recovery-malformed". */
+  recoveryMalformed?: boolean;
   entries: Record<string, EncryptedEntry>;
   /** Vault-level verification token: a fixed known constant encrypted
-   *  under the derived key. Lets unlock() detect a wrong passphrase
-   *  BEFORE caching the key (instead of silently writing entries under
-   *  a bad key). Optional for back-compat with vaults written before
-   *  this field existed -- absent => legacy vault, see unlock(). */
+   *  under the derived key (the DEK on v3). Lets unlock() detect a wrong
+   *  passphrase BEFORE caching the key (instead of silently writing entries
+   *  under a bad key). Optional for back-compat with vaults written before
+   *  this field existed -- absent => legacy vault, see unlock(). On v3 the
+   *  writer always stamps it; absent there means the documented hand-fix
+   *  for a corrupt marker was applied (vaultCheckCorruptHint), and the next
+   *  setSecret re-stamps it. */
   check?: EncryptedEntry;
+}
+
+/** A vault in the v3 key-slot layout. */
+export type V3VaultFile = VaultFile & { vault_id: string; keyslots: VaultKeyslots };
+
+/** True iff `vault` is in the v3 key-slot layout. */
+export function isV3Vault(vault: VaultFile): vault is V3VaultFile {
+  return vault.version >= KEYSLOT_SCHEMA_VERSION && typeof vault.vault_id === "string" && vault.keyslots !== undefined;
+}
+
+/** Throw on an in-memory vault that claims the key-slot schema without the
+ *  slots. loadVault refuses such a file; this catches one built in memory,
+ *  which would otherwise be keyed by its inert placeholder salt. */
+function assertCoherentVault(vault: VaultFile): void {
+  if (vault.version >= KEYSLOT_SCHEMA_VERSION && !isV3Vault(vault)) {
+    throw new Error(`vault declares schema v${vault.version} but carries no vault_id/keyslots`);
+  }
+}
+
+/** The AAD an entry named `name` is encrypted under: the v3 form binds the
+ *  vault_id as well as the name; v1/v2 bind the name alone. Exported so a test
+ *  or a recovery tool can decrypt an entry the way this module does. */
+export function vaultEntryAad(vault: VaultFile, name: string): string {
+  return isV3Vault(vault) ? `yaw-mcp:v3:entry:${vault.vault_id}:${name}` : name;
+}
+
+/** The AAD the `check` marker is encrypted under (VAULT_CHECK_AAD on v1/v2). */
+export function vaultCheckAad(vault: VaultFile): string {
+  return isV3Vault(vault) ? `yaw-mcp:v3:check:${vault.vault_id}` : VAULT_CHECK_AAD;
+}
+
+/** A key slot's AAD: canonical JSON of the slot's identity, so a slot moved
+ *  to another vault (vault_id), another role, or edited in any field the KEK
+ *  depends on fails to unwrap. */
+function slotAad(role: "passphrase", vaultId: string, slot: Pick<PassphraseSlot, "salt" | "kdf">): string;
+function slotAad(role: "recovery", vaultId: string, slot: Pick<RecoverySlot, "salt" | "kdf" | "created">): string;
+function slotAad(
+  role: "passphrase" | "recovery",
+  vaultId: string,
+  slot: { salt: string; kdf: KdfParams | string; created?: string },
+): string {
+  return canonicalJson({
+    role,
+    vault_id: vaultId,
+    version: KEYSLOT_SCHEMA_VERSION,
+    kdf: slot.kdf,
+    salt: slot.salt,
+    ...(role === "recovery" ? { created: slot.created } : {}),
+  });
+}
+
+/** The `digest` a v3 passphrase slot records: slotDigest over its AAD (which
+ *  binds vault_id, kdf and salt) and its wrapped key. Exported so tests and
+ *  repair tools stamp a slot the way the writer does. */
+export function passphraseSlotDigest(vaultId: string, slot: Pick<PassphraseSlot, "salt" | "kdf" | "wrapped">): string {
+  return slotDigest(slotAad("passphrase", vaultId, slot), slot.wrapped);
 }
 
 /** Fixed plaintext encrypted into vault.check. A successful decrypt of
@@ -124,6 +285,26 @@ export const VAULT_CHECK_CORRUPT_ERROR =
  *  CLI attaches the "forgot it? `secrets reset`" pointer by comparing against
  *  this constant, never by sniffing the message text. */
 export const VAULT_WRONG_PASSPHRASE_ERROR = "wrong passphrase for this vault (decryption failed)";
+
+/** Thrown by unlock() on a v3 vault when the passphrase slot cannot be
+ *  trusted to answer: its digest does not match the slot (its vault_id, kdf,
+ *  salt or wrapped key was damaged, so the unwrap is never attempted), or
+ *  it unwraps a key that opens neither the
+ *  check marker nor any entry (the slot and the contents disagree). Either
+ *  way the passphrase cannot be judged right or wrong. */
+export const VAULT_SLOT_DAMAGED_ERROR =
+  "the vault's passphrase slot is damaged -- the passphrase cannot be checked; `yaw-mcp secrets recover` restores access if a recovery code was saved";
+
+/** Thrown by unlockWithRecoveryCode on a vault with no usable recovery slot:
+ *  a v1/v2 vault, a v3 vault created without one, or one whose slot loadVault
+ *  dropped as malformed. */
+export const VAULT_NO_RECOVERY_ERROR = "this vault has no recovery code -- `yaw-mcp secrets reset` starts over";
+
+/** Thrown by unlockWithRecoveryCode when the code unwraps a key that opens
+ *  neither the check marker nor any entry: the recovery slot and the contents
+ *  disagree, so the code cannot restore this file. */
+export const VAULT_RECOVERY_SLOT_DAMAGED_ERROR =
+  "the vault's recovery slot does not match its contents -- the recovery code cannot restore this vault";
 
 export function vaultPath(home: string = homedir()): string {
   return join(home, CONFIG_DIRNAME, SECRETS_FILENAME);
@@ -148,7 +329,13 @@ export class VaultEntryCorruptError extends Error {
  *  own output contract (the CLI's `--json`, where stderr is one JSON object
  *  per line) can render it itself. `message` is the prose loadVault would
  *  otherwise have logged. */
-export type VaultLoadWarning = { kind: "check-malformed"; path: string; message: string };
+export type VaultLoadWarning =
+  | { kind: "check-malformed"; path: string; message: string }
+  /** v3: the recovery slot is present but unusable (bad shape, bad
+   *  `created`, a `kdf` other than RECOVERY_SLOT_KDF). The vault still loads,
+   *  without the slot, and records `recoveryMalformed: true`; `recovery new`
+   *  or `recovery remove` overwrites it. */
+  | { kind: "recovery-malformed"; path: string; message: string };
 
 export interface LoadVaultOptions {
   /** When set, loadVault reports through this and logs nothing itself: the
@@ -252,6 +439,9 @@ export async function loadVault(path: string, opts?: LoadVaultOptions): Promise<
       throw new VaultEntryCorruptError(name);
     }
   }
+  if (typeof obj.version === "number" && obj.version >= KEYSLOT_SCHEMA_VERSION) {
+    return loadV3Fields(obj, path, onWarning);
+  }
   // A malformed `check` is deliberately NOT fatal the way a malformed entry
   // is: the marker is a verification convenience the next setSecret re-stamps
   // (ensureCheck; removeSecret carries the vault's marker as it found it, so
@@ -273,6 +463,112 @@ export async function loadVault(path: string, opts?: LoadVaultOptions): Promise<
     ...(isValidKdfParams(obj.kdf) ? { kdf: obj.kdf } : {}),
     entries: obj.entries as Record<string, EncryptedEntry>,
     ...(check ? { check } : {}),
+  };
+}
+
+/** The v3 half of loadVault, run after the shared checks (root shape, salt
+ *  placeholder, version bounds, entry shapes). Validates vault_id, the
+ *  passphrase slot (fully: a malformed one leaves nothing that can open the
+ *  file, so the vault is corrupt) and the check marker's shape; a malformed
+ *  RECOVERY slot is reported and dropped instead (VaultLoadWarning
+ *  "recovery-malformed"), because the passphrase still opens everything.
+ *
+ *  A well-formed top-level `kdf` on a v3 file is dropped rather than fatal: no
+ *  writer puts one there and nothing reads it, so refusing the whole vault
+ *  over it would lock a user out for nothing. (A malformed one has already
+ *  been refused by loadVault's shared kdf check.)
+ *
+ *  A MISSING `check` loads (the hand-fix vaultCheckCorruptHint prints deletes
+ *  it, and the next setSecret re-stamps it); a present-but-malformed one is
+ *  corrupt. */
+function loadV3Fields(
+  obj: Record<string, unknown>,
+  path: string,
+  onWarning: ((warning: VaultLoadWarning) => void) | undefined,
+): VaultFile {
+  const corrupt = (what: string): Error => new Error(`vault at ${path} is corrupt: ${what}`);
+  if (typeof obj.vault_id !== "string" || !isBase64OfLength(obj.vault_id, VAULT_ID_LEN)) {
+    throw corrupt(`missing or invalid vault_id (expected ${VAULT_ID_LEN} bytes)`);
+  }
+  const keyslots = obj.keyslots;
+  if (!keyslots || typeof keyslots !== "object" || Array.isArray(keyslots)) {
+    throw corrupt("missing or invalid keyslots");
+  }
+  const slots = keyslots as Record<string, unknown>;
+  const passphrase = parsePassphraseSlot(slots.passphrase, corrupt);
+  if (obj.check !== undefined && !isEncryptedEntry(obj.check)) {
+    throw corrupt(
+      'the "check" marker is malformed -- delete the "check" key by hand and re-run; the next `yaw-mcp secrets set` re-stamps it',
+    );
+  }
+  let recovery: RecoverySlot | undefined;
+  let recoveryMalformed = false;
+  if (slots.recovery !== undefined) {
+    recovery = parseRecoverySlot(slots.recovery) ?? undefined;
+    if (!recovery) {
+      recoveryMalformed = true;
+      const message =
+        "Vault recovery slot is malformed; ignoring it (the recovery code cannot be used -- `yaw-mcp secrets recovery new` replaces it)";
+      if (onWarning) onWarning({ kind: "recovery-malformed", path, message });
+      else log("warn", message, { path });
+    }
+  }
+  return {
+    version: obj.version as number,
+    vault_id: obj.vault_id,
+    salt: obj.salt as string,
+    keyslots: { passphrase, ...(recovery ? { recovery } : {}) },
+    ...(recoveryMalformed ? { recoveryMalformed: true } : {}),
+    ...(isEncryptedEntry(obj.check) ? { check: obj.check } : {}),
+    entries: obj.entries as Record<string, EncryptedEntry>,
+  };
+}
+
+/** True iff `v` is a base64 string decoding to exactly `len` bytes. */
+function isBase64OfLength(v: unknown, len: number): boolean {
+  return typeof v === "string" && Buffer.from(v, "base64").length === len;
+}
+
+/** Validate a passphrase slot off disk, or throw `corrupt(...)` naming the
+ *  field. Rebuilt from the known fields only. */
+function parsePassphraseSlot(v: unknown, corrupt: (what: string) => Error): PassphraseSlot {
+  if (!v || typeof v !== "object" || Array.isArray(v)) throw corrupt("missing or invalid passphrase key slot");
+  const s = v as Record<string, unknown>;
+  if (!isBase64OfLength(s.salt, SALT_LEN)) throw corrupt(`passphrase key slot salt (expected ${SALT_LEN} bytes)`);
+  const kdfProblem = invalidKdfParamsReason(s.kdf);
+  if (kdfProblem !== null) throw corrupt(`passphrase key slot has invalid kdf parameters (${kdfProblem})`);
+  if (!isEncryptedEntry(s.wrapped)) throw corrupt("passphrase key slot has a malformed wrapped key");
+  if (!isBase64OfLength(s.digest, SLOT_DIGEST_LEN)) {
+    throw corrupt(`passphrase key slot digest (expected ${SLOT_DIGEST_LEN} bytes)`);
+  }
+  const kdf = s.kdf as KdfParams;
+  const w = s.wrapped;
+  return {
+    salt: s.salt as string,
+    kdf: { N: kdf.N, r: kdf.r, p: kdf.p },
+    wrapped: { iv: w.iv, ciphertext: w.ciphertext, authTag: w.authTag },
+    digest: s.digest as string,
+  };
+}
+
+/** ISO-8601 UTC date-time as Date.prototype.toISOString writes it (seconds
+ *  required, fraction optional, `Z` only). */
+const ISO_UTC_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?Z$/;
+
+/** Validate a recovery slot off disk; null when it is malformed. */
+function parseRecoverySlot(v: unknown): RecoverySlot | null {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return null;
+  const s = v as Record<string, unknown>;
+  if (!isBase64OfLength(s.salt, SALT_LEN)) return null;
+  if (s.kdf !== RECOVERY_SLOT_KDF) return null;
+  if (typeof s.created !== "string" || !ISO_UTC_RE.test(s.created) || Number.isNaN(Date.parse(s.created))) return null;
+  if (!isEncryptedEntry(s.wrapped)) return null;
+  const w = s.wrapped;
+  return {
+    salt: s.salt as string,
+    kdf: RECOVERY_SLOT_KDF,
+    created: s.created,
+    wrapped: { iv: w.iv, ciphertext: w.ciphertext, authTag: w.authTag },
   };
 }
 
@@ -299,7 +595,9 @@ export async function saveVault(path: string, vault: VaultFile): Promise<void> {
   // The file is likewise born 0o600, so the encrypted vault is never
   // group/other-readable in the window between rename and the chmod below
   // (ciphertext only, but consistent with the token/cookie files).
-  await atomicWriteFile(path, `${JSON.stringify(vault, null, 2)}\n`, "utf8", 0o600, 0o700);
+  // recoveryMalformed is loadVault's in-memory note, never part of the file.
+  const { recoveryMalformed: _inMemoryOnly, ...onDisk } = vault;
+  await atomicWriteFile(path, `${JSON.stringify(onDisk, null, 2)}\n`, "utf8", 0o600, 0o700);
   if (process.platform !== "win32") {
     // Both chmods are best-effort belt-and-suspenders over the birth modes
     // above. The DIRECTORY one is not redundant: atomicWriteFile leaves a
@@ -462,7 +760,12 @@ async function establishKey(passphrase: string): Promise<Buffer> {
   return out;
 }
 
-/** Derive the key for the given vault if not cached, else return the
+/** Unlock `vault` with `passphrase`. A v3 vault goes to unlockV3 (the slot
+ *  unwrap; returns a copy of the DEK; the cache is keyed on the slot's salt
+ *  AND digest). What follows describes the v1/v2 path, whose rules unlockV3
+ *  mirrors where they apply.
+ *
+ *  Derive the key for the given vault if not cached, else return the
  *  cached one. The cache is keyed on the salt, so a vault with a different
  *  salt (a rotated one) is a cache miss: its key is derived fresh and, once
  *  verified, replaces the cached one. No lock() is needed first: the
@@ -500,6 +803,8 @@ async function establishKey(passphrase: string): Promise<Buffer> {
  *  spawn time) would accept ANY passphrase once the first unlock had
  *  succeeded. */
 export async function unlock(vault: VaultFile, passphrase: string): Promise<Buffer> {
+  assertCoherentVault(vault);
+  if (isV3Vault(vault)) return unlockV3(vault, passphrase);
   if (!vaultVerifiesPassphrases(vault)) return establishKey(passphrase);
   const fingerprint = passphraseFingerprint(passphrase, vault.salt);
   if (
@@ -521,22 +826,7 @@ export async function unlock(vault: VaultFile, passphrase: string): Promise<Buff
   // reports "wrong passphrase" for a correct one, which is precisely the
   // lockout recording the parameters was meant to prevent.
   const params = vault.kdf ?? LEGACY_KDF;
-  // Costlier-than-default parameters are legal (a future build may write
-  // them; isValidKdfParams bounds them) but they are also the one reason a
-  // correct passphrase takes seconds instead of ~100ms, and p in particular
-  // is pure CPU the memory bound never sees. Say so at debug, so a slow
-  // unlock has a diagnostic instead of looking like a hang.
-  if (kdfExceedsDefault(params)) {
-    const d = defaultKdf();
-    log("debug", "Vault KDF parameters exceed this build's default; key derivation will be slower", {
-      N: params.N,
-      r: params.r,
-      p: params.p,
-      defaultN: d.N,
-      defaultR: d.r,
-      defaultP: d.p,
-    });
-  }
+  logSlowKdf(params);
   let key: Buffer;
   try {
     key = await unlockDerivation(vault, passphrase, params);
@@ -552,6 +842,121 @@ export async function unlock(vault: VaultFile, passphrase: string): Promise<Buff
   }
   setCache(key, vault.salt, fingerprint);
   return copyKey(key);
+}
+
+/** Costlier-than-default parameters are legal (a future build may write
+ *  them; isValidKdfParams bounds them) but they are also the one reason a
+ *  correct passphrase takes seconds instead of ~100ms, and p in particular is
+ *  pure CPU the memory bound never sees. Say so at debug, so a slow unlock has
+ *  a diagnostic instead of looking like a hang. */
+function logSlowKdf(params: Readonly<KdfParams>): void {
+  if (!kdfExceedsDefault(params)) return;
+  const d = defaultKdf();
+  log("debug", "Vault KDF parameters exceed this build's default; key derivation will be slower", {
+    N: params.N,
+    r: params.r,
+    p: params.p,
+    defaultN: d.N,
+    defaultR: d.r,
+    defaultP: d.p,
+  });
+}
+
+/** The cache identity of a v3 vault's passphrase slot: the vault_id, the
+ *  slot's salt AND its recorded digest, so a slot rewritten in this process
+ *  (a re-key, which always takes a fresh salt and vault_id; or an edit that
+ *  kept the salt) is a cache miss even under the same passphrase, and so is
+ *  a slot copied byte for byte into a file with another vault_id (a hit
+ *  returns the DEK before the digest, the AAD-bound unwrap and the contents
+ *  are checked). The "v3|" prefix keeps it disjoint from a v1/v2 cache entry,
+ *  which is keyed on the bare base64 salt. */
+function v3CacheId(vault: V3VaultFile): string {
+  const slot = vault.keyslots.passphrase;
+  return `v3|${vault.vault_id}|${slot.salt}|${slot.digest}`;
+}
+
+/** True iff the slot's recorded digest matches its identity and wrapped key. */
+function slotDigestMatches(vaultId: string, slot: PassphraseSlot): boolean {
+  const recorded = Buffer.from(slot.digest, "base64");
+  const actual = Buffer.from(passphraseSlotDigest(vaultId, slot), "base64");
+  return recorded.length === actual.length && timingSafeEqual(recorded, actual);
+}
+
+/** unlock() for a v3 vault: verify the slot digest, derive the slot's KEK
+ *  from the NFC passphrase (no legacy forms -- every v3 slot was written
+ *  under NFC), unwrap the DEK, and check it against the contents. Caches and
+ *  returns a copy of the DEK, with the same in-flight sharing, lock()
+ *  generation and zeroing discipline as the v1/v2 path.
+ *
+ *  Verdicts:
+ *    digest mismatch                          -> VAULT_SLOT_DAMAGED_ERROR
+ *                                                (no unwrap attempted)
+ *    GCM unwrap fails                         -> VAULT_WRONG_PASSPHRASE_ERROR
+ *    unwrap ok, marker fails, an entry opens  -> VAULT_CHECK_CORRUPT_ERROR
+ *    unwrap ok, marker fails, nothing opens   -> VAULT_SLOT_DAMAGED_ERROR */
+async function unlockV3(vault: V3VaultFile, passphrase: string): Promise<Buffer> {
+  const slot = vault.keyslots.passphrase;
+  const cacheId = v3CacheId(vault);
+  const fingerprint = passphraseFingerprint(passphrase, slot.salt);
+  if (
+    cachedKey &&
+    cachedSalt === cacheId &&
+    cachedFingerprint &&
+    cachedFingerprint.length === fingerprint.length &&
+    timingSafeEqual(cachedFingerprint, fingerprint)
+  ) {
+    fingerprint.fill(0);
+    return copyKey(cachedKey);
+  }
+  if (!slotDigestMatches(vault.vault_id, slot)) {
+    fingerprint.fill(0);
+    throw new Error(VAULT_SLOT_DAMAGED_ERROR);
+  }
+  const generation = cacheGeneration;
+  logSlowKdf(slot.kdf);
+  let dek: Buffer;
+  try {
+    const kek = await sharedDeriveKey(passphrase, slot.salt, slot.kdf, true);
+    try {
+      dek = unwrapKey(slot.wrapped, kek, slotAad("passphrase", vault.vault_id, slot));
+    } catch {
+      throw new Error(VAULT_WRONG_PASSPHRASE_ERROR);
+    } finally {
+      kek.fill(0);
+    }
+    const verdict = verifyV3Contents(vault, dek);
+    if (verdict !== "ok") {
+      dek.fill(0);
+      throw new Error(verdict === "marker-corrupt" ? VAULT_CHECK_CORRUPT_ERROR : VAULT_SLOT_DAMAGED_ERROR);
+    }
+  } catch (err) {
+    fingerprint.fill(0);
+    throw err;
+  }
+  if (generation !== cacheGeneration) {
+    fingerprint.fill(0);
+    return dek;
+  }
+  setCache(dek, cacheId, fingerprint);
+  return copyKey(dek);
+}
+
+/** Does `dek` agree with `vault`'s contents?
+ *    "ok"             -- the check marker verifies; or there is no marker (the
+ *                        hand-fix state) and an entry decrypts or there are no
+ *                        entries (the GCM unwrap already authenticated the key).
+ *    "marker-corrupt" -- the marker fails but an entry decrypts.
+ *    "mismatch"       -- nothing decrypts: the slot holds some other key. */
+function verifyV3Contents(vault: V3VaultFile, dek: Buffer): "ok" | "marker-corrupt" | "mismatch" {
+  const entries = Object.entries(vault.entries);
+  const someEntryDecrypts = (): boolean =>
+    entries.some(([name, e]) => canDecrypt(vault, e, dek, vaultEntryAad(vault, name)));
+  if (vault.check) {
+    if (checkMarkerMatches(vault, dek)) return "ok";
+    return someEntryDecrypts() ? "marker-corrupt" : "mismatch";
+  }
+  if (entries.length === 0 || someEntryDecrypts()) return "ok";
+  return "mismatch";
 }
 
 /** Derive and verify `vault`'s key from `passphrase`: the NFC form first,
@@ -602,11 +1007,13 @@ async function unlockDerivation(vault: VaultFile, passphrase: string, params: Re
 }
 
 /** May this vault still hold ciphertexts written WITHOUT the entry-name
- *  binding? True only for a pre-v2 file. A v2 vault refusing the unbound form
- *  is what makes the binding a real control: otherwise an attacker could strip
- *  the AAD by swapping in blobs that were never bound. */
+ *  binding? True only for a pre-v2 file (FIRST_BOUND_SCHEMA_VERSION, never
+ *  SECRETS_SCHEMA_VERSION -- that comparison handed v2 the fallback back the
+ *  moment v3 shipped). A v2/v3 vault refusing the unbound form is what makes
+ *  the binding a real control: otherwise an attacker could strip the AAD by
+ *  swapping in blobs that were never bound. */
 function allowsUnboundDecrypt(vault: VaultFile): boolean {
-  return vault.version < SECRETS_SCHEMA_VERSION;
+  return vault.version < FIRST_BOUND_SCHEMA_VERSION;
 }
 
 /** Decrypt `entry` with `aad` bound in, falling back to an UNBOUND decrypt on
@@ -659,13 +1066,14 @@ function canDecrypt(vault: VaultFile, entry: EncryptedEntry, key: Buffer, aad: s
  *    - nothing to check against (fresh/empty vault) -> accept.
  *
  *  The check marker is DECRYPTED AND COMPARED to VAULT_CHECK_PLAINTEXT, the
- *  same predicate rotateVault uses. Accepting "it decrypted" alone is
+ *  same predicate rekeyVault and verifyV3Contents use. Accepting "it decrypted" alone is
  *  equivalent under GCM (the auth tag already proves the plaintext), but the
  *  two verifiers must not disagree: if the cipher were ever changed to a
  *  non-AEAD mode, the looser one would silently accept any key. */
 function verifyKey(vault: VaultFile, key: Buffer): void {
   const entries = Object.entries(vault.entries);
-  const someEntryDecrypts = (): boolean => entries.some(([name, e]) => canDecrypt(vault, e, key, name));
+  const someEntryDecrypts = (): boolean =>
+    entries.some(([name, e]) => canDecrypt(vault, e, key, vaultEntryAad(vault, name)));
   if (vault.check) {
     if (checkMarkerMatches(vault, key)) return;
     if (someEntryDecrypts()) throw new Error(VAULT_CHECK_CORRUPT_ERROR);
@@ -677,11 +1085,11 @@ function verifyKey(vault: VaultFile, key: Buffer): void {
 }
 
 /** True iff the vault's check marker decrypts under `key` AND holds the
- *  expected constant. Shared by verifyKey and rotateVault. */
+ *  expected constant. Shared by verifyKey, verifyV3Contents and rekeyVault. */
 function checkMarkerMatches(vault: VaultFile, key: Buffer): boolean {
   if (!vault.check) return false;
   try {
-    return decryptBound(vault, vault.check, key, VAULT_CHECK_AAD) === VAULT_CHECK_PLAINTEXT;
+    return decryptBound(vault, vault.check, key, vaultCheckAad(vault)) === VAULT_CHECK_PLAINTEXT;
   } catch {
     return false;
   }
@@ -689,14 +1097,14 @@ function checkMarkerMatches(vault: VaultFile, key: Buffer): boolean {
 
 /** Return a vault guaranteed to carry a verification token under `key`.
  *  Encrypts VAULT_CHECK_PLAINTEXT when vault.check is absent; otherwise
- *  returns the vault unchanged. Module-private: setSecret and
- *  createEmptyVault below are its only callers. rotateVault stamps a fresh
- *  marker of its own (a new key needs one), and removeSecret stamps nothing
+ *  returns the vault unchanged. Module-private: setSecret is its only
+ *  caller. buildV3 stamps a fresh marker of its own (a new key needs one),
+ *  and removeSecret stamps nothing
  *  -- it leaves the marker as it found it, so a check-less vault stays
  *  check-less across a `remove` until the next `set`. */
 function ensureCheck(vault: VaultFile, key: Buffer): VaultFile {
   if (vault.check) return vault;
-  return { ...vault, check: encryptEntry(VAULT_CHECK_PLAINTEXT, key, VAULT_CHECK_AAD) };
+  return { ...vault, check: encryptEntry(VAULT_CHECK_PLAINTEXT, key, vaultCheckAad(vault)) };
 }
 
 /** True iff an unlock has been performed in this process. */
@@ -711,10 +1119,12 @@ export function isUnlocked(): boolean {
  *  the vault's": doctor's line, `secrets reset`'s refusal) must skip the
  *  check on such a vault rather than report a match that was never tested. */
 export function vaultVerifiesPassphrases(vault: VaultFile): boolean {
+  // A v3 vault always does: its passphrase slot's GCM unwrap is the check.
+  if (isV3Vault(vault)) return true;
   return vault.check !== undefined || Object.keys(vault.entries).length > 0;
 }
 
-/** The three answers to "is `passphrase` this vault's passphrase?":
+/** The answers to "is `passphrase` this vault's passphrase?":
  *    "opens"          -- unlock() succeeds.
  *    "marker-corrupt" -- unlock() fails ONLY because the check marker is
  *                        damaged (VAULT_CHECK_CORRUPT_ERROR: an entry decrypts
@@ -723,18 +1133,23 @@ export function vaultVerifiesPassphrases(vault: VaultFile): boolean {
  *                        opens until the marker is repaired
  *                        (vaultCheckCorruptHint); `rotate` refuses that vault
  *                        too -- its unlock() throws the same error before
- *                        rotateVault runs.
+ *                        rekeyVault runs.
+ *    "slot-damaged"   -- v3 only: unlock() fails with VAULT_SLOT_DAMAGED_ERROR.
+ *                        The passphrase slot cannot answer the question at
+ *                        all, so this is NEITHER right nor wrong: a caller
+ *                        must not treat it as "wrong" without saying so, and
+ *                        should point at `secrets recover`.
  *    "wrong"          -- unlock() fails with VAULT_WRONG_PASSPHRASE_ERROR
  *                        (nothing decrypts), or the passphrase is empty.
- *  Three values rather than a boolean because the callers say different
- *  things in the middle case: doctor must not print a green "unlocks" for a
- *  vault the broker refuses, and `secrets reset` must not send that user to
- *  `rotate`. There is no fourth value for a failure that says nothing about
- *  the passphrase (a key-derivation error): checkVaultPassphrase throws that
- *  instead -- see there. */
-export type VaultPassphraseVerdict = "opens" | "marker-corrupt" | "wrong";
+ *  More than a boolean because the callers say different things in the
+ *  middle cases: doctor must not print a green "unlocks" for a vault the
+ *  broker refuses, and `secrets reset` must not send that user to `rotate`.
+ *  There is no value for a failure that says nothing about the passphrase (a
+ *  key-derivation error): checkVaultPassphrase throws that instead -- see
+ *  there. */
+export type VaultPassphraseVerdict = "opens" | "marker-corrupt" | "slot-damaged" | "wrong";
 
-/** Which of the three `passphrase` is for `vault`.
+/** Which verdict `passphrase` gets for `vault`.
  *
  *  One spelling for the CLI: doctor's "does the configured passphrase open it"
  *  line and `secrets reset`'s refusal to move a vault this passphrase already
@@ -745,7 +1160,7 @@ export type VaultPassphraseVerdict = "opens" | "marker-corrupt" | "wrong";
  *  because it promises never to throw.
  *
  *  THROWS -- rather than answering "wrong" -- when unlock() fails for any
- *  reason other than its two verdict errors: in practice a scrypt failure in
+ *  reason other than its verdict errors: in practice a scrypt failure in
  *  deriveKey (the host cannot allocate the working set). That failure says
  *  nothing about the passphrase, and "wrong" would have doctor print "does
  *  NOT unlock" and `secrets reset` treat the vault as one to move aside.
@@ -763,6 +1178,7 @@ export async function checkVaultPassphrase(vault: VaultFile, passphrase: string)
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     if (msg === VAULT_CHECK_CORRUPT_ERROR) return "marker-corrupt";
+    if (msg === VAULT_SLOT_DAMAGED_ERROR) return "slot-damaged";
     if (msg === VAULT_WRONG_PASSPHRASE_ERROR) return "wrong";
     throw err;
   }
@@ -771,141 +1187,301 @@ export async function checkVaultPassphrase(vault: VaultFile, passphrase: string)
 /** The hand-fix for a corrupt check marker, worded once: the CLI's unlock
  *  error, doctor's passphrase line and `secrets reset`'s refusal all print
  *  it, and they must agree on what to delete. This module cannot name the
- *  file (unlock() never sees the path), so the caller passes it. */
+ *  file (unlock() never sees the path), so the caller passes it. Valid on v3
+ *  too: loadVault accepts a v3 file without a marker, and vault_id binding
+ *  keeps a foreign key from passing the any-entry-decrypts test. */
 export function vaultCheckCorruptHint(path: string): string {
   return `Your entries are intact: delete the "check" key from ${path} by hand and re-run -- the next \`yaw-mcp secrets set\` re-stamps it.`;
 }
 
-/** A fresh, EMPTY vault that already carries its verification marker under
- *  `passphrase` -- what `secrets reset` writes in place of the vault it moves
- *  aside. Of the two vault constructors, the one whose result verifies
- *  passphrases.
- *
- *  newVault() alone is not enough for that: an empty vault with no `check`
- *  has nothing for unlock() to verify against, so it accepts ANY passphrase
- *  and the next `secrets set` would silently establish whatever was typed
- *  then (running the confirm-twice creation prompt a second time). Stamping
- *  the marker here makes the passphrase chosen at reset THE passphrase: the
- *  next command verifies against it. setSecret's ensureCheck path is what
- *  stamps it on a first `set`; this is the same marker without an entry.
- *
- *  Derives under the parameters newVault() records in the file (defaultKdf()),
- *  so the recorded parameters and the marker's key agree. Touches neither
- *  disk nor the module key cache; the derived key is zeroed before return. */
-export async function createEmptyVault(passphrase: string): Promise<VaultFile> {
-  const vault = newVault();
-  const key = await deriveKey(passphrase, Buffer.from(vault.salt, "base64"), vault.kdf ?? defaultKdf());
+// ---------------------------------------------------------------------
+// v3 construction and re-keying.
+// ---------------------------------------------------------------------
+
+/** What createVaultV3 and rekeyVault return. `recoveryCode` is the display
+ *  form ("YAWR-...") of the recovery code the new recovery slot was written
+ *  for, present iff one was asked for. It is the ONLY copy: the caller shows
+ *  it on the prompt stream and drops it -- never to stdout, a log, an audit
+ *  record or a --json envelope. */
+export interface V3BuildResult {
+  vault: VaultFile;
+  recoveryCode?: string;
+}
+
+export interface CreateVaultV3Options {
+  /** Write a recovery slot and return its code. */
+  recovery: boolean;
+}
+
+export interface RekeyOptions {
+  /** Write a recovery slot (with a NEW code) on the re-keyed vault. False
+   *  drops any slot the old vault had. */
+  recovery: boolean;
+  /** The command name the abort messages use ("rotate aborted: ...", "re-run
+   *  rotate"). Defaults to "rotate". */
+  operation?: string;
+}
+
+/** Build a v3 vault around `plaintext` (name -> value): a fresh DEK, a fresh
+ *  vault_id, a passphrase slot under `passphrase` (NFC) and defaultKdf(), an
+ *  optional recovery slot, a check marker and every entry. `previousSlotSalt`
+ *  is the slot salt this build replaces, asserted different (it is random, so
+ *  the assert only catches a broken generator -- but the cache identity and
+ *  "an old passphrase never opens the new file" both lean on a fresh salt).
+ *  Touches neither disk nor the module key cache; every key it derives or
+ *  generates is zeroed before it returns. */
+async function buildV3(
+  plaintext: ReadonlyMap<string, string>,
+  passphrase: string,
+  recovery: boolean,
+  previousSlotSalt: string | undefined,
+): Promise<V3BuildResult> {
+  const vaultId = generateVaultId();
+  const slotSaltBytes = generateSalt();
+  const slotSalt = slotSaltBytes.toString("base64");
+  if (previousSlotSalt !== undefined && slotSalt === previousSlotSalt) {
+    throw new Error("internal error: a re-key must use a fresh passphrase slot salt");
+  }
+  const kdf: KdfParams = { ...defaultKdf() };
+  const dek = generateDek();
+  let kek: Buffer | undefined;
   try {
-    return ensureCheck(vault, key);
+    kek = await deriveKey(passphrase, slotSaltBytes, kdf);
+    const wrapped = wrapKey(dek, kek, slotAad("passphrase", vaultId, { salt: slotSalt, kdf }));
+    const keyslots: VaultKeyslots = {
+      passphrase: {
+        salt: slotSalt,
+        kdf,
+        wrapped,
+        digest: passphraseSlotDigest(vaultId, { salt: slotSalt, kdf, wrapped }),
+      },
+    };
+    let recoveryCode: string | undefined;
+    if (recovery) {
+      const issued = writeRecoverySlot(vaultId, dek);
+      keyslots.recovery = issued.slot;
+      recoveryCode = issued.code;
+    }
+    const v3: V3VaultFile = {
+      version: KEYSLOT_SCHEMA_VERSION,
+      vault_id: vaultId,
+      // The inert placeholder (see the file-format note): random, so it says
+      // nothing, and present, so builds >= 0.73.1 reach their version gate.
+      salt: generateSalt().toString("base64"),
+      keyslots,
+      entries: {},
+    };
+    v3.check = encryptEntry(VAULT_CHECK_PLAINTEXT, dek, vaultCheckAad(v3));
+    for (const [name, value] of plaintext) {
+      // setJsonKey, never `entries[name] = ...`: a legally-named "__proto__"
+      // secret (SECRET_NAME_RE allows it, and set/get/list/save/load all
+      // preserve it) would assign through Object.prototype's inherited
+      // setter, create NO own key, and silently vanish from the re-keyed
+      // vault -- destroying it, since the caller then overwrites the file.
+      setJsonKey(v3.entries, name, encryptEntry(value, dek, vaultEntryAad(v3, name)));
+    }
+    return recoveryCode === undefined ? { vault: v3 } : { vault: v3, recoveryCode };
   } finally {
-    key.fill(0);
+    dek.fill(0);
+    kek?.fill(0);
   }
 }
 
+/** A recovery slot wrapping `dek` under a freshly generated code. */
+function writeRecoverySlot(vaultId: string, dek: Buffer): { slot: RecoverySlot; code: string } {
+  const secret = generateRecoverySecret();
+  const saltBytes = generateSalt();
+  let kek: Buffer | undefined;
+  try {
+    kek = deriveRecoveryKek(secret, saltBytes);
+    const salt = saltBytes.toString("base64");
+    const created = new Date().toISOString();
+    const wrapped = wrapKey(dek, kek, slotAad("recovery", vaultId, { salt, kdf: RECOVERY_SLOT_KDF, created }));
+    return { slot: { salt, kdf: RECOVERY_SLOT_KDF, created, wrapped }, code: formatRecoveryCode(secret) };
+  } finally {
+    secret.fill(0);
+    kek?.fill(0);
+  }
+}
+
+/** A fresh, EMPTY v3 vault under `passphrase`, with a recovery slot when
+ *  `opts.recovery` -- what a first `secrets set` and `secrets reset` write.
+ *  The passphrase is THE passphrase from birth: the slot verifies it, so the
+ *  next command cannot silently establish a different one. Touches neither
+ *  disk nor the module key cache. */
+export async function createVaultV3(passphrase: string, opts: CreateVaultV3Options): Promise<V3BuildResult> {
+  return buildV3(new Map(), passphrase, opts.recovery, undefined);
+}
+
+/** A fresh, EMPTY v3 vault with no recovery slot: createVaultV3(passphrase,
+ *  {recovery: false}).vault. Kept for callers that predate recovery codes;
+ *  new code calls createVaultV3 so the recovery decision is explicit. */
+export async function createEmptyVault(passphrase: string): Promise<VaultFile> {
+  return (await createVaultV3(passphrase, { recovery: false })).vault;
+}
+
 /**
- * Re-encrypt every entry (and the verification check) under a NEW
- * passphrase. Returns a fresh VaultFile the caller saves atomically; it
+ * The ONE re-key primitive: rotate, recover, `recovery new`, `recovery
+ * remove` and the v1/v2 -> v3 migration all go through here. Decrypts every
+ * entry under `currentKey` (the DEK on v3, the scrypt-derived key on v1/v2,
+ * each with that schema's AAD rules), then builds a v3 vault with a FRESH DEK
+ * and vault_id, a new passphrase slot under `newPassphrase` (NFC, defaultKdf(),
+ * fresh salt) and, when `opts.recovery`, a new recovery slot and code. Nothing
+ * re-wraps the old DEK, so the old passphrase, the old recovery code and any
+ * backup of the old file open only the old file. Returns the new vault; it
  * does NOT touch disk or the module key cache.
  *
  * Crypto discipline -- decrypt-all-BEFORE-write:
- *   1. Decrypt the `check` marker (if present) with `oldKey`. A failure
- *      means the supplied old passphrase is wrong -- throw before any
- *      re-encryption so the caller never overwrites a good vault with a
- *      mis-keyed one.
+ *   1. Verify `currentKey` against the `check` marker (if present). A failure
+ *      means the key is wrong -- throw before any re-encryption so the
+ *      caller never overwrites a good vault with a mis-keyed one.
  *   2. Decrypt EVERY entry into memory. If ANY entry fails to decrypt
  *      (corruption, key mismatch), throw immediately -- nothing is
  *      re-encrypted, so the on-disk vault the caller still holds is
  *      untouched and recoverable. On a vault with a marker the error names
- *      the entry as corrupt, since step 1 proved the passphrase.
- *   3. Only after all plaintext is in hand: generate a fresh salt,
- *      derive `newKey`, and re-encrypt every entry + a fresh check
- *      marker under it.
+ *      the entry as corrupt, since step 1 proved the key.
+ *   3. Only after all plaintext is in hand: build the new vault.
  *
- * Rotate re-wraps the ENCRYPTION (salt + derived key), not the underlying
- * token VALUES -- a leaked token is still leaked; rotate the token at its
- * source for that.
+ * Re-keying replaces the ENCRYPTION, not the underlying token VALUES -- a
+ * leaked token is still leaked; rotate the token at its source for that.
  *
- * The caller is responsible for zeroizing the decrypted plaintext it can
- * see (the returned vault holds only ciphertext); the local `plaintext`
- * map here is best-effort cleared before return.
+ * The local `plaintext` map is best-effort cleared before return.
  */
-export async function rotateVault(vault: VaultFile, oldKey: Buffer, newPassphrase: string): Promise<VaultFile> {
-  // Step 1: verify the old key against the check marker first, so a wrong
-  // old passphrase aborts loudly before we attempt any entry decrypt.
+export async function rekeyVault(
+  vault: VaultFile,
+  currentKey: Buffer,
+  newPassphrase: string,
+  opts: RekeyOptions,
+): Promise<V3BuildResult> {
+  assertCoherentVault(vault);
+  const op = opts.operation ?? "rotate";
+  // Step 1: verify the key against the check marker first, so a wrong key
+  // aborts loudly before any entry decrypt.
   //
-  // Defensive, not a CLI-reachable path: the only caller (secrets-cmd's
-  // rotate) obtains `oldKey` from unlock(), which has already verified it
-  // against this same marker and thrown VAULT_WRONG_PASSPHRASE_ERROR on a
-  // mismatch -- so from the CLI this throw cannot fire. It stays because
-  // rotateVault is an exported building block: an embedder handing it a key
-  // from anywhere else must get the loud abort, not a vault re-encrypted
+  // Defensive, not a CLI-reachable path: the CLI obtains `currentKey` from
+  // unlock() or unlockWithRecoveryCode(), which have already verified it
+  // against this same marker -- so from the CLI this throw cannot fire. It
+  // stays because this is an exported building block: an embedder handing it
+  // a key from anywhere else must get the loud abort, not a vault re-encrypted
   // from garbage plaintext (step 2 would fail on the first entry anyway, but
   // on a vault with NO entries it would not, and the marker would be
   // re-stamped under a key nobody holds).
-  if (vault.check && !checkMarkerMatches(vault, oldKey)) {
-    throw new Error("rotate aborted: current passphrase is wrong (vault check failed to decrypt)");
+  if (vault.check && !checkMarkerMatches(vault, currentKey)) {
+    throw new Error(`${op} aborted: current passphrase is wrong (vault check failed to decrypt)`);
   }
 
   // Step 2: decrypt every entry into memory. Any failure aborts the whole
-  // rotation -- the on-disk vault stays untouched.
+  // re-key -- the on-disk vault stays untouched.
   //
   // What the failure means depends on step 1. With a marker, step 1 has just
   // PROVED the key, so an entry that fails here is damaged (or was written
   // under another key), and blaming the passphrase would send a user who
   // typed it right to `secrets reset` -- which refuses, because it opens the
-  // vault. Only a check-less (legacy) vault leaves the key unproven here.
+  // vault. Only a check-less vault leaves the key unproven here.
   const plaintext = new Map<string, string>();
-  for (const [name, entry] of Object.entries(vault.entries)) {
-    try {
-      plaintext.set(name, decryptBound(vault, entry, oldKey, name));
-    } catch {
-      // Best-effort scrub of whatever we already decrypted before bailing.
-      plaintext.clear();
-      if (vault.check) {
-        throw new Error(
-          `rotate aborted: entry "${name}" failed to decrypt, but the passphrase is right (the vault's check marker verifies under it) -- the entry is corrupt, or was written under a different passphrase than the rest of the vault. Remove it (\`yaw-mcp secrets remove ${name}\`), set it again, and re-run rotate.`,
-        );
-      }
-      throw new Error(`rotate aborted: entry "${name}" failed to decrypt under the current passphrase`);
-    }
-  }
-
-  // Step 3: all plaintext in hand -- derive a fresh key under a new salt
-  // and re-encrypt everything (entries + a fresh check marker). Rotate is
-  // also the migration path: the rewritten file is stamped with the current
-  // schema and this build's KDF parameters, and every ciphertext comes out
-  // bound to its entry name.
-  //
-  // The derivation runs INSIDE the try: a scrypt failure (the host cannot
-  // allocate the working set) must still reach the finally that clears the
-  // plaintext map.
-  const newSalt = generateSalt();
-  const kdf: KdfParams = { ...defaultKdf() };
-  let newKey: Buffer | undefined;
   try {
-    newKey = await deriveKey(newPassphrase, newSalt, kdf);
-    const entries: Record<string, EncryptedEntry> = {};
-    for (const [name, value] of plaintext) {
-      // setJsonKey, never `entries[name] = ...`: a legally-named "__proto__"
-      // secret (SECRET_NAME_RE allows it, and set/get/list/save/load all
-      // preserve it) would assign through Object.prototype's inherited
-      // setter, create NO own key, and silently vanish from the rotated
-      // vault -- destroying it, since the caller then overwrites the file.
-      setJsonKey(entries, name, encryptEntry(value, newKey, name));
+    for (const [name, entry] of Object.entries(vault.entries)) {
+      try {
+        plaintext.set(name, decryptBound(vault, entry, currentKey, vaultEntryAad(vault, name)));
+      } catch {
+        if (vault.check) {
+          throw new Error(
+            `${op} aborted: entry "${name}" failed to decrypt, but the passphrase is right (the vault's check marker verifies under it) -- the entry is corrupt, or was written under a different passphrase than the rest of the vault. Remove it (\`yaw-mcp secrets remove ${name}\`), set it again, and re-run ${op}.`,
+          );
+        }
+        throw new Error(`${op} aborted: entry "${name}" failed to decrypt under the current passphrase`);
+      }
     }
-    return {
-      version: SECRETS_SCHEMA_VERSION,
-      salt: newSalt.toString("base64"),
-      kdf,
-      entries,
-      check: encryptEntry(VAULT_CHECK_PLAINTEXT, newKey, VAULT_CHECK_AAD),
-    };
+    // Step 3: all plaintext in hand. The derivation runs INSIDE the try: a
+    // scrypt failure (the host cannot allocate the working set) must still
+    // reach the finally that clears the plaintext map.
+    return await buildV3(plaintext, newPassphrase, opts.recovery, vault.keyslots?.passphrase.salt);
   } finally {
     // Best-effort: drop references to plaintext. Strings can't be wiped in
     // V8, but clearing the map removes our held references promptly.
     plaintext.clear();
-    newKey?.fill(0);
   }
+}
+
+/**
+ * rekeyVault without a recovery slot, returning just the vault. Kept for
+ * callers that predate recovery codes; the CLI calls rekeyVault so the
+ * recovery decision is explicit (D2: there is no passphrase-only rotate --
+ * this re-keys too, and drops any recovery slot the vault had).
+ *
+ * @deprecated use rekeyVault.
+ */
+export async function rotateVault(vault: VaultFile, oldKey: Buffer, newPassphrase: string): Promise<VaultFile> {
+  return (await rekeyVault(vault, oldKey, newPassphrase, { recovery: false })).vault;
+}
+
+/** Unwrap a v3 vault's DEK with a recovery code, for `secrets recover`.
+ *
+ *  `code` is the code as the user typed it (parsed here, so the format and
+ *  typo errors of recovery-code.ts come through unchanged) or the 16-byte
+ *  secret itself (the caller keeps ownership; it is copied, not zeroed).
+ *  Returns the DEK in the caller's own allocation -- zero it when done. The
+ *  DEK is NOT cached: recovery is a one-shot that the caller follows with
+ *  rekeyVault, after which this DEK opens nothing current.
+ *
+ *  Throws:
+ *    VAULT_NO_RECOVERY_ERROR            -- v1/v2, or no usable recovery slot.
+ *    RECOVERY_CODE_FORMAT_ERROR / _TYPO_ERROR (recovery-code.ts)
+ *    RECOVERY_CODE_WRONG_VAULT_ERROR    -- the code does not unwrap the slot.
+ *    VAULT_CHECK_CORRUPT_ERROR          -- unwrapped, marker fails, an entry
+ *                                          opens (the usual hand-fix applies).
+ *    VAULT_RECOVERY_SLOT_DAMAGED_ERROR  -- unwrapped, but nothing opens. */
+export function unlockWithRecoveryCode(vault: VaultFile, code: string | Buffer): Buffer {
+  if (!isV3Vault(vault) || !vault.keyslots.recovery) throw new Error(VAULT_NO_RECOVERY_ERROR);
+  const slot = vault.keyslots.recovery;
+  let secret: Buffer;
+  if (typeof code === "string") {
+    secret = parseRecoveryCode(code);
+  } else {
+    if (code.length !== RECOVERY_SECRET_LEN) throw new Error(`recovery secret must be ${RECOVERY_SECRET_LEN} bytes`);
+    secret = copyKey(code);
+  }
+  let kek: Buffer;
+  try {
+    kek = deriveRecoveryKek(secret, Buffer.from(slot.salt, "base64"));
+  } finally {
+    secret.fill(0);
+  }
+  let dek: Buffer;
+  try {
+    dek = unwrapKey(slot.wrapped, kek, slotAad("recovery", vault.vault_id, slot));
+  } catch {
+    throw new Error(RECOVERY_CODE_WRONG_VAULT_ERROR);
+  } finally {
+    kek.fill(0);
+  }
+  const verdict = verifyV3Contents(vault, dek);
+  if (verdict !== "ok") {
+    dek.fill(0);
+    throw new Error(verdict === "marker-corrupt" ? VAULT_CHECK_CORRUPT_ERROR : VAULT_RECOVERY_SLOT_DAMAGED_ERROR);
+  }
+  return dek;
+}
+
+/** A vault's recovery-code state, for doctor and the CLI:
+ *    "set"         -- a usable recovery slot; `created` is its ISO date-time.
+ *    "none"        -- a v3 vault without one.
+ *    "malformed"   -- v3, but loadVault dropped an unusable slot.
+ *    "unsupported" -- a v1/v2 vault (rotate or `recovery new` upgrades it).
+ *  `created` is null for every state but "set". */
+export type RecoveryState = "set" | "none" | "malformed" | "unsupported";
+
+export interface RecoveryStatus {
+  state: RecoveryState;
+  created: string | null;
+}
+
+export function recoveryStatus(vault: VaultFile): RecoveryStatus {
+  if (!isV3Vault(vault)) return { state: "unsupported", created: null };
+  const slot = vault.keyslots.recovery;
+  if (slot) return { state: "set", created: slot.created };
+  if (vault.recoveryMalformed) return { state: "malformed", created: null };
+  return { state: "none", created: null };
 }
 
 // ---------------------------------------------------------------------
@@ -940,6 +1516,17 @@ export function setSecret(vault: VaultFile, key: Buffer, name: string, value: st
       `invalid secret name "${name}" -- use letters, digits, "_", "." or "-" only; other characters can never be referenced as \${secret:NAME}`,
     );
   }
+  assertCoherentVault(vault);
+  // v3: `key` is the DEK. Nothing about the key slots changes -- they are
+  // carried over byte for byte -- and there is no salt or kdf to stamp. The
+  // ciphertext is bound to vault_id and `name`; ensureCheck re-stamps a
+  // marker the hand-fix removed.
+  if (isV3Vault(vault)) {
+    return ensureCheck(
+      { ...vault, entries: { ...vault.entries, [name]: encryptEntry(value, key, vaultEntryAad(vault, name)) } },
+      key,
+    );
+  }
   // ensureCheck stamps vault.check on first save so future unlocks can
   // verify the passphrase before caching the derived key. The ciphertext is
   // bound to `name` (AAD) so it cannot be moved to another entry later.
@@ -950,7 +1537,7 @@ export function setSecret(vault: VaultFile, key: Buffer, name: string, value: st
   // from unlock(), which derived a kdf-less vault under LEGACY_KDF, so that
   // is what the file must record. (`entries` is a computed key in an object
   // literal, which defines an own property -- a "__proto__" secret survives
-  // this path; see rotateVault for the one that needed setJsonKey.)
+  // this path; see buildV3 for the one that needed setJsonKey.)
   //
   // The exception is a vault that verifies no passphrase (no marker, no
   // entries): unlock() did not trust its salt or kdf and derived `key` under
@@ -991,18 +1578,23 @@ export function getSecret(vault: VaultFile, key: Buffer, name: string): string |
   // loadVault refuses a vault whose entries are not all EncryptedEntry
   // objects, so an own property here is always one.
   if (!Object.hasOwn(vault.entries, name)) return null;
-  return decryptBound(vault, vault.entries[name], key, name);
+  return decryptBound(vault, vault.entries[name], key, vaultEntryAad(vault, name));
 }
 
-/** A fresh, EMPTY vault with NO verification marker -- what a first `secrets
- *  set` starts from when no file exists yet. Until setSecret stamps the marker
- *  (ensureCheck), unlock() has nothing to verify against and accepts ANY
- *  passphrase: right for that first `set`, whose passphrase becomes the
- *  vault's, and wrong for anything that must hold a passphrase from birth.
- *  createEmptyVault is this same vault with the marker already stamped. */
+/** A fresh, EMPTY **v2** vault (scrypt-keyed, no key slots) with NO
+ *  verification marker. Until setSecret stamps the marker (ensureCheck),
+ *  unlock() has nothing to verify against and accepts ANY passphrase.
+ *
+ *  LEGACY: this build creates vaults with createVaultV3. newVault stays as
+ *  the builder of the v2 layout every pre-v3 vault in the wild has -- the
+ *  tests that pin v1/v2 behaviour, and the migration paths, start from it --
+ *  and is pinned to v2 explicitly rather than SECRETS_SCHEMA_VERSION, since a
+ *  "v3" without key slots is a file loadVault refuses.
+ *
+ *  @deprecated for new vaults; use createVaultV3. */
 export function newVault(): VaultFile {
   return {
-    version: SECRETS_SCHEMA_VERSION,
+    version: LAST_SCRYPT_SCHEMA_VERSION,
     salt: generateSalt().toString("base64"),
     // Recorded, never assumed: see KdfParams. A vault that carries its own
     // cost factor keeps opening after the default is raised.
@@ -1121,7 +1713,7 @@ export function resolveSecretRefs(
         return full; // leave literal; reported via `missing` (see doc above)
       }
       try {
-        const value = decryptBound(vault, entry, key, name);
+        const value = decryptBound(vault, entry, key, vaultEntryAad(vault, name));
         decrypted.set(name, value);
         return value;
       } catch {

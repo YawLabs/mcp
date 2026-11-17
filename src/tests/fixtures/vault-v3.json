@@ -1,0 +1,48 @@
+{
+  "version": 3,
+  "vault_id": "IK8dQqa9kdHvr78XYBLeoA==",
+  "salt": "N250x95Bx9+D4QoHWdIxdg==",
+  "keyslots": {
+    "passphrase": {
+      "salt": "UGckWxgZOplXfLkBxFjDRA==",
+      "kdf": {
+        "N": 1024,
+        "r": 8,
+        "p": 1
+      },
+      "wrapped": {
+        "iv": "LQ6tDE9zkpxewZ+f",
+        "ciphertext": "RRcrLAdgpY11UHp1cieY4mOgOYm/uMp2hp1EAxK2Z/I=",
+        "authTag": "Z8ifCNCvEzxpUFGRc/VQPw=="
+      },
+      "digest": "fbkGgMQR/5LrQVKn1uLoRUg4Bjs5jsTzC1nfv3kbufk="
+    },
+    "recovery": {
+      "salt": "uUiWKKy4cDsQ98lBJRbtKg==",
+      "kdf": "hkdf-sha256",
+      "created": "2026-11-16T12:00:00.000Z",
+      "wrapped": {
+        "iv": "zAlDq28fvuaD04Ob",
+        "ciphertext": "eg6QwrTfiqG/heci4vmJ/FhEoSBdPAVsvSss1VmSlIQ=",
+        "authTag": "iM0x1U9TtkCH1lHDgl5bnA=="
+      }
+    }
+  },
+  "check": {
+    "iv": "+felCuFEYiQfHGkh",
+    "ciphertext": "aRNZGrHEs5JG/ZeUGiiTEQ==",
+    "authTag": "0klTcwfLO4JPHVnyH7dhCQ=="
+  },
+  "entries": {
+    "github": {
+      "iv": "7wB87ttsuakMdezJ",
+      "ciphertext": "o7AGdUN8EF0lv6GWCvo=",
+      "authTag": "77zpKRkn93E8Ak3NgLwKkQ=="
+    },
+    "aws": {
+      "iv": "kN91CoyCMp5qoZOa",
+      "ciphertext": "hpUDZRMSHFmvbwRpj94=",
+      "authTag": "RGXgT/y1NZBK4yH+x3qNmA=="
+    }
+  }
+}

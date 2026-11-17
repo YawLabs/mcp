@@ -50,7 +50,7 @@ import { displaySafe } from "./trust-cmd.js";
 import type { UpstreamServerConfig } from "./types.js";
 
 export const SET_USAGE = `Usage: yaw-mcp set <slug-or-namespace> <key=value> [<key=value> ...] [flags]
-       yaw-mcp set <slug-or-namespace> env.KEY --secret [--secret-name NAME] [--stdin] [flags]
+       yaw-mcp set <slug-or-namespace> env.KEY --secret [--secret-name NAME] [--stdin] [--no-recovery] [flags]
 
   Change per-server fields in your local ~/.yaw-mcp/bundles.json without
   hand-editing it. Only the entry you name is rewritten -- comments,
@@ -132,6 +132,9 @@ Flags:
                       "_", "." or "-").
   --stdin             With --secret: read the value from stdin whole even at
                       a terminal, instead of the no-echo prompt.
+  --no-recovery       With --secret, when the store creates the vault:
+                      create it WITHOUT a recovery code (yaw-mcp secrets set
+                      --no-recovery). Ignored when the vault exists.
   --json              Emit the result as JSON. env values are never printed.
                       A refused or declined confirmation emits an
                       {"ok":false,...} envelope on stderr, so a script never
@@ -177,6 +180,9 @@ export interface SetCommandOptions {
   /** `--stdin`: runSecrets's `fromStdin` -- read the value from stdin whole
    *  even at a terminal. Only with --secret. */
   fromStdin?: boolean;
+  /** `--no-recovery`: runSecrets's `noRecovery` -- a vault this store
+   *  creates gets no recovery code. Only with --secret. */
+  noRecovery?: boolean;
   /** The vault passphrase, handed to runSecrets as its embedder/test hook.
    *  The CLI parser never sets it: the env var or the TTY prompt does. */
   passphrase?: string;
@@ -240,6 +246,7 @@ export function parseSetArgs(
     else if (a === "--force" || a === "-y" || a === "--yes") opts.force = true;
     else if (a === "--secret") opts.secret = true;
     else if (a === "--stdin") opts.fromStdin = true;
+    else if (a === "--no-recovery") opts.noRecovery = true;
     else if (a === "--secret-name") {
       const v = argv[++i];
       // A following flag is a MISSING name, not a vault entry called "--json"
@@ -283,6 +290,9 @@ function checkSecretArgs(opts: SetCommandOptions): string | null {
   }
   if (opts.fromStdin && !opts.secret) {
     return "yaw-mcp set: --stdin only applies with --secret -- a plain value is given as key=value.";
+  }
+  if (opts.noRecovery && !opts.secret) {
+    return "yaw-mcp set: --no-recovery only applies with --secret (it is about the vault the secret is stored in).";
   }
   if (!opts.secret) return null;
   const assignments = opts.assignments ?? [];
@@ -941,6 +951,10 @@ interface SecretWrite {
   ref: string;
   replaced: boolean;
   freshVault: boolean;
+  /** runSecrets's `recovery` field: whether the vault as saved carries a
+   *  recovery slot. Known only under --json (the prose success line does not
+   *  say); null otherwise. Never the code itself. */
+  recovery: "set" | "none" | null;
 }
 
 /** Apply the edits to the text, write the file once, and report. */
@@ -1064,6 +1078,7 @@ async function applyAssignments(
                 ref: secret.ref,
                 replaced: secret.replaced,
                 fresh_vault: secret.freshVault,
+                recovery: secret.recovery,
               },
             }
           : {}),
@@ -1224,6 +1239,13 @@ async function runSetSecret(opts: SetCommandOptions, ctx: SetContext): Promise<S
       json: opts.json,
       force: opts.force,
       fromStdin: opts.fromStdin,
+      // A vault this store creates gets a recovery code unless --no-recovery
+      // -- which is also the flag runSecrets's exhausted-confirm abort names,
+      // so that hint is one this command accepts.
+      noRecovery: opts.noRecovery,
+      // The agent-session check (no code shown under CLAUDECODE / AI_AGENT)
+      // reads the env this command was told to run under, not process.env.
+      env: opts.env,
       home,
       cwd: opts.cwd,
       passphrase: opts.passphrase,
@@ -1245,17 +1267,19 @@ async function runSetSecret(opts: SetCommandOptions, ctx: SetContext): Promise<S
   const vaultText = vaultOut.join("");
   let replaced = vaultText.startsWith("Replaced secret");
   let freshVault = vaultText.startsWith("Created vault");
+  let recovery: SecretWrite["recovery"] = null;
   if (opts.json) {
     try {
-      const env = JSON.parse(vaultText.trim()) as { replaced?: unknown; fresh_vault?: unknown };
+      const env = JSON.parse(vaultText.trim()) as { replaced?: unknown; fresh_vault?: unknown; recovery?: unknown };
       replaced = env.replaced === true;
       freshVault = env.fresh_vault === true;
+      recovery = env.recovery === "set" || env.recovery === "none" ? env.recovery : null;
     } catch {
       // Unparseable success output would be a runSecrets bug; the write
       // happened either way, so report it as a plain store.
     }
   }
-  const secret: SecretWrite = { key, name, ref, replaced, freshVault };
+  const secret: SecretWrite = { key, name, ref, replaced, freshVault, recovery };
 
   const finishCmd = `yaw-mcp set ${pre.namespace} env.${key}='${ref}'`;
   const finishHint = `  The secret "${name}" IS in the vault; finish with \`${finishCmd}\`.`;
@@ -1277,7 +1301,7 @@ async function runSetSecret(opts: SetCommandOptions, ctx: SetContext): Promise<S
           path,
           namespace: pre.namespace,
           stored: true,
-          secret: { name, ref, replaced, fresh_vault: freshVault },
+          secret: { name, ref, replaced, fresh_vault: freshVault, recovery },
         }),
       );
     } else {

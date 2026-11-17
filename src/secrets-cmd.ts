@@ -1,9 +1,17 @@
 // `yaw-mcp secrets <action>` -- manage the encrypted secret vault at
 // ~/.yaw-mcp/secrets.json.
 //
-// Actions: set / get / list / remove / lock / rotate / reset / audit. The
-// vault is local-only; spawn-time substitution of ${secret:NAME} references
-// in bundles.json env values lives in upstream.ts.
+// Actions: set / get / list / remove / lock / rotate / reset / audit /
+// recover / recovery (new | remove). The vault is local-only; spawn-time
+// substitution of ${secret:NAME} references in bundles.json env values lives
+// in upstream.ts.
+//
+// Recovery codes: a vault created at a terminal carries a recovery slot, and
+// its code is shown ONCE, on the prompt stream only (never io.out, io.err, a
+// --json envelope, a log or the audit log), then confirmed by typing two of
+// its groups back -- see issueRecoveryCode. An AI agent session (CLAUDECODE or
+// AI_AGENT in the INJECTED env, opts.env) never sees one: the vault is
+// created without a slot and the user is nudged to add one at a terminal.
 //
 // Passphrase resolution (highest precedence first -- resolvePassphrase):
 //   0. opts.passphrase, the embedder/test hook (the CLI parser never sets it)
@@ -20,30 +28,41 @@
 // runSecrets for why remove and set differ. --force skips only the
 // confirmation, never the passphrase.
 
-import { createHash } from "node:crypto";
+import { createHash, randomInt } from "node:crypto";
 import { chmod, copyFile, constants as fsConstants, readFile, unlink } from "node:fs/promises";
-import { homedir } from "node:os";
+import { homedir, constants as osConstants } from "node:os";
+import { resolve as resolvePath } from "node:path";
 import { loadLocalBundles } from "./local-bundles.js";
 import { createStreamWriter } from "./logger.js";
 import { isInteractivePrompt } from "./readline-question.js";
-import { type AuditEvent, readAuditLog } from "./secrets-audit.js";
+import {
+  normalizeRecoveryGroup,
+  parseRecoveryCode,
+  RECOVERY_CODE_FORMAT_ERROR,
+  RECOVERY_CODE_TYPO_ERROR,
+  recoveryCodeGroups,
+} from "./recovery-code.js";
+import { type AuditEvent, type AuditEventKind, appendAuditEvent, readAuditLog } from "./secrets-audit.js";
 import {
   checkVaultPassphrase,
   collectSecretRefNames,
-  createEmptyVault,
+  createVaultV3,
   getSecret,
   listKeys,
   loadVault,
   lock,
   newVault,
+  recoveryStatus,
+  rekeyVault,
   removeSecret,
-  rotateVault,
   SECRET_NAME_RE,
   SECRETS_SCHEMA_VERSION,
   saveVault,
   setSecret,
   unlock,
+  unlockWithRecoveryCode,
   VAULT_CHECK_CORRUPT_ERROR,
+  VAULT_NO_RECOVERY_ERROR,
   VAULT_WRONG_PASSPHRASE_ERROR,
   VaultEntryCorruptError,
   type VaultFile,
@@ -93,32 +112,62 @@ Actions:
                           vault on disk (which only ever holds ciphertext),
                           and does NOT revoke anything. To cut off a running
                           server, stop the server.
-  rotate                  Re-encrypt every entry under a NEW passphrase
-                          (fresh salt + derived key). Re-wraps the
-                          ENCRYPTION, NOT the underlying token values -- a
-                          leaked token is still leaked; rotate it at its
-                          source. Reads the current passphrase, then the
-                          new one (env YAW_MCP_VAULT_PASSPHRASE_NEW or a
-                          confirm-twice TTY prompt). Also the only upgrade
-                          path for a vault file written under an older
-                          schema: the rewritten file carries the current
-                          version and every ciphertext is bound to its
-                          entry name. (Every other command leaves the
+  rotate                  Re-encrypt every entry under a NEW passphrase and
+                          a fresh data key: the old passphrase, any old
+                          recovery code and any backup of the old file
+                          open only the old file. Re-keys the ENCRYPTION,
+                          NOT the underlying token values -- a leaked token
+                          is still leaked; rotate it at its source. Reads
+                          the current passphrase, then the new one (env
+                          YAW_MCP_VAULT_PASSPHRASE_NEW or a confirm-twice
+                          TTY prompt). A vault with a recovery code gets a
+                          NEW code, shown at the terminal, so rotating it
+                          needs one -- or --no-recovery, which drops the
+                          code. Also upgrades a vault file written under an
+                          older schema to the current one (as does
+                          \`recovery new\`); every other command leaves the
                           file's schema as it found it, and says so on
-                          stderr when it is behind.)
+                          stderr when it is behind.
   reset                   Start the vault over when its passphrase is
-                          forgotten. Moves the existing file aside as
+                          forgotten and no recovery code was saved (with
+                          one, use \`recover\`: it keeps every entry). Moves
+                          the existing file aside as
                           secrets.json.reset-<timestamp>, next to it (it
                           still opens under the old passphrase, should that
                           turn up), prints the entry names it held (plaintext
                           keys, so no passphrase is needed) so you know what
                           to set again, and creates an empty vault under a
                           NEW passphrase -- confirmed twice on a TTY, or
-                          YAW_MCP_VAULT_PASSPHRASE when it is set. Asks you
-                          to type RESET first, and refuses without --force
-                          when there is no TTY to ask on. Refuses when the
+                          YAW_MCP_VAULT_PASSPHRASE when it is set -- with a
+                          new recovery code at a terminal. Asks you to type
+                          RESET first, and refuses without --force when
+                          there is no TTY to ask on. Refuses when the
                           passphrase it is given already opens the vault:
                           that is \`rotate\`, not a reset.
+  recover [--file <path>] Get back into a vault whose passphrase is
+                          forgotten, with the recovery code saved when it
+                          was created. Every entry is kept. Needs a
+                          terminal: the code is typed at a no-echo prompt,
+                          never passed in argv or the env. Then asks for a
+                          NEW passphrase (env YAW_MCP_VAULT_PASSPHRASE_NEW
+                          or a confirm-twice TTY prompt -- never
+                          YAW_MCP_VAULT_PASSPHRASE, which holds the old
+                          one). The vault is re-keyed, so the code you used
+                          stops working; a new code is shown in its place.
+                          --file recovers a copy moved aside (a reset's
+                          secrets.json.reset-<timestamp>) into the vault
+                          path; it refuses (exit 2) when a vault is already
+                          there -- move that one aside first. In an AI
+                          agent session it refuses unless --no-recovery,
+                          since the new code could not be shown.
+  recovery new            Add a recovery code to the vault, or replace the
+                          one it has (the old code stops working). Needs the
+                          passphrase and a terminal to show the code on.
+                          Upgrades an older-schema vault on the way.
+  recovery remove         Drop the vault's recovery code (the vault is
+                          re-keyed, so the old code opens nothing current).
+                          Confirmed on a TTY; refuses without --force when
+                          there is no TTY to ask on.
   audit [--secret NAME] [--server NS]
                           Show the local secret-resolution audit trail
                           (~/.yaw-mcp/secrets-audit.log): which secret
@@ -144,8 +193,9 @@ Flags:
                           carries one JSON object per line: {"warning":...}
                           lines (a
                           schema-behind file, a malformed check marker, a
-                          short passphrase, a vault just created, rotated
-                          or reset, a value printed in cleartext to a
+                          short passphrase, a vault just created, rotated,
+                          recovered or reset, a vault created without a
+                          recovery code, a value printed in cleartext to a
                           terminal, a bundles.json or trust store that
                           \`set\` could not read or parse) and, on failure,
                           the {"ok":false,"error":...} envelope last -- an
@@ -169,11 +219,22 @@ Flags:
                           never appears in argv. Cannot be combined with
                           --value.
   --force                Skip the destructive-action confirmation
-                          (remove, reset, and a set that overwrites an
-                          existing name). Required for remove and reset
+                          (remove, reset, recovery remove, and a set that
+                          overwrites an existing name). Required for remove,
+                          reset and recovery remove
                           when stdin or stdout is not a TTY (both ends are
-                          needed to ask). NEVER skips the passphrase.
+                          needed to ask). NEVER skips the passphrase or the
+                          recovery code, and never lets recover --file
+                          replace a vault already at the vault path.
                           Accepted and ignored on the other actions.
+  --no-recovery          Create, reset, rotate or recover the vault
+                          WITHOUT a recovery code (set, reset, rotate and
+                          recover only; on set it matters only when the set
+                          creates the vault). Rotate needs it to run
+                          without a terminal on a vault that has a code --
+                          the code is then dropped.
+  --file <path>          (recover only) Recover the vault copy at <path>
+                          instead of the one at the vault path.
   --secret <name>         (audit only) Filter to one secret name.
   --server <ns>           (audit only) Filter to one server namespace.
 
@@ -185,25 +246,70 @@ Passphrase:
   NEW passphrase comes from YAW_MCP_VAULT_PASSPHRASE_NEW (or a TTY
   confirm-twice prompt).
 
+Recovery code:
+  Creating a vault at a terminal (the first set, or reset) shows a recovery
+  code -- YAWR- and seven groups of four -- ONCE, and asks you to type two of
+  its groups back before anything is saved. Write it down and keep it apart
+  from the passphrase: it opens the vault on its own. It is shown only on the
+  terminal you are typing at (the prompt stream) -- never in a redirected or
+  captured stdout, a --json envelope, a log or the audit log -- and never shown
+  in an AI agent session (CLAUDECODE or AI_AGENT set): there, and off a
+  terminal, the vault is created without one and \`recovery new\` adds one
+  later. Everything is local -- no server, email or account is involved.
+
 Forgot the passphrase?
-  There is no recovery: the file holds only ciphertext under a key derived
-  from the passphrase, and nothing else -- no server, no recovery key -- can
-  open it. \`yaw-mcp secrets reset\` is the way back to a working vault: it
+  With the recovery code: \`yaw-mcp secrets recover\` keeps every entry and
+  sets a new passphrase. Without one there is no way back in: the file holds
+  only ciphertext, and nothing else -- no server, no account -- can open it.
+  \`yaw-mcp secrets reset\` is then the way back to a working vault: it
   moves the old file aside (kept, in case the passphrase turns up), lists
   the entry names you have to set again, and starts an empty vault under a
   new passphrase.`;
 
-/** The eight actions, spelled once: the parser accepts exactly these and
- *  runSecrets refuses anything else before it reads the vault. */
-const SECRETS_ACTIONS = ["set", "get", "list", "remove", "lock", "rotate", "reset", "audit"] as const;
+/** The actions, spelled once: the parser accepts exactly these and
+ *  runSecrets refuses anything else before it reads the vault. Exported for
+ *  completion-cmd.ts's drift test. */
+export const SECRETS_ACTIONS = [
+  "set",
+  "get",
+  "list",
+  "remove",
+  "lock",
+  "rotate",
+  "reset",
+  "audit",
+  "recover",
+  "recovery",
+] as const;
 type SecretsAction = (typeof SECRETS_ACTIONS)[number];
 
 function isSecretsAction(a: unknown): a is SecretsAction {
   return typeof a === "string" && (SECRETS_ACTIONS as readonly string[]).includes(a);
 }
 
+/** `recovery`'s required subcommand. */
+export const RECOVERY_SUBCOMMANDS = ["new", "remove"] as const;
+type RecoverySubcommand = (typeof RECOVERY_SUBCOMMANDS)[number];
+
+/** The actions --no-recovery applies to: the ones that write a new key slot
+ *  set and would otherwise issue a code. */
+const NO_RECOVERY_ACTIONS: readonly SecretsAction[] = ["set", "reset", "rotate", "recover"];
+
 export interface SecretsCommandOptions {
   action?: SecretsAction;
+  /** For `recovery`: which one (`new` or `remove`). */
+  recoverySub?: RecoverySubcommand;
+  /** --no-recovery: create / reset / rotate / recover without a recovery
+   *  code. */
+  noRecovery?: boolean;
+  /** For `recover`: --file, the vault copy to recover (default: the vault
+   *  path itself). */
+  file?: string;
+  /** The environment the AI-agent check reads (CLAUDECODE / AI_AGENT): a
+   *  recovery code is never shown when either is set. Injectable because
+   *  this repo's own test runs execute under CLAUDECODE; defaults to
+   *  process.env. Only that check reads it. */
+  env?: NodeJS.ProcessEnv;
   name?: string;
   value?: string;
   fromStdin?: boolean;
@@ -300,10 +406,23 @@ export function parseSecretsArgs(
   // the action) read `yaw-mcp secrets:`. `secrets set X --bogus` used to say
   // `yaw-mcp secrets:` while `secrets set X --value ""` said
   // `yaw-mcp secrets set:`.
-  const refuse = (msg: string): { ok: false; error: string; jsonError?: string } =>
-    json
+  // A refusal never echoes a token that looks like a recovery code (see
+  // looksLikeRecoveryCode): the message lands on stderr and, under --json, in
+  // the stdout envelope index.ts writes -- a code pasted into argv would be
+  // copied into both. `shown` quotes a token for a message, or stands in for
+  // one that looks like a code, and the refusal then says why.
+  let redacted = false;
+  const shown = (token: string): string => {
+    if (!looksLikeRecoveryCode(token)) return `"${token}"`;
+    redacted = true;
+    return "(an argument shaped like a recovery code, not repeated here)";
+  };
+  const refuse = (raw: string): { ok: false; error: string; jsonError?: string } => {
+    const msg = redacted ? `${raw}. ${RECOVERY_CODE_IN_ARGV_NOTE}` : raw;
+    return json
       ? { ok: false, error: JSON.stringify({ ok: false, error: msg }), jsonError: msg }
       : { ok: false, error: `yaw-mcp secrets${opts.action ? ` ${opts.action}` : ""}: ${msg}\n\n${SECRETS_USAGE}` };
+  };
   // After `--` every token is a positional: SECRET_NAME_RE allows a leading
   // "-", and without the marker such a name parsed as an unknown flag, so
   // get/remove/set could never address it.
@@ -311,15 +430,40 @@ export function parseSecretsArgs(
   // The positional slots, filled in order: the action, then the one name.
   const positional = (a: string): ReturnType<typeof refuse> | undefined => {
     if (!opts.action) {
-      if (!isSecretsAction(a)) return refuse(`unknown action "${a}"`);
+      if (!isSecretsAction(a)) return refuse(`unknown action ${shown(a)}`);
       opts.action = a;
       return undefined;
     }
+    // `recovery` takes its subcommand in the slot a name would fill, and
+    // takes no name after it.
+    if (opts.action === "recovery" && opts.recoverySub === undefined) {
+      if (!(RECOVERY_SUBCOMMANDS as readonly string[]).includes(a)) {
+        return refuse(`unknown recovery subcommand ${shown(a)} -- use \`recovery new\` or \`recovery remove\``);
+      }
+      opts.recoverySub = a as RecoverySubcommand;
+      return undefined;
+    }
+    // recover and recovery take no positional at all, and the likeliest one
+    // is the code itself (whole, or one group per argument when typed with
+    // spaces): refused at the FIRST stray token, which is never echoed.
+    if (opts.action === "recover" || opts.action === "recovery") {
+      if (looksLikeRecoveryCode(a)) redacted = true;
+      const label = opts.action === "recovery" ? `recovery ${opts.recoverySub}` : "recover";
+      return refuse(
+        `${label} takes no <name> or other argument -- the recovery code is typed at a no-echo prompt, never passed on the command line`,
+      );
+    }
     if (!opts.name) {
+      // A whole code in the <name> slot (`secrets get YAWR-...`) would be
+      // echoed by every later message that names the secret.
+      if (isRecoveryCodeShapedName(a)) {
+        redacted = true;
+        return refuse("the <name> given is shaped like a recovery code, so it is not used as a secret name");
+      }
       opts.name = a;
       return undefined;
     }
-    return refuse(`unexpected positional argument "${a}"`);
+    return refuse(`unexpected positional argument ${shown(a)}`);
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -343,6 +487,20 @@ export function parseSecretsArgs(
     }
     if (a === "--force") {
       opts.force = true;
+      continue;
+    }
+    if (a === "--no-recovery") {
+      opts.noRecovery = true;
+      continue;
+    }
+    if (a === "--file") {
+      const v = argv[++i];
+      // Same rule as --value: a following flag is a MISSING value. A path
+      // that really starts with "-" can be given as ./-name.
+      if (v === undefined || v.startsWith("-")) {
+        return refuse("--file requires a path (for one that starts with -, write ./-name)");
+      }
+      opts.file = v;
       continue;
     }
     if (a === "--value") {
@@ -380,12 +538,15 @@ export function parseSecretsArgs(
         (opts.action === "set" || opts.action === "get" || opts.action === "remove") && opts.name === undefined;
       const hint =
         nameSlot && SECRET_NAME_RE.test(a) ? ` -- for a name that starts with "-", put \`--\` before it` : "";
-      return refuse(`unknown flag "${a}"${hint}`);
+      return refuse(`unknown flag ${shown(a)}${hint}`);
     }
     const refused = positional(a);
     if (refused) return refused;
   }
   if (!opts.action) return refuse("missing action");
+  if (opts.action === "recovery" && opts.recoverySub === undefined) {
+    return refuse("recovery needs a subcommand: `recovery new` or `recovery remove`");
+  }
   // Reject a positional for the actions that take no <name>. Swallowing it
   // was SILENT and actively misleading: `secrets audit GH_TOKEN` parsed,
   // dropped the name, and printed the ENTIRE trail -- so an operator asking
@@ -394,11 +555,19 @@ export function parseSecretsArgs(
   // <name> positionally), so the audit message names the flag that really
   // filters.
   if (opts.name !== undefined && opts.action !== "set" && opts.action !== "get" && opts.action !== "remove") {
+    const quoted = shown(opts.name);
+    const filter = redacted ? "<name>" : opts.name;
     const hint =
       opts.action === "audit"
-        ? ` -- audit takes no <name>; filter with \`--secret ${opts.name}\` or \`--server ${opts.name}\``
+        ? ` -- audit takes no <name>; filter with \`--secret ${filter}\` or \`--server ${filter}\``
         : ` -- ${opts.action} takes no <name>`;
-    return refuse(`unexpected argument "${opts.name}"${hint}`);
+    return refuse(`unexpected argument ${quoted}${hint}`);
+  }
+  if (opts.noRecovery && !NO_RECOVERY_ACTIONS.includes(opts.action)) {
+    return refuse("--no-recovery applies to `set`, `reset`, `rotate` and `recover` only");
+  }
+  if (opts.file !== undefined && opts.action !== "recover") {
+    return refuse("--file applies to `recover` only");
   }
   // The usage text marks these flags "(set only)" / "(audit only)", but the
   // parser used to accept and then silently drop them on every other action:
@@ -444,10 +613,43 @@ export function parseSecretsArgs(
   // existed must stay readable/removable by its legacy name.
   if (opts.action === "set" && opts.name !== undefined && !SECRET_NAME_RE.test(opts.name)) {
     return refuse(
-      `invalid secret name "${opts.name}" -- use letters, digits, "_", "." or "-" only; other characters can never be referenced as \${secret:NAME}`,
+      `invalid secret name ${shown(opts.name)} -- use letters, digits, "_", "." or "-" only; other characters can never be referenced as \${secret:NAME}`,
     );
   }
   return { ok: true, options: opts };
+}
+
+/** What a refusal adds when it held back a token shaped like a recovery
+ *  code. */
+const RECOVERY_CODE_IN_ARGV_NOTE =
+  "A recovery code is never passed on the command line -- `yaw-mcp secrets recover` asks for it at a no-echo prompt -- and one typed there is now in your shell history";
+
+/** Whether `token` has the 28-symbol shape of a recovery code (prefix,
+ *  separators and Crockford aliases allowed), whether or not its check
+ *  symbols agree. */
+function hasRecoveryCodeShape(token: string): { shaped: boolean; checksPass: boolean } {
+  try {
+    parseRecoveryCode(token).fill(0);
+    return { shaped: true, checksPass: true };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "";
+    return { shaped: msg === RECOVERY_CODE_TYPO_ERROR, checksPass: false };
+  }
+}
+
+/** A token an argument refusal must not echo: one that starts with the
+ *  "YAWR" prefix (any case), or has a code's shape -- a mistyped code
+ *  included. Broad on purpose: it only decides what a refusal quotes. */
+function looksLikeRecoveryCode(token: string): boolean {
+  return /^\s*yawr/i.test(token) || hasRecoveryCodeShape(token).shaped;
+}
+
+/** A <name> refused outright: a code's shape AND either the prefix or check
+ *  symbols that agree -- narrow, so a real secret name (YAWR_TOKEN, or a long
+ *  run of letters that happens to have 28 symbols) still parses. */
+function isRecoveryCodeShapedName(token: string): boolean {
+  const { shaped, checksPass } = hasRecoveryCodeShape(token);
+  return shaped && (checksPass || /^\s*yawr/i.test(token));
 }
 
 export interface SecretsCommandResult {
@@ -690,13 +892,21 @@ function vaultChangedResult(io: SecretsIo, json: boolean | undefined, action: st
  *  passphrase that is FORGOTTEN, not mistyped, has no way back in, and until
  *  `reset` existed nothing anywhere said so -- `set` reported the wrong
  *  passphrase and exited 1, with no pointer. Every other unlock error passes
- *  through verbatim. */
-function unlockErrorMessage(err: unknown, path: string): string {
+ *  through verbatim (VAULT_SLOT_DAMAGED_ERROR carries its own pointer at
+ *  `recover`).
+ *
+ *  The forgotten-passphrase pointer names `recover` only when `vault` has a
+ *  usable recovery slot: sending a user without a code to a command that
+ *  will refuse them is worse than today's reset text. */
+function unlockErrorMessage(err: unknown, path: string, vault?: VaultFile | null): string {
   const msg = err instanceof Error ? err.message : String(err);
   if (msg === VAULT_CHECK_CORRUPT_ERROR) {
     return `${msg}. ${vaultCheckCorruptHint(path)}`;
   }
   if (msg === VAULT_WRONG_PASSPHRASE_ERROR) {
+    if (vault && recoveryStatus(vault).state === "set") {
+      return `${msg}. If it is forgotten, \`yaw-mcp secrets recover\` sets a new one with the vault's recovery code and keeps every entry (\`yaw-mcp secrets reset\` starts over without it).`;
+    }
     return `${msg}. If it is forgotten, \`yaw-mcp secrets reset\` moves this vault aside and starts a new one (the old file is kept).`;
   }
   return msg;
@@ -1203,22 +1413,260 @@ function secretConsumersNotice(
  *  a failed command as fine when this line said `ok: true` ahead of the
  *  `{"ok":false}` envelope. `warning` is this line's discriminator. */
 function schemaBehindNotice(io: SecretsIo, vault: VaultFile, path: string, json: boolean | undefined): void {
-  if (vault.version >= SECRETS_SCHEMA_VERSION) return;
+  const behind = vaultSchemaBehind(vault.version);
+  if (behind === null) return;
   if (json) {
     io.err(
       `${JSON.stringify({
         warning: "schema-behind",
         schema: vault.version,
         current: SECRETS_SCHEMA_VERSION,
-        upgrade: "yaw-mcp secrets rotate",
+        missing: behind.missing,
+        upgrade: [...VAULT_UPGRADE_COMMANDS],
         path,
       })}\n`,
     );
     return;
   }
   io.err(
-    `yaw-mcp secrets: warning -- the vault at ${path} is schema v${vault.version} (this build writes v${SECRETS_SCHEMA_VERSION}); its ciphertexts are not bound to their entry names until \`yaw-mcp secrets rotate\` rewrites it. No other command upgrades the file.\n`,
+    `yaw-mcp secrets: warning -- the vault at ${path} is schema v${vault.version} (this build writes v${SECRETS_SCHEMA_VERSION}): ${behind.why}. No other command upgrades the file.\n`,
   );
+}
+
+/** The commands that rewrite an older-schema vault as the current one, each
+ *  with a fresh data key: both go through rekeyVault, which upgrades any
+ *  older schema. */
+export const VAULT_UPGRADE_COMMANDS = ["yaw-mcp secrets rotate", "yaw-mcp secrets recovery new"] as const;
+
+/** VAULT_UPGRADE_COMMANDS as prose: "`a` or `b`". */
+export const VAULT_UPGRADE_COMMANDS_TEXT = VAULT_UPGRADE_COMMANDS.map((c) => `\`${c}\``).join(" or ");
+
+/** What an older-schema vault lacks and how to upgrade it, or null for the
+ *  current schema (or a newer one). The ONE spelling of the per-version text:
+ *  schemaBehindNotice here and doctor's `schema:` line both render it, so the
+ *  two cannot drift apart. A v1 file lacks the name binding AND the recovery
+ *  slot, a v2 file only the slot. */
+export function vaultSchemaBehind(version: number): { missing: string[]; why: string } | null {
+  if (version >= SECRETS_SCHEMA_VERSION) return null;
+  const upgrade = `${VAULT_UPGRADE_COMMANDS_TEXT} upgrades to v${SECRETS_SCHEMA_VERSION}`;
+  if (version < 2) {
+    return {
+      missing: ["name-binding", "recovery"],
+      why: `entries are not bound to their names and the vault has no recovery code -- ${upgrade}`,
+    };
+  }
+  return { missing: ["recovery"], why: `no recovery code support -- ${upgrade}` };
+}
+
+/** One `err` line after a command rewrote an older-schema vault as the
+ *  current one (rotate, `recovery new`): a running yaw-mcp still holds what it
+ *  read from the old file. */
+function vaultUpgradedNotice(io: SecretsIo, from: number, path: string, json: boolean | undefined): void {
+  if (from >= SECRETS_SCHEMA_VERSION) return;
+  const hint = "restart any running yaw-mcp (Yaw Terminal or your MCP client) to pick up the upgraded vault";
+  if (json) {
+    io.err(`${JSON.stringify({ warning: "vault-upgraded", path, from, to: SECRETS_SCHEMA_VERSION, hint })}\n`);
+    return;
+  }
+  io.err(
+    `yaw-mcp secrets: upgraded the vault at ${path} from schema v${from} to v${SECRETS_SCHEMA_VERSION}; ${hint}.\n`,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Recovery codes: who may see one, how it is shown and confirmed, and the
+// lines that stand in for it when it cannot be shown.
+// ---------------------------------------------------------------------------
+
+/** Set when an AI agent drives this process: CLAUDECODE (Claude Code) or
+ *  AI_AGENT. Read from the INJECTED env (opts.env) -- never process.env
+ *  directly -- so tests running under CLAUDECODE can still drive the display
+ *  path. Returns the variable's name, or null. */
+function agentSessionVar(opts: SecretsCommandOptions): string | null {
+  const env = opts.env ?? process.env;
+  for (const name of ["CLAUDECODE", "AI_AGENT"]) {
+    if ((env[name] ?? "") !== "") return name;
+  }
+  return null;
+}
+
+/** Why a recovery code cannot be shown right now, or null when it can:
+ *  "interactive" is the usual both-ends-a-TTY test AND no agent session. */
+function recoveryDisplayBlocker(
+  opts: SecretsCommandOptions,
+): { reason: "agent-session" | "no-terminal"; detail: string } | null {
+  // The terminal first: off one there is nowhere to show a code whoever is
+  // driving, and the reason then reads the same in and out of an agent.
+  if (!isInteractiveTTY(opts)) return { reason: "no-terminal", detail: nonTTYEnds(opts) };
+  const agent = agentSessionVar(opts);
+  if (agent !== null) {
+    return {
+      reason: "agent-session",
+      detail: `an AI agent session (${agent} is set) never displays a recovery code`,
+    };
+  }
+  return null;
+}
+
+/** The nudge for a vault written without a recovery code because none could
+ *  be shown (not for --no-recovery, which asked for exactly that). */
+function noRecoveryCodeNudge(
+  io: SecretsIo,
+  json: boolean | undefined,
+  blocker: { reason: "agent-session" | "no-terminal" },
+): void {
+  const why = blocker.reason === "agent-session" ? "an AI agent session" : "no terminal";
+  const hint = "Run `yaw-mcp secrets recovery new` in a terminal to add one.";
+  if (json) {
+    io.err(`${JSON.stringify({ warning: "no-recovery-code", reason: blocker.reason, hint })}\n`);
+    return;
+  }
+  io.err(`yaw-mcp secrets: No recovery code was created (${why}). ${hint}\n`);
+}
+
+/** One `err` line when a re-key dropped the vault's recovery code (rotate
+ *  --no-recovery on a vault that had one): the old code opens nothing
+ *  current from here on, and nothing replaced it. */
+function recoveryDroppedNotice(io: SecretsIo, path: string, json: boolean | undefined): void {
+  const hint = "`yaw-mcp secrets recovery new` adds a new one (at a terminal).";
+  if (json) {
+    io.err(`${JSON.stringify({ warning: "recovery-dropped", path, hint })}\n`);
+    return;
+  }
+  io.err(
+    `yaw-mcp secrets: warning -- the vault at ${path} no longer has a recovery code: the old code does not open it. ${hint}\n`,
+  );
+}
+
+/** Enter / leave the terminal's alternate screen: the code is shown inside
+ *  it, so leaving clears it from view (and from most scrollback). Harmless
+ *  where unsupported. */
+const ALT_SCREEN_ON = "\x1b[?1049h";
+const ALT_SCREEN_OFF = "\x1b[?1049l";
+
+/** How many times the user may get the two groups wrong before giving up. */
+const RECOVERY_CONFIRM_ATTEMPTS = 3;
+
+/** Show `code` on the prompt stream and have the user type two of its seven
+ *  groups back (distinct, chosen at random each attempt), up to
+ *  RECOVERY_CONFIRM_ATTEMPTS attempts. Returns "confirmed", "exhausted" or
+ *  CANCELLED (^C). Nothing has been saved when this runs, and on anything but
+ *  "confirmed" the caller writes nothing.
+ *
+ *  The code goes to promptStream ONLY -- the terminal end the user answers
+ *  on -- never io.out / io.err, so it cannot reach a --json envelope, a
+ *  captured stdout, a log, or the audit log. The alternate screen is left on
+ *  every exit, including ^C -- and including a signal that would kill the
+ *  process (see leaveAltScreenOnSignal), which a `finally` never sees. */
+async function issueRecoveryCode(
+  opts: SecretsCommandOptions,
+  code: string,
+): Promise<"confirmed" | "exhausted" | Cancelled> {
+  const { stdin } = termStreams(opts);
+  const out = promptStream(opts);
+  const groups = recoveryCodeGroups(code);
+  out.write(ALT_SCREEN_ON);
+  const detachSignals = leaveAltScreenOnSignal(out);
+  try {
+    out.write(
+      "Your vault's RECOVERY CODE -- shown this once:\n\n" +
+        `    ${code}\n\n` +
+        "Write it down and keep it apart from the passphrase. With it, `yaw-mcp secrets recover`\n" +
+        "opens the vault if the passphrase is forgotten -- and so can anyone else who has it.\n" +
+        "It is not stored anywhere you can read it back, and this screen clears when you are done.\n\n",
+    );
+    for (let attempt = 0; attempt < RECOVERY_CONFIRM_ATTEMPTS; attempt++) {
+      const first = randomInt(groups.length);
+      let second = randomInt(groups.length - 1);
+      if (second >= first) second++;
+      let ok = true;
+      for (const g of [first, second]) {
+        const answer = await readLineFromTTY(stdin, out, `Type group ${g + 1} of 7 to confirm: `, true);
+        if (answer === CANCELLED) return CANCELLED;
+        if (normalizeRecoveryGroup(answer) !== groups[g]) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) return "confirmed";
+      out.write(
+        attempt + 1 < RECOVERY_CONFIRM_ATTEMPTS
+          ? "That does not match the code above. Check what you wrote down and try again.\n"
+          : "That does not match the code above.\n",
+      );
+    }
+    return "exhausted";
+  } finally {
+    detachSignals();
+    out.write(ALT_SCREEN_OFF);
+  }
+}
+
+/** While a code is on the alternate screen: a SIGINT (^C on a terminal that
+ *  refused raw mode, where the group prompts read in cooked mode), SIGTERM
+ *  (`timeout`, an IDE or tmux kill) or SIGHUP would end the process through
+ *  node's default handler, which restores the terminal MODES but writes no
+ *  escape bytes -- leaving the code on screen under the next shell prompt.
+ *  These one-shot listeners leave the alternate screen first, then hand the
+ *  signal back: with no other listener for it, it is re-raised so the
+ *  process still dies of it (exit status included). A process 'exit'
+ *  (process.exit from elsewhere) leaves it too. Returns the detach. */
+function leaveAltScreenOnSignal(out: NodeJS.WritableStream): () => void {
+  const signals: NodeJS.Signals[] = ["SIGINT", "SIGTERM", "SIGHUP"];
+  const onExit = (): void => {
+    out.write(ALT_SCREEN_OFF);
+  };
+  const onSignal = (signal: NodeJS.Signals): void => {
+    detach();
+    out.write(ALT_SCREEN_OFF);
+    if (process.listenerCount(signal) > 0) return;
+    try {
+      process.kill(process.pid, signal);
+    } catch {
+      // A signal this platform cannot send to itself: exit as if it had.
+      process.exit(128 + (osConstants.signals[signal] ?? 0));
+    }
+  };
+  const detach = (): void => {
+    for (const s of signals) process.removeListener(s, onSignal);
+    process.removeListener("exit", onExit);
+  };
+  for (const s of signals) process.on(s, onSignal);
+  process.on("exit", onExit);
+  return detach;
+}
+
+/** Run issueRecoveryCode when `code` is set and turn its failure into this
+ *  command's result: ^C is the usual 130, an exhausted confirm exit 1 with
+ *  `abortHint` (how to get past it). Returns null when the caller may save. */
+async function confirmRecoveryCodeOrFail(
+  opts: SecretsCommandOptions,
+  io: SecretsIo,
+  action: string,
+  code: string | undefined,
+  abortHint: string,
+): Promise<SecretsCommandResult | null> {
+  if (code === undefined) return null;
+  const confirmed = await issueRecoveryCode(opts, code);
+  if (confirmed === CANCELLED) return cancelledResult(io, opts.json, action);
+  if (confirmed === "exhausted") {
+    return failResult(io, opts.json, action, `Aborted -- nothing was saved. ${abortHint}`, {
+      fields: { aborted: true },
+    });
+  }
+  return null;
+}
+
+/** Append vault-level audit events (names and kinds only -- the audit line
+ *  has no field a code could ride in). Fail-open like every audit write. */
+async function auditVaultEvents(home: string, kinds: AuditEventKind[]): Promise<void> {
+  for (const event of kinds) await appendAuditEvent({ server: "", secret: "", event }, home);
+}
+
+/** The --json envelopes' `recovery` field: whether the vault as saved carries
+ *  a usable recovery slot. */
+function recoveryField(vault: VaultFile): "set" | "none" {
+  return recoveryStatus(vault).state === "set" ? "set" : "none";
 }
 
 /** The two prompt labels and the warning subject of a confirm-twice
@@ -1455,7 +1903,7 @@ export async function runSecrets(
   const home = opts.home ?? homedir();
   const path = vaultPath(home);
 
-  // An action outside the eight is refused FIRST, before the fingerprint,
+  // An action outside SECRETS_ACTIONS is refused FIRST, before the fingerprint,
   // the load, the passphrase prompt and the scrypt derivation -- the CLI
   // parser never lets one through, but `action` is optional for an embedder,
   // and the old fallthrough at the bottom made that caller pay for all four
@@ -1495,6 +1943,15 @@ export async function runSecrets(
   // it runs ahead of the shared path too.
   if (opts.action === "reset") {
     return await runSecretsReset(opts, io);
+  }
+
+  // recover needs no passphrase either (it takes the recovery code instead),
+  // and `recovery` re-keys like rotate: both own their whole flow.
+  if (opts.action === "recover") {
+    return await runSecretsRecover(opts, io);
+  }
+  if (opts.action === "recovery") {
+    return await runSecretsRecovery(opts, io);
   }
 
   // audit is a read-only command -- no passphrase needed (it never
@@ -1543,7 +2000,12 @@ export async function runSecrets(
   if (isVaultUnreadable(baseline)) return vaultUnreadableResult(io, opts.json, opts.action, path, baseline);
   const loaded = await safeLoadVault(path, io, opts.json, opts.action);
   if (!loaded.ok) return loaded.result;
-  if (loaded.vault) schemaBehindNotice(io, loaded.vault, path, opts.json);
+  // A `set` on a planted empty check-less v1/v2 file replaces it with a v3
+  // vault (creatingVault, below), so the "no other command upgrades the file"
+  // notice would contradict what this run does: that case gets
+  // vaultUpgradedNotice after the save instead.
+  const replacesLegacyVault = opts.action === "set" && loaded.vault !== null && !vaultVerifiesPassphrases(loaded.vault);
+  if (loaded.vault && !replacesLegacyVault) schemaBehindNotice(io, loaded.vault, path, opts.json);
 
   // Short-circuit get/remove when the vault is missing or the entry
   // doesn't exist -- avoids prompting for a passphrase and paying the
@@ -1625,7 +2087,12 @@ export async function runSecrets(
   // on the TTY (like rotate's new passphrase). Only `set` reaches here on a
   // fresh vault -- get/remove short-circuit above -- and the env-var path
   // stays single-shot inside resolvePassphrase.
-  const creatingVault = opts.action === "set" && !vault.check && Object.keys(vault.entries).length === 0;
+  //
+  // Such a vault (fresh, or a planted empty check-less v1/v2 file) is never
+  // written back as it is: `set` builds a NEW v3 vault around the passphrase
+  // (createVaultV3), with a recovery code when one can be shown. A v3 vault
+  // always verifies (its passphrase slot is the check), so it never lands here.
+  const creatingVault = opts.action === "set" && !vaultVerifiesPassphrases(vault);
   // A legacy (check-less) vault that `remove` emptied is indistinguishable
   // from a brand-new one to unlock(): nothing in it verifies a passphrase, so
   // the next `set` re-establishes one. That is the same confirm-twice prompt
@@ -1660,11 +2127,15 @@ export async function runSecrets(
     );
   }
 
-  let key: Buffer;
-  try {
-    key = await unlock(vault, passphrase);
-  } catch (err) {
-    return failResult(io, opts.json, opts.action, unlockErrorMessage(err, path));
+  // Creating a vault derives its key only once the vault exists (below, after
+  // the value prompt): there is nothing to unlock yet.
+  let key: Buffer | undefined;
+  if (!creatingVault) {
+    try {
+      key = await unlock(vault, passphrase);
+    } catch (err) {
+      return failResult(io, opts.json, opts.action, unlockErrorMessage(err, path, loaded.vault));
+    }
   }
   try {
     // ----- set ------------------------------------------------------------
@@ -1694,20 +2165,62 @@ export async function runSecrets(
         value = entered;
       }
       if (!value) return failResult(io, opts.json, "set", "Secret value cannot be empty.");
+      // Creation order: passphrase -> value (above) -> generate the code ->
+      // show it -> confirm it -> changed-on-disk check -> save. A ^C or a
+      // failed confirmation anywhere before the save writes nothing.
+      let issuedCode: string | undefined;
+      let noCodeBlocker: ReturnType<typeof recoveryDisplayBlocker> = null;
+      if (creatingVault) {
+        const wantCode = opts.noRecovery !== true;
+        // --stdin read the value from stdin to its END: the terminal is
+        // still a TTY, but the confirmation prompts would read a spent
+        // stream, fail all three attempts at once and abort a vault whose
+        // code was already on screen. Treated as no terminal: no slot, and
+        // the nudge.
+        const stdinSpent = opts.value === undefined && opts.fromStdin === true;
+        noCodeBlocker = !wantCode
+          ? null
+          : stdinSpent
+            ? { reason: "no-terminal", detail: "stdin was read to its end for the value (--stdin)" }
+            : recoveryDisplayBlocker(opts);
+        try {
+          const built = await createVaultV3(passphrase, { recovery: wantCode && noCodeBlocker === null });
+          vault = built.vault;
+          issuedCode = built.recoveryCode;
+          key = await unlock(vault, passphrase);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return failResult(
+            io,
+            opts.json,
+            "set",
+            `could not derive the new vault's key (${msg}) -- nothing was saved.`,
+          );
+        }
+      }
       try {
         // setSecret rejects a name no ${secret:NAME} reference could ever
         // address (spaces, colons, braces) -- surface that as a normal CLI
         // error instead of an unhandled rejection. For the CLI path
         // parseSecretsArgs already rejected it before any prompt; this is
         // the backstop for programmatic callers of runSecrets.
-        vault = setSecret(vault, key, name, value);
+        vault = setSecret(vault, key as Buffer, name, value);
       } catch (err) {
         return failResult(io, opts.json, "set", err instanceof Error ? err.message : String(err));
       }
+      const unconfirmed = await confirmRecoveryCodeOrFail(
+        opts,
+        io,
+        "set",
+        issuedCode,
+        "Re-run, or pass --no-recovery to create the vault without a recovery code.",
+      );
+      if (unconfirmed) return unconfirmed;
       if (await vaultChangedSinceLoad(path, baseline)) return vaultChangedResult(io, opts.json, "set");
       // atomicWriteFile mkdirs the target dir, so no ensureVaultDir needed.
       const failed = await saveVaultOrReport(path, vault, io, opts.json, "set");
       if (failed) return failed;
+      if (issuedCode !== undefined) await auditVaultEvents(home, ["recovery-issued"]);
       // "Replaced" vs "Stored" is the only signal a scripted run gets that it
       // just destroyed a previous value (the non-TTY path proceeds without a
       // confirmation), so the two cases must never print the same line.
@@ -1733,6 +2246,8 @@ export async function runSecrets(
             // unknown, never "not stale". false is relative to bundles_path,
             // which may not be the file a client's yaw-mcp loaded.
             running_servers_stale: consumers === null ? null : consumers.namespaces.length > 0,
+            // Whether the saved vault carries a recovery slot. Never the code.
+            recovery: recoveryField(vault),
           })}\n`,
         );
       } else if (replacing) io.out(`Replaced secret "${name}".\n`);
@@ -1741,6 +2256,10 @@ export async function runSecrets(
       // the passphrase has to reach the yaw-mcp their CLIENT spawns, not just
       // the shell they typed this in. See freshVaultNudge.
       if (isFresh) freshVaultNudge(io, path, opts.json);
+      // A planted empty v1/v2 file was just replaced by a v3 vault: say so
+      // (no-op for anything already current).
+      if (replacesLegacyVault && loaded.vault) vaultUpgradedNotice(io, loaded.vault.version, path, opts.json);
+      if (noCodeBlocker !== null) noRecoveryCodeNudge(io, opts.json, noCodeBlocker);
       if (!opts.json) secretConsumersNotice(io, name, consumers, replacing, isFresh, opts.referenceFollows === true);
       return { exitCode: 0 };
     }
@@ -1754,7 +2273,7 @@ export async function runSecrets(
         // prompt, so `vault` is `loaded.vault` with `name` present and
         // getSecret's own hasOwn check cannot fail. The not-found message
         // lives there, once.
-        const value = getSecret(vault, key, name) as string;
+        const value = getSecret(vault, key as Buffer, name) as string;
         // Warn (on `err`, never `out` -- keeps the value pipeable) when the
         // caller is interactive: `get` prints cleartext, so an interactive run
         // scrolls a secret into terminal scrollback. Skipped for piped/redirected
@@ -1799,8 +2318,8 @@ export async function runSecrets(
       return { exitCode: 0 };
     }
 
-    // Unreachable: the guard at the top admits only the eight actions, and
-    // each has returned above. Typed `never` so a ninth action added to
+    // Unreachable: the guard at the top admits only SECRETS_ACTIONS, and
+    // each has returned above. Typed `never` so an action added to
     // SECRETS_ACTIONS without a branch here fails tsc instead of reaching this.
     const unhandled: never = opts.action;
     return failResult(io, opts.json, "", `unknown action ${String(unhandled)}`, { exitCode: 2 });
@@ -1811,7 +2330,7 @@ export async function runSecrets(
     // this process still short-circuits; only the copy stops outliving the
     // command in a heap dump. Best-effort, like the key.fill(0) inside
     // unlock() itself.
-    key.fill(0);
+    key?.fill(0);
   }
 }
 
@@ -1824,10 +2343,17 @@ export async function runSecrets(
  *      against vault.check, so a wrong current passphrase is rejected
  *      before any rotation).
  *   3. Resolve the NEW passphrase (env / TTY confirm-twice).
- *   4. rotateVault decrypts every entry under the old key FIRST (aborting
+ *   4. rekeyVault decrypts every entry under the old key FIRST (aborting
  *      on any failure with the on-disk vault untouched), then re-encrypts
- *      under a fresh salt + the new key.
+ *      under a FRESH data key wrapped by the new passphrase (and, when the
+ *      vault had a recovery code, a NEW code -- shown and confirmed before
+ *      anything is saved).
  *   5. Save atomically, lock() to drop the stale in-memory key.
+ *
+ *  A vault WITH a recovery code needs the new code shown, so a run that
+ *  cannot show it (no terminal, or an AI agent session) is refused (exit 2)
+ *  before any prompt unless --no-recovery, which drops the code instead. An
+ *  older-schema vault comes out as the current schema.
  */
 async function runSecretsRotate(opts: SecretsCommandOptions, io: SecretsIo): Promise<SecretsCommandResult> {
   const home = opts.home ?? homedir();
@@ -1858,6 +2384,28 @@ async function runSecretsRotate(opts: SecretsCommandOptions, io: SecretsIo): Pro
     );
   }
 
+  // D2: every rotate re-keys, so a recovery code the vault has is replaced by
+  // a NEW one (the old one must stop working) -- and the new one has to be
+  // shown. Decided before any prompt, so a refusal costs no typing.
+  const hadCode = recoveryStatus(vault).state === "set";
+  const wantCode = hadCode && opts.noRecovery !== true;
+  if (wantCode) {
+    const blocker = recoveryDisplayBlocker(opts);
+    if (blocker !== null) {
+      return failResult(
+        io,
+        opts.json,
+        "rotate",
+        `this vault has a recovery code, and rotating replaces it with a new one that has to be shown on a terminal -- but ${blocker.detail}.`,
+        {
+          exitCode: 2,
+          detail:
+            "Run rotate at a terminal, or pass --no-recovery to rotate and DROP the recovery code (`yaw-mcp secrets recovery new` adds one later).",
+        },
+      );
+    }
+  }
+
   const currentPassphrase = await resolvePassphrase(opts, io);
   if (currentPassphrase === CANCELLED) return cancelledResult(io, opts.json, "rotate");
   if (currentPassphrase === NO_ECHO) {
@@ -1883,7 +2431,7 @@ async function runSecretsRotate(opts: SecretsCommandOptions, io: SecretsIo): Pro
   try {
     oldKey = await unlock(vault, currentPassphrase);
   } catch (err) {
-    return failResult(io, opts.json, "rotate", unlockErrorMessage(err, path));
+    return failResult(io, opts.json, "rotate", unlockErrorMessage(err, path, vault));
   }
   try {
     const newPassphrase = await resolveNewPassphrase(opts, io);
@@ -1911,14 +2459,29 @@ async function runSecretsRotate(opts: SecretsCommandOptions, io: SecretsIo): Pro
     }
 
     let rotated: VaultFile;
+    let issuedCode: string | undefined;
     try {
-      // rotateVault decrypts EVERY entry first; if any fails it throws
+      // rekeyVault decrypts EVERY entry first; if any fails it throws
       // before re-encrypting, so the on-disk vault stays untouched.
-      rotated = await rotateVault(vault, oldKey, newPassphrase);
+      const built = await rekeyVault(vault, oldKey, newPassphrase, { recovery: wantCode });
+      rotated = built.vault;
+      issuedCode = built.recoveryCode;
     } catch (err) {
       // On-disk vault is untouched by definition (we never reached save).
       lock();
       return failResult(io, opts.json, "rotate", err instanceof Error ? err.message : String(err));
+    }
+
+    const unconfirmed = await confirmRecoveryCodeOrFail(
+      opts,
+      io,
+      "rotate",
+      issuedCode,
+      "Re-run, or pass --no-recovery to rotate and drop the recovery code.",
+    );
+    if (unconfirmed) {
+      lock();
+      return unconfirmed;
     }
 
     if (await vaultChangedSinceLoad(path, baseline)) {
@@ -1946,23 +2509,32 @@ async function runSecretsRotate(opts: SecretsCommandOptions, io: SecretsIo): Pro
     lock();
 
     const count = Object.keys(rotated.entries).length;
+    await auditVaultEvents(home, [
+      "vault-rekeyed",
+      ...(issuedCode !== undefined ? (["recovery-issued"] as const) : []),
+      ...(hadCode && issuedCode === undefined ? (["recovery-removed"] as const) : []),
+    ]);
 
     if (opts.json) {
-      io.out(`${JSON.stringify({ ok: true, rotated: true, secret_count: count })}\n`);
+      io.out(`${JSON.stringify({ ok: true, rotated: true, secret_count: count, recovery: recoveryField(rotated) })}\n`);
     } else {
       io.out(
-        `Rotated ${count} secret${count === 1 ? "" : "s"} under a new passphrase (encryption re-wrapped, token values unchanged).\n`,
+        `Rotated ${count} secret${count === 1 ? "" : "s"} under a new passphrase and a fresh data key (encryption re-keyed, token values unchanged).\n`,
       );
+      if (issuedCode !== undefined)
+        io.out("A new recovery code replaced the old one; the old code no longer opens the vault.\n");
       // No promise of a prompt: with YAW_MCP_VAULT_PASSPHRASE set (the
       // documented deployment) the next command reads the env, not a TTY.
       io.out("Vault locked -- the next secrets command needs the NEW passphrase.\n");
     }
     const envKeyed = opts.passphrase === undefined && (process.env.YAW_MCP_VAULT_PASSPHRASE ?? "").length > 0;
     rotateVaultNudge(io, path, opts.json, envKeyed);
+    if (hadCode && issuedCode === undefined) recoveryDroppedNotice(io, path, opts.json);
+    vaultUpgradedNotice(io, vault.version, path, opts.json);
     return { exitCode: 0 };
   } finally {
     // Zero this command's copy of the OLD key on every exit, including the
-    // new-passphrase refusals above and the rotateVault throw. unlock() hands
+    // new-passphrase refusals above and the rekeyVault throw. unlock() hands
     // back a COPY of its cache, so this touches nothing lock() does not
     // already own; it just stops the copy outliving the command in a heap
     // dump. Best-effort, like the key.fill(0) inside unlock() itself.
@@ -2049,18 +2621,66 @@ async function copyVaultAside(path: string, at: Date): Promise<string> {
 /** The pointers a refused reset gives instead: what a user who has NOT lost
  *  the passphrase actually wants is one of these. */
 const RESET_ALTERNATIVES =
-  "To change the passphrase of a vault that opens, use `yaw-mcp secrets rotate`; to drop an entry from it, `yaw-mcp secrets remove <name>`.";
+  "To change the passphrase of a vault that opens, use `yaw-mcp secrets rotate`; to drop an entry from it, `yaw-mcp secrets remove <name>`; to add, replace or drop its recovery code, `yaw-mcp secrets recovery new` / `recovery remove`.";
 
 /** The refusal for a passphrase that is already this vault's, worded for
  *  where it came from. On "marker-corrupt" the passphrase is right and the
  *  MARKER is broken: still nothing to reset (the entries are intact), but the
  *  way forward is the hand-fix, not `rotate` -- which refuses that vault
  *  too. */
-function alreadyOpensMessage(verdict: Exclude<VaultPassphraseVerdict, "wrong">, subject: string, path: string): string {
+function alreadyOpensMessage(
+  verdict: Exclude<VaultPassphraseVerdict, "wrong" | "slot-damaged">,
+  subject: string,
+  path: string,
+): string {
   if (verdict === "marker-corrupt") {
     return `${subject} is this vault's passphrase; it is the check marker in ${path} that is corrupt -- nothing to reset, and the vault was not touched. ${vaultCheckCorruptHint(path)}`;
   }
   return `${subject} already opens the vault at ${path} -- nothing to reset, and the vault was not touched. ${RESET_ALTERNATIVES}`;
+}
+
+/** reset's line when the guard's verdict is "slot-damaged": the passphrase
+ *  slot cannot say whether `subject` is right, so the reset goes ahead (it
+ *  may be exactly why the user is here) -- but not silently as if the
+ *  passphrase were wrong. */
+function slotDamagedNotice(
+  io: SecretsIo,
+  json: boolean | undefined,
+  subject: string,
+  path: string,
+  vault: VaultFile,
+): void {
+  const pointer =
+    recoveryStatus(vault).state === "set"
+      ? "it has a recovery code: `yaw-mcp secrets recover` restores access with every entry kept"
+      : "if a recovery code was saved, `yaw-mcp secrets recover` restores access with every entry kept";
+  if (json) {
+    io.err(`${JSON.stringify({ warning: "passphrase-slot-damaged", path, subject, hint: pointer })}\n`);
+    return;
+  }
+  io.err(
+    `yaw-mcp secrets reset: warning -- the passphrase slot of the vault at ${path} is damaged, so ${subject} could not be checked against it; ${pointer}.\n`,
+  );
+}
+
+/** reset's pointer at `recover` for a vault that has a recovery code. */
+function recoveryAvailableNotice(
+  io: SecretsIo,
+  json: boolean | undefined,
+  created: string | null,
+  entryCount: number | null,
+): void {
+  const date = created !== null ? created.slice(0, 10) : "unknown date";
+  const keeps = entryCount === null ? "every entry" : `all ${entryCount} ${entryCount === 1 ? "entry" : "entries"}`;
+  if (json) {
+    io.err(
+      `${JSON.stringify({ warning: "recovery-available", created, entries: entryCount, hint: "`yaw-mcp secrets recover` keeps every entry" })}\n`,
+    );
+    return;
+  }
+  io.err(
+    `yaw-mcp secrets reset: this vault has a recovery code (created ${date}): \`yaw-mcp secrets recover\` keeps ${keeps}.\n`,
+  );
 }
 
 /** The already-opens guard's check: checkVaultPassphrase with the derived
@@ -2161,11 +2781,17 @@ function resetVaultNudge(io: SecretsIo, path: string, json: boolean | undefined,
  *  old value is fed to the next command without a prompt and fails unlock
  *  with the wrong-passphrase message (which points at `reset`), and a running
  *  yaw-mcp server re-derives from its old value because the salt changed. */
-function rotateVaultNudge(io: SecretsIo, path: string, json: boolean | undefined, envKeyed: boolean): void {
+function rotateVaultNudge(
+  io: SecretsIo,
+  path: string,
+  json: boolean | undefined,
+  envKeyed: boolean,
+  warning: "vault-rotated" | "vault-recovered" = "vault-rotated",
+): void {
   if (json) {
     io.err(
       `${JSON.stringify({
-        warning: "vault-rotated",
+        warning,
         path,
         passphrase_source: envKeyed ? "env" : "prompt",
         hint: "Update YAW_MCP_VAULT_PASSPHRASE to the new passphrase wherever it is set (this shell, a shell profile, any client config `env` block) -- the old value no longer unlocks the vault. A running yaw-mcp server keeps the passphrase it started with -- restart it (restart your MCP client). `yaw-mcp doctor` reports whether the passphrase it sees unlocks the vault.",
@@ -2294,7 +2920,15 @@ async function runSecretsReset(opts: SecretsCommandOptions, io: SecretsIo): Prom
     const subject = opts.passphrase === undefined ? "YAW_MCP_VAULT_PASSPHRASE" : "the supplied passphrase";
     const verdict = await resetGuardVerdict(vault, scripted);
     if (typeof verdict === "object") return fail(guardFailedMessage(subject, path, verdict.failed));
-    if (verdict !== "wrong") return fail(alreadyOpensMessage(verdict, subject, path));
+    if (verdict === "slot-damaged") slotDamagedNotice(io, json, subject, path, vault);
+    else if (verdict !== "wrong") return fail(alreadyOpensMessage(verdict, subject, path));
+  }
+
+  // A vault with a recovery code does not need a reset: `recover` keeps every
+  // entry. Said on EVERY path, --force included, before anything changes.
+  const oldRecovery = vault !== null ? recoveryStatus(vault) : null;
+  if (oldRecovery?.state === "set") {
+    recoveryAvailableNotice(io, json, oldRecovery.created, "names" in names ? names.names.length : null);
   }
 
   // Named once, before the preamble, so the path the user is shown is the
@@ -2342,16 +2976,32 @@ async function runSecretsReset(opts: SecretsCommandOptions, io: SecretsIo): Prom
   if (guardable && vault !== null && scripted.length === 0) {
     const verdict = await resetGuardVerdict(vault, passphrase);
     if (typeof verdict === "object") return fail(guardFailedMessage("that passphrase", path, verdict.failed));
-    if (verdict !== "wrong") return fail(alreadyOpensMessage(verdict, "that passphrase", path));
+    if (verdict === "slot-damaged") slotDamagedNotice(io, json, "that passphrase", path, vault);
+    else if (verdict !== "wrong") return fail(alreadyOpensMessage(verdict, "that passphrase", path));
   }
 
+  // The new vault, built in memory, with a recovery code when one can be
+  // shown -- then shown and confirmed BEFORE anything on disk changes.
+  const wantCode = opts.noRecovery !== true;
+  const noCodeBlocker = wantCode ? recoveryDisplayBlocker(opts) : null;
   let fresh: VaultFile;
+  let issuedCode: string | undefined;
   try {
-    fresh = await createEmptyVault(passphrase);
+    const built = await createVaultV3(passphrase, { recovery: wantCode && noCodeBlocker === null });
+    fresh = built.vault;
+    issuedCode = built.recoveryCode;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     return fail(`could not derive the new vault's key (${msg}) -- nothing was changed.`);
   }
+  const unconfirmed = await confirmRecoveryCodeOrFail(
+    opts,
+    io,
+    "reset",
+    issuedCode,
+    "Re-run, or pass --no-recovery to create the vault without a recovery code.",
+  );
+  if (unconfirmed) return unconfirmed;
 
   if (await vaultChangedSinceLoad(path, baseline)) return vaultChangedResult(io, json, "reset");
 
@@ -2375,6 +3025,8 @@ async function runSecretsReset(opts: SecretsCommandOptions, io: SecretsIo): Prom
     return fail(`could not write the new vault at ${path} (${cause}) -- the old vault is untouched.${stray}`);
   }
 
+  if (issuedCode !== undefined) await auditVaultEvents(home, ["recovery-issued"]);
+
   if (json) {
     io.out(
       `${JSON.stringify({
@@ -2383,10 +3035,16 @@ async function runSecretsReset(opts: SecretsCommandOptions, io: SecretsIo): Prom
         moved_to: movedTo,
         entries: "names" in names ? names.names : null,
         unreadable: "unreadable" in names ? names.unreadable : null,
+        recovery: recoveryField(fresh),
       })}\n`,
     );
   } else {
     io.out(`Moved the old vault to ${movedTo}. It still opens under its old passphrase, should that turn up.\n`);
+    if (oldRecovery?.state === "set") {
+      io.out(
+        `Its recovery code still opens that copy: move the new (empty) vault at ${path} aside, then \`yaw-mcp secrets recover --file ${movedTo}\` brings it back with every entry.\n`,
+      );
+    }
     io.out(
       `Created an empty vault at ${path} under ${envKeyed ? "the passphrase in YAW_MCP_VAULT_PASSPHRASE" : "the new passphrase"}.\n`,
     );
@@ -2402,7 +3060,380 @@ async function runSecretsReset(opts: SecretsCommandOptions, io: SecretsIo): Prom
     }
   }
   resetVaultNudge(io, path, json, envKeyed);
+  if (noCodeBlocker !== null) noRecoveryCodeNudge(io, json, noCodeBlocker);
   return { exitCode: 0 };
+}
+
+/**
+ * Get back into a vault whose passphrase is forgotten, with its recovery code.
+ *
+ * Flow, in this order:
+ *   1. A terminal is required (exit 2 otherwise): the code is typed at a
+ *      no-echo prompt and is never accepted from argv or the env.
+ *   2. Fingerprint, then load the vault -- or, with --file, the moved-aside
+ *      copy (refused, exit 2, while a vault sits at the vault path: the user
+ *      moves it aside). An AI agent session is refused before this (exit 2)
+ *      unless --no-recovery: the new code could not be shown.
+ *      No usable recovery slot (v1/v2, or a v3 vault without one) is exit 1.
+ *   3. The code, up to MAX_PASSPHRASE_PROMPTS tries for a mistyped one (a
+ *      format or check-symbol error); a well-formed code that does not open
+ *      this vault ends the command.
+ *   4. The NEW passphrase: YAW_MCP_VAULT_PASSPHRASE_NEW or the confirm-twice
+ *      prompt -- never YAW_MCP_VAULT_PASSPHRASE, which holds the passphrase
+ *      that was lost (or a stale one) and must not silently become the new.
+ *   5. rekeyVault with a FRESH data key, so the code just used (single-use)
+ *      and the old passphrase open only the old file; a new code is issued
+ *      when it can be shown, and confirmed before anything is saved.
+ *   6. The changed-on-disk re-check, then the save.
+ */
+async function runSecretsRecover(opts: SecretsCommandOptions, io: SecretsIo): Promise<SecretsCommandResult> {
+  const home = opts.home ?? homedir();
+  const path = vaultPath(home);
+  const json = opts.json;
+  const fail = (msg: string, exitCode = 1): SecretsCommandResult => failResult(io, json, "recover", msg, { exitCode });
+
+  if (!isInteractiveTTY(opts)) {
+    return fail(
+      `recover needs a terminal: the recovery code is typed at a no-echo prompt, never read from argv or the env (${nonTTYEnds(opts)}).`,
+      2,
+    );
+  }
+  // A recovery re-keys, so the code used here stops working and a NEW one
+  // replaces it -- which has to be shown, and an AI agent session never
+  // shows one. Going ahead would turn a vault that had a code into one that
+  // has none after a single run, so it is refused (like rotate on a vault
+  // with a code) before anything is read or typed, unless --no-recovery
+  // asked for exactly that.
+  if (opts.noRecovery !== true) {
+    const agent = agentSessionVar(opts);
+    if (agent !== null) {
+      return failResult(
+        io,
+        json,
+        "recover",
+        `recovering replaces the recovery code with a new one that has to be shown on a terminal -- but an AI agent session (${agent} is set) never displays a recovery code.`,
+        {
+          exitCode: 2,
+          detail:
+            "Run `yaw-mcp secrets recover` yourself, at a terminal, or pass --no-recovery to recover WITHOUT a new code (`yaw-mcp secrets recovery new` adds one later).",
+        },
+      );
+    }
+  }
+
+  const source = opts.file !== undefined ? resolvePath(opts.file) : path;
+  const fromCopy = source !== resolvePath(path);
+
+  const baseline = await vaultFingerprint(path);
+  if (isVaultUnreadable(baseline)) return vaultUnreadableResult(io, json, "recover", path, baseline);
+  let sourceBaseline: VaultFingerprint = baseline;
+  if (fromCopy) {
+    // Never over a vault: recover writes its result to the vault path, and
+    // the one there may hold entries the copy does not. The user moves it.
+    if (baseline !== null) {
+      return fail(
+        `a vault already exists at ${path}, and recovering ${source} would replace it -- nothing was changed. Move it aside first (rename it, or let \`yaw-mcp secrets reset\` move it -- reset then leaves a new empty vault there, which has to be moved aside too), then re-run.`,
+        2,
+      );
+    }
+    sourceBaseline = await vaultFingerprint(source);
+    if (isVaultUnreadable(sourceBaseline)) {
+      return vaultUnreadableResult(io, json, "recover", source, sourceBaseline);
+    }
+  }
+  const loaded = await safeLoadVault(source, io, json, "recover");
+  if (!loaded.ok) return loaded.result;
+  const vault = loaded.vault;
+  if (!vault) return fail(`No vault at ${source} to recover.`);
+  const status = recoveryStatus(vault);
+  if (status.state === "malformed") {
+    return fail(
+      "this vault's recovery slot is malformed, so no recovery code can open it -- `yaw-mcp secrets reset` starts over",
+    );
+  }
+  if (status.state !== "set") return fail(VAULT_NO_RECOVERY_ERROR);
+
+  const { stdin } = termStreams(opts);
+  const out = promptStream(opts);
+  let dek: Buffer | undefined;
+  let lastTypo: string | undefined;
+  for (let attempt = 0; attempt < MAX_PASSPHRASE_PROMPTS && dek === undefined; attempt++) {
+    const typed = await readLineFromTTY(stdin, out, "Recovery code: ");
+    if (typed === CANCELLED) return cancelledResult(io, json, "recover");
+    if (typed === NO_ECHO) {
+      return fail(noEchoRefusal("Recovery code required.", "Run recover at a terminal that can turn echo off."));
+    }
+    if (typed.trim().length === 0) {
+      out.write("Recovery code cannot be empty.\n");
+      continue;
+    }
+    try {
+      dek = unlockWithRecoveryCode(vault, typed);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // A mistyped code gets another try. The line names what is wrong with
+      // its SHAPE and never echoes what was typed.
+      if (msg === RECOVERY_CODE_FORMAT_ERROR || msg === RECOVERY_CODE_TYPO_ERROR) {
+        lastTypo = msg;
+        out.write(`That is ${msg === RECOVERY_CODE_TYPO_ERROR ? "a " : ""}${msg}. Check it and try again.\n`);
+        continue;
+      }
+      if (msg === VAULT_CHECK_CORRUPT_ERROR) return fail(`${msg}. ${vaultCheckCorruptHint(source)}`);
+      return fail(`${msg}. Nothing was changed.`);
+    }
+  }
+  if (dek === undefined) {
+    return fail(
+      lastTypo !== undefined
+        ? `${lastTypo} -- no valid recovery code after ${MAX_PASSPHRASE_PROMPTS} attempts. Nothing was changed.`
+        : `No recovery code was entered after ${MAX_PASSPHRASE_PROMPTS} attempts. Nothing was changed.`,
+    );
+  }
+  const key: Buffer = dek;
+
+  try {
+    const newPassphrase = await resolveNewPassphrase(opts, io);
+    if (newPassphrase === CANCELLED) return cancelledResult(io, json, "recover");
+    if (newPassphrase === NO_ECHO) {
+      return fail(noEchoRefusal("New passphrase required.", "Set YAW_MCP_VAULT_PASSPHRASE_NEW instead."));
+    }
+    if (newPassphrase === null) {
+      return fail(
+        promptUnavailableMessage(
+          opts,
+          "New passphrase required (and must be confirmed).",
+          "YAW_MCP_VAULT_PASSPHRASE_NEW",
+          { confirm: true, supplied: opts.newPassphrase },
+        ),
+      );
+    }
+
+    // Both blockers were refused at the top (no terminal, an agent session),
+    // so a code is issued whenever one is wanted.
+    const wantCode = opts.noRecovery !== true;
+    let recovered: VaultFile;
+    let issuedCode: string | undefined;
+    try {
+      const built = await rekeyVault(vault, key, newPassphrase, {
+        recovery: wantCode,
+        operation: "recover",
+      });
+      recovered = built.vault;
+      issuedCode = built.recoveryCode;
+    } catch (err) {
+      return fail(err instanceof Error ? err.message : String(err));
+    }
+    const unconfirmed = await confirmRecoveryCodeOrFail(
+      opts,
+      io,
+      "recover",
+      issuedCode,
+      "Re-run recover (the code you used still works until a recovery is saved), or pass --no-recovery.",
+    );
+    if (unconfirmed) return unconfirmed;
+
+    // With --file the vault path was empty at load; this re-check also refuses
+    // a vault that appeared there since.
+    if (
+      (await vaultChangedSinceLoad(path, baseline)) ||
+      (fromCopy && (await vaultChangedSinceLoad(source, sourceBaseline)))
+    ) {
+      return vaultChangedResult(io, json, "recover");
+    }
+
+    const cause = await trySaveVault(path, recovered);
+    if (cause !== null) {
+      return fail(`could not write the vault file at ${path} (${cause}) -- nothing was saved.`);
+    }
+    // Any cached key belongs to a file that no longer exists.
+    lock();
+    await auditVaultEvents(home, [
+      "recovery-used",
+      "vault-rekeyed",
+      ...(issuedCode !== undefined ? (["recovery-issued"] as const) : []),
+    ]);
+
+    const count = Object.keys(recovered.entries).length;
+    if (json) {
+      io.out(
+        `${JSON.stringify({
+          ok: true,
+          recovered: true,
+          path,
+          source,
+          secret_count: count,
+          recovery: recoveryField(recovered),
+        })}\n`,
+      );
+    } else {
+      io.out(
+        `Recovered the vault at ${path}${fromCopy ? ` from ${source}` : ""}: ${count} secret${count === 1 ? "" : "s"} kept, now under the new passphrase and a fresh data key. The recovery code you used no longer opens it.\n`,
+      );
+      if (issuedCode !== undefined) io.out("A new recovery code replaced it.\n");
+    }
+    const envKeyed = (process.env.YAW_MCP_VAULT_PASSPHRASE ?? "").length > 0;
+    rotateVaultNudge(io, path, json, envKeyed, "vault-recovered");
+    return { exitCode: 0 };
+  } finally {
+    key.fill(0);
+  }
+}
+
+/**
+ * `recovery new` / `recovery remove`: add, replace or drop the vault's
+ * recovery code. Both RE-KEY (rekeyVault, same passphrase, fresh data key),
+ * so a replaced or removed code -- and any backup of the old file -- opens
+ * nothing current. `new` needs the code shown, so it refuses (exit 2) where
+ * it cannot be; `remove` is confirmed like `secrets remove`. `new` also
+ * upgrades an older-schema vault.
+ */
+async function runSecretsRecovery(opts: SecretsCommandOptions, io: SecretsIo): Promise<SecretsCommandResult> {
+  const home = opts.home ?? homedir();
+  const path = vaultPath(home);
+  const json = opts.json;
+  const sub = opts.recoverySub;
+  if (sub !== "new" && sub !== "remove") {
+    return failResult(io, json, "recovery", "recovery needs a subcommand: `recovery new` or `recovery remove`", {
+      exitCode: 2,
+    });
+  }
+  const label = `recovery ${sub}`;
+  const fail = (msg: string, extra: Parameters<typeof failResult>[4] = {}): SecretsCommandResult =>
+    failResult(io, json, label, msg, extra);
+
+  if (sub === "new") {
+    const blocker = recoveryDisplayBlocker(opts);
+    if (blocker !== null) {
+      return fail(`a recovery code has to be shown on a terminal, but ${blocker.detail}.`, {
+        exitCode: 2,
+        detail: "Run `yaw-mcp secrets recovery new` yourself, at a terminal.",
+      });
+    }
+  }
+
+  const baseline = await vaultFingerprint(path);
+  if (isVaultUnreadable(baseline)) return vaultUnreadableResult(io, json, label, path, baseline);
+  const loaded = await safeLoadVault(path, io, json, label);
+  if (!loaded.ok) return loaded.result;
+  const vault = loaded.vault;
+  if (!vault) {
+    return fail(
+      `No vault at ${path}. \`yaw-mcp secrets set <name>\` creates one (with a recovery code, at a terminal).`,
+    );
+  }
+  const status = recoveryStatus(vault);
+
+  if (sub === "remove") {
+    if (status.state !== "set" && status.state !== "malformed") {
+      return fail("this vault has no recovery code to remove.");
+    }
+    if (!opts.force) {
+      if (isInteractiveTTY(opts)) {
+        const confirmed = await promptYesNo(
+          opts,
+          "Remove the vault's recovery code? Without it, a forgotten passphrase means starting over with `secrets reset`.",
+        );
+        if (confirmed === CANCELLED) return cancelledResult(io, json, label);
+        if (!confirmed) return abortedResult(io, json, label);
+      } else {
+        return fail(`refusing to remove the recovery code without confirmation and ${nonTTYEnds(opts)}.`, {
+          exitCode: 2,
+          detail: "Re-run with --force to remove it.",
+        });
+      }
+    }
+  }
+
+  // A legacy vault with no check marker and no entries (one `remove` emptied)
+  // verifies no passphrase: unlock() accepts any, and the re-key below would
+  // build the new v3 passphrase slot under whatever was typed. That is a vault
+  // being established, so the entry is confirmed twice under the creation
+  // labels, with the same note `set` shows for it. (`remove` never reaches
+  // here on such a vault: v1/v2 have no recovery slot to remove.)
+  const establishing = !vaultVerifiesPassphrases(vault);
+  const passphrase = await resolvePassphrase(
+    opts,
+    io,
+    establishing,
+    CREATE_VAULT_LABELS,
+    establishing
+      ? `The vault at ${path} is empty, so it has no passphrase: the one you enter now becomes its passphrase.\n`
+      : undefined,
+  );
+  if (passphrase === CANCELLED) return cancelledResult(io, json, label);
+  if (passphrase === NO_ECHO) {
+    return fail(noEchoRefusal("Passphrase required.", "Set YAW_MCP_VAULT_PASSPHRASE instead."));
+  }
+  if (passphrase === null) {
+    return fail(
+      promptUnavailableMessage(opts, "Passphrase required.", "YAW_MCP_VAULT_PASSPHRASE", {
+        confirm: establishing,
+        supplied: opts.passphrase,
+      }),
+    );
+  }
+
+  let key: Buffer;
+  try {
+    key = await unlock(vault, passphrase);
+  } catch (err) {
+    return fail(unlockErrorMessage(err, path, vault));
+  }
+  try {
+    let rekeyed: VaultFile;
+    let issuedCode: string | undefined;
+    try {
+      const built = await rekeyVault(vault, key, passphrase, { recovery: sub === "new", operation: label });
+      rekeyed = built.vault;
+      issuedCode = built.recoveryCode;
+    } catch (err) {
+      lock();
+      return fail(err instanceof Error ? err.message : String(err));
+    }
+    const unconfirmed = await confirmRecoveryCodeOrFail(
+      opts,
+      io,
+      label,
+      issuedCode,
+      `Re-run \`yaw-mcp secrets ${label}\`; the vault was not changed.`,
+    );
+    if (unconfirmed) {
+      lock();
+      return unconfirmed;
+    }
+    if (await vaultChangedSinceLoad(path, baseline)) {
+      lock();
+      return vaultChangedResult(io, json, label);
+    }
+    const failed = await saveVaultOrReport(path, rekeyed, io, json, label);
+    lock();
+    if (failed) return failed;
+    await auditVaultEvents(home, [sub === "new" ? "recovery-issued" : "recovery-removed", "vault-rekeyed"]);
+
+    const count = Object.keys(rekeyed.entries).length;
+    const reenc = `${count} secret${count === 1 ? "" : "s"} re-encrypted under a fresh data key`;
+    if (json) {
+      io.out(
+        `${JSON.stringify({
+          ok: true,
+          ...(sub === "new" ? { issued: true } : { removed: true }),
+          path,
+          secret_count: count,
+          recovery: recoveryField(rekeyed),
+        })}\n`,
+      );
+    } else if (sub === "new") {
+      io.out(
+        `Issued a new recovery code for the vault at ${path} (${reenc}). ${status.state === "set" ? "The previous code" : "Any earlier code"} no longer opens it.\n`,
+      );
+    } else {
+      io.out(`Removed the recovery code from the vault at ${path} (${reenc}); the old code no longer opens it.\n`);
+    }
+    vaultUpgradedNotice(io, vault.version, path, json);
+    return { exitCode: 0 };
+  } finally {
+    key.fill(0);
+  }
 }
 
 /** Render + filter the local secret-resolution audit log. Read-only; never
@@ -2433,7 +3464,13 @@ async function runSecretsAudit(opts: SecretsCommandOptions, io: SecretsIo): Prom
     return { exitCode: 0 };
   }
   for (const e of events) {
-    io.out(`${e.ts}  ${e.event === "injected" ? "injected" : "missing "}  ${e.server}  ${e.secret}\n`);
+    if (e.event === "injected" || e.event === "missing") {
+      io.out(`${e.ts}  ${e.event === "injected" ? "injected" : "missing "}  ${e.server}  ${e.secret}\n`);
+    } else {
+      // A vault-level event (recovery-issued, vault-rekeyed, ...): no server,
+      // no secret -- just what happened to the vault, and when.
+      io.out(`${e.ts}  ${e.event}  (vault)\n`);
+    }
   }
   return { exitCode: 0 };
 }

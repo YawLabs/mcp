@@ -7,9 +7,24 @@ import { mkdir } from "node:fs/promises";
 import os from "node:os";
 import nodePath from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { parseSecretsArgs, runSecrets, SECRETS_USAGE } from "../secrets-cmd.js";
 import { lock, vaultPath } from "../secrets-vault.js";
+
+// A vault created at a (fake) terminal shows a recovery code and waits for two
+// of its groups to be typed back -- unless an AI agent drives the process. Pin
+// that for the whole file, so a test that creates a vault on a TTY never waits
+// on a confirmation it did not script, whether or not the suite itself runs
+// under CLAUDECODE.
+let savedAiAgent: string | undefined;
+beforeAll(() => {
+  savedAiAgent = process.env.AI_AGENT;
+  process.env.AI_AGENT = "secrets-cmd-prompts.test";
+});
+afterAll(() => {
+  if (savedAiAgent === undefined) delete process.env.AI_AGENT;
+  else process.env.AI_AGENT = savedAiAgent;
+});
 
 /** A TTY stdin that hands out one queued chunk per resume(), the shape the
  *  raw-mode reader drives (same contract as the fake in secrets-cmd.test.ts). */

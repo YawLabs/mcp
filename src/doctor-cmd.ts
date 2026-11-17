@@ -187,6 +187,7 @@ import {
 } from "./persistence.js";
 import { cachedRegistryLatest, type RegistryCacheOptions } from "./registry-cache.js";
 import { fetchLatestVersion as fetchRegistryLatest } from "./registry-latest.js";
+import { VAULT_UPGRADE_COMMANDS_TEXT, vaultSchemaBehind } from "./secrets-cmd.js";
 import {
   checkVaultPassphrase,
   collectMalformedSecretRefs,
@@ -195,8 +196,9 @@ import {
   listKeys,
   loadVault,
   lock,
+  type RecoveryState,
+  recoveryStatus,
   SECRET_NAME_RE,
-  SECRETS_SCHEMA_VERSION,
   type VaultFile,
   vaultCheckCorruptHint,
   vaultPath,
@@ -2041,6 +2043,25 @@ export interface VaultStatus {
    *  see vaultCheckCorruptHint. Only ever true beside `passphraseUnlocks:
    *  false`. Additive JSON field. */
   checkMarkerCorrupt: boolean;
+  /** True when the passphrase could not be checked at all because the v3
+   *  vault's passphrase slot is damaged (its digest does not match, or it
+   *  unwraps a key the vault's contents disagree with) -- checkVaultPassphrase's
+   *  "slot-damaged" verdict. NEITHER right nor wrong: `passphraseUnlocks` is
+   *  false beside it (unlock() fails, so the broker refuses the spawn), and the
+   *  way out is `secrets recover` when a recovery code was saved, not a retyped
+   *  passphrase. Only ever true beside `passphraseUnlocks: false`. Additive
+   *  JSON field. */
+  passphraseSlotDamaged: boolean;
+  /** The vault's recovery-code state (secrets-vault's recoveryStatus): "set"
+   *  (a usable recovery slot), "none" (a v3 vault without one), "malformed"
+   *  (v3, but the slot on disk is unusable and loadVault dropped it), or
+   *  "unsupported" (a v1/v2 vault, which has no slot to hold one). Null when
+   *  there is no readable vault. Read from the file alone -- no passphrase,
+   *  no code. Additive JSON field. */
+  recovery: RecoveryState | null;
+  /** When the recovery code was created (ISO-8601 UTC, as stored in the
+   *  slot). Non-null only when `recovery` is "set". Additive JSON field. */
+  recoveryCreated: string | null;
   /** Servers whose configured env carries `${secret:NAME}` refs. */
   refs: Array<{
     namespace: string;
@@ -2168,6 +2189,8 @@ async function collectVaultStatus(opts: {
   let entries: string[] | null = exists ? null : [];
   let unreadable: string | null = null;
   let schemaVersion: number | null = null;
+  let recovery: RecoveryState | null = null;
+  let recoveryCreated: string | null = null;
   let vault: VaultFile | null = null;
   if (exists) {
     try {
@@ -2177,6 +2200,11 @@ async function collectVaultStatus(opts: {
       // the honest reading of a vault file that vanished mid-run.
       entries = vault ? listKeys(vault) : [];
       schemaVersion = vault ? vault.version : null;
+      if (vault) {
+        const rs = recoveryStatus(vault);
+        recovery = rs.state;
+        recoveryCreated = rs.created;
+      }
     } catch (err) {
       unreadable = err instanceof Error ? err.message : String(err);
     }
@@ -2220,12 +2248,14 @@ async function collectVaultStatus(opts: {
   const passphrase = opts.env.YAW_MCP_VAULT_PASSPHRASE ?? "";
   let passphraseUnlocks: boolean | null = null;
   let checkMarkerCorrupt = false;
+  let passphraseSlotDamaged = false;
   if (passphrase !== "" && vault !== null && vaultVerifiesPassphrases(vault)) {
     const unlockedBeforeDoctor = isUnlocked();
     try {
       const verdict = await checkVaultPassphrase(vault, passphrase);
       passphraseUnlocks = verdict === "opens";
       checkMarkerCorrupt = verdict === "marker-corrupt";
+      passphraseSlotDamaged = verdict === "slot-damaged";
     } catch {
       // Could not check: leave passphraseUnlocks null.
     } finally {
@@ -2317,6 +2347,9 @@ async function collectVaultStatus(opts: {
     passphraseSet: passphrase !== "",
     passphraseUnlocks,
     checkMarkerCorrupt,
+    passphraseSlotDamaged,
+    recovery,
+    recoveryCreated,
     refs,
     malformed,
     missing,
@@ -2329,6 +2362,55 @@ async function collectVaultStatus(opts: {
       normalizeForCompare(resolve(opts.bundlesPath)) ===
         normalizeForCompare(resolve(localBundlesPath(userConfigDir(opts.home)))),
   };
+}
+
+/** The SECRET VAULT section's `schema:` line(s) for an on-disk version. An
+ *  older schema names what it lacks and the commands that upgrade it, in the
+ *  words `secrets`' own schema-behind notice uses -- vaultSchemaBehind is the
+ *  one spelling of that text, so the two cannot drift -- wrapped under the
+ *  label. The current schema, and one newer than this build (loadVault
+ *  refuses those, so in practice never reached), get the bare version. */
+function vaultSchemaLines(version: number): string[] {
+  const head = `  schema:     v${version}`;
+  const behind = vaultSchemaBehind(version);
+  if (behind === null) return [head];
+  return wrapUnder(`${head} --`, behind.why, "              ", 80);
+}
+
+/** `head` (kept exactly as given) followed by `text` word-wrapped at `width`
+ *  columns, continuation lines indented by `pad`. A `backticked command` is
+ *  one unbreakable word. */
+function wrapUnder(head: string, text: string, pad: string, width: number): string[] {
+  const lines: string[] = [];
+  let line = head;
+  for (const w of text.match(/`[^`]*`\S*|\S+/g) ?? []) {
+    if (line.length + 1 + w.length > width) {
+      lines.push(line);
+      line = pad + w;
+    } else {
+      line = `${line} ${w}`;
+    }
+  }
+  lines.push(line);
+  return lines;
+}
+
+/** The SECRET VAULT section's `recovery:` text for a recoveryStatus state.
+ *  `created` is shown as its date only: the slot stores a full ISO date-time,
+ *  and the day is what a user matches against where they saved the code. */
+function vaultRecoveryText(state: RecoveryState, created: string | null): string {
+  switch (state) {
+    case "set": {
+      const day = created !== null && /^\d{4}-\d{2}-\d{2}/.test(created) ? created.slice(0, 10) : created;
+      return day !== null ? `recovery code set (created ${day})` : "recovery code set";
+    }
+    case "none":
+      return "none -- `yaw-mcp secrets recovery new` adds one (needs a terminal)";
+    case "malformed":
+      return "slot damaged -- the passphrase still works; `yaw-mcp secrets recovery new` replaces it";
+    case "unsupported":
+      return `not available on schema v1/v2 -- ${VAULT_UPGRADE_COMMANDS_TEXT} upgrades`;
+  }
 }
 
 /** SECRET VAULT section.
@@ -2387,26 +2469,27 @@ function renderVaultSection(opts: {
     const entries = status.entries ?? [];
     print(`  entries:    ${entries.length === 0 ? "(none)" : `${entries.length} -- ${entries.join(", ")}`}`);
   }
-  // Schema line only when a vault was read. A vault created before v2 stays
-  // v1 forever (setSecret preserves the version), so its entries are never
-  // bound to their names and a blob swap between two names still decrypts --
-  // and until this line nothing told the user, who had no reason to run
-  // `secrets rotate` on a vault that works.
+  // Schema line only when a vault was read. A vault stays at the version it
+  // was created with until `secrets rotate` or `secrets recovery new`
+  // re-keys it -- setSecret preserves the version -- so a v1 vault's
+  // entries are never bound to their names (a blob swap between two names
+  // still decrypts) and neither v1 nor v2 can hold a recovery code. Until
+  // this line nothing told the user, who had no reason to upgrade a vault
+  // that works. Per-version text: the two old schemas lack different things.
   if (status.schemaVersion !== null) {
-    if (status.schemaVersion < SECRETS_SCHEMA_VERSION) {
-      print(`  schema:     v${status.schemaVersion} -- entries are NOT bound to their names until`);
-      print(`              \`yaw-mcp secrets rotate\` rewrites the file as v${SECRETS_SCHEMA_VERSION}`);
-    } else {
-      print(`  schema:     v${status.schemaVersion}`);
-    }
+    for (const line of vaultSchemaLines(status.schemaVersion)) print(line);
   }
-  // Four set-states, not two: set-and-opens, set-but-marker-corrupt (checked
-  // before the generic does-NOT branch), set-but-does-not, and set-but-
-  // unverifiable (no readable vault, nothing in it to check against, or a
-  // check that could not run). The "does NOT" line is the only surface that
-  // tells a stale or forgotten passphrase apart from an absent one -- the
-  // spawn error says "does not unlock" but nothing there pointed at the way
-  // out.
+  // Recovery line beside the schema line, from the same read: whether a
+  // forgotten passphrase is survivable. Never the code -- doctor never sees it.
+  if (status.recovery !== null) print(`  recovery:   ${vaultRecoveryText(status.recovery, status.recoveryCreated)}`);
+  // Five set-states, not two: set-and-opens, set-but-marker-corrupt and
+  // set-but-slot-damaged (both checked before the generic does-NOT branch),
+  // set-but-does-not, and set-but-unverifiable (no readable vault, nothing in
+  // it to check against, or a check that could not run). The "does NOT" line
+  // is the only surface that tells a stale or forgotten passphrase apart from
+  // an absent one -- the spawn error says "does not unlock" but nothing there
+  // pointed at the way out.
+  const hasRecoveryCode = status.recovery === "set";
   if (!status.passphraseSet) {
     print("  passphrase: not set in this environment");
   } else if (status.passphraseUnlocks === true) {
@@ -2418,13 +2501,35 @@ function renderVaultSection(opts: {
     print("  passphrase: set in this environment, and it is the vault's -- but the vault's check");
     print("              marker is corrupt, so nothing opens until it is repaired.");
     print(`              ${vaultCheckCorruptHint(status.path)}`);
+  } else if (status.passphraseSlotDamaged) {
+    // Also before the generic "does NOT" branch: the slot cannot answer the
+    // question, so calling this passphrase wrong would send a user who typed
+    // the right one to retype it, or to a `reset` that abandons every entry
+    // a recovery code would have kept.
+    print("  passphrase: set in this environment, but the vault's passphrase slot is damaged --");
+    print("              the passphrase cannot be checked, and nothing opens with it.");
+    if (hasRecoveryCode) {
+      print("              `yaw-mcp secrets recover` restores access with the recovery code and keeps");
+      print("              every entry.");
+    } else {
+      print("              No recovery code was saved, so the entries cannot be recovered; `yaw-mcp");
+      print("              secrets reset` moves the vault aside and starts a new one.");
+    }
   } else if (status.passphraseUnlocks === false) {
     print("  passphrase: set in this environment, but it does NOT unlock the vault");
     print("              a server whose env references the vault fails to start or connect with it.");
     print("              Check the value in the `env` block of your client config (doctor sees THIS");
-    print("              shell's, which can differ). If the passphrase is forgotten,");
-    print("              `yaw-mcp secrets reset` moves the vault aside, lists its entry names, and");
-    print("              starts a new one under a passphrase you choose.");
+    if (hasRecoveryCode) {
+      // Recover first: it keeps every entry, where reset abandons them.
+      print("              shell's, which can differ). If the passphrase is forgotten,");
+      print("              `yaw-mcp secrets recover` restores access with the recovery code and keeps");
+      print("              every entry. Only if the code is lost too, `yaw-mcp secrets reset` moves the");
+      print("              vault aside and starts a new one under a passphrase you choose.");
+    } else {
+      print("              shell's, which can differ). If the passphrase is forgotten,");
+      print("              `yaw-mcp secrets reset` moves the vault aside, lists its entry names, and");
+      print("              starts a new one under a passphrase you choose.");
+    }
   } else {
     print("  passphrase: set in this environment");
   }

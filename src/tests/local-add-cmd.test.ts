@@ -4,7 +4,16 @@ import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { type CatalogServer, DEFAULT_CATALOG_URL, type FetchCatalog } from "../catalog.js";
-import { parseAddArgs, parseListArgs, parseRemoveArgs, runAdd, runList, runRemove } from "../local-add-cmd.js";
+import {
+  ADD_USAGE,
+  gitAddSecretOptions,
+  parseAddArgs,
+  parseListArgs,
+  parseRemoveArgs,
+  runAdd,
+  runList,
+  runRemove,
+} from "../local-add-cmd.js";
 import { deriveNamespace, loadLocalBundles, removeUserBundle, upsertUserBundle } from "../local-bundles.js";
 import { CONFIG_DIRNAME } from "../paths.js";
 import { runStatus } from "../status-cmd.js";
@@ -4342,5 +4351,25 @@ describe("runAdd --json failures print one {ok:false} document [J-json]", () => 
     // Only meaningful if stderr was actually written after the document.
     expect(errCalls).toBeGreaterThan(0);
     expect(settled).toBe("rejected");
+  });
+});
+
+describe("add --git --no-recovery (the vault a secret offer may create)", () => {
+  it("parses with --git only, and the usage names it", () => {
+    const r = parseAddArgs(["--git", "https://example.test/o/r.git", "--no-recovery"]);
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.options.noRecovery).toBe(true);
+    const bare = parseAddArgs(["fetch", "--no-recovery"]);
+    expect(bare.ok).toBe(false);
+    if (!bare.ok) expect(bare.error).toBe("--no-recovery applies to a git server: pass --git <url>.");
+    expect(ADD_USAGE).toContain("--no-recovery");
+  });
+
+  it("the secret offer forwards --no-recovery and the add's own env to runSecrets", () => {
+    const env = { AI_AGENT: "injected" };
+    const o = gitAddSecretOptions({ noRecovery: true }, "fx_token", { home: "/h", cwd: "/c", env });
+    expect(o).toMatchObject({ action: "set", name: "fx_token", home: "/h", cwd: "/c", noRecovery: true, env });
+    expect(o.env).toBe(env);
+    expect(gitAddSecretOptions({}, "fx_token", { home: "/h", cwd: "/c", env }).noRecovery).toBeUndefined();
   });
 });

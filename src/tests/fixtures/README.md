@@ -150,3 +150,26 @@ thing still missing from this directory is real traffic.
 It does not: a fixture that exists and fails `validateCorpus` is a hard test
 FAILURE, not a skip. The likely causes are a bumped `FOUNDRY_CORPUS_VERSION`
 (re-export), a truncated or hand-edited file, or an empty `entries` array.
+
+## `vault-v1.json`, `vault-v2.json`, `vault-v3.json` -- golden secret vaults
+
+Consumed by `src/tests/secrets-vault-v3.test.ts`. Written ONCE by a throwaway
+generator that used raw `node:crypto` only (no yaw-mcp code), so each file is
+an independent implementation of its schema that the vault module must read.
+Do not regenerate them with the module itself -- that would turn the test into
+a round trip of whatever the module currently does.
+
+| file | passphrase | entries | notes |
+|---|---|---|---|
+| `vault-v1.json` | `golden-v1-fixture-passphrase` | github=`ghp_fixture_v1`, aws=`aws_fixture_v1` | no `kdf` (scrypt N=2^15 r=8 p=1), entries UNBOUND, check under `yaw-mcp:vault-check` |
+| `vault-v2.json` | `golden-v2-fixture-passphrase` | github=`ghp_fixture_v2`, aws=`aws_fixture_v2` | `kdf` N=1024 r=8 p=1, entries bound to their names |
+| `vault-v3.json` | `golden-v3-fixture-passphrase` | github=`ghp_fixture_v3`, aws=`aws_fixture_v3` | DEK + passphrase slot (N=1024) + recovery slot created `2026-11-16T12:00:00.000Z`; recovery code `YAWR-206S-0V9V-11BG-11MW-FTSJ-DXBZ-7MFX` |
+
+The recovery code above is a test fixture's, not a secret.
+
+`vault-v3.json`'s passphrase-slot `digest` was re-stamped once, when the digest
+grew to cover the slot AAD: SHA-256 over the canonical slot AAD
+(`{"kdf":{"N":1024,"p":1,"r":8},"role":"passphrase","salt":...,"vault_id":...,"version":3}`),
+one 0x00 byte, then the wrapped key's iv || ciphertext || authTag. The restamp
+used raw `node:crypto` only and first unwrapped the slot under the passphrase
+with that hand-written AAD; every other byte of the file is unchanged.
