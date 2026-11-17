@@ -61,8 +61,8 @@ vi.mock("../secrets-vault.js", async (importOriginal) => {
     // The spawn audit scans the env with collectSecretRefNames (secrets-vault's
     // single source of truth for the `${secret:NAME}` shape, built on
     // SECRET_REF_RE), and resolveServerEnv compares an unlock failure's
-    // message against VAULT_CHECK_CORRUPT_ERROR to tell
-    // "the vault is damaged, the passphrase is fine" from "wrong passphrase".
+    // message against VAULT_CHECK_CORRUPT_ERROR and VAULT_SLOT_DAMAGED_ERROR
+    // to tell "the vault is damaged" from "wrong passphrase".
     // Stubs would make those branches indistinguishable -- and a literal COPY
     // of any of them would silently go stale the day secrets-vault changes the
     // ref charset or the corrupt-check wording, leaving these suites green
@@ -70,6 +70,7 @@ vi.mock("../secrets-vault.js", async (importOriginal) => {
     collectSecretRefNames: actual.collectSecretRefNames,
     SECRET_REF_RE: actual.SECRET_REF_RE,
     VAULT_CHECK_CORRUPT_ERROR: actual.VAULT_CHECK_CORRUPT_ERROR,
+    VAULT_SLOT_DAMAGED_ERROR: actual.VAULT_SLOT_DAMAGED_ERROR,
     vaultCheckCorruptHint: actual.vaultCheckCorruptHint,
     vaultVerifiesPassphrases: actual.vaultVerifiesPassphrases,
   };

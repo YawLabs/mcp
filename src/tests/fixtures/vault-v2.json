@@ -1,0 +1,26 @@
+{
+  "version": 2,
+  "salt": "AxTHWqnG8JS0u/fQgVkNng==",
+  "kdf": {
+    "N": 1024,
+    "r": 8,
+    "p": 1
+  },
+  "entries": {
+    "github": {
+      "iv": "J4WxdeRJda0ft9X+",
+      "ciphertext": "+EU4GZ8YglERQAJ0bt8=",
+      "authTag": "2lzUCZoJ2Qurh3v3RnCZYw=="
+    },
+    "aws": {
+      "iv": "EOVKUqlvVdEg8CaZ",
+      "ciphertext": "XnFTIXf24syIArz0aGg=",
+      "authTag": "xYIUYu4Ffft1kjlsluGvnQ=="
+    }
+  },
+  "check": {
+    "iv": "D8p/7m9uhbXReBIJ",
+    "ciphertext": "MBUkdFFuA91L9+/nrbsrPQ==",
+    "authTag": "prOg/y9iXKlxN3JSXeNDQA=="
+  }
+}

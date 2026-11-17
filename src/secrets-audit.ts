@@ -44,7 +44,20 @@ export const AUDIT_TAIL_CAP = 5000;
  *  kept once one runs. */
 const AUDIT_TRIM_TO = AUDIT_TAIL_CAP - 500;
 
-export type AuditEventKind = "injected" | "missing";
+export type AuditEventKind = SecretAuditEventKind | VaultAuditEventKind;
+
+/** Events about one secret resolved for one server. */
+export type SecretAuditEventKind = "injected" | "missing";
+
+/** Events about the vault itself, written by `yaw-mcp secrets` (server and
+ *  secret are ""). Metadata only: a recovery code never appears in the log. */
+export const VAULT_AUDIT_EVENT_KINDS = [
+  "recovery-issued",
+  "recovery-used",
+  "recovery-removed",
+  "vault-rekeyed",
+] as const;
+export type VaultAuditEventKind = (typeof VAULT_AUDIT_EVENT_KINDS)[number];
 
 export interface AuditEvent {
   /** ISO-8601 timestamp. */
@@ -56,7 +69,9 @@ export interface AuditEvent {
   /** "injected": the secret was decrypted and handed to the server.
    *  "missing": a reference the spawn was refused over -- the name is not in
    *  the vault, its entry is there but did not decrypt, or the reference
-   *  itself did not parse (a `<malformed ref>` marker in `secret`). */
+   *  itself did not parse (a `<malformed ref>` marker in `secret`).
+   *  The VAULT_AUDIT_EVENT_KINDS describe the vault, not a server: their
+   *  server and secret are "". */
   event: AuditEventKind;
 }
 
@@ -213,6 +228,8 @@ function isAuditEvent(v: unknown): v is AuditEvent {
     typeof e.ts === "string" &&
     typeof e.server === "string" &&
     typeof e.secret === "string" &&
-    (e.event === "injected" || e.event === "missing")
+    (e.event === "injected" ||
+      e.event === "missing" ||
+      (VAULT_AUDIT_EVENT_KINDS as readonly unknown[]).includes(e.event))
   );
 }

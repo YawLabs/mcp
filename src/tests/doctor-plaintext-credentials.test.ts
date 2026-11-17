@@ -52,7 +52,22 @@ function writeVault(names: string[]): void {
   const entries = Object.fromEntries(names.map((n) => [n, { iv: "x", ciphertext: "y", authTag: "z" }]));
   writeFileSync(
     join(home, ".yaw-mcp", "secrets.json"),
-    JSON.stringify({ version: SECRETS_SCHEMA_VERSION, salt: SALT_B64, kdf: { N: 16384, r: 8, p: 1 }, entries }),
+    // A structurally valid v3 skeleton (loadVault only shape-checks slots and
+    // entries; nothing here is decrypted).
+    JSON.stringify({
+      version: SECRETS_SCHEMA_VERSION,
+      vault_id: SALT_B64,
+      salt: SALT_B64,
+      keyslots: {
+        passphrase: {
+          salt: SALT_B64,
+          kdf: { N: 16384, r: 8, p: 1 },
+          wrapped: { iv: "x", ciphertext: "y", authTag: "z" },
+          digest: Buffer.alloc(32, 1).toString("base64"),
+        },
+      },
+      entries,
+    }),
   );
 }
 

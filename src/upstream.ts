@@ -39,6 +39,7 @@ import {
   resolveSecretRefs,
   unlock,
   VAULT_CHECK_CORRUPT_ERROR,
+  VAULT_SLOT_DAMAGED_ERROR,
   vaultCheckCorruptHint,
   vaultPath,
   vaultVerifiesPassphrases,
@@ -173,7 +174,18 @@ export function clearSessionVaultPassphrase(): void {
  *  The verdict itself is secrets-vault's checkVaultPassphrase, the one
  *  spelling of "unlock, but read a corrupt check marker as a RIGHT
  *  passphrase": "opens" and "marker-corrupt" both accept what the user typed
- *  (a damaged marker would fail a retype identically). A check that throws
+ *  (a damaged marker would fail a retype identically). "slot-damaged" (a v3
+ *  vault whose passphrase slot is damaged) is also "verified", for the same
+ *  reason: a retype cannot change it. Either the slot's digest does not
+ *  match -- then EVERY passphrase gets that verdict, with no unwrap tried --
+ *  or the slot unwrapped under what the user typed (GCM-authenticated, so
+ *  that IS the passphrase the slot was written under) and only the contents
+ *  disagree with the key it holds. A passphrase that fails the unwrap gets
+ *  "wrong" instead, as on any vault. So "did not unlock" would send the
+ *  user round the prompt budget retyping a passphrase that may be right.
+ *  Kept, the retry reaches unlockForResolve, which fails the activation with
+ *  the damaged-slot error and its `yaw-mcp secrets recover` pointer instead
+ *  of prompting. A check that throws
  *  -- a key-derivation failure, which says nothing about the passphrase --
  *  answers "wrong", so the elicitation path reports it as a passphrase that
  *  did not unlock the vault. */
@@ -419,6 +431,15 @@ async function unlockForResolve(
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     if (msg === VAULT_CHECK_CORRUPT_ERROR) throw new Error(`${msg}. ${vaultCheckCorruptHint(vaultPath())}`);
+    // A damaged v3 passphrase slot is not a prompt either. unlock answers it
+    // for EVERY passphrase when the slot's digest does not match (checked
+    // before any unwrap), and otherwise only for the passphrase that unwraps
+    // the slot (the slot holds a key the contents do not know) -- a different
+    // passphrase fails the unwrap and lands below as a wrong one. Either way
+    // re-prompting for this passphrase could only loop. Its message already
+    // names the CLI repair (`yaw-mcp secrets recover`); the recovery code
+    // itself is never taken over MCP.
+    if (msg === VAULT_SLOT_DAMAGED_ERROR) throw new Error(msg);
     log("warn", "Vault passphrase did not unlock the vault", { namespace, keys: refKeys });
     throw new VaultPassphraseRequiredError(
       `vault locked: the passphrase available to yaw-mcp does not unlock the vault (${msg})`,

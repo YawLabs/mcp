@@ -31,7 +31,7 @@
 // share the same scrypt-derived key, so the key is derived once per
 // passphrase prompt, not once per entry.
 
-import { createCipheriv, createDecipheriv, randomBytes, scrypt as scryptCb } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, hkdfSync, randomBytes, scrypt as scryptCb } from "node:crypto";
 
 /** Length in bytes of the derived key. AES-256-GCM needs 32. */
 export const KEY_LEN = 32;
@@ -301,6 +301,17 @@ export function encryptEntry(plaintext: string, key: Buffer, aad?: string): Encr
 /** Decrypt an EncryptedEntry. Throws on tamper / wrong key / corruption --
  *  including an `aad` that does not match the one it was encrypted under. */
 export function decryptEntry(entry: EncryptedEntry, key: Buffer, aad?: string): string {
+  const pt = decryptRaw(entry, key, aad);
+  try {
+    return pt.toString("utf8");
+  } finally {
+    pt.fill(0);
+  }
+}
+
+/** The shared GCM decrypt: the plaintext bytes in a buffer the caller owns
+ *  (and should zero). */
+function decryptRaw(entry: EncryptedEntry, key: Buffer, aad?: string): Buffer {
   if (key.length !== KEY_LEN) throw new Error(`key must be ${KEY_LEN} bytes`);
   const iv = Buffer.from(entry.iv, "base64");
   const ct = Buffer.from(entry.ciphertext, "base64");
@@ -310,6 +321,123 @@ export function decryptEntry(entry: EncryptedEntry, key: Buffer, aad?: string): 
   const decipher = createDecipheriv("aes-256-gcm", key, iv);
   if (aad !== undefined) decipher.setAAD(Buffer.from(aad, "utf8"));
   decipher.setAuthTag(authTag);
-  const pt = Buffer.concat([decipher.update(ct), decipher.final()]);
-  return pt.toString("utf8");
+  const head = decipher.update(ct);
+  let tail: Buffer;
+  try {
+    tail = decipher.final();
+  } catch (err) {
+    // GCM's update() hands back the CTR-decrypted bytes BEFORE the tag is
+    // checked, so on an authentication failure under the right key `head`
+    // holds the plaintext (XOR any tampering). Zero it before rethrowing.
+    head.fill(0);
+    throw err;
+  }
+  const out = Buffer.alloc(head.length + tail.length);
+  head.copy(out, 0);
+  tail.copy(out, head.length);
+  head.fill(0);
+  tail.fill(0);
+  return out;
+}
+
+// ---------------------------------------------------------------------
+// Schema v3 key hierarchy (see secrets-vault.ts): a random data-encryption
+// key (DEK) encrypts every entry, and key SLOTS wrap that DEK under a key
+// derived from the passphrase (scrypt) or from a recovery code (HKDF).
+// ---------------------------------------------------------------------
+
+/** Length in bytes of a v3 vault's data-encryption key. */
+export const DEK_LEN = KEY_LEN;
+
+/** Length in bytes of a v3 vault's `vault_id`. */
+export const VAULT_ID_LEN = 16;
+
+/** Length in bytes of a passphrase slot's digest (SHA-256). */
+export const SLOT_DIGEST_LEN = 32;
+
+/** HKDF `info` for the recovery slot's key-encryption key. Versioned so a
+ *  future derivation change cannot collide with this one. */
+export const RECOVERY_KEK_INFO = "yaw-mcp:keyslot:recovery:v1";
+
+/** A fresh random DEK in its own zero-filled allocation (see copyKey). */
+export function generateDek(): Buffer {
+  const raw = randomBytes(DEK_LEN);
+  const out = copyKey(raw);
+  raw.fill(0);
+  return out;
+}
+
+/** A fresh random vault_id, base64. */
+export function generateVaultId(): string {
+  return randomBytes(VAULT_ID_LEN).toString("base64");
+}
+
+/** The recovery slot's key-encryption key: HKDF-SHA256 over the 16-byte code
+ *  secret, salted with the slot's salt. No stretching: the code carries 128
+ *  bits of entropy, so a fast KDF is not the weak link. */
+export function deriveRecoveryKek(secret: Buffer, salt: Buffer): Buffer {
+  const ab = hkdfSync("sha256", secret, salt, RECOVERY_KEK_INFO, KEY_LEN);
+  const view = Buffer.from(ab);
+  const out = copyKey(view);
+  view.fill(0);
+  return out;
+}
+
+/** GCM-wrap raw key bytes (a DEK) under `kek`, bound to `aad`. */
+export function wrapKey(keyBytes: Buffer, kek: Buffer, aad: string): EncryptedEntry {
+  if (kek.length !== KEY_LEN) throw new Error(`key must be ${KEY_LEN} bytes`);
+  const iv = randomBytes(IV_LEN);
+  const cipher = createCipheriv("aes-256-gcm", kek, iv);
+  cipher.setAAD(Buffer.from(aad, "utf8"));
+  const ct = Buffer.concat([cipher.update(keyBytes), cipher.final()]);
+  return {
+    iv: iv.toString("base64"),
+    ciphertext: ct.toString("base64"),
+    authTag: cipher.getAuthTag().toString("base64"),
+  };
+}
+
+/** Unwrap a DEK wrapped by wrapKey. Throws on a wrong `kek`, a different
+ *  `aad`, tampering, or a plaintext that is not DEK_LEN bytes. The result is
+ *  the caller's own allocation; zero it when done. */
+export function unwrapKey(wrapped: EncryptedEntry, kek: Buffer, aad: string): Buffer {
+  const out = decryptRaw(wrapped, kek, aad);
+  if (out.length !== DEK_LEN) {
+    out.fill(0);
+    throw new Error("unwrapped key has the wrong length");
+  }
+  return out;
+}
+
+/** base64 SHA-256 over a key slot's whole identity: the UTF-8 bytes of its
+ *  canonical AAD (role, vault_id, version, kdf, salt -- see secrets-vault's
+ *  slotAad), one 0x00 separator, then the wrapped blob's decoded iv ||
+ *  ciphertext || authTag. Canonical JSON never contains a NUL byte (control
+ *  characters are escaped), so the separator marks where the AAD ends; iv
+ *  and authTag are fixed length. An integrity stamp for accidental damage (a
+ *  truncated or bit-flipped slot, salt, kdf or vault_id), NOT a MAC: anyone
+ *  who can write the file can recompute it. What it buys is the distinction
+ *  between "the slot is damaged" and "the passphrase is wrong", which a GCM
+ *  failure alone cannot make -- every field the unwrap depends on is in it. */
+export function slotDigest(aad: string, wrapped: EncryptedEntry): string {
+  return createHash("sha256")
+    .update(Buffer.from(aad, "utf8"))
+    .update(Buffer.from([0]))
+    .update(Buffer.from(wrapped.iv, "base64"))
+    .update(Buffer.from(wrapped.ciphertext, "base64"))
+    .update(Buffer.from(wrapped.authTag, "base64"))
+    .digest("base64");
+}
+
+/** JSON with every object's keys sorted, recursively, and no whitespace: the
+ *  one spelling of a slot's AAD, so the writer and every reader agree byte
+ *  for byte whatever order the fields were built or parsed in. */
+export function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  const o = value as Record<string, unknown>;
+  const keys = Object.keys(o)
+    .filter((k) => o[k] !== undefined)
+    .sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalJson(o[k])}`).join(",")}}`;
 }

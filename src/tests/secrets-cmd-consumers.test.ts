@@ -10,10 +10,25 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import nodePath from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { runSecrets } from "../secrets-cmd.js";
 import { lock } from "../secrets-vault.js";
 import { grantTrust, TRUST_BYPASS_ENV } from "../trust.js";
+
+// A vault created at a (fake) terminal shows a recovery code and waits for two
+// of its groups to be typed back -- unless an AI agent drives the process. Pin
+// that for the whole file, so a test that creates a vault on a TTY never waits
+// on a confirmation it did not script, whether or not the suite itself runs
+// under CLAUDECODE.
+let savedAiAgent: string | undefined;
+beforeAll(() => {
+  savedAiAgent = process.env.AI_AGENT;
+  process.env.AI_AGENT = "secrets-cmd-consumers.test";
+});
+afterAll(() => {
+  if (savedAiAgent === undefined) delete process.env.AI_AGENT;
+  else process.env.AI_AGENT = savedAiAgent;
+});
 
 const PASS = "a-long-enough-passphrase";
 const VALUE = "ls_live_value_123";
@@ -136,6 +151,7 @@ describe("runSecrets set -- servers that reference the name", () => {
       referenced_by: ["billing", "lemonsqueezy"],
       bundles_path: bundlesPath(),
       running_servers_stale: true,
+      recovery: "none",
     });
     expect(errText()).toBe("");
   });

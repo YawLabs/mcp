@@ -1,13 +1,18 @@
-import { scryptSync } from "node:crypto";
-import { afterEach, describe, expect, it } from "vitest";
+import { createHash, hkdfSync, randomBytes, scryptSync } from "node:crypto";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  canonicalJson,
   copyKey,
   DEFAULT_KDF,
+  DEK_LEN,
   decryptEntry,
   defaultKdf,
   deriveKey,
+  deriveRecoveryKek,
   encryptEntry,
+  generateDek,
   generateSalt,
+  generateVaultId,
   invalidKdfParamsReason,
   isValidKdfParams,
   KEY_LEN,
@@ -16,6 +21,10 @@ import {
   normalizePassphrase,
   SALT_LEN,
   setDefaultKdfForTesting,
+  slotDigest,
+  unwrapKey,
+  VAULT_ID_LEN,
+  wrapKey,
 } from "../secrets-crypto.js";
 
 afterEach(() => {
@@ -133,6 +142,35 @@ describe("isValidKdfParams", () => {
       const key = await deriveKey("pw", salt, params);
       expect(key, JSON.stringify(params)).toHaveLength(KEY_LEN);
     }
+  });
+});
+
+describe("decryptEntry on an authentication failure", () => {
+  it("zeroes the bytes GCM's update() already decrypted before rethrowing", () => {
+    const key = randomBytes(32);
+    const secret = "sk-SECRET-token-123";
+    const entry = encryptEntry(secret, key, "aad");
+    const tag = Buffer.from(entry.authTag, "base64");
+    tag[0] ^= 1;
+    const tampered = { ...entry, authTag: tag.toString("base64") };
+    // update() runs before the tag check, so under the RIGHT key it hands
+    // back the plaintext; the buffer it returned must be wiped when final()
+    // throws. Record every Buffer zero-filled during the failing decrypt.
+    const zeroed: Buffer[] = [];
+    const realFill = Buffer.prototype.fill;
+    const spy = vi.spyOn(Buffer.prototype, "fill").mockImplementation(function (this: Buffer, ...args: unknown[]) {
+      const out = (realFill as (...a: unknown[]) => Buffer).apply(this, args);
+      if (args[0] === 0) zeroed.push(this);
+      return out;
+    });
+    try {
+      expect(() => decryptEntry(tampered, key, "aad")).toThrow();
+    } finally {
+      spy.mockRestore();
+    }
+    const head = zeroed.find((b) => b.length === Buffer.byteLength(secret));
+    expect(head, "the decrypted head buffer was not zeroed").toBeDefined();
+    expect(head?.every((byte) => byte === 0)).toBe(true);
   });
 });
 
@@ -271,5 +309,76 @@ describe("DEFAULT_KDF is frozen; tests move the default through the hook", () =>
     expect(kdfExceedsDefault({ N: 1 << 17, r: 8, p: 1 })).toBe(true);
     setDefaultKdfForTesting(null);
     expect(defaultKdf()).toBe(DEFAULT_KDF);
+  });
+});
+
+describe("v3 key-slot primitives", () => {
+  it("generateDek is 32 fresh bytes; generateVaultId is 16 fresh bytes in base64", () => {
+    const a = generateDek();
+    const b = generateDek();
+    expect(a).toHaveLength(DEK_LEN);
+    expect(a.equals(b)).toBe(false);
+    const id = generateVaultId();
+    expect(Buffer.from(id, "base64")).toHaveLength(VAULT_ID_LEN);
+    expect(generateVaultId()).not.toBe(id);
+  });
+
+  it("wrapKey/unwrapKey round-trip, and refuse a different kek or aad", () => {
+    const dek = generateDek();
+    const kek = randomBytes(32);
+    const wrapped = wrapKey(dek, kek, "aad-1");
+    expect(unwrapKey(wrapped, kek, "aad-1").equals(dek)).toBe(true);
+    expect(() => unwrapKey(wrapped, randomBytes(32), "aad-1")).toThrow();
+    expect(() => unwrapKey(wrapped, kek, "aad-2")).toThrow();
+  });
+
+  it("unwrapKey refuses a plaintext that is not a 32-byte key", () => {
+    const kek = randomBytes(32);
+    const wrapped = wrapKey(Buffer.alloc(16, 7), kek, "a");
+    expect(() => unwrapKey(wrapped, kek, "a")).toThrow(/wrong length/);
+  });
+
+  it("slotDigest is base64 SHA-256 over aad || 0x00 || iv || ciphertext || authTag", () => {
+    const wrapped = wrapKey(generateDek(), randomBytes(32), "x");
+    const aad = canonicalJson({
+      role: "passphrase",
+      vault_id: "v",
+      version: 3,
+      kdf: { N: 1024, r: 8, p: 1 },
+      salt: "s",
+    });
+    const expected = createHash("sha256")
+      .update(
+        Buffer.concat([
+          Buffer.from(aad, "utf8"),
+          Buffer.from([0]),
+          Buffer.from(wrapped.iv, "base64"),
+          Buffer.from(wrapped.ciphertext, "base64"),
+          Buffer.from(wrapped.authTag, "base64"),
+        ]),
+      )
+      .digest("base64");
+    expect(slotDigest(aad, wrapped)).toBe(expected);
+    expect(Buffer.from(slotDigest(aad, wrapped), "base64")).toHaveLength(32);
+    // The AAD is part of the digest: any change to it changes the stamp.
+    expect(slotDigest(`${aad} `, wrapped)).not.toBe(expected);
+  });
+
+  it("deriveRecoveryKek is HKDF-SHA256 with the pinned info string", () => {
+    const secret = randomBytes(16);
+    const salt = randomBytes(16);
+    const expected = Buffer.from(hkdfSync("sha256", secret, salt, "yaw-mcp:keyslot:recovery:v1", 32));
+    expect(deriveRecoveryKek(secret, salt).equals(expected)).toBe(true);
+    expect(deriveRecoveryKek(secret, randomBytes(16)).equals(expected)).toBe(false);
+  });
+
+  it("canonicalJson sorts keys recursively and drops undefined", () => {
+    expect(canonicalJson({ b: 1, a: { d: [1, "x"], c: null }, z: undefined })).toBe(
+      '{"a":{"c":null,"d":[1,"x"]},"b":1}',
+    );
+    // Build order does not matter.
+    expect(canonicalJson({ role: "r", kdf: { r: 8, N: 2, p: 1 } })).toBe(
+      canonicalJson({ kdf: { p: 1, N: 2, r: 8 }, role: "r" }),
+    );
   });
 });

@@ -50,6 +50,7 @@ import {
 import { isOamLaunch, MIN_OAM_VERSION, OAM_INSTALL_PS1, OAM_INSTALL_SH, unwrapOamLaunch } from "../oam-spawn.js";
 import { STATE_FILENAME, STATE_SCHEMA_VERSION } from "../persistence.js";
 import { REGISTRY_CACHE_FILENAME } from "../registry-cache.js";
+import { vaultSchemaBehind } from "../secrets-cmd.js";
 import {
   createEmptyVault,
   isUnlocked,
@@ -3976,8 +3977,53 @@ describe("runDoctor — SECRET VAULT", () => {
       // The CURRENT schema, derived from the constant the code under test
       // compares against, so a bump does not turn this fixture into a
       // "behind" vault and fail the no-nudge assertion for the wrong reason.
-      JSON.stringify({ version: SECRETS_SCHEMA_VERSION, salt: SALT_B64, kdf: { N: 16384, r: 8, p: 1 }, entries }),
+      // A structurally valid v3 skeleton (loadVault only shape-checks slots and
+      // entries; nothing here is decrypted).
+      JSON.stringify({
+        version: SECRETS_SCHEMA_VERSION,
+        vault_id: SALT_B64,
+        salt: SALT_B64,
+        keyslots: {
+          passphrase: {
+            salt: SALT_B64,
+            kdf: { N: 16384, r: 8, p: 1 },
+            wrapped: { iv: "x", ciphertext: "y", authTag: "z" },
+            digest: Buffer.alloc(32, 1).toString("base64"),
+          },
+        },
+        entries,
+      }),
     );
+  }
+
+  /** A raw OLD-schema vault, pinned to an explicit version (not the constant):
+   *  v1 carries no `kdf`, v2 does. No check marker. */
+  function writeLegacyVault(version: 1 | 2, entries: Record<string, unknown>): void {
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    writeFileSync(
+      join(synthHome, ".yaw-mcp", "secrets.json"),
+      JSON.stringify({
+        version,
+        salt: SALT_B64,
+        ...(version === 2 ? { kdf: { N: 16384, r: 8, p: 1 } } : {}),
+        entries,
+      }),
+    );
+  }
+
+  /** The golden v3 fixture (see fixtures/README.md): passphrase slot, a
+   *  recovery slot created 2026-11-16, two entries. `mutate` edits the parsed
+   *  JSON before it is written, to damage one slot. */
+  const V3_FIXTURE_PASSPHRASE = "golden-v3-fixture-passphrase";
+  function writeV3Fixture(mutate?: (v: Record<string, any>) => void): string {
+    const v = JSON.parse(
+      readFileSync(join(dirname(fileURLToPath(import.meta.url)), "fixtures", "vault-v3.json"), "utf8"),
+    ) as Record<string, any>;
+    mutate?.(v);
+    const file = join(synthHome, ".yaw-mcp", "secrets.json");
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, JSON.stringify(v));
+    return file;
   }
 
   function writeBundlesWithRef(): void {
@@ -4111,7 +4157,9 @@ describe("runDoctor — SECRET VAULT", () => {
   it("lists entry NAMES and reports the passphrase as a boolean, never a value", async () => {
     // The vault stores names as plaintext object keys (only values are
     // ciphertext), so this needs no passphrase -- same as `secrets list`.
-    writeVault({
+    // A v2 vault, pinned: the check-absent / entries-arm path below exists
+    // only on v1/v2 (a v3 vault's passphrase slot is always the check).
+    writeLegacyVault(2, {
       gh: { iv: "x", ciphertext: "y", authTag: "z" },
       tailscale: { iv: "x", ciphertext: "y", authTag: "z" },
     });
@@ -4137,30 +4185,217 @@ describe("runDoctor — SECRET VAULT", () => {
     expect(txt).not.toContain("hunter2-do-not-leak");
   });
 
-  it("reports the vault's schema version, and tells a v1 vault's owner that rotate is the upgrade", async () => {
-    // A vault created before v2 stays v1 forever: setSecret preserves the
-    // on-disk version, only `secrets rotate` restamps it. Its entries are
-    // therefore never bound to their names (a blob swap between two names
-    // still decrypts), and until this line NO surface told the user -- the
-    // vault works, so nobody runs rotate on it. v1 vaults carry no `kdf`
-    // (they were all written under the pinned legacy parameters).
-    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
-    writeFileSync(
-      join(synthHome, ".yaw-mcp", "secrets.json"),
-      JSON.stringify({ version: 1, salt: SALT_B64, entries: { gh: { iv: "x", ciphertext: "y", authTag: "z" } } }),
-    );
+  it("reports the vault's schema version, with per-version upgrade text for v1 and v2", async () => {
+    // A vault stays at the version it was created with: setSecret preserves
+    // the on-disk version, only a re-key restamps it. A v1 vault's entries
+    // are never bound to their names (a blob swap between two names still
+    // decrypts), and neither v1 nor v2 can hold a recovery code -- and until
+    // this line NO surface told the user, because the vault works. v1 vaults
+    // carry no `kdf` (they were all written under the pinned legacy
+    // parameters).
+    writeLegacyVault(1, { gh: { iv: "x", ciphertext: "y", authTag: "z" } });
     const cap = captureOut();
     await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
     const txt = cap.text();
-    expect(txt).toContain("schema:     v1 -- entries are NOT bound to their names until");
-    expect(txt).toContain("`yaw-mcp secrets rotate` rewrites the file as v2");
+    // Both re-keying commands upgrade a v1 vault (rekeyVault takes any older
+    // schema), as `secrets`' own schema-behind notice says.
+    expect(txt).toContain(
+      "schema:     v1 -- entries are not bound to their names and the vault has no\n" +
+        "              recovery code -- `yaw-mcp secrets rotate` or\n" +
+        "              `yaw-mcp secrets recovery new` upgrades to v3\n",
+    );
+    // One spelling: the wrapped doctor text IS vaultSchemaBehind's.
+    const v1Lines = txt.slice(txt.indexOf("schema:     v1 -- ")).split("\n").slice(0, 3);
+    expect(v1Lines.map((l) => l.trim()).join(" ")).toBe(`schema:     v1 -- ${vaultSchemaBehind(1)?.why}`);
+
+    // v2: name binding is there, recovery is not -- and two commands upgrade.
+    writeLegacyVault(2, { gh: { iv: "x", ciphertext: "y", authTag: "z" } });
+    const cap2 = captureOut();
+    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap2.out });
+    expect(cap2.text()).toContain(
+      "schema:     v2 -- no recovery code support -- `yaw-mcp secrets rotate` or\n" +
+        "              `yaw-mcp secrets recovery new` upgrades to v3\n",
+    );
+    expect(cap2.text()).not.toContain("not bound to their names");
 
     // A current vault gets the bare version line and no rotate nudge.
     writeVault({ gh: { iv: "x", ciphertext: "y", authTag: "z" } });
-    const cap2 = captureOut();
-    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap2.out });
-    expect(cap2.text()).toContain(`schema:     v${SECRETS_SCHEMA_VERSION}\n`);
-    expect(cap2.text()).not.toContain("secrets rotate");
+    const cap3 = captureOut();
+    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap3.out });
+    expect(SECRETS_SCHEMA_VERSION).toBe(3);
+    expect(cap3.text()).toContain("schema:     v3\n");
+    expect(cap3.text()).not.toContain("secrets rotate");
+  });
+
+  it("prints the recovery line for every recovery state, and never for an unreadable vault", async () => {
+    // set: the golden fixture's slot, shown by its date.
+    writeV3Fixture();
+    const set = captureOut();
+    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: set.out });
+    expect(set.text()).toContain("recovery:   recovery code set (created 2026-11-16)\n");
+
+    // none: a v3 vault created without one.
+    writeVault({ gh: { iv: "x", ciphertext: "y", authTag: "z" } });
+    const none = captureOut();
+    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: none.out });
+    expect(none.text()).toContain("recovery:   none -- `yaw-mcp secrets recovery new` adds one (needs a terminal)\n");
+
+    // malformed: loadVault drops a recovery slot it cannot use (here a
+    // created stamp that is not ISO) and still loads the vault.
+    writeV3Fixture((v) => {
+      v.keyslots.recovery.created = "last tuesday";
+    });
+    const bad = captureOut();
+    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: bad.out });
+    expect(bad.text()).toContain("entries:    2 -- aws, github");
+    expect(bad.text()).toContain(
+      "recovery:   slot damaged -- the passphrase still works; `yaw-mcp secrets recovery new` replaces it\n",
+    );
+
+    // unsupported: v1 and v2 have no slot to hold one.
+    for (const version of [1, 2] as const) {
+      writeLegacyVault(version, {});
+      const old = captureOut();
+      await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: old.out });
+      expect(old.text()).toContain(
+        "recovery:   not available on schema v1/v2 -- `yaw-mcp secrets rotate` or `yaw-mcp secrets recovery new` upgrades\n",
+      );
+    }
+
+    // Unreadable: no recovery claim at all.
+    writeFileSync(join(synthHome, ".yaw-mcp", "secrets.json"), "{ not json at all");
+    const unreadable = captureOut();
+    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: unreadable.out });
+    expect(unreadable.text()).toContain("entries:    unreadable");
+    expect(unreadable.text()).not.toContain("recovery:");
+  });
+
+  it("carries recovery and recoveryCreated in --json, null with no readable vault", async () => {
+    const vaultBlock = async (): Promise<Record<string, unknown>> => {
+      const cap = captureOut();
+      const r = await runDoctor({
+        cwd: synthCwd,
+        home: synthHome,
+        env: {},
+        os: "linux",
+        out: cap.out,
+        json: true,
+        skipRegistryCheck: true,
+      });
+      return JSON.parse(r.lines[0]).vault;
+    };
+    // No vault but a ref, so the block describes a vault that does not exist.
+    writeBundlesWithRef();
+    expect(await vaultBlock()).toMatchObject({ exists: false, recovery: null, recoveryCreated: null });
+
+    writeV3Fixture();
+    expect(await vaultBlock()).toMatchObject({
+      schemaVersion: 3,
+      recovery: "set",
+      recoveryCreated: "2026-11-16T12:00:00.000Z",
+      passphraseSlotDamaged: false,
+    });
+
+    writeVault({});
+    expect(await vaultBlock()).toMatchObject({ recovery: "none", recoveryCreated: null });
+
+    writeV3Fixture((v) => {
+      v.keyslots.recovery.kdf = "scrypt";
+    });
+    expect(await vaultBlock()).toMatchObject({ recovery: "malformed", recoveryCreated: null });
+
+    writeLegacyVault(2, {});
+    expect(await vaultBlock()).toMatchObject({ schemaVersion: 2, recovery: "unsupported", recoveryCreated: null });
+
+    writeFileSync(join(synthHome, ".yaw-mcp", "secrets.json"), "{ not json at all");
+    expect(await vaultBlock()).toMatchObject({ unreadable: expect.any(String), recovery: null, recoveryCreated: null });
+  });
+
+  it("reports a damaged passphrase slot as neither right nor wrong, and points at recover when a code exists", async () => {
+    // A digest that does not match the wrapped key: unlock() refuses before
+    // trying the unwrap, so the passphrase cannot be checked at all. Calling
+    // it "does NOT unlock" would send a user with the right passphrase to
+    // retype it, or to a reset that abandons entries the code would keep.
+    const damage = (v: Record<string, any>): void => {
+      v.keyslots.passphrase.digest = Buffer.alloc(32, 9).toString("base64");
+    };
+    const file = writeV3Fixture(damage);
+    const env = { YAW_MCP_VAULT_PASSPHRASE: V3_FIXTURE_PASSPHRASE };
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env, os: "linux", out: cap.out });
+    const txt = cap.text();
+    expect(txt).toContain("passphrase: set in this environment, but the vault's passphrase slot is damaged --");
+    expect(txt).toContain("`yaw-mcp secrets recover` restores access with the recovery code");
+    expect(txt).not.toContain("does NOT unlock");
+    expect(txt).not.toContain("secrets reset");
+    expect(txt).not.toContain(V3_FIXTURE_PASSPHRASE);
+    expect(r.exitCode).toBe(0);
+    expect(isUnlocked()).toBe(false);
+
+    const jsonCap = captureOut();
+    const j = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env,
+      os: "linux",
+      out: jsonCap.out,
+      json: true,
+      skipRegistryCheck: true,
+    });
+    expect(JSON.parse(j.lines[0]).vault).toMatchObject({
+      passphraseSet: true,
+      passphraseUnlocks: false,
+      checkMarkerCorrupt: false,
+      passphraseSlotDamaged: true,
+      recovery: "set",
+    });
+
+    // The same damage with no recovery slot: there is no recover to offer,
+    // and the line says the entries are lost rather than pointing at it.
+    writeV3Fixture((v) => {
+      damage(v);
+      delete v.keyslots.recovery;
+    });
+    const noCode = captureOut();
+    await runDoctor({ cwd: synthCwd, home: synthHome, env, os: "linux", out: noCode.out });
+    const t2 = noCode.text();
+    expect(t2).toContain("passphrase slot is damaged");
+    expect(t2).toContain("No recovery code was saved");
+    expect(t2).toContain("secrets reset` moves the vault aside");
+    expect(t2).not.toContain("secrets recover`");
+    expect(existsSync(file)).toBe(true);
+  });
+
+  it("points a wrong passphrase at recover FIRST when the vault has a recovery code", async () => {
+    writeV3Fixture();
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_VAULT_PASSPHRASE: "not-the-fixture-passphrase" },
+      os: "linux",
+      out: cap.out,
+    });
+    const txt = cap.text();
+    expect(txt).toContain("passphrase: set in this environment, but it does NOT unlock the vault");
+    const recoverAt = txt.indexOf("`yaw-mcp secrets recover`");
+    const resetAt = txt.indexOf("`yaw-mcp secrets reset`");
+    expect(recoverAt).toBeGreaterThan(-1);
+    expect(resetAt).toBeGreaterThan(recoverAt);
+    expect(txt).toContain("Only if the code is lost too");
+    expect(r.exitCode).toBe(0);
+    expect(isUnlocked()).toBe(false);
+
+    // And the right passphrase on the same fixture opens it: the slot is fine.
+    const ok = captureOut();
+    await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_VAULT_PASSPHRASE: V3_FIXTURE_PASSPHRASE },
+      os: "linux",
+      out: ok.out,
+    });
+    expect(ok.text()).toContain("passphrase: set in this environment, and it unlocks the vault");
   });
 
   it("carries the schema version in --json as an additive field", async () => {
@@ -4445,7 +4680,9 @@ describe("runDoctor — SECRET VAULT", () => {
   it("does not claim a verdict when there is nothing to check the passphrase against", async () => {
     // An empty, marker-less vault accepts every passphrase; "it unlocks"
     // would be a claim about nothing. The bare line, and null in --json.
-    writeVault({});
+    // Only a v1/v2 vault can be in that state (a v3 vault's passphrase slot
+    // is always something to check against), so the version is pinned.
+    writeLegacyVault(2, {});
     const cap = captureOut();
     const r = await runDoctor({
       cwd: synthCwd,

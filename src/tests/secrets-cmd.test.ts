@@ -13,7 +13,7 @@ import {
 import { mkdir } from "node:fs/promises";
 import os from "node:os";
 import nodePath from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { setLogSurface } from "../logger.js";
 import { parseSecretsArgs, resetBackupPath, runSecrets, SECRETS_USAGE } from "../secrets-cmd.js";
 import { deriveKey, type EncryptedEntry, encryptEntry, generateSalt, LEGACY_KDF } from "../secrets-crypto.js";
@@ -22,14 +22,31 @@ import {
   loadVault,
   lock,
   MALFORMED_REF_MARKER,
+  newVault,
   rotateVault,
   SECRETS_SCHEMA_VERSION,
   saveVault,
+  setSecret,
   unlock,
   type VaultFile,
   vaultPath,
 } from "../secrets-vault.js";
 import { symlinksAvailable } from "./symlinks.js";
+
+// A vault created at a (fake) terminal shows a recovery code and waits for two
+// of its groups to be typed back -- unless an AI agent drives the process. Pin
+// that for the whole file, so a test that creates a vault on a TTY never waits
+// on a confirmation it did not script, whether or not the suite itself runs
+// under CLAUDECODE. The tests of the display path inject `env: {}`.
+let savedAiAgent: string | undefined;
+beforeAll(() => {
+  savedAiAgent = process.env.AI_AGENT;
+  process.env.AI_AGENT = "secrets-cmd.test";
+});
+afterAll(() => {
+  if (savedAiAgent === undefined) delete process.env.AI_AGENT;
+  else process.env.AI_AGENT = savedAiAgent;
+});
 
 describe("parseSecretsArgs", () => {
   it("set requires a name", () => {
@@ -192,7 +209,7 @@ describe("parseSecretsArgs", () => {
     expect(SECRETS_USAGE).toContain("Forgot the passphrase?");
     expect(SECRETS_USAGE).toContain("secrets.json.reset-<timestamp>");
     // --force is the scripted way through reset's gate too.
-    expect(SECRETS_USAGE).toMatch(/Required for remove and reset/);
+    expect(SECRETS_USAGE).toMatch(/Required for remove,\s+reset and recovery remove/);
   });
 
   it("audit action parses with filters", () => {
@@ -2510,7 +2527,7 @@ describe("runSecrets rotate -- the success path re-keys EVERY entry", () => {
       io,
     );
     expect(r.exitCode).toBe(0);
-    expect(JSON.parse(outText())).toEqual({ ok: true, rotated: true, secret_count: 3 });
+    expect(JSON.parse(outText())).toEqual({ ok: true, rotated: true, secret_count: 3, recovery: "none" });
     expect(outText()).not.toContain("Vault locked");
     // The stale-passphrase nudge rides err as one JSON line, like reset's.
     const errLines = io.err.mock.calls
@@ -3908,7 +3925,8 @@ describe("runSecrets -- a schema-v1 vault is reported once per command, and only
         warning: "schema-behind",
         schema: 1,
         current: SECRETS_SCHEMA_VERSION,
-        upgrade: "yaw-mcp secrets rotate",
+        missing: ["name-binding", "recovery"],
+        upgrade: ["yaw-mcp secrets rotate", "yaw-mcp secrets recovery new"],
         path: vaultPath(home),
       },
     ]);
@@ -3945,8 +3963,13 @@ describe("runSecrets -- a schema-v1 vault is reported once per command, and only
     );
     expect(r.exitCode).toBe(0);
     // rotate IS the upgrade -- telling the user to run it from inside it
-    // would be noise.
-    expect(errText()).not.toContain("schema v1");
+    // would be noise. It says what it did instead, and that a running
+    // yaw-mcp needs a restart to see it.
+    expect(errText()).not.toContain("is schema v1");
+    expect(errText()).toContain(
+      `upgraded the vault at ${vaultPath(home)} from schema v1 to v${SECRETS_SCHEMA_VERSION}`,
+    );
+    expect(errText()).toContain("restart any running yaw-mcp (Yaw Terminal or your MCP client)");
     expect(onDiskVersion()).toBe(SECRETS_SCHEMA_VERSION);
 
     io.err.mockReset();
@@ -4185,15 +4208,17 @@ describe("runSecrets reset", () => {
       moved_to: backup,
       entries: ["GH_TOKEN", "NPM_TOKEN"],
       unreadable: null,
+      recovery: "none",
     });
-    // stderr under --json is JSON lines, and the nudge is one of them. The
+    // stderr under --json is JSON lines, and the nudges are among them. The
     // passphrase came from the opts hook, which is reported as "prompt":
     // only YAW_MCP_VAULT_PASSPHRASE itself reads as "env" (see the next
     // test), since the success line and the nudge say where the new
-    // passphrase lives.
+    // passphrase lives. No terminal, so no recovery code -- said, once.
     const errLines = errJsonLines(io);
-    expect(errLines).toHaveLength(1);
+    expect(errLines).toHaveLength(2);
     expect(errLines[0]).toMatchObject({ warning: "vault-reset", path: vaultPath(home), passphrase_source: "prompt" });
+    expect(errLines[1]).toMatchObject({ warning: "no-recovery-code", reason: "no-terminal" });
     expect(await opensWith(vaultPath(home), NEW_PASS)).toBe(true);
   });
 
@@ -4204,6 +4229,7 @@ describe("runSecrets reset", () => {
     expect(r.exitCode).toBe(0);
     expect(errJsonLines(io)).toEqual([
       expect.objectContaining({ warning: "vault-reset", path: vaultPath(home), passphrase_source: "env" }),
+      expect.objectContaining({ warning: "no-recovery-code", reason: "no-terminal" }),
     ]);
     expect(await opensWith(vaultPath(home), NEW_PASS)).toBe(true);
   });
@@ -4634,7 +4660,7 @@ describe("runSecrets --json -- every stderr line is a JSON object", () => {
     const r = await runSecrets({ action: "set", name: "GH", value: "ghp", home, json: true, io: nonTTYIo() }, io);
     expect(r.exitCode).toBe(0);
     const lines = errLines();
-    expect(lines).toHaveLength(2);
+    expect(lines).toHaveLength(3);
     expect(lines[0]).toMatchObject({
       warning: "short-passphrase",
       subject: "YAW_MCP_VAULT_PASSPHRASE",
@@ -4643,6 +4669,7 @@ describe("runSecrets --json -- every stderr line is a JSON object", () => {
     expect(lines[0]).not.toHaveProperty("ok");
     expect(lines[1]).toMatchObject({ warning: "vault-created", path: vaultPath(home), env_set_here: true });
     expect(typeof lines[1].hint).toBe("string");
+    expect(lines[2]).toMatchObject({ warning: "no-recovery-code", reason: "no-terminal" });
     expect(JSON.parse(outText())).toMatchObject({ ok: true, fresh_vault: true });
   });
 
@@ -4653,13 +4680,15 @@ describe("runSecrets --json -- every stderr line is a JSON object", () => {
     );
     expect(r.exitCode).toBe(0);
     const lines = errLines();
-    expect(lines).toHaveLength(2);
+    expect(lines).toHaveLength(3);
     expect(lines[0]).toMatchObject({
       warning: "short-passphrase",
       subject: "the passphrase you chose",
       min_length: 12,
     });
     expect(lines[1]).toMatchObject({ warning: "vault-created", path: vaultPath(home), env_set_here: false });
+    // The file pins AI_AGENT, so this terminal is an agent's: no code shown.
+    expect(lines[2]).toMatchObject({ warning: "no-recovery-code", reason: "agent-session" });
   });
 
   it("the unlock prompt's warning carries its rotate hint as a field, AHEAD of the ok:false envelope it precedes", async () => {
@@ -4779,11 +4808,13 @@ describe("runSecrets --json -- every stderr line is a JSON object", () => {
     let spy: { mockRestore: () => void };
 
     beforeEach(async () => {
-      const seeded = await runSecrets(
-        { action: "set", name: "GH", value: "ghp", passphrase: PASS, home },
-        { out: vi.fn(), err: vi.fn() },
-      );
-      expect(seeded.exitCode).toBe(0);
+      // A v2 vault: only v1/v2 load past a malformed marker (with this
+      // warning); v3 treats one as corrupt. `set` creates v3 now, so the v2
+      // file is written through the legacy builder.
+      const legacy = newVault();
+      const key = await unlock(legacy, PASS);
+      await saveVault(vaultPath(home), setSecret(legacy, key, "GH", "ghp"));
+      key.fill(0);
       lock();
       const onDisk = JSON.parse(readFileSync(vaultPath(home), "utf8")) as Record<string, unknown>;
       onDisk.check = { iv: 7 };
@@ -4817,8 +4848,15 @@ describe("runSecrets --json -- every stderr line is a JSON object", () => {
           path: vaultPath(home),
           message: expect.stringContaining("Vault verification token is malformed"),
         },
-        // rotate's stale-passphrase nudge is a JSON line too.
-        ...(a === "rotate" ? [expect.objectContaining({ warning: "vault-rotated", path: vaultPath(home) })] : []),
+        // Every command but rotate says the v2 file is behind; rotate
+        // upgrades it, and its stale-passphrase nudge and upgrade notice are
+        // JSON lines too.
+        ...(a === "rotate"
+          ? [
+              expect.objectContaining({ warning: "vault-rotated", path: vaultPath(home) }),
+              expect.objectContaining({ warning: "vault-upgraded", from: 2, to: SECRETS_SCHEMA_VERSION }),
+            ]
+          : [expect.objectContaining({ warning: "schema-behind", schema: 2 })]),
       ]);
       expect(JSON.parse(outText())).toMatchObject({ ok: true });
     });
@@ -4830,16 +4868,22 @@ describe("runSecrets --json -- every stderr line is a JSON object", () => {
       );
       expect(r.exitCode).toBe(0);
       expect(stderrWrites).toEqual([]);
-      expect(errLines().map((l) => l.warning)).toEqual(["check-malformed", "vault-reset"]);
+      expect(errLines().map((l) => l.warning)).toEqual(["check-malformed", "vault-reset", "no-recovery-code"]);
     });
 
     it("without --json it is one prose warning line on the command's own sink, naming the file", async () => {
       const r = await runSecrets({ action: "list", home }, io);
       expect(r.exitCode).toBe(0);
       expect(stderrWrites).toEqual([]);
-      expect(errText()).toBe(
-        `yaw-mcp secrets: warning -- ${vaultPath(home)}: Vault verification token is malformed; ignoring it (the next \`yaw-mcp secrets set\` re-stamps it).\n`,
+      expect(errText().split("\n")[0]).toBe(
+        `yaw-mcp secrets: warning -- ${vaultPath(home)}: Vault verification token is malformed; ignoring it (the next \`yaw-mcp secrets set\` re-stamps it).`,
       );
+      // ...followed only by the schema-behind notice for the v2 file.
+      expect(
+        errText()
+          .split("\n")
+          .filter((l) => l !== ""),
+      ).toHaveLength(2);
     });
   });
 

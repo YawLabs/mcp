@@ -149,6 +149,9 @@ export const ADD_USAGE = `Usage: yaw-mcp add <slug> [flags]
                     exits 130 with nothing built or written.
   --project         Write <project>/.yaw-mcp/bundles.json instead.
   --no-start-check  Skip the one real handshake after the build.
+  --no-recovery     When storing a secret the repo needs creates your vault
+                    (the offer at a terminal): create it WITHOUT a recovery
+                    code, as \`yaw-mcp secrets set --no-recovery\` does.
   -- <args>         Arguments passed to the server.
   The name is optional when the repo's yaw-mcp.json names a namespace (one
   another server already uses is refused; give a name instead). With
@@ -208,6 +211,9 @@ export interface AddCommandOptions {
   /** `--project`: write the project's .yaw-mcp/bundles.json. */
   project?: boolean;
   noStartCheck?: boolean;
+  /** `--no-recovery`: a vault the secret offer creates gets no recovery
+   *  code (runSecrets's `noRecovery`). */
+  noRecovery?: boolean;
   /** Server arguments after `--`. */
   serverArgs?: string[];
   /** Test seams for the git path: the TTY verdict, canned prompt answers, the
@@ -335,6 +341,10 @@ export function parseAddArgs(
         break;
       case "--no-start-check":
         opts.noStartCheck = true;
+        gitOnly.push(a);
+        break;
+      case "--no-recovery":
+        opts.noRecovery = true;
         gitOnly.push(a);
         break;
       case "--env": {
@@ -1399,6 +1409,29 @@ function gitEnvBindingLines(env: Record<string, string> | undefined): string[] {
   });
 }
 
+/** The runSecrets options of `add --git`'s offer to store a secret the repo
+ *  needs. A vault this store creates gets a recovery code unless
+ *  --no-recovery -- the flag runSecrets's exhausted-confirm abort names, so
+ *  this command accepts it -- and the agent check (no code shown under
+ *  CLAUDECODE / AI_AGENT) reads the env this add runs under, not
+ *  process.env. Exported for tests. */
+export function gitAddSecretOptions(
+  opts: Pick<AddCommandOptions, "noRecovery" | "io">,
+  name: string,
+  ctx: { home: string; cwd: string; env: NodeJS.ProcessEnv },
+): SecretsCommandOptions {
+  return {
+    action: "set",
+    name,
+    home: ctx.home,
+    cwd: ctx.cwd,
+    noRecovery: opts.noRecovery,
+    env: ctx.env,
+    referenceFollows: true,
+    io: opts.io as SecretsCommandOptions["io"],
+  };
+}
+
 async function runAddGit(opts: AddCommandOptions, spec: GitSpec): Promise<AddCommandResult> {
   const out = opts.out ?? createStreamWriter(process.stdout);
   const err = opts.err ?? createStreamWriter(process.stderr);
@@ -1610,17 +1643,10 @@ async function runAddGit(opts: AddCommandOptions, spec: GitSpec): Promise<AddCom
     const storeSecret =
       opts.storeSecret ??
       (async (secretName: string): Promise<boolean> => {
-        const r = await runSecrets(
-          {
-            action: "set",
-            name: secretName,
-            home,
-            cwd,
-            referenceFollows: true,
-            io: opts.io as SecretsCommandOptions["io"],
-          },
-          { out: (s) => out(s), err: (s) => err(s) },
-        );
+        const r = await runSecrets(gitAddSecretOptions(opts, secretName, { home, cwd, env }), {
+          out: (s) => out(s),
+          err: (s) => err(s),
+        });
         return r.exitCode === 0;
       });
     for (const secretName of wanted.filter((n) => !stored.has(n))) {

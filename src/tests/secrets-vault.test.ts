@@ -18,6 +18,7 @@ import {
   checkVaultPassphrase,
   collectMalformedSecretRefs,
   createEmptyVault,
+  createVaultV3,
   getSecret,
   hasSecretRefs,
   isUnlocked,
@@ -43,6 +44,8 @@ import {
   VaultEntryCorruptError,
   type VaultFile,
   type VaultLoadWarning,
+  vaultCheckAad,
+  vaultEntryAad,
   vaultPath,
 } from "../secrets-vault.js";
 
@@ -131,7 +134,9 @@ describe("secrets-vault: set/get/list/remove", () => {
     const v = newVault();
     expect(v.salt).toBeTruthy();
     expect(v.entries).toEqual({});
-    expect(v.version).toBe(SECRETS_SCHEMA_VERSION);
+    // newVault is the LEGACY v2 builder (createVaultV3 builds what this build
+    // writes), pinned to 2 rather than the current constant.
+    expect(v.version).toBe(2);
     // The scrypt parameters are recorded in the file, not assumed by the
     // reader, so a later cost bump cannot orphan this vault.
     expect(v.kdf).toEqual(DEFAULT_KDF);
@@ -346,12 +351,21 @@ describe("secrets-vault: set/get/list/remove", () => {
     // A schema newer than this build understands is refused loudly.
     writeFileSync(path, `${JSON.stringify({ version: 99, salt, entries: {} })}\n`);
     await expect(loadVault(path)).rejects.toThrow(/newer/i);
+    // One past the current version is the boundary, and is refused too.
+    writeFileSync(path, `${JSON.stringify({ version: SECRETS_SCHEMA_VERSION + 1, salt, entries: {} })}\n`);
+    await expect(loadVault(path)).rejects.toThrow(/newer/i);
     // Equal (current) version still loads -- forward reads stay compatible.
-    // The CURRENT constant, not a literal 1: v1 is the migration tests'
-    // business, and a literal silently stopped pinning the equal case the
-    // moment the schema moved past it.
-    writeFileSync(path, `${JSON.stringify({ version: SECRETS_SCHEMA_VERSION, salt, entries: {} })}\n`);
+    // The CURRENT constant, not a literal: a literal silently stopped pinning
+    // the equal case the moment the schema moved past it. A current-schema
+    // file is built by the current builder (raw JSON with only salt/entries
+    // is not a v3 vault).
+    const current = (await createVaultV3("current-schema", { recovery: false })).vault;
+    expect(current.version).toBe(SECRETS_SCHEMA_VERSION);
+    await saveVault(path, current);
     await expect(loadVault(path)).resolves.not.toBeNull();
+    // ...and the previous schema still loads as itself.
+    writeFileSync(path, `${JSON.stringify({ version: 2, salt, entries: {} })}\n`);
+    await expect(loadVault(path)).resolves.toMatchObject({ version: 2 });
   });
 
   it("loadVault preserves a valid check field round-trip", async () => {
@@ -487,9 +501,9 @@ describe("rotateVault", () => {
     expect(getSecret(rotated, newKey, "github")).toBe("ghp_abc");
     expect(getSecret(rotated, newKey, "aws")).toBe("aws_xyz");
 
-    // The new check marker verifies under the new key, and a wrong
-    // passphrase is rejected at unlock.
-    expect(decryptEntry(rotated.check as EncryptedEntry, newKey, VAULT_CHECK_AAD)).toBe(VAULT_CHECK_PLAINTEXT);
+    // The new check marker verifies under the new key (with the v3 AAD), and
+    // a wrong passphrase is rejected at unlock.
+    expect(decryptEntry(rotated.check as EncryptedEntry, newKey, vaultCheckAad(rotated))).toBe(VAULT_CHECK_PLAINTEXT);
     lock();
     await expect(unlock(rotated, "old-passphrase")).rejects.toThrow(/wrong passphrase/i);
   });
@@ -597,7 +611,7 @@ describe("rotateVault", () => {
     expect(getSecret(rotated, newKey, "github")).toBe("ghp_abc");
   });
 
-  it("migrates a v1, kdf-less vault with UNBOUND entries to v2", async () => {
+  it("migrates a v1, kdf-less vault with UNBOUND entries to v3", async () => {
     // The migration path the source advertises, end to end: rotate is what
     // rewrites a pre-v2 file into the current schema. Built by hand because
     // no code path produces a v1 vault any more.
@@ -617,7 +631,9 @@ describe("rotateVault", () => {
     const rotated = await rotateVault(legacy, oldKey, "new-passphrase");
 
     expect(rotated.version).toBe(SECRETS_SCHEMA_VERSION);
-    expect(rotated.kdf).toEqual(DEFAULT_KDF);
+    // v3 records the cost factor in the passphrase slot, never at the top.
+    expect(rotated.kdf).toBeUndefined();
+    expect(rotated.keyslots?.passphrase.kdf).toEqual(DEFAULT_KDF);
     expect(listKeys(rotated)).toEqual(["aws", "github"]);
 
     lock();
@@ -628,7 +644,8 @@ describe("rotateVault", () => {
     // The rewritten entries are name-BOUND, which is the point of the bump:
     // an unbound decrypt of the same blob is now refused.
     expect(() => decryptEntry(rotated.entries.github, newKey)).toThrow();
-    expect(decryptEntry(rotated.entries.github, newKey, "github")).toBe("ghp_legacy");
+    expect(() => decryptEntry(rotated.entries.github, newKey, "github")).toThrow();
+    expect(decryptEntry(rotated.entries.github, newKey, vaultEntryAad(rotated, "github"))).toBe("ghp_legacy");
   });
 });
 
@@ -1361,8 +1378,10 @@ describe("newVault and createEmptyVault: only the second verifies passphrases", 
     const stamped = await createEmptyVault("chosen-at-reset");
     expect(stamped.entries).toEqual({});
     expect(stamped.version).toBe(SECRETS_SCHEMA_VERSION);
-    // Recorded parameters and the marker's key agree: both DEFAULT_KDF.
-    expect(stamped.kdf).toEqual(DEFAULT_KDF);
+    // A v3 vault: the cost factor lives in the passphrase slot, and there is
+    // no recovery slot (createEmptyVault is createVaultV3 without one).
+    expect(stamped.keyslots?.passphrase.kdf).toEqual(DEFAULT_KDF);
+    expect(stamped.keyslots?.recovery).toBeUndefined();
     expect(stamped.check).toBeDefined();
     await expect(unlock(stamped, "something-else")).rejects.toThrow(/wrong passphrase/i);
     await expect(unlock(stamped, "chosen-at-reset")).resolves.toBeInstanceOf(Buffer);

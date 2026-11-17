@@ -9,11 +9,27 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough, Readable } from "node:stream";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { BUNDLES_LOCK_NAME } from "../local-bundles.js";
 import { parseSetArgs, runSet, SET_USAGE, type SetCommandOptions } from "../local-set-cmd.js";
+import { recoveryCodeGroups } from "../recovery-code.js";
 import { runSecrets } from "../secrets-cmd.js";
-import { lock } from "../secrets-vault.js";
+import { loadVault, lock, recoveryStatus } from "../secrets-vault.js";
+
+// A vault created at a (fake) terminal shows a recovery code and waits for two
+// of its groups to be typed back -- unless an AI agent drives the process. Pin
+// that for the whole file, so a test that creates a vault on a TTY never waits
+// on a confirmation it did not script, whether or not the suite itself runs
+// under CLAUDECODE.
+let savedAiAgent: string | undefined;
+beforeAll(() => {
+  savedAiAgent = process.env.AI_AGENT;
+  process.env.AI_AGENT = "local-set-secret.test";
+});
+afterAll(() => {
+  if (savedAiAgent === undefined) delete process.env.AI_AGENT;
+  else process.env.AI_AGENT = savedAiAgent;
+});
 
 const PASS = "correct-horse-battery";
 const VALUE = "ghp_new_value_123";
@@ -90,7 +106,10 @@ async function secretSet(
     secret: true,
     home: synthHome,
     cwd: synthHome,
-    env: {},
+    // runSet forwards its env to runSecrets's agent check, so this pin (like
+    // the process.env one above) keeps a vault created at a fake terminal
+    // from waiting on a code confirmation; the recovery tests pass env: {}.
+    env: { AI_AGENT: "local-set-secret.test" },
     passphrase: PASS,
     isTTY: false,
     io: pipedIo(value),
@@ -123,6 +142,16 @@ describe("parseSetArgs -- --secret", () => {
       expect(r.options.secretName).toBe("gh_pat");
       expect(r.options.assignments).toEqual(["env.GITHUB_TOKEN"]);
     }
+  });
+
+  it("accepts --no-recovery with --secret only", () => {
+    const r = parseSetArgs(["gh", "env.GITHUB_TOKEN", "--secret", "--no-recovery"]);
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.options.noRecovery).toBe(true);
+    const bare = parseSetArgs(["gh", "description=x", "--no-recovery"]);
+    expect(bare.ok).toBe(false);
+    if (!bare.ok) expect(bare.error).toContain("--no-recovery only applies with --secret");
+    expect(SET_USAGE).toContain("--no-recovery");
   });
 
   it("accepts --stdin with --secret only", () => {
@@ -456,6 +485,7 @@ describe("runSet --secret", () => {
       ref: "${secret:pg_pgpassword}",
       replaced: false,
       fresh_vault: true,
+      recovery: "none",
     });
     expect(r.err).not.toContain(VALUE);
     expect(envOf("pg")).toEqual({ PGPASSWORD: "plain2" });
@@ -660,7 +690,13 @@ describe("runSet --secret -- interactive, --json and reference edges", () => {
     const r = await secretSet("rot", "env.TOKEN", { json: true }, "v2\n");
     expect(r.exitCode).toBe(0);
     const env = JSON.parse(r.out.trim());
-    expect(env.secret).toEqual({ name: "mytok", ref: "${secret:mytok}", replaced: true, fresh_vault: false });
+    expect(env.secret).toEqual({
+      name: "mytok",
+      ref: "${secret:mytok}",
+      replaced: true,
+      fresh_vault: false,
+      recovery: "none",
+    });
     expect(await readBack("mytok")).toBe("v2");
   });
 
@@ -736,5 +772,86 @@ describe("runSet --secret -- interactive, --json and reference edges", () => {
     expect(c.hint).toContain("--secret-name NAME");
     expect(errLines(overwrite.err)[0]).toMatchObject({ namespace: "pg", destructive: ["PGPASSWORD"] });
     expect(existsSync(vaultFile())).toBe(false);
+  });
+});
+
+describe("runSet --secret -- the recovery code of a vault it creates", () => {
+  /** A terminal on both ends that answers the value prompt, then each "Type
+   *  group N" prompt with that group of the code on screen -- or, with
+   *  `wrong`, with it altered. */
+  function codeTty(wrong = false): { io: SetCommandOptions["io"]; shown: () => string } {
+    const stdin = Object.assign(new PassThrough(), {
+      isTTY: true,
+      isRaw: false,
+      setRawMode(v: boolean) {
+        stdin.isRaw = v;
+        return stdin;
+      },
+    });
+    const stdout = Object.assign(new PassThrough(), { isTTY: true, columns: 80 });
+    let all = "";
+    let handled = 0;
+    stdout.on("data", (b: Buffer) => {
+      all += b.toString("utf8");
+      const prompts = [...all.matchAll(/Secret value: |Type group (\d) of 7 to confirm: /g)];
+      while (handled < prompts.length) {
+        const m = prompts[handled++];
+        let typed = `${VALUE}\r`;
+        if (m[1] !== undefined) {
+          const code = (all.match(/YAWR(?:-[0-9A-Z]{4}){7}/) as RegExpMatchArray)[0];
+          const g = recoveryCodeGroups(code)[Number(m[1]) - 1];
+          typed = `${wrong ? `${g[0] === "0" ? "1" : "0"}${g.slice(1)}` : g}\r`;
+        }
+        setImmediate(() => stdin.write(typed));
+      }
+    });
+    return { io: { stdin, stdout }, shown: () => all };
+  }
+
+  async function vaultRecovery(): Promise<string> {
+    const v = await loadVault(vaultFile());
+    return v ? recoveryStatus(v).state : "absent";
+  }
+
+  it("the INJECTED env decides the agent check: env {} at a terminal shows a code, confirmed before the save", {
+    timeout: 20_000,
+  }, async () => {
+    // process.env carries AI_AGENT for this whole file: a code shown here
+    // proves the check read opts.env, not process.env.
+    writeBundles(SAMPLE);
+    const t = codeTty();
+    const r = await secretSet("gh", "env.GITHUB_TOKEN", { isTTY: true, io: t.io, env: {} });
+    expect(r.exitCode).toBe(0);
+    expect(t.shown()).toMatch(/YAWR(?:-[0-9A-Z]{4}){7}/);
+    expect(await vaultRecovery()).toBe("set");
+    expect(envOf("gh")).toMatchObject({ GITHUB_TOKEN: "${secret:gh_github_token}" });
+  });
+
+  it("an exhausted confirmation names --no-recovery, which `set --secret` accepts and honours", {
+    timeout: 20_000,
+  }, async () => {
+    writeBundles(SAMPLE);
+    const before = readFileSync(bundlesPath(), "utf8");
+    const t = codeTty(true);
+    const r = await secretSet("gh", "env.GITHUB_TOKEN", { isTTY: true, io: t.io, env: {} });
+    expect(r.exitCode).toBe(1);
+    expect(r.err).toContain(
+      "yaw-mcp set: Aborted -- nothing was saved. Re-run, or pass --no-recovery to create the vault without a recovery code.",
+    );
+    expect(existsSync(vaultFile())).toBe(false);
+    expect(readFileSync(bundlesPath(), "utf8")).toBe(before);
+
+    // The flag the hint names parses...
+    const parsed = parseSetArgs(["gh", "env.GITHUB_TOKEN", "--secret", "--no-recovery"]);
+    expect(parsed.ok).toBe(true);
+    // ...and is forwarded: no code, no slot, and no "none was created" nudge
+    // (it was asked for). Without the forwarding, process.env's AI_AGENT would
+    // suppress the code and print that nudge instead.
+    const t2 = codeTty();
+    const again = await secretSet("gh", "env.GITHUB_TOKEN", { isTTY: true, io: t2.io, env: {}, noRecovery: true });
+    expect(again.exitCode).toBe(0);
+    expect(t2.shown()).not.toMatch(/YAWR-/);
+    expect(again.err).not.toContain("No recovery code was created");
+    expect(await vaultRecovery()).toBe("none");
   });
 });

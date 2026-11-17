@@ -73,6 +73,11 @@ interface SubcommandSpec {
    *  placeholders are filtered out of the generated scripts but keep their
    *  slot so later positions still line up. */
   positional?: string[][];
+  /** Slot-1 candidates keyed by the slot-0 word: `secrets recovery <TAB>`
+   *  offers new / remove, while `secrets set <TAB>` (whose slot 1 is the
+   *  free-form <name>) offers none. Every generator emits these as a guard on
+   *  the slot-0 word, ahead of the plain slot lists. */
+  after?: Record<string, string[]>;
   flags: string[];
 }
 
@@ -155,6 +160,7 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
       "--project",
       "--yes",
       "--no-start-check",
+      "--no-recovery",
       "--help",
     ],
   },
@@ -205,7 +211,7 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
     name: "set",
     description: "Change a per-server field in bundles.json",
     positional: [["<slug-or-namespace>"], ["<key=value>"]],
-    flags: ["--json", "--force", "--yes", "--secret", "--secret-name", "--stdin", "--help"],
+    flags: ["--json", "--force", "--yes", "--secret", "--secret-name", "--stdin", "--no-recovery", "--help"],
   },
   {
     name: "enable",
@@ -314,12 +320,19 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
     flags: ["--help"],
   },
   // Secrets vault (local, encrypted). Actions/flags mirror parseSecretsArgs
-  // in src/secrets-cmd.ts -- keep them in sync.
+  // in src/secrets-cmd.ts (its exported SECRETS_ACTIONS; completion-cmd.test.ts
+  // checks the two agree). Slot 1 is the free-form <name>, except after
+  // `recovery`, whose subcommands (RECOVERY_SUBCOMMANDS there) come from
+  // `after` -- so they are never offered after `secrets set`.
   {
     name: "secrets",
     description: "Manage stored secrets",
-    positional: [["set", "get", "list", "remove", "lock", "rotate", "reset", "audit"], ["<name>"]],
-    flags: ["--value", "--stdin", "--force", "--secret", "--server", "--json", "--help"],
+    positional: [
+      ["set", "get", "list", "remove", "lock", "rotate", "reset", "audit", "recover", "recovery"],
+      ["<name>"],
+    ],
+    after: { recovery: ["new", "remove"] },
+    flags: ["--value", "--stdin", "--force", "--no-recovery", "--file", "--secret", "--server", "--json", "--help"],
   },
   // Other.
   {
@@ -445,6 +458,12 @@ function renderBash(): string {
     // `install --list` / `--all` forbid a client argument, so slot 0 is the
     // ONLY position those flags can occupy; fish and powershell both offer
     // flags there. A dash word now falls through to the flag compgen below.
+    // A slot-1 list that depends on the slot-0 word (COMP_WORDS[2]) goes
+    // first: the plain slot clauses below return unconditionally.
+    const afterClauses = Object.entries(spec.after ?? {}).map(
+      ([word, candidates]) =>
+        `    if [[ $cword -eq 3 && $cur != -* && "\${COMP_WORDS[2]}" == "${word}" ]]; then\n      COMPREPLY=( $(compgen -W "${candidates.join(" ")}" -- "$cur") )\n      return 0\n    fi`,
+    );
     const posClauses = realPositionals(spec).map(
       ({ candidates, index }) =>
         `    if [[ $cword -eq $((${index} + 2)) && $cur != -* ]]; then\n      COMPREPLY=( $(compgen -W "${candidates.join(" ")}" -- "$cur") )\n      return 0\n    fi`,
@@ -453,6 +472,7 @@ function renderBash(): string {
     // multi-line if-block and the two tail lines are literals, so the filter
     // could never drop an element.
     const parts = [
+      ...afterClauses,
       ...posClauses,
       `    COMPREPLY=( $(compgen -W "${spec.flags.join(" ")}" -- "$cur") )`,
       "    return 0",
@@ -528,7 +548,17 @@ function renderZsh(): string {
     // fallthrough already does. A bare name is a valid spec (no description
     // needed), and `(...)`-free so nothing here can open an action group.
     const flagArgs = spec.flags.map((f) => `'${f}'`);
-    const argSpecs = [...posArgs, ...flagArgs];
+    // Slot 1 keyed on the slot-0 word: inside the `*::arg:->args` state
+    // $words is shifted, so $words[2] is that word. No slot-1 list exists
+    // when `after` is used (slot 1 is free-form), so this is its only spec.
+    const after = Object.entries(spec.after ?? {});
+    const afterArgs =
+      after.length === 0
+        ? []
+        : [
+            `'2: :{${after.map(([word, candidates]) => `[[ $words[2] == ${word} ]] && compadd -- ${candidates.join(" ")}`).join("; ")}}'`,
+          ];
+    const argSpecs = [...posArgs, ...afterArgs, ...flagArgs];
     // `help` carries neither, and `_arguments` with no spec at all is a usage
     // error -- keep the inert rest group for that case only.
     lines.push(`        _arguments ${argSpecs.length > 0 ? argSpecs.join(" ") : "'*: :()'"}`);
@@ -616,6 +646,13 @@ complete -c yaw-mcp -f`;
         `complete -c yaw-mcp -n "__yaw_mcp_using_subcommand ${spec.name}; and test (count (commandline -opc)) -eq ${expectedCount}" -a "${candidates.join(" ")}"`,
       );
     }
+    // Slot 1 keyed on the slot-0 word: three tokens before the cursor
+    // (yaw-mcp, the subcommand, that word), the third being the key.
+    for (const [word, candidates] of Object.entries(spec.after ?? {})) {
+      positionalLines.push(
+        `complete -c yaw-mcp -n "__yaw_mcp_using_subcommand ${spec.name}; and test (count (commandline -opc)) -eq 3; and test (commandline -opc)[3] = ${word}" -a "${candidates.join(" ")}"`,
+      );
+    }
     for (const f of spec.flags) {
       // `-l` takes a LONG option name (no dashes). Only emit for `--` flags;
       // a single-dash flag (e.g. `-V`) would produce invalid `-l -V` syntax.
@@ -649,7 +686,18 @@ function renderPowershell(): string {
           `      if ($argIndex -eq ${index}) { $completions += @(${candidates.map((c) => `'${c}'`).join(", ")}) }`,
       )
       .join("\n");
-    const positionalBlock = positionalLines ? `${positionalLines}\n` : "";
+    // Slot 1 keyed on the slot-0 word, which is $tokens[2] whenever
+    // $argIndex is 1 (a partial word at slot 1 is $tokens[3]).
+    const afterLines = Object.entries(spec.after ?? {})
+      .map(
+        ([word, candidates]) =>
+          `      if ($argIndex -eq 1 -and $tokens[2] -eq '${word}') { $completions += @(${candidates.map((c) => `'${c}'`).join(", ")}) }`,
+      )
+      .join("\n");
+    const positionalBlock = [positionalLines, afterLines]
+      .filter((b) => b !== "")
+      .map((b) => `${b}\n`)
+      .join("");
     return `    '${spec.name}' {
 ${positionalBlock}      $completions += @(${flags})
     }`;

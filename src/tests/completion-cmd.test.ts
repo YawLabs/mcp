@@ -8,7 +8,10 @@
 // Before the second half existed the spec could lag the parser silently --
 // try-cleanup and reset-learning grew --force/--yes and `add` grew its whole
 // custom-server mode without Tab ever learning about them.
-import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { parseAuditArgs } from "../audit-cmd.js";
@@ -32,7 +35,7 @@ import { parseAddArgs, parseListArgs, parseRemoveArgs } from "../local-add-cmd.j
 import { parseSetArgs, parseToggleArgs } from "../local-set-cmd.js";
 import { parseResetLearningArgs } from "../reset-learning-cmd.js";
 import { parseSearchArgs } from "../search-cmd.js";
-import { parseSecretsArgs } from "../secrets-cmd.js";
+import { parseSecretsArgs, RECOVERY_SUBCOMMANDS, SECRETS_ACTIONS } from "../secrets-cmd.js";
 import { parseShareArgs } from "../share-cmd.js";
 import { parseSidecarsArgs } from "../sidecars-cmd.js";
 import { parseStatusArgs } from "../status-cmd.js";
@@ -367,7 +370,7 @@ describe("renderScript — fish", () => {
     expect(positionalLines.length).toBeGreaterThan(0);
     for (const line of positionalLines) {
       expect(line, `positional line is not scoped to the active subcommand: ${line}`).toMatch(
-        /-n "__yaw_mcp_using_subcommand [a-z-]+; and test \(count \(commandline -opc\)\) -eq [0-9]+"/,
+        /-n "__yaw_mcp_using_subcommand [a-z-]+; and test \(count \(commandline -opc\)\) -eq [0-9]+(?:; and test \(commandline -opc\)\[[0-9]+\] = [a-z-]+)?"/,
       );
     }
     expect(s).not.toContain("__fish_seen_subcommand_from");
@@ -411,7 +414,7 @@ describe("renderScript — powershell", () => {
     expect(s).toContain("if ($argIndex -eq 0) { $completions += @('list', 'match') }");
     expect(s).toContain("if ($argIndex -eq 0) { $completions += @('export') }");
     expect(s).toContain(
-      "if ($argIndex -eq 0) { $completions += @('set', 'get', 'list', 'remove', 'lock', 'rotate', 'reset', 'audit') }",
+      "if ($argIndex -eq 0) { $completions += @('set', 'get', 'list', 'remove', 'lock', 'rotate', 'reset', 'audit', 'recover', 'recovery') }",
     );
   });
 
@@ -438,6 +441,11 @@ describe("renderScript — powershell", () => {
     const secretsSlot1 = complete(["yaw-mcp", "secrets", "set"], "");
     expect(secretsSlot1).not.toContain("set");
     expect(secretsSlot1).toEqual(expect.arrayContaining(["--value", "--stdin"]));
+    // ...except after `recovery`, whose subcommands complete there -- and
+    // only there.
+    expect(complete(["yaw-mcp", "secrets", "recovery"], "")).toEqual(expect.arrayContaining(["new", "remove"]));
+    expect(complete(["yaw-mcp", "secrets", "recovery", "n"], "n")).toEqual(["new"]);
+    expect(secretsSlot1).not.toContain("new");
 
     // A subcommand with no positionals falls straight through to its flags.
     expect(complete(["yaw-mcp", "doctor"], "")).toEqual(["--json", "--help"]);
@@ -476,6 +484,14 @@ function simulatePowershell(script: string, tokens: string[], wordToComplete: st
     if (!branch) throw new Error(`no switch branch for "${sub}"`);
     candidates = [];
     for (const line of branch[1].split("\n")) {
+      const keyed = line.match(
+        /if \(\$argIndex -eq (\d+) -and \$tokens\[(\d+)\] -eq '([^']*)'\) \{ \$completions \+= @\((.*)\) \}/,
+      );
+      if (keyed) {
+        if (Number(keyed[1]) === argIndex && tokens[Number(keyed[2])] === keyed[3])
+          candidates.push(...parseList(keyed[4]));
+        continue;
+      }
       const guarded = line.match(/if \(\$argIndex -eq (\d+)\) \{ \$completions \+= @\((.*)\) \}/);
       if (guarded) {
         if (Number(guarded[1]) === argIndex) candidates.push(...parseList(guarded[2]));
@@ -649,7 +665,12 @@ describe("SUBCOMMAND_SPEC coverage", () => {
   it("keeps the secrets entry in sync with parseSecretsArgs (rotate/audit/--force in, push/pull out)", () => {
     const secrets = SUBCOMMAND_SPEC.find((s) => s.name === "secrets");
     expect(secrets).toBeDefined();
-    expect(secrets?.positional?.[0]).toEqual(["set", "get", "list", "remove", "lock", "rotate", "reset", "audit"]);
+    // The parser's own action list, imported -- not a third hand copy.
+    expect(secrets?.positional?.[0]).toEqual([...SECRETS_ACTIONS]);
+    expect(secrets?.positional?.[0]).toEqual(expect.arrayContaining(["recover", "recovery"]));
+    expect(secrets?.flags).toEqual(expect.arrayContaining(["--no-recovery", "--file"]));
+    // `recovery`'s subcommands, the parser's own list.
+    expect(secrets?.after).toEqual({ recovery: [...RECOVERY_SUBCOMMANDS] });
     // --force gates the destructive paths (`remove`, `reset`, and a `set`
     // that overwrites an existing name), so it MUST be completable -- a user
     // who cannot tab it will not discover the only way to script a remove or
@@ -808,5 +829,52 @@ describe("runCompletion", () => {
     const ps = await runCompletion({ shell: "powershell", out: capture().push });
     expect(bash.lines[0]).not.toBe(zsh.lines[0]);
     expect(fish.lines[0]).not.toBe(ps.lines[0]);
+  });
+});
+
+describe("secrets recovery <TAB> offers its subcommands in every shell", () => {
+  it("the zsh, fish and powershell scripts key slot 1 on the recovery word", () => {
+    expect(renderScript("zsh")).toContain("'2: :{[[ $words[2] == recovery ]] && compadd -- new remove}'");
+    expect(renderScript("fish")).toContain(
+      'complete -c yaw-mcp -n "__yaw_mcp_using_subcommand secrets; and test (count (commandline -opc)) -eq 3; and test (commandline -opc)[3] = recovery" -a "new remove"',
+    );
+    expect(renderScript("powershell")).toContain(
+      "if ($argIndex -eq 1 -and $tokens[2] -eq 'recovery') { $completions += @('new', 'remove') }",
+    );
+  });
+
+  // The bash script itself, run by bash: what COMPREPLY holds for a line.
+  const bash = spawnSync("bash", ["--version"], { encoding: "utf8" });
+  it.skipIf(bash.status !== 0)("bash: new/remove after `secrets recovery`, never after `secrets set`", () => {
+    const dir = mkdtempSync(join(tmpdir(), "yaw-mcp-completion-"));
+    try {
+      const file = join(dir, "run.sh");
+      const probe = (words: string[]): string =>
+        [
+          `COMP_WORDS=(${words.map((w) => `"${w}"`).join(" ")})`,
+          `COMP_CWORD=${words.length - 1}`,
+          "COMPREPLY=()",
+          "_yaw-mcp",
+          'echo "${COMPREPLY[*]}"',
+        ].join("\n");
+      writeFileSync(
+        file,
+        [
+          renderScript("bash"),
+          probe(["yaw-mcp", "secrets", "recovery", ""]),
+          probe(["yaw-mcp", "secrets", "recovery", "re"]),
+          probe(["yaw-mcp", "secrets", "set", ""]),
+        ].join("\n"),
+      );
+      const r = spawnSync("bash", [file], { encoding: "utf8" });
+      expect(r.status, r.stderr).toBe(0);
+      const [recovery, partial, set] = r.stdout.trim().split(/\r?\n/);
+      expect(recovery).toBe("new remove");
+      expect(partial).toBe("remove");
+      expect(set.split(" ")).not.toContain("new");
+      expect(set.split(" ")).toContain("--value");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
