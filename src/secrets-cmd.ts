@@ -14,10 +14,11 @@
 //
 // Destructive paths are gated the way install-cmd gates an existing-entry
 // collision -- confirm on a TTY, and off a TTY either refuse naming the
-// flag to re-run with (remove) or proceed with a message that says what
-// really happened (set over an existing name). See the block in runSecrets
-// for why the two differ. --force skips only the confirmation, never the
-// passphrase.
+// flag to re-run with (remove, and reset -- which asks for the word RESET
+// rather than y/N; see runSecretsReset) or proceed with a message that says
+// what really happened (set over an existing name). See the block in
+// runSecrets for why remove and set differ. --force skips only the
+// confirmation, never the passphrase.
 
 import { createHash } from "node:crypto";
 import { chmod, copyFile, constants as fsConstants, readFile, unlink } from "node:fs/promises";
@@ -132,9 +133,16 @@ Actions:
                           string, not the bare name.
 
 Flags:
+  --                      End of options: every argument after it is a
+                          positional, so a name that starts with "-" can
+                          be given (secrets get -- -name).
   --json                  Machine-readable output. stdout carries the result
-                          envelope, one JSON line; stderr carries one JSON
-                          object per line: {"warning":...} lines (a
+                          envelope, one JSON line, and nothing else: at a
+                          terminal the interactive prompts (passphrase,
+                          value, confirmations) and their retry messages
+                          go to stderr instead. Apart from those, stderr
+                          carries one JSON object per line: {"warning":...}
+                          lines (a
                           schema-behind file, a malformed check marker, a
                           short passphrase, a vault just created, rotated
                           or reset, a value printed in cleartext to a
@@ -233,15 +241,19 @@ export interface SecretsCommandOptions {
   /** For `rotate`: the NEW passphrase (overrides env + TTY prompt in tests). */
   newPassphrase?: string;
   /** The streams the INTERACTIVE PROMPTS use: the raw-mode reader takes its
-   *  bytes from `stdin` and writes its prompt text to `stdout`. Nothing else
-   *  goes through here. Every warning and error takes runSecrets's `io.err`
-   *  callback instead -- there used to be a `stderr` stream in this object
-   *  that the short-passphrase and cleartext warnings wrote to, which meant
-   *  an embedder supplying only the callbacks got those two lines on
-   *  process.stderr and everything else through `err`. One sink now. */
+   *  bytes from `stdin` and writes its prompt text to `stdout` -- or, under
+   *  --json, to `stderr` (process.stderr when it is not given), since stdout
+   *  then carries only the result envelope. Nothing else goes through here.
+   *  Every warning and error takes runSecrets's `io.err` callback instead --
+   *  `stderr` used to be where the short-passphrase and cleartext warnings
+   *  went, which meant an embedder supplying only the callbacks got those two
+   *  lines on process.stderr and everything else through `err`. One sink
+   *  for those now; `stderr` here is prompt text only, which keeps `err`
+   *  one JSON object per line under --json. */
   io?: {
     stdin: NodeJS.ReadableStream;
     stdout: NodeJS.WritableStream;
+    stderr?: NodeJS.WritableStream;
   };
 }
 
@@ -274,9 +286,12 @@ export function parseSecretsArgs(
   // flag is looked for anywhere in argv, not just before the bad token:
   // `secrets get --bogus --json` asked for JSON as surely as
   // `--json get --bogus` did. That matches what the loop below would find --
-  // no flag takes a dash-leading value, so a "--json" token is always the
-  // flag. --help still prints the usage: asking for it is asking for prose.
-  const json = argv.includes("--json");
+  // no flag takes a dash-leading value, so a "--json" token ahead of a `--`
+  // end-of-options marker is always the flag (after `--` it is a positional,
+  // so it is not looked for there). --help still prints the usage: asking
+  // for it is asking for prose.
+  const endOfOptions = argv.indexOf("--");
+  const json = (endOfOptions === -1 ? argv : argv.slice(0, endOfOptions)).includes("--json");
   const opts: SecretsCommandOptions = {};
   // The prose label is read from opts.action when refuse() runs, so every
   // refusal made once the action is parsed reads `yaw-mcp secrets <action>:`
@@ -289,8 +304,34 @@ export function parseSecretsArgs(
     json
       ? { ok: false, error: JSON.stringify({ ok: false, error: msg }), jsonError: msg }
       : { ok: false, error: `yaw-mcp secrets${opts.action ? ` ${opts.action}` : ""}: ${msg}\n\n${SECRETS_USAGE}` };
+  // After `--` every token is a positional: SECRET_NAME_RE allows a leading
+  // "-", and without the marker such a name parsed as an unknown flag, so
+  // get/remove/set could never address it.
+  let positionalOnly = false;
+  // The positional slots, filled in order: the action, then the one name.
+  const positional = (a: string): ReturnType<typeof refuse> | undefined => {
+    if (!opts.action) {
+      if (!isSecretsAction(a)) return refuse(`unknown action "${a}"`);
+      opts.action = a;
+      return undefined;
+    }
+    if (!opts.name) {
+      opts.name = a;
+      return undefined;
+    }
+    return refuse(`unexpected positional argument "${a}"`);
+  };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
+    if (positionalOnly) {
+      const refused = positional(a);
+      if (refused) return refused;
+      continue;
+    }
+    if (a === "--") {
+      positionalOnly = true;
+      continue;
+    }
     if (a === "--help" || a === "-h") return { ok: false, error: SECRETS_USAGE, help: true };
     if (a === "--json") {
       opts.json = true;
@@ -321,8 +362,9 @@ export function parseSecretsArgs(
       // filter literally named "--json" -- `audit --secret --json` used to
       // store "--json" as the secret filter and print an empty trail. A
       // dash-leading value is never a real filter here: a namespace cannot
-      // start with one, and the CLI cannot even `set` a dash-leading name
-      // (the positional would parse as an unknown flag).
+      // start with one. A dash-leading secret NAME is legal (SECRET_NAME_RE)
+      // and reachable as a positional after `--`, but there is no such
+      // escape for a flag's value, so --secret cannot filter on one.
       if (v === undefined || v.startsWith("-")) {
         return refuse(`${a} requires a value`);
       }
@@ -331,18 +373,17 @@ export function parseSecretsArgs(
       continue;
     }
     if (a.startsWith("-")) {
-      return refuse(`unknown flag "${a}"`);
+      // Where a <name> is still expected and the token is a legal one, it
+      // may well be a dash-leading name rather than a mistyped flag: say how
+      // to pass it.
+      const nameSlot =
+        (opts.action === "set" || opts.action === "get" || opts.action === "remove") && opts.name === undefined;
+      const hint =
+        nameSlot && SECRET_NAME_RE.test(a) ? ` -- for a name that starts with "-", put \`--\` before it` : "";
+      return refuse(`unknown flag "${a}"${hint}`);
     }
-    if (!opts.action) {
-      if (!isSecretsAction(a)) return refuse(`unknown action "${a}"`);
-      opts.action = a;
-      continue;
-    }
-    if (!opts.name) {
-      opts.name = a;
-      continue;
-    }
-    return refuse(`unexpected positional argument "${a}"`);
+    const refused = positional(a);
+    if (refused) return refused;
   }
   if (!opts.action) return refuse("missing action");
   // Reject a positional for the actions that take no <name>. Swallowing it
@@ -674,53 +715,125 @@ function abortedResult(io: SecretsIo, json: boolean | undefined, action: string)
   return failResult(io, json, action, "Aborted.", { fields: { aborted: true } });
 }
 
-/** Which ends are a TTY. Reads the INJECTED streams (never process.stdin
- *  directly) so tests drive it the same way they drive the passphrase
- *  prompts. Split out from isInteractiveTTY because the refusal message
- *  has to name the end that ACTUALLY failed. */
-function ttyEnds(opts: SecretsCommandOptions): { stdin: boolean; stdout: boolean } {
-  const stdin = opts.io?.stdin ?? process.stdin;
-  const stdout = opts.io?.stdout ?? process.stdout;
+/** The terminal streams every prompt in this file uses and every TTY check
+ *  looks at: `opts.io` when an embedder or test injected it, else the
+ *  process's own. Spelled once -- the `opts.io?.x ?? process.x` pair used to
+ *  be repeated at each prompt site. `stderr` is read only under --json (see
+ *  promptStream). */
+function termStreams(opts: Pick<SecretsCommandOptions, "io">): {
+  stdin: NodeJS.ReadStream;
+  stdout: NodeJS.WritableStream;
+  stderr: NodeJS.WritableStream;
+} {
   return {
-    stdin: (stdin as { isTTY?: boolean }).isTTY === true,
-    stdout: (stdout as { isTTY?: boolean }).isTTY === true,
+    stdin: (opts.io?.stdin ?? process.stdin) as NodeJS.ReadStream,
+    stdout: opts.io?.stdout ?? process.stdout,
+    stderr: opts.io?.stderr ?? process.stderr,
   };
 }
 
-/** Can we prompt? Both ends must be a TTY: stdin to read the answer,
- *  stdout to show the question -- the shared verdict (isInteractivePrompt in
- *  readline-question.ts) over this command's injected streams. `secrets` has
- *  no isTTY / promptAnswer seam, so only `io` is handed on; ttyEnds above
- *  stays for the refusal that names WHICH end failed. */
+/** Where the prompt text goes: the prompts themselves, reset's preamble and
+ *  the "cannot be empty" / "did not match" retry lines. stdout normally --
+ *  the terminal the user is answering on. Under --json stdout is the result
+ *  envelope and nothing else (SECRETS_USAGE), so the prompts go to stderr
+ *  instead -- the stream, not the `io.err` callback, which stays one JSON
+ *  object per line. */
+function promptStream(opts: SecretsCommandOptions): NodeJS.WritableStream {
+  const { stdout, stderr } = termStreams(opts);
+  return opts.json ? stderr : stdout;
+}
+
+/** Which ends are a TTY. Reads the INJECTED streams (never process.stdin
+ *  directly) so tests drive it the same way they drive the passphrase
+ *  prompts. Split out from isInteractiveTTY because the refusal message
+ *  has to name the end that ACTUALLY failed.
+ *
+ *  Each end is reported as it is; which output end a prompt needs is
+ *  promptEnd's call (stdout normally, stderr under --json). */
+function ttyEnds(opts: SecretsCommandOptions): { stdin: boolean; stdout: boolean; stderr: boolean } {
+  const { stdin, stdout, stderr } = termStreams(opts);
+  return {
+    stdin: (stdin as { isTTY?: boolean }).isTTY === true,
+    stdout: (stdout as { isTTY?: boolean }).isTTY === true,
+    stderr: (stderr as { isTTY?: boolean }).isTTY === true,
+  };
+}
+
+/** The output end the prompts are shown on -- the stream promptStream picks.
+ *  Under --json that is stderr, and stdout is the result envelope, so stdout
+ *  plays no part in whether a prompt can run: `secrets get GH --json >
+ *  out.json` at a terminal must still prompt (on stderr) for the passphrase.
+ *  A `--json 2>log` run must not -- the question would land in the log and
+ *  leave the user typing at nothing. */
+function promptEnd(opts: SecretsCommandOptions): "stdout" | "stderr" {
+  return opts.json ? "stderr" : "stdout";
+}
+
+/** Can we prompt? Both ends must be a TTY: stdin to read the answer, and the
+ *  end the question is shown on (promptEnd) -- the shared verdict
+ *  (isInteractivePrompt in readline-question.ts) over this command's injected
+ *  streams, with that end standing in for stdout. `secrets` has no isTTY /
+ *  promptAnswer seam, so only the streams are handed on; ttyEnds above stays
+ *  for the refusal that names WHICH end failed. */
 function isInteractiveTTY(opts: SecretsCommandOptions): boolean {
-  return isInteractivePrompt({ io: opts.io });
+  const { stdin } = termStreams(opts);
+  return isInteractivePrompt({ io: { stdin, stdout: promptStream(opts) } });
 }
 
 /** Name the end(s) that are not a TTY, for the non-interactive refusal.
  *  Naming stdin unconditionally was wrong for the common
- *  `yaw-mcp secrets remove NAME --json | jq` shape: run from an interactive
+ *  `yaw-mcp secrets remove NAME | cat` shape: run from an interactive
  *  shell that has a perfectly good TTY stdin and only a piped STDOUT, so the
- *  message sent the user to inspect the wrong half of their pipeline. */
+ *  message sent the user to inspect the wrong half of their pipeline. Under
+ *  --json the output end judged is stderr (promptEnd), never stdout. */
 function nonTTYEnds(opts: SecretsCommandOptions): string {
   const ends = ttyEnds(opts);
-  if (!ends.stdin && !ends.stdout) return "neither stdin nor stdout is a TTY";
-  return ends.stdin ? "stdout is not a TTY" : "stdin is not a TTY";
+  const end = promptEnd(opts);
+  const why = opts.json ? " (--json writes the prompts there)" : "";
+  if (!ends.stdin && !ends[end]) return `neither stdin nor ${end} is a TTY${why}`;
+  if (!ends[end]) return `${end} is not a TTY${why}`;
+  return "stdin is not a TTY";
 }
 
-/** The "cannot obtain a passphrase" refusal. The default wording sends the
- *  user to "a TTY" -- which is actively WRONG on Git Bash / MSYS, where the
- *  user IS sitting at a terminal but MSYS emulates it with named pipes, so
- *  Node reports isTTY false and the prompt can never fire. When the env says
- *  MSYS and prompting really was impossible (a std end is not a TTY, as
- *  opposed to a TTY user exhausting the re-prompt budget), name the real
- *  cause and the remedies instead of telling the user their terminal does
- *  not exist. MSYSTEM is set by every Git Bash flavour (MINGW64 / MINGW32 /
- *  UCRT64 / MSYS). */
-function promptUnavailableMessage(opts: SecretsCommandOptions, required: string, envVar: string): string {
-  if (!isInteractiveTTY(opts) && (process.env.MSYSTEM ?? "") !== "") {
+/** The "cannot obtain a passphrase" refusal, worded for WHY resolvePassphrase
+ *  or resolveNewPassphrase came back null -- there are three causes, and the
+ *  one-size "Set X or run from a TTY so we can prompt" used to be printed for
+ *  all of them, including to a user sitting at the TTY it sent them to:
+ *
+ *    - `supplied` is "": an embedder passed an empty passphrase hook
+ *      (opts.passphrase / opts.newPassphrase), which counts as none.
+ *    - The session IS interactive: the prompt ran and MAX_PASSPHRASE_PROMPTS
+ *      attempts were used up -- every entry empty or, with `confirm`, the two
+ *      entries never matching.
+ *    - It is not: no prompt could be shown. The default wording sends the
+ *      user to "a TTY" -- which is actively WRONG on Git Bash / MSYS, where
+ *      the user IS sitting at a terminal but MSYS emulates it with named
+ *      pipes, so Node reports isTTY false and the prompt can never fire.
+ *      When the env says MSYS, name the real cause and the remedies instead
+ *      of telling the user their terminal does not exist. MSYSTEM is set by
+ *      every Git Bash flavour (MINGW64 / MINGW32 / UCRT64 / MSYS). */
+function promptUnavailableMessage(
+  opts: SecretsCommandOptions,
+  required: string,
+  envVar: string,
+  how: { confirm?: boolean; supplied?: string } = {},
+): string {
+  if (how.supplied !== undefined && how.supplied.length === 0) {
+    return `${required} The passphrase supplied by the caller is empty.`;
+  }
+  if (isInteractiveTTY(opts)) {
+    const what = how.confirm
+      ? `No passphrase was set after ${MAX_PASSPHRASE_PROMPTS} attempts: each entry was empty or the two entries did not match.`
+      : `No passphrase was entered after ${MAX_PASSPHRASE_PROMPTS} attempts.`;
+    return `${required} ${what} Run the command again, or set ${envVar}.`;
+  }
+  if ((process.env.MSYSTEM ?? "") !== "") {
     return `${required} Node cannot prompt under Git Bash/MSYS -- the terminal is emulated with pipes, not a TTY. Set ${envVar}, run under winpty (winpty yaw-mcp ...), or use PowerShell/cmd.`;
   }
-  return `${required} Set ${envVar} or run from a TTY so we can prompt.`;
+  // Name the end that is redirected, as the value-prompt refusal does: a
+  // `--json 2>err.log` run at a terminal otherwise read "run from a TTY" to
+  // a user who is sitting at one.
+  return `${required} Set ${envVar} or run from a TTY so we can prompt (${nonTTYEnds(opts)}).`;
 }
 
 /** Ask a destructive-action question on the TTY. Defaults to NO: only an
@@ -729,9 +842,7 @@ function promptUnavailableMessage(opts: SecretsCommandOptions, required: string,
  *  a secret -- but otherwise shares the passphrase reader, so ^C still
  *  cancels the whole command instead of counting as "no". */
 async function promptYesNo(opts: SecretsCommandOptions, question: string): Promise<boolean | Cancelled> {
-  const stdin = opts.io?.stdin ?? process.stdin;
-  const stdout = opts.io?.stdout ?? process.stdout;
-  const answer = await readLineFromTTY(stdin as NodeJS.ReadStream, stdout, `${question} [y/N] `, true);
+  const answer = await readLineFromTTY(termStreams(opts).stdin, promptStream(opts), `${question} [y/N] `, true);
   if (answer === CANCELLED) return CANCELLED;
   const a = answer.trim().toLowerCase();
   return a === "y" || a === "yes";
@@ -1150,27 +1261,27 @@ async function promptPassphraseTwice(
   labels: PassphrasePromptLabels,
   note?: string,
 ): Promise<string | null | Cancelled | NoEcho> {
-  const stdin = opts.io?.stdin ?? process.stdin;
-  const stdout = opts.io?.stdout ?? process.stdout;
+  const { stdin } = termStreams(opts);
+  const out = promptStream(opts);
   for (let attempt = 0; attempt < MAX_PASSPHRASE_PROMPTS; attempt++) {
     // `note` rides at the head of the FIRST prompt, so it is written exactly
     // when that prompt is: readLineFromTTY writes nothing when it cannot turn
     // echo off (NO_ECHO), and a note above a prompt that never appears would
     // only precede the refusal.
     const prompt = attempt === 0 && note !== undefined ? `${note}${labels.first}` : labels.first;
-    const first = await readLineFromTTY(stdin as NodeJS.ReadStream, stdout, prompt);
+    const first = await readLineFromTTY(stdin, out, prompt);
     if (first === CANCELLED || first === NO_ECHO) return first;
     if (first.length === 0) {
-      stdout.write("Passphrase cannot be empty.\n");
+      out.write("Passphrase cannot be empty.\n");
       continue;
     }
-    const second = await readLineFromTTY(stdin as NodeJS.ReadStream, stdout, labels.confirm);
+    const second = await readLineFromTTY(stdin, out, labels.confirm);
     if (second === CANCELLED || second === NO_ECHO) return second;
     if (first === second) {
       warnIfShortPassphrase(io, opts.json, first, labels.subject);
       return first;
     }
-    stdout.write("Passphrases did not match. Try again.\n");
+    out.write("Passphrases did not match. Try again.\n");
   }
   return null;
 }
@@ -1198,8 +1309,6 @@ async function resolvePassphrase(
     warnIfShortPassphrase(io, opts.json, fromEnv, "YAW_MCP_VAULT_PASSPHRASE");
     return fromEnv;
   }
-  const stdin = opts.io?.stdin ?? process.stdin;
-  const stdout = opts.io?.stdout ?? process.stdout;
   if (!isInteractiveTTY(opts)) return null;
   // Creating a vault: it has no check marker yet, so unlock() accepts ANY
   // passphrase -- a first-set typo would silently BECOME the vault's
@@ -1217,8 +1326,10 @@ async function resolvePassphrase(
   // Reject an empty passphrase (bare Enter / EOF with nothing typed):
   // deriving a key from "" would otherwise unlock any vault. Re-prompt up
   // to a few times, then give up so we never spin forever on a closed pipe.
+  const { stdin } = termStreams(opts);
+  const out = promptStream(opts);
   for (let attempt = 0; attempt < MAX_PASSPHRASE_PROMPTS; attempt++) {
-    const entered = await readLineFromTTY(stdin as NodeJS.ReadStream, stdout);
+    const entered = await readLineFromTTY(stdin, out);
     if (entered === CANCELLED || entered === NO_ECHO) return entered;
     if (entered.length > 0) {
       // Unlocking an EXISTING vault. unlock() has NOT run yet, so this string
@@ -1237,7 +1348,7 @@ async function resolvePassphrase(
       );
       return entered;
     }
-    stdout.write("Passphrase cannot be empty.\n");
+    out.write("Passphrase cannot be empty.\n");
   }
   return null;
 }
@@ -1282,7 +1393,8 @@ function noEchoRefusal(required: string, remedy: string): string {
 }
 
 /** Returned by readStdinValue when stdin is a TTY (so there is nothing piped
- *  to read) but stdout is not (so the prompt cannot be shown). Distinct from
+ *  to read) but the end the prompt is shown on is not -- stdout, or stderr
+ *  under --json (so the prompt cannot be shown). Distinct from
  *  CANCELLED: the user did not decline anything, the command simply has no
  *  way to ask. */
 const PROMPT_IMPOSSIBLE: unique symbol = Symbol("yaw-mcp:value-prompt-impossible");
@@ -1305,25 +1417,21 @@ type PromptImpossible = typeof PROMPT_IMPOSSIBLE;
  *  one cost the user the passphrase entry and scrypt derivation that run
  *  before this prompt -- the cost parseSecretsArgs refuses `--value ""` early
  *  to avoid. */
-async function readStdinValue(
-  io?: SecretsCommandOptions["io"],
-  forceRaw?: boolean,
-): Promise<string | Cancelled | PromptImpossible | NoEcho> {
-  const stdin = io?.stdin ?? process.stdin;
-  const stdout = io?.stdout ?? process.stdout;
-  const stdinIsTTY = (stdin as { isTTY?: boolean }).isTTY === true;
-  const stdoutIsTTY = (stdout as { isTTY?: boolean }).isTTY === true;
-  if (stdinIsTTY && !forceRaw) {
-    if (!stdoutIsTTY) return PROMPT_IMPOSSIBLE;
+async function readStdinValue(opts: SecretsCommandOptions): Promise<string | Cancelled | PromptImpossible | NoEcho> {
+  const { stdin } = termStreams(opts);
+  const ends = ttyEnds(opts);
+  if (ends.stdin && !opts.fromStdin) {
+    if (!ends[promptEnd(opts)]) return PROMPT_IMPOSSIBLE;
+    const out = promptStream(opts);
     for (let attempt = 0; attempt < MAX_PASSPHRASE_PROMPTS; attempt++) {
       // Pass the label as the reader's PROMPT rather than writing it first:
       // the reader writes its own prompt, so pre-writing one printed
       // "Secret value: Vault passphrase: " and asked the user for the wrong
       // thing at the value prompt. keepTab: a Tab in a pasted token is part
       // of it (see readLineFromTTY).
-      const entered = await readLineFromTTY(stdin as NodeJS.ReadStream, stdout, "Secret value: ", false, true);
+      const entered = await readLineFromTTY(stdin, out, "Secret value: ", false, true);
       if (entered === CANCELLED || entered === NO_ECHO || entered.length > 0) return entered;
-      stdout.write("Secret value cannot be empty.\n");
+      out.write("Secret value cannot be empty.\n");
     }
     return "";
   }
@@ -1545,7 +1653,10 @@ export async function runSecrets(
       io,
       opts.json,
       opts.action,
-      promptUnavailableMessage(opts, "Passphrase required.", "YAW_MCP_VAULT_PASSPHRASE"),
+      promptUnavailableMessage(opts, "Passphrase required.", "YAW_MCP_VAULT_PASSPHRASE", {
+        confirm: creatingVault,
+        supplied: opts.passphrase,
+      }),
     );
   }
 
@@ -1562,7 +1673,7 @@ export async function runSecrets(
       let value: string;
       if (opts.value !== undefined) value = opts.value;
       else {
-        const entered = await readStdinValue(opts.io, opts.fromStdin);
+        const entered = await readStdinValue(opts);
         if (entered === CANCELLED) return cancelledResult(io, opts.json, "set");
         if (entered === NO_ECHO) {
           return failResult(
@@ -1577,7 +1688,7 @@ export async function runSecrets(
             io,
             opts.json,
             "set",
-            `cannot prompt for the value: stdin is a TTY but stdout is not, so the prompt would be written into the redirect instead of shown. ${opts.valueRemedy ?? "Pass --value <v>, or pipe the value in with --stdin."}`,
+            `cannot prompt for the value: stdin is a TTY but ${nonTTYEnds(opts)}, so the prompt would be written into the redirect instead of shown. ${opts.valueRemedy ?? "Pass --value <v>, or pipe the value in with --stdin."}`,
           );
         }
         value = entered;
@@ -1650,8 +1761,7 @@ export async function runSecrets(
         // stdout, which is the intended consumption path. Under --json it is a
         // JSON line like every other warning (this was the last prose one, and
         // a pty-driven wrapper parsing stderr per SECRETS_USAGE choked on it).
-        const outStream = opts.io?.stdout ?? process.stdout;
-        if ((outStream as { isTTY?: boolean }).isTTY === true) {
+        if (ttyEnds(opts).stdout) {
           if (opts.json) io.err(`${JSON.stringify({ warning: "cleartext-on-tty", name })}\n`);
           else {
             io.err(
@@ -1763,7 +1873,9 @@ async function runSecretsRotate(opts: SecretsCommandOptions, io: SecretsIo): Pro
       io,
       opts.json,
       "rotate",
-      promptUnavailableMessage(opts, "Current passphrase required.", "YAW_MCP_VAULT_PASSPHRASE"),
+      promptUnavailableMessage(opts, "Current passphrase required.", "YAW_MCP_VAULT_PASSPHRASE", {
+        supplied: opts.passphrase,
+      }),
     );
   }
 
@@ -1793,6 +1905,7 @@ async function runSecretsRotate(opts: SecretsCommandOptions, io: SecretsIo): Pro
           opts,
           "New passphrase required (and must be confirmed).",
           "YAW_MCP_VAULT_PASSPHRASE_NEW",
+          { confirm: true, supplied: opts.newPassphrase },
         ),
       );
     }
@@ -2131,6 +2244,16 @@ async function runSecretsReset(opts: SecretsCommandOptions, io: SecretsIo): Prom
   const json = opts.json;
   const fail = (msg: string): SecretsCommandResult => failResult(io, json, "reset", msg);
 
+  // An empty passphrase hook is no passphrase at all (resolvePassphrase
+  // returns null for it, and it does NOT fall through to the env var), so the
+  // reset could never finish. Refused here, before the fingerprint, the
+  // already-opens guard and the RESET confirmation: refusing it only after
+  // the user typed RESET made them confirm a reset that was never going to
+  // happen.
+  if (opts.passphrase === "") {
+    return fail("New passphrase required. The passphrase supplied by the caller is empty.");
+  }
+
   // Baseline BEFORE any read, as every mutating action takes it (see the
   // note above runSecrets's own): a write landing between the two reads then
   // fails the re-check instead of slipping under it.
@@ -2161,8 +2284,8 @@ async function runSecretsReset(opts: SecretsCommandOptions, io: SecretsIo): Prom
   // there, and the reset yields a properly stamped empty vault instead.
   const guardable = vault !== null && vaultVerifiesPassphrases(vault);
 
-  // `??`, not `||`: an empty test-hook passphrase means "none supplied"
-  // (resolvePassphrase returns null for it), not "fall through to the env".
+  // `??`, not `||`: a supplied hook wins over the env, as in
+  // resolvePassphrase. (An EMPTY hook never gets here -- refused at the top.)
   const scripted = opts.passphrase ?? process.env.YAW_MCP_VAULT_PASSPHRASE ?? "";
   if (guardable && vault !== null && scripted.length > 0) {
     // Named for where it came from: an embedder's opts.passphrase is not the
@@ -2181,10 +2304,9 @@ async function runSecretsReset(opts: SecretsCommandOptions, io: SecretsIo): Prom
 
   if (!opts.force) {
     if (isInteractiveTTY(opts)) {
-      const stdin = opts.io?.stdin ?? process.stdin;
-      const stdout = opts.io?.stdout ?? process.stdout;
-      stdout.write(resetPreamble(path, resetBackupPath(path, at), names, envKeyed));
-      const answer = await readLineFromTTY(stdin as NodeJS.ReadStream, stdout, "Type RESET to continue: ", true);
+      const out = promptStream(opts);
+      out.write(resetPreamble(path, resetBackupPath(path, at), names, envKeyed));
+      const answer = await readLineFromTTY(termStreams(opts).stdin, out, "Type RESET to continue: ", true);
       if (answer === CANCELLED) return cancelledResult(io, json, "reset");
       if (answer.trim().toLowerCase() !== "reset") return abortedResult(io, json, "reset");
     } else {
@@ -2209,7 +2331,9 @@ async function runSecretsReset(opts: SecretsCommandOptions, io: SecretsIo): Prom
   }
   if (passphrase === null) {
     return fail(
-      promptUnavailableMessage(opts, "New passphrase required (and must be confirmed).", "YAW_MCP_VAULT_PASSPHRASE"),
+      promptUnavailableMessage(opts, "New passphrase required (and must be confirmed).", "YAW_MCP_VAULT_PASSPHRASE", {
+        confirm: true,
+      }),
     );
   }
 

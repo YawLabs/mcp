@@ -195,7 +195,15 @@ export interface SetCommandOptions {
   /** Test seams, mirroring RemoveCommandOptions. */
   isTTY?: boolean;
   promptAnswer?: string;
-  io?: { stdin?: NodeJS.ReadableStream; stdout?: NodeJS.WritableStream; terminal?: boolean };
+  /** `stderr` is where the vault prompts of `--secret --json` are shown
+   *  (runSecrets writes them there so stdout stays the document); forwarded
+   *  to runSecrets with stdin / stdout. Unset, runSecrets uses process.stderr. */
+  io?: {
+    stdin?: NodeJS.ReadableStream;
+    stdout?: NodeJS.WritableStream;
+    stderr?: NodeJS.WritableStream;
+    terminal?: boolean;
+  };
   /** The verb the USER typed, for the message prefix. `enable` and `disable`
    *  are sugar that delegates to runSet, and every diagnostic here used to say
    *  `yaw-mcp set:` -- so `yaw-mcp enable nosuch` reported a failure of a
@@ -1205,6 +1213,10 @@ async function runSetSecret(opts: SetCommandOptions, ctx: SetContext): Promise<S
   const vaultOut: string[] = [];
   const stdin = opts.io?.stdin;
   const stdout = opts.io?.stdout;
+  // stderr too: under --json runSecrets shows its prompts there and judges
+  // interactivity on it, so an injected io without it would prompt on (and
+  // be judged by) the real process.stderr.
+  const stderr = opts.io?.stderr;
   const vault = await runSecrets(
     {
       action: "set",
@@ -1217,7 +1229,7 @@ async function runSetSecret(opts: SetCommandOptions, ctx: SetContext): Promise<S
       passphrase: opts.passphrase,
       referenceFollows: true,
       valueRemedy: "Pipe the value in with --stdin.",
-      io: stdin && stdout ? { stdin, stdout } : undefined,
+      io: stdin && stdout ? { stdin, stdout, ...(stderr ? { stderr } : {}) } : undefined,
     },
     { out: (s) => vaultOut.push(s), err: (s) => vaultErr(s, verb, err) },
   );

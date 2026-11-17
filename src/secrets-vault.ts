@@ -49,8 +49,9 @@ import { setJsonKey } from "./json-key.js";
 import { log } from "./logger.js";
 import { CONFIG_DIRNAME } from "./paths.js";
 import {
-  DEFAULT_KDF,
+  copyKey,
   decryptEntry,
+  defaultKdf,
   deriveKey,
   type EncryptedEntry,
   encryptEntry,
@@ -63,6 +64,12 @@ import {
   normalizePassphrase,
   SALT_LEN,
 } from "./secrets-crypto.js";
+
+/** The message of a thrown value, for comparing against the exported
+ *  verdict constants. */
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
 
 export const SECRETS_FILENAME = "secrets.json";
 export const SECRETS_SCHEMA_VERSION = 2;
@@ -326,12 +333,24 @@ let cachedSalt: string | null = null;
  *  passphraseFingerprint). Lets a cache hit prove the SUPPLIED passphrase
  *  is the one the cached key came from, without paying scrypt again. */
 let cachedFingerprint: Buffer | null = null;
+/** Bumped by every lock(). An unlock() records it before its scrypt and only
+ *  fills the cache if it is unchanged afterwards, so a lock() issued while a
+ *  derivation was in flight is not silently undone when that derivation
+ *  resolves. */
+let cacheGeneration = 0;
 
 /** Random per-process HMAC key for the passphrase fingerprint. Never
  *  written to disk and regenerated on every process start, so a
- *  fingerprint is meaningless outside the process that made it (and an
- *  attacker who can read this process's memory already has the derived
- *  key, which is strictly worse). */
+ *  fingerprint means nothing to anyone who has only the vault FILE.
+ *
+ *  It is NOT harmless against someone who can read this process's memory:
+ *  with the fingerprint AND this key, every passphrase guess costs one HMAC
+ *  instead of one scrypt, and a recovered passphrase opens more than the
+ *  cached key does -- a pre-rotate backup of the vault, say, which the
+ *  current derived key cannot. That is a deliberate tradeoff: the fingerprint
+ *  is what lets a cache hit verify the supplied passphrase without paying
+ *  scrypt on every unlock. lock() zeroes the cached fingerprint with the key
+ *  to keep the exposure to the time a key is cached anyway. */
 const FINGERPRINT_HMAC_KEY = randomBytes(32);
 
 /** Cheap, constant-time-comparable stand-in for "which passphrase
@@ -342,20 +361,115 @@ function passphraseFingerprint(passphrase: string, salt: string): Buffer {
 }
 
 export function lock(): void {
-  // Best-effort zeroize of the MODULE's copy only. Callers hold their own
+  // Best-effort zeroize of the MODULE's copies only. Callers hold their own
   // copies (see unlock), so this cannot reach -- or corrupt -- a key a
   // caller is still using.
+  cacheGeneration += 1;
   if (cachedKey) cachedKey.fill(0);
+  if (cachedFingerprint) cachedFingerprint.fill(0);
   cachedKey = null;
   cachedSalt = null;
   cachedFingerprint = null;
 }
 
+/** Install a verified key in the module cache, zeroing whatever it replaces.
+ *  The cache takes ownership of `key` and `fingerprint`. */
+function setCache(key: Buffer, salt: string, fingerprint: Buffer): void {
+  if (cachedKey && cachedKey !== key) cachedKey.fill(0);
+  if (cachedFingerprint && cachedFingerprint !== fingerprint) cachedFingerprint.fill(0);
+  cachedKey = key;
+  cachedSalt = salt;
+  cachedFingerprint = fingerprint;
+}
+
+/** One scrypt run shared by every concurrent caller asking for the same
+ *  derivation. `waiters` counts the callers still to copy the result out;
+ *  the last one removes the entry and zeroes the shared buffer. */
+interface Derivation {
+  promise: Promise<Buffer>;
+  waiters: number;
+}
+
+/** In-flight derivations, keyed by salt, kdf parameters, the normalize flag
+ *  and an HMAC of the passphrase form (never the passphrase itself). */
+const inflightDerivations = new Map<string, Derivation>();
+
+/** deriveKey, but concurrent calls for the same (passphrase form, salt, kdf
+ *  params) share ONE scrypt run: N servers resolving `${secret:...}` at once
+ *  on a cold cache used to pay N derivations. Each caller still gets its OWN
+ *  copy of the key (see unlock), so one caller zeroing its key cannot touch
+ *  another's. A rejected derivation is removed with its last waiter, so the
+ *  next call retries instead of replaying the failure. */
+async function sharedDeriveKey(
+  passphrase: string,
+  salt: string,
+  params: Readonly<KdfParams>,
+  normalize: boolean,
+): Promise<Buffer> {
+  const id = [
+    salt,
+    `${params.N}:${params.r}:${params.p}`,
+    normalize ? "nfc" : "raw",
+    createHmac("sha256", FINGERPRINT_HMAC_KEY).update(passphrase, "utf8").digest("base64"),
+  ].join("|");
+  let flight = inflightDerivations.get(id);
+  if (!flight) {
+    flight = { promise: deriveKey(passphrase, Buffer.from(salt, "base64"), params, normalize), waiters: 0 };
+    inflightDerivations.set(id, flight);
+  }
+  const mine = flight;
+  mine.waiters += 1;
+  try {
+    return copyKey(await mine.promise);
+  } finally {
+    mine.waiters -= 1;
+    if (mine.waiters === 0) {
+      if (inflightDerivations.get(id) === mine) inflightDerivations.delete(id);
+      // Every waiter has taken its copy; wipe the shared one.
+      mine.promise.then(
+        (shared) => shared.fill(0),
+        () => undefined,
+      );
+    }
+  }
+}
+
+/** Keys unlock() derived to ESTABLISH a vault that verifies no passphrase
+ *  (no check marker, no entries), mapped to the fresh salt and parameters
+ *  they were derived under. setSecret reads this to write those, not the
+ *  on-disk salt and kdf, into the vault it returns. Keyed on the key Buffer
+ *  the caller holds, so it follows the key rather than one vault object. */
+const establishedKeys = new WeakMap<Buffer, { salt: string; kdf: KdfParams }>();
+
+/** unlock() for a vault with nothing to verify a passphrase against.
+ *
+ *  Such a vault's salt and kdf are not worth trusting: nothing in the file
+ *  was produced by the user's passphrase, so they are whatever wrote the
+ *  file -- including someone who planted an empty vault recording N=2, which
+ *  every later entry would then be encrypted under forever. So the key is
+ *  derived under a FRESH salt and defaultKdf(), and setSecret writes those
+ *  into the vault it returns (see establishedKeys). */
+async function establishKey(passphrase: string): Promise<Buffer> {
+  const generation = cacheGeneration;
+  const kdf: KdfParams = { ...defaultKdf() };
+  const saltBytes = generateSalt();
+  const salt = saltBytes.toString("base64");
+  const key = await deriveKey(passphrase, saltBytes, kdf);
+  const out = copyKey(key);
+  if (generation === cacheGeneration) setCache(key, salt, passphraseFingerprint(passphrase, salt));
+  else key.fill(0);
+  establishedKeys.set(out, { salt, kdf });
+  return out;
+}
+
 /** Derive the key for the given vault if not cached, else return the
  *  cached one. The cache is keyed on the salt, so a vault with a different
  *  salt (a rotated one) is a cache miss: its key is derived fresh and, once
- *  verified, replaces the cached one. No lock() is needed first; lock() only
- *  zeroizes the cached key, which that replacement drops without filling.
+ *  verified, replaces the cached one. No lock() is needed first: the
+ *  replaced key is zero-filled as it is dropped. A lock() issued while the
+ *  derivation is in flight wins -- the key is still returned to this caller,
+ *  but not cached. Concurrent cold unlocks of the same vault and passphrase
+ *  share one scrypt run (sharedDeriveKey).
  *
  *  Returns the caller's OWN copy of the key, never the cached Buffer
  *  itself. lock() zero-fills the cached one in place, and a caller that
@@ -373,9 +487,11 @@ export function lock(): void {
  *    - vault.check absent, but entries exist (legacy vault) -> any entry
  *      that decrypts proves the key; only when NONE does is it a wrong
  *      passphrase (see verifyKey).
- *    - neither (fresh/empty vault) -> nothing to verify against; accept.
- *      The next setSecret stamps vault.check (via ensureCheck) so the
- *      saved vault carries a token future unlocks verify against.
+ *    - neither (fresh/empty vault) -> nothing to verify against; accept,
+ *      deriving under a fresh salt and defaultKdf() rather than the file's
+ *      (establishKey). The next setSecret writes those and stamps vault.check
+ *      (via ensureCheck), so the saved vault carries a token future unlocks
+ *      verify against.
  *
  *  The cache short-circuit ALSO checks the passphrase: it is taken only
  *  when the supplied passphrase fingerprints to the one that produced the
@@ -384,6 +500,7 @@ export function lock(): void {
  *  spawn time) would accept ANY passphrase once the first unlock had
  *  succeeded. */
 export async function unlock(vault: VaultFile, passphrase: string): Promise<Buffer> {
+  if (!vaultVerifiesPassphrases(vault)) return establishKey(passphrase);
   const fingerprint = passphraseFingerprint(passphrase, vault.salt);
   if (
     cachedKey &&
@@ -392,16 +509,17 @@ export async function unlock(vault: VaultFile, passphrase: string): Promise<Buff
     cachedFingerprint.length === fingerprint.length &&
     timingSafeEqual(cachedFingerprint, fingerprint)
   ) {
-    return Buffer.from(cachedKey);
+    fingerprint.fill(0);
+    return copyKey(cachedKey);
   }
-  const salt = Buffer.from(vault.salt, "base64");
+  const generation = cacheGeneration;
   // The vault's OWN parameters, not this build's default: a vault written
   // under a different cost factor must keep opening. A vault that records
   // NONE falls back to LEGACY_KDF -- the pinned v1 constant -- rather than
-  // DEFAULT_KDF, because DEFAULT_KDF is free to move: reading a kdf-less
-  // vault under a raised default derives a different key and reports "wrong
-  // passphrase" for a correct one, which is precisely the lockout recording
-  // the parameters was meant to prevent.
+  // the build default, because the default is free to move: reading a
+  // kdf-less vault under a raised default derives a different key and
+  // reports "wrong passphrase" for a correct one, which is precisely the
+  // lockout recording the parameters was meant to prevent.
   const params = vault.kdf ?? LEGACY_KDF;
   // Costlier-than-default parameters are legal (a future build may write
   // them; isValidKdfParams bounds them) but they are also the one reason a
@@ -409,38 +527,78 @@ export async function unlock(vault: VaultFile, passphrase: string): Promise<Buff
   // is pure CPU the memory bound never sees. Say so at debug, so a slow
   // unlock has a diagnostic instead of looking like a hang.
   if (kdfExceedsDefault(params)) {
+    const d = defaultKdf();
     log("debug", "Vault KDF parameters exceed this build's default; key derivation will be slower", {
       N: params.N,
       r: params.r,
       p: params.p,
-      defaultN: DEFAULT_KDF.N,
-      defaultR: DEFAULT_KDF.r,
-      defaultP: DEFAULT_KDF.p,
+      defaultN: d.N,
+      defaultR: d.r,
+      defaultP: d.p,
     });
   }
-  let key = await deriveKey(passphrase, salt, params);
+  let key: Buffer;
+  try {
+    key = await unlockDerivation(vault, passphrase, params);
+  } catch (err) {
+    fingerprint.fill(0);
+    throw err;
+  }
+  if (generation !== cacheGeneration) {
+    // lock() ran while scrypt was in flight: honour it. The caller asked for
+    // a key and gets one, but nothing is left behind in the cache.
+    fingerprint.fill(0);
+    return key;
+  }
+  setCache(key, vault.salt, fingerprint);
+  return copyKey(key);
+}
+
+/** Derive and verify `vault`'s key from `passphrase`: the NFC form first,
+ *  then -- only when that is reported as a WRONG passphrase -- the legacy
+ *  forms a vault created before normalization may have been keyed on. Every
+ *  derivation that is not returned is zero-filled before this returns or
+ *  throws. */
+async function unlockDerivation(vault: VaultFile, passphrase: string, params: Readonly<KdfParams>): Promise<Buffer> {
+  const key = await sharedDeriveKey(passphrase, vault.salt, params, true);
+  let primary: unknown;
   try {
     verifyKey(vault, key);
+    return key;
   } catch (err) {
-    // Legacy retry: a vault created before passphrases were NFC-normalized was
-    // keyed on the exact bytes the user typed. If those differ from the
-    // normalized form (a decomposed accent from a macOS keyboard), give the
-    // un-normalized derivation one chance before condemning the passphrase --
-    // otherwise this change would lock those users out of their own vault.
-    if (normalizePassphrase(passphrase) === passphrase) throw err;
-    key.fill(0); // best-effort zeroize the derivation we are discarding
-    key = await deriveKey(passphrase, salt, params, false);
+    key.fill(0);
+    primary = err;
+  }
+  // A corrupt-marker verdict means an entry decrypted under the NFC key: the
+  // passphrase is right, so no other form is worth a scrypt run. Only a
+  // wrong-passphrase verdict is retried.
+  if (errorMessage(primary) !== VAULT_WRONG_PASSPHRASE_ERROR) throw primary;
+  // Legacy retry: a vault created before passphrases were NFC-normalized was
+  // keyed on the exact bytes the user typed. If those differ from the
+  // normalized form (a decomposed accent from a macOS keyboard), give the
+  // un-normalized derivation a chance before condemning the passphrase --
+  // otherwise normalization would lock those users out of their own vault.
+  // The NFD form is tried too, for a vault created from a decomposing input
+  // method that is now being opened with composed text (the raw bytes alone
+  // only covers the opposite direction). NFC stays first.
+  const nfc = normalizePassphrase(passphrase);
+  const nfd = passphrase.normalize("NFD");
+  const legacyForms: string[] = [];
+  if (passphrase !== nfc) legacyForms.push(passphrase);
+  if (nfd !== passphrase && nfd !== nfc) legacyForms.push(nfd);
+  for (const form of legacyForms) {
+    const retry = await sharedDeriveKey(form, vault.salt, params, false);
     try {
-      verifyKey(vault, key);
-    } catch {
-      key.fill(0);
-      throw err; // report the primary (normalized) failure, not the retry's
+      verifyKey(vault, retry);
+      return retry;
+    } catch (err) {
+      retry.fill(0);
+      // This form decrypted an entry: the passphrase is right and the marker
+      // is what is broken. Say THAT, not the primary "wrong passphrase".
+      if (errorMessage(err) === VAULT_CHECK_CORRUPT_ERROR) throw err;
     }
   }
-  cachedKey = key;
-  cachedSalt = vault.salt;
-  cachedFingerprint = fingerprint;
-  return Buffer.from(key);
+  throw primary;
 }
 
 /** May this vault still hold ciphertexts written WITHOUT the entry-name
@@ -631,12 +789,12 @@ export function vaultCheckCorruptHint(path: string): string {
  *  next command verifies against it. setSecret's ensureCheck path is what
  *  stamps it on a first `set`; this is the same marker without an entry.
  *
- *  Derives under DEFAULT_KDF, which is what newVault() records in the file,
+ *  Derives under the parameters newVault() records in the file (defaultKdf()),
  *  so the recorded parameters and the marker's key agree. Touches neither
  *  disk nor the module key cache; the derived key is zeroed before return. */
 export async function createEmptyVault(passphrase: string): Promise<VaultFile> {
   const vault = newVault();
-  const key = await deriveKey(passphrase, Buffer.from(vault.salt, "base64"), DEFAULT_KDF);
+  const key = await deriveKey(passphrase, Buffer.from(vault.salt, "base64"), vault.kdf ?? defaultKdf());
   try {
     return ensureCheck(vault, key);
   } finally {
@@ -717,9 +875,15 @@ export async function rotateVault(vault: VaultFile, oldKey: Buffer, newPassphras
   // also the migration path: the rewritten file is stamped with the current
   // schema and this build's KDF parameters, and every ciphertext comes out
   // bound to its entry name.
+  //
+  // The derivation runs INSIDE the try: a scrypt failure (the host cannot
+  // allocate the working set) must still reach the finally that clears the
+  // plaintext map.
   const newSalt = generateSalt();
-  const newKey = await deriveKey(newPassphrase, newSalt, DEFAULT_KDF);
+  const kdf: KdfParams = { ...defaultKdf() };
+  let newKey: Buffer | undefined;
   try {
+    newKey = await deriveKey(newPassphrase, newSalt, kdf);
     const entries: Record<string, EncryptedEntry> = {};
     for (const [name, value] of plaintext) {
       // setJsonKey, never `entries[name] = ...`: a legally-named "__proto__"
@@ -732,7 +896,7 @@ export async function rotateVault(vault: VaultFile, oldKey: Buffer, newPassphras
     return {
       version: SECRETS_SCHEMA_VERSION,
       salt: newSalt.toString("base64"),
-      kdf: { ...DEFAULT_KDF },
+      kdf,
       entries,
       check: encryptEntry(VAULT_CHECK_PLAINTEXT, newKey, VAULT_CHECK_AAD),
     };
@@ -740,7 +904,7 @@ export async function rotateVault(vault: VaultFile, oldKey: Buffer, newPassphras
     // Best-effort: drop references to plaintext. Strings can't be wiped in
     // V8, but clearing the map removes our held references promptly.
     plaintext.clear();
-    newKey.fill(0);
+    newKey?.fill(0);
   }
 }
 
@@ -782,15 +946,27 @@ export function setSecret(vault: VaultFile, key: Buffer, name: string, value: st
   //
   // `kdf` is stamped on the same path, so a vault that recorded none stops
   // being kdf-less the first time it is written to. The value is LEGACY_KDF,
-  // not DEFAULT_KDF: the key this entry is being encrypted under came from
-  // unlock(), which derived a kdf-less vault under LEGACY_KDF, so that is
-  // what the file must record. (`entries` is a computed key in an object
+  // not the build default: the key this entry is being encrypted under came
+  // from unlock(), which derived a kdf-less vault under LEGACY_KDF, so that
+  // is what the file must record. (`entries` is a computed key in an object
   // literal, which defines an own property -- a "__proto__" secret survives
   // this path; see rotateVault for the one that needed setJsonKey.)
+  //
+  // The exception is a vault that verifies no passphrase (no marker, no
+  // entries): unlock() did not trust its salt or kdf and derived `key` under
+  // a fresh salt and defaultKdf() instead (establishKey), so THOSE are what
+  // this write records. Otherwise a planted empty vault with a trivial cost
+  // factor would fix that factor for every entry ever stored in it. A key
+  // that did not come from establishKey (an embedder deriving its own)
+  // keeps the vault's salt and kdf as before.
+  const established = vaultVerifiesPassphrases(vault) ? undefined : establishedKeys.get(key);
+  const keyed: Pick<VaultFile, "salt" | "kdf"> = established
+    ? { salt: established.salt, kdf: { ...established.kdf } }
+    : { salt: vault.salt, kdf: vault.kdf ?? { ...LEGACY_KDF } };
   return ensureCheck(
     {
       ...vault,
-      kdf: vault.kdf ?? { ...LEGACY_KDF },
+      ...keyed,
       entries: {
         ...vault.entries,
         [name]: encryptEntry(value, key, name),
@@ -812,10 +988,10 @@ export function getSecret(vault: VaultFile, key: Buffer, name: string): string |
   // Own-property check first so an inherited member (`toString`,
   // `constructor`, ...) is reported as absent instead of being handed to
   // decryptEntry as a bogus entry.
+  // loadVault refuses a vault whose entries are not all EncryptedEntry
+  // objects, so an own property here is always one.
   if (!Object.hasOwn(vault.entries, name)) return null;
-  const entry = vault.entries[name];
-  if (!entry) return null;
-  return decryptBound(vault, entry, key, name);
+  return decryptBound(vault, vault.entries[name], key, name);
 }
 
 /** A fresh, EMPTY vault with NO verification marker -- what a first `secrets
@@ -830,7 +1006,7 @@ export function newVault(): VaultFile {
     salt: generateSalt().toString("base64"),
     // Recorded, never assumed: see KdfParams. A vault that carries its own
     // cost factor keeps opening after the default is raised.
-    kdf: { ...DEFAULT_KDF },
+    kdf: { ...defaultKdf() },
     entries: {},
   };
 }

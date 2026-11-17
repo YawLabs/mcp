@@ -318,7 +318,7 @@ export const META_TOOLS = {
   secrets: {
     name: "mcp_connect_secrets",
     description:
-      "Report, per installed server, which local-vault secrets its `${secret:NAME}` references resolve to -- NAMES only, never a value. `injectedSecrets`: names the vault has. `missing`: names it lacks (`yaw-mcp secrets set <name>`). `malformed`: references that do not parse (a space in the name, a missing `}`), quoted in bounded form behind a `<malformed ref>` marker. yaw-mcp refuses to start a server over a missing or malformed reference. Servers with no references are omitted. Decrypts nothing; needs no passphrase.",
+      "Per installed server, which local-vault secrets its `${secret:NAME}` references resolve to -- NAMES only, never a value. `injectedSecrets`: names the vault has. `missing`: names it lacks (`yaw-mcp secrets set <name>`). `malformed`: references that do not parse, in bounded form. yaw-mcp refuses to start a server over a missing or malformed reference. Servers with no references are omitted. An absent vault adds a status line; an unreadable one is an error naming the cause. Decrypts nothing; needs no passphrase.",
     inputSchema: {
       type: "object" as const,
       properties: {

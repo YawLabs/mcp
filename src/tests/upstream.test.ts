@@ -70,6 +70,8 @@ vi.mock("../secrets-vault.js", async (importOriginal) => {
     collectSecretRefNames: actual.collectSecretRefNames,
     SECRET_REF_RE: actual.SECRET_REF_RE,
     VAULT_CHECK_CORRUPT_ERROR: actual.VAULT_CHECK_CORRUPT_ERROR,
+    vaultCheckCorruptHint: actual.vaultCheckCorruptHint,
+    vaultVerifiesPassphrases: actual.vaultVerifiesPassphrases,
   };
 });
 
@@ -2158,7 +2160,7 @@ describe("resolveServerEnv", () => {
   it("keeps the missing-only refusal message unchanged and adds a malformed clause after it", async () => {
     vi.mocked(hasSecretRefs).mockReturnValue(true);
     process.env.YAW_MCP_VAULT_PASSPHRASE = "test-passphrase";
-    vi.mocked(loadVault).mockResolvedValue({ version: 2, salt: "abc", entries: {} } as any);
+    vi.mocked(loadVault).mockResolvedValue({ version: 2, salt: "abc", entries: { OTHER: {} } } as any);
     vi.mocked(unlock).mockResolvedValue(Buffer.from("fakekey"));
     vi.mocked(resolveSecretRefs).mockReturnValue({
       resolved: { A: "${secret:MISSING_NAME}", B: "${secret:gh token}" },
@@ -4613,6 +4615,9 @@ describe("connectToUpstream remote headers", () => {
     // transport exists: a literal `${secret:...}` must never travel as a
     // credential to the far end.
     vi.mocked(hasSecretRefs).mockReturnValue(true);
+    // A vault holding an entry: an entry-less one refuses as "missing" with no
+    // prompt (resolveServerEnv), which is not the locked case under test.
+    vi.mocked(loadVault).mockResolvedValue({ entries: { gh: {} } } as any);
 
     const err = await connectToUpstream(makeRemoteConfig({ headers: { Authorization: "Bearer ${secret:gh}" } })).catch(
       (e: unknown) => e,
@@ -4935,24 +4940,24 @@ describe("verifyVaultPassphrase", () => {
   // the top of this file; its own mapping is tested in secrets-vault.test.ts),
   // so these drive its three answers -- and its throw -- directly.
 
-  it("returns true when the passphrase opens the vault", async () => {
+  it("answers verified when the passphrase opens the vault", async () => {
     const fakeVault = { version: 1, salt: "abc", entries: { A: {} } } as any;
     vi.mocked(loadVault).mockResolvedValue(fakeVault);
     vi.mocked(checkVaultPassphrase).mockResolvedValue("opens");
 
-    await expect(verifyVaultPassphrase("right")).resolves.toBe(true);
+    await expect(verifyVaultPassphrase("right")).resolves.toBe("verified");
     expect(vi.mocked(checkVaultPassphrase)).toHaveBeenCalledWith(fakeVault, "right");
   });
 
-  it("returns false when the passphrase is wrong", async () => {
+  it("answers wrong when the passphrase is wrong", async () => {
     vi.mocked(loadVault).mockResolvedValue({ version: 1, salt: "abc", entries: { A: {} } } as any);
     vi.mocked(checkVaultPassphrase).mockResolvedValue("wrong");
 
-    await expect(verifyVaultPassphrase("wrong")).resolves.toBe(false);
+    await expect(verifyVaultPassphrase("wrong")).resolves.toBe("wrong");
   });
 
-  it("returns false for an empty passphrase without touching the vault", async () => {
-    await expect(verifyVaultPassphrase("")).resolves.toBe(false);
+  it("answers wrong for an empty passphrase without touching the vault", async () => {
+    await expect(verifyVaultPassphrase("")).resolves.toBe("wrong");
     expect(vi.mocked(loadVault)).not.toHaveBeenCalled();
     expect(vi.mocked(checkVaultPassphrase)).not.toHaveBeenCalled();
   });
@@ -4964,10 +4969,10 @@ describe("verifyVaultPassphrase", () => {
     vi.mocked(loadVault).mockResolvedValue({ version: 1, salt: "abc", entries: { A: {} } } as any);
     vi.mocked(checkVaultPassphrase).mockResolvedValue("marker-corrupt");
 
-    await expect(verifyVaultPassphrase("actually-correct")).resolves.toBe(true);
+    await expect(verifyVaultPassphrase("actually-correct")).resolves.toBe("verified");
   });
 
-  it("answers false, and does not throw, when the check itself fails", async () => {
+  it("answers wrong, and does not throw, when the check itself fails", async () => {
     // checkVaultPassphrase throws for a failure that is not a verdict (a
     // key-derivation error). This function promises never to throw, and it
     // folds that into false exactly as it did every non-marker unlock failure
@@ -4975,25 +4980,25 @@ describe("verifyVaultPassphrase", () => {
     vi.mocked(loadVault).mockResolvedValue({ version: 1, salt: "abc", entries: { A: {} } } as any);
     vi.mocked(checkVaultPassphrase).mockRejectedValue(new Error("Invalid scrypt params: memory limit exceeded"));
 
-    await expect(verifyVaultPassphrase("anything")).resolves.toBe(false);
+    await expect(verifyVaultPassphrase("anything")).resolves.toBe("wrong");
   });
 
-  it("does not reject a passphrase when there is no vault to verify against", async () => {
-    // unlock() accepts anything for an absent/empty vault, and the real
-    // refusal for that case ("no vault exists yet") is resolveServerEnv's to
-    // report -- with wording that tells the user to create one.
+  it("answers unverifiable -- not verified -- when there is no vault to verify against", async () => {
+    // unlock() accepts anything for an absent/empty vault. "verified" here
+    // would let the caller store the value and stop asking, so a vault
+    // created later under a DIFFERENT passphrase failed every server.
     vi.mocked(loadVault).mockResolvedValue(null);
 
-    await expect(verifyVaultPassphrase("anything")).resolves.toBe(true);
+    await expect(verifyVaultPassphrase("anything")).resolves.toBe("unverifiable");
   });
 
-  it("does not blame the passphrase for an unreadable vault", async () => {
+  it("answers unverifiable (neither wrong nor verified) for an unreadable vault", async () => {
     vi.mocked(loadVault).mockRejectedValue(new Error("EACCES: permission denied"));
 
-    await expect(verifyVaultPassphrase("fine")).resolves.toBe(true);
+    await expect(verifyVaultPassphrase("fine")).resolves.toBe("unverifiable");
   });
 
-  it("commits nothing to module state on a passphrase that verifies TRUE", async () => {
+  it("commits nothing to module state on a passphrase that verifies", async () => {
     // The whole reason this function exists: it CHECKS. Installing the value it
     // just verified would make "verify, then decide" impossible and quietly
     // displace whatever the session (or the env var) already holds.
@@ -5001,18 +5006,18 @@ describe("verifyVaultPassphrase", () => {
     vi.mocked(loadVault).mockResolvedValue({ version: 1, salt: "abc", entries: { A: {} } } as any);
     vi.mocked(checkVaultPassphrase).mockResolvedValue("opens");
 
-    await expect(verifyVaultPassphrase("a-different-one")).resolves.toBe(true);
+    await expect(verifyVaultPassphrase("a-different-one")).resolves.toBe("verified");
     expect(vaultPassphrase()).toBe("already-committed");
   });
 
-  it("commits nothing to module state on a passphrase that verifies FALSE", async () => {
+  it("commits nothing to module state on a passphrase that is wrong", async () => {
     // The failure direction matters more: a typo that displaced a working
     // passphrase would break every later resolve in the session.
     setSessionVaultPassphrase("already-committed");
     vi.mocked(loadVault).mockResolvedValue({ version: 1, salt: "abc", entries: { A: {} } } as any);
     vi.mocked(checkVaultPassphrase).mockResolvedValue("wrong");
 
-    await expect(verifyVaultPassphrase("typo")).resolves.toBe(false);
+    await expect(verifyVaultPassphrase("typo")).resolves.toBe("wrong");
     expect(vaultPassphrase()).toBe("already-committed");
   });
 });

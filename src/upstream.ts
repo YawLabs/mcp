@@ -39,7 +39,9 @@ import {
   resolveSecretRefs,
   unlock,
   VAULT_CHECK_CORRUPT_ERROR,
+  vaultCheckCorruptHint,
   vaultPath,
+  vaultVerifiesPassphrases,
 } from "./secrets-vault.js";
 import { MAX_TIMEOUT_MS } from "./timeouts.js";
 import {
@@ -93,6 +95,11 @@ export class VaultPassphraseRequiredError extends Error {
      *  var is set, and the answer to it has to win over the value that just
      *  failed. */
     public readonly reason: "missing" | "invalid" = "missing",
+    /** What the refs live in, in the operator's words -- resolveServerEnv's
+     *  `subject`: "server env" for a local server, "remote server headers"
+     *  for a remote one. Carried so the server layer names the right map
+     *  ("its headers (Authorization)", not "its env (Authorization)"). */
+    public readonly subject: string = "server env",
   ) {
     super(message);
     this.name = "VaultPassphraseRequiredError";
@@ -145,33 +152,46 @@ export function clearSessionVaultPassphrase(): void {
  *  equivalent: by then a typo has already displaced a possibly-correct
  *  YAW_MCP_VAULT_PASSPHRASE.
  *
- *  Returns true when there is NO vault yet -- there is nothing to verify
- *  against, unlock() accepts any passphrase for an empty vault, and the real
- *  refusal for that case ("no vault exists yet") belongs to resolveServerEnv.
- *  Never throws: an unreadable or corrupt vault is not the typed passphrase's
- *  fault, so it verifies as true and lets the resolve path report the real
- *  error with its own wording.
+ *  Three answers, because "nothing to check against" is not "verified":
+ *    "verified"     -- the passphrase opens the vault (or its check marker is
+ *                      corrupt, which means the passphrase is RIGHT: see below).
+ *    "wrong"        -- it does not, or the check itself failed.
+ *    "unverifiable" -- there is no vault, it cannot be read, or it holds
+ *                      neither a check marker nor an entry (unlock() accepts
+ *                      ANY passphrase there). The caller must neither store
+ *                      the value as the session passphrase nor stop asking:
+ *                      a vault created later under a DIFFERENT passphrase
+ *                      would otherwise fail every vault-backed server until
+ *                      restart, with no prompt left to correct it.
+ *                      resolveServerEnv refuses a missing, unreadable or
+ *                      entry-less vault before any prompt, so in the prompt
+ *                      flow this answer means the vault CHANGED while the
+ *                      prompt was open (deleted, made unreadable, or emptied
+ *                      of its last entry with no check marker to keep).
+ *  Never throws.
  *
  *  The verdict itself is secrets-vault's checkVaultPassphrase, the one
  *  spelling of "unlock, but read a corrupt check marker as a RIGHT
  *  passphrase": "opens" and "marker-corrupt" both accept what the user typed
  *  (a damaged marker would fail a retype identically). A check that throws
  *  -- a key-derivation failure, which says nothing about the passphrase --
- *  answers false, like a wrong passphrase, so the elicitation path reports it
- *  as a passphrase that did not unlock the vault. */
-export async function verifyVaultPassphrase(passphrase: string): Promise<boolean> {
-  if (passphrase.length === 0) return false;
+ *  answers "wrong", so the elicitation path reports it as a passphrase that
+ *  did not unlock the vault. */
+export type VaultPassphraseCheck = "verified" | "wrong" | "unverifiable";
+
+export async function verifyVaultPassphrase(passphrase: string): Promise<VaultPassphraseCheck> {
+  if (passphrase.length === 0) return "wrong";
   let vault: Awaited<ReturnType<typeof loadVault>>;
   try {
     vault = await loadVault(vaultPath());
   } catch {
-    return true;
+    return "unverifiable";
   }
-  if (!vault) return true;
+  if (!vault || !vaultVerifiesPassphrases(vault)) return "unverifiable";
   try {
-    return (await checkVaultPassphrase(vault, passphrase)) !== "wrong";
+    return (await checkVaultPassphrase(vault, passphrase)) !== "wrong" ? "verified" : "wrong";
   } catch {
-    return false;
+    return "wrong";
   }
 }
 
@@ -244,24 +264,13 @@ export async function resolveServerEnv(
     .filter(([, v]) => typeof v === "string" && v.includes("${secret:"))
     .map(([k]) => k);
   const lead = subject.charAt(0).toUpperCase() + subject.slice(1);
-  const passphrase = vaultPassphrase();
-  if (typeof passphrase !== "string" || passphrase.length === 0) {
-    // `namespace` rides along with the keys. Without it this line says a
-    // server is waiting on the vault without saying WHICH, and on a config
-    // with several credentialed servers that is the only fact the reader
-    // needs -- the thrown error carries it, but the log is what a user
-    // grepping their client's stderr actually sees.
-    log("warn", `${lead} carries \${secret:...} refs but YAW_MCP_VAULT_PASSPHRASE is not set`, {
-      namespace,
-      keys: refKeys,
-    });
-    throw new VaultPassphraseRequiredError(
-      `vault locked: ${subject} references \${secret:...} but YAW_MCP_VAULT_PASSPHRASE is not set`,
-      namespace,
-      refKeys,
-      "missing",
-    );
-  }
+  // The vault is loaded BEFORE the passphrase is looked at. "No vault exists
+  // yet" and "vault unreadable" are answers no passphrase can change, so
+  // checking the passphrase first asked the user to type one (the
+  // VaultPassphraseRequiredError below drives the in-session prompt) for a
+  // vault that is not there -- and the typed value then had nothing to be
+  // verified against.
+  //
   // A vault that EXISTS but cannot be READ is a different failure from having
   // no vault at all, and collapsing the two told the operator to create a vault
   // they already have while the real reason (bad JSON, a truncated write,
@@ -278,33 +287,28 @@ export async function resolveServerEnv(
   if (!vault) {
     throw new Error(`vault locked: ${subject} references \${secret:...} but no vault exists yet`);
   }
-  // A passphrase that does not open the vault is a question for the user, not
-  // a dead end -- so it throws the SAME typed error as no passphrase at all,
-  // tagged "invalid". Without this a wrong YAW_MCP_VAULT_PASSPHRASE was
-  // unrecoverable in-session: the raw unlock error fell through to the generic
-  // missing-credential path, which (correctly) refuses to elicit yaw-mcp's own
-  // secrets, so nothing could offer the correction.
-  //
-  // VAULT_CHECK_CORRUPT_ERROR is deliberately re-thrown untouched: that error
-  // means the passphrase IS correct and the check marker is damaged, so a
-  // prompt would ask the user to re-type a passphrase that was never wrong and
-  // then fail identically. Anything else here is a decrypt failure, which is
-  // what a wrong passphrase looks like.
-  let key: Buffer;
+  // A vault that holds NO entries cannot satisfy any well-formed ref, whatever
+  // the passphrase: every name is missing. So neither ask for a passphrase nor
+  // unlock. Asking was a dead loop for a legacy vault emptied by `remove` (no
+  // check marker, no entries): verifyVaultPassphrase answers "unverifiable"
+  // there, the typed value is discarded, and the next activation asks again
+  // until the prompt budget ran out. Unlocking was ~100 ms of scrypt per
+  // activation for nothing, and on a marker-less vault it re-keys under a
+  // fresh salt and evicts the module's cached key (see unlock/establishKey).
+  // resolveSecretRefs never touches the key when no entry exists, so an empty
+  // buffer stands in; the audit and the missing-ref refusal below run as usual.
+  const noEntries = Object.keys(vault.entries).length === 0;
+  const key = noEntries ? Buffer.alloc(0) : await unlockForResolve(vault, namespace, refKeys, subject, lead);
+  // unlock() hands back the caller's OWN copy of the derived key (the module
+  // cache keeps its own), so nothing else zeroes this one: fill it the moment
+  // the decrypt is done, whether or not it threw.
+  let decrypted: ReturnType<typeof resolveSecretRefs>;
   try {
-    key = await unlock(vault, passphrase);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    if (msg === VAULT_CHECK_CORRUPT_ERROR) throw err;
-    log("warn", "Vault passphrase did not unlock the vault", { namespace, keys: refKeys });
-    throw new VaultPassphraseRequiredError(
-      `vault locked: the passphrase available to yaw-mcp does not unlock the vault (${msg})`,
-      namespace,
-      refKeys,
-      "invalid",
-    );
+    decrypted = resolveSecretRefs(env, vault, key);
+  } finally {
+    key.fill(0);
   }
-  const { resolved, missing, malformed, values } = resolveSecretRefs(env, vault, key);
+  const { resolved, missing, malformed, values } = decrypted;
   // Hand the caller every decrypted value, keyed by secret NAME, so it can arm
   // the redactor with those as well as the composed strings. `resolved` holds
   // `Bearer <token>` for the documented `"Bearer ${secret:linear}"` shape, so
@@ -353,11 +357,78 @@ export async function resolveServerEnv(
   // value), so it goes through secrets-vault's sanitizer, never raw.
   if (missing.length > 0 || malformed.length > 0) {
     const problems: string[] = [];
-    if (missing.length > 0) problems.push(`missing or undecryptable secret refs: ${missing.join(", ")}`);
+    if (missing.length > 0) {
+      // On an empty vault the names are simply absent, and the fix is to store
+      // them -- say so, since no passphrase prompt preceded this refusal.
+      const fix = noEntries ? ` (the vault holds no secrets yet; store each with \`yaw-mcp secrets set <name>\`)` : "";
+      problems.push(`missing or undecryptable secret refs: ${missing.join(", ")}${fix}`);
+    }
     if (malformed.length > 0) problems.push(`malformed secret refs: ${malformed.map((m) => m.display).join(", ")}`);
     throw new Error(`vault: ${problems.join("; ")}`);
   }
   return resolved;
+}
+
+/** resolveServerEnv's passphrase + unlock step, for a vault that holds at
+ *  least one entry. Throws the prompt-driving VaultPassphraseRequiredError
+ *  ("missing" / "invalid") or the corrupt-marker hand-fix; returns the
+ *  caller's own key copy otherwise. */
+async function unlockForResolve(
+  vault: NonNullable<Awaited<ReturnType<typeof loadVault>>>,
+  namespace: string,
+  refKeys: string[],
+  subject: string,
+  lead: string,
+): Promise<Buffer> {
+  const passphrase = vaultPassphrase();
+  if (typeof passphrase !== "string" || passphrase.length === 0) {
+    // `namespace` rides along with the keys. Without it this line says a
+    // server is waiting on the vault without saying WHICH, and on a config
+    // with several credentialed servers that is the only fact the reader
+    // needs -- the thrown error carries it, but the log is what a user
+    // grepping their client's stderr actually sees.
+    log("warn", `${lead} carries \${secret:...} refs but YAW_MCP_VAULT_PASSPHRASE is not set`, {
+      namespace,
+      keys: refKeys,
+    });
+    throw new VaultPassphraseRequiredError(
+      `vault locked: ${subject} references \${secret:...} but YAW_MCP_VAULT_PASSPHRASE is not set`,
+      namespace,
+      refKeys,
+      "missing",
+      subject,
+    );
+  }
+  // A passphrase that does not open the vault is a question for the user, not
+  // a dead end -- so it throws the SAME typed error as no passphrase at all,
+  // tagged "invalid". Without this a wrong YAW_MCP_VAULT_PASSPHRASE was
+  // unrecoverable in-session: the raw unlock error fell through to the generic
+  // missing-credential path, which (correctly) refuses to elicit yaw-mcp's own
+  // secrets, so nothing could offer the correction.
+  //
+  // VAULT_CHECK_CORRUPT_ERROR is NOT turned into a prompt: that error means
+  // the passphrase IS correct and the check marker is damaged, so a prompt
+  // would ask the user to re-type a passphrase that was never wrong and then
+  // fail identically. It is re-thrown with the same hand-fix the CLI attaches
+  // (vaultCheckCorruptHint), so a failed activation says how to repair it.
+  // Anything else here is a decrypt failure, which is what a wrong passphrase
+  // looks like.
+  let key: Buffer;
+  try {
+    key = await unlock(vault, passphrase);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg === VAULT_CHECK_CORRUPT_ERROR) throw new Error(`${msg}. ${vaultCheckCorruptHint(vaultPath())}`);
+    log("warn", "Vault passphrase did not unlock the vault", { namespace, keys: refKeys });
+    throw new VaultPassphraseRequiredError(
+      `vault locked: the passphrase available to yaw-mcp does not unlock the vault (${msg})`,
+      namespace,
+      refKeys,
+      "invalid",
+      subject,
+    );
+  }
+  return key;
 }
 
 /**

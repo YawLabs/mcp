@@ -62,15 +62,30 @@ export interface KdfParams {
 }
 
 /** What a vault created by THIS build is written with. Free to move upward as
- *  hardware gets faster: every vault created or rotated from now on records
- *  the parameters it was written under, and a vault that records NONE is read
- *  under LEGACY_KDF below -- never under this.
+ *  hardware gets faster (by editing this literal): every vault created or
+ *  rotated from now on records the parameters it was written under, and a
+ *  vault that records NONE is read under LEGACY_KDF below -- never under this.
  *
- *  Deliberately NOT frozen, unlike LEGACY_KDF: secrets-vault.test.ts assigns
- *  DEFAULT_KDF.N in place to stand in for a future bump (a kdf-less vault
- *  must still open under LEGACY_KDF). Freezing this would make that
- *  assignment throw under ESM strict mode. */
-export const DEFAULT_KDF: KdfParams = { N: 1 << 15, r: 8, p: 1 };
+ *  Frozen, like LEGACY_KDF, so no importer can move the cost factor at run
+ *  time. Code that WRITES a vault reads the default through defaultKdf(), not
+ *  this constant, so a test can stand in for a future bump with
+ *  setDefaultKdfForTesting instead of mutating a shared export. */
+export const DEFAULT_KDF: Readonly<KdfParams> = Object.freeze({ N: 1 << 15, r: 8, p: 1 });
+
+/** Test-only override of the build default; null in production. */
+let defaultKdfOverride: Readonly<KdfParams> | null = null;
+
+/** The parameters a vault created or rotated NOW is written with:
+ *  DEFAULT_KDF, unless a test has overridden it. */
+export function defaultKdf(): Readonly<KdfParams> {
+  return defaultKdfOverride ?? DEFAULT_KDF;
+}
+
+/** TEST HOOK. Stand in for a future cost bump without mutating DEFAULT_KDF;
+ *  pass null to restore it. Production code never calls this. */
+export function setDefaultKdfForTesting(params: KdfParams | null): void {
+  defaultKdfOverride = params === null ? null : Object.freeze({ ...params });
+}
 
 /** The parameters every KDF-LESS vault was derived under -- schema v1, written
  *  before `kdf` was recorded in the file, when the cost factor was a
@@ -159,7 +174,8 @@ export function isValidKdfParams(v: unknown): v is KdfParams {
  *  instead of ~100ms, so unlock() logs the parameters at debug when this is
  *  true: a slow unlock gets a diagnostic instead of looking like a hang. */
 export function kdfExceedsDefault(params: KdfParams): boolean {
-  return params.N > DEFAULT_KDF.N || params.r > DEFAULT_KDF.r || params.p > DEFAULT_KDF.p;
+  const d = defaultKdf();
+  return params.N > d.N || params.r > d.r || params.p > d.p;
 }
 
 export interface EncryptedEntry {
@@ -174,6 +190,16 @@ export interface EncryptedEntry {
 /** Generate a fresh random salt for a new vault. */
 export function generateSalt(): Buffer {
   return randomBytes(SALT_LEN);
+}
+
+/** A copy of `key` in its OWN zero-filled allocation. Never Buffer.from(buf)
+ *  or allocUnsafe for key material: those can hand back a slice of Node's
+ *  shared 8 KB pool, which outlives every fill(0) a caller does on its view
+ *  and sits next to unrelated allocations. */
+export function copyKey(key: Buffer): Buffer {
+  const out = Buffer.alloc(key.length);
+  key.copy(out);
+  return out;
 }
 
 /** Unicode-normalize a passphrase before it reaches scrypt.
@@ -196,15 +222,23 @@ export function normalizePassphrase(passphrase: string): string {
  *  every such vault was written under LEGACY_KDF. Defaulting to DEFAULT_KDF
  *  would re-key those vaults the day the default is raised. A caller reading
  *  any other existing vault MUST pass the parameters recorded in it, and a
- *  caller CREATING a vault must pass DEFAULT_KDF explicitly. `normalize` is
- *  only turned off for the legacy un-normalized retry described in
- *  normalizePassphrase. */
+ *  caller CREATING a vault must pass defaultKdf() explicitly. `normalize` is
+ *  only turned off for the legacy un-normalized retries described in
+ *  normalizePassphrase.
+ *
+ *  Rejects any `params` invalidKdfParamsReason refuses, BEFORE scrypt runs,
+ *  with the same "invalid kdf parameters (...)" wording loadVault uses: a
+ *  caller handing in params that never went through loadVault (a vault built
+ *  in memory, an embedder) gets the bound enforced here too, rather than
+ *  relying on node's maxmem or OpenSSL to refuse a memory bomb. */
 export async function deriveKey(
   passphrase: string,
   salt: Buffer,
-  params: KdfParams = LEGACY_KDF,
+  params: Readonly<KdfParams> = LEGACY_KDF,
   normalize = true,
 ): Promise<Buffer> {
+  const problem = invalidKdfParamsReason(params);
+  if (problem !== null) throw new Error(`invalid kdf parameters (${problem})`);
   return scryptCallWithMaxmem(normalize ? normalizePassphrase(passphrase) : passphrase, salt, KEY_LEN, params);
 }
 
@@ -212,7 +246,7 @@ async function scryptCallWithMaxmem(
   password: string,
   salt: Buffer,
   keylen: number,
-  params: KdfParams,
+  params: Readonly<KdfParams>,
 ): Promise<Buffer> {
   // node:crypto's scrypt(password, salt, keylen, opts?) accepts opts.
   // promisify doesn't carry opts cleanly, so we re-implement the
@@ -221,14 +255,23 @@ async function scryptCallWithMaxmem(
   // maxmem scales WITH the parameters: scrypt's own default is far below what
   // N=2^15 needs, and a hardcoded 64MB would start throwing the moment a
   // vault records a higher cost factor. 256 * N * r is 2x the working set.
-  // This is a ceiling for node, NOT the security bound -- isValidKdfParams
-  // has already refused any pair whose working set exceeds
-  // MAX_KDF_MEMORY_BYTES, so nothing reaching here can ask for 2 GiB.
+  // This is a ceiling for node, NOT the security bound -- deriveKey, the only
+  // caller, has just run invalidKdfParamsReason on these params and thrown on
+  // any pair whose working set exceeds MAX_KDF_MEMORY_BYTES, so nothing
+  // reaching here can ask for 2 GiB.
   const maxmem = Math.max(64 * 1024 * 1024, 256 * params.N * params.r);
   return new Promise((resolve, reject) => {
-    scryptCb(password, salt, keylen, { N: params.N, r: params.r, p: params.p, maxmem }, (err, key) =>
-      err ? reject(err) : resolve(key as Buffer),
-    );
+    scryptCb(password, salt, keylen, { N: params.N, r: params.r, p: params.p, maxmem }, (err, key) => {
+      if (err) {
+        reject(err);
+        return;
+      }
+      // Re-home the key in a dedicated allocation (see copyKey) and wipe
+      // node's buffer, so the only copy left is one a fill(0) really clears.
+      const own = copyKey(key as Buffer);
+      (key as Buffer).fill(0);
+      resolve(own);
+    });
   });
 }
 

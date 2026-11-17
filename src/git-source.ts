@@ -66,7 +66,15 @@ import {
   gitRoot,
   userConfigDir,
 } from "./paths.js";
-import { getSecret, loadVault, SECRET_NAME_RE, unlock, vaultPath } from "./secrets-vault.js";
+import {
+  getSecret,
+  loadVault,
+  SECRET_NAME_RE,
+  unlock,
+  VAULT_CHECK_CORRUPT_ERROR,
+  vaultCheckCorruptHint,
+  vaultPath,
+} from "./secrets-vault.js";
 import { acquireSidecarsLock, defaultRunNpm, npmBin, type RunNpmOptions } from "./sidecars-cmd.js";
 import { readTrustStore, trustedRecords, trustStorePath } from "./trust.js";
 import type { UpstreamServerConfig } from "./types.js";
@@ -1245,7 +1253,22 @@ async function readVaultSecret(name: string, home: string): Promise<string> {
       `the vault is locked, so the git token in secret "${name}" cannot be read. Set YAW_MCP_VAULT_PASSPHRASE for this command.`,
     );
   }
-  const value = getSecret(vault, await unlock(vault, passphrase), name);
+  let key: Buffer;
+  try {
+    key = await unlock(vault, passphrase);
+  } catch (err) {
+    // A corrupt check marker means the passphrase is RIGHT and one key needs
+    // deleting by hand -- carry that fix, as the CLI and the broker do.
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg === VAULT_CHECK_CORRUPT_ERROR) throw new Error(`${msg}. ${vaultCheckCorruptHint(vaultPath(home))}`);
+    throw err;
+  }
+  let value: string | null;
+  try {
+    value = getSecret(vault, key, name);
+  } finally {
+    key.fill(0);
+  }
   if (!value) throw new Error(`secret "${name}" is empty or unreadable.`);
   return value;
 }

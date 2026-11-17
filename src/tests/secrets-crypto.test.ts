@@ -1,8 +1,10 @@
 import { scryptSync } from "node:crypto";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import {
+  copyKey,
   DEFAULT_KDF,
   decryptEntry,
+  defaultKdf,
   deriveKey,
   encryptEntry,
   generateSalt,
@@ -13,7 +15,12 @@ import {
   LEGACY_KDF,
   normalizePassphrase,
   SALT_LEN,
+  setDefaultKdfForTesting,
 } from "../secrets-crypto.js";
+
+afterEach(() => {
+  setDefaultKdfForTesting(null);
+});
 
 // secrets-crypto.ts imported directly. The derivation and AEAD round trips are
 // also exercised through the vault in secrets-vault.test.ts; this file covers
@@ -100,8 +107,15 @@ describe("isValidKdfParams", () => {
       expect(isValidKdfParams(params), JSON.stringify(params)).toBe(false);
       // The fact the guard encodes, checked against node itself: if a future
       // runtime ever accepts these, this line says so rather than letting the
-      // guard quietly refuse vaults that would open.
-      await expect(deriveKey("pw", salt, params), JSON.stringify(params)).rejects.toThrow();
+      // guard quietly refuse vaults that would open. node's scrypt directly,
+      // not deriveKey: deriveKey now runs the guard first, so it would only
+      // be checking the guard against itself.
+      expect(
+        () => scryptSync("pw", salt, 32, { ...params, maxmem: 256 * 1024 * 1024 }),
+        JSON.stringify(params),
+      ).toThrow();
+      // ...and deriveKey refuses them up front with loadVault's wording.
+      await expect(deriveKey("pw", salt, params), JSON.stringify(params)).rejects.toThrow(/invalid kdf parameters/);
     }
   });
 
@@ -205,5 +219,57 @@ describe("kdfExceedsDefault", () => {
     expect(kdfExceedsDefault({ N: DEFAULT_KDF.N, r: DEFAULT_KDF.r + 1, p: 1 })).toBe(true);
     // Cheaper than the default is not "exceeds".
     expect(kdfExceedsDefault({ N: DEFAULT_KDF.N >> 1, r: 1, p: 1 })).toBe(false);
+  });
+});
+
+describe("deriveKey validates its parameters", () => {
+  it("rejects params invalidKdfParamsReason refuses before scrypt runs, naming the field", async () => {
+    const salt = generateSalt();
+    await expect(deriveKey("pw", salt, { N: 3, r: 8, p: 1 })).rejects.toThrow(
+      /^invalid kdf parameters \(N=3 must be a power of two/,
+    );
+    await expect(deriveKey("pw", salt, { N: 1 << 18, r: 32, p: 1 })).rejects.toThrow(/over the \d+ bound/);
+    await expect(deriveKey("pw", salt, { N: 1 << 15, r: 8, p: 17 })).rejects.toThrow(/p=17/);
+  });
+});
+
+describe("key material lives in its own allocation", () => {
+  it("deriveKey returns a key backed by its own ArrayBuffer, not a slice of the shared pool", async () => {
+    const key = await deriveKey("pw", generateSalt(), { N: 1 << 10, r: 8, p: 1 });
+    expect(key).toHaveLength(KEY_LEN);
+    expect(key.byteOffset).toBe(0);
+    expect(key.buffer.byteLength).toBe(KEY_LEN);
+  });
+
+  it("copyKey copies into a dedicated buffer the source can be zeroed without touching", () => {
+    const src = Buffer.alloc(KEY_LEN, 7);
+    const out = copyKey(src);
+    expect(out).not.toBe(src);
+    expect(out.buffer).not.toBe(src.buffer);
+    expect(out.byteOffset).toBe(0);
+    expect(out.buffer.byteLength).toBe(KEY_LEN);
+    src.fill(0);
+    expect(out.every((b) => b === 7)).toBe(true);
+  });
+});
+
+describe("DEFAULT_KDF is frozen; tests move the default through the hook", () => {
+  it("cannot be mutated in place", () => {
+    expect(Object.isFrozen(DEFAULT_KDF)).toBe(true);
+    expect(() => {
+      (DEFAULT_KDF as { N: number }).N = 2;
+    }).toThrow(TypeError);
+    expect(DEFAULT_KDF.N).toBe(1 << 15);
+  });
+
+  it("setDefaultKdfForTesting moves defaultKdf() and kdfExceedsDefault, and null restores DEFAULT_KDF", () => {
+    expect(defaultKdf()).toBe(DEFAULT_KDF);
+    setDefaultKdfForTesting({ N: 1 << 16, r: 8, p: 1 });
+    expect(defaultKdf()).toEqual({ N: 1 << 16, r: 8, p: 1 });
+    expect(Object.isFrozen(defaultKdf())).toBe(true);
+    expect(kdfExceedsDefault(DEFAULT_KDF)).toBe(false);
+    expect(kdfExceedsDefault({ N: 1 << 17, r: 8, p: 1 })).toBe(true);
+    setDefaultKdfForTesting(null);
+    expect(defaultKdf()).toBe(DEFAULT_KDF);
   });
 });

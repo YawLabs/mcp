@@ -67,7 +67,7 @@ beforeEach(() => {
   vi.mocked(connectToUpstream).mockReset();
   vi.mocked(verifyVaultPassphrase)
     .mockReset()
-    .mockImplementation(async (p: string) => p === VAULT_PASSPHRASE);
+    .mockImplementation(async (p: string) => (p === VAULT_PASSPHRASE ? "verified" : "wrong"));
   hoisted.sessionPassphrase = null;
 });
 
