@@ -38,7 +38,7 @@
         "minLength": 1,
         "pattern": "^[a-z][a-z0-9_]{0,29}$"
       },
-      "description": "Allow-list of server namespaces to activate. If set in any scope, only these servers are active. Precedence: local scope wins over project, which wins over global (most-specific overrides). Entries are matched literally against an installed namespace, so `pattern` mirrors NAMESPACE_RE (src/local-bundles.ts): a lowercase letter followed by up to 29 more of [a-z0-9_]. A blank, padded, or wrong-case entry ('GitHub', ' github') can never name a server. The loader is softer about the same three cases, and the split is deliberate -- it drops a blank entry with a warning, trims a padded one, and KEEPS an unmatchable one with a warning (dropping it would empty the array and silently promote this scope to the parent's allow-list). `uniqueItems` likewise flags a repeated namespace in the editor, where it is always a typo; the loader treats the duplicate as the harmless no-op it is."
+      "description": "Allow-list of server namespaces to activate. If set in any scope, only these servers are active, and an empty list allows nothing. config.local.json wins over the project config.json, and either can only NARROW the user-global list: an entry the global list leaves out is dropped with a warning. Entries are matched literally against an installed namespace, so `pattern` mirrors NAMESPACE_RE (src/local-bundles.ts): a lowercase letter followed by up to 29 more of [a-z0-9_]. A non-string or blank entry, or a value that is not an array, is a policy error and refuses every server spawn until fixed; a padded entry is trimmed, and a wrong-case entry is kept with a warning and matches nothing."
     },
     "blocked": {
       "type": "array",
@@ -46,9 +46,9 @@
       "items": {
         "type": "string",
         "minLength": 1,
-        "pattern": "^[a-z][a-z0-9_]{0,29}$"
+        "pattern": "^([a-z][a-z0-9_]{0,29}|(package|command|url):\\S.*)$"
       },
-      "description": "Deny-list of server namespaces that are never activated. Merged as a union across all scopes (additive, not overriding). Same namespace `pattern` and `uniqueItems` as `servers`, and the same strict-schema / lenient-loader split: the union is a Set, so the loader absorbs a duplicate rather than rejecting it."
+      "description": "Deny-list of servers that are never activated, merged as a union across all scopes. An entry is a namespace, which also covers any configured server with the same launch identity, or an explicit identity that holds under any namespace: `package:@scope/name`, `command:name-or-path`, or `url:https://host/path`. This catches re-registration of the same package, command or URL; it does not catch a wrapper script, a renamed binary or a fork. A value of the wrong type is a policy error and refuses every server spawn until fixed."
     },
     "blockedTools": {
       "type": "array",
@@ -56,9 +56,9 @@
       "items": {
         "type": "string",
         "minLength": 1,
-        "pattern": "^[A-Za-z0-9_.:-]+\\*?$"
+        "pattern": "^([A-Za-z0-9_.:-]+\\*?|(package|command|url):\\S.*#[A-Za-z0-9_.:-]+\\*?)$"
       },
-      "description": "Deny-list of individual TOOLS that are never callable, merged as a union across all scopes exactly like `blocked`. A different axis from `blocked`: that one names whole servers and is enforced when a server would spawn, while these name tools and are enforced when one would be called -- so a blocked tool on an allowed server is refused at the gate, and there is no allow-list counterpart to un-deny one. Entries are the FLATTENED wire name tools/list advertises, `<namespace>_<tool>` (`gh_delete_repo`), matched literally and case-sensitively, with an optional single trailing `*` for a prefix match (`pg_drop_*`). A bare `*` is refused: a deny matching everything is far likelier a mistake than an intent, and `blocked` is how you turn a server off. A bare tool name does NOT match across servers, because `<namespace>_<tool>` cannot be unambiguously re-split -- namespaces may themselves contain `_`. Meta-tools (`mcp_connect_*`) cannot be blocked. A blocked tool is withheld from tools/list but keeps its route, so calling it by name returns an explicit refusal rather than an `unknown tool` error that reads as a typo."
+      "description": "Deny-list of individual TOOLS that are never callable, merged as a union across all scopes exactly like `blocked`. A different axis from `blocked`: that one names whole servers, while these name tools and are enforced when one would be called. Entries are the FLATTENED wire name tools/list advertises, `<namespace>_<tool>` (`gh_delete_repo`), matched literally and case-sensitively, with an optional single trailing `*` for a prefix match (`pg_drop_*`); such an entry also covers the same tool on any configured server with the same launch identity, and a wildcard covering a whole namespace (`ssh*`) covers every tool on those servers. `<identity>#<tool>` (`package:@scope/name#delete_repo`) names the upstream's own tool under any namespace. A bare `*` is refused, and a bare tool name does NOT match across servers. Meta-tools (`mcp_connect_*`) cannot be blocked. A blocked tool is withheld from tools/list but keeps its route, so calling it by name returns an explicit refusal."
     }
   },
   "examples": [

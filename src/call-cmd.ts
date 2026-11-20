@@ -71,7 +71,9 @@ import { findTool, formatToolNotFound, normalizeToolName } from "./read-tool.js"
 import {
   blockedToolsSource,
   complianceRefusalReason,
+  effectiveProfile,
   isToolDenied,
+  policyErrorText,
   resolveMinCompliance,
   spawnGateVerdict,
 } from "./spawn-gate.js";
@@ -425,7 +427,10 @@ async function callOnce(
   const cached = Object.hasOwn(grades, server.namespace) ? grades[server.namespace] : undefined;
   const graded = cached ? { ...server, complianceGrade: cached.grade } : server;
 
-  const refusal = spawnGateVerdict(graded, profile, resolveMinCompliance(env));
+  // Denies follow a server's launch identity, so they are resolved against the
+  // whole configured list: `ssh2` is refused when it is `ssh` under a new name.
+  const toolPolicy = effectiveProfile(profile, servers);
+  const refusal = spawnGateVerdict(graded, profile, resolveMinCompliance(env), servers);
   if (refusal) {
     // The CLI's rendering of the shared verdict. The remediation is what
     // differs from the broker's wording: there is no mcp_connect_* call to
@@ -435,8 +440,11 @@ async function callOnce(
       case "disabled":
         message = `yaw-mcp call: "${refusal.namespace}" is configured but disabled, so it was not started. Run \`yaw-mcp enable ${refusal.namespace}\` to turn it back on.`;
         break;
+      case "policy-invalid":
+        message = `yaw-mcp call: "${refusal.namespace}" was not started. ${displaySafe(policyErrorText(refusal.errors))}`;
+        break;
       case "profile":
-        message = `yaw-mcp call: "${refusal.namespace}" is not allowed by the project profile at ${displaySafe(refusal.profilePath ?? "your yaw-mcp config")}, so it was not started.`;
+        message = `yaw-mcp call: "${refusal.namespace}" is not allowed by the project profile at ${displaySafe(refusal.profilePath ?? "your yaw-mcp config")}${refusal.identity ? ` (it launches ${displaySafe(refusal.identity)}, the same server as a "blocked" entry), so it was not started. Remove that blocked entry to allow it; listing it in \`servers\` does not.` : ", so it was not started."}`;
         break;
       case "compliance":
         // displaySafe around the whole reason, not around the grade: the
@@ -465,7 +473,7 @@ async function callOnce(
   // that runs against the REAL list, and covers the case this one gets wrong
   // (a server whose own tool is genuinely called `gh_search`).
   const preSpawnWire = `${namespace}_${normalizeToolName(namespace, toolArg)}`;
-  if (isToolDenied(preSpawnWire, profile?.blockedTools)) {
+  if (isToolDenied(preSpawnWire, toolPolicy?.blockedTools)) {
     return fail(
       2,
       `yaw-mcp call: tool "${displaySafe(preSpawnWire)}" is blocked by the "blockedTools" list in ${displaySafe(
@@ -500,7 +508,7 @@ async function callOnce(
       // pre-spawn check above cannot see the tool list, so this is the one
       // that is authoritative -- and it is why an exact-match tool whose name
       // embeds the namespace is still covered.
-      if (isToolDenied(tool.namespacedName, profile?.blockedTools)) {
+      if (isToolDenied(tool.namespacedName, toolPolicy?.blockedTools)) {
         // Upstream-sourced too: `namespacedName` is `<namespace>_<the name the
         // server advertised>`, and a wildcard deny matches one carrying
         // control bytes even though a literal entry could not (TOOL_ENTRY_RE

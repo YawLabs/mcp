@@ -296,14 +296,15 @@ describe("shipped config JSON schema", () => {
   });
 });
 
-describe("loadYawMcpConfig — fail-open on bad files", () => {
-  it("malformed JSON in local file falls back to global", async () => {
+describe("loadYawMcpConfig — bad files are reported as policy errors", () => {
+  it("malformed JSON in a local file is a policy error, and the other files still load", async () => {
     writeConfig(synthHome, CONFIG_FILENAME, { servers: ["github"] });
     writeConfigRaw(synthCwd, LOCAL_CONFIG_FILENAME, "{ this is not json");
     const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
     expect(r.servers).toEqual(["github"]);
     expect(r.loadedFiles.map((f) => f.scope)).toEqual(["global"]);
     expect(r.warnings.some((w) => w.includes("invalid JSON"))).toBe(true);
+    expect(r.policyErrors?.[0]?.path).toBe(join(synthCwd, CONFIG_DIRNAME, LOCAL_CONFIG_FILENAME));
   });
 
   // V8's JSON.parse message quotes ~10 characters of source around the bad
@@ -342,39 +343,39 @@ describe("loadYawMcpConfig — fail-open on bad files", () => {
     // A config.json that is really a DIRECTORY reads as EISDIR on every
     // platform -- the portable stand-in for the field case (a root-owned
     // 0600 ~/.yaw-mcp/config.json left by a sudo-run install or a restored
-    // backup, which reads EACCES). Swallowing it made the allow/deny lists
-    // silently vanish -- isAllowed then falls through to allow-all -- with
-    // `doctor --json` reporting an empty warnings array, while the far
-    // milder invalid-JSON case above did warn.
+    // backup, which reads EACCES). The lists in it cannot be known, so it is
+    // a policy error rather than an absent file.
     const cfgPath = join(synthHome, CONFIG_DIRNAME, CONFIG_FILENAME);
     mkdirSync(cfgPath, { recursive: true });
     const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
     expect(r.loadedFiles).toEqual([]);
     expect(r.servers).toBeUndefined();
-    const w = r.warnings.find((x) => x.includes("unreadable"));
+    const w = r.warnings.find((x) => x.includes("could not be read"));
     expect(w).toBeDefined();
     expect(w).toContain(cfgPath);
+    expect(r.policyErrors?.[0]?.path).toBe(cfgPath);
   });
 
-  it("non-object root is ignored with a warning", async () => {
+  it("non-object root is a policy error", async () => {
     writeConfigRaw(synthHome, CONFIG_FILENAME, JSON.stringify(["not", "an", "object"]));
     const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
     expect(r.loadedFiles).toEqual([]);
     expect(r.warnings.some((w) => w.includes("must be a JSON object"))).toBe(true);
+    expect(r.policyErrors).toHaveLength(1);
   });
 });
 
 describe("loadYawMcpConfig — servers/blocked merging", () => {
-  it("project allow-list wins over global", async () => {
+  it("project allow-list narrows global", async () => {
     writeConfig(synthHome, CONFIG_FILENAME, { servers: ["a", "b"] });
-    writeConfig(synthCwd, CONFIG_FILENAME, { servers: ["c"] });
+    writeConfig(synthCwd, CONFIG_FILENAME, { servers: ["b"] });
     const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
-    expect(r.servers).toEqual(["c"]);
+    expect(r.servers).toEqual(["b"]);
   });
 
-  it("local allow-list wins over project and global", async () => {
-    writeConfig(synthHome, CONFIG_FILENAME, { servers: ["a"] });
-    writeConfig(synthCwd, CONFIG_FILENAME, { servers: ["b"] });
+  it("local allow-list wins over project, within global", async () => {
+    writeConfig(synthHome, CONFIG_FILENAME, { servers: ["a", "c"] });
+    writeConfig(synthCwd, CONFIG_FILENAME, { servers: ["a"] });
     writeConfig(synthCwd, LOCAL_CONFIG_FILENAME, { servers: ["c"] });
     const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
     expect(r.servers).toEqual(["c"]);
@@ -390,32 +391,29 @@ describe("loadYawMcpConfig — servers/blocked merging", () => {
 });
 
 describe("loadYawMcpConfig — non-string servers/blocked entries (fix F1)", () => {
-  it("an all-invalid servers array falls through to the parent scope instead of shadowing it with allow-all", async () => {
+  it("an all-invalid servers array is a policy error and allows nothing", async () => {
     writeConfig(synthHome, CONFIG_FILENAME, { servers: ["github"] });
-    // Local scope has ONLY non-string entries. Pre-fix it filtered to []
-    // -- which isAllowed treats as allow-all -- and shadowed the global
-    // allow-list. It must instead fall through so global's ["github"] wins.
     writeConfigRaw(synthCwd, LOCAL_CONFIG_FILENAME, JSON.stringify({ servers: [123, { namespace: "x" }] }));
     const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
-    expect(r.servers).toEqual(["github"]);
-    expect(r.warnings.some((w) => w.includes("'servers' dropped"))).toBe(true);
+    expect(r.servers).toEqual([]);
+    expect(r.policyErrors?.[0]?.message).toContain("'servers' has 2 non-string or empty entries");
+    expect(isAllowed(r, "github")).toBe(false);
   });
 
-  it("keeps valid string entries and warns about the dropped ones", async () => {
+  it("a non-string entry beside valid ones is a policy error", async () => {
     writeConfigRaw(synthHome, CONFIG_FILENAME, JSON.stringify({ servers: ["github", 123, "slack"] }));
     const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
     expect(r.servers).toEqual(["github", "slack"]);
-    expect(r.warnings.some((w) => w.includes("'servers' dropped 1 non-string or empty entry"))).toBe(true);
+    expect(r.warnings.some((w) => w.includes("'servers' has 1 non-string or empty entry"))).toBe(true);
+    expect(isAllowed(r, "github")).toBe(false);
   });
 
-  it("drops an empty-string namespace with a warning instead of keeping a silent deny-all", async () => {
-    // The shipped schema says minLength 1. A kept "" made isAllowed require
-    // namespace === "" -- unreachable under NAMESPACE_RE -- so `servers: [""]`
-    // silently denied every real server with no diagnostic.
+  it("blank entries are a policy error", async () => {
     writeConfigRaw(synthHome, CONFIG_FILENAME, JSON.stringify({ servers: ["github", "", "  "] }));
     const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
     expect(r.servers).toEqual(["github"]);
-    expect(r.warnings.some((w) => w.includes("'servers' dropped 2 non-string or empty entries"))).toBe(true);
+    expect(r.warnings.some((w) => w.includes("'servers' has 2 non-string or empty entries"))).toBe(true);
+    expect(r.policyErrors).toHaveLength(1);
   });
 
   it("warns on an unknown top-level key instead of ignoring it silently", async () => {
@@ -433,61 +431,73 @@ describe("loadYawMcpConfig — non-string servers/blocked entries (fix F1)", () 
     expect(w).not.toContain("'$schema'");
   });
 
-  it("a genuinely empty servers array is preserved (explicit 'no filter', not all-invalid)", async () => {
+  it("a genuinely empty servers array is preserved, and allows nothing", async () => {
     writeConfig(synthHome, CONFIG_FILENAME, { servers: [] });
     const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
     expect(r.servers).toEqual([]);
-    // No drop warning for a legitimately empty array.
-    expect(r.warnings.some((w) => w.includes("'servers' dropped"))).toBe(false);
+    expect(r.warnings).toEqual([]);
+    expect(r.policyErrors).toBeUndefined();
+    expect(isAllowed(r, "github")).toBe(false);
   });
 });
 
-// Gap 15: filterStringArray runs on the BLOCKED field too (config-loader.ts:160).
-// Mirrors the servers tests above, but blocked merges via unionBlocked -- so
-// the all-invalid case must leave r.blocked UNDEFINED (not [] / an empty
-// deny-list), which is what proves the field fell through rather than
-// resolving to an empty union.
+// filterStringArray runs on the BLOCKED field too. A damaged deny-list cannot be
+// read as "deny less", so it refuses spawns exactly as a damaged allow-list does.
 describe("loadYawMcpConfig — non-string blocked entries (fix F1, blocked field)", () => {
-  it("keeps valid string entries and warns about the dropped ones", async () => {
+  it("a non-string entry beside valid ones is a policy error", async () => {
     writeConfigRaw(synthHome, CONFIG_FILENAME, JSON.stringify({ blocked: ["slack", 42] }));
     const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
     expect(r.blocked).toEqual(["slack"]);
-    expect(r.warnings.some((w) => w.includes("'blocked' dropped 1 non-string or empty entry"))).toBe(true);
+    expect(r.warnings.some((w) => w.includes("'blocked' has 1 non-string or empty entry"))).toBe(true);
+    expect(r.policyErrors).toHaveLength(1);
   });
 
-  it("an all-invalid blocked array resolves to undefined, not an empty deny-list", async () => {
-    // Only non-string entries. filterStringArray returns undefined (not []),
-    // so unionBlocked stays untouched and r.blocked is undefined -- a []
-    // here would be a spurious "empty deny-list" resolved from junk input.
+  it("an all-invalid blocked array is a policy error", async () => {
     writeConfigRaw(synthHome, CONFIG_FILENAME, JSON.stringify({ blocked: [123] }));
     const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
-    expect(r.blocked).toBeUndefined();
-    expect(r.warnings.some((w) => w.includes("'blocked' dropped"))).toBe(true);
+    expect(r.blocked).toEqual([]);
+    expect(isAllowed(r, "anything")).toBe(false);
+  });
+
+  it("a policyProblem message reaches policyWarnings as well as warnings", async () => {
+    // A refusal used to name only the FILE, while an unknown key got its own
+    // policyWarnings line -- so a reader could not tell WHICH key was broken
+    // from the refusal / health text. policyWarnings is display-only
+    // (isAllowed ignores it), so this is a repeat, not a second enforcement.
+    writeConfigRaw(synthHome, CONFIG_FILENAME, JSON.stringify({ blocked: ["slack", 42] }));
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    const message = r.policyErrors?.[0]?.message;
+    expect(message).toBeDefined();
+    expect(r.policyWarnings).toContain(message);
+    // This file has no unknown key, so policyWarnings is exactly that message.
+    expect(r.policyWarnings).toHaveLength(1);
+    expect(toProfile(r)?.policyWarnings).toContain(message);
+    // Still a policy ERROR: the warning addition never softened the refusal.
+    expect(r.policyErrors).toHaveLength(1);
+    expect(isAllowed(r, "slack")).toBe(false);
   });
 
   it("a genuinely empty blocked array is preserved (explicit, not all-invalid)", async () => {
     writeConfig(synthHome, CONFIG_FILENAME, { blocked: [] });
     const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
     expect(r.blocked).toEqual([]);
-    // No drop warning for a legitimately empty array.
-    expect(r.warnings.some((w) => w.includes("'blocked' dropped"))).toBe(false);
+    expect(r.warnings).toEqual([]);
+    expect(r.policyErrors).toBeUndefined();
   });
 });
 
-// A field that is PRESENT but not an array at all. The mirror image of the
-// F1 case above and quieter: the field was discarded with no diagnostic on
-// any surface, so `"servers": "github"` -- written to lock a session down to
-// one server -- left isAllowed returning true for everything while `doctor`
-// exited 0 with an empty warnings array.
+// A field that is PRESENT but not an array at all: `"servers": "github"`,
+// written to lock a session down to one server, must not leave it unrestricted.
 describe("loadYawMcpConfig — non-array servers/blocked field", () => {
-  it("warns and ignores a string 'servers' instead of dropping it in silence", async () => {
+  it("reports a string 'servers' as a policy error", async () => {
     writeConfigRaw(synthHome, CONFIG_FILENAME, JSON.stringify({ servers: "github" }));
     const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
     expect(r.servers).toBeUndefined();
     const w = r.warnings.find((x) => x.includes("'servers' must be an array"));
     expect(w).toBeDefined();
     expect(w).toContain("found string");
-    // The FIELD is dropped, not the file: everything else still loads.
+    expect(isAllowed(r, "github")).toBe(false);
+    // The rest of the file still loads.
     expect(r.loadedFiles.map((f) => f.scope)).toEqual(["global"]);
   });
 
@@ -511,10 +521,8 @@ describe("loadYawMcpConfig — non-array servers/blocked field", () => {
   });
 });
 
-// Entries were validated with `.trim()` but KEPT untrimmed, so `" github"`
-// survived as an allow-list no installed namespace can ever match: a silent
-// deny-all that also shadows a valid parent scope. Trim on the way in, and
-// warn (never drop) on anything NAMESPACE_RE would reject.
+// Entries are kept trimmed, so `" github"` can match an installed namespace, and
+// anything NAMESPACE_RE would reject is warned about but kept.
 describe("loadYawMcpConfig — namespace shape of servers/blocked entries", () => {
   it("keeps the TRIMMED spelling, so a padded entry can still match an installed server", async () => {
     writeConfigRaw(synthHome, CONFIG_FILENAME, JSON.stringify({ servers: [" github", "slack  "] }));
@@ -532,12 +540,8 @@ describe("loadYawMcpConfig — namespace shape of servers/blocked entries", () =
     expect(isAllowed(r, "slack")).toBe(false);
   });
 
-  it("warns about an unmatchable namespace but KEEPS it, so the scope is not silently promoted", async () => {
-    // Dropping "GitHub" would empty the array, hit the all-invalid
-    // fall-through, and resolve this scope to the parent's allow-all -- the
-    // exact F1 bug filterStringArray exists to prevent. Warn instead.
+  it("warns about an unmatchable namespace but KEEPS it, so it allows nothing", async () => {
     writeConfigRaw(synthCwd, LOCAL_CONFIG_FILENAME, JSON.stringify({ servers: ["GitHub"] }));
-    writeConfig(synthHome, CONFIG_FILENAME, { servers: ["github"] });
     const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
     expect(r.servers).toEqual(["GitHub"]);
     const w = r.warnings.find((x) => x.includes("is not a valid namespace"));
@@ -738,11 +742,12 @@ describe("isAllowed / profileAllows", () => {
     expect(isAllowed({ servers: ["github", "postgres"] }, "slack")).toBe(false);
   });
 
-  it("empty allow-list is treated as 'no restriction' (not 'deny all')", () => {
-    // Users who clear servers to [] likely meant "no explicit filter",
-    // not "nothing allowed". Blocking everything would make the config
-    // feel broken rather than permissive.
-    expect(isAllowed({ servers: [] }, "anything")).toBe(true);
+  it("empty allow-list allows nothing", () => {
+    expect(isAllowed({ servers: [] }, "anything")).toBe(false);
+  });
+
+  it("a broken policy file allows nothing", () => {
+    expect(isAllowed({ policyErrors: [{ path: "p", message: "m" }] }, "anything")).toBe(false);
   });
 
   it("deny-list blocks even if allow-list permits", () => {
@@ -946,10 +951,10 @@ describe("blockedTools", () => {
     expect(r.warnings.some((w) => w.includes("'blockedTools' must be an array of tool-name strings"))).toBe(true);
     writeConfig(synthHome, "config.json", { blockedTools: ["github_delete_repo", 7], blocked: ["gh", 7] });
     r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
-    expect(
-      r.warnings.some((w) => w.includes("'blockedTools' dropped 1") && w.includes("non-empty tool-name strings")),
-    ).toBe(true);
-    expect(r.warnings.some((w) => w.includes("'blocked' dropped 1") && w.includes("non-empty namespace strings"))).toBe(
+    expect(r.warnings.some((w) => w.includes("'blockedTools' has 1") && w.includes("non-empty tool-name string"))).toBe(
+      true,
+    );
+    expect(r.warnings.some((w) => w.includes("'blocked' has 1") && w.includes("non-empty namespace string"))).toBe(
       true,
     );
   });

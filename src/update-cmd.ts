@@ -66,7 +66,7 @@ import {
   scrubRepoUrlUserinfo,
   writeGitState,
 } from "./git-source.js";
-import { defaultStartCheck, startFailureTail } from "./local-add-cmd.js";
+import { defaultStartCheck, type StartCheckOptions, startFailureTail } from "./local-add-cmd.js";
 import {
   type GitPinPatch,
   gitNodeCommand,
@@ -134,7 +134,10 @@ export interface UpdateCommandOptions {
   io?: YesNoOptions["io"];
   runPm?: GitBuildContext["runPm"];
   resolveToken?: GitBuildContext["resolveToken"];
-  startCheck?: (config: UpstreamServerConfig) => Promise<{ ok: true; tools: number } | { ok: false; error: string }>;
+  startCheck?: (
+    config: UpstreamServerConfig,
+    check?: StartCheckOptions,
+  ) => Promise<{ ok: true; tools: number } | { ok: false; error: string }>;
   now?: () => Date;
   home?: string;
   cwd?: string;
@@ -816,7 +819,7 @@ async function startCheck(
   // A check that throws is a check that failed: escaping here would end the
   // run half-way, with later entries untried and state.json unwritten.
   try {
-    return await (opts.startCheck ?? defaultStartCheck)({
+    const config: UpstreamServerConfig = {
       id: `local-${e.namespace}`,
       name: e.namespace,
       namespace: e.namespace,
@@ -827,7 +830,10 @@ async function startCheck(
       cwd: pkgDir,
       ...(Object.keys(e.env).length > 0 ? { env: e.env } : {}),
       isActive: true,
-    });
+    };
+    // The policy judges the entry as stored too: a `url:` deny names its repository.
+    const check: StartCheckOptions = { cwd: opts.cwd, home: opts.home, policyAs: { ...config, git: e.git } };
+    return await (opts.startCheck ?? defaultStartCheck)(config, check);
   } catch (x) {
     return { ok: false, error: x instanceof Error ? x.message : String(x) };
   }

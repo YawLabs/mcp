@@ -424,6 +424,35 @@ describe("runBundlesCommand — match", () => {
       expect(parsed.excluded).toEqual(["slack"]);
     });
 
+    it("tells the user how to re-activate a server excluded through its identity", async () => {
+      // Two namespaces launching the SAME command: `blocked` names only the
+      // identity, so no edit to `servers` (or to the other namespace's entry)
+      // can bring either back. The "not activatable" line alone left no way out.
+      seedBundles([
+        makeServer({ namespace: "github", name: "GitHub", command: "node", args: ["/srv/gh.js"] }),
+        makeServer({ namespace: "gh2", name: "GitHub twin", command: "node", args: ["/srv/gh.js"] }),
+      ]);
+      seedConfig({ blocked: ["command:node"] });
+      const io = captureIO();
+      const r = await run({ out: io.push, err: io.pushErr });
+      expect(r.exitCode).toBe(0);
+      const combined = io.out.join("\n");
+      expect(combined).toContain("Excluded by your config.json allow/deny profile:");
+      expect(combined).toContain('the same server as a "blocked" entry');
+      expect(combined).toContain("remove that blocked entry to allow it");
+      expect(combined).toContain("listing it in `servers` does not");
+    });
+
+    it("prints no remedy for a plain deny -- its own line is already the remedy", async () => {
+      seedThree();
+      seedConfig({ blocked: ["slack"] });
+      const io = captureIO();
+      await run({ out: io.push, err: io.pushErr });
+      const combined = io.out.join("\n");
+      expect(combined).toMatch(/Excluded by your config\.json allow\/deny profile: slack/);
+      expect(combined).not.toContain("remove that blocked entry");
+    });
+
     it("stays quiet (no excluded line) when no profile is configured", async () => {
       seedThree();
       const io = captureIO();

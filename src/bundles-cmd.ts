@@ -50,9 +50,10 @@ import {
   matchBundles,
   splitBundleMissing,
 } from "./bundles.js";
-import { isAllowed, isReadOnlyDiagnostics, loadYawMcpConfig } from "./config-loader.js";
+import { isAllowed, isReadOnlyDiagnostics, loadYawMcpConfig, toProfile } from "./config-loader.js";
 import { loadLocalBundles } from "./local-bundles.js";
 import { createStreamWriter } from "./logger.js";
+import { effectiveProfile, identityBlockOf } from "./spawn-gate.js";
 
 export type BundlesAction = "list" | "match";
 
@@ -191,15 +192,33 @@ export async function runBundlesCommand(opts: BundlesCommandOptions = {}): Promi
   // a blocked namespace as installed made the CLI print a bundle as "Ready to
   // activate" with an `mcp_connect_activate({...})` snippet the server then
   // hard-refuses -- the one thing this command exists to get right.
-  const installed = enabled.filter((ns) => isAllowed(config, ns));
-  const excluded = enabled.filter((ns) => !isAllowed(config, ns));
+  const configured = loaded.config?.servers ?? [];
+  const rawProfile = toProfile(config);
+  const policy = effectiveProfile(rawProfile, configured);
+  const installed = enabled.filter((ns) => isAllowed(policy, ns));
+  const excluded = enabled.filter((ns) => !isAllowed(policy, ns));
+  // The remedy for each exclusion, per kind. A namespace the profile excludes
+  // THROUGH ITS LAUNCH IDENTITY cannot be re-enabled by editing `servers`, so
+  // the "not activatable" line alone sends the user to a file that will not
+  // help -- name the blocked entry to remove instead (same sentence as the
+  // broker's and the check refusal's). Everything else (a plain deny, an empty
+  // or narrowing allow-list) is what the `servers`/`blocked` edit already says.
+  const remedies = rawProfile
+    ? excluded.flatMap((ns) => {
+        const identity = identityBlockOf(rawProfile, configured, ns);
+        return identity
+          ? [
+              `${ns} launches ${identity}, the same server as a "blocked" entry -- remove that blocked entry to allow it; listing it in \`servers\` does not.`,
+            ]
+          : [];
+      })
+    : [];
   const matched = matchBundles(installed);
   // `missing` is measured against what can load NOW, so it also holds members
   // that are already in bundles.json: disabled ("isActive": false) or kept
   // out by the profile. Split it by remedy with the same function the
   // LLM-facing mcp_connect_bundles uses. `missing` itself is unchanged (a
   // --json consumer reads it); the three lists are additive and partition it.
-  const configured = loaded.config?.servers ?? [];
   const match: MatchWithSplit = {
     ready: matched.ready,
     partial: matched.partial.map((entry) => ({ ...entry, ...splitBundleMissing(entry.missing, configured) })),
@@ -210,7 +229,7 @@ export async function runBundlesCommand(opts: BundlesCommandOptions = {}): Promi
     return { exitCode: 0, lines, stdout, stderr };
   }
 
-  renderMatch(match, installed, excluded, print);
+  renderMatch(match, installed, excluded, print, remedies);
   return { exitCode: 0, lines, stdout, stderr };
 }
 
@@ -250,6 +269,7 @@ function renderMatch(
   installed: string[],
   excluded: string[],
   print: (s?: string) => void,
+  identityRemedies: readonly string[] = [],
 ): void {
   const installedList = installed.length === 0 ? "(none)" : installed.slice().sort().join(", ");
   const serverWord = installed.length === 1 ? "server" : "servers";
@@ -263,6 +283,10 @@ function renderMatch(
     print(
       `Excluded by your config.json allow/deny profile: ${excluded.slice().sort().join(", ")} (enabled in bundles.json, but not activatable)`,
     );
+    // ...and HOW to make an identity-excluded one activatable. Without this the
+    // line above names a server and no remedy: editing `servers` cannot lift a
+    // `blocked` entry that matches its launch identity.
+    for (const line of identityRemedies) print(`  ${line}`);
   }
   print("");
 

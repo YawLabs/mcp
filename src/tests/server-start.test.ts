@@ -1320,8 +1320,9 @@ describe("ConnectServer.start() — opt-in auto-load of the recurring pack", () 
 describe("ConnectServer.start() — config warnings + handed-in config", () => {
   it("logs the config loader's warnings when it loads the config itself", async () => {
     // An embedded host constructs ConnectServer directly and never runs
-    // index.ts, which is where the CLI path logged these. A typo'd key fails
-    // OPEN to allow-all, so a silent load is the worst outcome.
+    // index.ts, which is where the CLI path logged these. A typo'd key still
+    // fails OPEN -- 'blocke' enforces nothing -- so a silent load is the worst
+    // outcome.
     writeBundles(synthHome, [serverEntry("gh")]);
     writeUserConfigFile(CONFIG_FILENAME, { blocke: ["gh"] });
 
@@ -1331,8 +1332,16 @@ describe("ConnectServer.start() — config warnings + handed-in config", () => {
     const warning = logs.find((l) => l.msg === "Config warning");
     expect(warning).toBeDefined();
     expect(String(warning?.warning)).toContain("'blocke'");
-    // ...and it did fail open: nothing is blocked.
-    expect(result.priv.profile).toBeNull();
+    // The misspelled deny is not enforced (nothing is blocked), but it is no
+    // longer invisible: the config yields a profile carrying policyWarnings,
+    // so the health output and activation refusals repeat the warning instead
+    // of the file reading as "no policy at all". policyWarnings is display
+    // only -- isAllowed ignores it, so `gh` still spawns, as it did when the
+    // profile was null.
+    expect(result.priv.profile).not.toBeNull();
+    expect(result.priv.profile?.blocked).toBeUndefined();
+    expect(result.priv.profile?.policyWarnings?.[0]).toContain("'blocke'");
+    expect(spawnedNamespaces()).toEqual(["gh"]);
   });
 
   it("uses a handed-in config without re-loading from disk or re-logging its warnings", async () => {
