@@ -64,6 +64,13 @@ type Answer = string | ((screen: string) => string);
 class ScriptedTTY {
   isTTY = true;
   isRaw = false;
+  /** Set once the scripted answers run out: a drained queue is a CLOSED
+   *  stdin, not a prompt waiting on a human. tty-reader resolves every read
+   *  after it as ANSWER_EOF ("") straight from this flag, without waiting --
+   *  so a test that queues fewer answers than prompts exercises a genuine
+   *  deliver-nothing stdin, and a confirm loop that forgot its empty-bound
+   *  would resolve "" forever (the test times out) instead of passing. */
+  readableEnded = false;
   private listener: ((chunk: string) => void) | null = null;
   private queue: Answer[];
   setRawMode = (v: boolean): this => {
@@ -94,6 +101,11 @@ class ScriptedTTY {
     const next = this.queue.shift();
     if (next !== undefined) {
       queueMicrotask(() => this.listener?.(typeof next === "function" ? next(this.screen()) : next));
+    } else {
+      // Nothing left to hand out: the writer is gone. The flag is checked by
+      // tty-reader after resume(), so this read still settles (as ""), while
+      // every later one is already "ended" on entry.
+      this.readableEnded = true;
     }
     return this;
   }
@@ -119,6 +131,14 @@ function sink(isTTY: boolean): Sink {
 function codesOn(screen: string): string[] {
   return screen.match(CODE_RE) ?? [];
 }
+
+/** Occurrences of `needle` in `s`. Counting is REQUIRED wherever two
+ *  wordings overlap: the confirm's final attempt prints "That does not match
+ *  the code above." as a whole line, while the earlier attempts print that
+ *  SAME text as a prefix of "… try again.", so `toContain` cannot tell one
+ *  occurrence from three -- only an occurrence count pins which variant
+ *  printed how often. */
+const occurrences = (s: string, needle: string): number => s.split(needle).length - 1;
 
 /** The answer to the latest "Type group N" prompt, for the latest code shown. */
 const rightGroup: Answer = (screen) => {
@@ -355,6 +375,57 @@ describe("creating a vault issues a recovery code at a terminal", () => {
     expect(recoveryStatus(await onDisk()).state).toBe("set");
   });
 
+  it("an empty answer at a group prompt re-prompts without burning an attempt", async () => {
+    // Three bare Enters (\r with nothing typed: what tty-reader folds to ""):
+    // under the old counting they were three mismatches, so the 3 attempts
+    // died before the right groups were ever asked. An empty entry is nothing
+    // typed -- re-prompt the same group instead.
+    const t = terminal([`${PASS}\r`, `${PASS}\r`, "\r", "\r", "\r", rightGroup, rightGroup]);
+    const r = await runSecrets({ action: "set", name: "GH", value: "v", home, io: t.io, env: {} }, io);
+    expect(r.exitCode).toBe(0);
+    expect(t.screen.text()).not.toContain("That does not match");
+    expect(recoveryStatus(await onDisk()).state).toBe("set");
+  });
+
+  it("empty answers alone still end the confirm (a closed stdin must not spin)", async () => {
+    // A closed/EOF'd stdin yields an empty read forever; the empty-bound (not
+    // the attempt count, which empties no longer touch) is what terminates.
+    // Eight empties are fed: the confirm must stop after exactly the bound's
+    // five re-prompts, not after the three MISMATCH attempts the old counting
+    // turned empties into (that would be three prompts, not five).
+    const t = terminal([`${PASS}\r`, `${PASS}\r`, "\r", "\r", "\r", "\r", "\r", "\r", "\r", "\r"]);
+    const r = await runSecrets({ action: "set", name: "GH", value: "v", home, io: t.io, env: {} }, io);
+    expect(r.exitCode).toBe(1);
+    // The REASON, on the prompt stream: the "That does not match" line never
+    // prints for empties, so the empty-bound exit carries its own sentence --
+    // without it the user (and this test) would see only the caller's generic
+    // "Aborted -- nothing was saved." with no cause.
+    expect(t.screen.text()).toContain("No group was entered -- the prompt was left empty 5 times in a row.");
+    expect(errText()).toContain("Aborted -- nothing was saved.");
+    expect(existsSync(vaultPath(home))).toBe(false);
+    expect(t.screen.text().match(/Type group \d of 7/g)).toHaveLength(5);
+  });
+
+  it("a stdin that delivers nothing at the group prompt ends the confirm (no infinite loop)", async () => {
+    // Deliberately NOT scripted past the two passphrase lines: once they are
+    // consumed the fake stdin has nothing left and closes (readableEnded), so
+    // every group read folds to "" -- the shape a pipe whose writer exited
+    // actually has, which the scripted test above cannot produce (its queue
+    // answers forever). The empty-bound is the only thing that can end this
+    // loop; if it regressed the reader would resolve "" forever and this test
+    // would TIME OUT rather than pass.
+    const t = terminal([`${PASS}\r`, `${PASS}\r`]);
+    const r = await runSecrets({ action: "set", name: "GH", value: "v", home, io: t.io, env: {} }, io);
+    expect(r.exitCode).toBe(1);
+    // Terminated after exactly the bound's five prompts, with the reason.
+    expect(t.screen.text().match(/Type group \d of 7/g)).toHaveLength(5);
+    expect(t.screen.text()).toContain("No group was entered -- the prompt was left empty 5 times in a row.");
+    expect(errText()).toContain("Aborted -- nothing was saved.");
+    expect(existsSync(vaultPath(home))).toBe(false);
+    // The alternate screen was still left exactly once the confirm was done.
+    expect(t.screen.text().endsWith(ALT_OFF)).toBe(true);
+  });
+
   it("^C at the confirmation: exit 130, nothing saved, the alternate screen left", async () => {
     const t = terminal([`${PASS}\r`, `${PASS}\r`, "\x03"]);
     const r = await runSecrets({ action: "set", name: "GH", value: "v", home, io: t.io, env: {} }, io);
@@ -404,6 +475,25 @@ describe("creating a vault issues a recovery code at a terminal", () => {
       reason: "no-terminal",
       hint: "Run `yaw-mcp secrets recovery new` in a terminal to add one.",
     });
+  });
+
+  it('--json on an un-upgraded v2 vault reports recovery: "unsupported", the state doctor reports', async () => {
+    // The old field collapsed RecoveryState to "set" | "none", so a v1/v2
+    // vault -- which has no slot to hold a code -- read as a plain "none",
+    // disagreeing with doctor's vault.recovery ("unsupported").
+    const legacy = newVault();
+    const key = await unlock(legacy, PASS);
+    await saveVault(vaultPath(home), setSecret(legacy, key, "GH", "v"));
+    key.fill(0);
+    lock();
+    const r = await runSecrets(
+      { action: "set", name: "NPM", value: "v", passphrase: PASS, home, io: noTerminal(), env: {}, json: true },
+      io,
+    );
+    expect(r.exitCode).toBe(0);
+    expect(JSON.parse(outText())).toMatchObject({ recovery: "unsupported" });
+    // Same read, same vocabulary on the doctor side of the pair.
+    expect(recoveryStatus(await onDisk()).state).toBe("unsupported");
   });
 
   it("--no-recovery at a terminal: no code, no slot, and no nudge (it was asked for)", async () => {
@@ -515,6 +605,133 @@ describe("creating a vault issues a recovery code at a terminal", () => {
       kill.mockRestore();
       for (const l of others) process.on(signal, l as (...args: unknown[]) => void);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// issueRecoveryCode runs TWO independent counters: `attempt` (wrong groups,
+// three allowed) and `empty` (blank answers, five allowed). They are
+// asymmetric by design -- an empty answer spends no attempt -- and `empty` is
+// never reset, so it bounds a CONTIGUOUS run of blanks, not a total. Neither
+// fact is visible in a run that is all empties or all wrongs; these tests mix
+// them on the scripted TTY, where every prompt and every answer is countable.
+// ---------------------------------------------------------------------------
+describe("the recovery confirm counts wrong groups and empty groups separately", () => {
+  it("empties interleaved with wrong groups spend no attempts; three wrong answers still end it", async () => {
+    // Every attempt's FIRST group is answered with a bare Enter, its second
+    // with a wrong one. Under counting that charged attempts for empties, the
+    // three attempts would be gone after the first wrong answer -- two wrong
+    // groups would still sit in the queue, `pending` would not be 0, and the
+    // vault would never be reached at all. As implemented, six answers are
+    // consumed (3 blanks + 3 wrongs) and the loop exits on `attempt`.
+    const t = terminal([
+      `${PASS}\r`,
+      `${PASS}\r`,
+      "\r",
+      wrongGroup,
+      "\r",
+      wrongGroup,
+      "\r",
+      wrongGroup,
+      rightGroup,
+      rightGroup,
+    ]);
+    const r = await runSecrets({ action: "set", name: "GH", value: "v", home, io: t.io, env: {} }, io);
+    expect(r.exitCode).toBe(1);
+    const screen = t.screen.text();
+    // One mismatch line per WRONG answer, none per blank.
+    expect(occurrences(screen, "That does not match the code above.")).toBe(3);
+    // 6 reads, each preceded by its own prompt: a blank re-asks the SAME
+    // group, a wrong one ends its attempt. Nothing after the third wrong was
+    // touched -- the two right answers queued behind it are still unread,
+    // which is what separates "ended on the attempt budget" from "ended
+    // because the answers ran out".
+    expect(occurrences(screen, "Type group ")).toBe(6);
+    expect(t.stdin.pending).toBe(2);
+    // The `empty` counter never resets, so the three blanks -- one per
+    // attempt, never five in a row -- must NOT reach the empty bound. Ending
+    // on the mismatch wording rather than the "5 times in a row" reason is
+    // what separates a run length from an accumulator.
+    expect(screen).not.toContain("No group was entered");
+    expect(errText()).toContain("Aborted -- nothing was saved.");
+    expect(existsSync(vaultPath(home))).toBe(false);
+    expect(screen.endsWith(ALT_OFF)).toBe(true);
+    expectCodeOnlyOnScreen(codesOn(screen));
+  });
+
+  it("one wrong group, then a drained stdin: the mismatch line AND the empty-bound reason, no hang", async () => {
+    // Exactly one wrong group is queued, then nothing: the next resume finds
+    // the queue empty, sets readableEnded, and every later read folds to ""
+    // straight away. This is the real shape of "typed it wrong, then the
+    // connection dropped", and it terminates only because BOTH counters are
+    // bounded -- one attempt spent (the mismatch line the user is owed) and
+    // five blanks hit (the reason line, since the mismatch wording never
+    // prints for an empty). A loop with only one of the two either hangs on
+    // the endless "" or exits having never said why.
+    const t = terminal([`${PASS}\r`, `${PASS}\r`, wrongGroup]);
+    const r = await runSecrets({ action: "set", name: "GH", value: "v", home, io: t.io, env: {} }, io);
+    expect(r.exitCode).toBe(1);
+    const screen = t.screen.text();
+    expect(occurrences(screen, "That does not match the code above.")).toBe(1);
+    expect(screen).toContain("No group was entered -- the prompt was left empty 5 times in a row.");
+    // Finite, and it got to the BOUND's fifth empty prompt -- one prompt for
+    // the wrong answer plus five for the blanks (1 + 5, not 1 + 3: empties do
+    // not spend attempts, so the attempt budget could not end this run).
+    expect(occurrences(screen, "Type group ")).toBe(6);
+    expect(t.stdin.pending).toBe(0);
+    expect(errText()).toContain("Aborted -- nothing was saved.");
+    expect(existsSync(vaultPath(home))).toBe(false);
+    expect(screen.endsWith(ALT_OFF)).toBe(true);
+  });
+
+  it("the last attempt prints the bare mismatch sentence: three wrongs, counted not contained", async () => {
+    const t = terminal([`${PASS}\r`, `${PASS}\r`, wrongGroup, wrongGroup, wrongGroup]);
+    const r = await runSecrets({ action: "set", name: "GH", value: "v", home, io: t.io, env: {} }, io);
+    expect(r.exitCode).toBe(1);
+    const screen = t.screen.text();
+    // Attempts 1 and 2 invite another try; attempt 3 only states the fact.
+    expect(occurrences(screen, "That does not match the code above. Check what you wrote down and try again.")).toBe(2);
+    // The bare sentence, terminated by its own newline: exactly once, on the
+    // last attempt. Counting BOTH variants (2 + 1 = 3) is the only honest
+    // assertion -- the bare sentence is a prefix of the retry wording, so
+    // `toContain("That does not match the code above.")` passes on the retry
+    // wording alone and would say nothing about the final attempt at all.
+    expect(occurrences(screen, "That does not match the code above.\n")).toBe(1);
+    expect(occurrences(screen, "That does not match the code above.")).toBe(3);
+    expect(screen.endsWith(ALT_OFF)).toBe(true);
+    expect(errText()).toBe(
+      "yaw-mcp secrets set: Aborted -- nothing was saved. Re-run, or pass --no-recovery to create the vault without a recovery code.\n",
+    );
+    expect(existsSync(vaultPath(home))).toBe(false);
+    expectCodeOnlyOnScreen(codesOn(screen));
+  });
+
+  it("a full-width group typed at the confirm is accepted (NFKC through the real TTY comparison)", async () => {
+    // A CJK IME hands back full-width forms ("０", "Ａ"). The comparison is
+    // normalizeRecoveryGroup(answer) !== groups[g], so the fold has to happen
+    // on the path a TTY answer actually takes -- not only in parseRecoveryCode
+    // -- or a user who typed the RIGHT code correctly is told it does not
+    // match. Every symbol of a Crockford group has a full-width form, so the
+    // whole first group is mapped (char + 0xFEE0) and nothing else in the run
+    // changes.
+    const fullwidthGroup: Answer = (screen) => {
+      const ascii = (rightGroup as (s: string) => string)(screen);
+      const group = ascii.slice(0, -1); // drop the trailing \r
+      const wide = [...group].map((ch) => String.fromCharCode(ch.charCodeAt(0) + 0xfee0)).join("");
+      return `${wide}\r`;
+    };
+    const t = terminal([`${PASS}\r`, `${PASS}\r`, fullwidthGroup, rightGroup]);
+    const r = await runSecrets({ action: "set", name: "GH", value: "v", home, io: t.io, env: {} }, io);
+    expect(r.exitCode).toBe(0);
+    const screen = t.screen.text();
+    // Accepted as the RIGHT group: no mismatch line, and not counted as a
+    // blank either (which would have re-prompted the same group and shown the
+    // empty-bound reason instead of saving).
+    expect(screen).not.toContain("That does not match");
+    expect(screen).not.toContain("No group was entered");
+    expect(occurrences(screen, "Type group ")).toBe(2);
+    expect(t.stdin.pending).toBe(0);
+    expect(recoveryStatus(await onDisk()).state).toBe("set");
   });
 });
 
@@ -679,11 +896,81 @@ describe("secrets recover", () => {
     const code = await seedV3(true);
     const aside = `${vaultPath(home)}.reset-copy`;
     copyFileSync(vaultPath(home), aside);
+    const sourceBefore = readFileSync(aside, "utf8");
     rmSync(vaultPath(home));
     const t = terminal([`${code}\r`, `${NEW_PASS}\r`, `${NEW_PASS}\r`]);
     const r = await runSecrets({ action: "recover", file: aside, home, io: t.io, env: {}, noRecovery: true }, io);
     expect(r.exitCode).toBe(0);
     expect(await opensWith(NEW_PASS)).toBe(true);
+    // fromCopy: the source is untouched, so the code just used still opens
+    // IT -- the old blanket "no longer opens it" was wrong for this branch.
+    expect(outText()).toContain(
+      `The source copy at ${aside} is unchanged and still opens under the recovery code you used`,
+    );
+    expect(outText()).toContain("the recovered vault at");
+    expect(outText()).not.toContain("The recovery code you used no longer opens it.");
+    // The source itself is byte-identical to before the recover.
+    expect(readFileSync(aside, "utf8")).toBe(sourceBefore);
+    expect(await codeOpens(code, aside)).toBe(true);
+  });
+
+  it("--file fromCopy WITH a code issued: the fresh code is named, and the old code is never declared dead", async () => {
+    // The pair of sentences either side of the `fromCopy ?` ternary used to
+    // be one blanket claim: "the recovery code you used no longer opens it"
+    // also printed on a recover from a copy, where the SOURCE is untouched
+    // and still opens under it -- sending whoever holds the copy after a vault
+    // that is fine. The `not.toContain` below was the only pin on that side;
+    // what the copy run DOES say about its fresh code (issued but never
+    // shown to stdout) was not asserted anywhere.
+    const code = await seedV3(true);
+    const aside = `${vaultPath(home)}.reset-copy`;
+    copyFileSync(vaultPath(home), aside);
+    const sourceBefore = readFileSync(aside, "utf8");
+    rmSync(vaultPath(home));
+    const t = terminal([`${code}\r`, `${NEW_PASS}\r`, `${NEW_PASS}\r`, rightGroup, rightGroup]);
+    const r = await runSecrets({ action: "recover", file: aside, home, io: t.io, env: {} }, io);
+    expect(r.exitCode).toBe(0);
+    const out = outText();
+    expect(out).toContain(
+      "and a fresh recovery code (shown on the confirmation screen just now -- write it down; that screen has cleared)",
+    );
+    expect(out).not.toContain("A new recovery code replaced it.");
+    expect(out).not.toContain("The recovery code you used no longer opens it.");
+    // The confirm DID run: the code was on screen, two groups of it were
+    // typed back (the answers the queued `rightGroup`s produce), and the new
+    // code -- read off that screen, the way every other test here captures it
+    // -- is what opens the recovered vault now.
+    const codes = codesOn(t.screen.text());
+    expect(codes).toHaveLength(1);
+    expect(occurrences(t.screen.text(), "Type group ")).toBe(2);
+    expect(await codeOpens(codes[0])).toBe(true);
+    expect(await opensWith(NEW_PASS)).toBe(true);
+    // The copy itself is byte-identical, and its own code still opens IT.
+    expect(readFileSync(aside, "utf8")).toBe(sourceBefore);
+    expect(await codeOpens(code, aside)).toBe(true);
+    expectCodeOnlyOnScreen([code, ...codes]);
+  });
+
+  it("an in-place recover with a code issued says BOTH the old code is dead and a new one replaced it", async () => {
+    // Positive pin on the other arm of the ternary: the fromCopy test above
+    // carries only `not.toContain` for these two sentences, so a run that
+    // dropped them entirely would still be green. Here the vault at the path
+    // IS what was recovered, so both halves are true and both must print.
+    const oldCode = await seedV3(true);
+    const t = terminal([`${oldCode}\r`, `${NEW_PASS}\r`, `${NEW_PASS}\r`, rightGroup, rightGroup]);
+    const r = await runSecrets({ action: "recover", home, io: t.io, env: {} }, io);
+    expect(r.exitCode).toBe(0);
+    const out = outText();
+    expect(out).toContain("The recovery code you used no longer opens it.");
+    expect(out).toContain("A new recovery code replaced it.");
+    expect(out).not.toContain("shown on the confirmation screen just now");
+    const codes = codesOn(t.screen.text());
+    expect(codes).toHaveLength(1);
+    expect(codes[0]).not.toBe(oldCode);
+    expect(await codeOpens(oldCode)).toBe(RECOVERY_CODE_WRONG_VAULT_ERROR);
+    expect(await codeOpens(codes[0])).toBe(true);
+    expect(await opensWith(NEW_PASS)).toBe(true);
+    expectCodeOnlyOnScreen([oldCode, ...codes]);
   });
 
   it.each([

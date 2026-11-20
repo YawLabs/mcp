@@ -18,11 +18,13 @@ import { setLogSurface } from "../logger.js";
 import { parseSecretsArgs, resetBackupPath, runSecrets, SECRETS_USAGE } from "../secrets-cmd.js";
 import { deriveKey, type EncryptedEntry, encryptEntry, generateSalt, LEGACY_KDF } from "../secrets-crypto.js";
 import {
+  createVaultV3,
   isUnlocked,
   loadVault,
   lock,
   MALFORMED_REF_MARKER,
   newVault,
+  recoveryStatus,
   rotateVault,
   SECRETS_SCHEMA_VERSION,
   saveVault,
@@ -2527,6 +2529,8 @@ describe("runSecrets rotate -- the success path re-keys EVERY entry", () => {
       io,
     );
     expect(r.exitCode).toBe(0);
+    // The vaults above were seeded off a terminal (no slot), so the full
+    // vocabulary still reads "none" here -- same value the collapse gave.
     expect(JSON.parse(outText())).toEqual({ ok: true, rotated: true, secret_count: 3, recovery: "none" });
     expect(outText()).not.toContain("Vault locked");
     // The stale-passphrase nudge rides err as one JSON line, like reset's.
@@ -5072,5 +5076,73 @@ describe("runSecrets set on a legacy vault -- the two things it has to say", () 
     expect(r.exitCode).toBe(0);
     expect(promptText()).toContain("Confirm passphrase: ");
     expect(promptText()).not.toContain("is empty");
+  });
+});
+
+// -----------------------------------------------------------------------
+// `recovery` in a --json envelope is the FULL RecoveryState vocabulary, not
+// the old "set" | "none" collapse: doctor's `vault.recovery` reports
+// "unsupported" for a v1/v2 file and "malformed" for a v3 one whose recovery
+// slot loadVault could not use, and an envelope that said "none" for either
+// would disagree with the very next `doctor --json` the user runs. Both
+// states are loadable but cannot be created by a command that keeps the
+// file's schema -- `set` leaves a legacy vault legacy and a malformed slot
+// malformed -- so both are reachable through exactly this envelope.
+// -----------------------------------------------------------------------
+
+describe("runSecrets set --json -- the recovery field carries doctor's vocabulary", () => {
+  const io = { out: vi.fn(), err: vi.fn() };
+  const outText = (): string => io.out.mock.calls.map((c) => c[0] as string).join("");
+  let home: string;
+
+  beforeEach(async () => {
+    io.out.mockReset();
+    io.err.mockReset();
+    lock();
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    home = makeHome();
+    await mkdir(nodePath.join(home, ".yaw-mcp"), { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+    lock();
+  });
+
+  it('a v3 vault whose recovery slot loadVault marks malformed reports recovery: "malformed"', async () => {
+    const pass = "malformed-slot-passphrase";
+    const built = await createVaultV3(pass, { recovery: true });
+    await saveVault(vaultPath(home), built.vault);
+    lock();
+    // Damage the slot so parseRecoverySlot rejects it: `kdf` must be the
+    // literal "hkdf-sha256" (secrets-vault's RECOVERY_SLOT_KDF), so anything
+    // else makes the slot unusable while leaving the PASSPHRASE slot intact
+    // -- which is what makes this state reportable at all: a malformed
+    // passphrase slot fails the load outright and never reaches an envelope.
+    const raw = JSON.parse(readFileSync(vaultPath(home), "utf8")) as Record<string, any>;
+    raw.keyslots.recovery.kdf = "scrypt";
+    writeFileSync(vaultPath(home), JSON.stringify(raw));
+
+    const r = await runSecrets(
+      { action: "set", name: "GH", value: "v", passphrase: pass, home, json: true, io: nonTTYIo() },
+      io,
+    );
+    expect(r.exitCode).toBe(0);
+    const env = JSON.parse(outText()) as Record<string, unknown>;
+    expect(env).toMatchObject({ ok: true, recovery: "malformed" });
+    // Not the old collapse: "none" would read as "no code was ever created".
+    expect(env.recovery).not.toBe("none");
+
+    // The verdict survives the write: saveVault carries the raw slot back out
+    // as `keyslots.recovery`, so a reload still drops it as malformed rather
+    // than reporting the plain "none" the run itself would have invented.
+    lock();
+    const reloaded = await loadVault(vaultPath(home));
+    expect(reloaded).not.toBeNull();
+    expect(reloaded?.recoveryMalformed).toBe(true);
+    expect(recoveryStatus(reloaded as VaultFile).state).toBe("malformed");
+    expect((JSON.parse(readFileSync(vaultPath(home), "utf8")) as Record<string, any>).keyslots.recovery.kdf).toBe(
+      "scrypt",
+    );
   });
 });

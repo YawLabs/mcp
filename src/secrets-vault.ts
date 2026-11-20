@@ -14,7 +14,7 @@
 //                                    // corrupt instead of "newer yaw-mcp"
 //     "keyslots": {
 //       "passphrase": { salt, kdf: {N,r,p}, wrapped: {iv,ciphertext,authTag}, digest },
-//       "recovery":   { salt, kdf: "hkdf-sha256", created, wrapped }   // optional
+//       "recovery":   { salt, kdf: "hkdf-sha256", created, wrapped, digest? } // optional
 //     },
 //     "check": { iv, ciphertext, authTag },   // VAULT_CHECK_PLAINTEXT under the DEK
 //     "entries": { "<secret-name>": { iv, ciphertext, authTag } }
@@ -173,6 +173,14 @@ export interface RecoverySlot {
   /** ISO-8601 UTC date-time the slot (and its code) was created. */
   created: string;
   wrapped: EncryptedEntry;
+  /** base64 SHA-256 over the slot's canonical AAD (which binds `created` as
+   *  well as salt and vault_id) and its wrapped key (recoverySlotDigest) --
+   *  the same integrity stamp the passphrase slot carries, so a bit-flipped
+   *  `created` or vault_id reads as a DAMAGED slot rather than as "wrong
+   *  code". Absent on slots written before this stamp existed: those still
+   *  open, they just cannot be told apart from a damaged slot short of the
+   *  unwrap (see recoverySlotDigestMatches). */
+  digest?: string;
 }
 
 export interface VaultKeyslots {
@@ -195,9 +203,20 @@ export interface VaultFile {
   /** v3 only: the slots that wrap the DEK. */
   keyslots?: VaultKeyslots;
   /** IN MEMORY ONLY, never written (saveVault strips it): loadVault found a
-   *  recovery slot it could not use and dropped it -- see VaultLoadWarning's
-   *  "recovery-malformed". */
+   *  recovery slot it could not use -- see VaultLoadWarning's
+   *  "recovery-malformed". It stays set while `recoveryMalformedRaw` holds
+   *  the slot, so the verdict survives a save/reload even though the raw
+   *  bytes ride along in `keyslots.recovery`. */
   recoveryMalformed?: boolean;
+  /** IN MEMORY ONLY, never written on its own (saveVault strips it): the
+   *  PARSED-JSON recovery slot loadVault failed to validate, kept so an
+   *  ordinary `set`/`remove` round-trips it instead of deleting it from disk.
+   *  It is written back out as `keyslots.recovery` (see saveVault), and only
+   *  the documented overwriters -- `recovery new`, `recovery remove` and any
+   *  re-key -- replace it. Untyped `unknown` on purpose: validation failed,
+   *  so no field of it can be trusted, and it is never read for anything but
+   *  serialization. */
+  recoveryMalformedRaw?: unknown;
   entries: Record<string, EncryptedEntry>;
   /** Vault-level verification token: a fixed known constant encrypted
    *  under the derived key (the DEK on v3). Lets unlock() detect a wrong
@@ -266,6 +285,18 @@ export function passphraseSlotDigest(vaultId: string, slot: Pick<PassphraseSlot,
   return slotDigest(slotAad("passphrase", vaultId, slot), slot.wrapped);
 }
 
+/** The `digest` a v3 RECOVERY slot records -- the same algorithm as the
+ *  passphrase slot's (slotDigest over the slot's canonical AAD, which for
+ *  this role also binds `created`, then the wrapped key). Exported for the
+ *  same reason: a test or a repair tool stamps it the way writeRecoverySlot
+ *  does. */
+export function recoverySlotDigest(
+  vaultId: string,
+  slot: Pick<RecoverySlot, "salt" | "kdf" | "created" | "wrapped">,
+): string {
+  return slotDigest(slotAad("recovery", vaultId, slot), slot.wrapped);
+}
+
 /** Fixed plaintext encrypted into vault.check. A successful decrypt of
  *  the stored check proves the derived key matches the one the vault was
  *  created with -- i.e. the passphrase is correct. */
@@ -300,9 +331,13 @@ export const VAULT_SLOT_DAMAGED_ERROR =
  *  dropped as malformed. */
 export const VAULT_NO_RECOVERY_ERROR = "this vault has no recovery code -- `yaw-mcp secrets reset` starts over";
 
-/** Thrown by unlockWithRecoveryCode when the code unwraps a key that opens
- *  neither the check marker nor any entry: the recovery slot and the contents
- *  disagree, so the code cannot restore this file. */
+/** Thrown by unlockWithRecoveryCode when the recovery slot cannot be trusted
+ *  to answer: its recorded digest does not match the slot (its vault_id,
+ *  salt, `created` or wrapped key was edited or bit-flipped, so the unwrap is
+ *  never attempted), or it unwraps a key that opens neither the check marker
+ *  nor any entry (the slot and the contents disagree). Either way the code
+ *  cannot be judged right or wrong -- which is the point: a damaged slot must
+ *  not be reported to the holder of a correct code as a wrong code. */
 export const VAULT_RECOVERY_SLOT_DAMAGED_ERROR =
   "the vault's recovery slot does not match its contents -- the recovery code cannot restore this vault";
 
@@ -332,9 +367,11 @@ export class VaultEntryCorruptError extends Error {
 export type VaultLoadWarning =
   | { kind: "check-malformed"; path: string; message: string }
   /** v3: the recovery slot is present but unusable (bad shape, bad
-   *  `created`, a `kdf` other than RECOVERY_SLOT_KDF). The vault still loads,
-   *  without the slot, and records `recoveryMalformed: true`; `recovery new`
-   *  or `recovery remove` overwrites it. */
+   *  `created`, a `kdf` other than RECOVERY_SLOT_KDF). The vault still loads
+   *  and records `recoveryMalformed: true`, and the slot's raw JSON is KEPT
+   *  (`recoveryMalformedRaw`, written back as `keyslots.recovery`) so an
+   *  ordinary `set`/`remove` cannot delete it; `recovery new` or `recovery
+   *  remove` replaces it. */
   | { kind: "recovery-malformed"; path: string; message: string };
 
 export interface LoadVaultOptions {
@@ -470,8 +507,9 @@ export async function loadVault(path: string, opts?: LoadVaultOptions): Promise<
  *  placeholder, version bounds, entry shapes). Validates vault_id, the
  *  passphrase slot (fully: a malformed one leaves nothing that can open the
  *  file, so the vault is corrupt) and the check marker's shape; a malformed
- *  RECOVERY slot is reported and dropped instead (VaultLoadWarning
- *  "recovery-malformed"), because the passphrase still opens everything.
+ *  RECOVERY slot is reported instead (VaultLoadWarning "recovery-malformed"),
+ *  because the passphrase still opens everything -- and it is KEPT, in the
+ *  raw parsed JSON, so a later ordinary write cannot destroy it.
  *
  *  A well-formed top-level `kdf` on a v3 file is dropped rather than fatal: no
  *  writer puts one there and nothing reads it, so refusing the whole vault
@@ -503,12 +541,22 @@ function loadV3Fields(
   }
   let recovery: RecoverySlot | undefined;
   let recoveryMalformed = false;
+  let recoveryRaw: unknown;
   if (slots.recovery !== undefined) {
     recovery = parseRecoverySlot(slots.recovery) ?? undefined;
     if (!recovery) {
+      // KEEP the unvalidated slot, do not drop it. The warning below tells
+      // the user only `recovery new` replaces it -- and that is a promise
+      // this has to keep: an ordinary `set`/`remove` spreads this object
+      // through saveVault, so leaving the slot out of it would delete the
+      // user's last copy of a slot a future `recovery new` is meant to
+      // supersede (and any key that might still repair it). Parsed-but-
+      // unvalidated JSON, held in its own field so no reader ever mistakes
+      // it for a RecoverySlot.
       recoveryMalformed = true;
+      recoveryRaw = slots.recovery;
       const message =
-        "Vault recovery slot is malformed; ignoring it (the recovery code cannot be used -- `yaw-mcp secrets recovery new` replaces it)";
+        "Vault recovery slot is malformed; the recovery code cannot be used, but the slot is kept as-is until `yaw-mcp secrets recovery new` or `recovery remove` replaces it";
       if (onWarning) onWarning({ kind: "recovery-malformed", path, message });
       else log("warn", message, { path });
     }
@@ -518,7 +566,7 @@ function loadV3Fields(
     vault_id: obj.vault_id,
     salt: obj.salt as string,
     keyslots: { passphrase, ...(recovery ? { recovery } : {}) },
-    ...(recoveryMalformed ? { recoveryMalformed: true } : {}),
+    ...(recoveryMalformed ? { recoveryMalformed: true, recoveryMalformedRaw: recoveryRaw } : {}),
     ...(isEncryptedEntry(obj.check) ? { check: obj.check } : {}),
     entries: obj.entries as Record<string, EncryptedEntry>,
   };
@@ -555,7 +603,11 @@ function parsePassphraseSlot(v: unknown, corrupt: (what: string) => Error): Pass
  *  required, fraction optional, `Z` only). */
 const ISO_UTC_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?Z$/;
 
-/** Validate a recovery slot off disk; null when it is malformed. */
+/** Validate a recovery slot off disk; null when it is malformed. `digest` is
+ *  copied through only when it is a string -- a slot written before that
+ *  stamp existed is well formed without one (see recoverySlotDigestMatches),
+ *  while a digest of another type is damage the matcher must be able to see,
+ *  not a reason to call the whole slot unusable. */
 function parseRecoverySlot(v: unknown): RecoverySlot | null {
   if (!v || typeof v !== "object" || Array.isArray(v)) return null;
   const s = v as Record<string, unknown>;
@@ -563,12 +615,14 @@ function parseRecoverySlot(v: unknown): RecoverySlot | null {
   if (s.kdf !== RECOVERY_SLOT_KDF) return null;
   if (typeof s.created !== "string" || !ISO_UTC_RE.test(s.created) || Number.isNaN(Date.parse(s.created))) return null;
   if (!isEncryptedEntry(s.wrapped)) return null;
+  if (s.digest !== undefined && typeof s.digest !== "string") return null;
   const w = s.wrapped;
   return {
     salt: s.salt as string,
     kdf: RECOVERY_SLOT_KDF,
     created: s.created,
     wrapped: { iv: w.iv, ciphertext: w.ciphertext, authTag: w.authTag },
+    ...(typeof s.digest === "string" ? { digest: s.digest } : {}),
   };
 }
 
@@ -596,7 +650,34 @@ export async function saveVault(path: string, vault: VaultFile): Promise<void> {
   // group/other-readable in the window between rename and the chmod below
   // (ciphertext only, but consistent with the token/cookie files).
   // recoveryMalformed is loadVault's in-memory note, never part of the file.
-  const { recoveryMalformed: _inMemoryOnly, ...onDisk } = vault;
+  // recoveryMalformedRaw is the SLOT it describes: it is written, as
+  // keyslots.recovery, because dropping it here is exactly how an ordinary
+  // `set`/`remove` used to delete a malformed recovery slot from disk (see
+  // loadV3Fields). Both notes come off, so a well-formed vault never grows
+  // the fields and `saveVault never writes the in-memory note` holds either
+  // way.
+  const { recoveryMalformed: _inMemoryOnly, recoveryMalformedRaw: rawRecovery, ...rest } = vault;
+  // A raw slot with no keyslots to carry it means the ONLY surviving copy of
+  // that slot is the one this call would drop: loadV3Fields sets the raw only
+  // where keyslots.recovery failed validation, and loadVault refuses a v3
+  // vault with no keyslots at all, so nothing on disk reaches here -- only a
+  // hand-built vault can. Writing `rest` as-is would round-trip as a vault
+  // with no recovery slot, i.e. silently reintroduce the deletion bug the
+  // raw exists to prevent, so refuse loudly instead of losing the slot.
+  if (rawRecovery !== undefined && rest.keyslots === undefined) {
+    throw new Error(
+      "vault carries recoveryMalformedRaw but no keyslots; refusing to save (it would drop the recovery slot)",
+    );
+  }
+  // The raw rides out as keyslots.recovery ONLY where no valid slot already
+  // sits. loadV3Fields sets the two exclusively, so a valid slot alongside
+  // the raw means something repaired or replaced the slot in memory without
+  // clearing the note -- the valid one is newer, and letting the stale raw
+  // win here would silently undo that repair.
+  const onDisk =
+    rawRecovery !== undefined && rest.keyslots && !rest.keyslots.recovery
+      ? { ...rest, keyslots: { ...rest.keyslots, recovery: rawRecovery as RecoverySlot } }
+      : rest;
   await atomicWriteFile(path, `${JSON.stringify(onDisk, null, 2)}\n`, "utf8", 0o600, 0o700);
   if (process.platform !== "win32") {
     // Both chmods are best-effort belt-and-suspenders over the birth modes
@@ -882,6 +963,21 @@ function slotDigestMatches(vaultId: string, slot: PassphraseSlot): boolean {
   return recorded.length === actual.length && timingSafeEqual(recorded, actual);
 }
 
+/** recovery's slotDigestMatches, with the backwards-compat rule the passphrase
+ *  slot does NOT need: a slot written before this stamp existed carries no
+ *  `digest`, and an absent stamp is not damage -- it is age. Such a slot is
+ *  accepted (the unwrap is the only witness it has, exactly as it was before),
+ *  so a MISSING digest on an existing vault can never read as a wrong code.
+ *  A present-but-wrong one means a field the unwrap depends on -- `created`,
+ *  salt, vault_id or the wrapped key -- was edited or bit-flipped, which the
+ *  unwrap can only report as a failed GCM, i.e. as "wrong code". */
+function recoverySlotDigestMatches(vaultId: string, slot: RecoverySlot): boolean {
+  if (slot.digest === undefined) return true;
+  const recorded = Buffer.from(slot.digest, "base64");
+  const actual = Buffer.from(recoverySlotDigest(vaultId, slot), "base64");
+  return recorded.length === actual.length && timingSafeEqual(recorded, actual);
+}
+
 /** unlock() for a v3 vault: verify the slot digest, derive the slot's KEK
  *  from the NFC passphrase (no legacy forms -- every v3 slot was written
  *  under NFC), unwrap the DEK, and check it against the contents. Caches and
@@ -945,7 +1041,11 @@ async function unlockV3(vault: V3VaultFile, passphrase: string): Promise<Buffer>
  *    "ok"             -- the check marker verifies; or there is no marker (the
  *                        hand-fix state) and an entry decrypts or there are no
  *                        entries (the GCM unwrap already authenticated the key).
- *    "marker-corrupt" -- the marker fails but an entry decrypts.
+ *    "marker-corrupt" -- the marker fails but an entry decrypts, OR there is
+ *                        nothing else to decrypt: with zero entries the marker
+ *                        is the only witness, and the unwrap that got us here
+ *                        already proved the key, so a failing marker says
+ *                        the marker is damaged -- never that the key is wrong.
  *    "mismatch"       -- nothing decrypts: the slot holds some other key. */
 function verifyV3Contents(vault: V3VaultFile, dek: Buffer): "ok" | "marker-corrupt" | "mismatch" {
   const entries = Object.entries(vault.entries);
@@ -953,6 +1053,13 @@ function verifyV3Contents(vault: V3VaultFile, dek: Buffer): "ok" | "marker-corru
     entries.some(([name, e]) => canDecrypt(vault, e, dek, vaultEntryAad(vault, name)));
   if (vault.check) {
     if (checkMarkerMatches(vault, dek)) return "ok";
+    // On an EMPTY vault there is no entry to corroborate either way, so
+    // "mismatch" would be an accusation the evidence cannot support: the
+    // caller reached here through a successful authenticated unwrap of the
+    // slot, which already proves the key. Report the marker itself as what
+    // is broken, or a correct passphrase/recovery code is told the slot is
+    // damaged and the marker is never named in the fix hint.
+    if (entries.length === 0) return "marker-corrupt";
     return someEntryDecrypts() ? "marker-corrupt" : "mismatch";
   }
   if (entries.length === 0 || someEntryDecrypts()) return "ok";
@@ -1297,7 +1404,8 @@ function writeRecoverySlot(vaultId: string, dek: Buffer): { slot: RecoverySlot; 
     const salt = saltBytes.toString("base64");
     const created = new Date().toISOString();
     const wrapped = wrapKey(dek, kek, slotAad("recovery", vaultId, { salt, kdf: RECOVERY_SLOT_KDF, created }));
-    return { slot: { salt, kdf: RECOVERY_SLOT_KDF, created, wrapped }, code: formatRecoveryCode(secret) };
+    const digest = recoverySlotDigest(vaultId, { salt, kdf: RECOVERY_SLOT_KDF, created, wrapped });
+    return { slot: { salt, kdf: RECOVERY_SLOT_KDF, created, wrapped, digest }, code: formatRecoveryCode(secret) };
   } finally {
     secret.fill(0);
     kek?.fill(0);
@@ -1427,10 +1535,15 @@ export async function rotateVault(vault: VaultFile, oldKey: Buffer, newPassphras
  *  Throws:
  *    VAULT_NO_RECOVERY_ERROR            -- v1/v2, or no usable recovery slot.
  *    RECOVERY_CODE_FORMAT_ERROR / _TYPO_ERROR (recovery-code.ts)
+ *    VAULT_RECOVERY_SLOT_DAMAGED_ERROR  -- the slot's recorded digest does not
+ *                                          match its identity (a field the
+ *                                          unwrap binds was edited or
+ *                                          bit-flipped), so the code cannot be
+ *                                          judged right or wrong; or the code
+ *                                          unwrapped a key that opens nothing.
  *    RECOVERY_CODE_WRONG_VAULT_ERROR    -- the code does not unwrap the slot.
  *    VAULT_CHECK_CORRUPT_ERROR          -- unwrapped, marker fails, an entry
- *                                          opens (the usual hand-fix applies).
- *    VAULT_RECOVERY_SLOT_DAMAGED_ERROR  -- unwrapped, but nothing opens. */
+ *                                          opens (the usual hand-fix applies). */
 export function unlockWithRecoveryCode(vault: VaultFile, code: string | Buffer): Buffer {
   if (!isV3Vault(vault) || !vault.keyslots.recovery) throw new Error(VAULT_NO_RECOVERY_ERROR);
   const slot = vault.keyslots.recovery;
@@ -1440,6 +1553,17 @@ export function unlockWithRecoveryCode(vault: VaultFile, code: string | Buffer):
   } else {
     if (code.length !== RECOVERY_SECRET_LEN) throw new Error(`recovery secret must be ${RECOVERY_SECRET_LEN} bytes`);
     secret = copyKey(code);
+  }
+  // Before any KDF or unwrap: the digest covers every field the unwrap
+  // binds (vault_id, salt, created, the wrapped blob), so a mismatch means
+  // the SLOT is damaged and a bit-flipped `created` cannot be reported to
+  // the holder of a CORRECT code as "this recovery code does not open this
+  // vault" -- the unwrap would fail all the same and GCM alone cannot tell
+  // the two apart. A slot with no digest (written before this stamp) is
+  // accepted: absence is age, not damage (recoverySlotDigestMatches).
+  if (!recoverySlotDigestMatches(vault.vault_id, slot)) {
+    secret.fill(0);
+    throw new Error(VAULT_RECOVERY_SLOT_DAMAGED_ERROR);
   }
   let kek: Buffer;
   try {

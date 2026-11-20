@@ -151,6 +151,9 @@ describe("runSecrets set -- servers that reference the name", () => {
       referenced_by: ["billing", "lemonsqueezy"],
       bundles_path: bundlesPath(),
       running_servers_stale: true,
+      // seed() stores with PASSPHRASE off a terminal, so no slot was created
+      // -- still "none": the full vocabulary only differs from the old
+      // collapse on a pre-v3 vault ("unsupported") or a bad slot ("malformed").
       recovery: "none",
     });
     expect(errText()).toBe("");

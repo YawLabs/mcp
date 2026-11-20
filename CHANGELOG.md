@@ -4,6 +4,10 @@ All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented 
 
 ## Unreleased
 
+**Changed -- the `--json` envelopes' `recovery` field reports the full state vocabulary**
+
+The `set`, `reset`, `rotate`, `recover` and `recovery` `--json` envelopes (and `yaw-mcp set <server> env.KEY --secret --json`, which relays the field) now carry `"set" | "none" | "malformed" | "unsupported"` -- exactly what `doctor --json`'s `vault.recovery` reports -- instead of collapsing everything but a usable slot to `"none"`. An un-upgraded v1/v2 vault now reads `"unsupported"` (it has no slot to hold a code) and a malformed slot reads `"malformed"`, where both used to read as `"none"`; scripts that compared the field against `"set"` are unaffected. Also fixed in this area: `recover --file` no longer claims "the recovery code you used no longer opens it" about the untouched source copy (the source keeps its code; only the recovered vault at the path is under the fresh passphrase/code), an empty answer at the recovery-code confirm prompt no longer burns one of the three attempts (it re-prompts; a closed stdin still terminates on its own bound), and `doctor`'s recovery line names the RECOVERY slot as damaged so it cannot be confused with the passphrase-slot line.
+
 ## 1.1.15
 
 **Added -- vault recovery codes**

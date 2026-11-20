@@ -153,7 +153,8 @@ FAILURE, not a skip. The likely causes are a bumped `FOUNDRY_CORPUS_VERSION`
 
 ## `vault-v1.json`, `vault-v2.json`, `vault-v3.json` -- golden secret vaults
 
-Consumed by `src/tests/secrets-vault-v3.test.ts`. Written ONCE by a throwaway
+Consumed by `src/tests/secrets-vault-v3.test.ts` and (for `vault-v3.json`
+only) `src/tests/doctor-cmd.test.ts`. Written ONCE by a throwaway
 generator that used raw `node:crypto` only (no yaw-mcp code), so each file is
 an independent implementation of its schema that the vault module must read.
 Do not regenerate them with the module itself -- that would turn the test into

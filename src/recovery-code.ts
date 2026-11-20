@@ -210,8 +210,15 @@ export function normalizeRecoveryGroup(input: string): string {
   return normalizeChars(input);
 }
 
+/** The single normalization entry point for typed input: NFKC first, then
+ *  case, separators, Crockford aliases. NFKC folds full-width digits/letters
+ *  ("１", "Ｙ") a CJK IME hands back onto their ASCII forms -- without
+ *  it the right code was rejected as wrong length/characters -- and is a
+ *  no-op on ASCII, mirroring why the passphrase path normalizes at all
+ *  (secrets-crypto.ts normalizePassphrase). */
 function normalizeChars(input: string): string {
   return input
+    .normalize("NFKC")
     .toUpperCase()
     .replace(/[\s-]+/g, "")
     .replace(/O/g, "0")
@@ -220,11 +227,12 @@ function normalizeChars(input: string): string {
 
 /** Parse to symbols and verify both checks. Throws the format or typo error. */
 function parseSymbols(input: string): number[] {
-  let s = input.toUpperCase().replace(/[\s-]+/g, "");
+  // Normalize once, up front (see normalizeChars): so the prefix check below
+  // sees a full-width "ＹＡＷＲ" as "YAWR" and the alias map runs on ASCII.
+  let s = normalizeChars(input);
   // A real code never starts with Y (its first symbol is < 8), so stripping
   // the prefix cannot eat a symbol.
   if (s.startsWith(RECOVERY_CODE_PREFIX)) s = s.slice(RECOVERY_CODE_PREFIX.length);
-  s = normalizeChars(s);
   if (s.length !== TOTAL_SYMBOLS) throw new Error(RECOVERY_CODE_FORMAT_ERROR);
   const symbols: number[] = [];
   for (const ch of s) {
@@ -243,8 +251,9 @@ function parseSymbols(input: string): number[] {
 }
 
 /** Parse a code as the user typed it: case-insensitive, spaces and dashes
- *  ignored, the "YAWR" prefix optional, Crockford's O -> 0 and I/L -> 1
- *  aliases applied (U is invalid). Returns the 16-byte secret in the
+ *  ignored, the "YAWR" prefix optional, full-width forms NFKC-normalized to
+ *  ASCII (CJK IME input), Crockford's O -> 0 and I/L -> 1 aliases applied
+ *  (U is invalid). Returns the 16-byte secret in the
  *  caller's own allocation (zero it when done). Throws
  *  RECOVERY_CODE_FORMAT_ERROR for the wrong length or characters, and
  *  RECOVERY_CODE_TYPO_ERROR when a check symbol disagrees. */

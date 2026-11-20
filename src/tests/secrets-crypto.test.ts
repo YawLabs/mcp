@@ -13,6 +13,7 @@ import {
   generateDek,
   generateSalt,
   generateVaultId,
+  IV_LEN,
   invalidKdfParamsReason,
   isValidKdfParams,
   KEY_LEN,
@@ -188,6 +189,58 @@ describe("encryptEntry / decryptEntry key-length guard", () => {
     }
     // ...and the right length still round-trips.
     expect(decryptEntry(entry, good)).toBe("x");
+  });
+});
+
+describe("IV freshness: every call draws a fresh random IV", () => {
+  // A regression to a fixed or colliding IV still round-trips fine -- the
+  // SAME key+IV+plaintext decrypts under the same key -- so nothing else in
+  // this file would catch it. With AES-GCM, IV reuse under one key also leaks
+  // plaintext XOR relationships, so pin it directly: two calls with identical
+  // key, plaintext and AAD must differ in iv (and therefore ciphertext).
+  it("encryptEntry: same key/plaintext/AAD twice yields distinct iv and ciphertext", () => {
+    const key = randomBytes(KEY_LEN);
+    const a = encryptEntry("same plaintext", key, "same-aad");
+    const b = encryptEntry("same plaintext", key, "same-aad");
+    expect(a.iv).not.toBe(b.iv);
+    expect(a.ciphertext).not.toBe(b.ciphertext);
+    // Both are still live, fresh, well-formed IVs -- distinct alone proves
+    // nothing if one of them is degenerate.
+    expect(Buffer.from(a.iv, "base64")).toHaveLength(IV_LEN);
+    expect(Buffer.from(b.iv, "base64")).toHaveLength(IV_LEN);
+    expect(decryptEntry(a, key, "same-aad")).toBe("same plaintext");
+    expect(decryptEntry(b, key, "same-aad")).toBe("same plaintext");
+  });
+
+  it("wrapKey: same dek/kek/aad twice yields distinct iv and ciphertext", () => {
+    const dek = generateDek();
+    const kek = randomBytes(KEY_LEN);
+    const a = wrapKey(dek, kek, "slot-aad");
+    const b = wrapKey(dek, kek, "slot-aad");
+    expect(a.iv).not.toBe(b.iv);
+    expect(a.ciphertext).not.toBe(b.ciphertext);
+    expect(Buffer.from(a.iv, "base64")).toHaveLength(IV_LEN);
+    expect(Buffer.from(b.iv, "base64")).toHaveLength(IV_LEN);
+    expect(unwrapKey(a, kek, "slot-aad").equals(dek)).toBe(true);
+    expect(unwrapKey(b, kek, "slot-aad").equals(dek)).toBe(true);
+  });
+});
+
+describe("IV_LEN is a literal, not a tautology over the source", () => {
+  // Both IV tests above assert toHaveLength(IV_LEN) -- that is true of the
+  // source constant by definition and would stay green if IV_LEN were edited
+  // to 8 or 16, both of which Node's createCipheriv accepts for AES-GCM. So
+  // pin the value against the written spec (AES-GCM standard IV size / NIST
+  // guidance) the way SALT_LEN is pinned to 16 above.
+  it("is 12 bytes", () => {
+    expect(IV_LEN).toBe(12);
+    // The code that draws the IV really uses it: the size the guard rejects on
+    // decrypt is the same number the generator hands out.
+    const key = randomBytes(KEY_LEN);
+    const entry = encryptEntry("pinned", key, "aad");
+    expect(Buffer.from(entry.iv, "base64")).toHaveLength(12);
+    const short = { ...entry, iv: Buffer.alloc(IV_LEN - 1).toString("base64") };
+    expect(() => decryptEntry(short, key, "aad")).toThrow(/invalid IV length/);
   });
 });
 

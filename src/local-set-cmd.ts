@@ -42,7 +42,7 @@ import { createStreamWriter } from "./logger.js";
 import { userConfigDir } from "./paths.js";
 import { askYesNo, isInteractivePrompt, QUESTION_CANCELLED } from "./readline-question.js";
 import { runSecrets } from "./secrets-cmd.js";
-import { SECRET_NAME_RE, SECRET_REF_RE } from "./secrets-vault.js";
+import { type RecoveryState, SECRET_NAME_RE, SECRET_REF_RE } from "./secrets-vault.js";
 import { MAX_TIMEOUT_MS } from "./timeouts.js";
 // The shadow note prints a path straight off the filesystem walk, like the
 // one `add` prints -- same neutering, imported from the same place.
@@ -943,6 +943,10 @@ async function confirmDestructive(
   return null;
 }
 
+/** Every value `recovery` admits: the one vocabulary runSecrets's envelopes
+ *  and doctor's `vault.recovery` share. The relay accepts exactly these. */
+const RECOVERY_STATES: ReadonlySet<string> = new Set<RecoveryState>(["set", "none", "malformed", "unsupported"]);
+
 /** What a --secret run did in the vault, for the summary line and the --json
  *  envelope. Never the value. */
 interface SecretWrite {
@@ -951,10 +955,12 @@ interface SecretWrite {
   ref: string;
   replaced: boolean;
   freshVault: boolean;
-  /** runSecrets's `recovery` field: whether the vault as saved carries a
-   *  recovery slot. Known only under --json (the prose success line does not
-   *  say); null otherwise. Never the code itself. */
-  recovery: "set" | "none" | null;
+  /** runSecrets's `recovery` field: the vault-as-saved's recovery-code state,
+   *  the full RecoveryState vocabulary (what doctor's `vault.recovery`
+   *  reports -- "set" | "none" | "malformed" | "unsupported"). Known only
+   *  under --json (the prose success line does not say); null otherwise.
+   *  Never the code itself. */
+  recovery: RecoveryState | null;
 }
 
 /** Apply the edits to the text, write the file once, and report. */
@@ -1273,7 +1279,11 @@ async function runSetSecret(opts: SetCommandOptions, ctx: SetContext): Promise<S
       const env = JSON.parse(vaultText.trim()) as { replaced?: unknown; fresh_vault?: unknown; recovery?: unknown };
       replaced = env.replaced === true;
       freshVault = env.fresh_vault === true;
-      recovery = env.recovery === "set" || env.recovery === "none" ? env.recovery : null;
+      // Every value the full vocabulary admits, so an un-upgraded vault's
+      // "unsupported" and a bad slot's "malformed" survive the relay instead
+      // of collapsing to null; anything else is not runSecrets's field.
+      recovery =
+        typeof env.recovery === "string" && RECOVERY_STATES.has(env.recovery) ? (env.recovery as RecoveryState) : null;
     } catch {
       // Unparseable success output would be a runSecrets bug; the write
       // happened either way, so report it as a plain store.

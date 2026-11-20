@@ -11,7 +11,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
-import { Writable } from "node:stream";
+import { PassThrough, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 function writeYawMcpConfig(root: string, filename: string, obj: unknown): void {
@@ -47,18 +47,25 @@ import {
   unloadableConfigFix,
   unparseableConfigFix,
 } from "../install-targets.js";
+import { runSet } from "../local-set-cmd.js";
 import { isOamLaunch, MIN_OAM_VERSION, OAM_INSTALL_PS1, OAM_INSTALL_SH, unwrapOamLaunch } from "../oam-spawn.js";
 import { STATE_FILENAME, STATE_SCHEMA_VERSION } from "../persistence.js";
 import { REGISTRY_CACHE_FILENAME } from "../registry-cache.js";
-import { vaultSchemaBehind } from "../secrets-cmd.js";
+import { runSecrets, vaultSchemaBehind } from "../secrets-cmd.js";
 import {
   createEmptyVault,
+  createVaultV3,
   isUnlocked,
+  loadVault,
   lock,
+  newVault,
+  type RecoveryState,
+  recoveryStatus,
   SECRETS_SCHEMA_VERSION,
   saveVault,
   setSecret,
   unlock,
+  type VaultFile,
 } from "../secrets-vault.js";
 
 // An UNREADABLE project bundles.json is a doctor branch of its own (the
@@ -4249,7 +4256,7 @@ describe("runDoctor — SECRET VAULT", () => {
     await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: bad.out });
     expect(bad.text()).toContain("entries:    2 -- aws, github");
     expect(bad.text()).toContain(
-      "recovery:   slot damaged -- the passphrase still works; `yaw-mcp secrets recovery new` replaces it\n",
+      "recovery:   recovery slot damaged -- the passphrase still works; `yaw-mcp secrets recovery new` or `recovery remove` replaces it\n",
     );
 
     // unsupported: v1 and v2 have no slot to hold one.
@@ -4309,6 +4316,144 @@ describe("runDoctor — SECRET VAULT", () => {
 
     writeFileSync(join(synthHome, ".yaw-mcp", "secrets.json"), "{ not json at all");
     expect(await vaultBlock()).toMatchObject({ unreadable: expect.any(String), recovery: null, recoveryCreated: null });
+  });
+
+  // The two JSON surfaces PROMISE the same value for the same bytes:
+  // secrets-cmd's `recovery` field and doctor's `vault.recovery` are both
+  // recoveryStatus(...).state (see both files' comments), so a disagreement is
+  // a bug one of them has to carry -- and only doctor prints the value today,
+  // so nothing else pins the pair. Each state is written to disk first (no
+  // command in the pair can CREATE a legacy or a damaged slot, and `set`
+  // REPLACES a planted check-less legacy file with a v3 one), then read back
+  // through `secrets set --json` -- the envelope that carries `recovery` on an
+  // existing vault -- and `doctor --json`, plus the `set --secret --json`
+  // relay local-set-cmd re-emits.
+  it("secrets --json, doctor --json and set --secret --json agree on every recovery state", async () => {
+    const PASSPHRASE = "cross-command-recovery-passphrase";
+    const vaultFile = join(synthHome, ".yaw-mcp", "secrets.json");
+    writeBundlesWithRef();
+
+    const secretsOut: string[] = [];
+    const secretsErr: string[] = [];
+    const secretsIo = { out: (s: string) => secretsOut.push(s), err: (s: string) => secretsErr.push(s) };
+    const reset = (): void => {
+      secretsOut.length = 0;
+      secretsErr.length = 0;
+      lock();
+    };
+
+    /** `secrets set --json` over the vault as it stands (its envelope carries
+     *  `recovery`), then `doctor --json`'s `.vault.recovery` over the SAME
+     *  file -- two independent reads of one state. */
+    const both = async (): Promise<RecoveryState[]> => {
+      reset();
+      const r = await runSecrets(
+        {
+          action: "set",
+          name: "CROSS_CHECK",
+          value: "v",
+          passphrase: PASSPHRASE,
+          home: synthHome,
+          cwd: synthCwd,
+          json: true,
+        },
+        secretsIo,
+      );
+      const line = secretsOut.find((s) => s.trim().startsWith("{"));
+      expect(r.exitCode, `secrets set --json failed: ${secretsErr.join("")}`).toBe(0);
+      expect(line, "no envelope on stdout").toBeDefined();
+      const fromSecrets = (JSON.parse(line as string) as { recovery: RecoveryState }).recovery;
+
+      reset();
+      const cap = captureOut();
+      const d = await runDoctor({
+        cwd: synthCwd,
+        home: synthHome,
+        env: {},
+        os: "linux",
+        out: cap.out,
+        json: true,
+        skipRegistryCheck: true,
+      });
+      const fromDoctor = (JSON.parse(d.lines[0]) as { vault: { recovery: RecoveryState | null } }).vault.recovery;
+      expect(fromDoctor).not.toBeNull();
+      return [fromSecrets, fromDoctor as RecoveryState];
+    };
+
+    /** `set --secret --json`'s relayed `secret.recovery`: local-set-cmd reads
+     *  it back out of runSecrets's envelope through a hand-maintained copy of
+     *  the vocabulary, and falls back to null for anything it does not know. */
+    const relay = async (): Promise<unknown> => {
+      const out: string[] = [];
+      const err: string[] = [];
+      const stdin = new PassThrough();
+      stdin.end("relayed-value\n");
+      const r = await runSet({
+        target: "gh",
+        assignments: ["env.GITHUB_PERSONAL_ACCESS_TOKEN"],
+        secret: true,
+        home: synthHome,
+        cwd: synthCwd,
+        env: {},
+        passphrase: PASSPHRASE,
+        isTTY: false,
+        force: true,
+        json: true,
+        io: { stdin, stdout: new PassThrough() },
+        out: (s) => out.push(s),
+        err: (s) => err.push(s),
+      });
+      const line = out.find((s) => s.trim().startsWith("{"));
+      expect(r.exitCode, `set --secret --json failed: ${err.join("")}`).toBe(0);
+      expect(line, "no relay envelope on stdout").toBeDefined();
+      return (JSON.parse(line as string) as { secret: { recovery: unknown } }).secret.recovery;
+    };
+
+    // -- "set": a v3 vault with a usable slot (a code the module issued).
+    const built = await createVaultV3(PASSPHRASE, { recovery: true });
+    await saveVault(vaultFile, built.vault);
+    expect(await both()).toEqual(["set", "set"]);
+    expect(await relay()).toBe("set");
+
+    // -- "none": a v3 vault built without a slot (rather than deleting one from
+    //    `built` in memory, which would make the two writes hard to tell
+    //    apart: this is what `set --no-recovery` and an agent session write).
+    const noSlot = await createVaultV3(PASSPHRASE, { recovery: false });
+    await saveVault(vaultFile, noSlot.vault);
+    expect(await both()).toEqual(["none", "none"]);
+    expect(await relay()).toBe("none");
+
+    // -- "malformed": the slot is present but parseRecoverySlot rejects it
+    //    (`kdf` must be the literal "hkdf-sha256"); the passphrase slot is
+    //    untouched, so both commands still read the vault. The relay is
+    //    asserted here too -- local-set-secret.test.ts covers the same state
+    //    through `set --secret`, so a null there and here would be the same
+    //    RECOVERY_STATES gap showing up twice.
+    await saveVault(vaultFile, built.vault);
+    const damaged = JSON.parse(readFileSync(vaultFile, "utf8")) as Record<string, any>;
+    damaged.keyslots.recovery.kdf = "scrypt";
+    writeFileSync(vaultFile, JSON.stringify(damaged));
+    expect(await both()).toEqual(["malformed", "malformed"]);
+    expect(await relay()).toBe("malformed");
+
+    // -- "unsupported": pre-v3. `set` would REPLACE a planted check-less
+    //    legacy file (it reads as "no passphrase yet" -- creatingVault), so it
+    //    is given an entry first: the file verifies its own passphrase, `set`
+    //    keeps the schema, and the read itself leaves the state as found.
+    const legacy = newVault();
+    const key = await unlock(legacy, PASSPHRASE);
+    await saveVault(vaultFile, setSecret(legacy, key, "LEGACY", "old-value"));
+    key.fill(0);
+    lock();
+    expect(await both()).toEqual(["unsupported", "unsupported"]);
+    expect(await relay()).toBe("unsupported");
+
+    // Nothing above fell back to null, and the file on disk still reports the
+    // state the last pair of reads saw.
+    lock();
+    const last = await loadVault(vaultFile);
+    expect(last).not.toBeNull();
+    expect(recoveryStatus(last as VaultFile).state).toBe("unsupported");
   });
 
   it("reports a damaged passphrase slot as neither right nor wrong, and points at recover when a code exists", async () => {

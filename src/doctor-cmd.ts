@@ -2407,7 +2407,15 @@ function vaultRecoveryText(state: RecoveryState, created: string | null): string
     case "none":
       return "none -- `yaw-mcp secrets recovery new` adds one (needs a terminal)";
     case "malformed":
-      return "slot damaged -- the passphrase still works; `yaw-mcp secrets recovery new` replaces it";
+      // Names the SLOT, not just "slot": passphraseSlotDamaged has its own
+      // line ("the passphrase slot is damaged"), and a bare "slot damaged"
+      // here read as a second report of that one -- this is the RECOVERY
+      // slot, and the point of the sentence is that the passphrase is fine.
+      // Same promise the load warning makes (secrets-vault.ts: the slot is
+      // KEPT until one of the two commands replaces it): naming only `new`
+      // implied remove would not, and the two must not disagree in output
+      // the same user may see back to back.
+      return "recovery slot damaged -- the passphrase still works; `yaw-mcp secrets recovery new` or `recovery remove` replaces it";
     case "unsupported":
       return `not available on schema v1/v2 -- ${VAULT_UPGRADE_COMMANDS_TEXT} upgrades`;
   }

@@ -14,7 +14,16 @@ import { BUNDLES_LOCK_NAME } from "../local-bundles.js";
 import { parseSetArgs, runSet, SET_USAGE, type SetCommandOptions } from "../local-set-cmd.js";
 import { recoveryCodeGroups } from "../recovery-code.js";
 import { runSecrets } from "../secrets-cmd.js";
-import { loadVault, lock, recoveryStatus } from "../secrets-vault.js";
+import {
+  createVaultV3,
+  loadVault,
+  lock,
+  newVault,
+  recoveryStatus,
+  saveVault,
+  setSecret,
+  unlock,
+} from "../secrets-vault.js";
 
 // A vault created at a (fake) terminal shows a recovery code and waits for two
 // of its groups to be typed back -- unless an AI agent drives the process. Pin
@@ -695,6 +704,8 @@ describe("runSet --secret -- interactive, --json and reference edges", () => {
       ref: "${secret:mytok}",
       replaced: true,
       fresh_vault: false,
+      // A v3 vault without a slot: "none" either way -- the full vocabulary
+      // only moves this value for a pre-v3 vault ("unsupported").
       recovery: "none",
     });
     expect(await readBack("mytok")).toBe("v2");
@@ -853,5 +864,63 @@ describe("runSet --secret -- the recovery code of a vault it creates", () => {
     expect(t2.shown()).not.toMatch(/YAWR-/);
     expect(again.err).not.toContain("No recovery code was created");
     expect(await vaultRecovery()).toBe("none");
+  });
+
+  it.each([
+    ["pre-v3 (unsupported)", "legacy" as const],
+    ["malformed recovery slot (malformed)", "malformed" as const],
+  ])("the relay passes a %s vault's state through instead of collapsing it to null", async (_label, shape) => {
+    // runSecrets's `recovery` is read back out of its --json envelope and
+    // re-emitted under `secret.recovery`, filtered by a HAND-MAINTAINED copy
+    // of the RecoveryState vocabulary (local-set-cmd RECOVERY_STATES). A
+    // missing state -- or an envelope value outside it -- falls back to null,
+    // which is what "no --json run at all" means, so a real state reported as
+    // null tells a script the vault has no readable recovery answer when it
+    // does. Both shapes below are loadable but no `set` can create them (the
+    // file keeps its schema, the slot stays damaged), so they are written
+    // straight to disk first.
+    writeBundles(SAMPLE);
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    if (shape === "legacy") {
+      // A v1/v2 file has no slot to hold a code: recoveryStatus says
+      // "unsupported", which the old "set" | "none" collapse reported as a
+      // plain "none". Its own check-less format (no `check`, names bound only
+      // from v2 on) lets setSecret write into it without upgrading.
+      const legacy = newVault();
+      const key = await unlock(legacy, PASS);
+      await saveVault(vaultFile(), setSecret(legacy, key, "OLD", "old-value"));
+      key.fill(0);
+      lock();
+    } else {
+      // v3 with a slot parseRecoverySlot rejects (`kdf` must be the literal
+      // "hkdf-sha256"); the passphrase slot is untouched, so the store still
+      // unlocks and writes, and saveVault carries the raw slot back out.
+      const built = await createVaultV3(PASS, { recovery: true });
+      await saveVault(vaultFile(), built.vault);
+      const raw = JSON.parse(readFileSync(vaultFile(), "utf8")) as Record<string, any>;
+      raw.keyslots.recovery.kdf = "scrypt";
+      writeFileSync(vaultFile(), JSON.stringify(raw));
+      lock();
+    }
+    const expected = shape === "legacy" ? "unsupported" : "malformed";
+
+    // The value rides in as a PLAIN store (the default --secret run) or under
+    // --json: only the latter asks runSecrets for its own envelope, which is
+    // where the relay reads the field from.
+    const plain = await secretSet("pg", "env.PGPASSWORD", { force: true });
+    expect(plain.exitCode).toBe(0);
+    const j = await secretSet("rot", "env.TOKEN", { force: true, json: true }, "another-value\n");
+    expect(j.exitCode).toBe(0);
+    expect((JSON.parse(j.out.trim()) as { secret: Record<string, unknown> }).secret.recovery).toBe(expected);
+    // Not null: null is the "no envelope was parsed" answer, and it is the
+    // value the relay defaulted to before RECOVERY_STATES knew these states.
+    expect((JSON.parse(j.out.trim()) as { secret: { recovery: unknown } }).secret.recovery).not.toBeNull();
+
+    // The vault on disk agrees with what was relayed (same vocabulary, one
+    // read through the vault module).
+    lock();
+    const v = await loadVault(vaultFile());
+    expect(v).not.toBeNull();
+    expect(recoveryStatus(v as NonNullable<typeof v>).state).toBe(expected);
   });
 });

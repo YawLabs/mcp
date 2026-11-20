@@ -38,6 +38,7 @@ import {
   lock,
   newVault,
   passphraseSlotDigest,
+  recoverySlotDigest,
   recoveryStatus,
   rekeyVault,
   removeSecret,
@@ -283,9 +284,21 @@ describe("v3 unlock verdicts", () => {
       },
     };
     await expect(unlock(foreign, "right")).rejects.toThrow(VAULT_SLOT_DAMAGED_ERROR);
-    // Same with no entries at all: the marker alone disagrees.
+    // Same with no entries at all: now the marker is the ONLY witness, and
+    // the unwrap that reached it already proved the passphrase is the one the
+    // slot was created under. Nothing in the file can tell "slot wraps a
+    // foreign key" from "the marker alone is damaged" -- the GCM failure is
+    // identical -- so the rule is to believe the authenticated unwrap and
+    // blame the marker, not the slot (VAULT_CHECK_CORRUPT_ERROR points at the
+    // hand-fix; VAULT_SLOT_DAMAGED_ERROR would send the user chasing a slot
+    // that checks out). With an entry present the entry settles it, which is
+    // the case the line above covers.
     const emptyForeign: VaultFile = { ...foreign, entries: {} };
-    await expect(unlock(emptyForeign, "right")).rejects.toThrow(VAULT_SLOT_DAMAGED_ERROR);
+    await expect(unlock(emptyForeign, "right")).rejects.toThrow(VAULT_CHECK_CORRUPT_ERROR);
+    expect(await checkVaultPassphrase(emptyForeign, "right")).toBe("marker-corrupt");
+    // The passphrase is still the slot's own: a wrong one never reaches the
+    // marker at all.
+    await expect(unlock(emptyForeign, "wrong")).rejects.toThrow(VAULT_WRONG_PASSPHRASE_ERROR);
   });
 
   it("marker corrupt but an entry decrypts -> VAULT_CHECK_CORRUPT_ERROR (marker-corrupt verdict)", async () => {
@@ -297,6 +310,33 @@ describe("v3 unlock verdicts", () => {
     await expect(unlock(damaged, "right")).rejects.toThrow(VAULT_CHECK_CORRUPT_ERROR);
     expect(await checkVaultPassphrase(damaged, "right")).toBe("marker-corrupt");
     await expect(unlock(damaged, "wrong")).rejects.toThrow(VAULT_WRONG_PASSPHRASE_ERROR);
+  });
+
+  it("marker corrupt on an EMPTY vault -> marker-corrupt, never slot-damaged (the unwrap already proved the key)", async () => {
+    const { vault, code } = await v3With("right", {}, true);
+    expect(Object.keys(vault.entries)).toEqual([]);
+    const damaged: VaultFile = {
+      ...vault,
+      check: { ...(vault.check as EncryptedEntry), ciphertext: Buffer.from("garbage!").toString("base64") },
+    };
+    // With zero entries the marker is the only witness, and there is nothing
+    // to corroborate it either way -- but the GCM unwrap that got us here
+    // already authenticated the key. Reporting "slot damaged" would accuse the
+    // slot on that evidence, name the passphrase slot in the error and send
+    // the user to `secrets recover` instead of the hand-fix that deletes the
+    // marker (whose hint only VAULT_CHECK_CORRUPT_ERROR carries).
+    const verdict = await unlock(damaged, "right").then(
+      () => "opened",
+      (err: unknown) => (err as Error).message,
+    );
+    expect(verdict).toBe(VAULT_CHECK_CORRUPT_ERROR);
+    expect(verdict).not.toBe(VAULT_SLOT_DAMAGED_ERROR);
+    expect(await checkVaultPassphrase(damaged, "right")).toBe("marker-corrupt");
+    // A wrong passphrase still fails at the unwrap, before the marker is read.
+    await expect(unlock(damaged, "wrong")).rejects.toThrow(VAULT_WRONG_PASSPHRASE_ERROR);
+    // The same empty-vault rule applies to the recovery path, where the
+    // unwrap proves the code instead of the passphrase.
+    expect(() => unlockWithRecoveryCode(damaged, code as string)).toThrow(VAULT_CHECK_CORRUPT_ERROR);
   });
 
   it("the hand-fix (marker deleted) loads and unlocks, and the next set re-stamps the marker", async () => {
@@ -467,11 +507,22 @@ describe("recovery codes", () => {
   it("a recovery slot copied from another vault does not open this one", async () => {
     const a = await v3With("p", { github: "ghp_A" }, true);
     const b = await v3With("p", { github: "ghp_B" }, true);
+    const bSlot = b.vault.keyslots?.recovery;
+    if (!bSlot) throw new Error("no slot");
+    // B's slot, digest and all, under A's vault_id. It cannot open A's file
+    // and the verdict is SLOT DAMAGE rather than "wrong code": the stamp is
+    // computed over B's vault_id, so under A's it cannot match -- the same
+    // answer the passphrase slot gives a slot moved between vaults (see the
+    // `moved` cache test above), and a code cannot be blamed for the file it
+    // was never recorded against.
     const grafted: VaultFile = {
       ...a.vault,
-      keyslots: { passphrase: a.vault.keyslots?.passphrase as never, recovery: b.vault.keyslots?.recovery },
+      keyslots: { passphrase: a.vault.keyslots?.passphrase as never, recovery: bSlot },
     };
-    expect(() => unlockWithRecoveryCode(grafted, b.code as string)).toThrow(RECOVERY_CODE_WRONG_VAULT_ERROR);
+    expect(() => unlockWithRecoveryCode(grafted, b.code as string)).toThrow(VAULT_RECOVERY_SLOT_DAMAGED_ERROR);
+    // A foreign code against A's OWN slot is still a wrong code: the slot's
+    // stamp matches, so the unwrap is attempted and B's code fails it.
+    expect(() => unlockWithRecoveryCode(a.vault, b.code as string)).toThrow(RECOVERY_CODE_WRONG_VAULT_ERROR);
   });
 
   it("a recovery slot wrapping a key the contents do not know -> VAULT_RECOVERY_SLOT_DAMAGED_ERROR", async () => {
@@ -501,7 +552,91 @@ describe("recovery codes", () => {
     expect(() => unlockWithRecoveryCode(markerBad, code as string)).toThrow(VAULT_CHECK_CORRUPT_ERROR);
   });
 
-  it("editing the recovery slot's created time breaks the unwrap (it is in the AAD)", async () => {
+  it("the recovery slot carries a digest: a flipped created or vault_id reads as slot-damaged, not wrong code", async () => {
+    const { vault, code } = await v3With("p", { github: "ghp_1" }, true);
+    const slot = vault.keyslots?.recovery;
+    if (!slot) throw new Error("no slot");
+    // The stamp is the same algorithm as the passphrase slot's, over the
+    // recovery AAD (which binds created as well as salt and vault_id).
+    expect(slot.digest).toBe(
+      recoverySlotDigest(vault.vault_id as string, {
+        salt: slot.salt,
+        kdf: slot.kdf,
+        created: slot.created,
+        wrapped: slot.wrapped,
+      }),
+    );
+    const otherId = generateSalt();
+    const flipped = Buffer.from(slot.digest as string, "base64");
+    flipped[0] ^= 0xff;
+    const cases: Record<string, VaultFile> = {
+      // The unwrap binds `created`, so an edited one fails GCM exactly like a
+      // wrong code -- unless the digest is read first.
+      created: {
+        ...vault,
+        keyslots: {
+          passphrase: vault.keyslots?.passphrase as never,
+          recovery: { ...slot, created: "2020-01-01T00:00:00.000Z" },
+        },
+      },
+      vault_id: { ...vault, vault_id: otherId.toString("base64") },
+      // The digest is itself damage: it no longer describes the slot.
+      digest: {
+        ...vault,
+        keyslots: {
+          passphrase: vault.keyslots?.passphrase as never,
+          recovery: { ...slot, digest: flipped.toString("base64") },
+        },
+      },
+    };
+    for (const [field, damaged] of Object.entries(cases)) {
+      // The holder of the CORRECT code is told the slot is damaged -- the
+      // unwrap would fail identically for a typo, so without the digest this
+      // reads as "this recovery code does not open this vault".
+      const verdict = (() => {
+        try {
+          unlockWithRecoveryCode(damaged, code as string);
+          return "opened";
+        } catch (err) {
+          return (err as Error).message;
+        }
+      })();
+      expect(verdict, field).toBe(VAULT_RECOVERY_SLOT_DAMAGED_ERROR);
+      expect(verdict, field).not.toBe(RECOVERY_CODE_WRONG_VAULT_ERROR);
+    }
+    // The undamaged vault still opens, and a genuinely wrong code is still
+    // a wrong code -- the digest says nothing about the CODE, only about the
+    // slot it unwraps.
+    expect(unlockWithRecoveryCode(vault, code as string)).toBeInstanceOf(Buffer);
+    const other = formatRecoveryCode(Buffer.alloc(16, 9));
+    expect(() => unlockWithRecoveryCode(vault, other)).toThrow(RECOVERY_CODE_WRONG_VAULT_ERROR);
+  });
+
+  it("a vault written before the recovery digest existed still opens (a missing stamp is age, not damage)", async () => {
+    const { vault, code } = await v3With("p", { github: "ghp_1" }, true);
+    const slot = vault.keyslots?.recovery;
+    if (!slot) throw new Error("no slot");
+    // What every pre-digest v3 file looks like: no `digest` field at all --
+    // including the pinned golden fixture, which this build must keep reading.
+    const { digest: _undigested, ...oldSlot } = slot;
+    const old: VaultFile = {
+      ...vault,
+      keyslots: { passphrase: vault.keyslots?.passphrase as never, recovery: oldSlot },
+    };
+    expect(old.keyslots?.recovery?.digest).toBeUndefined();
+    expect(unlockWithRecoveryCode(old, code as string)).toBeInstanceOf(Buffer);
+    // Absence must not become "wrong code" either: a well-formed but foreign
+    // code on a digest-less slot is still reported as the wrong code.
+    const other = formatRecoveryCode(Buffer.alloc(16, 9));
+    expect(() => unlockWithRecoveryCode(old, other)).toThrow(RECOVERY_CODE_WRONG_VAULT_ERROR);
+    // The golden fixture (written by an independent implementation, with no
+    // digest) still opens by its code.
+    const fixtureVault = JSON.parse(readFileSync(join(FIXTURES, "vault-v3.json"), "utf8")) as VaultFile;
+    expect(fixtureVault.keyslots?.recovery?.digest).toBeUndefined();
+    expect(unlockWithRecoveryCode(fixtureVault, "YAWR-206S-0V9V-11BG-11MW-FTSJ-DXBZ-7MFX")).toBeInstanceOf(Buffer);
+  });
+
+  it("editing the recovery slot's created time is slot damage, not a wrong code (it is in the AAD and the digest)", async () => {
     const { vault, code } = await v3With("p", {}, true);
     const slot = vault.keyslots?.recovery;
     if (!slot) throw new Error("no slot");
@@ -512,7 +647,7 @@ describe("recovery codes", () => {
         recovery: { ...slot, created: "2020-01-01T00:00:00.000Z" },
       },
     };
-    expect(() => unlockWithRecoveryCode(edited, code as string)).toThrow(RECOVERY_CODE_WRONG_VAULT_ERROR);
+    expect(() => unlockWithRecoveryCode(edited, code as string)).toThrow(VAULT_RECOVERY_SLOT_DAMAGED_ERROR);
   });
 
   it("recoveryStatus: set / none / malformed / unsupported", async () => {
@@ -690,7 +825,88 @@ describe("loadVault: v3 validation", () => {
       // saveVault never writes the in-memory note.
       await saveVault(path, loaded);
       expect(readFileSync(path, "utf8")).not.toContain("recoveryMalformed");
+      // ...but it DOES write the slot back out: the note describes a slot
+      // that is still on disk, and dropping it is how an ordinary write used
+      // to destroy the user's copy of it (see the round-trip test below).
+      expect(JSON.parse(readFileSync(path, "utf8")).keyslots.recovery).toEqual(recovery);
     }
+  });
+
+  it("a malformed recovery slot survives a non-rekeying set: set and save keep it on disk", async () => {
+    const good = await base();
+    const slots = good.keyslots as Record<string, Record<string, unknown>>;
+    // One shape of malformed (a `created` that is not an ISO-UTC instant) is
+    // enough: every shape goes through the same load -> keep -> save path.
+    const malformed = { ...slots.recovery, created: "yesterday" };
+    writeRaw({ ...good, keyslots: { ...slots, recovery: malformed } });
+    const loaded = (await loadVault(path)) as VaultFile;
+    expect(loaded.recoveryMalformed).toBe(true);
+    expect(recoveryStatus(loaded).state).toBe("malformed");
+    // An ordinary `set` -- no re-key, no `recovery new` -- spreads this vault
+    // through saveVault. The malformed slot must be back on disk afterwards,
+    // byte for byte, exactly as `recovery new`'s warning promised.
+    const dek = await unlock(loaded, "p");
+    const afterSet = setSecret(loaded, dek, "new-secret", "value");
+    dek.fill(0);
+    lock();
+    await saveVault(path, afterSet);
+    const onDisk = JSON.parse(readFileSync(path, "utf8")) as Record<string, any>;
+    expect(onDisk.keyslots.recovery).toEqual(malformed);
+    expect(onDisk.recoveryMalformed).toBeUndefined();
+    // ...and it reloads as the same malformed verdict, still with its entries.
+    const warnings: VaultLoadWarning[] = [];
+    const reloaded = (await loadVault(path, { onWarning: (w) => warnings.push(w) })) as VaultFile;
+    expect(warnings.map((w) => w.kind)).toEqual(["recovery-malformed"]);
+    expect(recoveryStatus(reloaded).state).toBe("malformed");
+    expect(listKeys(reloaded)).toEqual(["github", "new-secret"]);
+    // removeSecret round-trips it the same way.
+    const afterRemove = removeSecret(reloaded, "new-secret");
+    await saveVault(path, afterRemove);
+    expect(JSON.parse(readFileSync(path, "utf8")).keyslots.recovery).toEqual(malformed);
+    // Only a re-key replaces it: `recovery remove` builds a vault with no
+    // slot at all, so neither the raw slot nor the flag rides along.
+    const dek2 = await unlock(afterRemove, "p");
+    const removed = await rekeyVault(afterRemove, dek2, "p", { recovery: false, operation: "recovery remove" });
+    dek2.fill(0);
+    expect(recoveryStatus(removed.vault).state).toBe("none");
+    expect(removed.vault.recoveryMalformed).toBeUndefined();
+    await saveVault(path, removed.vault);
+    expect(JSON.parse(readFileSync(path, "utf8")).keyslots.recovery).toBeUndefined();
+  });
+
+  it("saveVault refuses a hand-built raw slot with no keyslots instead of dropping it", async () => {
+    // The raw note can only exist alongside the keyslots that carry it when
+    // it came from disk: loadV3Fields sets it only where keyslots.recovery
+    // failed validation, and loadVault refuses a v3 vault with no keyslots at
+    // all. So a vault with the raw and no keyslots is hand-built -- and the
+    // old write path serialized it as-is, silently dropping the ONLY copy of
+    // the slot and reintroducing the very deletion the raw exists to prevent.
+    const { vault } = await v3With("p", { github: "ghp_1" }, true);
+    const slots = vault.keyslots as unknown as Record<string, Record<string, unknown>>;
+    const orphan: VaultFile = {
+      ...vault,
+      keyslots: undefined,
+      recoveryMalformed: true,
+      recoveryMalformedRaw: { ...slots.recovery, created: "yesterday" },
+    };
+    await expect(saveVault(path, orphan)).rejects.toThrow(/recoveryMalformedRaw but no keyslots/);
+    // Loud, not just late: nothing was written behind the refusal.
+    expect(() => readFileSync(path)).toThrow();
+  });
+
+  it("saveVault lets a valid keyslots.recovery win over a stale raw slot", async () => {
+    // loadV3Fields sets the two exclusively, so both at once means something
+    // repaired or replaced the slot in memory without clearing the note --
+    // and the guard used to serialize only via the raw path, silently
+    // reverting that repair on the next save. The valid slot is newer; it
+    // must be what lands on disk.
+    const { vault } = await v3With("p", { github: "ghp_1" }, true);
+    const staleRaw = { ...(vault.keyslots?.recovery as unknown as Record<string, unknown>), created: "yesterday" };
+    await saveVault(path, { ...vault, recoveryMalformed: true, recoveryMalformedRaw: staleRaw });
+    const onDisk = JSON.parse(readFileSync(path, "utf8")) as Record<string, any>;
+    expect(onDisk.keyslots.recovery).toEqual(vault.keyslots?.recovery);
+    expect(onDisk.keyslots.recovery).not.toEqual(staleRaw);
+    expect(onDisk.recoveryMalformedRaw).toBeUndefined();
   });
 
   it("drops a well-formed top-level kdf on v3 instead of refusing the vault", async () => {
@@ -806,5 +1022,266 @@ describe("golden fixtures (written by an independent raw node:crypto implementat
         slotAadFor("passphrase", migrated.vault_id as string, { kdf: slot?.kdf, salt: slot?.salt }),
       ),
     ).not.toThrow();
+  });
+});
+
+// The digest's flagship scenarios: shapes of damage that are WELL formed on
+// disk (loadVault's shape checks pass) and only the recorded stamp can see.
+// Every one must read as SLOT DAMAGE, never as "wrong code" -- the holder of
+// the correct code must not be blamed for the file's damage.
+describe("recovery slot digest: damage reads as damage, never as a wrong code", () => {
+  /** Re-wrap a FOREIGN DEK under `code` in this vault's own slot identity and
+   *  re-stamp the digest exactly as writeRecoverySlot would. The splice is
+   *  then authentic for this vault_id -- the digest check passes, the code's
+   *  unwrap SUCCEEDS -- and only verifyV3Contents can tell the key inside
+   *  opens nothing. (The older foreign-DEK test swaps `wrapped` but keeps the
+   *  ORIGINAL digest, so it exits at the digest check and never reaches the
+   *  verdict mapping.) */
+  async function splicedForeignSlot(vault: VaultFile, code: string) {
+    const { parseRecoveryCode } = await import("../recovery-code.js");
+    const { deriveRecoveryKek } = await import("../secrets-crypto.js");
+    const slot = vault.keyslots?.recovery;
+    if (!slot) throw new Error("no recovery slot");
+    const kek = deriveRecoveryKek(parseRecoveryCode(code), Buffer.from(slot.salt, "base64"));
+    const wrapped = wrapKey(
+      generateDek(),
+      kek,
+      slotAadFor("recovery", vault.vault_id as string, { kdf: slot.kdf, salt: slot.salt, created: slot.created }),
+    );
+    return {
+      ...slot,
+      wrapped,
+      digest: recoverySlotDigest(vault.vault_id as string, {
+        salt: slot.salt,
+        kdf: slot.kdf,
+        created: slot.created,
+        wrapped,
+      }),
+    };
+  }
+
+  /** The verdict unlockWithRecoveryCode gives `code` on `vault`, captured
+   *  rather than thrown so a test can assert it is NOT the wrong-code answer
+   *  -- the whole point of reading the stamp before the unwrap. */
+  function recoveryVerdict(vault: VaultFile, code: string): string {
+    try {
+      unlockWithRecoveryCode(vault, code);
+      return "opened";
+    } catch (err) {
+      return (err as Error).message;
+    }
+  }
+
+  it("a digest-RE-STAMPED slot around a foreign DEK -> SLOT_DAMAGED via verifyV3Contents' mismatch verdict", async () => {
+    const { vault, code } = await v3With("p", { github: "ghp_1" }, true);
+    const spliced = await splicedForeignSlot(vault, code as string);
+    // The wrapped key really was replaced (the old test's condition), while
+    // the digest was re-stamped for it -- so the digest check PASSES here.
+    expect(spliced.wrapped).not.toEqual(vault.keyslots?.recovery?.wrapped);
+    const foreign: VaultFile = {
+      ...vault,
+      keyslots: { passphrase: vault.keyslots?.passphrase as never, recovery: spliced },
+    };
+    // The check marker is intact and every entry is present: the unwrap
+    // succeeds, the marker fails under the foreign key, no entry decrypts,
+    // so verifyV3Contents says "mismatch". unlockWithRecoveryCode must map
+    // that to SLOT DAMAGE -- never CHECK_CORRUPT (that verdict needs an
+    // entry to OPEN, which nothing here does) and never WRONG_VAULT (the
+    // unwrap that just succeeded proved the code unwraps this slot).
+    const verdict = recoveryVerdict(foreign, code as string);
+    expect(verdict).toBe(VAULT_RECOVERY_SLOT_DAMAGED_ERROR);
+    expect(verdict).not.toBe(RECOVERY_CODE_WRONG_VAULT_ERROR);
+    expect(verdict).not.toBe(VAULT_CHECK_CORRUPT_ERROR);
+  });
+
+  it("the same foreign-DEK splice on a check-less vault -> SLOT_DAMAGED through the vault.check-absent branch", async () => {
+    const { vault, code } = await v3With("p", { github: "ghp_1" }, true);
+    const spliced = await splicedForeignSlot(vault, code as string);
+    const { check: _gone, ...noCheck } = vault;
+    const foreign: VaultFile = {
+      ...noCheck,
+      keyslots: { passphrase: vault.keyslots?.passphrase as never, recovery: spliced },
+    };
+    expect(foreign.check).toBeUndefined();
+    // verifyV3Contents' check-less branch (the documented hand-fix state):
+    // with no marker the entries are the only witnesses, none decrypts, so
+    // the verdict is "mismatch" -> SLOT_DAMAGED. Absence of the marker must
+    // not let the foreign key through as "ok" (an entry OPENING would be the
+    // marker-corrupt path; here nothing opens).
+    expect(recoveryVerdict(foreign, code as string)).toBe(VAULT_RECOVERY_SLOT_DAMAGED_ERROR);
+  });
+
+  it("a bit-flipped wrapped.ciphertext with the recorded digest intact -> SLOT_DAMAGED, never WRONG_VAULT", async () => {
+    const { vault, code } = await v3With("p", { github: "ghp_1" }, true);
+    const slot = vault.keyslots?.recovery;
+    if (!slot) throw new Error("no slot");
+    const ct = Buffer.from(slot.wrapped.ciphertext, "base64");
+    ct[0] ^= 1;
+    // Well formed on disk (loadVault type-checks the three wrapped strings,
+    // not the bytes) and the digest still records the ORIGINAL ciphertext --
+    // exactly what one flipped bit leaves. Without the stamp the unwrap fails
+    // GCM and the only verdict it can give is WRONG_VAULT, telling the holder
+    // of the CORRECT code the file is not theirs; the stamp is read first
+    // (before any derivation, see unlockWithRecoveryCode) and blames the slot.
+    const flipped: VaultFile = {
+      ...vault,
+      keyslots: {
+        passphrase: vault.keyslots?.passphrase as never,
+        recovery: { ...slot, wrapped: { ...slot.wrapped, ciphertext: ct.toString("base64") } },
+      },
+    };
+    const verdict = recoveryVerdict(flipped, code as string);
+    expect(verdict).toBe(VAULT_RECOVERY_SLOT_DAMAGED_ERROR);
+    expect(verdict).not.toBe(RECOVERY_CODE_WRONG_VAULT_ERROR);
+  });
+
+  it("a length-preserving salt flip with the recorded digest intact -> SLOT_DAMAGED (the digest binds salt)", async () => {
+    const { vault, code } = await v3With("p", { github: "ghp_1" }, true);
+    const slot = vault.keyslots?.recovery;
+    if (!slot) throw new Error("no slot");
+    const salt = Buffer.from(slot.salt, "base64");
+    salt[0] ^= 1;
+    const flippedSalt = salt.toString("base64");
+    // Same byte length as the original, so loadVault's 16-byte salt check
+    // still passes -- only the stamp can see it, because the canonical AAD it
+    // covers includes `salt`: the recorded digest holds the ORIGINAL bytes,
+    // so it no longer re-derives. Same shape the passphrase slot's salt-flip
+    // test covers, on the recovery side.
+    expect(Buffer.from(flippedSalt, "base64")).toHaveLength(16);
+    const flipped: VaultFile = {
+      ...vault,
+      keyslots: {
+        passphrase: vault.keyslots?.passphrase as never,
+        recovery: { ...slot, salt: flippedSalt },
+      },
+    };
+    const verdict = recoveryVerdict(flipped, code as string);
+    expect(verdict).toBe(VAULT_RECOVERY_SLOT_DAMAGED_ERROR);
+    expect(verdict).not.toBe(RECOVERY_CODE_WRONG_VAULT_ERROR);
+  });
+
+  it("a truncated digest string -> SLOT_DAMAGED, not an unhandled timingSafeEqual RangeError", async () => {
+    const { vault, code } = await v3With("p", { github: "ghp_1" }, true);
+    const slot = vault.keyslots?.recovery;
+    if (!slot) throw new Error("no slot");
+    // 4 chars, not the 44 of base64(SHA-256): Buffer.from(x, "base64")
+    // decodes to 3 bytes, so the recorded.length === actual.length guard has
+    // to reject BEFORE timingSafeEqual would throw RangeError on
+    // mismatched-length inputs -- that throw is unhandled and would surface
+    // as a crash instead of the documented verdict.
+    expect(Buffer.from("AAAA", "base64")).toHaveLength(3);
+    const truncated: VaultFile = {
+      ...vault,
+      keyslots: {
+        passphrase: vault.keyslots?.passphrase as never,
+        recovery: { ...slot, digest: "AAAA" },
+      },
+    };
+    expect(recoveryVerdict(truncated, code as string)).toBe(VAULT_RECOVERY_SLOT_DAMAGED_ERROR);
+  });
+
+  it("a non-string digest loads as recovery-malformed, keeps the raw slot, and survives a save/load round trip", async () => {
+    const { vault } = await v3With("p", { github: "ghp_1" }, true);
+    const good = JSON.parse(JSON.stringify(vault)) as Record<string, unknown>;
+    const slots = good.keyslots as Record<string, Record<string, unknown>>;
+    // parseRecoverySlot's digest-TYPE branch: a stamp of the wrong type is
+    // damage the matcher must be able to see, not a field to drop -- dropping
+    // it silently would read the slot as pre-digest (absence = age, always
+    // accepted) and report "set" for a stamp that says something is wrong.
+    // The malformed-shape loop covers bad created/kdf/salt/wrapped/shape;
+    // this exercises the type check on a well-shaped slot, then the whole
+    // keep promise: warned, raw KEPT, and a fresh load sees it again.
+    for (const digest of [1, null]) {
+      const label = `digest: ${JSON.stringify(digest)}`;
+      writeRaw({ ...good, keyslots: { ...slots, recovery: { ...slots.recovery, digest } } });
+      const warnings: VaultLoadWarning[] = [];
+      const loaded = (await loadVault(path, { onWarning: (w) => warnings.push(w) })) as VaultFile;
+      expect(
+        warnings.map((w) => w.kind),
+        label,
+      ).toEqual(["recovery-malformed"]);
+      expect(loaded.keyslots?.recovery, label).toBeUndefined();
+      expect(loaded.recoveryMalformed, label).toBe(true);
+      expect(loaded.recoveryMalformedRaw, label).toEqual({ ...slots.recovery, digest });
+      expect(recoveryStatus(loaded).state, label).toBe("malformed");
+      // The passphrase still opens it -- only the recovery code is lost.
+      expect(await checkVaultPassphrase(loaded, "p"), label).toBe("opens");
+      lock();
+      await saveVault(path, loaded);
+      const onDisk = JSON.parse(readFileSync(path, "utf8")) as Record<string, any>;
+      expect(onDisk.keyslots.recovery, label).toEqual({ ...slots.recovery, digest });
+      expect(onDisk.recoveryMalformed, label).toBeUndefined();
+      const warnings2: VaultLoadWarning[] = [];
+      const reloaded = (await loadVault(path, { onWarning: (w) => warnings2.push(w) })) as VaultFile;
+      expect(
+        warnings2.map((w) => w.kind),
+        label,
+      ).toEqual(["recovery-malformed"]);
+      expect(recoveryStatus(reloaded).state, label).toBe("malformed");
+    }
+  });
+
+  it("`recovery new` replaces a malformed slot: fresh valid slot, notes dropped, status set on reload", async () => {
+    const { vault } = await v3With("p", { github: "ghp_1" }, true);
+    const slots = vault.keyslots as unknown as Record<string, Record<string, unknown>>;
+    const malformed = { ...slots.recovery, created: "yesterday" };
+    writeRaw({ ...vault, keyslots: { ...slots, recovery: malformed } });
+    const warnings: VaultLoadWarning[] = [];
+    const loaded = (await loadVault(path, { onWarning: (w) => warnings.push(w) })) as VaultFile;
+    expect(warnings.map((w) => w.kind)).toEqual(["recovery-malformed"]);
+    expect(loaded.recoveryMalformedRaw).toEqual(malformed);
+    expect(recoveryStatus(loaded).state).toBe("malformed");
+    // The load warning promises `recovery new` REPLACES the kept slot -- the
+    // existing test covers only the `recovery remove` half of that promise.
+    // The fresh build must carry neither note and a slot that validates.
+    const dek = await unlock(loaded, "p");
+    const next = await rekeyVault(loaded, dek, "p", { recovery: true, operation: "recovery new" });
+    dek.fill(0);
+    lock();
+    expect(next.recoveryCode).toMatch(CODE_RE);
+    expect(next.vault.recoveryMalformed).toBeUndefined();
+    expect(next.vault.recoveryMalformedRaw).toBeUndefined();
+    const slot = next.vault.keyslots?.recovery;
+    if (!slot) throw new Error("recovery new wrote no slot");
+    expect(slot.created).not.toBe(malformed.created);
+    // Stamped the way writeRecoverySlot stamps it -- not merely present.
+    expect(slot.digest).toBe(
+      recoverySlotDigest(next.vault.vault_id as string, {
+        salt: slot.salt,
+        kdf: slot.kdf,
+        created: slot.created,
+        wrapped: slot.wrapped,
+      }),
+    );
+    expect(unlockWithRecoveryCode(next.vault, next.recoveryCode as string)).toBeInstanceOf(Buffer);
+    await saveVault(path, next.vault);
+    const onDisk = JSON.parse(readFileSync(path, "utf8")) as Record<string, any>;
+    expect(onDisk.keyslots.recovery).toEqual(slot);
+    expect(onDisk.keyslots.recovery).not.toEqual(malformed);
+    const warnings2: VaultLoadWarning[] = [];
+    const reloaded = (await loadVault(path, { onWarning: (w) => warnings2.push(w) })) as VaultFile;
+    expect(warnings2.map((w) => w.kind)).toEqual([]);
+    expect(recoveryStatus(reloaded)).toEqual({ state: "set", created: slot.created });
+    expect(unlockWithRecoveryCode(reloaded, next.recoveryCode as string)).toBeInstanceOf(Buffer);
+    expect(await checkVaultPassphrase(reloaded, "p")).toBe("opens");
+    lock();
+  });
+
+  it("a valid slot alongside a stale raw note reads as set, not malformed (the valid-wins precedence saveVault applies)", async () => {
+    const { vault } = await v3With("p", { github: "ghp_1" }, true);
+    const slot = vault.keyslots?.recovery;
+    if (!slot) throw new Error("no slot");
+    const staleRaw = { ...slot, created: "yesterday" };
+    // The state saveVault's valid-wins guard writes: both notes at once mean
+    // a repair replaced the slot in memory without clearing the note, and the
+    // newer valid slot must win. recoveryStatus must apply the SAME
+    // precedence -- keyslots.recovery is read first, so the stale raw
+    // (recoveryMalformed) must never flip a usable slot to "malformed", or
+    // status and the saved file would disagree about the same vault.
+    const both: VaultFile = { ...vault, recoveryMalformed: true, recoveryMalformedRaw: staleRaw };
+    expect(recoveryStatus(both)).toEqual({ state: "set", created: slot.created });
+    await saveVault(path, both);
+    const loaded = (await loadVault(path)) as VaultFile;
+    expect(recoveryStatus(loaded)).toEqual({ state: "set", created: slot.created });
   });
 });

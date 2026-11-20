@@ -52,6 +52,7 @@ import {
   loadVault,
   lock,
   newVault,
+  type RecoveryState,
   recoveryStatus,
   rekeyVault,
   removeSecret,
@@ -153,7 +154,10 @@ Actions:
                           or a confirm-twice TTY prompt -- never
                           YAW_MCP_VAULT_PASSPHRASE, which holds the old
                           one). The vault is re-keyed, so the code you used
-                          stops working; a new code is shown in its place.
+                          stops working on it and a new code is shown in
+                          its place (--file leaves the source copy
+                          untouched, so the code you used still opens that
+                          copy).
                           --file recovers a copy moved aside (a reset's
                           secrets.json.reset-<timestamp>) into the vault
                           path; it refuses (exit 2) when a vault is already
@@ -1547,11 +1551,28 @@ const ALT_SCREEN_OFF = "\x1b[?1049l";
 /** How many times the user may get the two groups wrong before giving up. */
 const RECOVERY_CONFIRM_ATTEMPTS = 3;
 
+/** How many empty group answers (a bare Enter, ^D, spaces/dashes) are accepted
+ *  before giving up. They are NOT mismatches -- unlike the passphrase prompts,
+ *  an empty entry here means "nothing was typed", not "typed wrong" -- so they
+ *  do not burn RECOVERY_CONFIRM_ATTEMPTS. This separate bound is what still
+ *  terminates the loop on an EOF'd/closed stdin, which answers "" forever
+ *  (readLineFromTTY folds ^D and a stream end into ""), same role as
+ *  MAX_PASSPHRASE_PROMPTS plays for the passphrase prompts. */
+const RECOVERY_CONFIRM_MAX_EMPTY = 5;
+
 /** Show `code` on the prompt stream and have the user type two of its seven
  *  groups back (distinct, chosen at random each attempt), up to
- *  RECOVERY_CONFIRM_ATTEMPTS attempts. Returns "confirmed", "exhausted" or
- *  CANCELLED (^C). Nothing has been saved when this runs, and on anything but
- *  "confirmed" the caller writes nothing.
+ *  RECOVERY_CONFIRM_ATTEMPTS attempts. An EMPTY answer (a bare Enter, ^D --
+ *  which readLineFromTTY folds to "" -- or only spaces/dashes, which normalize
+ *  away) re-prompts without consuming one: nothing was typed, so it is not a
+ *  mismatch, and burning an attempt for it made the three tries vanish under
+ *  the user's fingers. It is counted against RECOVERY_CONFIRM_MAX_EMPTY
+ *  instead, so a closed stdin that answers "" forever still ends the command
+ *  -- with a line on the prompt stream that names WHY (the mismatch wording
+ *  at the bottom of the loop never prints for empties, so without it the user
+ *  would land on "Aborted -- nothing was saved." with no reason).
+ *  Returns "confirmed", "exhausted" or CANCELLED (^C). Nothing has been saved
+ *  when this runs, and on anything but "confirmed" the caller writes nothing.
  *
  *  The code goes to promptStream ONLY -- the terminal end the user answers
  *  on -- never io.out / io.err, so it cannot reach a --json envelope, a
@@ -1575,22 +1596,52 @@ async function issueRecoveryCode(
         "opens the vault if the passphrase is forgotten -- and so can anyone else who has it.\n" +
         "It is not stored anywhere you can read it back, and this screen clears when you are done.\n\n",
     );
-    for (let attempt = 0; attempt < RECOVERY_CONFIRM_ATTEMPTS; attempt++) {
+    for (let attempt = 0, empty = 0; attempt < RECOVERY_CONFIRM_ATTEMPTS && empty < RECOVERY_CONFIRM_MAX_EMPTY; ) {
       const first = randomInt(groups.length);
       let second = randomInt(groups.length - 1);
       if (second >= first) second++;
+      const pair = [first, second];
       let ok = true;
-      for (const g of [first, second]) {
+      for (let i = 0; i < pair.length; i++) {
+        const g = pair[i];
         const answer = await readLineFromTTY(stdin, out, `Type group ${g + 1} of 7 to confirm: `, true);
         if (answer === CANCELLED) return CANCELLED;
-        if (normalizeRecoveryGroup(answer) !== groups[g]) {
+        const typed = normalizeRecoveryGroup(answer);
+        if (typed.length === 0) {
+          // Nothing typed (bare Enter, ^D, only spaces/dashes): re-prompt the
+          // SAME group -- an empty entry is not a mismatch, so no attempt is
+          // spent on it. Bounded by `empty` (not the attempt count), which is
+          // what still ends the loop when a closed stdin answers "" forever.
+          empty++;
+          if (empty >= RECOVERY_CONFIRM_MAX_EMPTY) {
+            // The "That does not match" line below never runs for empties, so
+            // name the reason HERE: confirmRecoveryCodeOrFail reduces this
+            // exit to "Aborted -- nothing was saved." with no cause (unlike
+            // the wrong-group path, whose mismatch line explained it on screen
+            // first). Leave the alternate screen BEFORE writing it -- the
+            // `finally` below writes ALT_SCREEN_OFF again, and everything on
+            // that screen is wiped by leaving it, so a line printed while
+            // still on it would be erased before the user could read it. The
+            // second OFF is a no-op on the primary screen.
+            out.write(ALT_SCREEN_OFF);
+            out.write(
+              "No group was entered -- the prompt was left empty " +
+                `${RECOVERY_CONFIRM_MAX_EMPTY} times in a row. Re-run the command when you have the code written down.\n`,
+            );
+            return "exhausted";
+          }
+          i--;
+          continue;
+        }
+        if (typed !== groups[g]) {
           ok = false;
           break;
         }
       }
       if (ok) return "confirmed";
+      attempt++;
       out.write(
-        attempt + 1 < RECOVERY_CONFIRM_ATTEMPTS
+        attempt < RECOVERY_CONFIRM_ATTEMPTS
           ? "That does not match the code above. Check what you wrote down and try again.\n"
           : "That does not match the code above.\n",
       );
@@ -1663,10 +1714,16 @@ async function auditVaultEvents(home: string, kinds: AuditEventKind[]): Promise<
   for (const event of kinds) await appendAuditEvent({ server: "", secret: "", event }, home);
 }
 
-/** The --json envelopes' `recovery` field: whether the vault as saved carries
- *  a usable recovery slot. */
-function recoveryField(vault: VaultFile): "set" | "none" {
-  return recoveryStatus(vault).state === "set" ? "set" : "none";
+/** The --json envelopes' `recovery` field: the vault-as-saved's recovery-code
+ *  state, the FULL RecoveryState vocabulary -- exactly doctor's
+ *  `vault.recovery` (same values, from the same recoveryStatus), so the two
+ *  agree on an un-upgraded v1/v2 vault ("unsupported", which the old
+ *  "set" | "none" collapse reported as a plain "none") and on a malformed
+ *  slot ("malformed", likewise). Never null here: every caller holds a vault
+ *  that was just written or loaded (doctor's null is only "no readable
+ *  vault", a state no envelope on this side describes). Never the code. */
+function recoveryField(vault: VaultFile): RecoveryState {
+  return recoveryStatus(vault).state;
 }
 
 /** The two prompt labels and the warning subject of a confirm-twice
@@ -2246,7 +2303,8 @@ export async function runSecrets(
             // unknown, never "not stale". false is relative to bundles_path,
             // which may not be the file a client's yaw-mcp loaded.
             running_servers_stale: consumers === null ? null : consumers.namespaces.length > 0,
-            // Whether the saved vault carries a recovery slot. Never the code.
+            // The saved vault's recovery-code state, full vocabulary -- the
+            // same values doctor's `vault.recovery` reports. Never the code.
             recovery: recoveryField(vault),
           })}\n`,
         );
@@ -3266,10 +3324,18 @@ async function runSecretsRecover(opts: SecretsCommandOptions, io: SecretsIo): Pr
         })}\n`,
       );
     } else {
+      // fromCopy only rewrites `path`; the source copy is untouched, so the
+      // code just used still opens IT -- claiming it "no longer opens it" sent
+      // the reader of a moved-aside copy to look for a vault that is fine.
       io.out(
-        `Recovered the vault at ${path}${fromCopy ? ` from ${source}` : ""}: ${count} secret${count === 1 ? "" : "s"} kept, now under the new passphrase and a fresh data key. The recovery code you used no longer opens it.\n`,
+        `Recovered the vault at ${path}${fromCopy ? ` from ${source}` : ""}: ${count} secret${count === 1 ? "" : "s"} kept, now under the new passphrase and a fresh data key.`,
       );
-      if (issuedCode !== undefined) io.out("A new recovery code replaced it.\n");
+      io.out(
+        fromCopy
+          ? ` The source copy at ${source} is unchanged and still opens under the recovery code you used; the recovered vault at ${path} is under the new passphrase${issuedCode !== undefined ? " and a fresh recovery code (shown on the confirmation screen just now -- write it down; that screen has cleared)" : ""}.\n`
+          : " The recovery code you used no longer opens it.\n",
+      );
+      if (issuedCode !== undefined && !fromCopy) io.out("A new recovery code replaced it.\n");
     }
     const envKeyed = (process.env.YAW_MCP_VAULT_PASSPHRASE ?? "").length > 0;
     rotateVaultNudge(io, path, json, envKeyed, "vault-recovered");
