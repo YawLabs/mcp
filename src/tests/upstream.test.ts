@@ -229,6 +229,12 @@ vi.mock("../oam-spawn.js", async (importOriginal) => {
     // belowMin, so any version would pass -- but a fixture that contradicts
     // MIN_OAM_VERSION reads as a bug to whoever bumps the floor next.
     probeOam: vi.fn(() => ({ bin: "/usr/bin/oam", version: actual.MIN_OAM_VERSION, belowMin: false })),
+    // The Windows + non-node-broker npx rewrite (oam spawn ignoring
+    // windowsVerbatimArguments workaround). Passthrough by default so every
+    // pre-existing test still spawns byte-for-byte whatever its fixture says;
+    // the wiring test below mocks a rewrite to observe it, and its paired
+    // negative case asserts the passthrough held.
+    npxUnderNode: vi.fn((command: string, args: string[]) => ({ command, args })),
   };
 });
 
@@ -258,7 +264,7 @@ vi.mock("@modelcontextprotocol/sdk/client/streamableHttp.js", () => ({
 // Import the mocked modules so the wiring tests can configure/assert them.
 import { defaultRuntime } from "../default-runtime.js";
 import { log } from "../logger.js";
-import { MIN_OAM_VERSION, resolveManagedSpawn, resolveOamSpawn } from "../oam-spawn.js";
+import { MIN_OAM_VERSION, npxUnderNode, resolveManagedSpawn, resolveOamSpawn } from "../oam-spawn.js";
 import { appendAuditEvent } from "../secrets-audit.js";
 // Import the mocked secrets-vault module so individual tests can configure it.
 import {
@@ -2527,6 +2533,80 @@ describe("connectToUpstream oam boot-probe fallback", () => {
     expect(_sdkBehavior.stdioConstructions[1]?.args).toEqual(["-y", "@yawlabs/fetch-mcp@latest"]);
     // The downgrade attempt skips the rewrite entirely.
     expect(vi.mocked(resolveOamSpawn)).toHaveBeenCalledOnce();
+  });
+
+  // The wiring case for the workaround, in a nested describe so the rewrite
+  // implementation is installed and RESTORED around exactly these tests:
+  // `vi.clearAllMocks()` in the parent afterEach clears calls, not
+  // implementations (the managed describe re-primes resolveManagedSpawn for
+  // this same reason), and a leaked rewrite would silently change every later
+  // spawn in this file.
+  describe("npxUnderNode respawn wiring", () => {
+    beforeEach(() => {
+      vi.mocked(npxUnderNode).mockImplementation((command, args) =>
+        command === "npx" ? { command: "C:\\nodejs\\node.exe", args: ["C:\\npx-cli.js", ...args] } : { command, args },
+      );
+    });
+    afterEach(() => {
+      vi.mocked(npxUnderNode).mockImplementation((command: string, args: string[]) => ({ command, args }));
+    });
+
+    it("applies npxUnderNode to the respawn argv (the oam spawn-verbatim workaround wiring)", async () => {
+      // The respawn restores the ORIGINAL bare npx while the broker process is
+      // still oam -- the exact case oam's ignored windowsVerbatimArguments turns
+      // into `'"npx ^"-y^" ..."' is not recognized ...`. upstream.ts must run the
+      // final launch through npxUnderNode on every attempt; the pure rewrite's
+      // four gates (win32, npx, broker-not-node, completable) live in
+      // oam-spawn.test.ts, so this pins the CALL, its INPUT, and that the output
+      // reaches the transport.
+      vi.mocked(resolveOamSpawn).mockResolvedValue({ command: "/usr/bin/oam", args: ["run", "/e.js"] });
+      let connects = 0;
+      _sdkBehavior.clientConnect = () => {
+        connects++;
+        return connects === 1 ? Promise.reject(new Error("oam crashed on boot")) : Promise.resolve();
+      };
+      const config = makeLocalConfig({
+        runtime: "oam",
+        command: "npx",
+        args: ["-y", "@yawlabs/fetch-mcp@latest"],
+      });
+
+      const connection = await connectToUpstream(config);
+
+      expect(connection.status).toBe("connected");
+      expect(vi.mocked(npxUnderNode)).toHaveBeenCalledWith("npx", ["-y", "@yawlabs/fetch-mcp@latest"]);
+      expect(_sdkBehavior.stdioConstructions[1]?.command).toBe("C:\\nodejs\\node.exe");
+      expect(_sdkBehavior.stdioConstructions[1]?.args).toEqual(["C:\\npx-cli.js", "-y", "@yawlabs/fetch-mcp@latest"]);
+    });
+  });
+
+  it("leaves every other spawn byte-identical through the npxUnderNode call (default passthrough)", async () => {
+    // The counterpart to the wiring case: with the mock at its passthrough
+    // default -- what every other test in this file runs -- the rewrite is
+    // still CALLED on the respawn, and changes nothing. A non-npx config
+    // exercises the same invariant on a single-attempt spawn: no oam rewrite,
+    // no respawn, command untouched.
+    vi.mocked(resolveOamSpawn).mockResolvedValue({ command: "/usr/bin/oam", args: ["run", "/e.js"] });
+    let connects = 0;
+    _sdkBehavior.clientConnect = () => {
+      connects++;
+      return connects === 1 ? Promise.reject(new Error("oam crashed on boot")) : Promise.resolve();
+    };
+    await connectToUpstream(makeLocalConfig({ runtime: "oam", command: "npx", args: ["-y", "x"] }));
+    expect(vi.mocked(npxUnderNode)).toHaveBeenCalledWith("npx", ["-y", "x"]);
+    expect(_sdkBehavior.stdioConstructions.map((c) => c.command)).toEqual(["/usr/bin/oam", "npx"]);
+
+    vi.mocked(npxUnderNode).mockClear();
+    vi.mocked(resolveOamSpawn).mockClear();
+    // The shared `connects` counter is already past 2 after the successful
+    // respawn above; a config-specific always-reject keeps this a genuine
+    // first-attempt failure rather than an accidental second-attempt success.
+    _sdkBehavior.clientConnect = () => Promise.reject(new Error("stop after spawn"));
+    await expect(
+      connectToUpstream(makeLocalConfig({ runtime: "oam", command: "uvx", args: ["some-pkg"] })),
+    ).rejects.toBeInstanceOf(ActivationError);
+    expect(vi.mocked(npxUnderNode)).toHaveBeenCalledWith("uvx", ["some-pkg"]);
+    expect(_sdkBehavior.stdioConstructions.at(-1)?.command).toBe("uvx");
   });
 
   it("downgrades exactly once: a second failure propagates (no retry ladder)", async () => {

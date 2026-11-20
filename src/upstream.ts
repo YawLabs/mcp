@@ -27,7 +27,7 @@ import { defaultRuntime } from "./default-runtime.js";
 import { gitEntryBuilt } from "./git-build-state.js";
 import { stripInternalSecretsFromEnv } from "./internal-secret-env.js";
 import { log } from "./logger.js";
-import { oamHeapOomHint, probeOam, resolveManagedSpawn, resolveOamSpawn } from "./oam-spawn.js";
+import { npxUnderNode, oamHeapOomHint, probeOam, resolveManagedSpawn, resolveOamSpawn } from "./oam-spawn.js";
 import { gitFailedPath } from "./paths.js";
 import { appendAuditEvent } from "./secrets-audit.js";
 import {
@@ -2247,6 +2247,27 @@ async function connectToUpstreamOnce(
           resolved = managed;
         }
       }
+      // WINDOWS + NON-NODE BROKER + a launch still named `npx`: run it as
+      // `node npx-cli.js ...` instead. This is the oam->npx downgrade respawn's
+      // path -- suppressRewrites restores the ORIGINAL bare npx command while
+      // the broker process itself is still oam -- and it was broken there: the
+      // MCP SDK's cross-spawn wraps the bare npx in `cmd /d /s /c "npx ^"-y^"
+      // ..."` with windowsVerbatimArguments, oam's child_process runtime
+      // IGNORES that flag (measured 3/3 garbage under oam, clean under node),
+      // and the double-escaped whole line becomes the program name ("is not
+      // recognized as an internal or external command" with carets). node.exe
+      // is a real .exe, which cross-spawn spawns directly with no cmd.exe
+      // detour, so the ignore-verbatim bug never engages.
+      //
+      // WORKAROUND, not a feature: DROP this when oam's spawn honors
+      // windowsVerbatimArguments -- the comment above names the bug to remove
+      // it for. It is a no-op off Windows, under a node-hosted broker, and for
+      // every non-npx launch (uv/uvx/docker/python, oam, managed node), so no
+      // other server's spawn changes. npxUnderNode returns the launch
+      // unchanged whenever it cannot complete the rewrite (no node.exe on
+      // PATH, no npx-cli.js beside it), so the failure mode is exactly the
+      // pre-rewrite one.
+      resolved = npxUnderNode(resolved.command, resolved.args);
     } catch (err) {
       if (err instanceof ActivationError) throw err;
       const message = err instanceof Error ? err.message : String(err);
