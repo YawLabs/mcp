@@ -20,6 +20,7 @@ import {
   npxCacheNodeModules,
   npxSpec,
   npxSpecIndex,
+  npxUnderNode,
   OAM_HOSTABLE_NODE_BOOLEAN_FLAGS,
   OAM_HOSTABLE_NODE_VALUE_FLAGS,
   OAM_INSTALL_PS1,
@@ -811,6 +812,141 @@ describe("nodeLaunchKind", () => {
     expect(nodeLaunchKind("docker")).toBeNull();
     expect(nodeLaunchKind("uvx")).toBeNull();
     expect(nodeLaunchKind("oam")).toBeNull();
+  });
+});
+
+// The oam->npx downgrade respawn's Windows workaround: a bare `npx` spawned
+// while the broker runs on oam goes through cross-spawn's cmd.exe detour with
+// windowsVerbatimArguments, which oam's child_process runtime IGNORES
+// (measured 3/3 garbage under oam, clean under node) -- the double-escaped
+// line becomes the program name ("is not recognized as an internal or
+// external command"). Running the same launch as `node npx-cli.js ...` skips
+// the detour (node.exe is a real .exe) and the bug never engages. These pin
+// the rewrite's FOUR gates: win32, npx, broker-not-node, and a completable
+// rewrite -- everything else must come back byte-identical so no other
+// server's spawn changes.
+describe("npxUnderNode", () => {
+  // Fixture shape: a REAL temp dir laid out like a Windows node install --
+  // node.exe on a PATH entry, and the npx-cli.js candidate beside it
+  // (npxCliCandidates probes three; the first -- beside the binary -- is the
+  // Windows npm layout and the one this fixture stages). Real files, not the
+  // SYNTH_ROOT injection at the top of this file: the injection answers only
+  // statSync/accessSync there, and this search also runs existsSync -- a fake
+  // path would reach the real fs, ENOENT every candidate, and the rewrite
+  // would never fire.
+  function nodeInstall(): { env: NodeJS.ProcessEnv; nodeBin: string; cli: string; cleanup: () => void } {
+    const dir = mkdtempSync(join(tmpdir(), "npxundernode-"));
+    const nodeBin = join(dir, "node.exe");
+    const cli = join(dir, "node_modules", "npm", "bin", "npx-cli.js");
+    writeFileSync(nodeBin, "");
+    mkdirSync(dirname(cli), { recursive: true });
+    writeFileSync(cli, "");
+    // PATHEXT spelled lowercase so the candidate resolveBinAbsolute builds is
+    // byte-identical to the file on disk: it appends the PATHEXT extension to
+    // "node" and returns it VERBATIM (a real Windows PATHEXT says ".EXE", so
+    // production comes back as `node.EXE` -- which CreateProcess runs
+    // case-insensitively; the fixture just must not tie the assertion to that
+    // casing accident).
+    return {
+      env: { PATH: dir, PATHEXT: ".com;.exe" },
+      nodeBin,
+      cli,
+      cleanup: () => rmSync(dir, { recursive: true, force: true }),
+    };
+  }
+
+  const npxArgs = ["-y", "@yawlabs/kubernetes-mcp-server@latest", "serve"];
+  // The broker-not-node gate is process.execPath in production; both branches
+  // are pinned with an injectable execPath so the suite runs identically on a
+  // Windows dev machine (node) and a Linux runner (whatever node is there).
+  const oamExec = String.raw`C:\oam\oam.exe`;
+
+  it("rewrites a bare npx to node + npx-cli.js when the broker is not node (win32)", () => {
+    const fx = nodeInstall();
+    // resolveBinAbsolute folds the found path to win32 spelling (identity on a
+    // Windows runner), and npxCliCandidates builds the candidate from THAT --
+    // so both the expected command and the exists key go through the same
+    // fold. Matching `p === fx.cli` raw would tie the assertion to the host's
+    // separator rather than to the layout.
+    const exists = (p: string) => p === winNormalize(fx.cli, "win32");
+    try {
+      expect(npxUnderNode("npx", npxArgs, { platform: "win32", execPath: oamExec, env: fx.env, exists })).toEqual({
+        command: winNormalize(fx.nodeBin, "win32"),
+        args: [winNormalize(fx.cli, "win32"), ...npxArgs],
+      });
+      // npx.cmd -- the shim npm actually ships on Windows -- is the same kind.
+      expect(
+        npxUnderNode("npx.cmd", npxArgs, { platform: "win32", execPath: oamExec, env: fx.env, exists }).command,
+      ).toBe(winNormalize(fx.nodeBin, "win32"));
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  it("leaves the launch untouched under a node-hosted broker", () => {
+    const fx = nodeInstall();
+    try {
+      const out = npxUnderNode("npx", npxArgs, {
+        platform: "win32",
+        execPath: fx.nodeBin,
+        env: fx.env,
+        exists: () => true,
+      });
+      expect(out).toEqual({ command: "npx", args: npxArgs });
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  it("leaves the launch untouched off Windows (no cmd.exe detour to bypass)", () => {
+    const fx = nodeInstall();
+    try {
+      const out = npxUnderNode("npx", npxArgs, { platform: "linux", execPath: oamExec, env: fx.env });
+      expect(out).toEqual({ command: "npx", args: npxArgs });
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  it("leaves a non-npx launch untouched (uv/uvx/docker/python, oam, managed node)", () => {
+    const fx = nodeInstall();
+    try {
+      for (const command of ["uvx", "docker", "python", "/opt/node/bin/node", String.raw`C:\oam\oam.exe`]) {
+        expect(npxUnderNode(command, ["x"], { platform: "win32", execPath: oamExec, env: fx.env })).toEqual({
+          command,
+          args: ["x"],
+        });
+      }
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  it("stays on bare npx when no node.exe resolves on PATH", () => {
+    const out = npxUnderNode("npx", npxArgs, {
+      platform: "win32",
+      execPath: oamExec,
+      env: { PATH: "" },
+      exists: () => true,
+    });
+    expect(out).toEqual({ command: "npx", args: npxArgs });
+  });
+
+  it("stays on bare npx when no npx-cli.js sits beside the node it found", () => {
+    // A half-rewrite (node binary, no npx-cli.js) would spawn ENOENT and lose
+    // the diagnosis the cmd.exe message carries: all-or-nothing instead.
+    const fx = nodeInstall();
+    try {
+      const out = npxUnderNode("npx", npxArgs, {
+        platform: "win32",
+        execPath: oamExec,
+        env: fx.env,
+        exists: () => false,
+      });
+      expect(out).toEqual({ command: "npx", args: npxArgs });
+    } finally {
+      fx.cleanup();
+    }
   });
 });
 

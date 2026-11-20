@@ -113,6 +113,9 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { killAndDetach } from "./bounded-child.js";
+// npxCliCandidates only -- the npm npx-cli.js layout, shared with the
+// compliance suite's own npx fallback so the two resolve the same file.
+import { npxCliCandidates } from "./compliance-cmd.js";
 import { CURRENT_OS, type InstallOS } from "./install-targets.js";
 import { stripInternalSecretsFromEnv } from "./internal-secret-env.js";
 import { log } from "./logger.js";
@@ -2927,6 +2930,63 @@ export function resolveManagedSpawn(
       return hit;
     },
   });
+}
+
+/**
+ * Rewrite a bare `npx` launch to `node npx-cli.js ...` when -- and ONLY when
+ * -- the broker process itself is not running on node and the host is Windows.
+ *
+ * THE BUG THIS WORKS AROUND (MEASURED 2026-11-13, win-arm64): the MCP SDK's
+ * StdioClientTransport spawns through cross-spawn, and on Windows cross-spawn
+ * routes any non-.exe command through `cmd /d /s /c "..."` with
+ * windowsVerbatimArguments:true -- a string that carries the MCP SDK's OWN
+ * escaping of each argv element (`npx ^\"-y\" ...`). node's spawn honors
+ * windowsVerbatimArguments; oam's child_process runtime IGNORES it (3/3 runs
+ * garbage under oam, clean under node), so oam re-escapes the already-escaped
+ * line a second time and the whole quoted string becomes the program name:
+ * `'"npx ^"-y^" ..."' is not recognized as an internal or external command`,
+ * with carets under every quote -- a second install_failure on top of the
+ * server's own first-attempt failure. The oam->npx downgrade respawn in
+ * upstream.ts is the only path that reaches this: every other npx sidecar
+ * boots on attempt 1 and never respawns.
+ *
+ * The rewrite reproduces npx.cmd (`node.exe .../npx-cli.js %*`) directly: a
+ * node.exe resolved on PATH is an .exe, which cross-spawn passes to
+ * CreateProcess WITHOUT the cmd.exe detour, so no quoting happens at all and
+ * the ignore-verbatim bug never engages. Off Windows there is no cmd.exe
+ * re-escape to ignore (cross-spawn execs .cmd shims directly), so the launch
+ * stays byte-identical. Under a node-hosted broker the spawn is already
+ * correct -- execPath is node -- so this is a no-op there too.
+ *
+ * Returns the launch unchanged whenever the rewrite cannot be completed: no
+ * node.exe on PATH (resolveBinAbsolute), or no npx-cli.js beside that binary
+ * (npxCliCandidates, the same list compliance-cmd probes). A bare npx then
+ * spawns exactly as it did before this existed -- broken under oam, but no
+ * worse, and a silent half-rewrite (a node binary with no npx-cli.js) would
+ * fail with ENOENT instead of the cmd.exe message.
+ */
+export function npxUnderNode(
+  command: string,
+  args: string[],
+  opts: {
+    platform?: NodeJS.Platform;
+    execPath?: string;
+    env?: NodeJS.ProcessEnv;
+    exists?: (p: string) => boolean;
+  } = {},
+): { command: string; args: string[] } {
+  const platform = opts.platform ?? process.platform;
+  if (platform !== "win32") return { command, args };
+  if (nodeLaunchKind(command) !== "npx") return { command, args };
+  const execPath = opts.execPath ?? process.execPath;
+  if (nodeLaunchKind(execPath) === "node") return { command, args };
+  const env = opts.env ?? process.env;
+  const fileExists = opts.exists ?? existsSync;
+  const nodeBin = resolveBinAbsolute("node", env, platform);
+  if (nodeBin === null) return { command, args };
+  const cli = npxCliCandidates(nodeBin, platform).find((c) => fileExists(c));
+  if (cli === undefined) return { command, args };
+  return { command: nodeBin, args: [cli, ...args] };
 }
 
 /** True when a launch command names an oam binary -- bare "oam"/"oam.exe" or

@@ -286,8 +286,14 @@ export async function resolveSuiteLaunch(
 /** Candidate locations of npm's `npx-cli.js`, relative to the running node
  *  binary. Windows lays npm out beside node.exe; POSIX installs put it under
  *  `<prefix>/lib/node_modules`. Both shapes are probed on every platform so
- *  unusual layouts (nvm, volta, scoop, a portable unpack) still resolve. */
-function npxCliCandidates(execPath: string, platform: NodeJS.Platform): string[] {
+ *  unusual layouts (nvm, volta, scoop, a portable unpack) still resolve.
+ *
+ *  Exported for oam-spawn's npxUnderNode, which reuses this same list to run
+ *  a bare `npx` launch as `node npx-cli.js` under a non-node broker (npx.cmd
+ *  is literally `node.exe .../npx-cli.js %*`). The layout knowledge lives in
+ *  one place: two copies of these three candidates would drift apart and the
+ *  two launchers would resolve different npm copies on the same machine. */
+export function npxCliCandidates(execPath: string, platform: NodeJS.Platform): string[] {
   // Use the path flavour of the TARGET platform, not the host's. resolveNpxLaunch
   // accepts `platform` as an injectable, and until this was keyed off it the
   // injectable was a lie: dirname("C:\nodejs\node.exe") is "." under POSIX
