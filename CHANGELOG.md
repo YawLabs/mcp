@@ -4,6 +4,8 @@ All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented 
 
 ## Unreleased
 
+## 1.1.16
+
 **Fixed -- the oam->npx downgrade respawn runs npx under node.exe on Windows**
 
 On Windows, a bare `npx` respawn while the broker runs on oam went through cross-spawn's `cmd /d /s /c` quoting with `windowsVerbatimArguments`, which oam's child_process runtime ignores -- the double-escaped line became the program name and the respawn reported an install failure on top of the server's own. The launch is now rewritten to `node.exe npx-cli.js ...` (npx.cmd's own shape) only in that case: win32, an npx command, a non-node broker, and a completable rewrite; everywhere else the spawn is byte-identical.
