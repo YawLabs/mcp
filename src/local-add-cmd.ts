@@ -87,6 +87,7 @@ import {
   SECRET_NAME_RE,
   vaultPath,
 } from "./secrets-vault.js";
+import { policyRefusalForCheck } from "./spawn-gate.js";
 import { TransientConnectError, withTransientUpstream } from "./transient-upstream.js";
 // The removal preview renders command / args / url / name straight out of
 // bundles.json immediately above a [y/N] prompt, so it needs the same
@@ -225,7 +226,10 @@ export interface AddCommandOptions {
   io?: { stdin?: NodeJS.ReadableStream; stdout?: NodeJS.WritableStream; terminal?: boolean };
   runPm?: GitBuildContext["runPm"];
   resolveToken?: GitBuildContext["resolveToken"];
-  startCheck?: (config: UpstreamServerConfig) => Promise<{ ok: true; tools: number } | { ok: false; error: string }>;
+  startCheck?: (
+    config: UpstreamServerConfig,
+    check?: StartCheckOptions,
+  ) => Promise<{ ok: true; tools: number } | { ok: false; error: string }>;
   storeSecret?: (name: string) => Promise<boolean>;
   home?: string;
   cwd?: string;
@@ -1359,9 +1363,29 @@ function gitEntryEnv(manifest: GitManifest, overrides: Record<string, string>): 
  *  shell (shellActivationMessage): the activation error's own text ends in a
  *  remedy addressed to an MCP client. An error with no config pointer -- a
  *  locked vault -- passes through verbatim, which startRemedy relies on. */
+export interface StartCheckOptions {
+  cwd?: string;
+  home?: string;
+  /** The entry as it will be stored, when that is what the policy should judge.
+   *  A git server is started from its build (a node script under the build
+   *  dir), but a `url:` deny names its repository, which only the stored entry
+   *  carries. */
+  policyAs?: UpstreamServerConfig;
+}
+
 export async function defaultStartCheck(
   config: UpstreamServerConfig,
+  opts: StartCheckOptions = {},
 ): Promise<{ ok: true; tools: number } | { ok: false; error: string }> {
+  // The check runs the server, so the allow/deny policy applies to it: to the
+  // launch itself, and to the stored entry when that is a different identity.
+  const loaded = await loadLocalBundles({ cwd: opts.cwd ?? process.cwd(), home: opts.home });
+  const others = loaded.config?.servers ?? [];
+  const where = { cwd: opts.cwd, home: opts.home };
+  const refused =
+    (opts.policyAs ? await policyRefusalForCheck(opts.policyAs, others, where) : null) ??
+    (await policyRefusalForCheck(config, others, where));
+  if (refused !== null) return { ok: false, error: refused };
   try {
     const tools = await withTransientUpstream(config, async (conn) => conn.tools.length);
     return { ok: true, tools };
@@ -1672,18 +1696,21 @@ async function runAddGit(opts: AddCommandOptions, spec: GitSpec): Promise<AddCom
     // anything that is not a connect failure). Escaping here would skip the
     // write below and leave the build on disk with no entry pinning it.
     try {
-      started = await (opts.startCheck ?? defaultStartCheck)({
-        id: `local-${namespace}`,
-        name,
-        namespace,
-        type: "local",
-        transport: "stdio",
-        command: gitNodeCommand(),
-        args: [join(pkgDir, ...build.entry.split(/[\\/]/)), ...storedArgs],
-        cwd: pkgDir,
-        ...(checkEnv ? { env: checkEnv } : {}),
-        isActive: true,
-      });
+      started = await (opts.startCheck ?? defaultStartCheck)(
+        {
+          id: `local-${namespace}`,
+          name,
+          namespace,
+          type: "local",
+          transport: "stdio",
+          command: gitNodeCommand(),
+          args: [join(pkgDir, ...build.entry.split(/[\\/]/)), ...storedArgs],
+          cwd: pkgDir,
+          ...(checkEnv ? { env: checkEnv } : {}),
+          isActive: true,
+        },
+        { cwd, home, policyAs: { ...willStore, namespace, isActive: true } as UpstreamServerConfig },
+      );
     } catch (e) {
       started = { ok: false, error: e instanceof Error ? e.message : String(e) };
     }

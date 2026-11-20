@@ -1142,3 +1142,76 @@ describe("runAudit -- scrubbed echoes", () => {
     expect(err).not.toContain(secret);
   });
 });
+
+describe("runAudit obeys the allow/deny policy", () => {
+  const entry = { namespace: "ssh", type: "local", command: "node", args: ["/srv/ssh.js"] };
+  const twin = { namespace: "ssh2", type: "local", command: "node", args: ["/srv/ssh.js"] };
+  let home: string;
+
+  afterEach(() => rmSync(home, { recursive: true, force: true }));
+
+  async function audit(config: string, namespace = "ssh") {
+    home = makeHome([entry, twin]);
+    writeFileSync(join(home, CONFIG_DIRNAME, "config.json"), config);
+    const io = captureIO();
+    let started = false;
+    const r = await runAudit({
+      namespace,
+      home,
+      cwd: home,
+      out: io.push,
+      err: io.pushErr,
+      runner: async () => {
+        started = true;
+        return { grade: "A", score: 99 };
+      },
+    });
+    return { code: r.exitCode, started, err: io.err.join("") };
+  }
+
+  it.each([
+    ["a blocked namespace", '{ "blocked": ["ssh"] }', "ssh", "not allowed by the project profile"],
+    ["the same server under another namespace", '{ "blocked": ["ssh"] }', "ssh2", "command:/srv/ssh.js"],
+    ["an identity entry", '{ "blocked": ["command:/srv/ssh.js"] }', "ssh", "not allowed"],
+    ["an empty allow-list", '{ "servers": [] }', "ssh", "not allowed"],
+    ["a broken policy file", "{", "ssh", "no MCP server may start"],
+  ])("does not start the server for %s", async (_name, config, namespace, text) => {
+    const r = await audit(config, namespace);
+    expect(r.code).toBe(2);
+    expect(r.started).toBe(false);
+    expect(r.err).toContain(text);
+  });
+
+  it("sends an identity refusal to the blocked entry, not to the allow-list", async () => {
+    // Editing `servers` cannot lift a `blocked` entry that names the launch
+    // identity, so the generic "Change `servers` or `blocked` there to allow
+    // it" was a dead end here (the broker's wording at server.ts
+    // spawnGateRefusalText is the one it has to agree with).
+    const r = await audit('{ "blocked": ["command:/srv/ssh.js"] }');
+    expect(r.code).toBe(2);
+    expect(r.err).toContain('the same server as a "blocked" entry');
+    expect(r.err).toContain("Remove that blocked entry to allow it");
+    expect(r.err).toContain("listing it in `servers` does not");
+    expect(r.err).not.toContain("Change `servers` or `blocked` there");
+  });
+
+  it("a plain namespace deny keeps the generic allow-list remedy", async () => {
+    const r = await audit('{ "blocked": ["ssh"] }');
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("Change `servers` or `blocked` there to allow it");
+    expect(r.err).not.toContain("Remove that blocked entry");
+  });
+
+  it("a broken policy file points at the file message, not at the lists", async () => {
+    const r = await audit("{");
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("no MCP server may start");
+    expect(r.err).not.toContain("Change `servers` or `blocked` there");
+  });
+
+  it("still audits a server the policy allows", async () => {
+    const r = await audit('{ "blocked": ["unrelated"] }');
+    expect(r.code).toBe(0);
+    expect(r.started).toBe(true);
+  });
+});

@@ -2651,9 +2651,9 @@ describe("ConnectServer", () => {
         // getProfiledActiveServers set discover filters pack history on.
         const priv = getPrivate(server);
         priv.config = makeConfig([
-          makeServerConfig({ id: "0", namespace: "kept" }),
-          makeServerConfig({ id: "1", namespace: "off", isActive: false }),
-          makeServerConfig({ id: "2", namespace: "denied" }),
+          makeServerConfig({ id: "0", namespace: "kept", args: ["kept"] }),
+          makeServerConfig({ id: "1", namespace: "off", args: ["off"], isActive: false }),
+          makeServerConfig({ id: "2", namespace: "denied", args: ["denied"] }),
         ]);
         priv.profile = { path: "/p/.yaw-mcp/config.json", blocked: ["denied"] };
         priv.learning.loadSnapshot({

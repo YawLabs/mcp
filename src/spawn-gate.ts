@@ -21,7 +21,14 @@
 // stops being actionable in either.
 
 import { type ComplianceGrade, classifyGrade, parseMinCompliance, passesMinCompliance } from "./compliance.js";
-import { type Profile, profileAllows } from "./config-loader.js";
+import { loadYawMcpConfig, type PolicyError, type Profile, profileAllows, toProfile } from "./config-loader.js";
+import {
+  displayIdentity,
+  normalizeIdentityEntry,
+  type ServerIdentity,
+  serverIdentity,
+  sharedIdentity,
+} from "./server-identity.js";
 import type { UpstreamServerConfig } from "./types.js";
 
 /** Why a spawn was refused. One variant per gate, in the order they are
@@ -30,10 +37,12 @@ import type { UpstreamServerConfig } from "./types.js";
  *  the user turned off deliberately). */
 export type SpawnRefusal =
   | { kind: "disabled"; namespace: string }
+  /** A policy file is broken, so no server may start. */
+  | { kind: "policy-invalid"; namespace: string; errors: PolicyError[] }
   /** `profilePath` is the config file the allow/deny list came from, so the
    *  refusal can name the file to edit. Undefined only when a caller passes a
    *  profile with no path, which toProfile never produces. */
-  | { kind: "profile"; namespace: string; profilePath: string | undefined }
+  | { kind: "profile"; namespace: string; profilePath: string | undefined; identity?: string }
   /** `grade` is the server's grade AS STORED -- possibly an unrecognized
    *  string, which is a different refusal from "graded below the floor" and
    *  has to be reported as such (see complianceRefusalReason). */
@@ -56,6 +65,10 @@ export function resolveMinCompliance(env: NodeJS.ProcessEnv = process.env): Comp
  * disabled, then project profile, then the YAW_MCP_MIN_COMPLIANCE floor.
  * Returns the refusal, or null when the server clears all three.
  *
+ * `allServers` is the configured server list: a deny written against one
+ * namespace extends to every server with the same launch identity, which only
+ * the whole list can answer.
+ *
  * Every caller here actually EXECUTES the server's configured command with its
  * resolved env (vault secrets included), so "we disconnect afterwards" buys a
  * transient connect no exemption -- and neither does "this is only one tool
@@ -65,15 +78,157 @@ export function spawnGateVerdict(
   server: UpstreamServerConfig,
   profile: Profile | null,
   minCompliance: ComplianceGrade | null,
+  allServers: readonly UpstreamServerConfig[] = [server],
 ): SpawnRefusal | null {
   if (!server.isActive) return { kind: "disabled", namespace: server.namespace };
-  if (!profileAllows(profile, server.namespace)) {
-    return { kind: "profile", namespace: server.namespace, profilePath: profile?.path };
+  if (profile?.policyErrors?.length) {
+    return { kind: "policy-invalid", namespace: server.namespace, errors: profile.policyErrors };
+  }
+  if (!profileAllows(effectiveProfile(profile, allServers), server.namespace)) {
+    const identity = profile ? identityBlockOf(profile, allServers, server.namespace) : null;
+    return {
+      kind: "profile",
+      namespace: server.namespace,
+      profilePath: profile?.path,
+      ...(identity ? { identity } : {}),
+    };
   }
   if (minCompliance !== null && !passesMinCompliance(server.complianceGrade, minCompliance)) {
     return { kind: "compliance", namespace: server.namespace, grade: server.complianceGrade, min: minCompliance };
   }
   return null;
+}
+
+/**
+ * Why a shell command that starts a configured server only to check it (`audit`,
+ * the start check in `add` and `update`) may not, or null. These do not load a
+ * server for use, so "disabled" and the compliance floor do not apply (auditing
+ * is how a server gets a grade). The allow/deny policy does.
+ */
+export async function policyRefusalForCheck(
+  server: UpstreamServerConfig,
+  allServers: readonly UpstreamServerConfig[],
+  opts: { cwd?: string; home?: string } = {},
+): Promise<string | null> {
+  const profile = toProfile(await loadYawMcpConfig(opts));
+  const others = allServers.filter((s) => s.namespace !== server.namespace);
+  const refusal = spawnGateVerdict({ ...server, isActive: true }, profile, null, [...others, server]);
+  // The remedy differs per refusal kind, so the sentence does too. Pointing an
+  // identity refusal at `servers` is actively wrong: listing the namespace
+  // there does not lift a `blocked` entry naming its launch identity (see the
+  // broker's wording in server.ts spawnGateRefusalText), and a broken policy
+  // file has no `servers`/`blocked` edit to make -- only the file message.
+  if (refusal?.kind === "policy-invalid") return policyErrorText(refusal.errors);
+  if (refusal?.kind !== "profile") return null;
+  const where = refusal.profilePath ?? "your yaw-mcp config";
+  if (refusal.identity) {
+    return `"${refusal.namespace}" is not allowed by the project profile at ${where} (it launches ${refusal.identity}, the same server as a "blocked" entry), so it was not started. Remove that blocked entry to allow it; listing it in \`servers\` does not.`;
+  }
+  return `"${refusal.namespace}" is not allowed by the project profile at ${where}, so it was not started. Change \`servers\` or \`blocked\` there to allow it.`;
+}
+
+/** The refusal text for broken policy files: each file, what is wrong with it
+ *  and how to fix it. Shared because the fix is the same from either side. */
+export function policyErrorText(errors: readonly PolicyError[]): string {
+  return `yaw-mcp's policy config is broken, so no MCP server may start. ${errors.map((e) => e.message).join(" ")}`;
+}
+
+type IdentifiedServer = ServerIdentity & { namespace: string };
+
+const identify = (servers: readonly UpstreamServerConfig[]): IdentifiedServer[] =>
+  servers.map((server) => ({ namespace: server.namespace, ...serverIdentity(server) }));
+
+/** Each namespace `blocked` reaches through a launch identity, and that identity. */
+function identityBlocks(profile: Profile, identified: readonly IdentifiedServer[]): Map<string, string> {
+  const blocks = new Map<string, string>();
+  for (const entry of profile.blocked ?? []) {
+    const explicit = normalizeIdentityEntry(entry);
+    if (explicit) {
+      for (const s of identified) if (s.all.includes(explicit)) blocks.set(s.namespace, explicit);
+      continue;
+    }
+    const source = identified.find((s) => s.namespace === entry);
+    if (!source) continue;
+    for (const s of identified) {
+      const shared = s === source ? null : sharedIdentity(source, s);
+      if (shared) blocks.set(s.namespace, shared);
+    }
+  }
+  return blocks;
+}
+
+/**
+ * The `blocked` entry that reaches a namespace through its launch identity, or
+ * null when nothing does (the block is plain, or absent).
+ *
+ * Two callers need this separately from `effectiveProfile`: the check refusal
+ * has to say WHICH entry to remove (removing a `blocked` namespace or editing
+ * `servers` does not lift an identity deny), and `bundles match` has to print
+ * the same remedy for a server its allow/deny filter excluded. Returns the
+ * entry as a refusal may print it -- `displayIdentity` drops the arguments of
+ * an exact-launch identity, which can hold a credential.
+ */
+export function identityBlockOf(
+  profile: Profile,
+  servers: readonly UpstreamServerConfig[],
+  namespace: string,
+): string | null {
+  const matched = identityBlocks(profile, identify(servers)).get(namespace);
+  if (!matched) return null;
+  // Only when the RAW profile still allows the namespace: if `blocked` names it
+  // directly too, the identity is not the reason and telling the user to remove
+  // IT would leave the plain entry still refusing.
+  if (!profileAllows(profile, namespace)) return null;
+  return displayIdentity(matched);
+}
+
+/**
+ * The profile the gates enforce: the configured lists plus what they imply for
+ * the servers configured right now.
+ *
+ *   - a `blocked` namespace also blocks every server with its launch identity;
+ *   - a `package:` / `command:` / `url:` entry blocks every server it matches;
+ *   - a `<namespace>_<tool>` deny also covers that tool on those servers, and a
+ *     wildcard covering a whole namespace (`ssh*`) covers all of theirs;
+ *   - a `<identity>#<tool>` deny becomes `<namespace>_<tool>` for each match.
+ *
+ * Everything is expanded to plain namespaces and wire names, so the existing
+ * predicates (isAllowed, isToolDenied) enforce it unchanged. Flattened names
+ * are ambiguous when a namespace contains `_`; every reading is applied, which
+ * denies more rather than less. Recompute whenever the server list changes.
+ */
+export function effectiveProfile(profile: Profile | null, servers: readonly UpstreamServerConfig[]): Profile | null {
+  if (!profile || (!profile.blocked?.length && !profile.blockedTools?.length)) return profile;
+  const identified = identify(servers);
+  const blocked = new Set([...(profile.blocked ?? []), ...identityBlocks(profile, identified).keys()]);
+
+  const blockedTools = new Set<string>();
+  for (const entry of profile.blockedTools ?? []) {
+    const hash = entry.lastIndexOf("#");
+    const explicit = hash > 0 ? normalizeIdentityEntry(entry.slice(0, hash)) : null;
+    if (explicit) {
+      for (const s of identified) {
+        if (s.all.includes(explicit)) blockedTools.add(`${s.namespace}_${entry.slice(hash + 1)}`);
+      }
+      continue;
+    }
+    blockedTools.add(entry);
+    const prefix = entry.endsWith("*") ? entry.slice(0, -1) : "";
+    for (const source of identified) {
+      const head = `${source.namespace}_`;
+      const tool = entry.startsWith(head) ? entry.slice(head.length) : prefix && head.startsWith(prefix) ? "*" : "";
+      if (tool === "") continue;
+      for (const s of identified) {
+        if (sharedIdentity(source, s)) blockedTools.add(`${s.namespace}_${tool}`);
+      }
+    }
+  }
+
+  return {
+    ...profile,
+    ...(profile.blocked ? { blocked: [...blocked] } : {}),
+    ...(profile.blockedTools ? { blockedTools: [...blockedTools] } : {}),
+  };
 }
 
 /**

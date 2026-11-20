@@ -16,8 +16,8 @@
 // Exit codes:
 //   0  audited successfully, grade written
 //   1  no server with that namespace in bundles.json
-//   2  nothing was graded: the server isn't a stdio/command server (nothing
-//      to spawn); it is a git-sourced server not built on this machine
+//   2  nothing was graded: the allow/deny policy refuses the server or is
+//      broken; the server isn't a stdio/command server (nothing to spawn); it is a git-sourced server not built on this machine
 //      (upstream.ts gitBuildMissing); on Windows its command/args carry a cmd.exe metacharacter
 //      the shell-spawned suite would split on (findCmdMetacharToken); its
 //      env references a ${secret:NAME} the vault could not resolve (locked,
@@ -39,6 +39,7 @@ import { scrubInternalSecretsFromProcessEnv } from "./internal-secret-env.js";
 import { loadLocalBundles } from "./local-bundles.js";
 import { createStreamWriter, log } from "./logger.js";
 import { hasSecretRefs } from "./secrets-vault.js";
+import { policyRefusalForCheck } from "./spawn-gate.js";
 import type { UpstreamServerConfig } from "./types.js";
 import { gitBuildMissing, resolveServerEnv } from "./upstream.js";
 
@@ -387,6 +388,14 @@ export async function runAudit(opts: AuditCommandOptions = {}): Promise<AuditCom
     } else {
       printErr(`yaw-mcp audit: "${namespace}" has no command to spawn -- it can't be audited as a stdio server.`);
     }
+    return { exitCode: 2 };
+  }
+
+  // An audit starts the server, with its vault secrets, so the allow/deny policy
+  // applies as it does to any other spawn. Checked before the vault is touched.
+  const refused = await policyRefusalForCheck(server, servers, { cwd: opts.cwd, home });
+  if (refused !== null) {
+    printErr(`yaw-mcp audit: ${refused}`);
     return { exitCode: 2 };
   }
 

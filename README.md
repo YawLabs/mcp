@@ -332,17 +332,23 @@ The project `.yaw-mcp/` is found by walking up from the cwd -- stopping just bef
   // optional -- gives editors key completion + inline validation
   "$schema": "https://raw.githubusercontent.com/YawLabs/mcp/main/schemas/yaw-mcp.config.v1.json",
   "version": 1,                          // schema version; newer versions log a warning
-  "servers": ["gh", "pg", "linear"],     // allow-list of namespaces (most-specific scope wins)
-  "blocked": ["prod_db"],                // deny-list (UNION across all scopes -- fail-safe on deny)
+  "servers": ["gh", "pg", "linear"],     // allow-list; a project file can only narrow the global one
+  "blocked": ["prod_db"],                // deny-list (UNION across all scopes); also takes identities
   "blockedTools": ["gh_delete_repo"],    // per-tool deny-list -- see "Blocking individual tools" below
   "installNudge": true                   // opt-in: discover may suggest installing MCP servers for
                                          // CLIs found in your recent shell history (off by default)
 }
 ```
 
-That shape ships as a JSON Schema -- [`schemas/yaw-mcp.config.v1.json`](schemas/yaw-mcp.config.v1.json), served from the raw URL in the `$schema` line above -- so any editor that honors `$schema` completes the keys and flags a typo as you type. A namespace is `[a-z][a-z0-9_]{0,29}` (so `prod_db`, not `prod-db`); the schema rejects anything else, while the loader only warns and keeps loading.
+That shape ships as a JSON Schema -- [`schemas/yaw-mcp.config.v1.json`](schemas/yaw-mcp.config.v1.json), served from the raw URL in the `$schema` line above -- so any editor that honors `$schema` completes the keys and flags a typo as you type. A namespace is `[a-z][a-z0-9_]{0,29}` (so `prod_db`, not `prod-db`); the schema rejects anything else, while the loader warns about a misspelled entry and keeps it, where it matches nothing. A misspelled top-level key (`"blokced"`) is ignored, so it enforces nothing: the loader warns with a suggested spelling, and `mcp_connect_health` and every activation refusal repeat the warning until the key is fixed. It does not refuse servers, since the key may belong to a newer release.
 
-Malformed files log a warning and fall through (fail-open). yaw-mcp reads *this* file once at startup, so restart the client after editing it -- unlike `bundles.json`, which is re-read while the session runs. `mcp_connect_health` shows which files are applied.
+**How the lists combine.** `config.local.json` beats the project `config.json` for `servers`, and either one can only *narrow* a global `servers` list: an entry the global list leaves out is dropped with a warning naming both files. An explicit `"servers": []` allows nothing. With no `servers` key anywhere, every server not denied is allowed.
+
+**A broken policy file stops servers from starting.** A missing file means no policy from that file. A file that exists but cannot be read or parsed, or whose `servers`, `blocked` or `blockedTools` is the wrong type or holds a non-string or blank entry, refuses every server spawn until it is fixed. The `mcp_connect_*` tools keep working, and `mcp_connect_health`, `yaw-mcp doctor` and each refusal name the file and what is wrong with it. Fix or delete the file, then restart the client.
+
+yaw-mcp reads *this* file once at startup, so restart the client after editing it -- unlike `bundles.json`, which is re-read while the session runs. `mcp_connect_health` shows which files are applied.
+
+**What this policy is.** It controls what yaw-mcp itself will start and forward. It is advisory when the agent runs as the same OS user as yaw-mcp: that agent can edit these files and `bundles.json`, run the server's command directly, or use the credential from a shell, and no MCP-side control can stop that. To enforce a boundary, run the agent under a different user or in a container that cannot reach the config, the vault or the network targets.
 
 ### Project guide -- `YAW-MCP.md`
 
@@ -382,11 +388,28 @@ Settable: `isActive`, `pinned`, `runtime`, `connectTimeoutMs`, `description`, an
 { "blockedTools": ["gh_delete_repo", "pg_drop_*"] }
 ```
 
-Entries are the flattened `<namespace>_<tool>` names that appear in the tool list, matched literally and case-sensitively, with an optional single trailing `*` for a prefix match. A bare `*` is refused, and a bare tool name does not match across servers -- `<namespace>_<tool>` cannot be split back apart reliably, because a namespace may itself contain `_`. The broker's own `mcp_connect_*` tools cannot be blocked.
+Entries are the flattened `<namespace>_<tool>` names that appear in the tool list, matched literally and case-sensitively, with an optional single trailing `*` for a prefix match. `<identity>#<tool>` (below) names a server's own tool under whatever namespace it has. A bare `*` is refused, and a bare tool name does not match across servers -- `<namespace>_<tool>` cannot be split back apart reliably, because a namespace may itself contain `_`. The broker's own `mcp_connect_*` tools cannot be blocked.
 
 The two keys act on different events. `blocked` is checked when a server would start; `blockedTools` is checked when a tool would be called, which is also what makes it cover a tool reached inside an `mcp_connect_exec` pipeline. A pipeline naming a blocked tool is refused before any step runs, rather than failing partway through. Denies merge across config scopes, so a project config can add one but never remove one, and there is no allow-list counterpart.
 
 A blocked tool is withheld from the tool list, so the model does not see it as an option, but it keeps its route: calling it by name returns an explicit refusal rather than an unknown-tool error that reads like a typo. `discover` still shows it in a server's known-tools line, marked `[blocked]`, since that line describes what the server offers.
+
+A server blocked with `blocked` is refused everywhere yaw-mcp reaches it: activation, `mcp_connect_read_tool`, `mcp_connect_exec`, `tools/call`, `resources/read`, `prompts/get`, the resource and prompt lists, `yaw-mcp call`, `yaw-mcp audit`, and the start check in `yaw-mcp add` and `yaw-mcp update`. `yaw-mcp compliance <target>` takes a command you type rather than a configured server, so the policy does not apply to it. `blockedTools` covers tools only, not a server's resources or prompts.
+
+#### Denies follow the server, not just its name
+
+A namespace is only a label, so a deny also applies to the server behind it. With `ssh` and `ssh2` both launching `@example/ssh-mcp`, `"blocked": ["ssh"]` refuses both and `"blockedTools": ["ssh_exec_command"]` also covers `ssh2_exec_command`. Two namespaces count as the same server when they launch the same package or image, the same script through an interpreter, or the same URL. Any other command (`java`, `dotnet`, a server binary) counts only with identical arguments, since one such command can host many unrelated servers. Arguments and `env` are not part of a package, script or URL identity, so two namespaces on the same package with different arguments (`prod_db` and `staging_db` on one postgres server package) are the same server here, and blocking one blocks both. That link exists only while the named namespace is still in `bundles.json`. To make a deny hold after a rename, name the identity directly:
+
+```jsonc
+{
+  "blocked": ["package:@example/ssh-mcp", "command:ssh-mcp", "url:https://mcp.example.com/v1"],
+  "blockedTools": ["package:@example/ssh-mcp#exec_command", "url:https://mcp.example.com/v1#drop_*"]
+}
+```
+
+`package:` is the package a runner launches (`npx`, `bunx`, `pnpm dlx`, `uvx`, `uv tool run`, `pipx run`, `python -m`, or a `docker run` image), ignoring the version, whether written `@1.2`, `==1.2`, `:1.2` or as a digest. `command:` is the executable or the script an interpreter runs, under any arguments: a bare name matches it at any path, and a path matches only that path. `command:java` therefore blocks every `java` server. `url:` is a remote endpoint or git source, ignoring credentials, query string and fragment.
+
+These checks catch the same package, command or URL registered again. They do not establish what a program does: a wrapper script, a renamed copy of a binary, a fork under another package name, a launch through a shell string (`bash -c`, `npx -c`), or a server binary given different arguments has a different identity or none, and a namespace deny does not extend to it. Use a `command:` entry for the last case. The `servers` allow-list matches namespaces only.
 
 ## Local secret vault
 
@@ -466,7 +489,7 @@ Python servers (`sqlite`, `time`, `sentry`, ...) launch via Astral's `uv`/`uvx`.
 
 ## Trust & security
 
-MCP servers are third-party code you choose to run. yaw-mcp doesn't sandbox them -- that's your OS and network. What it gives you is **visibility and a gate**:
+MCP servers are third-party code you choose to run. yaw-mcp doesn't sandbox them -- that's your OS and network. What it gives you is **visibility and a gate**. The gate is advisory against an agent running as your OS user: an agent with a shell and the credential can bypass any MCP-side control (see [Configuration](#configuration----yaw-mcp) above).
 
 - **Compliance grades (A-F)** -- the `@yawlabs/mcp-compliance` suite (88 tests for MCP 2025-11-25, 103 for 2026-07-28, picked by what the server speaks) grades a server; `yaw-mcp list` shows it in a `GRADE` column and `discover` shows it inline (`github [ready] [A]`). `YAW_MCP_MIN_COMPLIANCE=B` makes `activate` refuse anything below the floor. Ungraded servers pass (don't punish unknown); audit them yourself with `yaw-mcp compliance <target>`.
 - **Source transparency** -- `list` and `discover` show the exact `command`, `args`, and `url` each server launches with. Nothing is wrapped.

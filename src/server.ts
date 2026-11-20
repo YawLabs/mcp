@@ -1,5 +1,6 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
+import { join } from "node:path";
 import { getSupportedElicitationModes } from "@modelcontextprotocol/sdk/client/index.js";
 import {
   type CallToolResult,
@@ -44,7 +45,14 @@ import { bundlesFileHint } from "./bundles-hint.js";
 import { formatShadowLine, installTargetForCli } from "./cli-shadows.js";
 import { canonicalJson } from "./client-config-values.js";
 import { classifyGrade, passesMinCompliance } from "./compliance.js";
-import { loadYawMcpConfig, type Profile, profileAllows, type ResolvedConfig, toProfile } from "./config-loader.js";
+import {
+  CONFIG_FILENAME,
+  loadYawMcpConfig,
+  type Profile,
+  profileAllows,
+  type ResolvedConfig,
+  toProfile,
+} from "./config-loader.js";
 import { estimateFromConnectedTools, estimateFromToolCache, formatCostLabel } from "./cost-estimate.js";
 import { detectMissingCredentials } from "./credentials.js";
 import { formatRelativeAge, scanShellHistoryForShadows } from "./doctor-cmd.js";
@@ -95,6 +103,7 @@ import {
 } from "./meta-tools.js";
 import { isFeatureDisabled, isFeatureEnabled, resolveNonNegativeIntEnv } from "./opt-out-env.js";
 import { PackDetector } from "./pack-detect.js";
+import { userConfigDir } from "./paths.js";
 import {
   isPersistenceDisabled,
   loadState,
@@ -179,7 +188,9 @@ import { maybeRefreshSidecars } from "./sidecar-refresh.js";
 import {
   blockedToolsSource,
   complianceRefusalReason,
+  effectiveProfile,
   isToolDenied,
+  policyErrorText,
   resolveMinCompliance,
   spawnGateVerdict,
 } from "./spawn-gate.js";
@@ -1467,6 +1478,12 @@ export class ConnectServer {
    *  why the block is shown once rather than on every activate. */
   private readonly instructionsShown = new Set<string>();
   private profile: Profile | null = null;
+  private policyMemo: {
+    profile: Profile | null;
+    servers: UpstreamServerConfig[];
+    count: number;
+    value: Profile | null;
+  } | null = null;
   // Shadow-driven install-nudge gate. Resolved once at start() from the
   // env override (YAW_MCP_INSTALL_NUDGE=1) OR config (installNudge: true);
   // off by default. When false, discover NEVER runs the shell-history scan
@@ -2080,7 +2097,7 @@ export class ConnectServer {
         // route instead would make a call by name return `Unknown tool`,
         // which reads as a typo and sends the model hunting for a name that
         // is right there.
-        (wireName) => this.isToolDenied(wireName),
+        (wireName) => this.isToolDenied(wireName) || this.toolRouteRefusal(wireName) !== null,
       );
       // The installed servers ride on dispatch's description (find_tool's
       // under lite), not in SERVER_INSTRUCTIONS: initialize is answered
@@ -2105,7 +2122,7 @@ export class ConnectServer {
       await this.ready;
       return {
         resources: buildResourceList(
-          this.connections,
+          this.allowedConnections(),
           this.getBuiltinResources(),
           this.currentExposure(),
           this.sessionActivated,
@@ -2131,6 +2148,13 @@ export class ConnectServer {
     // leaving the proxied request to run out its timeout.
     handle("resources/read", async (request, ctx) => {
       await this.ready;
+      // A builtin is yaw-mcp's own and shadows any upstream uri, so only a read
+      // that would reach an upstream is subject to the server policy.
+      const resourceNamespace = this.getBuiltinResourceMap().has(request.params.uri)
+        ? undefined
+        : this.resourceRoutes.get(request.params.uri)?.namespace;
+      const resourceRefusal = resourceNamespace ? this.serverPolicyRefusal(resourceNamespace) : null;
+      if (resourceRefusal) return { contents: [{ uri: request.params.uri, text: resourceRefusal }] };
       return (await routeResourceRead(
         request.params.uri,
         this.resourceRoutes,
@@ -2144,7 +2168,7 @@ export class ConnectServer {
       await this.ready;
       return {
         prompts: buildPromptList(
-          this.connections,
+          this.allowedConnections(),
           this.currentExposure(),
           this.sessionActivated,
         ) as ListPromptsResult["prompts"],
@@ -2153,6 +2177,11 @@ export class ConnectServer {
 
     handle("prompts/get", async (request, ctx) => {
       await this.ready;
+      const promptNamespace = this.promptRoutes.get(request.params.name)?.namespace;
+      const promptRefusal = promptNamespace ? this.serverPolicyRefusal(promptNamespace) : null;
+      if (promptRefusal) {
+        return { messages: [{ role: "user", content: { type: "text", text: promptRefusal } }] };
+      }
       return (await routePromptGet(
         request.params.name,
         request.params.arguments as Record<string, string> | undefined,
@@ -2440,7 +2469,8 @@ export class ConnectServer {
   // comment in cli-shadows.ts.
   private getProfiledActiveServers(): UpstreamServerConfig[] {
     const all = (this.config?.servers ?? []).filter((s) => s.isActive);
-    const profiled = this.profile ? all.filter((s) => profileAllows(this.profile, s.namespace)) : all;
+    const policy = this.policy();
+    const profiled = policy ? all.filter((s) => profileAllows(policy, s.namespace)) : all;
     return profiled.map((server) => this.mergeToolCache(server));
   }
 
@@ -3193,16 +3223,20 @@ export class ConnectServer {
     // Load the effective config (allow/deny lists + the install-nudge flag)
     // from .yaw-mcp/config.* files. Walks up from cwd for a project-local
     // .yaw-mcp/ dir and also consults ~/.yaw-mcp/config.json (user-global).
-    // Local beats project beats global for the allow-list; denies union.
-    // Failure is silent — fail-open so a bad config doesn't brick the
-    // session. One read here derives BOTH the profile and the nudge gate
+    // Local beats project for the allow-list, which can only narrow the global
+    // one; denies union. A broken policy file, or a load that fails outright,
+    // refuses every spawn while the meta-tools stay up to report why. One read here derives BOTH the profile and the nudge gate
     // (previously loadEffectiveProfile re-read the config just for the
     // profile slice).
     let resolvedConfig: ResolvedConfig | null;
     if (opts.config) {
       resolvedConfig = opts.config;
     } else {
-      resolvedConfig = await loadYawMcpConfig({ cwd: process.cwd() }).catch(() => null);
+      resolvedConfig = await loadYawMcpConfig({ cwd: process.cwd() }).catch((err): ResolvedConfig => {
+        const path = join(userConfigDir(), CONFIG_FILENAME);
+        const message = `${path}: yaw-mcp could not load its config (${err instanceof Error ? err.message : String(err)}). No MCP server will start until this is fixed: check that the file and your project's .yaw-mcp/ directory are readable, restart your MCP client, and run \`yaw-mcp doctor\` to confirm.`;
+        return { projectConfigDir: null, loadedFiles: [], warnings: [message], policyErrors: [{ path, message }] };
+      });
       // The loader's soft problems (unknown keys, wrong-typed values, retired
       // hosted-backend keys). Logged HERE only when we did the load: a caller
       // that hands the config in has already seen them, and the same line
@@ -4008,6 +4042,13 @@ export class ConnectServer {
         isError: true,
       });
     }
+    // The same position, for a tool whose whole SERVER is refused. A connection
+    // can outlive the decision: a bundles.json reload can reveal that a running
+    // server shares its launch identity with a blocked one.
+    const serverRefusal = this.toolRouteRefusal(name);
+    if (serverRefusal) {
+      return brandRoutingFault({ content: [{ type: "text", text: serverRefusal }], isError: true });
+    }
 
     // Snapshot routes at method entry. rebuildRoutes() may fire during
     // the auto-reconnect awaits below (via onUpstreamListChanged from
@@ -4670,7 +4711,41 @@ export class ConnectServer {
    *  deny -- a shell entry point that skipped it would be a hole straight
    *  through the policy -- without importing the broker. */
   private isToolDenied(wireName: string): boolean {
-    return isToolDenied(wireName, this.profile?.blockedTools);
+    return isToolDenied(wireName, this.policy()?.blockedTools);
+  }
+
+  /** The profile as enforced against the servers configured right now (see
+   *  effectiveProfile). Memoized on its inputs: tool lists ask once per tool,
+   *  and a bundles.json reload installs a new server array. */
+  private policy(): Profile | null {
+    const servers = this.config?.servers ?? [];
+    const memo = this.policyMemo;
+    if (memo && memo.profile === this.profile && memo.servers === servers && memo.count === servers.length) {
+      return memo.value;
+    }
+    const value = effectiveProfile(this.profile, servers);
+    this.policyMemo = { profile: this.profile, servers, count: servers.length, value };
+    return value;
+  }
+
+  /** Why the server policy refuses this namespace, or null. The one check behind
+   *  every path that reaches a CONNECTED upstream (tools/call, resources/read,
+   *  prompts/get); spawn paths go through spawnGateRefusal. */
+  private serverPolicyRefusal(namespace: string): string | null {
+    const errors = this.profile?.policyErrors;
+    if (errors?.length) return policyErrorText(errors);
+    if (profileAllows(this.policy(), namespace)) return null;
+    return `Server "${namespace}" is not allowed by the project profile at ${this.profile?.path}. Report the block to the user instead of routing around it; if it should be reachable, the profile must be edited and this MCP client restarted.`;
+  }
+
+  private toolRouteRefusal(wireName: string): string | null {
+    const namespace = this.toolRoutes.get(wireName)?.namespace;
+    return namespace ? this.serverPolicyRefusal(namespace) : null;
+  }
+
+  /** The connections the server policy still permits, for the list surfaces. */
+  private allowedConnections(): Map<string, UpstreamConnection> {
+    return new Map([...this.connections].filter(([namespace]) => this.serverPolicyRefusal(namespace) === null));
   }
 
   /** Which file the user has to edit. Shared with the CLI's deny refusal for
@@ -4931,7 +5006,8 @@ export class ConnectServer {
    *  look for it in discover's disabled list (which renders profile-blocked
    *  entries nowhere), sends it to the wrong file. */
   private noServersEnabledText(): string {
-    const profile = this.profile;
+    if (this.profile?.policyErrors?.length) return policyErrorText(this.profile.policyErrors);
+    const profile = this.policy();
     const servers = this.config?.servers ?? [];
     const disabled = servers.filter((s) => !s.isActive);
     const blocked = profile ? servers.filter((s) => s.isActive && !profileAllows(profile, s.namespace)) : [];
@@ -4939,12 +5015,24 @@ export class ConnectServer {
     if (profile && blocked.length > 0) {
       const quote = (list: UpstreamServerConfig[]) => list.map((s) => `"${s.namespace}"`).join(", ");
       // isAllowed: an explicit "blocked" entry wins over the allow list, so
-      // a namespace on it needs removing from there; every other blocked
-      // namespace is missing from a non-empty "servers" allow list.
-      const denied = blocked.filter((s) => profile.blocked?.includes(s.namespace));
+      // a namespace on it needs removing from there. `profile` is the
+      // EFFECTIVE policy, whose "blocked" also holds the namespaces reached
+      // through a launch identity: those are not in any file, so the edit is
+      // to the entry that reaches them, not to the namespace. Every other
+      // blocked namespace is missing from a non-empty "servers" allow list.
+      const written = this.profile?.blocked ?? [];
+      const denied = blocked.filter((s) => written.includes(s.namespace));
+      const viaIdentity = blocked.filter(
+        (s) => !written.includes(s.namespace) && profile.blocked?.includes(s.namespace),
+      );
       const unlisted = blocked.filter((s) => !profile.blocked?.includes(s.namespace));
       const edits: string[] = [];
       if (unlisted.length > 0) edits.push(`add ${quote(unlisted)} to its "servers" allow list`);
+      if (viaIdentity.length > 0) {
+        edits.push(
+          `remove the "blocked" entry that names the same launch as ${quote(viaIdentity)} (another namespace for the same package, script, URL or command, or a package:/command:/url: entry) -- adding ${viaIdentity.length === 1 ? "it" : "them"} to "servers" does not lift a block`,
+        );
+      }
       // "blocked" is the UNION across every config scope (config-loader's
       // unionBlocked), while profile.path is only the primary file -- so the
       // list to edit may live in the user-global file instead. Name both
@@ -5032,7 +5120,14 @@ export class ConnectServer {
           );
         }
         if (configured) {
-          return focusMiss(`"${focusNamespace}" is not allowed by the project profile in effect.`);
+          // The gate's own sentence: it names the file to edit, the launch
+          // identity a block came through, or the broken policy file. The bare
+          // "not allowed by the profile" sent a broken policy and an identity
+          // block to the "servers" list, which fixes neither.
+          const why =
+            this.spawnGateRefusal(configured, "activate") ??
+            `"${focusNamespace}" is not allowed by the project profile in effect.`;
+          return focusMiss(`${why} Call mcp_connect_health to see the policy in effect.`);
         }
         const near = closestNames(
           focusNamespace,
@@ -5828,13 +5923,26 @@ export class ConnectServer {
     server: UpstreamServerConfig,
     purpose: "activate" | "inspect its tools" | "report its secrets",
   ): string | null {
-    const refusal = spawnGateVerdict(server, this.profile, resolveMinCompliance());
+    const refusal = spawnGateVerdict(server, this.profile, resolveMinCompliance(), this.config?.servers ?? [server]);
     if (!refusal) return null;
+    const text = this.spawnGateRefusalText(refusal, purpose);
+    // A misspelled policy key enforces nothing, so a refusal may not be the one
+    // the user meant to write. Say so wherever a refusal is shown.
+    const policyWarnings = this.profile?.policyWarnings ?? [];
+    return policyWarnings.length > 0 ? `${text} Note: ${policyWarnings.join(" ")}` : text;
+  }
+
+  private spawnGateRefusalText(
+    refusal: NonNullable<ReturnType<typeof spawnGateVerdict>>,
+    purpose: "activate" | "inspect its tools" | "report its secrets",
+  ): string {
     switch (refusal.kind) {
       case "disabled":
         return `"${refusal.namespace}" is installed but disabled. Set "isActive": true for it in ${bundlesFileHint("defines-it")} and try again to ${purpose} -- the edit is picked up on the next mcp_connect_* call, with no client restart.`;
+      case "policy-invalid":
+        return `Cannot ${purpose} for "${refusal.namespace}". ${policyErrorText(refusal.errors)}`;
       case "profile":
-        return `"${refusal.namespace}" is not allowed by the project profile at ${refusal.profilePath}.`;
+        return `"${refusal.namespace}" is not allowed by the project profile at ${refusal.profilePath}${refusal.identity ? ` (it launches ${refusal.identity}, the same server as a "blocked" entry, so remove that entry to allow it; listing it in "servers" does not)` : ""}.`;
       case "compliance":
         return `Refused to load "${refusal.namespace}": ${complianceRefusalReason(refusal.grade, refusal.min)}. Unset YAW_MCP_MIN_COMPLIANCE (or lower it) to override.`;
     }
@@ -8618,8 +8726,31 @@ export class ConnectServer {
       } else {
         lines.push(`Profile: ${this.profile.path}`);
       }
-      if (this.profile.servers?.length) lines.push(`  allow: ${this.profile.servers.join(", ")}`);
+      for (const e of this.profile.policyErrors ?? []) lines.push(`  POLICY ERROR: ${e.message}`);
+      for (const w of this.profile.policyWarnings ?? []) lines.push(`  POLICY WARNING: ${w}`);
+      if (this.profile.servers) lines.push(`  allow: ${this.profile.servers.join(", ") || "(nothing)"}`);
       if (this.profile.blocked?.length) lines.push(`  block: ${this.profile.blocked.join(", ")}`);
+      // `block:` is the RAW list, but the gate enforces the identity-EXPANDED
+      // one (this.policy() / effectiveProfile): a `package:`/`command:`/`url:`
+      // entry, or a namespace sharing a launch identity with a blocked one,
+      // excludes servers that never appear in `blocked`. Print the difference
+      // so an identity-blocked namespace is visible here and not only at the
+      // refusal. Derived from the SAME effective set the gate uses, so the two
+      // can't drift; set only when something is blocked BEYOND the raw list.
+      const enforced = this.profile.policyErrors?.length ? null : this.policy();
+      const servers = this.config?.servers ?? [];
+      const rawBlocked = this.profile.blocked;
+      // With a broken policy file profileAllows refuses everything for the
+      // wrong reason, so the identity line stays out; the POLICY ERROR line
+      // above already names the file to fix.
+      const extraBlocked = enforced
+        ? servers
+            .filter((s) => s.isActive && !profileAllows(enforced, s.namespace))
+            .map((s) => s.namespace)
+            .filter((ns) => !rawBlocked?.includes(ns))
+            .sort()
+        : [];
+      if (extraBlocked.length > 0) lines.push(`  also blocked via identity: ${extraBlocked.join(", ")}`);
       // The per-tool deny belongs here too. toProfile returns non-null for a
       // blockedTools-ONLY config, so without this line health announces a
       // profile and then displays none of the policy it is enforcing --

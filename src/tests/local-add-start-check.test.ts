@@ -1,4 +1,7 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // defaultStartCheck is `add`'s (and `update`'s) one real handshake. The seam
 // is the same pair transient-upstream.test.ts mocks: nothing here spawns a
@@ -27,7 +30,16 @@ const CONFIG = {
   isActive: true,
 } as UpstreamServerConfig;
 
+let home: string;
+let paths: { home: string; cwd: string };
+
+beforeEach(() => {
+  home = mkdtempSync(join(tmpdir(), "yaw-start-check-"));
+  paths = { home, cwd: home };
+});
+
 afterEach(() => {
+  rmSync(home, { recursive: true, force: true });
   vi.mocked(connectToUpstream).mockReset();
   vi.mocked(disconnectFromUpstream).mockClear();
 });
@@ -37,7 +49,7 @@ describe("defaultStartCheck", () => {
     const conn = { config: CONFIG, status: "connected", tools: [{}, {}] } as unknown as UpstreamConnection;
     vi.mocked(connectToUpstream).mockResolvedValue(conn);
 
-    expect(await defaultStartCheck(CONFIG)).toEqual({ ok: true, tools: 2 });
+    expect(await defaultStartCheck(CONFIG, paths)).toEqual({ ok: true, tools: 2 });
     expect(disconnectFromUpstream).toHaveBeenCalledTimes(1);
     expect(disconnectFromUpstream).toHaveBeenCalledWith(conn);
   });
@@ -53,11 +65,36 @@ describe("defaultStartCheck", () => {
       ),
     );
 
-    expect(await defaultStartCheck(CONFIG)).toEqual({
+    expect(await defaultStartCheck(CONFIG, paths)).toEqual({
       ok: false,
       error: 'spawn failed -> Fix "fx" in bundles.json, then run the command again.',
     });
     expect(disconnectFromUpstream).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["a blocked server", '{ "blocked": ["fx"] }', "not allowed by the project profile"],
+    ["a broken policy file", "{", "no MCP server may start"],
+  ])("does not start %s", async (_name, config, text) => {
+    mkdirSync(join(home, ".yaw-mcp"), { recursive: true });
+    writeFileSync(join(home, ".yaw-mcp", "config.json"), config);
+    const result = await defaultStartCheck(CONFIG, paths);
+    expect(result.ok).toBe(false);
+    expect(result.ok ? "" : result.error).toContain(text);
+    expect(connectToUpstream).not.toHaveBeenCalled();
+  });
+
+  it("judges a git server by its repository too, not only by its build", async () => {
+    mkdirSync(join(home, ".yaw-mcp"), { recursive: true });
+    writeFileSync(join(home, ".yaw-mcp", "config.json"), '{ "blocked": ["url:https://github.com/acme/fx"] }');
+    const stored = {
+      ...CONFIG,
+      git: { url: "https://github.com/acme/fx.git", ref: "main", commit: "abc", entry: "i.js" },
+    };
+    const result = await defaultStartCheck(CONFIG, { ...paths, policyAs: stored as typeof CONFIG });
+    expect(result.ok).toBe(false);
+    expect(result.ok ? "" : result.error).toContain("not allowed by the project profile");
+    expect(connectToUpstream).not.toHaveBeenCalled();
   });
 
   it("passes an error with no config pointer through verbatim", async () => {
@@ -65,7 +102,7 @@ describe("defaultStartCheck", () => {
     // arrive unchanged.
     vi.mocked(connectToUpstream).mockRejectedValue(new Error("vault locked: the passphrase does not unlock the vault"));
 
-    expect(await defaultStartCheck(CONFIG)).toEqual({
+    expect(await defaultStartCheck(CONFIG, paths)).toEqual({
       ok: false,
       error: "vault locked: the passphrase does not unlock the vault",
     });

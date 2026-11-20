@@ -4,6 +4,10 @@ All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented 
 
 ## Unreleased
 
+**Fixed -- the oam->npx downgrade respawn runs npx under node.exe on Windows**
+
+On Windows, a bare `npx` respawn while the broker runs on oam went through cross-spawn's `cmd /d /s /c` quoting with `windowsVerbatimArguments`, which oam's child_process runtime ignores -- the double-escaped line became the program name and the respawn reported an install failure on top of the server's own. The launch is now rewritten to `node.exe npx-cli.js ...` (npx.cmd's own shape) only in that case: win32, an npx command, a non-node broker, and a completable rewrite; everywhere else the spawn is byte-identical.
+
 **Changed -- the `--json` envelopes' `recovery` field reports the full state vocabulary**
 
 The `set`, `reset`, `rotate`, `recover` and `recovery` `--json` envelopes (and `yaw-mcp set <server> env.KEY --secret --json`, which relays the field) now carry `"set" | "none" | "malformed" | "unsupported"` -- exactly what `doctor --json`'s `vault.recovery` reports -- instead of collapsing everything but a usable slot to `"none"`. An un-upgraded v1/v2 vault now reads `"unsupported"` (it has no slot to hold a code) and a malformed slot reads `"malformed"`, where both used to read as `"none"`; scripts that compared the field against `"set"` are unaffected. Also fixed in this area: `recover --file` no longer claims "the recovery code you used no longer opens it" about the untouched source copy (the source keeps its code; only the recovered vault at the path is under the fresh passphrase/code), an empty answer at the recovery-code confirm prompt no longer burns one of the three attempts (it re-prompts; a closed stdin still terminates on its own bound), and `doctor`'s recovery line names the RECOVERY slot as damaged so it cannot be confused with the passphrase-slot line.
@@ -11,6 +15,22 @@ The `set`, `reset`, `rotate`, `recover` and `recovery` `--json` envelopes (and `
 **Changed -- the oam floor moves to 0.21.1**
 
 `npm run verify:oam-floor` hosted a stdio `@modelcontextprotocol/server` server on oam v0.21.1 through `oam run` on 2026-11-20 -- both protocol eras, 2025-11-25 (initialize) and 2026-07-28 (server/discover), each through tools/list and tools/call -- and raised `MIN_OAM_VERSION` to it; the floor was 0.20.2. A machine whose oam is older hosts its node/npx sidecars on node instead, and logs a warning naming both versions, `oam self-update` as the fix, and that yaw-mcp needs a restart afterwards.
+
+**Breaking -- the allow/deny policy now fails closed**
+
+- A project `config.json` or `config.local.json` can only narrow a global `servers` list. Entries the global list leaves out are dropped with a warning; add them to `~/.yaw-mcp/config.json` to allow them.
+- `"servers": []` now allows nothing. It used to mean no restriction; delete the key for that.
+- `yaw-mcp audit`, and the start check in `yaw-mcp add` and `yaw-mcp update`, now obey the allow/deny policy: a blocked server, or any server under a broken policy file, is not started (`audit` exits 2).
+- A config file that exists but cannot be read or parsed, or whose `servers`, `blocked` or `blockedTools` is the wrong type or holds a non-string or blank entry, now refuses every server spawn until it is fixed. These used to be warnings, with the file or field ignored. The `mcp_connect_*` tools keep working, and `mcp_connect_health`, `yaw-mcp doctor` and each refusal name the file and the fix.
+- `blocked` and `blockedTools` now also apply to any configured server with the same launch identity (package or image, interpreter script, URL, or for any other command the same command and arguments) as the namespace they name, so a second namespace for the same server is refused too. Arguments and `env` do not count for a package, script or URL, so two namespaces on one package with different arguments (`prod_db` and `staging_db` on one postgres server) are blocked together.
+- The start check in `yaw-mcp add --git` and `yaw-mcp update` is judged by the server's repository as well as its build, so a `url:` deny on the repository stops it.
+- A blocked server is refused on `resources/read`, `prompts/get` and `tools/call` even when already connected, and is left out of the resource and prompt lists.
+
+**Added**
+
+`blocked` accepts `package:`, `command:` and `url:` entries, and `blockedTools` accepts `<identity>#<tool>`, which hold under any namespace. These match the same package, command or URL registered again; a wrapper script, a renamed binary or a fork is not caught. The README now states that this policy is advisory against an agent running as the same OS user.
+
+A misspelled top-level key in a policy file (`"blokced"`) now comes with a suggested spelling, and `mcp_connect_health` and activation refusals repeat it. It is still ignored rather than refusing servers. `discover` on a server blocked through its identity, or under a broken policy file, now names that cause and its fix instead of pointing at the `servers` list.
 
 ## 1.1.15
 

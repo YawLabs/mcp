@@ -23,12 +23,20 @@
 // redirect the API base while a global-scope token was attached, sending
 // that token to an attacker-chosen host.
 //
-// servers/blocked merging: allow-list picks the most specific scope that
-// sets it (local > project > global); deny-list unions across all scopes.
+// servers/blocked merging: local beats project for the allow-list, and the
+// result can only NARROW a global allow-list (entries outside it are dropped
+// with a warning). The deny-lists union across all scopes.
+//
+// POLICY FILES FAIL CLOSED. A missing file means "no policy from this file". A
+// file that exists but cannot be read or parsed, or whose servers / blocked /
+// blockedTools have the wrong type, is a policy error: every server spawn is
+// refused until it is fixed (see policyErrors). The meta-tools keep working so
+// the problem can be diagnosed.
 
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { closestNames } from "./fuzzy.js";
 import { parseJsonc } from "./jsonc.js";
 import { jsonErrorLocation, NAMESPACE_RE } from "./local-bundles.js";
 import { log } from "./logger.js";
@@ -59,13 +67,27 @@ export interface LoadedConfigFile {
   /** Opt-in flag for the shadow-driven install nudge. Off (undefined)
    *  by default; only `true` enables it. See install-nudge.ts. */
   installNudge?: boolean;
+  /** The warning for top-level keys this file carries that the loader does not
+   *  read, when there are any. Kept per file so the policy surfaces can repeat
+   *  it: a misspelled `blocked` enforces nothing. */
+  unknownKeysWarning?: string;
+}
+
+/** A policy file that exists but could not be honored. */
+export interface PolicyError {
+  path: string;
+  message: string;
 }
 
 export interface ResolvedConfig {
-  /** Allow-list (local > project > global). Undefined when no scope sets it. */
+  /** Allow-list (local > project, narrowed by global). Undefined when no scope
+   *  sets it. An empty list allows nothing. */
   servers?: string[];
-  /** Deny-list (union across all scopes that set it). */
+  /** Deny-list (union across all scopes that set it). Holds namespaces and
+   *  `package:` / `command:` / `url:` identity entries. */
   blocked?: string[];
+  /** Present when a policy file is broken. Every spawn is refused while set. */
+  policyErrors?: PolicyError[];
   /** Per-tool deny-list, union across every scope that sets it -- the same
    *  merge as `blocked`, and for the same reason: a project config may ADD a
    *  deny, never subtract one. Undefined when no scope sets it. */
@@ -81,6 +103,13 @@ export interface ResolvedConfig {
   loadedFiles: LoadedConfigFile[];
   /** Soft problems that don't fail loading. Surface in `yaw-mcp doctor`. */
   warnings: string[];
+  /** Broken-policy messages (one per `policyErrors` entry) plus unknown
+   *  top-level keys, one per file that has them. A subset of `warnings`,
+   *  repeated where the policy is shown (`mcp_connect_health`, activation
+   *  refusals) so a refusal carries the file's own KEY-level message and not
+   *  just its path. Never a reason to refuse AGAIN: a broken file already
+   *  refuses through `policyErrors`, an unknown key may be a newer release's. */
+  policyWarnings?: string[];
 }
 
 export interface LoadConfigOptions {
@@ -222,14 +251,25 @@ const namespaceEntry: EntryValidator = (entry, field, path) =>
     ? null
     : `${path}: '${field}' entry '${entry}' is not a valid namespace (a lowercase letter followed by [a-z0-9_], 30 characters at most) -- it can never match an installed server.`;
 
+/** `blocked` also takes a launch identity (server-identity.ts), which is how a
+ *  deny survives the server being registered under another namespace. */
+const IDENTITY_ENTRY_RE = /^(?:package|command|url):\S/;
+
+const blockedEntry: EntryValidator = (entry, field, path) =>
+  IDENTITY_ENTRY_RE.test(entry) ? null : namespaceEntry(entry, field, path);
+
 /** A flattened wire tool name, optionally ending in a single `*` wildcard.
  *  A bare `*` is refused: a deny that matches everything is far more likely a
  *  mistake than an intent, and `blocked` is the way to turn a server off. */
 const TOOL_ENTRY_RE = /^[A-Za-z0-9_.:-]+\*?$/;
 
+/** `<identity>#<tool>`: a tool on whichever namespace that server is under. */
+const IDENTITY_TOOL_ENTRY_RE = /^(?:package|command|url):\S.*#[A-Za-z0-9_.:-]+\*?$/;
+
 const toolEntry: EntryValidator = (entry, field, path) => {
+  if (IDENTITY_TOOL_ENTRY_RE.test(entry)) return null;
   if (!TOOL_ENTRY_RE.test(entry)) {
-    return `${path}: '${field}' entry '${entry}' is not a valid tool name (letters, digits, '_', '.', ':', '-', with an optional single trailing '*') -- it can never match a tool.`;
+    return `${path}: '${field}' entry '${entry}' is not a valid tool name (letters, digits, '_', '.', ':', '-', with an optional single trailing '*', or '<identity>#<tool>') -- it can never match a tool.`;
   }
   // Meta-tools are the broker's own control surface: blocking one would
   // disable the mechanism the user manages the block WITH, and the call gate
@@ -239,84 +279,76 @@ const toolEntry: EntryValidator = (entry, field, path) => {
     return `${path}: '${field}' entry '${entry}' names a yaw-mcp meta-tool, which cannot be blocked -- remove it, or block the upstream server with 'blocked'.`;
   }
   // Without a separator the entry cannot be a `<namespace>_<tool>` wire name,
-  // so it is almost always someone trying to block a whole server here.
-  if (!entry.includes("_")) {
+  // so it is almost always someone trying to block a whole server here. A
+  // wildcard is different: `ssh*` is a working prefix, and dropping a deny
+  // the user wrote would leave its tools callable.
+  if (!entry.includes("_") && !entry.endsWith("*")) {
     return `${path}: '${field}' entry '${entry}' has no '_' separator, so it cannot be a '<namespace>_<tool>' name -- to block a whole server use 'blocked'.`;
   }
   return null;
 };
 
-/** Filter a config array field down to its usable string entries. Warns when
- *  entries are dropped, when the field isn't an array at all, and when an
- *  entry fails `validate` -- it can't be a namespace (`servers` / `blocked`)
- *  or a tool name (`blockedTools`). Warning rather than silently swallowing
- *  an unusable value is the rule every field in this loader follows; the
- *  retired `apiBase` / `token` keys are warned about the same way when they
- *  are merely present. Returns undefined
- *  when the field isn't an array OR when a non-empty array held no usable
- *  STRING entry (strings that only fail `validate` are a different case under
- *  `dropInvalid`, which returns [] for them -- see the end of the body): a
- *  non-empty array that filters to [] must fall THROUGH to the parent scope
- *  rather than resolve to [] -- an empty allow-list means allow-all in
- *  isAllowed, so a `servers:[123]` at a specific scope would otherwise
- *  silently shadow a valid parent scope's allow-list with allow-all. A
- *  genuinely empty [] is preserved as-is (an explicit "no filter"). */
+const POLICY_FIX =
+  "No MCP server will start until this is fixed: correct the file (or delete it, since a missing file sets no policy), restart your MCP client, and run `yaw-mcp doctor` to confirm.";
+
+/** Record a broken policy file: refused at every spawn gate, and repeated in
+ *  `warnings` so doctor and the startup log show it too. */
+function policyProblem(path: string, problem: string, warnings: string[], errors: PolicyError[]): void {
+  const message = `${path}: ${problem} ${POLICY_FIX}`;
+  warnings.push(message);
+  errors.push({ path, message });
+}
+
+/** Filter a config array field down to its usable string entries. A field of
+ *  the wrong type, or an array holding non-string or blank entries, is a policy
+ *  error: guessing what a damaged allow- or deny-list meant is how a typo turns
+ *  into allow-all. An entry that is a string of the wrong shape only warns.
+ *  Returns undefined when the field is absent or not an array. An empty [] is
+ *  preserved: on `servers` it means "allow nothing". */
 function filterStringArray(
   raw: unknown,
   field: string,
   path: string,
   warnings: string[],
+  errors: PolicyError[],
   validate: EntryValidator = namespaceEntry,
-  // Whether a REJECTED entry is dropped as well as warned about.
-  //
-  // False for servers/blocked, where dropping would empty the array, hit the
-  // fall-through below, and silently promote a specific scope's deny into the
-  // parent's allow-all -- the bug this function exists to prevent.
-  //
-  // True for blockedTools, which has no allow-list counterpart and so no
-  // fall-through to corrupt. Keeping a rejected entry there made the warning
-  // a lie in the one case that matters: a bare `*` is reported as unmatchable
-  // and then enforced by the gate's prefix match as deny-everything.
+  // Whether a REJECTED entry is dropped as well as warned about. True for
+  // blockedTools: a bare `*` is reported as unmatchable, so keeping it would
+  // let the gate's prefix match enforce it as deny-everything.
   dropInvalid = false,
 ): string[] | undefined {
-  // What the field holds, for the two warnings that are not the validator's.
+  // What the field holds, for the two messages that are not the validator's.
   const noun = validate === toolEntry ? "tool-name" : "namespace";
   if (!Array.isArray(raw)) {
-    // A PRESENT but non-array value (`"servers": "github"` -- the plausible
-    // hand-edit for "lock this session to one server") used to be dropped in
-    // silence, so the field failed OPEN to allow-all while `doctor` reported
-    // an empty warnings array. Absence is the normal case for every scope the
-    // user hasn't configured and stays silent. Only the FIELD is dropped here
-    // -- the rest of the file still loads.
+    // Absence is the normal case for every scope the user hasn't configured.
     if (raw !== undefined) {
-      warnings.push(
-        `${path}: '${field}' must be an array of ${noun} strings (found ${raw === null ? "null" : typeof raw}) -- ignored.`,
+      policyProblem(
+        path,
+        `'${field}' must be an array of ${noun} strings (found ${raw === null ? "null" : typeof raw}), for example "${field}": [].`,
+        warnings,
+        errors,
       );
     }
     return undefined;
   }
-  // Non-strings AND blank strings are dropped (the shipped schema says
-  // minLength 1). A kept "" was a silent deny-everything: isAllowed then
-  // required namespace === "", which NAMESPACE_RE makes unreachable.
-  // Survivors are kept TRIMMED: validating `" github".trim()` while KEEPING
-  // the untrimmed spelling produced an allow-list no installed namespace can
-  // ever match -- a silent deny-all that also shadows a valid parent scope.
-  // On `blocked` the same trim turns an inert `" slack"` into a real deny,
-  // which is the honest reading of what the user wrote.
+  // Non-strings AND blank strings are not usable (the shipped schema says
+  // minLength 1). Survivors are kept TRIMMED: validating `" github".trim()`
+  // while keeping the untrimmed spelling would produce an entry no installed
+  // namespace can ever match.
   const strings = raw
     .map((v) => (typeof v === "string" ? v.trim() : v))
     .filter((v): v is string => typeof v === "string" && v !== "");
   const dropped = raw.length - strings.length;
   if (dropped > 0) {
-    warnings.push(
-      `${path}: '${field}' dropped ${dropped} non-string or empty ${dropped === 1 ? "entry" : "entries"} -- only non-empty ${noun} strings are honored.`,
+    policyProblem(
+      path,
+      `'${field}' has ${dropped} non-string or empty ${dropped === 1 ? "entry" : "entries"}; every entry must be a non-empty ${noun} string.`,
+      warnings,
+      errors,
     );
   }
-  // The namespace-shape check (servers/blocked; blockedTools passes
-  // dropInvalid, see the parameter) is a WARNING, never a drop: dropping would empty the
-  // array, hit the fall-through below, and silently promote a specific scope's
-  // deny-all into the parent scope's allow-all -- the exact bug this function
-  // exists to prevent. NAMESPACE_RE is imported from local-bundles.ts rather
+  // The shape check is a WARNING on servers/blocked: an unmatchable allow entry
+  // simply allows nothing. NAMESPACE_RE is imported from local-bundles.ts rather
   // than re-spelled so the validator and the installer pin one definition.
   const kept: string[] = [];
   for (const s of strings) {
@@ -324,26 +356,15 @@ function filterStringArray(
     if (problem) warnings.push(problem);
     if (!problem || !dropInvalid) kept.push(s);
   }
-  // All entries invalid (non-empty array that filtered to []): treat as
-  // unset so the resolver falls through to the parent scope instead of
-  // resolving to an empty (allow-all) list that shadows it.
-  if (strings.length === 0 && raw.length > 0) return undefined;
-  // With dropInvalid (blockedTools), an array whose STRING entries all fail
-  // the shape check resolves to an EMPTY list, not undefined: there is no
-  // parent scope for blockedTools to fall through to, and `deny nothing` is
-  // the honest reading of `every entry you wrote is unusable`. Note the
-  // asymmetry with the guard just above: an array with no usable STRINGS at
-  // all (`[1, null]`, `[""]`) returns undefined from there for every field,
-  // blockedTools included -- that guard runs first and does not know which
-  // field it is serving. Both answers mean "nothing is denied" to the gate
-  // (isToolDenied treats undefined and [] alike), so the difference is only
-  // visible to a caller comparing the resolved value. toProfile is one: its
-  // blockedToolsPaths lists a file whose key resolved to [] (`["*"]`) and
-  // leaves out one whose key resolved to undefined (`[1]`).
   return kept;
 }
 
-async function readConfigAt(path: string, scope: ConfigScope, warnings: string[]): Promise<LoadedConfigFile | null> {
+async function readConfigAt(
+  path: string,
+  scope: ConfigScope,
+  warnings: string[],
+  errors: PolicyError[],
+): Promise<LoadedConfigFile | null> {
   let raw: string;
   try {
     raw = await readFile(path, "utf8");
@@ -354,14 +375,13 @@ async function readConfigAt(path: string, scope: ConfigScope, warnings: string[]
     // to load. Anything ELSE means the file IS there and we could not read
     // it -- EACCES on a root-owned `~/.yaw-mcp/config.json` (sudo-run
     // install, restored backup), EISDIR on a `config.json/` directory, EIO
-    // on a flaky mount. Swallowing those made the user's allow/deny lists
-    // vanish with `doctor --json` reporting an empty warnings array, while
-    // the far less dangerous invalid-JSON case below did warn. Warn on both.
+    // on a flaky mount. The allow/deny lists in it cannot be known, so this
+    // is a policy error like the invalid-JSON case below.
     const code = (err as NodeJS.ErrnoException).code;
     if (code === "ENOENT" || code === "ENOTDIR") return null;
     const msg = err instanceof Error ? err.message : String(err);
-    warnings.push(`${path}: unreadable (${code ?? msg}) -- file ignored`);
-    log("warn", "Config file exists but could not be read; ignoring", { path, error: msg, code });
+    policyProblem(path, `exists but could not be read (${code ?? msg}).`, warnings, errors);
+    log("warn", "Config file exists but could not be read; refusing server spawns", { path, error: msg, code });
     return null;
   }
   let parsed: unknown;
@@ -372,12 +392,12 @@ async function readConfigAt(path: string, scope: ConfigScope, warnings: string[]
     // the bad token, which can be a pasted secret. Same rule as bundles.json
     // (parseBundlesContent).
     const where = jsonErrorLocation(raw, err);
-    warnings.push(`${path}: invalid JSON ${where} -- file ignored`);
-    log("warn", "Config file is not valid JSON; ignoring", { path, location: where });
+    policyProblem(path, `invalid JSON ${where}.`, warnings, errors);
+    log("warn", "Config file is not valid JSON; refusing server spawns", { path, location: where });
     return null;
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    warnings.push(`${path}: root must be a JSON object -- file ignored`);
+    policyProblem(path, "the top level must be a JSON object.", warnings, errors);
     return null;
   }
   const obj = parsed as Record<string, unknown>;
@@ -419,15 +439,22 @@ async function readConfigAt(path: string, scope: ConfigScope, warnings: string[]
   const unknownKeys = Object.keys(obj).filter(
     (k) => !KNOWN_CONFIG_KEYS.has(k) && !(DEPRECATED_KEYS as readonly string[]).includes(k),
   );
+  let unknownKeysWarning: string | undefined;
   if (unknownKeys.length > 0) {
-    warnings.push(
-      `${path}: unknown ${unknownKeys.length === 1 ? "key" : "keys"} ${unknownKeys.map((k) => `'${k}'`).join(", ")} ignored -- known keys: ${[...KNOWN_CONFIG_KEYS].join(", ")}. Full schema: ${CONFIG_SCHEMA_URL}`,
-    );
+    const known = [...KNOWN_CONFIG_KEYS];
+    const guesses = unknownKeys
+      .map((k) => [k, closestNames(k, known, 1)[0]] as const)
+      .filter(([, guess]) => guess !== undefined)
+      .map(([k, guess]) => `'${k}' -> '${guess}'`);
+    const hint =
+      guesses.length > 0 ? ` Did you mean ${guesses.join(", ")}? Rename it and restart your MCP client.` : "";
+    unknownKeysWarning = `${path}: unknown ${unknownKeys.length === 1 ? "key" : "keys"} ${unknownKeys.map((k) => `'${k}'`).join(", ")} ignored, so nothing in ${unknownKeys.length === 1 ? "it is" : "them is"} enforced -- known keys: ${known.join(", ")}.${hint} Full schema: ${CONFIG_SCHEMA_URL}`;
+    warnings.push(unknownKeysWarning);
   }
 
-  const servers = filterStringArray(obj.servers, "servers", path, warnings);
-  const blocked = filterStringArray(obj.blocked, "blocked", path, warnings);
-  const blockedTools = filterStringArray(obj.blockedTools, "blockedTools", path, warnings, toolEntry, true);
+  const servers = filterStringArray(obj.servers, "servers", path, warnings, errors);
+  const blocked = filterStringArray(obj.blocked, "blocked", path, warnings, errors, blockedEntry);
+  const blockedTools = filterStringArray(obj.blockedTools, "blockedTools", path, warnings, errors, toolEntry, true);
   // Only a literal boolean is honored — a non-boolean (string "true",
   // number 1) is ignored rather than coerced, so a typo can't silently
   // flip on a privacy-sensitive nudge.
@@ -442,16 +469,37 @@ async function readConfigAt(path: string, scope: ConfigScope, warnings: string[]
     );
   }
 
-  return { path, scope, version, servers, blocked, blockedTools, installNudge };
+  return {
+    path,
+    scope,
+    version,
+    servers,
+    blocked,
+    blockedTools,
+    installNudge,
+    ...(unknownKeysWarning ? { unknownKeysWarning } : {}),
+  };
 }
 
-/** Merge servers (allow-list): most specific scope wins. */
-function pickServers(files: LoadedConfigFile[]): string[] | undefined {
-  const local = files.find((f) => f.scope === "local")?.servers;
-  if (local !== undefined) return local;
-  const project = files.find((f) => f.scope === "project")?.servers;
-  if (project !== undefined) return project;
-  return files.find((f) => f.scope === "global")?.servers;
+/** Merge servers (allow-list). config.local.json beats the project file, and
+ *  whichever applies may only narrow the user-global list: a config that
+ *  arrives with a cloned repository must not be able to grant itself a server
+ *  the user's own allow-list leaves out. */
+function pickServers(files: LoadedConfigFile[], warnings: string[]): string[] | undefined {
+  const specific =
+    files.find((f) => f.scope === "local" && f.servers) ?? files.find((f) => f.scope === "project" && f.servers);
+  const global = files.find((f) => f.scope === "global" && f.servers);
+  if (!specific?.servers) return global?.servers;
+  if (!global?.servers) return specific.servers;
+  const allowed = new Set(global.servers);
+  const dropped = specific.servers.filter((s) => !allowed.has(s));
+  if (dropped.length > 0) {
+    const them = dropped.length === 1 ? "it" : "them";
+    warnings.push(
+      `${specific.path}: 'servers' ${dropped.map((s) => `'${s}'`).join(", ")} dropped -- not in the global allow-list at ${global.path}, and a project config can only narrow that list. To allow ${them}, add ${them} to ${global.path} and restart your MCP client.`,
+    );
+  }
+  return specific.servers.filter((s) => allowed.has(s));
 }
 
 /** Resolve installNudge: most specific scope that sets it wins (local >
@@ -509,6 +557,7 @@ export async function loadYawMcpConfig(opts: LoadConfigOptions = {}): Promise<Re
   const home = resolve(opts.home ?? homedir());
 
   const warnings: string[] = [];
+  const policyErrors: PolicyError[] = [];
   const loadedFiles: LoadedConfigFile[] = [];
 
   // Fold any pre-0.12 flat config dotfiles into `.yaw-mcp/` before the
@@ -544,7 +593,7 @@ export async function loadYawMcpConfig(opts: LoadConfigOptions = {}): Promise<Re
   const projectPath = projectConfigDir ? join(projectConfigDir, CONFIG_FILENAME) : null;
   const globalPath = join(globalDir, CONFIG_FILENAME);
 
-  const local = localPath ? await readConfigAt(localPath, "local", warnings) : null;
+  const local = localPath ? await readConfigAt(localPath, "local", warnings, policyErrors) : null;
   if (local) loadedFiles.push(local);
 
   // Belt and braces against double-loading the user-global dir as project
@@ -558,20 +607,33 @@ export async function loadYawMcpConfig(opts: LoadConfigOptions = {}): Promise<Re
   // applies) so a case-variant or unnormalized spelling still compares equal.
   const normalizeDir = (d: string): string => normalizeForCompare(resolve(d));
   const projectIsGlobal = projectConfigDir !== null && normalizeDir(projectConfigDir) === normalizeDir(globalDir);
-  const project = projectIsGlobal || !projectPath ? null : await readConfigAt(projectPath, "project", warnings);
+  const project =
+    projectIsGlobal || !projectPath ? null : await readConfigAt(projectPath, "project", warnings, policyErrors);
   if (project) loadedFiles.push(project);
 
-  const global = await readConfigAt(globalPath, "global", warnings);
+  const global = await readConfigAt(globalPath, "global", warnings, policyErrors);
   if (global) loadedFiles.push(global);
 
+  const policyWarnings = loadedFiles.flatMap((f) => (f.unknownKeysWarning ? [f.unknownKeysWarning] : []));
+  // ...and the BROKEN-policy messages too (the policyProblem ones: wrong-typed
+  // servers/blocked/blockedTools, unreadable/invalid JSON file). They already
+  // reach `warnings` and `policyErrors` (which refuses every spawn), but a
+  // refusal only NAMED the file -- while an unknown key got its own
+  // policyWarnings line. policyWarnings is display-only (isAllowed and
+  // effectiveProfile never read it), so repeating a message here costs no
+  // enforcement and gives each refusal the key-level message to show.
+  policyWarnings.push(...policyErrors.map((e) => e.message));
+
   return {
-    servers: pickServers(loadedFiles),
+    servers: pickServers(loadedFiles, warnings),
     blocked: unionStringField(loadedFiles, "blocked"),
     blockedTools: unionStringField(loadedFiles, "blockedTools"),
     installNudge: pickInstallNudge(loadedFiles),
     projectConfigDir,
     loadedFiles,
     warnings,
+    ...(policyErrors.length > 0 ? { policyErrors } : {}),
+    ...(policyWarnings.length > 0 ? { policyWarnings } : {}),
   };
 }
 
@@ -600,6 +662,12 @@ export interface Profile {
    *  config.local.json loaded, a project config.json carrying the deny is
    *  neither of them. Absent when no file declares the key. */
   blockedToolsPaths?: string[];
+  /** Broken policy files. While present, every server is refused. */
+  policyErrors?: PolicyError[];
+  /** Broken-policy messages and unknown top-level keys
+   *  (ResolvedConfig.policyWarnings): shown, never enforced, and never a
+   *  reason to refuse on their own. */
+  policyWarnings?: string[];
 }
 
 /** Derive a Profile from a ResolvedConfig, or null if no allow/deny
@@ -608,7 +676,14 @@ export interface Profile {
  *  spawn and tool gates). Only the path fields are for display: they
  *  condense which files contributed, for health output and refusal text. */
 export function toProfile(config: ResolvedConfig): Profile | null {
-  if (config.servers === undefined && config.blocked === undefined && config.blockedTools === undefined) {
+  const policyErrors = config.policyErrors?.length ? config.policyErrors : undefined;
+  if (
+    config.servers === undefined &&
+    config.blocked === undefined &&
+    config.blockedTools === undefined &&
+    !policyErrors &&
+    !config.policyWarnings?.length
+  ) {
     return null;
   }
   const byScope = new Map<ConfigScope, LoadedConfigFile>();
@@ -619,21 +694,21 @@ export function toProfile(config: ResolvedConfig): Profile | null {
   const global = byScope.get("global");
 
   const primary = local ?? project ?? global;
-  // Unreachable at runtime, and deliberately kept: `config.servers` /
-  // `config.blocked` are only ever populated FROM a loadedFiles entry, so the
-  // guard above already implies at least one scope is present here. What this
-  // line does is narrow `primary` for the compiler (Map.get is optional) --
-  // and it degrades a hypothetical future resolver that synthesizes rules
-  // with no backing file to "no profile" instead of a TypeError on `.path`.
-  if (!primary) return null;
+  // A broken file may be the only one there is, and it still has to produce a
+  // profile: null would read as "no policy".
+  const path = primary?.path ?? policyErrors?.[0]?.path;
+  // Otherwise unreachable: the lists are only ever populated from a loaded file.
+  if (path === undefined) return null;
 
   const result: Profile = {
-    path: primary.path,
+    path,
     servers: config.servers,
     blocked: config.blocked,
     blockedTools: config.blockedTools,
   };
-  if (primary !== global && global) {
+  if (policyErrors) result.policyErrors = policyErrors;
+  if (config.policyWarnings?.length) result.policyWarnings = config.policyWarnings;
+  if (primary && primary !== global && global) {
     result.userPath = global.path;
   }
   // loadedFiles is pushed local -> project -> global, so this is precedence
@@ -644,12 +719,15 @@ export function toProfile(config: ResolvedConfig): Profile | null {
 }
 
 /** Returns true iff `namespace` is allowed by the resolved allow/deny lists. */
-export function isAllowed(rules: { servers?: string[]; blocked?: string[] } | null, namespace: string): boolean {
+export function isAllowed(
+  rules: { servers?: string[]; blocked?: string[]; policyErrors?: PolicyError[] } | null,
+  namespace: string,
+): boolean {
   if (!rules) return true;
+  if (rules.policyErrors?.length) return false;
   if (rules.blocked?.includes(namespace)) return false;
-  if (rules.servers && rules.servers.length > 0) {
-    return rules.servers.includes(namespace);
-  }
+  // Set means set: an explicit empty list allows nothing.
+  if (rules.servers) return rules.servers.includes(namespace);
   return true;
 }
 

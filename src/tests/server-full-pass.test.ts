@@ -205,7 +205,10 @@ describe("bundle gaps name the remedy each member needs", () => {
 
   it("match: a profile-blocked member is reported as blocked, not missing", async () => {
     priv.config = {
-      servers: [makeServerConfig({ namespace: "github" }), makeServerConfig({ id: "2", namespace: "pagerduty" })],
+      servers: [
+        makeServerConfig({ namespace: "github", args: ["github"] }),
+        makeServerConfig({ id: "2", namespace: "pagerduty", args: ["pagerduty"] }),
+      ],
       configVersion: "v1",
     };
     priv.profile = { path: "/p/.yaw-mcp.json", blocked: ["pagerduty"] };

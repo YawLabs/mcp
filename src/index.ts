@@ -839,8 +839,9 @@ if (subcommand === "compliance") {
     1. <project>/.yaw-mcp/config.local.json   machine-local overrides (gitignore)
     2. <project>/.yaw-mcp/config.json         project-shared (checked in)
     3. ~/.yaw-mcp/config.json                 user-global default
-  \`servers\` comes from the first file that sets it; \`blocked\` and
-  \`blockedTools\` are the union of every file's entries.
+  \`servers\`: the first project file setting it, narrowing the global list.
+  \`blocked\`, \`blockedTools\`: the union of all files. A broken file stops
+  every server; \`yaw-mcp doctor\` names it.
 
   yaw-mcp reads these config.json files ONCE, at startup. Restart the MCP
   client (or kill yaw-mcp; the client will respawn it) after editing one.
@@ -941,9 +942,9 @@ if (subcommand === "compliance") {
       //
       // Be honest about how narrow that is. The two failure modes this
       // comment used to name cannot reach here:
-      //   * an unreadable config dir -- loadYawMcpConfig is fail-open by
+      //   * an unreadable config dir -- loadYawMcpConfig does not reject by
       //     construction. readConfigAt turns EVERY read/parse error into a
-      //     warning and returns null, and both the legacy-path migration and
+      //     policy error and returns null, and both the legacy-path migration and
       //     the project-dir walk-up carry their own .catch().
       //   * a transport that fails to connect -- server.start() is
       //     fire-and-forget below with its OWN .catch(), which logs "Fatal
@@ -976,8 +977,8 @@ async function runServer(): Promise<void> {
   //
   // Registered BEFORE the first await below, so nothing that goes wrong
   // while the config loads is left without a net. loadYawMcpConfig() itself
-  // is fail-open -- a malformed config or a permissions error becomes a
-  // warning, not a rejection (see the comment at the runServer() call) --
+  // does not reject on a malformed config or a permissions error: those become
+  // policy errors that refuse spawns (see the comment at the runServer() call) --
   // so this ordering is cheap insurance rather than a guard against a known
   // startup rejection.
   process.on("unhandledRejection", (e) => log("error", "unhandledRejection", { error: String(e) }));
