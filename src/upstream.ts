@@ -631,8 +631,9 @@ export function cpuBusyFraction(start: CpuTimes, end: CpuTimes): number | null {
 // Bound on per-request listTools/listResources/listPrompts after the
 // initial handshake. Without this, a server that completes connect but
 // then hangs on an inventory call would lock up activation forever (the
-// CONNECT_TIMEOUT timer above is already cleared by the time we reach
-// the listX calls). 15s matches the connect ceiling -- if a server
+// connect-deadline timer in connectToUpstreamOnce is already cleared by the
+// time we reach the listX calls). 15s matches the default connect ceiling
+// (defaultConnectTimeout()) -- if a server
 // can't list its own tools in 15s, surface it as a real failure.
 //
 // Lazy + memoized for the reason defaultConnectTimeout() gives; same naming
@@ -661,13 +662,13 @@ export const MAX_RESOURCES_PER_SERVER = 1000;
 export const MAX_PROMPTS_PER_SERVER = 1000;
 
 // Bound on how many cursor'd pages a single list fetch will follow. Each
-// page gets a fresh LIST_TIMEOUT, so bounding pages only by the item caps
+// page gets a fresh listTimeout(), so bounding pages only by the item caps
 // would let a misbehaving upstream dribble one slow item per page and hold
 // a single activation for up to 1000 sequential requests -- and
 // connectToUpstreamOnce runs three such fetches back to back. 50 pages is
 // plenty for any legitimate inventory under the item caps (real servers
 // paginate in the tens-to-hundreds of items per page), and it bounds the
-// worst case to pages x LIST_TIMEOUT per category instead of hours.
+// worst case to pages x listTimeout() per category instead of hours.
 export const MAX_LIST_PAGES = 50;
 
 // Error categories surfaced to the caller. The dispatch/activate handlers
@@ -676,7 +677,7 @@ export const MAX_LIST_PAGES = 50;
 export type ActivationFailureCategory =
   | "spawn_failure" // command missing (ENOENT), not executable (EACCES), or refused by the OS (EFTYPE / spawn UNKNOWN)
   | "install_failure" // process spawned but exited non-zero before handshake
-  | "init_timeout" // process running but didn't complete init within CONNECT_TIMEOUT
+  | "init_timeout" // process running but didn't complete init within the connect deadline
   // Two different failures share this one. For any server: the handshake
   // completed and something after it failed (the initial tools/list errored,
   // the server disconnected during initialization). For a REMOTE server it is
@@ -938,8 +939,9 @@ function secretMatchVariants(value: string): string[] {
  *
  *  The ref test is a plain substring check on the CONFIG value, the same one
  *  resolveServerEnv's refKeys uses, so a ref that resolution left alone still
- *  counts as vault-sourced. Secret values are spread LAST so a vault entry
- *  name wins over a same-named env key: it is the entry to rotate. */
+ *  counts as vault-sourced. The bare secret values are merged by
+ *  mergeSecretValues, which keeps a same-named env entry holding a DIFFERENT
+ *  value instead of dropping it. */
 function localRedactionMap(
   configEnv: Record<string, string>,
   serverEnv: Record<string, string>,
@@ -953,7 +955,29 @@ function localRedactionMap(
       out[k] = v;
     }
   }
-  return { ...out, ...secretValues };
+  return mergeSecretValues(out, secretValues);
+}
+
+/** Merge the bare decrypted values (keyed by VAULT SECRET NAME) into a
+ *  redaction map keyed by ENV / HEADER NAME. The two namespaces can collide:
+ *  `{ GITHUB_TOKEN: "ghp_literal", GH_TOKEN: "${secret:GITHUB_TOKEN}" }`
+ *  puts a literal under `GITHUB_TOKEN` and a different vault value under the
+ *  secret name `GITHUB_TOKEN`, and a plain spread silently dropped the
+ *  literal from the map -- so it was no longer redacted. On a collision with
+ *  a different value the secret goes in under `secret:<name>` instead (the
+ *  marker then reads `***secret:GITHUB_TOKEN***`, still naming the vault entry
+ *  to rotate); an equal value needs no second entry. Exported for tests. */
+export function mergeSecretValues(
+  base: Record<string, string>,
+  secretValues: Record<string, string>,
+): Record<string, string> {
+  const out: Record<string, string> = { ...base };
+  for (const [name, value] of Object.entries(secretValues)) {
+    if (typeof value !== "string") continue;
+    if (!Object.hasOwn(out, name)) out[name] = value;
+    else if (out[name] !== value) out[`secret:${name}`] = value;
+  }
+  return out;
 }
 
 /** True when `value` is a URL whose userinfo carries a password --
@@ -1822,7 +1846,7 @@ export async function connectToUpstream(
     // by the memos).
     if (!(err instanceof ActivationError)) throw err;
     if (attempt.oamRewriteApplied) {
-      log("warn", "oam-hosted server failed to boot; downgrading to node for this session", {
+      log("warn", "oam-hosted server failed to boot; retrying once on node", {
         namespace: config.namespace,
         oamVersion: attempt.oamVersion,
         category: err.category,
@@ -1906,7 +1930,7 @@ export async function connectToUpstream(
       // same way on either command), and pinning on that would leave the
       // server on raw npx -- the exact cost this rewrite exists to remove --
       // for the rest of the session on evidence that implicated nothing.
-      log("warn", "managed-sidecar server failed to boot; downgrading to npx for this session", {
+      log("warn", "managed-sidecar server failed to boot; retrying once on npx", {
         namespace: config.namespace,
         category: err.category,
         error: err.message,
@@ -2248,9 +2272,11 @@ async function connectToUpstreamOnce(
         }
       }
       // WINDOWS + NON-NODE BROKER + a launch still named `npx`: run it as
-      // `node npx-cli.js ...` instead. This is the oam->npx downgrade respawn's
-      // path -- suppressRewrites restores the ORIGINAL bare npx command while
-      // the broker process itself is still oam -- and it was broken there: the
+      // `node npx-cli.js ...` instead. The rewrite runs on EVERY resolve of an
+      // npx launch under a non-node broker, not only the respawn; the
+      // oam->node downgrade respawn -- suppressRewrites restores the ORIGINAL
+      // bare npx command while the broker process itself is still oam -- is
+      // the case that motivated it, and the one measured broken there: the
       // MCP SDK's cross-spawn wraps the bare npx in `cmd /d /s /c "npx ^"-y^"
       // ..."` with windowsVerbatimArguments, oam's child_process runtime
       // IGNORES that flag (measured 3/3 garbage under oam, clean under node),
@@ -2441,7 +2467,7 @@ async function connectToUpstreamOnce(
       // `"Authorization": "Bearer ${secret:linear}"`, and a gateway that
       // answers with `{"error":"invalid_api_key","key":"<token>"}` echoes only
       // the token, which the composed string does not match.
-      resolvedServerEnv = { ...resolvedHeaders, ...headerSecretValues };
+      resolvedServerEnv = mergeSecretValues(resolvedHeaders, headerSecretValues);
       requestHeaders = resolvedHeaders;
     }
 
@@ -2652,7 +2678,12 @@ async function connectToUpstreamOnce(
           : ` Underlying error: ${redactSecretsInOutput(raw, resolvedServerEnv).slice(0, 300)}`;
         message = `Command '${config.command}' is not on PATH or is not executable. Verify the runtime is installed (e.g. Node.js for npx, Python for uvx).${spawnedNote}${underlying}`;
       } else {
-        message = err instanceof Error ? err.message : String(err);
+        // Redacted like every sibling branch: "unknown" is what a child that
+        // REJECTS initialize with a JSON-RPC error lands on (a numeric code),
+        // and an upstream that echoes an injected value there ("invalid token:
+        // <value>") while writing nothing to stderr would otherwise put it in
+        // the log and the model-visible activate result.
+        message = redactSecretsInOutput(err instanceof Error ? err.message : String(err), resolvedServerEnv);
       }
     }
 
@@ -2807,7 +2838,7 @@ async function connectToUpstreamOnce(
       );
       // throwOnError on all three refreshes: a failed fetch must leave the
       // PREVIOUS inventory standing. Without it the resources/prompts fetchers
-      // return [] on any transport error or LIST_TIMEOUT, so one blip mid-
+      // return [] on any transport error or listTimeout(), so one blip mid-
       // session assigned [] here, rebuilt routes off it, and made every
       // resource/prompt of a healthy server vanish from the client until some
       // future list_changed that may never arrive. The assignment is inside
@@ -2844,7 +2875,7 @@ async function connectToUpstreamOnce(
 
     // A REAL phase boundary, not a tick: the handshake is done and the child
     // is answering, and what follows is three list calls with their own
-    // LIST_TIMEOUT each (plus pagination). A server that handshakes fast and
+    // listTimeout() each (plus pagination). A server that handshakes fast and
     // then takes ten seconds to enumerate a large tool set was previously
     // indistinguishable from one still trying to start.
     progress?.(`"${config.namespace}" is up -- reading its tools, resources and prompts`);
@@ -2943,7 +2974,7 @@ export async function disconnectFromUpstream(connection: UpstreamConnection): Pr
  *
  *  `throwOnError` (the list_changed refresh path): THROW instead, so the
  *  caller can leave the previous inventory in place. Swallowing on refresh
- *  meant one transient transport error or LIST_TIMEOUT replaced a live
+ *  meant one transient transport error or listTimeout() replaced a live
  *  inventory with [] and silently un-published every resource/prompt the
  *  client had. The tools fetcher is already immune because it rethrows; this
  *  flag is how the other two opt into the same protection without changing
@@ -2958,10 +2989,11 @@ export interface FetchListOptions {
  *  otherwise have everything past page 1 silently dropped.
  *
  *  Four bounds keep a misbehaving server from holding activation hostage.
- *  Each page gets its own LIST_TIMEOUT via the caller's request options, so
+ *  Each page gets its own listTimeout() via the caller's request options, so
  *  the page count is the only thing standing between one fetch and
- *  pages x LIST_TIMEOUT of wall time:
- *  - the fetch stops one page after the item cap is exceeded (the caller
+ *  pages x listTimeout() of wall time:
+ *  - the fetch stops as soon as more than the item cap has arrived, so it
+ *    reads one page past the cap only when a total lands exactly on it (the caller
  *    truncates there anyway, and the overshoot is what lets its truncation
  *    warning fire);
  *  - a page that returns zero items but still hands back a cursor ends the
@@ -3002,7 +3034,7 @@ async function fetchAllPages<T>(
     if (items.length === 0) {
       // A cursor on a zero-item page is a dribble, not pagination -- a
       // legitimate inventory always makes progress. Stop rather than burn
-      // another LIST_TIMEOUT-bounded round trip on it.
+      // another listTimeout()-bounded round trip on it.
       log("warn", "Upstream returned an empty page with a cursor; stopping pagination", {
         namespace: context.namespace,
         endpoint: context.endpoint,
@@ -3119,7 +3151,7 @@ function isMethodNotFound(err: unknown): boolean {
 
 /** The log line for a resources/prompts list error the initial connect
  *  swallowed. -32601 is the expected answer from a server without the
- *  capability and stays silent. Anything else (a LIST_TIMEOUT, a transport
+ *  capability and stays silent. Anything else (a listTimeout() expiry, a transport
  *  error, a server that has the capability and failed) still yields an empty
  *  inventory, but says so: otherwise a server whose resources or prompts went
  *  missing leaves no trace of why. The message is truncated because it is

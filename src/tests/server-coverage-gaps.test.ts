@@ -188,7 +188,7 @@ describe("a bundle whose missing members are all installed but disabled", () => 
     const entry = end === -1 ? block : block.slice(0, end);
 
     expect(entry).toContain(
-      "disabled: pagerduty, slack (installed; enable with: yaw-mcp enable pagerduty && yaw-mcp enable slack)",
+      "disabled: pagerduty, slack (installed; enable with: yaw-mcp enable pagerduty, yaw-mcp enable slack)",
     );
     expect(entry).not.toContain("missing:");
     expect(entry).not.toContain("yaw-mcp add");

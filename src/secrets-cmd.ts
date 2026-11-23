@@ -29,7 +29,7 @@
 // confirmation, never the passphrase.
 
 import { createHash, randomInt } from "node:crypto";
-import { chmod, copyFile, constants as fsConstants, readFile, unlink } from "node:fs/promises";
+import { chmod, copyFile, constants as fsConstants, readFile, realpath, unlink } from "node:fs/promises";
 import { homedir, constants as osConstants } from "node:os";
 import { resolve as resolvePath } from "node:path";
 import { loadLocalBundles } from "./local-bundles.js";
@@ -318,8 +318,9 @@ export interface SecretsCommandOptions {
   value?: string;
   fromStdin?: boolean;
   json?: boolean;
-  /** Skip the destructive-action confirmation (remove, reset, and a set
-   *  that overwrites an existing name). Never skips the passphrase. */
+  /** Skip the destructive-action confirmation (remove, reset, `recovery
+   *  remove`, and a set that overwrites an existing name). Never skips the
+   *  passphrase. */
   force?: boolean;
   /** For `audit`: filter to one secret name. */
   secretFilter?: string;
@@ -826,7 +827,8 @@ async function vaultChangedSinceLoad(path: string, baseline: VaultFingerprint): 
  *  sentence is vaultUnreadableMessage's, the one get/list print through
  *  safeLoadVault for the identical on-disk state; the "Nothing was written."
  *  after it is this refusal's own, since only the actions that write reach
- *  it (set, remove, rotate, reset). */
+ *  it (set, remove, rotate, reset, recover -- for the vault path and for a
+ *  --file source -- and recovery new|remove). */
 function vaultUnreadableResult(
   io: SecretsIo,
   json: boolean | undefined,
@@ -1064,7 +1066,8 @@ async function promptYesNo(opts: SecretsCommandOptions, question: string): Promi
 
 /** Warn (never block) when an ACCEPTED passphrase is under the soft floor.
  *
- *  Applies to every path a passphrase can arrive on, not just the env var.
+ *  Applies to the env vars and every TTY prompt, not just the env var (the
+ *  embedder hooks opts.passphrase / opts.newPassphrase are not warned).
  *  Warning only on the env path was backwards: the interactive prompt is
  *  the one place a human actually CHOOSES a passphrase, so `secrets set` on
  *  a fresh vault could create it under "abc" with no feedback while the
@@ -1396,7 +1399,8 @@ function secretConsumersNotice(
 /** One `err` line when a loaded vault is behind this build's schema.
  *
  *  The v2 name binding (secrets-vault.ts's AAD) only engages for a file
- *  that SAYS v2, and nothing but `rotate` ever rewrites the version:
+ *  that SAYS v2, and only the rekeyVault commands (`rotate`, `recovery new`)
+ *  rewrite the version of an existing vault:
  *  setSecret spreads the vault it was given, so a v1 file stays v1 through
  *  years of `set`s -- every entry position-independent (a blob swapped
  *  between PROD and DEV still decrypts) while the vault header and the
@@ -1404,8 +1408,9 @@ function secretConsumersNotice(
  *  not `list`, not `set`, not doctor. This is that surface -- once per
  *  command that loads such a vault, on `err` (never `out`, which carries
  *  `get`'s cleartext and the --json envelopes; same rule as
- *  warnIfShortPassphrase, and like it, it fires under --json too). rotate
- *  is the one command that does not call it: it IS the upgrade.
+ *  warnIfShortPassphrase, and like it, it fires under --json too). Only
+ *  list and get/set/remove call it; rotate, recovery, recover and reset own
+ *  their flows and do not (rotate and `recovery new` ARE the upgrade).
  *
  *  Under --json the notice is its own JSON LINE, not prose: every error
  *  envelope this command emits goes to `err` too, so a --json wrapper parses
@@ -1551,8 +1556,9 @@ const ALT_SCREEN_OFF = "\x1b[?1049l";
 /** How many times the user may get the two groups wrong before giving up. */
 const RECOVERY_CONFIRM_ATTEMPTS = 3;
 
-/** How many empty group answers (a bare Enter, ^D, spaces/dashes) are accepted
- *  before giving up. They are NOT mismatches -- unlike the passphrase prompts,
+/** How many empty group answers (a bare Enter, ^D, spaces/dashes) IN A ROW
+ *  are accepted before giving up -- any typed answer resets the count. They
+ *  are NOT mismatches -- unlike the passphrase prompts,
  *  an empty entry here means "nothing was typed", not "typed wrong" -- so they
  *  do not burn RECOVERY_CONFIRM_ATTEMPTS. This separate bound is what still
  *  terminates the loop on an EOF'd/closed stdin, which answers "" forever
@@ -1567,7 +1573,8 @@ const RECOVERY_CONFIRM_MAX_EMPTY = 5;
  *  away) re-prompts without consuming one: nothing was typed, so it is not a
  *  mismatch, and burning an attempt for it made the three tries vanish under
  *  the user's fingers. It is counted against RECOVERY_CONFIRM_MAX_EMPTY
- *  instead, so a closed stdin that answers "" forever still ends the command
+ *  instead (consecutively -- a typed answer starts the count over), so a
+ *  closed stdin that answers "" forever still ends the command
  *  -- with a line on the prompt stream that names WHY (the mismatch wording
  *  at the bottom of the loop never prints for empties, so without it the user
  *  would land on "Aborted -- nothing was saved." with no reason).
@@ -1596,7 +1603,9 @@ async function issueRecoveryCode(
         "opens the vault if the passphrase is forgotten -- and so can anyone else who has it.\n" +
         "It is not stored anywhere you can read it back, and this screen clears when you are done.\n\n",
     );
-    for (let attempt = 0, empty = 0; attempt < RECOVERY_CONFIRM_ATTEMPTS && empty < RECOVERY_CONFIRM_MAX_EMPTY; ) {
+    // `empty` is only ever ended by the inner `return` below: every mismatch
+    // `break` follows a typed answer, which zeroes it, so it is always 0 here.
+    for (let attempt = 0, empty = 0; attempt < RECOVERY_CONFIRM_ATTEMPTS; ) {
       const first = randomInt(groups.length);
       let second = randomInt(groups.length - 1);
       if (second >= first) second++;
@@ -1610,15 +1619,17 @@ async function issueRecoveryCode(
         if (typed.length === 0) {
           // Nothing typed (bare Enter, ^D, only spaces/dashes): re-prompt the
           // SAME group -- an empty entry is not a mismatch, so no attempt is
-          // spent on it. Bounded by `empty` (not the attempt count), which is
-          // what still ends the loop when a closed stdin answers "" forever.
+          // spent on it. Bounded by `empty` -- the CONSECUTIVE blanks, reset by
+          // any typed answer below -- whose `return` here is what still ends
+          // the command when a closed stdin answers "" forever.
           empty++;
           if (empty >= RECOVERY_CONFIRM_MAX_EMPTY) {
             // The "That does not match" line below never runs for empties, so
             // name the reason HERE: confirmRecoveryCodeOrFail reduces this
             // exit to "Aborted -- nothing was saved." with no cause (unlike
-            // the wrong-group path, whose mismatch line explained it on screen
-            // first). Leave the alternate screen BEFORE writing it -- the
+            // the wrong-group path, whose mismatch line explains it -- the
+            // last one also off the alternate screen, for the same reason).
+            // Leave the alternate screen BEFORE writing it -- the
             // `finally` below writes ALT_SCREEN_OFF again, and everything on
             // that screen is wiped by leaving it, so a line printed while
             // still on it would be erased before the user could read it. The
@@ -1633,6 +1644,9 @@ async function issueRecoveryCode(
           i--;
           continue;
         }
+        // A typed answer (right or wrong) breaks the blank run: `empty` counts
+        // consecutive empties only, so scattered blanks never reach the bound.
+        empty = 0;
         if (typed !== groups[g]) {
           ok = false;
           break;
@@ -1640,11 +1654,14 @@ async function issueRecoveryCode(
       }
       if (ok) return "confirmed";
       attempt++;
-      out.write(
-        attempt < RECOVERY_CONFIRM_ATTEMPTS
-          ? "That does not match the code above. Check what you wrote down and try again.\n"
-          : "That does not match the code above.\n",
-      );
+      if (attempt < RECOVERY_CONFIRM_ATTEMPTS) {
+        out.write("That does not match the code above. Check what you wrote down and try again.\n");
+      } else {
+        // The last mismatch ends the command: leave the alternate screen
+        // first (as the empty-bound exit does) so the line survives it.
+        out.write(ALT_SCREEN_OFF);
+        out.write(`That does not match the code shown -- ${RECOVERY_CONFIRM_ATTEMPTS} attempts used.\n`);
+      }
     }
     return "exhausted";
   } finally {
@@ -1886,9 +1903,9 @@ async function resolveNewPassphrase(
 const MAX_PASSPHRASE_PROMPTS = 3;
 
 /** Soft floor for a passphrase: shorter than this triggers a stderr
- *  warning (never a hard block) on EVERY path a passphrase arrives on --
- *  env var, TTY creation prompt, TTY unlock prompt, and rotate's new
- *  passphrase. See warnIfShortPassphrase. */
+ *  warning (never a hard block) on the env var, TTY creation prompt, TTY
+ *  unlock prompt, and rotate's new passphrase -- every path but the embedder
+ *  hooks (opts.passphrase / opts.newPassphrase). See warnIfShortPassphrase. */
 const MIN_PASSPHRASE_WARN_LEN = 12;
 
 /** The refusal for NO_ECHO, worded like promptUnavailableMessage: what was
@@ -1965,7 +1982,7 @@ export async function runSecrets(
   // parser never lets one through, but `action` is optional for an embedder,
   // and the old fallthrough at the bottom made that caller pay for all four
   // to hear "unknown action", in prose even under --json. The `never` binding
-  // at the bottom makes tsc name a ninth action with no branch below.
+  // at the bottom makes tsc name any new action with no branch below.
   if (!isSecretsAction(opts.action)) {
     return failResult(io, opts.json, "", `unknown action ${String(opts.action)}`, { exitCode: 2 });
   }
@@ -2845,13 +2862,14 @@ function rotateVaultNudge(
   json: boolean | undefined,
   envKeyed: boolean,
   warning: "vault-rotated" | "vault-recovered" = "vault-rotated",
+  jsonFields: Record<string, unknown> = { passphrase_source: envKeyed ? "env" : "prompt" },
 ): void {
   if (json) {
     io.err(
       `${JSON.stringify({
         warning,
         path,
-        passphrase_source: envKeyed ? "env" : "prompt",
+        ...jsonFields,
         hint: "Update YAW_MCP_VAULT_PASSPHRASE to the new passphrase wherever it is set (this shell, a shell profile, any client config `env` block) -- the old value no longer unlocks the vault. A running yaw-mcp server keeps the passphrase it started with -- restart it (restart your MCP client). `yaw-mcp doctor` reports whether the passphrase it sees unlocks the vault.",
       })}\n`,
     );
@@ -3144,6 +3162,27 @@ async function runSecretsReset(opts: SecretsCommandOptions, io: SecretsIo): Prom
  *      when it can be shown, and confirmed before anything is saved.
  *   6. The changed-on-disk re-check, then the save.
  */
+/** Whether `a` and `b` name the same file: each is resolved and realpath'd
+ *  (symlinks, 8.3 short names), falling back to the resolved spelling when it
+ *  does not exist, and on win32 -- case-insensitive filesystems -- compared
+ *  without regard to case. Exported for tests (`platform` is injectable). */
+export async function isSameFilePath(
+  a: string,
+  b: string,
+  platform: NodeJS.Platform = process.platform,
+): Promise<boolean> {
+  const canonical = async (p: string): Promise<string> => {
+    const resolved = resolvePath(p);
+    try {
+      return await realpath(resolved);
+    } catch {
+      return resolved;
+    }
+  };
+  const [x, y] = await Promise.all([canonical(a), canonical(b)]);
+  return platform === "win32" ? x.toLowerCase() === y.toLowerCase() : x === y;
+}
+
 async function runSecretsRecover(opts: SecretsCommandOptions, io: SecretsIo): Promise<SecretsCommandResult> {
   const home = opts.home ?? homedir();
   const path = vaultPath(home);
@@ -3180,7 +3219,10 @@ async function runSecretsRecover(opts: SecretsCommandOptions, io: SecretsIo): Pr
   }
 
   const source = opts.file !== undefined ? resolvePath(opts.file) : path;
-  const fromCopy = source !== resolvePath(path);
+  // By identity, not spelling: `--file` naming the vault itself in another
+  // case / symlink / 8.3 form is the in-place recover, not a copy that would
+  // be refused for "replacing" the very file it names.
+  const fromCopy = !(await isSameFilePath(source, path));
 
   const baseline = await vaultFingerprint(path);
   if (isVaultUnreadable(baseline)) return vaultUnreadableResult(io, json, "recover", path, baseline);
@@ -3299,10 +3341,8 @@ async function runSecretsRecover(opts: SecretsCommandOptions, io: SecretsIo): Pr
       return vaultChangedResult(io, json, "recover");
     }
 
-    const cause = await trySaveVault(path, recovered);
-    if (cause !== null) {
-      return fail(`could not write the vault file at ${path} (${cause}) -- nothing was saved.`);
-    }
+    const failed = await saveVaultOrReport(path, recovered, io, json, "recover");
+    if (failed) return failed;
     // Any cached key belongs to a file that no longer exists.
     lock();
     await auditVaultEvents(home, [
@@ -3337,8 +3377,17 @@ async function runSecretsRecover(opts: SecretsCommandOptions, io: SecretsIo): Pr
       );
       if (issuedCode !== undefined && !fromCopy) io.out("A new recovery code replaced it.\n");
     }
+    // recover never READS YAW_MCP_VAULT_PASSPHRASE: `envKeyed` only says it is
+    // still set (to the lost/old value) for the prose nudge. The JSON line's
+    // passphrase_source names where the NEW passphrase came from, same
+    // precedence as resolveNewPassphrase (the opts hook counts as "prompt",
+    // as rotate's does), and the stale env var rides in its own field.
     const envKeyed = (process.env.YAW_MCP_VAULT_PASSPHRASE ?? "").length > 0;
-    rotateVaultNudge(io, path, json, envKeyed, "vault-recovered");
+    const newFromEnv = opts.newPassphrase === undefined && (process.env.YAW_MCP_VAULT_PASSPHRASE_NEW ?? "").length > 0;
+    rotateVaultNudge(io, path, json, envKeyed, "vault-recovered", {
+      passphrase_source: newFromEnv ? "env" : "prompt",
+      stale_env_set: envKeyed,
+    });
     return { exitCode: 0 };
   } finally {
     key.fill(0);

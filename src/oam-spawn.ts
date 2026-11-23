@@ -1205,7 +1205,7 @@ let oamProbeGeneration = 0;
  * (same fallback as oam-absent) plus ONE warn log naming both versions. An
  * unparseable version is treated as usable -- a working `--version` proves
  * oam exists, and refusing on a future format change would silently disable
- * every opted-in server.
+ * every oam-hosted (node/npx) server.
  *
  * `run` is injectable so the parse + gate logic is testable without a real
  * binary on PATH.
@@ -1370,7 +1370,7 @@ async function probeOamUncached(run: (bin: string) => Promise<string>, generatio
         // ...but updating alone changes nothing here. A non-timeout verdict
         // like this one is cached for the process lifetime and only cleared by
         // a test hook (only a timeout verdict lapses, after
-        // OAM_PROBE_TIMEOUT_RECHECK_MS), so every opted-in server keeps landing
+        // OAM_PROBE_TIMEOUT_RECHECK_MS), so every oam-hosted (node/npx) server keeps landing
         // on node until the broker restarts -- and an MCP broker under a
         // desktop client lives for days. Without this the user runs the update,
         // sees no further log line, and reads a working fix as a fix that did
@@ -1384,7 +1384,7 @@ async function probeOamUncached(run: (bin: string) => Promise<string>, generatio
       // A clean exit with nothing version-shaped in stdout is treated as
       // usable -- a working --version proves oam exists, and refusing on a
       // future change to its output format would silently disable every
-      // opted-in server (see probeOam's doc). No released oam has printed this
+      // oam-hosted (node/npx) server (see probeOam's doc). No released oam has printed this
       // way: clap writes --version to stdout, the one stream the probe pipes.
       // But it means the MIN_OAM_VERSION gate above never ran
       // for this binary, so the "old builds hang in ways that read as server
@@ -1416,7 +1416,7 @@ async function probeOamUncached(run: (bin: string) => Promise<string>, generatio
     //
     // EVERY other failure is not routine: oam IS on disk and did not produce a
     // usable --version. Since the probe result is cached for the process
-    // lifetime, that one outcome silently downgrades every opted-in server to
+    // lifetime, that one outcome silently downgrades every oam-hosted (node/npx) server to
     // node until restart, with nothing to explain why. So warn once, matching
     // the belowMin path, and let the timeout keep its own message -- it is the
     // only failure with an actionable budget attached to it. A timeout reaches
@@ -1533,7 +1533,7 @@ export interface OamRewriteDeps {
  *  config carries `NODE.EXE` as readily as `node.exe`, and the whole point of
  *  the basename match below is that every real shape of the same launcher is
  *  recognised. Matching only lowercase left `C:\Program Files\nodejs\NODE.EXE`
- *  classified as not-Node, so an opted-in server silently ran on node forever
+ *  classified as not-Node, so an oam-hosted server silently ran on node forever
  *  and doctor -- which calls the same helper -- agreed with the spawn, leaving
  *  nothing anywhere to explain why the opt-in did nothing. */
 const WIN_EXE_EXT = /\.(?:exe|cmd|bat)$/i;
@@ -1843,7 +1843,7 @@ export function rewriteForOam(
     // --node-options, ...) lands in `spec` and would be treated as the
     // package name. Staying on npx is the safe answer -- reimplementing
     // npx's arg parser here is not worth it -- but say WHY at debug level:
-    // from the outside, an opted-in server quietly running on node is
+    // from the outside, an oam-hosted server quietly running on node is
     // indistinguishable from oam being absent.
     //
     // -y/--yes are skipped only where npx ITSELF consumes them: before the
@@ -1989,9 +1989,12 @@ export function managedNodeBin(
 /** Dependencies of {@link rewriteNpmToManagedNode}: the node binary to spawn
  *  with (null -> stay on npx) and the on-disk entry resolver. Same
  *  `resolveEntry(pkg, wantVersion)` contract as {@link OamRewriteDeps} --
- *  an exact pin must return null rather than a copy declaring something else. */
+ *  an exact pin must return null rather than a copy declaring something else.
+ *  `nodeBin` may be a thunk: it is then called only once the launch has
+ *  classified as hostable, so a launch the rewrite refuses anyway (flag spec,
+ *  range, git/path spec) never pays the PATH walk managedNodeBin can cost. */
 export interface ManagedRewriteDeps {
-  nodeBin: string | null;
+  nodeBin: string | null | (() => string | null);
   resolveEntry: (pkg: string, wantVersion: string | null) => string | null;
 }
 
@@ -2036,10 +2039,6 @@ export function rewriteNpmToManagedNode(
   // Launch kind FIRST: a docker/uvx/oam command was never npx, so a missing
   // node must not log "staying on npx" for it.
   if (nodeLaunchKind(command) !== "npx") return { command, args };
-  if (!deps.nodeBin) {
-    log("debug", "no node binary located for the managed sidecar spawn; staying on npx", { command });
-    return { command, args };
-  }
   const launch = classifyNpxLaunch(args);
   if (launch.kind === "no-spec") return { command, args };
   if (launch.kind === "flag-spec") {
@@ -2069,6 +2068,14 @@ export function rewriteNpmToManagedNode(
     });
     return { command, args };
   }
+  // The node binary is resolved only now, for a launch the rewrite would
+  // actually take -- and before the entry lookup, which is a directory walk
+  // of its own and pointless without a node to run the entry with.
+  const nodeBin = typeof deps.nodeBin === "function" ? deps.nodeBin() : deps.nodeBin;
+  if (!nodeBin) {
+    log("debug", "no node binary located for the managed sidecar spawn; staying on npx", { command });
+    return { command, args };
+  }
   const { pkg, wantVersion } = launch;
   const entry = deps.resolveEntry(pkg, wantVersion);
   if (!entry) {
@@ -2088,7 +2095,7 @@ export function rewriteNpmToManagedNode(
     }
     return { command, args };
   }
-  return { command: deps.nodeBin, args: [entry, ...launch.rest] };
+  return { command: nodeBin, args: [entry, ...launch.rest] };
 }
 
 /** The path fragment that marks an npm `_npx` cache directory. Derived once:
@@ -2891,12 +2898,15 @@ export function resolveManagedSpawn(
   // Omitted -> managedNodeBin(), resolved lazily below: when the broker is not
   // running on node that is a PATH walk, and upstream.ts calls this for EVERY
   // local server oam did not take, including every non-npx one (docker, uvx,
-  // python), which never needs a node binary.
+  // python), which never needs a node binary. Passed to the rewrite as a thunk,
+  // so an npx launch the rewrite refuses (flag spec, range, git/path spec)
+  // skips the walk too. A launch that classifies hostable but has no on-disk
+  // entry still pays it, and npxUnderNode then runs its own (memoized) lookup.
   nodeBin?: string | null,
 ): { command: string; args: string[] } {
   if (nodeLaunchKind(command) !== "npx") return { command, args };
   return rewriteNpmToManagedNode(command, args, {
-    nodeBin: nodeBin === undefined ? managedNodeBin() : nodeBin,
+    nodeBin: nodeBin === undefined ? () => managedNodeBin() : nodeBin,
     resolveEntry: (pkg, wantVersion) => {
       if (wantVersion !== null) return resolveNpmEntry(pkg, fromUrl, npmCache, managedRoot, wantVersion);
       const memoed = managedEntryMemo.get(pkg);
@@ -2932,8 +2942,30 @@ export function resolveManagedSpawn(
   });
 }
 
+// Per-process memo for the node/npx-cli.js lookup inside npxUnderNode. PATH and
+// the node install are stable for the life of the process, but the lookup costs
+// a full PATH walk plus up to three existsSync probes on EVERY resolve -- the
+// rewrite sits at the end of upstream.ts's launch resolver, not only on the
+// respawn that motivated it. Keyed by nothing, and guarded by the opts check
+// instead: it is read and written ONLY when every opt is defaulted (the
+// production call shape), so an injected platform/execPath/env/exists -- the
+// test shape -- resolves fresh in both directions and can never read or poison
+// the memo. A hit is only trusted while its npx-cli.js still exists (one
+// existsSync instead of the walk, same policy as managedEntryMemo): a node
+// install removed or moved under a long-lived broker drops the entry and
+// re-resolves rather than emitting `node <missing npx-cli.js>`. A MISS (no node
+// on PATH, no npx-cli.js beside it) is never memoized, on purpose, so a node
+// installed after the first connect is picked up without a restart.
+let npxUnderNodeMemo: { nodeBin: string; cli: string } | null = null;
+
+/** Reset the npxUnderNode memo (test hook) -- process-lifetime by design, so
+ *  without this the memo tests depend on which one runs first. */
+export function resetNpxUnderNodeMemo(): void {
+  npxUnderNodeMemo = null;
+}
+
 /**
- * Rewrite a bare `npx` launch to `node npx-cli.js ...` when -- and ONLY when
+ * Rewrite an `npx` launch to `node npx-cli.js ...` when -- and ONLY when
  * -- the broker process itself is not running on node and the host is Windows.
  *
  * THE BUG THIS WORKS AROUND (MEASURED 2026-11-13, win-arm64): the MCP SDK's
@@ -2946,9 +2978,12 @@ export function resolveManagedSpawn(
  * line a second time and the whole quoted string becomes the program name:
  * `'"npx ^"-y^" ..."' is not recognized as an internal or external command`,
  * with carets under every quote -- a second install_failure on top of the
- * server's own first-attempt failure. The oam->npx downgrade respawn in
- * upstream.ts is the only path that reaches this: every other npx sidecar
- * boots on attempt 1 and never respawns.
+ * server's own first-attempt failure. The oam->node downgrade respawn in
+ * upstream.ts is the case that motivated this -- it was the one observed
+ * failing with the garbage above -- but it is not the only path that reaches
+ * the rewrite: npxUnderNode runs unconditionally at the end of upstream.ts's
+ * launch resolver, so a first-attempt npx launch whose argv shape the
+ * oam/managed rewrites decline (e.g. `npx --package x y`) reaches it too.
  *
  * The rewrite reproduces npx.cmd (`node.exe .../npx-cli.js %*`) directly: a
  * node.exe resolved on PATH is an .exe, which cross-spawn passes to
@@ -2963,7 +2998,19 @@ export function resolveManagedSpawn(
  * (npxCliCandidates, the same list compliance-cmd probes). A bare npx then
  * spawns exactly as it did before this existed -- broken under oam, but no
  * worse, and a silent half-rewrite (a node binary with no npx-cli.js) would
- * fail with ENOENT instead of the cmd.exe message.
+ * fail with ENOENT instead of the cmd.exe message. The lookup asks for
+ * `node.exe` by name, not `node`: an extensionless name would be tried with
+ * every PATHEXT extension, and a `node.cmd`/`node.bat` shim earlier on PATH
+ * would come back as the command -- the very cmd.exe detour this avoids.
+ *
+ * KNOWN LIMITATIONS. (1) The node comes from the BROKER's PATH (process.env;
+ * upstream.ts passes no env), not the child's merged env: a server whose own
+ * env sets PATH to select a node/npx is rewritten to the broker's first node
+ * anyway -- the same server-PATH caveat OamProbe.bin documents for oam, and
+ * the process-wide memo is what keeps it from being fixed per server as
+ * written. (2) The npx gate is nodeLaunchKind, a BASENAME match: an absolute
+ * `C:\tools\node18\npx.cmd` is rewritten to the PATH node's npx-cli.js too,
+ * not one resolved beside that path.
  */
 export function npxUnderNode(
   command: string,
@@ -2975,6 +3022,10 @@ export function npxUnderNode(
     exists?: (p: string) => boolean;
   } = {},
 ): { command: string; args: string[] } {
+  // The three gates below are the expected no-op for nearly every launch
+  // (every launch off Windows, every non-npx launch, every launch under a
+  // node broker), and this runs on every local resolve: they return without
+  // logging, so a debug log is not one "nothing happened" line per connect.
   const platform = opts.platform ?? process.platform;
   if (platform !== "win32") return { command, args };
   if (nodeLaunchKind(command) !== "npx") return { command, args };
@@ -2982,11 +3033,35 @@ export function npxUnderNode(
   if (nodeLaunchKind(execPath) === "node") return { command, args };
   const env = opts.env ?? process.env;
   const fileExists = opts.exists ?? existsSync;
-  const nodeBin = resolveBinAbsolute("node", env, platform);
-  if (nodeBin === null) return { command, args };
-  const cli = npxCliCandidates(nodeBin, platform).find((c) => fileExists(c));
-  if (cli === undefined) return { command, args };
-  return { command: nodeBin, args: [cli, ...args] };
+  // The memo engages only when EVERY opt is defaulted -- the production shape.
+  // Any injected value (tests) takes the fresh-resolution path below.
+  const defaulted =
+    opts.platform === undefined && opts.execPath === undefined && opts.env === undefined && opts.exists === undefined;
+  // Revalidate a memo hit: its npx-cli.js gone means the node install moved or
+  // was removed under the broker -- drop it and resolve fresh.
+  if (defaulted && npxUnderNodeMemo !== null && !existsSync(npxUnderNodeMemo.cli)) npxUnderNodeMemo = null;
+  let found: { nodeBin: string; cli: string };
+  if (defaulted && npxUnderNodeMemo !== null) {
+    found = npxUnderNodeMemo;
+  } else {
+    const nodeBin = resolveBinAbsolute("node.exe", env, platform);
+    if (nodeBin === null) {
+      log("debug", "no node.exe resolved on PATH; staying on npx", { command });
+      return { command, args };
+    }
+    const cli = npxCliCandidates(nodeBin, platform).find((c) => fileExists(c));
+    if (cli === undefined) {
+      log("debug", "no npx-cli.js beside the resolved node binary; staying on npx", { command, nodeBin });
+      return { command, args };
+    }
+    if (defaulted) npxUnderNodeMemo = { nodeBin, cli };
+    found = { nodeBin, cli };
+  }
+  log("debug", "npx launch rewritten to node + npx-cli.js (skips the cmd.exe verbatim-args detour)", {
+    nodeBin: found.nodeBin,
+    cli: found.cli,
+  });
+  return { command: found.nodeBin, args: [found.cli, ...args] };
 }
 
 /** True when a launch command names an oam binary -- bare "oam"/"oam.exe" or

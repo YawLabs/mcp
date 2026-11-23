@@ -338,7 +338,10 @@ describe("ConnectServer", () => {
       const result = priv.handleDiscover();
       const text = result.content[0].text;
       expect(text).toContain("Disabled servers:");
-      expect(text).toContain('old — Old Server ("isActive": false in bundles.json)');
+      expect(text).toContain('old — Old Server ("isActive": false)');
+      // Names the file in effect, not a bare "bundles.json".
+      expect(text).toContain('set "isActive": true in the bundles.json that defines it (~/.yaw-mcp/bundles.json');
+      expect(text).not.toContain("false in bundles.json");
     });
 
     it("shows cached tools for inactive connections", () => {
@@ -10184,6 +10187,8 @@ describe("find_tool", () => {
     const result = await priv.handleToolCall("mcp_connect_find_tool", { query: "   " });
     expect(result.content[0].text).toContain("needs a query");
     expect(result.content[0].text).not.toContain("create_issue");
+    // A refusal, flagged like dispatch's empty-intent refusal.
+    expect(result.isError).toBe(true);
   });
 
   it("coerces a non-string query rather than throwing out of the tokenizer", async () => {
@@ -10192,7 +10197,9 @@ describe("find_tool", () => {
     // The low-level Server does not validate against inputSchema, so this
     // shape really can arrive from a misbehaving client.
     const result = await priv.handleToolCall("mcp_connect_find_tool", { query: 42 });
-    expect(result.isError).toBeUndefined();
+    // isError is the empty-query refusal's own flag; the text proves it is
+    // that refusal and not a thrown tokenizer error.
+    expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("needs a query");
   });
 
@@ -11202,7 +11209,7 @@ describe("empty states name the REAL reason", () => {
     // The header that used to sit over an empty list is gone...
     expect(text).not.toContain("Installed MCP servers:");
     // ...and the detail that was already there still is.
-    expect(text).toContain('gh — GitHub ("isActive": false in bundles.json)');
+    expect(text).toContain('gh — GitHub ("isActive": false)');
   });
 
   it("says the same thing discover and dispatch say, from one source", () => {

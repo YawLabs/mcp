@@ -4,6 +4,31 @@ All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented 
 
 ## Unreleased
 
+**Fixed -- a deny written against a flag value cannot be escaped by respelling the flag**
+
+An unknown runner flag spelled with `=` (`bunx --unknown=hidden other`) used to drop its value from the launch identity entirely, while the space spelling (`bunx --unknown hidden other`) kept it as a weak reading a `package:` deny matches -- so rewriting the same flag with `=` hid the package. The `--long=value` form now keeps the weak reading too (runner launchers only; an attached short flag such as `docker run -eTOKEN=abc` is not read as a package, and an empty value is never one). An interpreter's value-taking flag (`node --watch-path src /x/a.js`) used to bind the flag's VALUE as the launch identity (`command:src`): two different scripts sharing one flag value were treated as the same server, and a `command:` deny on the script itself missed the launch. node's and python's value flags are now listed, so the script is the identity; an interpreter flag the table does not know is read as boolean, the first positional is the script, and the positional after it survives only as a weak reading -- so `node --inspect /opt/a.js stdio` still binds `/opt/a.js`, and a deny naming the script still matches when a value flag is missing from the table.
+
+**Fixed -- health's policy and profile lines stop contradicting the other surfaces**
+
+A broken policy file's message printed twice in `mcp_connect_health` -- once as `POLICY ERROR:` and again as `POLICY WARNING:`, because the config loader folds every error into the warnings list for the refusal surfaces. The refusals' `Note:` dropped the duplicate too, for the same reason. The `also blocked via identity:` line fired for any namespace the enforced profile excludes whose name is not in the raw `blocked` list, so a plain allow-list (`servers: ["ssh"]` excluding `ssh2`, no `blocked` entry anywhere) was mislabeled as an identity block; the line now names only namespaces a `blocked` entry actually reaches through a launch identity, the same helper the refusal uses.
+
+**Changed -- the recovery confirm's empty-answer bound counts consecutive blanks**
+
+The bound that ends a recovery-code confirmation on a closed stdin (`No group was entered -- the prompt was left empty 5 times in a row.`) counted cumulative blanks: wrong, wrong, then three bare Enters fired a "in a row" claim about answers that were not consecutive. A typed answer resets the count now, so the message means what it says; the closed-stdin case ("" forever) still terminates on the same bound.
+
+**Changed -- the npx-under-node rewrite logs its decisions and caches its lookup**
+
+When the `node npx-cli.js` rewrite on Windows finds no node.exe on PATH or no npx-cli.js beside it, it now logs that at debug -- naming the node binary -- instead of failing silently into the cryptic cmd.exe message, and a rewrite that applies logs the node binary and cli it chose. The no-op cases (off Windows, not an npx launch, a node-hosted broker) stay quiet, since they are every other launch. The rewrite now resolves `node.exe` itself, so a `node.cmd`/`node.bat` shim earlier on PATH can no longer reintroduce the cmd.exe detour. The node/npx-cli.js resolution is memoized for the process: the rewrite runs at the end of the launch resolver on every connect of an npx sidecar under a non-node broker (the oam->node downgrade respawn and first-attempt npx launches alike), and each one used to pay a full PATH walk plus up to three existence probes. A cached hit is re-checked on disk and resolved fresh if npx-cli.js has gone; misses are never cached, so a node installed mid-session is picked up.
+
+**Fixed -- secrets and refusal surfaces**
+
+- An initialize rejection with empty stderr no longer carries a credential the server echoed back into the activation error: the raw SDK message is redacted like every other pre-handshake failure. A vault secret that shares its name with an env or header key holding a different value is now redacted too, instead of one overwriting the other in the redaction map.
+- A refusal for a disabled server under a broken policy file names the policy file again (the duplicate-message fix had dropped it from every refusal kind, not just the policy-invalid one).
+- A config reload applies `grades.json` before installing the new server list, so a concurrent call can no longer slip a server below `YAW_MCP_MIN_COMPLIANCE` through during the grades read. Pre-warm no longer announces, warns about, or waits on a server the compliance floor refuses.
+- `mcp_connect_find_tool` marks its no-servers and empty-query replies as errors; the no-argument secrets report says no servers are usable (as an error) instead of a misleading remedy.
+- The bundles "enable with:" remedy lists one `yaw-mcp enable <ns>` per disabled member instead of joining them with `&&`, which Windows PowerShell 5.1 rejects.
+- `secrets recover` on the last wrong recovery-code group prints the mismatch after leaving the alternate screen, so it is no longer wiped the moment it is shown. `recover --file` recognises the vault's own path regardless of case on Windows. Its `--json` `passphrase_source` now reports where the NEW passphrase came from, with `stale_env_set` saying whether the old `YAW_MCP_VAULT_PASSPHRASE` is still set.
+
 ## 1.1.16
 
 **Fixed -- the oam->npx downgrade respawn runs npx under node.exe on Windows**

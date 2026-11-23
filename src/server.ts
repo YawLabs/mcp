@@ -189,6 +189,7 @@ import {
   blockedToolsSource,
   complianceRefusalReason,
   effectiveProfile,
+  identityBlockOf,
   isToolDenied,
   policyErrorText,
   resolveMinCompliance,
@@ -1636,7 +1637,7 @@ export class ConnectServer {
   // Per-namespace count of tool calls currently awaiting an upstream
   // response. Incremented immediately before routeToolCall and decremented
   // in a finally, so it is accurate across concurrent calls. Read by
-  // trackUsageAndAutoDeactivate: the idle reaper runs on OTHER calls'
+  // trackUsageForNamespaces: the idle reaper runs on OTHER calls'
   // completions, so without this a long call to B can be killed mid-flight
   // by a burst of short calls to A (and then booked as B's failure).
   private inflightCalls = new Map<string, number>();
@@ -1686,8 +1687,8 @@ export class ConnectServer {
 
   // Baseline idle-call threshold lives in resolveIdleThreshold() (module
   // scope, re-read per call) rather than in a static initializer here: a
-  // static latches the env at import, which is exactly the pattern the
-  // isAutoActivateEnabled comment above calls out as the one to avoid.
+  // static latches the env at import, which is exactly the pattern
+  // resolveIdleThreshold's own comment above calls out as the one to avoid.
 
   // Concurrent-load ceiling. See server-cap.ts — checked in
   // runActivateOne before a new upstream is spawned so we refuse at
@@ -2207,8 +2208,8 @@ export class ConnectServer {
 
   private readonly onUpstreamListChanged = (ns: string) => {
     log("info", "Upstream list changed, rebuilding routes", { namespace: ns });
-    // Re-learn the tool list from the refreshed connection, exactly as
-    // runActivateOne does on a fresh activation. upstream.ts has already
+    // Re-learn the tool list from the refreshed connection, through the same
+    // learnToolsFrom runActivateOne uses on a fresh activation. upstream.ts has already
     // re-listed the tools onto the connection by the time this fires, and
     // this.toolCache is what every COLD reader uses: the deferred routes
     // rebuilt after an idle eviction, discover's `known tools:` line, the
@@ -2216,15 +2217,7 @@ export class ConnectServer {
     // table follows the change while all four keep serving the pre-change
     // list until the namespace is activated again.
     const conn = this.connections.get(ns);
-    if (conn?.status === "connected") {
-      this.toolCache.set(
-        ns,
-        conn.tools.map((t) => ({ name: t.name, description: t.description })),
-      );
-      this.toolCacheLearnedAt.set(ns, Date.now());
-      this.stampLearnedMeta(ns, conn);
-      this.scheduleStateSave();
-    }
+    if (conn?.status === "connected") this.learnToolsFrom(ns, conn);
     this.refreshRoutesAndNotify().catch((err: Error) => {
       // Logged rather than silenced — a failure here means the client
       // won't know tools/resources/prompts just changed, which cascades
@@ -2248,7 +2241,16 @@ export class ConnectServer {
    *  snapshot, so a server the sweep has already finished drops out as soon
    *  as its list lands. */
   private serversPrewarmIsLearning(): UpstreamServerConfig[] {
-    return this.getProfiledActiveServers().filter((s) => this.prewarmMustLearn(s) && !this.prewarmBackoffFor(s));
+    return this.getProfiledActiveServers().filter(
+      (s) => this.spawnGatePasses(s) && this.prewarmMustLearn(s) && !this.prewarmBackoffFor(s),
+    );
+  }
+
+  /** Would the spawn gate let this server be launched right now? The verdict
+   *  alone, for the pre-warm sweep: a server it refuses (the compliance floor)
+   *  is never spawned by pre-warm, so it must not be counted as learning. */
+  private spawnGatePasses(server: UpstreamServerConfig): boolean {
+    return spawnGateVerdict(server, this.profile, resolveMinCompliance(), this.config?.servers ?? [server]) === null;
   }
 
   /** Must pre-warm learn this server before its tools can be trusted -- no
@@ -2279,6 +2281,21 @@ export class ConnectServer {
   private configKeyForNamespace(namespace: string): string | undefined {
     const entry = (this.config?.servers ?? []).find((s) => s.namespace === namespace);
     return entry === undefined ? undefined : toolCacheConfigKey(entry);
+  }
+
+  /** Learn `conn`'s tool list as the namespace's cold cache: the list itself,
+   *  when it was learned, its fingerprint (stampLearnedMeta), and a debounced,
+   *  best-effort state save so the next session can skip the pre-warm spawn.
+   *  The one sequence behind both a fresh activation (runActivateOne) and an
+   *  upstream list_changed, so a field added here reaches both. */
+  private learnToolsFrom(namespace: string, conn: UpstreamConnection): void {
+    this.toolCache.set(
+      namespace,
+      conn.tools.map((t) => ({ name: t.name, description: t.description })),
+    );
+    this.toolCacheLearnedAt.set(namespace, Date.now());
+    this.stampLearnedMeta(namespace, conn);
+    this.scheduleStateSave();
   }
 
   /** Record the fingerprint + upstream version of a list just learned from
@@ -2670,13 +2687,25 @@ export class ConnectServer {
   // synthetic ~/.yaw-mcp without running the whole of start().
   private async hydrateComplianceGrades(home: string = homedir()): Promise<void> {
     if (!this.config) return;
+    this.config.servers = await this.overlayComplianceGrades(this.config.servers, home);
+  }
+
+  /** The overlay itself, over a server list that need not be installed yet.
+   *  The reload path applies it to the freshly-parsed list BEFORE adoptConfig,
+   *  so `this.config` is never observable without it: proxied tools/call
+   *  requests are not serialized behind a reload, and one landing during the
+   *  grades.json read would otherwise gate on un-overlaid entries. */
+  private async overlayComplianceGrades(
+    servers: UpstreamServerConfig[],
+    home: string = homedir(),
+  ): Promise<UpstreamServerConfig[]> {
     // readGradesCache never throws (missing/garbled cache -> {}), but the
     // catch keeps a surprise I/O rejection from aborting startup: an
     // unreadable grade cache must degrade to "ungraded", not to "no server".
     const grades: GradesCache = await readGradesCache(home).catch(() => ({}));
-    if (Object.keys(grades).length === 0) return;
+    if (Object.keys(grades).length === 0) return servers;
     let applied = 0;
-    this.config.servers = this.config.servers.map((server) => {
+    const overlaid = servers.map((server) => {
       // Own keys only -- defence in depth. readGradesCache already hands back
       // a prototype-less map (the only plain object here is the empty catch
       // fallback above, which has returned by now), so this guard matters
@@ -2693,6 +2722,7 @@ export class ConnectServer {
       return { ...server, complianceGrade: cached.grade };
     });
     if (applied > 0) log("info", "Applied cached compliance grades", { graded: applied });
+    return overlaid;
   }
 
   /** Install a freshly-loaded server list as the running config. Shared by
@@ -2892,11 +2922,6 @@ export class ConnectServer {
       return false;
     }
 
-    const previousVersion = this.configVersion;
-    this.configWarnings = result.warnings;
-    this.adoptConfig(result.config);
-    this.bundlesLoadedFrom = result.path;
-    this.bundlesVanishedWarned = false;
     // Re-overlay grades for the same reason start() overlays them before
     // anything reads the config: freshly-parsed entries carry only the grade
     // bundles.json itself records (validateEntry passes it through), not the
@@ -2904,7 +2929,18 @@ export class ConnectServer {
     // this a reload would revert every re-read server to its file grade, or
     // to ungraded where the file has none -- the [A]-[F] badge and the
     // YAW_MCP_MIN_COMPLIANCE verdict would stop reflecting `yaw-mcp audit`.
-    await this.hydrateComplianceGrades();
+    // Overlaid BEFORE adoptConfig, with no await between adopting and
+    // returning: a proxied tools/call is not held behind a reload, so one
+    // landing during the grades.json read must still see the OLD (overlaid)
+    // config, never the new list without its grades.
+    const reloaded = result.config
+      ? { ...result.config, servers: await this.overlayComplianceGrades(result.config.servers) }
+      : result.config;
+    const previousVersion = this.configVersion;
+    this.configWarnings = result.warnings;
+    this.adoptConfig(reloaded);
+    this.bundlesLoadedFrom = result.path;
+    this.bundlesVanishedWarned = false;
     const changed = this.configVersion !== previousVersion;
     log("info", changed ? "Reloaded bundles" : "bundles.json touched but unchanged", {
       path: result.path,
@@ -3228,22 +3264,31 @@ export class ConnectServer {
     // refuses every spawn while the meta-tools stay up to report why. One read here derives BOTH the profile and the nudge gate
     // (previously loadEffectiveProfile re-read the config just for the
     // profile slice).
-    let resolvedConfig: ResolvedConfig | null;
+    let resolvedConfig: ResolvedConfig;
     if (opts.config) {
       resolvedConfig = opts.config;
     } else {
       resolvedConfig = await loadYawMcpConfig({ cwd: process.cwd() }).catch((err): ResolvedConfig => {
         const path = join(userConfigDir(), CONFIG_FILENAME);
         const message = `${path}: yaw-mcp could not load its config (${err instanceof Error ? err.message : String(err)}). No MCP server will start until this is fixed: check that the file and your project's .yaw-mcp/ directory are readable, restart your MCP client, and run \`yaw-mcp doctor\` to confirm.`;
-        return { projectConfigDir: null, loadedFiles: [], warnings: [message], policyErrors: [{ path, message }] };
+        // policyWarnings carries the same message because the loader always
+        // folds each policyErrors message into it (config-loader's
+        // `policyWarnings.push(...policyErrors.map(...))`); keep that invariant.
+        return {
+          projectConfigDir: null,
+          loadedFiles: [],
+          warnings: [message],
+          policyErrors: [{ path, message }],
+          policyWarnings: [message],
+        };
       });
       // The loader's soft problems (unknown keys, wrong-typed values, retired
       // hosted-backend keys). Logged HERE only when we did the load: a caller
       // that hands the config in has already seen them, and the same line
       // twice reads like two problems.
-      for (const w of resolvedConfig?.warnings ?? []) log("warn", "Config warning", { warning: w });
+      for (const w of resolvedConfig.warnings) log("warn", "Config warning", { warning: w });
     }
-    this.profile = resolvedConfig ? toProfile(resolvedConfig) : null;
+    this.profile = toProfile(resolvedConfig);
     if (this.profile) {
       log("info", "Loaded profile", {
         path: this.profile.path,
@@ -3333,7 +3378,8 @@ export class ConnectServer {
     // and forget — ensureUv() is memoized, so the first activation
     // awaits the same in-flight promise rather than triggering a
     // second download. This moves the 2–10s first-run cost off the
-    // activation path (where it could collide with CONNECT_TIMEOUT)
+    // activation path (where it could collide with the connect deadline,
+    // defaultConnectTimeout() / MCP_CONNECT_TIMEOUT)
     // and onto startup, where it's expected. The gate is uvLaunchKind --
     // the SAME predicate resolveUvSpawn bootstraps against -- so
     // `uvx.exe` / `UV.CMD` configs prewarm too; an exact-string match
@@ -3584,8 +3630,14 @@ export class ConnectServer {
     // prewarm didn't create and must not tear down. The isChanged gate
     // in the batch below covers the race where a namespace connects
     // between this snapshot and its activation turn.
+    //
+    // A server the spawn gate would refuse (today only the compliance floor
+    // reaches here: getProfiledActiveServers already drops disabled and
+    // profile-blocked ones) is not a candidate either. activateOne would
+    // refuse it, the refusal records no backoff by design, and it would be
+    // announced as pre-warming and warned about on every startup.
     const available = this.getProfiledActiveServers().filter(
-      (s) => this.connections.get(s.namespace)?.status !== "connected",
+      (s) => this.connections.get(s.namespace)?.status !== "connected" && this.spawnGatePasses(s),
     );
     // A server whose pre-warm failed recently -- in THIS broker or in any
     // other pane's (state.json) -- under the same launch config is skipped:
@@ -4052,7 +4104,7 @@ export class ConnectServer {
 
     // Snapshot routes at method entry. rebuildRoutes() may fire during
     // the auto-reconnect awaits below (via onUpstreamListChanged from
-    // any other connection, or via trackUsageAndAutoDeactivate on a
+    // any other connection, or via trackUsageForNamespaces on a
     // concurrent tool call) and replace this.toolRoutes with a fresh
     // Map. Re-reading this.toolRoutes later would dispatch against a
     // map whose contents don't match the route we already captured —
@@ -4235,7 +4287,7 @@ export class ConnectServer {
     const connForHealth = route ? this.connections.get(route.namespace) : undefined;
 
     // Mark the namespace busy for the duration of the upstream call. The
-    // idle reaper (trackUsageAndAutoDeactivate) runs on OTHER calls'
+    // idle reaper (trackUsageForNamespaces) runs on OTHER calls'
     // completions, and this namespace's idle counter is only reset AFTER
     // this call returns — so without the marker a burst of short calls to A
     // can tip a slow, still-in-flight B over its threshold, close B's
@@ -4735,7 +4787,15 @@ export class ConnectServer {
     const errors = this.profile?.policyErrors;
     if (errors?.length) return policyErrorText(errors);
     if (profileAllows(this.policy(), namespace)) return null;
-    return `Server "${namespace}" is not allowed by the project profile at ${this.profile?.path}. Report the block to the user instead of routing around it; if it should be reachable, the profile must be edited and this MCP client restarted.`;
+    // A reload can reveal that a running server shares its launch identity
+    // with a blocked one -- the case this connected-path check exists for --
+    // so name the entry to remove, as spawnGateRefusalText's "profile" arm
+    // does. policy() refusing means a profile is set, so this.profile is too.
+    const identity = this.profile ? identityBlockOf(this.profile, this.config?.servers ?? [], namespace) : null;
+    const identityHint = identity
+      ? ` (it launches ${identity}, the same server as a "blocked" entry, so remove that entry to allow it; listing it in "servers" does not)`
+      : "";
+    return `Server "${namespace}" is not allowed by the project profile at ${this.profile?.path}${identityHint}. Report the block to the user instead of routing around it; if it should be reachable, the profile must be edited and this MCP client restarted.`;
   }
 
   private toolRouteRefusal(wireName: string): string | null {
@@ -4831,6 +4891,29 @@ export class ConnectServer {
       // response is about to call "Auto-loaded". The other two intent-driven
       // sites (handleActivate, handleDispatch) get this from activateOne;
       // this shortcut bypasses it and so has to do it by hand.
+      //
+      // A claim converts prewarm's uncounted connection into a counted,
+      // advertised one, so it needs the cap check activateOne runs on a
+      // prewarm join. Checked with the claim still in place (evaluateCapFor
+      // then counts the candidate once, as a newcomer); on refusal the claim
+      // stays so prewarm's teardown proceeds, and the reply says why, as the
+      // failed auto-warm below does.
+      if (this.prewarmNamespaces.has(top.namespace)) {
+        const capDecision = this.evaluateCapFor(top.namespace);
+        if (!capDecision.allow) {
+          const output = this.buildDiscoverOutput(context, null, focusNamespace);
+          return {
+            ...output,
+            content: [
+              ...output.content,
+              {
+                type: "text",
+                text: `Could not auto-load "${top.namespace}" (top match for your query): ${capDecision.message}`,
+              },
+            ],
+          };
+        }
+      }
       this.prewarmNamespaces.delete(top.namespace);
       const grew = !this.sessionActivated.has(top.namespace);
       this.sessionActivated.add(top.namespace);
@@ -4988,6 +5071,13 @@ export class ConnectServer {
       ...this.configWarnings.map((w) => `! ${w}`),
       "No servers are loaded, and the diagnostics above say why -- so this is NOT necessarily an empty install; servers already in bundles.json can be missing because the file could not be read. Fix it (or run `yaw-mcp doctor` for the full report); the fix is picked up on the next mcp_connect_* call, with no client restart.",
     ].join("\n");
+  }
+
+  /** The answer for "getProfiledActiveServers() is empty": nothing configured
+   *  (emptyStateText) versus everything configured filtered out
+   *  (noServersEnabledText). One split for the handlers that need both. */
+  private noUsableServersText(): string {
+    return (this.config?.servers.length ?? 0) === 0 ? this.emptyStateText() : this.noServersEnabledText();
   }
 
   /** Everything installed is either `"isActive": false` or kept out by the
@@ -5559,8 +5649,11 @@ export class ConnectServer {
     if (!focused && inactive.length > 0) {
       lines.push("\nDisabled servers:");
       for (const server of inactive) {
-        lines.push(`  ${server.namespace} — ${server.name} ("isActive": false in bundles.json)`);
+        lines.push(`  ${server.namespace} — ${server.name} ("isActive": false)`);
       }
+      // The file IN EFFECT, as the rest of discover names it (bundlesFileHint):
+      // a bare "bundles.json" can send the edit to a file this session ignores.
+      lines.push(`  (set "isActive": true in ${bundlesFileHint("defines-it")} to enable one)`);
     }
 
     // Shadow-driven install candidates — its OWN section, gated OFF by
@@ -5903,15 +5996,17 @@ export class ConnectServer {
   // configured server from a shell, with no broker in the process -- enforces
   // the identical policy without importing this module.
   //
-  // Four callers HERE. Two actually execute the server's configured command
+  // Five callers HERE. Two actually execute the server's configured command
   // with its resolved env -- runActivateOne (persistent activation) and
   // handleReadTool (transient inspect) -- so "we disconnect afterwards" buys
   // read_tool no exemption. Those two used to carry line-for-line copies of
   // the checks, which meant a policy change had to land twice to stay
-  // consistent. The other two spawn nothing and only want the verdict as
+  // consistent. The other three spawn nothing and only want the verdict as
   // text: handleSecretsReport, to say why a named server is missing from its
-  // report, and handleExec's pre-flight, to refuse a pipeline before step 0
-  // when a later step's deferred server would be refused anyway. `purpose`
+  // report, handleExec's pre-flight, to refuse a pipeline before step 0
+  // when a later step's deferred server would be refused anyway, and
+  // buildDiscoverOutputImpl's focus miss, to say why a named server is not
+  // loadable (it passes "activate", the action the reader would take). `purpose`
   // supplies the only words that legitimately differ: what the caller was
   // about to do with the server.
   //
@@ -5927,9 +6022,24 @@ export class ConnectServer {
     if (!refusal) return null;
     const text = this.spawnGateRefusalText(refusal, purpose);
     // A misspelled policy key enforces nothing, so a refusal may not be the one
-    // the user meant to write. Say so wherever a refusal is shown.
-    const policyWarnings = this.profile?.policyWarnings ?? [];
+    // the user meant to write. Say so on every spawn-gate refusal (the
+    // connected-path serverPolicyRefusal and noServersEnabledText do not carry
+    // this Note). Only a policy-invalid refusal already carries the
+    // policyErrors messages in `text`, so only there are the folded copies
+    // skipped; any other kind (a "disabled" verdict is decided BEFORE the
+    // policy-file check) keeps them, or a broken policy file would go unnamed.
+    const policyWarnings =
+      refusal.kind === "policy-invalid" ? this.genuinePolicyWarnings() : (this.profile?.policyWarnings ?? []);
     return policyWarnings.length > 0 ? `${text} Note: ${policyWarnings.join(" ")}` : text;
+  }
+
+  /** policyWarnings minus the policyErrors messages config-loader folds into
+   *  it: what remains is a genuine warning (e.g. an unknown key). For surfaces
+   *  that already print the policyErrors themselves, so the broken file's
+   *  message does not print twice. */
+  private genuinePolicyWarnings(): string[] {
+    const errorMessages = new Set((this.profile?.policyErrors ?? []).map((e) => e.message));
+    return (this.profile?.policyWarnings ?? []).filter((w) => !errorMessages.has(w));
   }
 
   private spawnGateRefusalText(
@@ -5940,7 +6050,9 @@ export class ConnectServer {
       case "disabled":
         return `"${refusal.namespace}" is installed but disabled. Set "isActive": true for it in ${bundlesFileHint("defines-it")} and try again to ${purpose} -- the edit is picked up on the next mcp_connect_* call, with no client restart.`;
       case "policy-invalid":
-        return `Cannot ${purpose} for "${refusal.namespace}". ${policyErrorText(refusal.errors)}`;
+        // `purpose` reads as a verb phrase about the server ("inspect its
+        // tools"), so name the server first to give "its" an antecedent.
+        return `"${refusal.namespace}": cannot ${purpose}. ${policyErrorText(refusal.errors)}`;
       case "profile":
         return `"${refusal.namespace}" is not allowed by the project profile at ${refusal.profilePath}${refusal.identity ? ` (it launches ${refusal.identity}, the same server as a "blocked" entry, so remove that entry to allow it; listing it in "servers" does not)` : ""}.`;
       case "compliance":
@@ -6318,14 +6430,9 @@ export class ConnectServer {
             void disconnectFromUpstream(displaced).catch(() => {});
           }
           this.idleCallCounts.set(namespace, 0);
-          const toolMeta = connection.tools.map((t) => ({ name: t.name, description: t.description }));
-          this.toolCache.set(namespace, toolMeta);
-          this.toolCacheLearnedAt.set(namespace, Date.now());
-          this.stampLearnedMeta(namespace, connection);
-          // Persist the learned list so the NEXT session skips the pre-warm
-          // spawn for this namespace. Debounced + best-effort; a failed save
-          // just means we re-learn next time.
-          this.scheduleStateSave();
+          // Persists the learned list so the NEXT session skips the pre-warm
+          // spawn for this namespace (see learnToolsFrom).
+          this.learnToolsFrom(namespace, connection);
 
           // The same predicate tools/list uses. Announcing the raw inventory
           // told the model a denied tool had just been loaded, and the next
@@ -6665,9 +6772,9 @@ export class ConnectServer {
       // on: values the user submits are stored the moment they arrive, so the
       // retry's re-run launches with them (and so does any later activate, if
       // the client never retries).
-      const asked = leg?.ask;
-      if (asked) {
-        asked.settled = entryPromise.then(
+      const pendingAsk = leg?.ask;
+      if (pendingAsk) {
+        pendingAsk.settled = entryPromise.then(
           (e): SecretAnswer => {
             if (e.kind === "submitted") this.storeCredentialValues(namespace, missing, e.values);
             return { subject, kind: "credential", entry: e };
@@ -7348,6 +7455,8 @@ export class ConnectServer {
   //                  or the page closed under the wait); or, from a drifted
   //                  page only, an empty submission.
   //   unreachable -- the masked-entry page never took a passphrase.
+  //   unverifiable -- typed, but the vault had nothing to check it against;
+  //                  not stored, not latched.
   private async promptForVaultPassphrase(
     namespace: string,
     lastError: VaultPassphraseRequiredError,
@@ -7687,13 +7796,10 @@ export class ConnectServer {
       const ns = filterRequestedFor;
       const unmatched = this.unmatchedFilterNames(ns);
       if (unmatched.length > 0) {
-        // The same list unmatchedFilterNames judged the names against, so it
-        // is never empty here: that helper returns [] for an unknown list.
-        const conn = this.connections.get(ns);
-        const offered =
-          conn && conn.status === "connected"
-            ? conn.tools.map((t) => t.name)
-            : (this.cachedToolsFor(ns) ?? []).map((t) => t.name);
+        // The same list unmatchedFilterNames judged the names against
+        // (knownToolNames), so it is never empty here: that helper returns []
+        // for an unknown list.
+        const offered = this.knownToolNames(ns);
         const plural = unmatched.length === 1;
         const lead = `Note: the ${plural ? "tool" : "tools"} you asked to keep ${plural ? "does" : "do"} not exist on "${ns}": ${unmatched.join(", ")}.`;
         const fix = ` That server offers: ${offered.join(", ")}. Re-run mcp_connect_activate with a name from that list, or omit "tools" to advertise all of them.`;
@@ -7733,16 +7839,20 @@ export class ConnectServer {
   private unmatchedFilterNames(namespace: string): string[] {
     const filter = this.toolFilters.get(namespace);
     if (!filter || filter.size === 0) return [];
-    const conn = this.connections.get(namespace);
-    let known: string[];
-    if (conn && conn.status === "connected") {
-      known = conn.tools.map((t) => t.name);
-    } else {
-      known = (this.cachedToolsFor(namespace) ?? []).map((t) => t.name);
-    }
+    const known = this.knownToolNames(namespace);
     if (known.length === 0) return [];
     const have = new Set(known);
     return [...filter].filter((n) => !have.has(n)).sort();
+  }
+
+  /** The tool names `namespace` is known to offer: the live list when
+   *  connected, else the cached one; [] when neither is known. The one list
+   *  both unmatchedFilterNames and handleActivate's "That server offers"
+   *  line read, so the two cannot disagree. */
+  private knownToolNames(namespace: string): string[] {
+    const conn = this.connections.get(namespace);
+    if (conn && conn.status === "connected") return conn.tools.map((t) => t.name);
+    return (this.cachedToolsFor(namespace) ?? []).map((t) => t.name);
   }
 
   // Background refinement of a just-recorded heuristic reward via the optional
@@ -7909,8 +8019,10 @@ export class ConnectServer {
     // does not move the re-dispatch window.
     const dispatchedAt = Date.now();
     if (primary) {
-      // Remember the intent each activated server was routed for, so the
-      // optional LLM reward grader can judge later tool calls against the goal.
+      // Remember the intent each winner was routed for -- recorded before the
+      // loads below, so a winner that then fails to load keeps it too (it is
+      // still the intent it was picked for) -- so the optional LLM reward
+      // grader can judge later tool calls against the goal.
       for (const w of winners) this.lastIntentByNamespace.set(w.namespace, trimmed);
     }
 
@@ -8135,7 +8247,10 @@ export class ConnectServer {
   // Deliberately NOT cleared here: toolCache / toolCacheLearnedAt (what the
   // server offers survives an unload -- that is what makes it deferred
   // rather than invisible), activationFailures (a health signal with its own
-  // TTL), and learning counters (cross-session by design).
+  // TTL), learning counters (cross-session by design), and
+  // lastIntentByNamespace (the reward grader's best-effort, per-namespace
+  // intent; staleness across an unload is the documented limit in
+  // reward-grader.ts, and a re-dispatch overwrites it).
   //
   // Takes the connection being forgotten and forgets ONLY if the map still
   // holds that one. Every caller has just awaited disconnectFromUpstream,
@@ -8235,6 +8350,9 @@ export class ConnectServer {
     };
   }
 
+  /** Single-namespace entry point to the idle reaper (trackUsageForNamespaces,
+   *  which exec and observed() call directly). Kept as a named wrapper because
+   *  the reaper tests drive it through this name. */
   private async trackUsageAndAutoDeactivate(calledNamespace: string): Promise<void> {
     await this.trackUsageForNamespaces([calledNamespace]);
   }
@@ -8657,6 +8775,14 @@ export class ConnectServer {
       };
     }
 
+    // No server arg and nothing usable: under a broken policy file or with
+    // every server disabled/blocked the list above is empty, and "No installed
+    // server references any ..." would be false -- the servers may reference
+    // plenty. Same split (and isError) as find_tool and dispatch.
+    if (!serverArg && servers.length === 0) {
+      return { content: [{ type: "text", text: this.noUsableServersText() }], isError: true };
+    }
+
     if (rows.length === 0) {
       // Both scopes must read as a NEGATION. The single-server phrasing
       // needs its own verb ("does not reference") -- reusing the
@@ -8727,19 +8853,24 @@ export class ConnectServer {
         lines.push(`Profile: ${this.profile.path}`);
       }
       for (const e of this.profile.policyErrors ?? []) lines.push(`  POLICY ERROR: ${e.message}`);
-      for (const w of this.profile.policyWarnings ?? []) lines.push(`  POLICY WARNING: ${w}`);
+      // config-loader folds each policyErrors message INTO policyWarnings for
+      // the refusal surfaces, so iterating both arrays here would print a
+      // broken policy file's message twice. Skip what POLICY ERROR already
+      // showed; what remains is a genuine warning (e.g. an unknown key).
+      for (const w of this.genuinePolicyWarnings()) lines.push(`  POLICY WARNING: ${w}`);
       if (this.profile.servers) lines.push(`  allow: ${this.profile.servers.join(", ") || "(nothing)"}`);
       if (this.profile.blocked?.length) lines.push(`  block: ${this.profile.blocked.join(", ")}`);
       // `block:` is the RAW list, but the gate enforces the identity-EXPANDED
       // one (this.policy() / effectiveProfile): a `package:`/`command:`/`url:`
       // entry, or a namespace sharing a launch identity with a blocked one,
-      // excludes servers that never appear in `blocked`. Print the difference
-      // so an identity-blocked namespace is visible here and not only at the
-      // refusal. Derived from the SAME effective set the gate uses, so the two
-      // can't drift; set only when something is blocked BEYOND the raw list.
+      // excludes servers that never appear in `blocked`. Print only the
+      // identity-derived part of that difference -- a namespace a plain
+      // allow-list excludes has no blocked entry at all, and the `allow:` line
+      // plus the discover/refusal wording already cover it. identityBlockOf is
+      // the same helper the gate's refusal uses, so the two can't drift.
       const enforced = this.profile.policyErrors?.length ? null : this.policy();
       const servers = this.config?.servers ?? [];
-      const rawBlocked = this.profile.blocked;
+      const profile = this.profile;
       // With a broken policy file profileAllows refuses everything for the
       // wrong reason, so the identity line stays out; the POLICY ERROR line
       // above already names the file to fix.
@@ -8747,7 +8878,10 @@ export class ConnectServer {
         ? servers
             .filter((s) => s.isActive && !profileAllows(enforced, s.namespace))
             .map((s) => s.namespace)
-            .filter((ns) => !rawBlocked?.includes(ns))
+            // identityBlockOf returns null for a namespace the RAW profile
+            // already refuses (its profileAllows guard), which covers a raw
+            // `blocked` entry -- no separate rawBlocked check needed.
+            .filter((ns) => identityBlockOf(profile, servers, ns) !== null)
             .sort()
         : [];
       if (extraBlocked.length > 0) lines.push(`  also blocked via identity: ${extraBlocked.join(", ")}`);
@@ -8906,7 +9040,7 @@ export class ConnectServer {
   private async handleFindTool(
     query: string,
     limit?: number,
-  ): Promise<{ content: Array<{ type: string; text: string }> }> {
+  ): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
     const servers = this.getProfiledActiveServers();
     if (servers.length === 0) {
       // Two different empty states reach this one branch, and they need
@@ -8914,11 +9048,9 @@ export class ConnectServer {
       // emptyStateText case, while a full bundles.json whose every entry is
       // disabled or profile-blocked is the noServersEnabledText case -- being
       // told to "add one" when six are already installed is the same
-      // falsehood discover used to print.
-      const configured = this.config?.servers.length ?? 0;
-      return {
-        content: [{ type: "text", text: configured === 0 ? this.emptyStateText() : this.noServersEnabledText() }],
-      };
+      // falsehood discover used to print. Flagged isError, as handleDispatch
+      // flags the same two texts; "no match" below stays a normal answer.
+      return { content: [{ type: "text", text: this.noUsableServersText() }], isError: true };
     }
     if (query.trim() === "") {
       return {
@@ -8928,6 +9060,7 @@ export class ConnectServer {
             text: 'find_tool needs a query describing what the tool should do, e.g. { "query": "create a github issue" }.',
           },
         ],
+        isError: true,
       };
     }
 
@@ -9222,7 +9355,10 @@ export class ConnectServer {
         }
         if (disabled.length > 0) {
           lines.push(
-            `    disabled: ${disabled.join(", ")} (installed; enable with: yaw-mcp enable ${disabled.join(" && yaw-mcp enable ")})`,
+            // One command per member, comma-listed: `enable` takes a single
+            // namespace, and no joiner is shell-neutral (`&&` is a parse error
+            // in Windows PowerShell 5.1, `;` is not a separator in cmd.exe).
+            `    disabled: ${disabled.join(", ")} (installed; enable with: ${disabled.map((ns) => `yaw-mcp enable ${ns}`).join(", ")})`,
           );
         }
         if (blocked.length > 0) {
@@ -9313,12 +9449,12 @@ export class ConnectServer {
     const explicitReturn = typeof args.return === "string" ? args.return : undefined;
 
     // Whole-pipeline refusals, decided BEFORE step 0 fires a side effect.
-    // Both used to be per-step checks inside the dispatch loop below, where
+    // The meta-tool and $ref checks used to be per-step inside the dispatch loop below, where
     // "before" only meant before the OFFENDING step: a one-character typo in
     // the second step of `create issue -> comment on it` still cost a filed
     // issue, and the usual reaction (fix the ref, re-run the exec) filed a
-    // second one. Every producer key is known statically, so neither refusal
-    // needs anything to have run. Nothing has, so there is no partial output
+    // second one. Every producer key is known statically, so none of these
+    // refusals needs anything to have run. Nothing has, so there is no partial output
     // to report and no idle tracking to settle on these paths.
     //
     // Meta-tools first, which is validateExecRefs' documented ORDERING
@@ -9338,7 +9474,7 @@ export class ConnectServer {
       const step = steps[i];
       if (!(META_TOOL_NAMES as Set<string>).has(step.tool)) continue;
       const key = stepBindingKey(step, i);
-      // Plain text, like both sibling preflight refusals, because the SHAPE is
+      // Plain text, like the other preflight refusals, because the SHAPE is
       // the phase marker: `exec: ...` means nothing ran, while the
       // {ok, failedStep, error, partial} envelope means execution started and
       // `partial` holds what completed. That distinction is what tells a reader
@@ -9478,8 +9614,8 @@ export class ConnectServer {
       // A deferred route is built FROM a config entry, so a miss means the
       // route table is momentarily behind `this.config`: a reload adopts the
       // new config first and rebuilds the routes only at the end of
-      // reconcileConfig, after the awaits in between (the grade overlay, the
-      // teardown of changed servers), so a concurrent exec can land there. There is nothing to apply a
+      // reconcileConfig, after the awaits in between (the teardown of changed
+      // servers), so a concurrent exec can land there. There is nothing to apply a
       // policy to in that case, so fall through to the lazy path, which is
       // where the step would have gone anyway and which re-resolves everything
       // at dispatch time.

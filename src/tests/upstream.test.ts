@@ -25,6 +25,7 @@ import {
   MAX_RESOURCES_PER_SERVER,
   MAX_TOOLS_PER_SERVER,
   mergeChildEnv,
+  mergeSecretValues,
   redactSecretsInOutput,
   resetManagedDowngrades,
   resetOamDowngrades,
@@ -2041,6 +2042,67 @@ describe("resolveServerEnv", () => {
     expect(Object.keys(childEnv ?? {})).not.toContain("gh");
   });
 
+  it("redacts an injected value echoed in an initialize REJECTION when stderr is empty", async () => {
+    // The "unknown" branch: a child that answers initialize with a JSON-RPC
+    // error (numeric code) and writes nothing to stderr. Its message used to
+    // reach the ActivationError verbatim while every sibling branch redacted.
+    vi.mocked(hasSecretRefs).mockReturnValue(true);
+    process.env.YAW_MCP_VAULT_PASSPHRASE = "test-passphrase";
+    vi.mocked(loadVault).mockResolvedValue({ version: 1, salt: "abc", entries: { gh: {} } } as any);
+    vi.mocked(unlock).mockResolvedValue(Buffer.from("fakekey"));
+    const token = "ghp_AbCdEfGhIjKlMnOpQrStUvWx12345678";
+    vi.mocked(resolveSecretRefs).mockReturnValue({
+      resolved: { AUTH: `Bearer ${token}` },
+      missing: [],
+      malformed: [],
+      values: { gh: token },
+    });
+    _sdkBehavior.clientConnect = () =>
+      Promise.reject(Object.assign(new Error(`invalid token: ${token}`), { code: -32000 }));
+
+    const err = (await connectToUpstream(makeLocalConfig({ env: { AUTH: "Bearer ${secret:gh}" } })).catch(
+      (e: unknown) => e,
+    )) as ActivationError;
+
+    expect(err).toBeInstanceOf(ActivationError);
+    expect(err.category).toBe("unknown");
+    expect(err.stderrTail).toBeUndefined();
+    expect(err.message).not.toContain(token);
+    expect(err.message).toContain("invalid token: ***gh***");
+  });
+
+  it("keeps a credential-named LITERAL in the redaction map when a vault secret shares its name", async () => {
+    // `GITHUB_TOKEN` is a literal env key AND the vault secret name GH_TOKEN
+    // refers to, with different values. A plain spread of the secret values
+    // overwrote the literal's map entry, so the literal went out unredacted.
+    vi.mocked(hasSecretRefs).mockReturnValue(true);
+    process.env.YAW_MCP_VAULT_PASSPHRASE = "test-passphrase";
+    vi.mocked(loadVault).mockResolvedValue({ version: 1, salt: "abc", entries: { GITHUB_TOKEN: {} } } as any);
+    vi.mocked(unlock).mockResolvedValue(Buffer.from("fakekey"));
+    const literal = "ghp_LiteralLiteralLiteral0123456789";
+    const vaulted = "ghp_VaultedVaultedVaulted9876543210";
+    vi.mocked(resolveSecretRefs).mockReturnValue({
+      resolved: { GITHUB_TOKEN: literal, GH_TOKEN: vaulted },
+      missing: [],
+      malformed: [],
+      values: { GITHUB_TOKEN: vaulted },
+    });
+    _sdkBehavior.clientConnect = () => {
+      _sdkBehavior.stderrEmitter?.emit("data", Buffer.from(`bad creds: ${literal} / ${vaulted}`));
+      return Promise.reject(new Error("handshake failed"));
+    };
+
+    const err = (await connectToUpstream(
+      makeLocalConfig({ env: { GITHUB_TOKEN: literal, GH_TOKEN: "${secret:GITHUB_TOKEN}" } }),
+    ).catch((e: unknown) => e)) as ActivationError;
+
+    expect(err).toBeInstanceOf(ActivationError);
+    expect(err.stderrTail).not.toContain(literal);
+    expect(err.stderrTail).not.toContain(vaulted);
+    expect(err.message).not.toContain(literal);
+    expect(err.stderrTail).toContain("***GITHUB_TOKEN***");
+  });
+
   it("throws when secret NAME is missing from vault", async () => {
     vi.mocked(hasSecretRefs).mockReturnValue(true);
     process.env.YAW_MCP_VAULT_PASSPHRASE = "test-passphrase";
@@ -2937,7 +2999,7 @@ describe("connectToUpstream managed-sidecar default spawn", () => {
     expect(vi.mocked(resolveManagedSpawn)).toHaveBeenCalledOnce();
     expect(vi.mocked(log)).toHaveBeenCalledWith(
       "warn",
-      "managed-sidecar server failed to boot; downgrading to npx for this session",
+      "managed-sidecar server failed to boot; retrying once on npx",
       expect.objectContaining({ namespace: "test" }),
     );
   });
@@ -3231,16 +3293,12 @@ describe("connectToUpstream runtime reporting", () => {
     await connectToUpstream(makeLocalConfig({ runtime: "oam", command: "npx", args: ["-y", "x"] }));
 
     // The warn is the only trace that a server left oam -- pin its fields.
-    expect(vi.mocked(log)).toHaveBeenCalledWith(
-      "warn",
-      "oam-hosted server failed to boot; downgrading to node for this session",
-      {
-        namespace: "test",
-        oamVersion: MIN_OAM_VERSION,
-        category: "unknown",
-        error: expect.stringContaining("oam crashed on boot"),
-      },
-    );
+    expect(vi.mocked(log)).toHaveBeenCalledWith("warn", "oam-hosted server failed to boot; retrying once on node", {
+      namespace: "test",
+      oamVersion: MIN_OAM_VERSION,
+      category: "unknown",
+      error: expect.stringContaining("oam crashed on boot"),
+    });
     // The success line must name the runtime that ACTUALLY won, not the one
     // that was attempted first.
     expect(vi.mocked(log)).toHaveBeenCalledWith("info", "Connected to upstream", {
@@ -5553,5 +5611,22 @@ describe("cpuBusyFraction", () => {
     expect(cpuBusyFraction({ idle: 0, total: 0 }, { idle: 250, total: 1000 })).toBe(0.75);
     expect(cpuBusyFraction({ idle: 10, total: 100 }, { idle: 10, total: 100 })).toBeNull();
     expect(cpuBusyFraction({ idle: 0, total: 0 }, { idle: 2000, total: 1000 })).toBe(0);
+  });
+});
+
+describe("mergeSecretValues", () => {
+  it("adds a secret under its own name when nothing holds that key", () => {
+    expect(mergeSecretValues({ AUTH: "Bearer x" }, { gh: "x" })).toEqual({ AUTH: "Bearer x", gh: "x" });
+  });
+
+  it("keeps the base entry and namespaces the secret on a same-name, different-value collision", () => {
+    expect(mergeSecretValues({ GITHUB_TOKEN: "literal" }, { GITHUB_TOKEN: "vaulted" })).toEqual({
+      GITHUB_TOKEN: "literal",
+      "secret:GITHUB_TOKEN": "vaulted",
+    });
+  });
+
+  it("adds no second entry when the colliding values are equal", () => {
+    expect(mergeSecretValues({ TOKEN: "same" }, { TOKEN: "same" })).toEqual({ TOKEN: "same" });
   });
 });

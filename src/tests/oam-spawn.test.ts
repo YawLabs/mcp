@@ -38,6 +38,7 @@ import {
   probeOam,
   resetManagedEntryMemo,
   resetNpmCacheDir,
+  resetNpxUnderNodeMemo,
   resetOamBinCache,
   resetPinnedSidecarLog,
   resolveBinAbsolute,
@@ -125,6 +126,21 @@ vi.mock("node:fs", async (importOriginal) => {
   return { ...actual, statSync, accessSync };
 });
 
+// probeOam reads process.env.OAM_BIN even with an injected runner (an ENOENT
+// with OAM_BIN set is "OAM_BIN points at a missing path", not "oam absent"),
+// so every "oam absent" case here assumes it is unset. Clear it for each test
+// and restore the developer's value after; the tests that SET it save/restore
+// on top of this.
+let savedOamBinEnv: string | undefined;
+beforeEach(() => {
+  savedOamBinEnv = process.env.OAM_BIN;
+  delete process.env.OAM_BIN;
+});
+afterEach(() => {
+  if (savedOamBinEnv === undefined) delete process.env.OAM_BIN;
+  else process.env.OAM_BIN = savedOamBinEnv;
+});
+
 describe("winNormalize", () => {
   it("converts forward slashes to backslashes on Windows (cmd-safe)", () => {
     expect(winNormalize("C:/Users/jeff/oam/target/release/oam.exe", "win32")).toBe(
@@ -189,9 +205,10 @@ describe("specConstraint", () => {
 
 // Guards the on-disk lookup: a git/path spec is not a package NAME, and
 // resolveNpmEntry would happily look one up as if it were. sidecars-cmd.ts and
-// default-runtime.ts import this rather than carrying their own copies (the
-// dedupe has happened), so this is the single place the rule is pinned and all
-// three surfaces move together when it changes.
+// trust-cmd.ts import this rather than carrying their own copies (the dedupe
+// has happened), and default-runtime.ts reaches the same rule through
+// classifyNpxLaunch, so this is the single place the rule is pinned and every
+// surface moves together when it changes.
 describe("isRegistrySpec", () => {
   it("accepts plain registry specs", () => {
     for (const ok of ["@yawlabs/fetch-mcp", "@yawlabs/fetch-mcp@latest", "cowsay", "server-memory@1.2.3"]) {
@@ -815,7 +832,7 @@ describe("nodeLaunchKind", () => {
   });
 });
 
-// The oam->npx downgrade respawn's Windows workaround: a bare `npx` spawned
+// The oam->node downgrade respawn's Windows workaround: a bare `npx` spawned
 // while the broker runs on oam goes through cross-spawn's cmd.exe detour with
 // windowsVerbatimArguments, which oam's child_process runtime IGNORES
 // (measured 3/3 garbage under oam, clean under node) -- the double-escaped
@@ -829,11 +846,11 @@ describe("npxUnderNode", () => {
   // Fixture shape: a REAL temp dir laid out like a Windows node install --
   // node.exe on a PATH entry, and the npx-cli.js candidate beside it
   // (npxCliCandidates probes three; the first -- beside the binary -- is the
-  // Windows npm layout and the one this fixture stages). Real files, not the
-  // SYNTH_ROOT injection at the top of this file: the injection answers only
-  // statSync/accessSync there, and this search also runs existsSync -- a fake
-  // path would reach the real fs, ENOENT every candidate, and the rewrite
-  // would never fire.
+  // Windows npm layout and the one this fixture stages). Real files are
+  // REQUIRED only for the no-opts (memo) tests below, whose npx-cli.js probe is
+  // the real existsSync -- which the SYNTH_ROOT injection at the top of this
+  // file does not answer. The tests that inject `exists` could use either; the
+  // node lookup goes through isExecutableFile, which the injection does answer.
   function nodeInstall(): { env: NodeJS.ProcessEnv; nodeBin: string; cli: string; cleanup: () => void } {
     const dir = mkdtempSync(join(tmpdir(), "npxundernode-"));
     const nodeBin = join(dir, "node.exe");
@@ -857,9 +874,17 @@ describe("npxUnderNode", () => {
 
   const npxArgs = ["-y", "@yawlabs/kubernetes-mcp-server@latest", "serve"];
   // The broker-not-node gate is process.execPath in production; both branches
-  // are pinned with an injectable execPath so the suite runs identically on a
-  // Windows dev machine (node) and a Linux runner (whatever node is there).
+  // are pinned with an injectable execPath so the INJECTED-opts tests run
+  // identically on a Windows dev machine (node) and a Linux runner (whatever
+  // node is there). The no-opts memo tests further down are the exception:
+  // they need a Windows host (see their own comment).
   const oamExec = String.raw`C:\oam\oam.exe`;
+
+  // The npxUnderNode memo is process-lifetime; reset it so no test's outcome
+  // depends on which no-opts call ran before it.
+  beforeEach(() => {
+    resetNpxUnderNodeMemo();
+  });
 
   it("rewrites a bare npx to node + npx-cli.js when the broker is not node (win32)", () => {
     const fx = nodeInstall();
@@ -945,6 +970,206 @@ describe("npxUnderNode", () => {
       });
       expect(out).toEqual({ command: "npx", args: npxArgs });
     } finally {
+      fx.cleanup();
+    }
+  });
+
+  it("skips a node.cmd shim earlier on PATH: the command must be the real node.exe", () => {
+    // An extensionless "node" lookup tries every PATHEXT extension per dir, so
+    // a node.cmd in an earlier dir would win -- and a .cmd command takes the
+    // same cmd.exe detour the rewrite exists to avoid.
+    const shimDir = mkdtempSync(join(tmpdir(), "npxundernode-shim-"));
+    writeFileSync(join(shimDir, "node.cmd"), "");
+    const fx = nodeInstall();
+    try {
+      const out = npxUnderNode("npx", npxArgs, {
+        platform: "win32",
+        execPath: oamExec,
+        env: { PATH: `${shimDir};${dirname(fx.nodeBin)}`, PATHEXT: ".com;.exe;.cmd" },
+        exists: (p) => p === winNormalize(fx.cli, "win32"),
+      });
+      expect(out).toEqual({
+        command: winNormalize(fx.nodeBin, "win32"),
+        args: [winNormalize(fx.cli, "win32"), ...npxArgs],
+      });
+    } finally {
+      fx.cleanup();
+      rmSync(shimDir, { recursive: true, force: true });
+    }
+  });
+
+  // The no-opts call shape is the only shape the memo serves, and production
+  // reaches it through the REAL process.*: win32, an execPath that is oam
+  // rather than node, and the machine PATH. On a dev machine execPath IS node
+  // and a Linux runner would exit at the platform gate before any lookup, so
+  // the test swaps all three in for the duration of one call -- the whole-env
+  // swap plus descriptor save/restore the resolveManagedSpawn lazy-resolution
+  // test ("omitted nodeBin is resolved lazily", further below) uses, restored unconditionally in finally. The lookup itself
+  // stays real: existsSync probes the fixture on disk, which is why these
+  // tests are real temp dirs and not an injected `exists`.
+  function callAsOamBroker(pathDir: string, command: string, args: string[]): { command: string; args: string[] } {
+    const realEnv = process.env;
+    const platformDesc = Object.getOwnPropertyDescriptor(process, "platform");
+    const execPathDesc = Object.getOwnPropertyDescriptor(process, "execPath");
+    try {
+      Object.defineProperty(process, "platform", { value: "win32", configurable: true, writable: true });
+      Object.defineProperty(process, "execPath", { value: oamExec, configurable: true, writable: true });
+      // PATHEXT lowercase so resolveBinAbsolute appends the same ".exe" the
+      // fixture file is named with and returns it VERBATIM (nodeInstall's
+      // comment): a real ".EXE" would come back as `node.EXE` and miss the
+      // on-disk spelling the expected value folds through winNormalize.
+      process.env = {
+        ...realEnv,
+        PATH: pathDir,
+        Path: undefined,
+        path: undefined,
+        PATHEXT: ".com;.exe",
+      } as NodeJS.ProcessEnv;
+      return npxUnderNode(command, args);
+    } finally {
+      process.env = realEnv;
+      if (platformDesc) Object.defineProperty(process, "platform", platformDesc);
+      if (execPathDesc) Object.defineProperty(process, "execPath", execPathDesc);
+    }
+  }
+
+  it("memoizes the defaulted lookup: a second no-opts call does not re-walk PATH", () => {
+    // Both calls run the PRODUCTION shape -- every opt defaulted -- so the
+    // npx-cli.js probe is the REAL existsSync. Its candidates are spelled with
+    // win32 separators (npxCliCandidates builds them from the win32-folded
+    // nodeBin), which only existsSync on a Windows host can answer -- so
+    // unlike the injected-opts tests above, this one and the two after it
+    // need a Windows host. That is the host the suite actually runs on (no CI
+    // legs; release.sh runs it on the machine that cuts the release), and a
+    // skipIf would make them run nowhere (see the note at the top of the file).
+    const fx = nodeInstall();
+    const emptyDir = mkdtempSync(join(tmpdir(), "npxundernode-empty-"));
+    const rewritten = {
+      command: winNormalize(fx.nodeBin, "win32"),
+      args: [winNormalize(fx.cli, "win32"), ...npxArgs],
+    };
+    try {
+      // Call 1 takes the fresh-resolution branch (the beforeEach reset the
+      // memo) and seeds it with the fixture's node.exe + npx-cli.js.
+      expect(callAsOamBroker(dirname(fx.nodeBin), "npx", npxArgs)).toEqual(rewritten);
+      // Call 2 must be answered from the memo: PATH now names an EMPTY dir, so
+      // a fresh walk would find no node.exe and return bare npx. The rewrite
+      // coming back anyway is the proof the second call never re-walked PATH.
+      expect(callAsOamBroker(emptyDir, "npx", npxArgs)).toEqual(rewritten);
+    } finally {
+      fx.cleanup();
+      rmSync(emptyDir, { recursive: true, force: true });
+    }
+  });
+
+  it("drops a memo hit whose npx-cli.js is gone and resolves fresh instead", () => {
+    // A node install removed under a long-lived broker must not turn every
+    // later npx launch into `node <missing npx-cli.js>` (the half-rewrite the
+    // function's doc rules out): the hit is revalidated with one existsSync.
+    const fx = nodeInstall();
+    const emptyDir = mkdtempSync(join(tmpdir(), "npxundernode-empty-"));
+    try {
+      expect(callAsOamBroker(dirname(fx.nodeBin), "npx", npxArgs).command).toBe(winNormalize(fx.nodeBin, "win32"));
+      rmSync(fx.cli);
+      // The memo still names the deleted cli; the fresh walk over the empty
+      // PATH finds nothing, so the all-or-nothing answer is bare npx.
+      expect(callAsOamBroker(emptyDir, "npx", npxArgs)).toEqual({ command: "npx", args: npxArgs });
+      // And the stale entry was DROPPED, not merely bypassed: with the cli
+      // back on disk, a memo that survived would answer again; a dropped one
+      // leaves the empty PATH to answer, i.e. bare npx.
+      writeFileSync(fx.cli, "");
+      expect(callAsOamBroker(emptyDir, "npx", npxArgs)).toEqual({ command: "npx", args: npxArgs });
+    } finally {
+      fx.cleanup();
+      rmSync(emptyDir, { recursive: true, force: true });
+    }
+  });
+
+  it("an injected call never writes the memo", () => {
+    // The WRITE half of the opts guard: an injected call against fixture A
+    // must not seed the memo, so the following no-opts call against fixture B
+    // resolves fresh and returns B. A poisoned memo would answer with A,
+    // whose files are still on disk, so the revalidation would keep it.
+    const fxA = nodeInstall();
+    const fxB = nodeInstall();
+    try {
+      expect(
+        npxUnderNode("npx", npxArgs, {
+          platform: "win32",
+          execPath: oamExec,
+          env: fxA.env,
+          exists: (p) => p === winNormalize(fxA.cli, "win32"),
+        }).command,
+      ).toBe(winNormalize(fxA.nodeBin, "win32"));
+      expect(callAsOamBroker(dirname(fxB.nodeBin), "npx", npxArgs)).toEqual({
+        command: winNormalize(fxB.nodeBin, "win32"),
+        args: [winNormalize(fxB.cli, "win32"), ...npxArgs],
+      });
+    } finally {
+      fxA.cleanup();
+      fxB.cleanup();
+    }
+  });
+
+  it("an injected call never reads the memo", () => {
+    // Prime the memo through the production shape (fixture A; the beforeEach
+    // started it cold, so the prime's fresh walk seeds it with A). Then inject
+    // everything and point at fixture B: the rewrite must come back as B's
+    // node + cli. A's paths would mean the memo answered -- exactly the
+    // failure an injected opt must never reach, and what makes this test go
+    // RED if the opts guard is dropped from the memo read.
+    const fxA = nodeInstall();
+    const fxB = nodeInstall();
+    try {
+      expect(callAsOamBroker(dirname(fxA.nodeBin), "npx", npxArgs)).toEqual({
+        command: winNormalize(fxA.nodeBin, "win32"),
+        args: [winNormalize(fxA.cli, "win32"), ...npxArgs],
+      });
+      expect(
+        npxUnderNode("npx", npxArgs, {
+          platform: "win32",
+          execPath: oamExec,
+          env: fxB.env,
+          exists: (p) => p === winNormalize(fxB.cli, "win32"),
+        }),
+      ).toEqual({
+        command: winNormalize(fxB.nodeBin, "win32"),
+        args: [winNormalize(fxB.cli, "win32"), ...npxArgs],
+      });
+    } finally {
+      fxA.cleanup();
+      fxB.cleanup();
+    }
+  });
+
+  it("skips a relative PATH entry rather than answering it: a leading '.' still resolves the fixture node", () => {
+    // resolveBinAbsolute DROPS a relative candidate -- join(".", "node.exe")
+    // is the bare name, so its answer would depend on the broker's CWD --
+    // instead of returning it. To make the skip OBSERVABLE the broker's CWD
+    // (this process's, via chdir, restored in finally -- and before cleanup:
+    // Windows refuses to delete a process's current directory) IS the fixture
+    // dir, so the relative candidate would resolve to the very files the
+    // absolute fixture entry resolves to: had it been answered, nodeBin came
+    // back as the bare "node.exe" and the cli as a CWD-relative path, neither
+    // of which the absolute assertion accepts. The injected `exists` and
+    // PATHEXT fold through winNormalize like the first test above.
+    const fx = nodeInstall();
+    const originalCwd = process.cwd();
+    try {
+      process.chdir(dirname(fx.nodeBin));
+      expect(
+        npxUnderNode("npx", npxArgs, {
+          platform: "win32",
+          execPath: oamExec,
+          env: { PATH: `.;${dirname(fx.nodeBin)}`, PATHEXT: ".com;.exe" },
+          exists: (p) => p === winNormalize(fx.cli, "win32"),
+        }),
+      ).toEqual({
+        command: winNormalize(fx.nodeBin, "win32"),
+        args: [winNormalize(fx.cli, "win32"), ...npxArgs],
+      });
+    } finally {
+      process.chdir(originalCwd);
       fx.cleanup();
     }
   });
@@ -1371,6 +1596,33 @@ describe("rewriteNpmToManagedNode", () => {
     expect(rewriteNpmToManagedNode("npx", [], deps)).toEqual({ command: "npx", args: [] });
   });
 
+  it("calls a nodeBin thunk only for a launch it would take", () => {
+    // resolveManagedSpawn passes managedNodeBin as a thunk (a PATH walk under a
+    // non-node broker): a refused launch must never pay for it.
+    let calls = 0;
+    const lazy = {
+      ...deps,
+      nodeBin: () => {
+        calls++;
+        return "/usr/bin/node";
+      },
+    };
+    for (const args of [["-y", "--package=x", "run"], ["-y", "some-mcp@^1.2.3"], ["-y", "./local-server"], ["-y"]]) {
+      expect(rewriteNpmToManagedNode("npx", args, lazy)).toEqual({ command: "npx", args });
+    }
+    expect(calls).toBe(0);
+    expect(rewriteNpmToManagedNode("npx", ["-y", "some-mcp"], lazy)).toEqual({
+      command: "/usr/bin/node",
+      args: ["/pkgs/some-mcp/dist/index.js"],
+    });
+    expect(calls).toBe(1);
+    // A thunk answering null stays on npx, same as a null value.
+    expect(rewriteNpmToManagedNode("npx", ["-y", "some-mcp"], { ...deps, nodeBin: () => null })).toEqual({
+      command: "npx",
+      args: ["-y", "some-mcp"],
+    });
+  });
+
   it("does not claim an npx fallback for a non-npx launch when no node bin is located", () => {
     // The launch kind is checked before nodeBin: a docker command with no
     // locatable node used to log "staying on npx" for a launch that was never
@@ -1760,6 +2012,12 @@ describe("resolveManagedSpawn entry memo", () => {
       expect(resolveManagedSpawn("docker", ["run", "-i", "img"], brokerUrl, null, managedRoot)).toEqual({
         command: "docker",
         args: ["run", "-i", "img"],
+      });
+      expect(pathReads).toBe(0);
+      // An npx launch the rewrite refuses (flag-first argv) skips the walk too.
+      expect(resolveManagedSpawn("npx", ["-y", "--package=x", "run"], brokerUrl, null, managedRoot)).toEqual({
+        command: "npx",
+        args: ["-y", "--package=x", "run"],
       });
       expect(pathReads).toBe(0);
       // Positive control: the same setup DOES walk PATH for npx and spawns the
@@ -3438,17 +3696,15 @@ describe("resolveOamSpawn -- unavailable-oam warning", () => {
     // the user HAS oam, it is just a dev build. The warn must carry the
     // failure's own label (oamFailureLabel) and point at the PATH/OAM_BIN
     // choice, never at the installer.
-    await probeOam(async () => {
-      throw new Error("build-tree refusal happens before any spawn -- unreachable injected run");
-    });
-    // The injected runner bypasses the gate by design, so prime the cache by
-    // building the refusal the way production reaches it: reset, set a real
-    // build-tree OAM_BIN, probe with the default runner.
-    resetOamBinCache();
-    const { mkdirSync: mk, writeFileSync: wr, rmSync: rm } = await import("node:fs");
+    // An injected runner bypasses the build-tree gate by design, so prime the
+    // cache the way production reaches the refusal: a real build-tree OAM_BIN,
+    // probed with the default runner (the beforeEach already reset the cache).
     const dir = join(tmpdir(), `yaw-mcp-bt-warn-${process.pid}`, "target", "release");
-    mk(dir, { recursive: true });
-    wr(join(dir, "oam.exe"), "");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "oam.exe"), "");
+    // Load-bearing off Windows only, where resolveBinAbsolute requires X_OK:
+    // without it the gate never sees the path and the real spawn runs instead.
+    chmodSync(join(dir, "oam.exe"), 0o755);
     const savedBin = process.env.OAM_BIN;
     process.env.OAM_BIN = join(dir, "oam.exe");
     try {
@@ -3463,7 +3719,7 @@ describe("resolveOamSpawn -- unavailable-oam warning", () => {
     } finally {
       if (savedBin === undefined) delete process.env.OAM_BIN;
       else process.env.OAM_BIN = savedBin;
-      rm(join(tmpdir(), `yaw-mcp-bt-warn-${process.pid}`), { recursive: true, force: true });
+      rmSync(join(tmpdir(), `yaw-mcp-bt-warn-${process.pid}`), { recursive: true, force: true });
     }
   });
 });

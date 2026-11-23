@@ -177,6 +177,96 @@ describe("serverIdentity", () => {
   ])("gives a generic launch no identity to bind a deny to (%#)", (server) => {
     expect(serverIdentity(server).primary).toBeNull();
   });
+
+  it("an unknown runner flag's `=` value is a weak reading, like the space spelling", () => {
+    // The space form keeps `hidden` as weak; the `=` respelling must not hide
+    // it from a deny.
+    expect(serverIdentity(local("a", "bunx", ["--unknown", "hidden", "other"])).weak).toContain("package:hidden");
+    const eq = serverIdentity(local("a", "bunx", ["--unknown=hidden", "other"]));
+    expect(eq.primary).toBe("package:other");
+    expect(eq.weak).toContain("package:hidden");
+  });
+
+  it("a known runner flag's `=` value adds no weak reading", () => {
+    // Only an UNKNOWN flag's value is ambiguous: a listed value flag
+    // (`--registry=`) or bool flag (`--yes=`) spelled with `=` names no package.
+    const registry = serverIdentity(local("a", "npx", ["--registry=https://r.test", "p"]));
+    expect(registry.primary).toBe("package:p");
+    expect(registry.weak).toEqual([]);
+    const yes = serverIdentity(local("a", "npx", ["--yes=true", "p"]));
+    expect(yes.primary).toBe("package:p");
+    expect(yes.weak).toEqual([]);
+  });
+
+  it("an attached short flag's `=` value adds no weak reading", () => {
+    // `-eTOKEN=abc` is `-e TOKEN=abc`, not an unknown `-eTOKEN` whose value is
+    // a package: `abc` must not become `package:abc`.
+    const id = serverIdentity(local("a", "docker", ["run", "-eTOKEN=abc", "img/x"]));
+    expect(id.primary).toBe("package:img/x");
+    expect(id.weak).not.toContain("package:abc");
+  });
+
+  it("an unknown flag's empty value adds no weak reading in either spelling", () => {
+    // An empty value is not a package name: neither `--unknown ""` nor
+    // `--unknown=` may manufacture a bare `package:` entry.
+    for (const args of [
+      ["--unknown=", "other"],
+      ["--unknown", "", "other"],
+    ]) {
+      const id = serverIdentity(local("a", "bunx", args));
+      expect(id.primary).toBe("package:other");
+      expect(id.weak).toEqual([]);
+    }
+  });
+
+  it("an interpreter's `=` flag value is not a reading at all", () => {
+    // `--flag=value` cannot hide the script, so its value (possibly a
+    // credential) is not carried into the identity.
+    for (const flag of ["--max-old-space-size=4096", "--api-key=sk-secret"]) {
+      const id = serverIdentity(local("a", "node", [flag, "/x/a.js"]));
+      expect(id.primary).toBe("command:/x/a.js");
+      expect(id.weak).toEqual(["command:a.js"]);
+    }
+  });
+
+  it("a listed interpreter value flag's operand is skipped, not read as the script", () => {
+    const both = serverIdentity(local("a", "node", ["--watch-path", "src", "/x/a.js"]));
+    expect(both.primary).toBe("command:/x/a.js");
+    expect(both.all).not.toContain("command:src");
+    // No script after the value: nothing definite to bind a deny to.
+    expect(serverIdentity(local("a", "node", ["--watch-path", "src"])).primary).toBeNull();
+  });
+
+  it.each([
+    [local("a", "node", ["--inspect", "/opt/a.js", "stdio"]), "command:/opt/a.js"],
+    [local("a", "node", ["--no-warnings", "/srv/fs/index.js", "/data"]), "command:/srv/fs/index.js"],
+    [local("a", "python", ["-u", "/a/server.py", "stdio"]), "command:/a/server.py"],
+    [local("a", "python", ["-uB", "/a/server.py", "stdio"]), "command:/a/server.py"],
+    [local("a", "deno", ["run", "-A", "/a/s.ts", "arg"]), "command:/a/s.ts"],
+  ])("a boolean interpreter flag + script + script argument binds the script (%#)", (server, expected) => {
+    const id = serverIdentity(server);
+    expect(id.primary).toBe(expected);
+    expect(id.strong).toEqual([expected]);
+  });
+
+  it("an unlisted interpreter value flag cannot hide the script from an explicit deny", () => {
+    // `--new-flag` is in no table, so it reads as boolean and `v` is the
+    // target; the script after it is kept as a weak reading.
+    const id = serverIdentity(local("a", "node", ["--new-flag", "v", "/x/a.js"]));
+    expect(id.primary).toBe("command:v");
+    expect(id.weak).toContain("command:/x/a.js");
+  });
+
+  it("an interpreter unknown flag followed by a flag-like token still finds the script", () => {
+    // `--new-flag` is unknown and read as boolean, so nothing is consumed; the
+    // scan continues and `--inspect` (itself unknown) is not a script, so
+    // `/x/a.js` wins as the primary. The flag-like token is never bound as the
+    // script -- no `command:--inspect`.
+    const id = serverIdentity(local("a", "node", ["--new-flag", "--inspect", "/x/a.js"]));
+    expect(id.primary).toBe("command:/x/a.js");
+    expect(id.strong).toEqual(["command:/x/a.js"]);
+    expect(id.weak).not.toContain("command:--inspect");
+  });
 });
 
 describe("denies follow the server, not its label", () => {
@@ -216,6 +306,17 @@ describe("denies follow the server, not its label", () => {
     ])?.blockedTools;
     expect(isToolDenied("ssh2_ssh_exec", tools)).toBe(true);
     expect(isToolDenied("other_ssh_exec", tools)).toBe(false);
+  });
+
+  it("a weak reading still blocks a server when a script follows an unlisted flag", () => {
+    // Header contract: an unknown flag cannot hide a package/script from a
+    // deny. An explicit entry is matched against `all`, which includes weak
+    // readings, so the weak `command:/x/a.js` reaches enforcement; the other
+    // script is left alone.
+    const a = local("a", "node", ["--new-flag", "v", "/x/a.js"]);
+    const b = local("b", "node", ["--new-flag", "w", "/y/b.js"]);
+    expect(spawnGateVerdict(a, profile({ blocked: ["command:/x/a.js"] }), null, [a, b])?.kind).toBe("profile");
+    expect(spawnGateVerdict(b, profile({ blocked: ["command:/x/a.js"] }), null, [a, b])).toBeNull();
   });
 
   it("matches url and command identities, ignoring a query string", () => {
@@ -273,6 +374,21 @@ describe("a deny does not spread to unrelated servers", () => {
       local("a", "node", ["-r", "dotenv/config", "a.js"]),
       local("b", "node", ["-r", "dotenv/config", "b.js"]),
     ],
+    [
+      "node sharing --watch-path's value",
+      local("a", "node", ["--watch-path", "src", "/x/a.js"]),
+      local("b", "node", ["--watch-path", "src", "/y/b.js"]),
+    ],
+    [
+      "python scripts sharing a boolean flag and a script argument",
+      local("a", "python", ["-u", "/x/a.py", "stdio"]),
+      local("b", "python", ["-u", "/y/b.py", "stdio"]),
+    ],
+    [
+      "node scripts sharing an unknown boolean flag and a script argument",
+      local("a", "node", ["--inspect", "/x/a.js", "stdio"]),
+      local("b", "node", ["--inspect", "/y/b.js", "stdio"]),
+    ],
   ])("%s", (_name, a, b) => {
     expect(spawnGateVerdict(b, profile({ blocked: ["a"] }), null, [a, b])).toBeNull();
     const tools = effectiveProfile(profile({ blockedTools: ["a_probe", "a*"] }), [a, b])?.blockedTools;
@@ -309,6 +425,16 @@ describe("a deny is not escaped by respelling the launch", () => {
     ["a bare name for a path", local("a", "/opt/srv"), local("b", "srv")],
     ["a relative spelling", local("a", "node", ["./x/a.js"]), local("b", "node", ["x/../x/a.js"])],
     ["an interpreter flag", local("a", "node", ["/x/a.js"]), local("b", "node", ["--title", "t", "/x/a.js"])],
+    [
+      "a script argument after a boolean flag",
+      local("a", "python", ["-u", "/x/a.py", "stdio"]),
+      local("b", "python", ["-u", "/x/a.py", "http"]),
+    ],
+    [
+      "a script argument after an unknown flag",
+      local("a", "node", ["--inspect", "/x/a.js", "stdio"]),
+      local("b", "node", ["--inspect", "/x/a.js", "http"]),
+    ],
     ["a one-string cmd launch", local("a", "npx", ["p"]), local("b", "cmd", ["/c", "npx -y p"])],
   ])("namespace deny: %s", (_name, a, b) => {
     expect(spawnGateVerdict(b, profile({ blocked: ["a"] }), null, [a, b])?.kind).toBe("profile");
@@ -564,6 +690,62 @@ describe("the broker applies the policy on every path to an upstream", () => {
     expect(both).not.toContain("also blocked via identity:");
   });
 
+  it("does not call a plain allow-list exclusion an identity block", () => {
+    // {servers:["ssh"]} excludes ssh2 with NO blocked entry: the "also blocked
+    // via identity" line would blame identity for what the allow-list did, and
+    // discover/refusal already tell the user to add the namespace to `servers`.
+    priv.profile = { path: "/cfg/config.json", servers: ["ssh"] };
+    priv.config = { servers: [SSH, SSH2], configVersion: "" };
+    const text = priv.handleHealth().content[0].text;
+    expect(text).toContain("allow: ssh");
+    expect(text).not.toContain("also blocked via identity:");
+  });
+
+  it("keeps the identity line for a block that reaches a namespace through its identity", () => {
+    // Same shape as the allow-list case, but with a real blocked entry whose
+    // launch identity ssh2 shares -- the line must still fire for this one.
+    priv.profile = { path: "/cfg/config.json", servers: ["ssh", "ssh2"], blocked: ["ssh"] };
+    priv.config = { servers: [SSH, SSH2], configVersion: "" };
+    expect(priv.handleHealth().content[0].text).toContain("also blocked via identity: ssh2");
+  });
+
+  it("does not blame identity for a namespace the raw allow-list also excludes", () => {
+    // ssh2 is identity-matched by `blocked: ["ssh"]` but NOT raw-blocked, so
+    // health asks identityBlockOf about it; only identityBlockOf's
+    // profileAllows guard (the raw `servers` list excludes ssh2, so removing
+    // the identity entry would not allow it) keeps the line out.
+    priv.profile = { path: "/cfg/config.json", servers: ["ssh"], blocked: ["ssh"] };
+    priv.config = { servers: [SSH, SSH2], configVersion: "" };
+    const text = priv.handleHealth().content[0].text;
+    expect(text).toContain("block: ssh");
+    expect(text).not.toContain("also blocked via identity:");
+  });
+
+  it("prints a broken policy file's message once, not again as a warning", () => {
+    // config-loader folds each policyErrors message into policyWarnings for
+    // the refusal surfaces; health prints both arrays, so without the dedupe
+    // the same message appears as POLICY ERROR and again as POLICY WARNING.
+    const message = "/cfg/config.json: invalid JSON at line 1. Fix it.";
+    priv.profile = {
+      path: "/cfg/config.json",
+      policyErrors: [{ path: "/cfg/config.json", message }],
+      // What the fold produces:
+      policyWarnings: [message],
+    };
+    const text = priv.handleHealth().content[0].text;
+    expect(text).toContain(`POLICY ERROR: ${message}`);
+    expect(text).not.toContain(`POLICY WARNING: ${message}`);
+    // A genuine warning (never an error) still prints.
+    priv.profile = {
+      path: "/cfg/config.json",
+      policyErrors: [{ path: "/cfg/config.json", message }],
+      policyWarnings: [message, "/cfg/config.json: unknown key 'blokced' ignored"],
+    };
+    expect(priv.handleHealth().content[0].text).toContain(
+      "POLICY WARNING: /cfg/config.json: unknown key 'blokced' ignored",
+    );
+  });
+
   it("repeats a misspelled policy key in health and in a refusal", async () => {
     const warning = "/cfg/config.json: unknown key 'blokced' ignored";
     priv.profile = { path: "/cfg/config.json", servers: [], policyWarnings: [warning] };
@@ -571,6 +753,32 @@ describe("the broker applies the policy on every path to an upstream", () => {
     const activate = await priv.handleToolCall("mcp_connect_activate", { server: "ssh" });
     expect(activate.isError).toBe(true);
     expect(activate.content[0].text).toContain(warning);
+  });
+
+  it("dedupes the refusal Note against the policy-invalid text, keeping genuine warnings", async () => {
+    // config-loader folds policyErrors into policyWarnings; the refusal's text
+    // already prints each error via policyErrorText, so the Note must drop any
+    // warning that duplicates an error message -- or the file's message prints
+    // twice -- while a warning that is only a warning (an unknown key) stays.
+    const msgA = "/cfg/config.json: invalid JSON at line 1. Fix it.";
+    const msgB = "/cfg/config.json: 'servers' must be an array of non-empty strings";
+    priv.profile = {
+      path: "/cfg/config.json",
+      policyErrors: [
+        { path: "/cfg/config.json", message: msgA },
+        { path: "/cfg/config.json", message: msgB },
+      ],
+      policyWarnings: [msgA, "/cfg/config.json: unknown key 'blokced' ignored"],
+    };
+    const activate = await priv.handleToolCall("mcp_connect_activate", { server: "ssh" });
+    expect(activate.isError).toBe(true);
+    const text = activate.content[0].text;
+    expect(text).toContain(msgB);
+    expect(text.indexOf(msgB)).toBe(text.lastIndexOf(msgB));
+    // Deduped: the Note drops msgA -- but the error text itself still names it
+    // once via policyErrorText, so count occurrences rather than assert absent.
+    expect(text.split(msgA).length - 1).toBe(1);
+    expect(text).toContain("unknown key 'blokced' ignored");
   });
 });
 

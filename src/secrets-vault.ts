@@ -328,7 +328,7 @@ export const VAULT_SLOT_DAMAGED_ERROR =
 
 /** Thrown by unlockWithRecoveryCode on a vault with no usable recovery slot:
  *  a v1/v2 vault, a v3 vault created without one, or one whose slot loadVault
- *  dropped as malformed. */
+ *  could not validate (kept as recoveryMalformedRaw, but not usable). */
 export const VAULT_NO_RECOVERY_ERROR = "this vault has no recovery code -- `yaw-mcp secrets reset` starts over";
 
 /** Thrown by unlockWithRecoveryCode when the recovery slot cannot be trusted
@@ -367,7 +367,7 @@ export class VaultEntryCorruptError extends Error {
 export type VaultLoadWarning =
   | { kind: "check-malformed"; path: string; message: string }
   /** v3: the recovery slot is present but unusable (bad shape, bad
-   *  `created`, a `kdf` other than RECOVERY_SLOT_KDF). The vault still loads
+   *  `created`, a `kdf` other than RECOVERY_SLOT_KDF, a non-string `digest`).The vault still loads
    *  and records `recoveryMalformed: true`, and the slot's raw JSON is KEPT
    *  (`recoveryMalformedRaw`, written back as `keyslots.recovery`) so an
    *  ordinary `set`/`remove` cannot delete it; `recovery new` or `recovery
@@ -402,7 +402,7 @@ export async function loadVault(path: string, opts?: LoadVaultOptions): Promise<
     // and overwrite real data.
     if (code === "ENOENT") return null;
     if (!onWarning) {
-      log("warn", "Failed to read vault", { path, error: err instanceof Error ? err.message : String(err), code });
+      log("warn", "Failed to read vault", { path, error: errorMessage(err), code });
     }
     throw err;
   }
@@ -411,9 +411,9 @@ export async function loadVault(path: string, opts?: LoadVaultOptions): Promise<
     parsed = JSON.parse(raw);
   } catch (err) {
     if (!onWarning) {
-      log("warn", "Vault file is not valid JSON", { path, error: err instanceof Error ? err.message : String(err) });
+      log("warn", "Vault file is not valid JSON", { path, error: errorMessage(err) });
     }
-    throw new Error(`vault at ${path} is not valid JSON: ${err instanceof Error ? err.message : String(err)}`);
+    throw new Error(`vault at ${path} is not valid JSON: ${errorMessage(err)}`);
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new Error(`vault at ${path} is corrupt: root must be a JSON object`);
@@ -603,11 +603,13 @@ function parsePassphraseSlot(v: unknown, corrupt: (what: string) => Error): Pass
  *  required, fraction optional, `Z` only). */
 const ISO_UTC_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?Z$/;
 
-/** Validate a recovery slot off disk; null when it is malformed. `digest` is
- *  copied through only when it is a string -- a slot written before that
- *  stamp existed is well formed without one (see recoverySlotDigestMatches),
- *  while a digest of another type is damage the matcher must be able to see,
- *  not a reason to call the whole slot unusable. */
+/** Validate a recovery slot off disk; null when it is malformed. A NON-STRING
+ *  `digest` makes the whole slot recovery-malformed: parseRecoverySlot returns
+ *  null, so loadVault warns "recovery-malformed" and KEEPS the raw slot
+ *  (recoveryMalformedRaw) instead of feeding it to the matcher -- the matcher
+ *  never sees a digest it cannot handle. `digest` is copied through only when
+ *  it is a string; `undefined` is allowed because a slot written before that
+ *  stamp existed is well formed without one (see recoverySlotDigestMatches). */
 function parseRecoverySlot(v: unknown): RecoverySlot | null {
   if (!v || typeof v !== "object" || Array.isArray(v)) return null;
   const s = v as Record<string, unknown>;
@@ -1049,8 +1051,7 @@ async function unlockV3(vault: V3VaultFile, passphrase: string): Promise<Buffer>
  *    "mismatch"       -- nothing decrypts: the slot holds some other key. */
 function verifyV3Contents(vault: V3VaultFile, dek: Buffer): "ok" | "marker-corrupt" | "mismatch" {
   const entries = Object.entries(vault.entries);
-  const someEntryDecrypts = (): boolean =>
-    entries.some(([name, e]) => canDecrypt(vault, e, dek, vaultEntryAad(vault, name)));
+  const someEntryDecrypts = (): boolean => anyEntryDecrypts(vault, dek);
   if (vault.check) {
     if (checkMarkerMatches(vault, dek)) return "ok";
     // On an EMPTY vault there is no entry to corroborate either way, so
@@ -1146,6 +1147,11 @@ function canDecrypt(vault: VaultFile, entry: EncryptedEntry, key: Buffer, aad: s
   }
 }
 
+/** True iff at least one of `vault`'s entries decrypts under `key`. */
+function anyEntryDecrypts(vault: VaultFile, key: Buffer): boolean {
+  return Object.entries(vault.entries).some(([name, e]) => canDecrypt(vault, e, key, vaultEntryAad(vault, name)));
+}
+
 /** Throw a clear error if `key` does not match the vault.
  *
  *  A single failed canary is NOT enough to conclude "wrong passphrase":
@@ -1178,16 +1184,13 @@ function canDecrypt(vault: VaultFile, entry: EncryptedEntry, key: Buffer, aad: s
  *  two verifiers must not disagree: if the cipher were ever changed to a
  *  non-AEAD mode, the looser one would silently accept any key. */
 function verifyKey(vault: VaultFile, key: Buffer): void {
-  const entries = Object.entries(vault.entries);
-  const someEntryDecrypts = (): boolean =>
-    entries.some(([name, e]) => canDecrypt(vault, e, key, vaultEntryAad(vault, name)));
   if (vault.check) {
     if (checkMarkerMatches(vault, key)) return;
-    if (someEntryDecrypts()) throw new Error(VAULT_CHECK_CORRUPT_ERROR);
+    if (anyEntryDecrypts(vault, key)) throw new Error(VAULT_CHECK_CORRUPT_ERROR);
     throw new Error(VAULT_WRONG_PASSPHRASE_ERROR);
   }
-  if (entries.length === 0) return; // fresh/empty vault -- nothing to verify yet
-  if (someEntryDecrypts()) return;
+  if (Object.keys(vault.entries).length === 0) return; // fresh/empty vault -- nothing to verify yet
+  if (anyEntryDecrypts(vault, key)) return;
   throw new Error(VAULT_WRONG_PASSPHRASE_ERROR);
 }
 
@@ -1214,7 +1217,9 @@ function ensureCheck(vault: VaultFile, key: Buffer): VaultFile {
   return { ...vault, check: encryptEntry(VAULT_CHECK_PLAINTEXT, key, vaultCheckAad(vault)) };
 }
 
-/** True iff an unlock has been performed in this process. */
+/** True iff a key is currently cached in this process: false after lock(),
+ *  after an unlock whose derivation raced a lock(), and after
+ *  unlockWithRecoveryCode (which never caches). */
 export function isUnlocked(): boolean {
   return cachedKey !== null;
 }
@@ -1283,7 +1288,7 @@ export async function checkVaultPassphrase(vault: VaultFile, passphrase: string)
     (await unlock(vault, passphrase)).fill(0);
     return "opens";
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
+    const msg = errorMessage(err);
     if (msg === VAULT_CHECK_CORRUPT_ERROR) return "marker-corrupt";
     if (msg === VAULT_SLOT_DAMAGED_ERROR) return "slot-damaged";
     if (msg === VAULT_WRONG_PASSPHRASE_ERROR) return "wrong";
@@ -1422,8 +1427,9 @@ export async function createVaultV3(passphrase: string, opts: CreateVaultV3Optio
 }
 
 /** A fresh, EMPTY v3 vault with no recovery slot: createVaultV3(passphrase,
- *  {recovery: false}).vault. Kept for callers that predate recovery codes;
- *  new code calls createVaultV3 so the recovery decision is explicit. */
+ *  {recovery: false}).vault. Test-only today: no production code calls it, the
+ *  tests that build fixture vaults do. New code calls createVaultV3 so the
+ *  recovery decision is explicit. */
 export async function createEmptyVault(passphrase: string): Promise<VaultFile> {
   return (await createVaultV3(passphrase, { recovery: false })).vault;
 }
@@ -1512,8 +1518,8 @@ export async function rekeyVault(
 }
 
 /**
- * rekeyVault without a recovery slot, returning just the vault. Kept for
- * callers that predate recovery codes; the CLI calls rekeyVault so the
+ * rekeyVault without a recovery slot, returning just the vault. Test-only
+ * today: no production code calls it, the tests do. The CLI calls rekeyVault so the
  * recovery decision is explicit (D2: there is no passphrase-only rotate --
  * this re-keys too, and drops any recovery slot the vault had).
  *
@@ -1590,7 +1596,8 @@ export function unlockWithRecoveryCode(vault: VaultFile, code: string | Buffer):
 /** A vault's recovery-code state, for doctor and the CLI:
  *    "set"         -- a usable recovery slot; `created` is its ISO date-time.
  *    "none"        -- a v3 vault without one.
- *    "malformed"   -- v3, but loadVault dropped an unusable slot.
+ *    "malformed"   -- v3, but loadVault could not validate the slot (kept
+ *                     as recoveryMalformedRaw).
  *    "unsupported" -- a v1/v2 vault (rotate or `recovery new` upgrades it).
  *  `created` is null for every state but "set". */
 export type RecoveryState = "set" | "none" | "malformed" | "unsupported";
@@ -1712,7 +1719,10 @@ export function getSecret(vault: VaultFile, key: Buffer, name: string): string |
  *  LEGACY: this build creates vaults with createVaultV3. newVault stays as
  *  the builder of the v2 layout every pre-v3 vault in the wild has -- the
  *  tests that pin v1/v2 behaviour, and the migration paths, start from it --
- *  and is pinned to v2 explicitly rather than SECRETS_SCHEMA_VERSION, since a
+ *  and `secrets set` (secrets-cmd.ts) uses it as the in-memory placeholder
+ *  when no vault exists yet (`loaded.vault ?? newVault()`): having no slots,
+ *  it makes vaultVerifiesPassphrases false until createVaultV3 replaces it,
+ *  so changing its version changes first-`set` behaviour. It is pinned to v2 explicitly rather than SECRETS_SCHEMA_VERSION, since a
  *  "v3" without key slots is a file loadVault refuses.
  *
  *  @deprecated for new vaults; use createVaultV3. */

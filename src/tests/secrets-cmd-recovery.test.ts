@@ -17,7 +17,7 @@ import {
   recoveryCodeGroups,
 } from "../recovery-code.js";
 import { auditLogPath } from "../secrets-audit.js";
-import { parseSecretsArgs, runSecrets, SECRETS_USAGE } from "../secrets-cmd.js";
+import { isSameFilePath, parseSecretsArgs, runSecrets, SECRETS_USAGE } from "../secrets-cmd.js";
 import {
   createVaultV3,
   getSecret,
@@ -132,13 +132,25 @@ function codesOn(screen: string): string[] {
   return screen.match(CODE_RE) ?? [];
 }
 
-/** Occurrences of `needle` in `s`. Counting is REQUIRED wherever two
- *  wordings overlap: the confirm's final attempt prints "That does not match
- *  the code above." as a whole line, while the earlier attempts print that
- *  SAME text as a prefix of "… try again.", so `toContain` cannot tell one
- *  occurrence from three -- only an occurrence count pins which variant
- *  printed how often. */
+/** Occurrences of `needle` in `s`. Counting is REQUIRED wherever a line can
+ *  repeat: every non-final wrong attempt prints the same retry line, so
+ *  `toContain` cannot tell one occurrence from two -- only an occurrence
+ *  count pins which variant printed how often. */
 const occurrences = (s: string, needle: string): number => s.split(needle).length - 1;
+
+/** The retry line (attempts 1 and 2) and the final-attempt line, which is
+ *  written AFTER leaving the alternate screen so it survives it. */
+const RETRY_MISMATCH = "That does not match the code above. Check what you wrote down and try again.\n";
+const FINAL_MISMATCH = "That does not match the code shown -- 3 attempts used.\n";
+
+/** The final mismatch line is on the PRIMARY screen: an ALT_OFF lies between
+ *  the last group prompt and it, and no ALT_ON follows. */
+function expectFinalMismatchVisible(screen: string): void {
+  const at = screen.indexOf(FINAL_MISMATCH);
+  expect(at).toBeGreaterThan(-1);
+  expect(screen.lastIndexOf(ALT_OFF, at)).toBeGreaterThan(screen.lastIndexOf("Type group", at));
+  expect(screen.indexOf(ALT_ON, at)).toBe(-1);
+}
 
 /** The answer to the latest "Type group N" prompt, for the latest code shown. */
 const rightGroup: Answer = (screen) => {
@@ -410,8 +422,8 @@ describe("creating a vault issues a recovery code at a terminal", () => {
     // Deliberately NOT scripted past the two passphrase lines: once they are
     // consumed the fake stdin has nothing left and closes (readableEnded), so
     // every group read folds to "" -- the shape a pipe whose writer exited
-    // actually has, which the scripted test above cannot produce (its queue
-    // answers forever). The empty-bound is the only thing that can end this
+    // actually has, which the scripted test above does not reach (its queue
+    // still holds answers when the bound fires, so its stream never ends). The empty-bound is the only thing that can end this
     // loop; if it regressed the reader would resolve "" forever and this test
     // would TIME OUT rather than pass.
     const t = terminal([`${PASS}\r`, `${PASS}\r`]);
@@ -610,16 +622,16 @@ describe("creating a vault issues a recovery code at a terminal", () => {
 
 // ---------------------------------------------------------------------------
 // issueRecoveryCode runs TWO independent counters: `attempt` (wrong groups,
-// three allowed) and `empty` (blank answers, five allowed). They are
-// asymmetric by design -- an empty answer spends no attempt -- and `empty` is
-// never reset, so it bounds a CONTIGUOUS run of blanks, not a total. Neither
-// fact is visible in a run that is all empties or all wrongs; these tests mix
-// them on the scripted TTY, where every prompt and every answer is countable.
+// three allowed) and `empty` (blank answers, five allowed IN A ROW -- any
+// typed answer resets it). They are asymmetric by design -- an empty answer
+// spends no attempt. Neither fact is visible in a run that is all empties or
+// all wrongs; these tests mix them on the scripted TTY, where every prompt
+// and every answer is countable.
 // ---------------------------------------------------------------------------
 describe("the recovery confirm counts wrong groups and empty groups separately", () => {
   it("empties interleaved with wrong groups spend no attempts; three wrong answers still end it", async () => {
-    // Every attempt's FIRST group is answered with a bare Enter, its second
-    // with a wrong one. Under counting that charged attempts for empties, the
+    // Every attempt's first group is answered with a bare Enter, which
+    // re-asks that SAME group, and then with a wrong one. Under counting that charged attempts for empties, the
     // three attempts would be gone after the first wrong answer -- two wrong
     // groups would still sit in the queue, `pending` would not be 0, and the
     // vault would never be reached at all. As implemented, six answers are
@@ -640,7 +652,8 @@ describe("the recovery confirm counts wrong groups and empty groups separately",
     expect(r.exitCode).toBe(1);
     const screen = t.screen.text();
     // One mismatch line per WRONG answer, none per blank.
-    expect(occurrences(screen, "That does not match the code above.")).toBe(3);
+    expect(occurrences(screen, RETRY_MISMATCH)).toBe(2);
+    expect(occurrences(screen, FINAL_MISMATCH)).toBe(1);
     // 6 reads, each preceded by its own prompt: a blank re-asks the SAME
     // group, a wrong one ends its attempt. Nothing after the third wrong was
     // touched -- the two right answers queued behind it are still unread,
@@ -648,15 +661,111 @@ describe("the recovery confirm counts wrong groups and empty groups separately",
     // because the answers ran out".
     expect(occurrences(screen, "Type group ")).toBe(6);
     expect(t.stdin.pending).toBe(2);
-    // The `empty` counter never resets, so the three blanks -- one per
-    // attempt, never five in a row -- must NOT reach the empty bound. Ending
-    // on the mismatch wording rather than the "5 times in a row" reason is
-    // what separates a run length from an accumulator.
+    // The three blanks are each broken up by a typed answer, so the
+    // consecutive-empty run never leaves 1 -- far from the five-in-a-row
+    // bound. Ending on the mismatch wording rather than the "5 times in a
+    // row" reason is what separates a run from an accumulator.
     expect(screen).not.toContain("No group was entered");
     expect(errText()).toContain("Aborted -- nothing was saved.");
     expect(existsSync(vaultPath(home))).toBe(false);
     expect(screen.endsWith(ALT_OFF)).toBe(true);
     expectCodeOnlyOnScreen(codesOn(screen));
+  });
+
+  it("a wrong answer resets the empty run: six blanks in two runs of three never fire the empty bound", async () => {
+    // Six blanks in total (3 + 3), each run broken by a wrong answer, so the
+    // CONSECUTIVE run never leaves 3 -- five under a run semantic means never
+    // firing. Under a cumulative count this exact script WOULD fire (the
+    // fifth blank overall), so the absence of the reason line is what pins
+    // the reset: the loop must end on the attempt budget instead, with all
+    // three mismatch lines printed and nothing saved.
+    const t = terminal([
+      `${PASS}\r`,
+      `${PASS}\r`,
+      wrongGroup,
+      "\r",
+      "\r",
+      "\r",
+      wrongGroup,
+      "\r",
+      "\r",
+      "\r",
+      wrongGroup,
+    ]);
+    const r = await runSecrets({ action: "set", name: "GH", value: "v", home, io: t.io, env: {} }, io);
+    expect(r.exitCode).toBe(1);
+    const screen = t.screen.text();
+    expect(occurrences(screen, RETRY_MISMATCH)).toBe(2);
+    expect(occurrences(screen, FINAL_MISMATCH)).toBe(1);
+    expect(screen).not.toContain("No group was entered");
+    // 1 prompt for attempt 1's wrong group, then per later attempt: the group
+    // prompt, three re-prompts for its three blanks, and the wrong answer.
+    expect(occurrences(screen, "Type group ")).toBe(9);
+    expect(t.stdin.pending).toBe(0);
+    expect(errText()).toContain("Aborted -- nothing was saved.");
+    expect(existsSync(vaultPath(home))).toBe(false);
+    expect(screen.endsWith(ALT_OFF)).toBe(true);
+    expectCodeOnlyOnScreen(codesOn(screen));
+  });
+
+  it("a wrong answer resets the run: four blanks, a wrong group, then five blanks fire the bound with one attempt spent", async () => {
+    // Four blanks re-prompt the same group without spending an attempt (the
+    // run reaches 4, under the bound), then one WRONG answer spends attempt 1
+    // AND resets the run: the `empty = 0` in the loop runs for any typed
+    // answer, right or wrong, before the mismatch break. So the five blanks
+    // queued behind it -- all on the next attempt's first group -- climb
+    // 1..5 and fire. This is the complement of the scattered-blanks test
+    // above: there the reset kept the run from EVER reaching the bound; here
+    // the reset hands the run a fresh budget of five, and the bound fires
+    // with only ONE attempt spent.
+    const t = terminal([`${PASS}\r`, `${PASS}\r`, "\r", "\r", "\r", "\r", wrongGroup, "\r", "\r", "\r", "\r", "\r"]);
+    const r = await runSecrets({ action: "set", name: "GH", value: "v", home, io: t.io, env: {} }, io);
+    expect(r.exitCode).toBe(1);
+    const screen = t.screen.text();
+    expect(screen).toContain("No group was entered -- the prompt was left empty 5 times in a row.");
+    // One mismatch line: the single wrong answer. The blanks print none -- the
+    // bound's own reason line is the only other wording on the way out.
+    expect(occurrences(screen, "That does not match the code above.")).toBe(1);
+    // 5 prompts on the first group (1 + 4 blank re-prompts, the wrong answer
+    // read off the fifth) + 5 on the next attempt's group (its first blank is
+    // read from that group's own prompt, then four re-prompts fire the bound
+    // on the fifth). Every confirm answer is consumed exactly (plus the two
+    // passphrase answers) -- the run ends ON the bound, not one read short of
+    // the script.
+    expect(occurrences(screen, "Type group ")).toBe(10);
+    expect(t.stdin.pending).toBe(0);
+    expect(errText()).toContain("Aborted -- nothing was saved.");
+    expect(existsSync(vaultPath(home))).toBe(false);
+    expect(screen.endsWith(ALT_OFF)).toBe(true);
+  });
+
+  it("a RIGHT answer resets the run too: 4 blanks, right, 4 blanks, right is confirmed and saved", async () => {
+    // Eight blanks in all, but never five in a row: the correct first group
+    // breaks the run. If the reset ran only for a wrong answer, the second
+    // group's fourth blank would be the fifth in the run and abort the save.
+    const t = terminal([
+      `${PASS}\r`,
+      `${PASS}\r`,
+      "\r",
+      "\r",
+      "\r",
+      "\r",
+      rightGroup,
+      "\r",
+      "\r",
+      "\r",
+      "\r",
+      rightGroup,
+    ]);
+    const r = await runSecrets({ action: "set", name: "GH", value: "v", home, io: t.io, env: {} }, io);
+    expect(r.exitCode).toBe(0);
+    const screen = t.screen.text();
+    expect(screen).not.toContain("No group was entered");
+    expect(screen).not.toContain("That does not match");
+    // 5 prompts per group (1 + 4 blank re-prompts), every answer consumed.
+    expect(occurrences(screen, "Type group ")).toBe(10);
+    expect(t.stdin.pending).toBe(0);
+    expect(recoveryStatus(await onDisk()).state).toBe("set");
   });
 
   it("one wrong group, then a drained stdin: the mismatch line AND the empty-bound reason, no hang", async () => {
@@ -684,20 +793,20 @@ describe("the recovery confirm counts wrong groups and empty groups separately",
     expect(screen.endsWith(ALT_OFF)).toBe(true);
   });
 
-  it("the last attempt prints the bare mismatch sentence: three wrongs, counted not contained", async () => {
+  it("the last attempt's mismatch line is written off the alternate screen, so it survives leaving it", async () => {
     const t = terminal([`${PASS}\r`, `${PASS}\r`, wrongGroup, wrongGroup, wrongGroup]);
     const r = await runSecrets({ action: "set", name: "GH", value: "v", home, io: t.io, env: {} }, io);
     expect(r.exitCode).toBe(1);
     const screen = t.screen.text();
-    // Attempts 1 and 2 invite another try; attempt 3 only states the fact.
-    expect(occurrences(screen, "That does not match the code above. Check what you wrote down and try again.")).toBe(2);
-    // The bare sentence, terminated by its own newline: exactly once, on the
-    // last attempt. Counting BOTH variants (2 + 1 = 3) is the only honest
-    // assertion -- the bare sentence is a prefix of the retry wording, so
-    // `toContain("That does not match the code above.")` passes on the retry
-    // wording alone and would say nothing about the final attempt at all.
-    expect(occurrences(screen, "That does not match the code above.\n")).toBe(1);
-    expect(occurrences(screen, "That does not match the code above.")).toBe(3);
+    // Attempts 1 and 2 invite another try (on the alternate screen, under
+    // the code); attempt 3 states the fact, exactly once.
+    expect(occurrences(screen, RETRY_MISMATCH)).toBe(2);
+    expect(occurrences(screen, FINAL_MISMATCH)).toBe(1);
+    // Leaving the alternate screen wipes everything on it, so the final line
+    // must come AFTER the ALT_OFF -- written on it, the user would never see
+    // why the command aborted.
+    expectFinalMismatchVisible(screen);
+    expect(screen.lastIndexOf(RETRY_MISMATCH)).toBeLessThan(screen.indexOf(ALT_OFF));
     expect(screen.endsWith(ALT_OFF)).toBe(true);
     expect(errText()).toBe(
       "yaw-mcp secrets set: Aborted -- nothing was saved. Re-run, or pass --no-recovery to create the vault without a recovery code.\n",
@@ -797,7 +906,36 @@ describe("secrets recover", () => {
       recovery: "set",
     });
     expect(errJson().map((l) => l.warning)).toEqual(["vault-recovered"]);
+    // passphrase_source names where the NEW passphrase came from (_NEW);
+    // the never-read old env var is reported separately.
+    expect(errJson()[0]).toMatchObject({ passphrase_source: "env", stale_env_set: true });
     expectCodeOnlyOnScreen([oldCode, ...codesOn(t.screen.text())]);
+  });
+
+  it("--json: a typed new passphrase reports passphrase_source prompt even with the old env var set", async () => {
+    const oldCode = await seedV3(true);
+    process.env.YAW_MCP_VAULT_PASSPHRASE = "the-env-passphrase-never-used";
+    const t = terminal([`${oldCode}\r`, `${NEW_PASS}\r`, `${NEW_PASS}\r`], true);
+    const r = await runSecrets({ action: "recover", home, io: t.io, env: {}, json: true, noRecovery: true }, io);
+    expect(r.exitCode).toBe(0);
+    expect(await opensWith(NEW_PASS)).toBe(true);
+    expect(errJson()).toEqual([
+      expect.objectContaining({ warning: "vault-recovered", passphrase_source: "prompt", stale_env_set: true }),
+    ]);
+
+    // And with no old env var at all, the stale flag is false.
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    process.env.YAW_MCP_VAULT_PASSPHRASE_NEW = "yet-another-new-passphrase";
+    io.err.mockReset();
+    io.out.mockReset();
+    lock();
+    const code2 = await seedV3(true);
+    const t2 = terminal([`${code2}\r`], true);
+    const r2 = await runSecrets({ action: "recover", home, io: t2.io, env: {}, json: true, noRecovery: true }, io);
+    expect(r2.exitCode).toBe(0);
+    expect(errJson()).toEqual([
+      expect.objectContaining({ warning: "vault-recovered", passphrase_source: "env", stale_env_set: false }),
+    ]);
   });
 
   it("a typo gets another try; a code for ANOTHER vault ends it with nothing changed", async () => {
@@ -891,6 +1029,40 @@ describe("secrets recover", () => {
     expect(readdirSync(nodePath.dirname(vaultPath(home))).sort()).toEqual(before);
     expect(await codeOpens(code, aside)).toBe(true);
   });
+
+  it("isSameFilePath: identity, not spelling -- case-insensitive on win32 only, realpath'd when the file exists", async () => {
+    const p = vaultPath(home);
+    // Nonexistent spellings fall back to the resolved string.
+    expect(await isSameFilePath("C:\\Users\\Me\\x.json", "c:\\users\\me\\X.JSON", "win32")).toBe(true);
+    expect(await isSameFilePath("/home/me/x.json", "/home/me/X.json", "linux")).toBe(false);
+    expect(await isSameFilePath("/home/me/x.json", "/home/me/x.json", "linux")).toBe(true);
+    // An existing file under a `..` detour is the same file.
+    await seedV3(true);
+    const detour = nodePath.join(
+      nodePath.dirname(p),
+      "..",
+      nodePath.basename(nodePath.dirname(p)),
+      nodePath.basename(p),
+    );
+    expect(await isSameFilePath(detour, p)).toBe(true);
+    expect(await isSameFilePath(`${p}.other`, p)).toBe(false);
+  });
+
+  it.runIf(process.platform === "win32")(
+    "--file naming the vault itself in another case is the in-place recover, not a refused copy",
+    async () => {
+      const code = await seedV3(true);
+      const t = terminal([`${code}\r`, `${NEW_PASS}\r`, `${NEW_PASS}\r`]);
+      const r = await runSecrets(
+        { action: "recover", file: vaultPath(home).toUpperCase(), home, io: t.io, env: {}, noRecovery: true },
+        io,
+      );
+      expect(r.exitCode).toBe(0);
+      expect(errText()).not.toContain("a vault already exists");
+      expect(outText()).toContain("The recovery code you used no longer opens it.");
+      expect(await opensWith(NEW_PASS)).toBe(true);
+    },
+  );
 
   it("--file with no vault at the path just writes the recovered one there", async () => {
     const code = await seedV3(true);

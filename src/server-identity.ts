@@ -117,7 +117,13 @@ const CONTAINER_RUNNER: FlagTable = {
 const NODE_INTERPRETER: FlagTable = {
   value: flags(
     "-r --require --import --loader --experimental-loader -C --conditions --env-file --input-type --title " +
-      "--preload --tsconfig --tsconfig-override",
+      "--preload --tsconfig --tsconfig-override --watch-path --env-file-if-exists --inspect-port --debug-port " +
+      "--max-old-space-size --max-semi-space-size --stack-size --openssl-config --icu-data-dir " +
+      "--redirect-warnings --disable-warning --unhandled-rejections --dns-result-order --diagnostic-dir " +
+      "--report-dir --report-directory --report-filename --report-signal --cpu-prof-dir --cpu-prof-name " +
+      "--heap-prof-dir --heap-prof-name --heapsnapshot-signal --secure-heap --secure-heap-min " +
+      "--experimental-config-file --localstorage-file --trace-event-categories --trace-event-file-pattern " +
+      "--use-largepages --tls-cipher-list --tls-keylog --watch-kill-signal",
   ),
   bool: flags(""),
   stop: flags("-e --eval -p --print"),
@@ -128,8 +134,8 @@ const DENO_INTERPRETER: FlagTable = {
   value: new Set([...NODE_INTERPRETER.value, "-c", "--config", "--import-map", "--lock"]),
 };
 const PYTHON_INTERPRETER: FlagTable = {
-  value: flags("-W -X"),
-  bool: flags(""),
+  value: flags("-W -X --check-hash-based-pycs"),
+  bool: flags("-b -B -d -E -i -I -O -OO -P -q -R -s -S -u -v -x"),
   target: flags("-m"),
   stop: flags("-c"),
   unknownIsBool: true,
@@ -272,16 +278,40 @@ function parseTarget(args: readonly string[], table: FlagTable): ParsedTarget {
       const value = eq === -1 ? args[i + 1] : a.slice(eq + 1);
       if (value) return done(value, true);
     }
-    if (eq !== -1 || table.bool.has(a)) continue;
+    if (eq !== -1 || table.bool.has(a)) {
+      // A RUNNER's unknown `--flag=value` carries its value in the token
+      // itself; the space spelling of the same flag lands in `ambiguous` below,
+      // so respelling it with `=` must not hide that reading from a deny. Not
+      // for interpreters (their space spelling never consumes a value, and an
+      // `=` value cannot be the script) nor attached short flags
+      // (`-eTOKEN=abc`): there the value is only false-match surface.
+      if (eq !== -1 && !table.unknownIsBool && a.startsWith("--") && !table.value.has(name) && !table.bool.has(name)) {
+        const v = a.slice(eq + 1);
+        if (v) ambiguous.push(v);
+      }
+      continue;
+    }
     if (table.value.has(a)) {
       i++;
       continue;
     }
     if (/^-[A-Za-z]{2,}$/.test(a) && [...a.slice(1)].every((c) => table.bool.has(`-${c}`))) continue;
-    if (table.unknownIsBool) continue;
+    if (table.unknownIsBool) {
+      // An unlisted interpreter flag is read as boolean: the next positional
+      // stays the script, so `node --inspect /opt/a.js stdio` is /opt/a.js,
+      // not its argument `stdio`. Value flags therefore belong in
+      // `table.value`. For one that is missing (`node --new-flag v /x/a.js`)
+      // the positional after the first is kept as a WEAK reading, so an
+      // explicit `command:/x/a.js` deny still matches; it is never the target.
+      const next = args[i + 1];
+      const after = args[i + 2];
+      if (next !== undefined && !next.startsWith("-") && after && !after.startsWith("-")) ambiguous.push(after);
+      continue;
+    }
     const next = args[i + 1];
     if (next !== undefined && !next.startsWith("-")) {
-      ambiguous.push(next);
+      // An empty value is consumed but names no package.
+      if (next) ambiguous.push(next);
       i++;
     }
   }
@@ -326,11 +356,16 @@ function localIdentity(command: string, args: readonly string[]): ServerIdentity
       table === PYTHON_INTERPRETER
         ? scriptArgs.flatMap((a) => (/^-[bBdEiIOPqRsSuvx]+m$/.test(a) ? [a.slice(0, -1), "-m"] : [a]))
         : scriptArgs;
-    const { target, viaFlag } = parseTarget(expanded, table);
-    if (!target) return identity([], [], launchers);
-    if (viaFlag) return identity([packageId(target)], [], launchers);
+    const { target, viaFlag, ambiguous } = parseTarget(expanded, table);
+    // `ambiguous` holds the positional after an unlisted flag's possible value
+    // (`node --new-flag v /x/a.js` -> `/x/a.js`): only a weak reading, so it
+    // can match an explicit deny or another server's strong id, but two
+    // launches never match on it alone.
+    const weakReadings = ambiguous.map((v) => commandIds(v)).flatMap((c) => [c.strong, ...c.weak]);
+    if (!target) return identity([], weakReadings, launchers);
+    if (viaFlag) return identity([packageId(target)], weakReadings, launchers);
     const script = commandIds(target);
-    return identity([script.strong], script.weak, launchers);
+    return identity([script.strong], [...script.weak, ...weakReadings], launchers);
   }
   if (SHELLS.has(launcher) || GENERIC_LAUNCHERS.has(launcher)) return identity([], [], launchers);
   // Any other command may host many different servers (java, dotnet, ssh, a
