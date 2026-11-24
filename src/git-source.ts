@@ -1821,11 +1821,15 @@ async function buildLocked(
   const plan = detectPackageManager(installDir);
   if ("error" in plan) return fail(2, `${scrubRepoUrlUserinfo(req.spec.url)}: ${plan.error}`);
   for (const w of plan.warnings) warn(w);
-  const pmCmd = resolvePmCommand(plan, { env: ctx.env, platform: ctx.platform, exclude: work });
-  if ("error" in pmCmd) return fail(2, pmCmd.error);
-  const build = planBuild(plan, installDir, targetDir);
-  if (build && "error" in build) return fail(2, build.error);
 
+  // The consent gate runs BEFORE the pm invocation is resolved: it is the
+  // surface that lists what repo code an install would run (lifecycle scripts
+  // plus the package-manager config -- a root .yarnrc.yml yarnPath over a
+  // subdir package, a .pnpmfile.cjs), and an environment refusal ("yarn is
+  // not installed") used to fire first and hide that listing entirely on any
+  // machine without yarn/corepack. Nothing here runs repo code, so moving it
+  // ahead of the resolution changes no safety property: a refused add still
+  // builds nothing, it just refuses with the config named.
   if (!hasRepoConsent(req.spec.url, ctx.home)) {
     const lines = consentLines(
       lifecycleScripts(installDir, targetDir),
@@ -1852,6 +1856,11 @@ async function buildLocked(
     }
     await recordRepoConsent(req.spec.url, ctx.home, ctx.now?.());
   }
+
+  const pmCmd = resolvePmCommand(plan, { env: ctx.env, platform: ctx.platform, exclude: work });
+  if ("error" in pmCmd) return fail(2, pmCmd.error);
+  const build = planBuild(plan, installDir, targetDir);
+  if (build && "error" in build) return fail(2, build.error);
 
   const pmOpts = (output: (c: string) => void): RunNpmOptions => ({
     ...(pmCmd.bin ? { bin: pmCmd.bin } : {}),
