@@ -4,6 +4,8 @@ All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented 
 
 ## Unreleased
 
+## 1.1.17
+
 **Fixed -- the consent screen is no longer hidden behind a "package manager not installed" refusal**
 
 `yaw-mcp add --git` resolved how to invoke the package manager (yarn/pnpm on PATH or through corepack) BEFORE showing the consent screen, so on a machine with neither yarn nor corepack a repo whose install would run a root `.yarnrc.yml` `yarnPath` (or any other package-manager config) was refused with `this repo builds with yarn, which is not installed` and the listing of what that config would run never appeared. The consent gate -- lifecycle scripts plus the repo's package-manager config files -- now runs first, so the refusal names the `yarnPath`/`.pnpmfile`/`.npmrc` code an install would load; the environment refusal follows only once the repo's scripts are allowed to run. Nothing about what is blocked changed: a refused add still builds nothing.
