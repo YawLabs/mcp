@@ -2942,26 +2942,35 @@ export function resolveManagedSpawn(
   });
 }
 
-// Per-process memo for the node/npx-cli.js lookup inside npxUnderNode. PATH and
-// the node install are stable for the life of the process, but the lookup costs
-// a full PATH walk plus up to three existsSync probes on EVERY resolve -- the
-// rewrite sits at the end of upstream.ts's launch resolver, not only on the
-// respawn that motivated it. Keyed by nothing, and guarded by the opts check
-// instead: it is read and written ONLY when every opt is defaulted (the
-// production call shape), so an injected platform/execPath/env/exists -- the
-// test shape -- resolves fresh in both directions and can never read or poison
-// the memo. A hit is only trusted while its npx-cli.js still exists (one
-// existsSync instead of the walk, same policy as managedEntryMemo): a node
-// install removed or moved under a long-lived broker drops the entry and
-// re-resolves rather than emitting `node <missing npx-cli.js>`. A MISS (no node
-// on PATH, no npx-cli.js beside it) is never memoized, on purpose, so a node
-// installed after the first connect is picked up without a restart.
-let npxUnderNodeMemo: { nodeBin: string; cli: string } | null = null;
+// Per-process memo for the node/npx-cli.js lookup inside npxUnderNode. The
+// lookup costs a full PATH walk plus up to three existsSync probes on EVERY
+// resolve -- the rewrite sits at the end of upstream.ts's launch resolver, not
+// only on the respawn that motivated it. Keyed by the env the lookup ran
+// against (its PATH, case-folded spelling included), because that env is the
+// only input the resolution reads: upstream.ts passes the CHILD's merged env
+// (#230), and two servers can disagree about PATH in one broker process, so a
+// keyless memo would serve one server's node to the other. A hit is only
+// trusted while its npx-cli.js still exists (one existsSync instead of the
+// walk, same policy as managedEntryMemo): a node install removed or moved under
+// a long-lived broker drops the entry and re-resolves rather than emitting
+// `node <missing npx-cli.js>`. A MISS (no node on PATH, no npx-cli.js beside it)
+// is never memoized, on purpose, so a node installed after the first connect is
+// picked up without a restart.
+const npxUnderNodeMemo = new Map<string, { nodeBin: string; cli: string }>();
 
 /** Reset the npxUnderNode memo (test hook) -- process-lifetime by design, so
  *  without this the memo tests depend on which one runs first. */
 export function resetNpxUnderNodeMemo(): void {
-  npxUnderNodeMemo = null;
+  npxUnderNodeMemo.clear();
+}
+
+/** The memo key for one lookup env: its PATH with any case-variant spelling
+ *  folded to one -- Windows delivers `Path` and `PATH` interchangeably (see
+ *  mergeChildEnv), and both spellings must read as the same PATH. */
+function npxMemoKey(env: NodeJS.ProcessEnv): string {
+  const path = env.PATH ?? env.Path ?? env.path ?? "";
+  const pathext = env.PATHEXT ?? env.PathExt ?? env.pathext ?? "";
+  return JSON.stringify([path, pathext]);
 }
 
 /**
@@ -3003,15 +3012,20 @@ export function resetNpxUnderNodeMemo(): void {
  * every PATHEXT extension, and a `node.cmd`/`node.bat` shim earlier on PATH
  * would come back as the command -- the very cmd.exe detour this avoids.
  *
- * KNOWN LIMITATIONS. (1) The node comes from the BROKER's PATH (process.env;
- * upstream.ts passes no env), not the child's merged env: a server whose own
- * env sets PATH to select a node/npx is rewritten to the broker's first node
- * anyway -- the same server-PATH caveat OamProbe.bin documents for oam, and
- * the process-wide memo is what keeps it from being fixed per server as
- * written. (2) The npx gate is nodeLaunchKind, a BASENAME match: an absolute
- * `C:\tools\node18\npx.cmd` is rewritten to the PATH node's npx-cli.js too,
- * not one resolved beside that path.
- */
+ * KNOWN LIMITATIONS. (1) The node comes from the CHILD's PATH when the caller
+ * supplies one (upstream.ts passes the merged spawn env) and from the broker's
+ * process.env otherwise; the memo is keyed by that PATH, so servers that
+ * disagree about PATH resolve independently. A server env that sets PATH
+ * WITHOUT node on it gets no rewrite and stays on bare npx -- the same
+ * server-PATH caveat OamProbe.bin documents for oam. (2) The npx gate is
+ * nodeLaunchKind, a BASENAME match, so the launch must name a bare `npx` (any
+ * case, any .cmd/.bat extension): an npx at a PATH-hittable name is BY
+ * DEFINITION resolved off the same PATH the node lookup walks, so the found
+ * node's npx-cli.js is the one npx.cmd would have run. An absolute or
+ * relative-path npx -- `C:\tools\node18\npx.cmd`, `.\npx.cmd` -- carries a
+ * separator, so nodeLaunchKind reads it as null and the launch is left
+ * untouched: rewriting it to the PATH node's npx-cli.js would silently swap
+ * npm versions on a server that deliberately pinned an install. */
 export function npxUnderNode(
   command: string,
   args: string[],
@@ -3028,35 +3042,47 @@ export function npxUnderNode(
   // logging, so a debug log is not one "nothing happened" line per connect.
   const platform = opts.platform ?? process.platform;
   if (platform !== "win32") return { command, args };
-  if (nodeLaunchKind(command) !== "npx") return { command, args };
+  // A BARE npx name only (#230): nodeLaunchKind is a basename match, so an
+  // absolute or relative-path npx ALSO reads as "npx" here -- but it pinned
+  // its own install (its npm lives beside ITS node), and the PATH node's
+  // npx-cli.js is a different npm. A separator in the command opts the launch
+  // out; only the PATH-resolvable bare name is rewritten.
+  if (nodeLaunchKind(command) !== "npx" || /[\\/]/.test(command)) return { command, args };
   const execPath = opts.execPath ?? process.execPath;
   if (nodeLaunchKind(execPath) === "node") return { command, args };
   const env = opts.env ?? process.env;
   const fileExists = opts.exists ?? existsSync;
-  // The memo engages only when EVERY opt is defaulted -- the production shape.
-  // Any injected value (tests) takes the fresh-resolution path below.
-  const defaulted =
-    opts.platform === undefined && opts.execPath === undefined && opts.env === undefined && opts.exists === undefined;
+  // The memo engages when the production caller's shape holds: platform and
+  // execPath defaulted and a REAL exists. env is NOT part of that guard -- it
+  // is the memo's KEY (#230): upstream.ts always passes the child's merged env,
+  // and a test that passes an env still resolves through the same keyed map.
+  // An injected platform/execPath/exists -- the rest of the test shape --
+  // resolves fresh in both directions and can never read or poison the memo.
+  const defaulted = opts.platform === undefined && opts.execPath === undefined && opts.exists === undefined;
+  const memoKey = npxMemoKey(env);
   // Revalidate a memo hit: its npx-cli.js gone means the node install moved or
   // was removed under the broker -- drop it and resolve fresh.
-  if (defaulted && npxUnderNodeMemo !== null && !existsSync(npxUnderNodeMemo.cli)) npxUnderNodeMemo = null;
-  let found: { nodeBin: string; cli: string };
-  if (defaulted && npxUnderNodeMemo !== null) {
-    found = npxUnderNodeMemo;
-  } else {
-    const nodeBin = resolveBinAbsolute("node.exe", env, platform);
-    if (nodeBin === null) {
-      log("debug", "no node.exe resolved on PATH; staying on npx", { command });
-      return { command, args };
-    }
-    const cli = npxCliCandidates(nodeBin, platform).find((c) => fileExists(c));
-    if (cli === undefined) {
-      log("debug", "no npx-cli.js beside the resolved node binary; staying on npx", { command, nodeBin });
-      return { command, args };
-    }
-    if (defaulted) npxUnderNodeMemo = { nodeBin, cli };
-    found = { nodeBin, cli };
+  const memoed = npxUnderNodeMemo.get(memoKey);
+  if (memoed !== undefined && !fileExists(memoed.cli)) {
+    npxUnderNodeMemo.delete(memoKey);
   }
+  const found =
+    npxUnderNodeMemo.get(memoKey) ??
+    (() => {
+      const nodeBin = resolveBinAbsolute("node.exe", env, platform);
+      if (nodeBin === null) {
+        log("debug", "no node.exe resolved on PATH; staying on npx", { command });
+        return null;
+      }
+      const cli = npxCliCandidates(nodeBin, platform).find((c) => fileExists(c));
+      if (cli === undefined) {
+        log("debug", "no npx-cli.js beside the resolved node binary; staying on npx", { command, nodeBin });
+        return null;
+      }
+      if (defaulted) npxUnderNodeMemo.set(memoKey, { nodeBin, cli });
+      return { nodeBin, cli };
+    })();
+  if (found === null) return { command, args };
   log("debug", "npx launch rewritten to node + npx-cli.js (skips the cmd.exe verbatim-args detour)", {
     nodeBin: found.nodeBin,
     cli: found.cli,

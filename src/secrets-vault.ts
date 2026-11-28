@@ -1426,14 +1426,6 @@ export async function createVaultV3(passphrase: string, opts: CreateVaultV3Optio
   return buildV3(new Map(), passphrase, opts.recovery, undefined);
 }
 
-/** A fresh, EMPTY v3 vault with no recovery slot: createVaultV3(passphrase,
- *  {recovery: false}).vault. Test-only today: no production code calls it, the
- *  tests that build fixture vaults do. New code calls createVaultV3 so the
- *  recovery decision is explicit. */
-export async function createEmptyVault(passphrase: string): Promise<VaultFile> {
-  return (await createVaultV3(passphrase, { recovery: false })).vault;
-}
-
 /**
  * The ONE re-key primitive: rotate, recover, `recovery new`, `recovery
  * remove` and the v1/v2 -> v3 migration all go through here. Decrypts every
@@ -1515,18 +1507,6 @@ export async function rekeyVault(
     // V8, but clearing the map removes our held references promptly.
     plaintext.clear();
   }
-}
-
-/**
- * rekeyVault without a recovery slot, returning just the vault. Test-only
- * today: no production code calls it, the tests do. The CLI calls rekeyVault so the
- * recovery decision is explicit (D2: there is no passphrase-only rotate --
- * this re-keys too, and drops any recovery slot the vault had).
- *
- * @deprecated use rekeyVault.
- */
-export async function rotateVault(vault: VaultFile, oldKey: Buffer, newPassphrase: string): Promise<VaultFile> {
-  return (await rekeyVault(vault, oldKey, newPassphrase, { recovery: false })).vault;
 }
 
 /** Unwrap a v3 vault's DEK with a recovery code, for `secrets recover`.

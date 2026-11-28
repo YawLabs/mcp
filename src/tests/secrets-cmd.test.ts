@@ -25,7 +25,7 @@ import {
   MALFORMED_REF_MARKER,
   newVault,
   recoveryStatus,
-  rotateVault,
+  rekeyVault,
   SECRETS_SCHEMA_VERSION,
   saveVault,
   setSecret,
@@ -2138,7 +2138,7 @@ describe("runSecrets set -- overwrite confirmation and Replaced/Stored split", (
 // rotate re-encrypts EVERY entry under a new passphrase, so a partial
 // failure could leave the vault half-rewritten: some entries readable only
 // under the old passphrase, some only under the new, and no way for the
-// user to tell which. secrets-vault.rotateVault is written decrypt-ALL-
+// user to tell which. secrets-vault.rekeyVault is written decrypt-ALL-
 // before-write for exactly that reason, and runSecretsRotate only reaches
 // saveVault on the all-succeeded path.
 //
@@ -2201,7 +2201,7 @@ describe("runSecrets rotate -- abort paths leave the vault byte-identical", () =
   it("ONE undecryptable entry aborts the whole rotation -- vault byte-identical, siblings still readable", async () => {
     // The headline case. BETA is corrupted so that it is still STRUCTURALLY
     // valid (loadVault only checks iv/ciphertext/authTag are strings) but
-    // fails AES-GCM authentication. rotateVault decrypts in insertion order,
+    // fails AES-GCM authentication. rekeyVault decrypts in insertion order,
     // so ALPHA succeeds and BETA throws -- i.e. the abort happens with
     // plaintext already in hand, which is precisely the moment a naive
     // implementation would have started writing.
@@ -2925,7 +2925,7 @@ describe("runSecrets -- concurrent-writer guard", () => {
           const onDisk = await loadVault(file);
           if (!onDisk) throw new Error("fixture: vault vanished");
           const key = await unlock(onDisk, OLD);
-          await saveVault(file, await rotateVault(onDisk, key, CONCURRENT_NEW));
+          await saveVault(file, (await rekeyVault(onDisk, key, CONCURRENT_NEW, { recovery: false })).vault);
           concurrent.bytes = readFileSync(file);
           deliver();
         })();

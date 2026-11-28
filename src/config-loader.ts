@@ -103,12 +103,13 @@ export interface ResolvedConfig {
   loadedFiles: LoadedConfigFile[];
   /** Soft problems that don't fail loading. Surface in `yaw-mcp doctor`. */
   warnings: string[];
-  /** Broken-policy messages (one per `policyErrors` entry) plus unknown
-   *  top-level keys, one per file that has them. A subset of `warnings`,
-   *  repeated where the policy is shown (`mcp_connect_health`, activation
-   *  refusals) so a refusal carries the file's own KEY-level message and not
-   *  just its path. Never a reason to refuse AGAIN: a broken file already
-   *  refuses through `policyErrors`, an unknown key may be a newer release's. */
+  /** Unknown top-level keys, one per file that has them. A subset of
+   *  `warnings`, repeated where the policy is shown (`mcp_connect_health`,
+   *  activation refusals) so a reader can tell an ignored key from a real
+   *  policy. Never a reason to refuse: an unknown key may be a newer
+   *  release's. Broken-policy messages do NOT fold in here (#230) -- they
+   *  already reach `warnings` and `policyErrors`, which every refusal surface
+   *  prints directly. */
   policyWarnings?: string[];
 }
 
@@ -615,14 +616,6 @@ export async function loadYawMcpConfig(opts: LoadConfigOptions = {}): Promise<Re
   if (global) loadedFiles.push(global);
 
   const policyWarnings = loadedFiles.flatMap((f) => (f.unknownKeysWarning ? [f.unknownKeysWarning] : []));
-  // ...and the BROKEN-policy messages too (the policyProblem ones: wrong-typed
-  // servers/blocked/blockedTools, unreadable/invalid JSON file). They already
-  // reach `warnings` and `policyErrors` (which refuses every spawn), but a
-  // refusal only NAMED the file -- while an unknown key got its own
-  // policyWarnings line. policyWarnings is display-only (isAllowed and
-  // effectiveProfile never read it), so repeating a message here costs no
-  // enforcement and gives each refusal the key-level message to show.
-  policyWarnings.push(...policyErrors.map((e) => e.message));
 
   return {
     servers: pickServers(loadedFiles, warnings),
@@ -664,9 +657,11 @@ export interface Profile {
   blockedToolsPaths?: string[];
   /** Broken policy files. While present, every server is refused. */
   policyErrors?: PolicyError[];
-  /** Broken-policy messages and unknown top-level keys
+  /** Unknown top-level keys and wrong-typed values that are not policy lists
    *  (ResolvedConfig.policyWarnings): shown, never enforced, and never a
-   *  reason to refuse on their own. */
+   *  reason to refuse on their own. Broken-policy messages do NOT fold in here
+   *  -- they already reach `warnings` and `policyErrors`, and every refusal
+   *  surface prints those directly (#230). */
   policyWarnings?: string[];
 }
 

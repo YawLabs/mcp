@@ -28,8 +28,9 @@ describe("spawn-gate refusal Note under a broken policy file", () => {
     priv.profile = {
       path: "/cfg/config.json",
       policyErrors: [{ path: "/cfg/config.json", message }],
-      // What config-loader's fold produces.
-      policyWarnings: [message],
+      // The message reaching a refusal exactly once is the loader's doing now
+      // (#230): policyWarnings never carried it, so here it is empty.
+      policyWarnings: [],
     };
   });
 

@@ -235,7 +235,7 @@ vi.mock("../oam-spawn.js", async (importOriginal) => {
     // pre-existing test still spawns byte-for-byte whatever its fixture says;
     // the wiring test below mocks a rewrite to observe it, and its paired
     // negative case asserts the passthrough held.
-    npxUnderNode: vi.fn((command: string, args: string[]) => ({ command, args })),
+    npxUnderNode: vi.fn((command: string, args: string[]) => ({ command, args })), // opts (the child env) ignored: passthrough
   };
 });
 
@@ -2605,7 +2605,7 @@ describe("connectToUpstream oam boot-probe fallback", () => {
   // spawn in this file.
   describe("npxUnderNode respawn wiring", () => {
     beforeEach(() => {
-      vi.mocked(npxUnderNode).mockImplementation((command, args) =>
+      vi.mocked(npxUnderNode).mockImplementation((command, args: string[]) =>
         command === "npx" ? { command: "C:\\nodejs\\node.exe", args: ["C:\\npx-cli.js", ...args] } : { command, args },
       );
     });
@@ -2636,9 +2636,43 @@ describe("connectToUpstream oam boot-probe fallback", () => {
       const connection = await connectToUpstream(config);
 
       expect(connection.status).toBe("connected");
-      expect(vi.mocked(npxUnderNode)).toHaveBeenCalledWith("npx", ["-y", "@yawlabs/fetch-mcp@latest"]);
+      expect(vi.mocked(npxUnderNode)).toHaveBeenCalledWith(
+        "npx",
+        ["-y", "@yawlabs/fetch-mcp@latest"],
+        expect.objectContaining({ env: expect.objectContaining({}) }),
+      );
       expect(_sdkBehavior.stdioConstructions[1]?.command).toBe("C:\\nodejs\\node.exe");
       expect(_sdkBehavior.stdioConstructions[1]?.args).toEqual(["C:\\npx-cli.js", "-y", "@yawlabs/fetch-mcp@latest"]);
+    });
+
+    it("passes the CHILD's MERGED env -- server PATH wins -- not process.env (#230)", async () => {
+      // The #30 root-cause fix lives in this one argument: a server whose env
+      // overrides PATH selects its own node in the rewrite only if the env
+      // npxUnderNode resolves against is mergeChildEnv(parentEnv, serverEnv).
+      // The earlier assertion only checked "some env object arrived" -- an
+      // accidental revert to `process.env` (the pre-#230 shape) passed every
+      // wiring test. The server's PATH value must be IN what the mock received,
+      // spelled the way mergeChildEnv emits it on this host.
+      vi.mocked(resolveOamSpawn).mockResolvedValue({ command: "/usr/bin/oam", args: ["run", "/e.js"] });
+      _sdkBehavior.clientConnect = () => Promise.reject(new Error("oam crashed on boot"));
+      const serverPath = "C:\\server\\node18";
+      const config = makeLocalConfig({
+        runtime: "oam",
+        command: "npx",
+        args: ["-y", "x"],
+        env: { PATH: serverPath, SERVER_ONLY: "yes" },
+      });
+
+      await expect(connectToUpstream(config)).rejects.toBeInstanceOf(ActivationError);
+
+      const call = vi.mocked(npxUnderNode).mock.calls.find((c) => c[0] === "npx");
+      expect(call, "npxUnderNode was called for the npx launch").toBeDefined();
+      const env = call?.[2]?.env as Record<string, string> | undefined;
+      expect(env).toBeDefined();
+      // The child's PATH (mergeChildEnv's uppercase emission on win32, the
+      // server's spelling elsewhere) -- not the broker process's PATH.
+      expect(env?.PATH ?? env?.Path).toBe(serverPath);
+      expect(env?.SERVER_ONLY).toBe("yes");
     });
   });
 
@@ -2655,7 +2689,11 @@ describe("connectToUpstream oam boot-probe fallback", () => {
       return connects === 1 ? Promise.reject(new Error("oam crashed on boot")) : Promise.resolve();
     };
     await connectToUpstream(makeLocalConfig({ runtime: "oam", command: "npx", args: ["-y", "x"] }));
-    expect(vi.mocked(npxUnderNode)).toHaveBeenCalledWith("npx", ["-y", "x"]);
+    expect(vi.mocked(npxUnderNode)).toHaveBeenCalledWith(
+      "npx",
+      ["-y", "x"],
+      expect.objectContaining({ env: expect.objectContaining({}) }),
+    );
     expect(_sdkBehavior.stdioConstructions.map((c) => c.command)).toEqual(["/usr/bin/oam", "npx"]);
 
     vi.mocked(npxUnderNode).mockClear();
@@ -2667,7 +2705,7 @@ describe("connectToUpstream oam boot-probe fallback", () => {
     await expect(
       connectToUpstream(makeLocalConfig({ runtime: "oam", command: "uvx", args: ["some-pkg"] })),
     ).rejects.toBeInstanceOf(ActivationError);
-    expect(vi.mocked(npxUnderNode)).toHaveBeenCalledWith("uvx", ["some-pkg"]);
+    expect(vi.mocked(npxUnderNode)).toHaveBeenCalledWith("uvx", ["some-pkg"], expect.anything());
     expect(_sdkBehavior.stdioConstructions.at(-1)?.command).toBe("uvx");
   });
 

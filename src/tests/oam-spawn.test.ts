@@ -998,15 +998,17 @@ describe("npxUnderNode", () => {
     }
   });
 
-  // The no-opts call shape is the only shape the memo serves, and production
-  // reaches it through the REAL process.*: win32, an execPath that is oam
-  // rather than node, and the machine PATH. On a dev machine execPath IS node
-  // and a Linux runner would exit at the platform gate before any lookup, so
-  // the test swaps all three in for the duration of one call -- the whole-env
-  // swap plus descriptor save/restore the resolveManagedSpawn lazy-resolution
-  // test ("omitted nodeBin is resolved lazily", further below) uses, restored unconditionally in finally. The lookup itself
+  // The memo's production shape is "every opt defaulted EXCEPT env" since #230:
+  // upstream.ts passes the child's merged env on every call, and the memo keys
+  // on that env's PATH. Production reaches the memo through the REAL
+  // process.platform/execPath (win32, an execPath that is oam rather than node)
+  // and a REAL env object. On a dev machine execPath IS node and a Linux runner
+  // would exit at the platform gate before any lookup, so the test swaps the
+  // descriptors in for the duration of one call -- save/restore in finally --
+  // and passes a REAL env built around the fixture PATH. The lookup itself
   // stays real: existsSync probes the fixture on disk, which is why these
-  // tests are real temp dirs and not an injected `exists`.
+  // tests are real temp dirs and not an injected `exists` -- and that is why
+  // they still only run on a Windows host, now gated (see below).
   function callAsOamBroker(pathDir: string, command: string, args: string[]): { command: string; args: string[] } {
     const realEnv = process.env;
     const platformDesc = Object.getOwnPropertyDescriptor(process, "platform");
@@ -1018,14 +1020,14 @@ describe("npxUnderNode", () => {
       // fixture file is named with and returns it VERBATIM (nodeInstall's
       // comment): a real ".EXE" would come back as `node.EXE` and miss the
       // on-disk spelling the expected value folds through winNormalize.
-      process.env = {
+      const env = {
         ...realEnv,
         PATH: pathDir,
         Path: undefined,
         path: undefined,
         PATHEXT: ".com;.exe",
       } as NodeJS.ProcessEnv;
-      return npxUnderNode(command, args);
+      return npxUnderNode(command, args, { env });
     } finally {
       process.env = realEnv;
       if (platformDesc) Object.defineProperty(process, "platform", platformDesc);
@@ -1033,17 +1035,23 @@ describe("npxUnderNode", () => {
     }
   }
 
-  it("memoizes the defaulted lookup: a second no-opts call does not re-walk PATH", () => {
-    // Both calls run the PRODUCTION shape -- every opt defaulted -- so the
-    // npx-cli.js probe is the REAL existsSync. Its candidates are spelled with
-    // win32 separators (npxCliCandidates builds them from the win32-folded
-    // nodeBin), which only existsSync on a Windows host can answer -- so
-    // unlike the injected-opts tests above, this one and the two after it
-    // need a Windows host. That is the host the suite actually runs on (no CI
-    // legs; release.sh runs it on the machine that cuts the release), and a
-    // skipIf would make them run nowhere (see the note at the top of the file).
+  const winHostOnly = process.platform === "win32" ? it : it.skip;
+
+  winHostOnly("memoizes the defaulted lookup: a second same-PATH call does not re-walk PATH", () => {
+    // Both calls run the PRODUCTION shape -- every opt defaulted except env,
+    // which upstream.ts passes (#230) -- so the npx-cli.js probe is the REAL
+    // existsSync. Its candidates are spelled with win32 separators
+    // (npxCliCandidates builds them from the win32-folded nodeBin), which only
+    // existsSync on a Windows host can answer -- so unlike the injected-opts
+    // tests above, this one and the one after it need a Windows host. That is
+    // the host the suite actually runs on (no CI legs; release.sh runs it on
+    // the machine that cuts the release), so they are gated on `skip` -- the
+    // failure the file header records was skipIf, which skipped the ONLY
+    // environment the suite runs in and made the tests run nowhere. Here the
+    // guard skips them on macOS/Linux and RUNS them on the Windows host the
+    // suite is actually executed on (#230).
     const fx = nodeInstall();
-    const emptyDir = mkdtempSync(join(tmpdir(), "npxundernode-empty-"));
+    const fixtureDir = dirname(fx.nodeBin);
     const rewritten = {
       command: winNormalize(fx.nodeBin, "win32"),
       args: [winNormalize(fx.cli, "win32"), ...npxArgs],
@@ -1051,45 +1059,57 @@ describe("npxUnderNode", () => {
     try {
       // Call 1 takes the fresh-resolution branch (the beforeEach reset the
       // memo) and seeds it with the fixture's node.exe + npx-cli.js.
-      expect(callAsOamBroker(dirname(fx.nodeBin), "npx", npxArgs)).toEqual(rewritten);
-      // Call 2 must be answered from the memo: PATH now names an EMPTY dir, so
-      // a fresh walk would find no node.exe and return bare npx. The rewrite
-      // coming back anyway is the proof the second call never re-walked PATH.
-      expect(callAsOamBroker(emptyDir, "npx", npxArgs)).toEqual(rewritten);
+      expect(callAsOamBroker(fixtureDir, "npx", npxArgs)).toEqual(rewritten);
+      // THE memo proof (review of #231): the memo is keyed by the env's PATH,
+      // so call 2 keeps the SAME PATH -- but node.exe is removed from disk
+      // first. The revalidation checks ONLY the memo entry's cli (one
+      // existsSync), which still exists, so a memo HIT answers the rewrite; a
+      // FRESH walk over this PATH now finds no node.exe and answers bare npx.
+      // Call 2 returning the rewrite therefore means the memo answered without
+      // re-walking -- the exact property the title names, and the thing a
+      // dropped memo write would break (call 2 would resolve fresh: bare npx,
+      // RED; mutation-checked 2026-11-23).
+      rmSync(fx.nodeBin);
+      expect(callAsOamBroker(fixtureDir, "npx", npxArgs)).toEqual(rewritten);
+      // The hit was still REVALIDATED, not trusted blindly: the "drops a memo
+      // hit" test below continues this fixture's story with the cli removed.
     } finally {
       fx.cleanup();
-      rmSync(emptyDir, { recursive: true, force: true });
     }
   });
 
-  it("drops a memo hit whose npx-cli.js is gone and resolves fresh instead", () => {
+  winHostOnly("drops a memo hit whose npx-cli.js is gone and resolves fresh instead", () => {
     // A node install removed under a long-lived broker must not turn every
     // later npx launch into `node <missing npx-cli.js>` (the half-rewrite the
     // function's doc rules out): the hit is revalidated with one existsSync.
+    // Windows host only -- see the memo test above.
     const fx = nodeInstall();
-    const emptyDir = mkdtempSync(join(tmpdir(), "npxundernode-empty-"));
+    const fixtureDir = dirname(fx.nodeBin);
     try {
-      expect(callAsOamBroker(dirname(fx.nodeBin), "npx", npxArgs).command).toBe(winNormalize(fx.nodeBin, "win32"));
+      expect(callAsOamBroker(fixtureDir, "npx", npxArgs).command).toBe(winNormalize(fx.nodeBin, "win32"));
       rmSync(fx.cli);
-      // The memo still names the deleted cli; the fresh walk over the empty
-      // PATH finds nothing, so the all-or-nothing answer is bare npx.
-      expect(callAsOamBroker(emptyDir, "npx", npxArgs)).toEqual({ command: "npx", args: npxArgs });
+      // The memo still names the deleted cli; the fresh walk over the SAME PATH
+      // finds no npx-cli.js either (the file is gone), so the all-or-nothing
+      // answer is bare npx -- and the memo entry was dropped with it.
+      expect(callAsOamBroker(fixtureDir, "npx", npxArgs)).toEqual({ command: "npx", args: npxArgs });
       // And the stale entry was DROPPED, not merely bypassed: with the cli
-      // back on disk, a memo that survived would answer again; a dropped one
-      // leaves the empty PATH to answer, i.e. bare npx.
+      // back on disk, a surviving memo would have been revalidated and answered
+      // (the previous call would have returned the rewrite); a dropped one
+      // re-resolves fresh and the rewrite comes back.
       writeFileSync(fx.cli, "");
-      expect(callAsOamBroker(emptyDir, "npx", npxArgs)).toEqual({ command: "npx", args: npxArgs });
+      expect(callAsOamBroker(fixtureDir, "npx", npxArgs).command).toBe(winNormalize(fx.nodeBin, "win32"));
     } finally {
       fx.cleanup();
-      rmSync(emptyDir, { recursive: true, force: true });
     }
   });
 
   it("an injected call never writes the memo", () => {
-    // The WRITE half of the opts guard: an injected call against fixture A
-    // must not seed the memo, so the following no-opts call against fixture B
-    // resolves fresh and returns B. A poisoned memo would answer with A,
-    // whose files are still on disk, so the revalidation would keep it.
+    // The WRITE half of the opts guard: an injected call (exists injected --
+    // the one opt that cannot default in a test, since the memo engages only
+    // when EVERY opt is defaulted) against fixture A must not seed the memo,
+    // so the following memo-shape call against fixture B resolves fresh and
+    // returns B. A poisoned memo would answer with A, whose files are still on
+    // disk, so the revalidation would keep it.
     const fxA = nodeInstall();
     const fxB = nodeInstall();
     try {
@@ -1112,8 +1132,8 @@ describe("npxUnderNode", () => {
   });
 
   it("an injected call never reads the memo", () => {
-    // Prime the memo through the production shape (fixture A; the beforeEach
-    // started it cold, so the prime's fresh walk seeds it with A). Then inject
+    // Prime the memo through the memo shape (fixture A; the beforeEach started
+    // it cold, so the prime's fresh walk seeds it with A). Then inject
     // everything and point at fixture B: the rewrite must come back as B's
     // node + cli. A's paths would mean the memo answered -- exactly the
     // failure an injected opt must never reach, and what makes this test go
@@ -1139,6 +1159,92 @@ describe("npxUnderNode", () => {
     } finally {
       fxA.cleanup();
       fxB.cleanup();
+    }
+  });
+
+  it("memoizes PER PATH: two servers whose envs disagree resolve independently", () => {
+    // The memo is keyed by the env's PATH (#230), not process-global: server A
+    // pins node 18 on its PATH, server B uses the broker's default. A keyless
+    // memo would answer the second server with the first server's node.
+    const fxA = nodeInstall();
+    const fxB = nodeInstall();
+    try {
+      expect(callAsOamBroker(dirname(fxA.nodeBin), "npx", npxArgs)).toEqual({
+        command: winNormalize(fxA.nodeBin, "win32"),
+        args: [winNormalize(fxA.cli, "win32"), ...npxArgs],
+      });
+      expect(callAsOamBroker(dirname(fxB.nodeBin), "npx", npxArgs)).toEqual({
+        command: winNormalize(fxB.nodeBin, "win32"),
+        args: [winNormalize(fxB.cli, "win32"), ...npxArgs],
+      });
+    } finally {
+      fxA.cleanup();
+      fxB.cleanup();
+    }
+  });
+
+  it("one memo entry per PATH whatever spelling the key arrives under (Path/PATH fold)", () => {
+    // Windows delivers the variable as `Path`, mergeChildEnv emits `PATH`, and
+    // a hand-built env could carry either (or lowercase). npxMemoKey folds the
+    // spellings to one, so a broker started with `Path` and a server merged to
+    // `PATH` share ONE memo entry -- the fold's whole point. The observable
+    // difference is NOT the rewrite result (every spelling walks the same dirs
+    // and finds the same node); it is the memo hit. Seed with one spelling,
+    // remove node.exe from disk, re-call with ANOTHER spelling: a hit answers
+    // the rewrite naming the now-deleted node (revalidation checks only the
+    // cli); a missed fold (two entries) makes the second spelling re-walk,
+    // find no node.exe, and return bare npx. Windows host: real existsSync.
+    const fx = nodeInstall();
+    try {
+      // Seed under the `PATH` spelling (mergeChildEnv's emission).
+      expect(callAsOamBroker(dirname(fx.nodeBin), "npx", npxArgs)).toEqual({
+        command: winNormalize(fx.nodeBin, "win32"),
+        args: [winNormalize(fx.cli, "win32"), ...npxArgs],
+      });
+      rmSync(fx.nodeBin);
+      // Same PATH under the `Path` spelling: must read as the SAME memo key.
+      const realEnv = process.env;
+      const platformDesc = Object.getOwnPropertyDescriptor(process, "platform");
+      const execPathDesc = Object.getOwnPropertyDescriptor(process, "execPath");
+      try {
+        Object.defineProperty(process, "platform", { value: "win32", configurable: true, writable: true });
+        Object.defineProperty(process, "execPath", { value: oamExec, configurable: true, writable: true });
+        const env = {
+          ...realEnv,
+          Path: dirname(fx.nodeBin),
+          PATH: undefined,
+          path: undefined,
+          PATHEXT: ".com;.exe",
+        } as NodeJS.ProcessEnv;
+        expect(npxUnderNode("npx", npxArgs, { env })).toEqual({
+          command: winNormalize(fx.nodeBin, "win32"),
+          args: [winNormalize(fx.cli, "win32"), ...npxArgs],
+        });
+      } finally {
+        process.env = realEnv;
+        if (platformDesc) Object.defineProperty(process, "platform", platformDesc);
+        if (execPathDesc) Object.defineProperty(process, "execPath", execPathDesc);
+      }
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  it("leaves an ABSOLUTE npx path untouched: it pinned its own install", () => {
+    // nodeLaunchKind is a basename match, but the gate must not rewrite an npx
+    // at an absolute path (#230): `C:\tools\node18\npx.cmd` deliberately selects
+    // node18's npm, and the PATH node's npx-cli.js is a different npm. Only a
+    // BARE npx name -- the thing PATH itself resolves -- is rewritten.
+    const fx = nodeInstall();
+    try {
+      for (const command of [String.raw`C:\tools\node18\npx.cmd`, String.raw`C:\tools\node18\npx.exe`, "./npx.cmd"]) {
+        expect(npxUnderNode(command, npxArgs, { platform: "win32", execPath: oamExec, env: fx.env })).toEqual({
+          command,
+          args: npxArgs,
+        });
+      }
+    } finally {
+      fx.cleanup();
     }
   });
 

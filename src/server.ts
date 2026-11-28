@@ -190,6 +190,7 @@ import {
   complianceRefusalReason,
   effectiveProfile,
   identityBlockOf,
+  identityBlocksOf,
   isToolDenied,
   policyErrorText,
   resolveMinCompliance,
@@ -2155,7 +2156,14 @@ export class ConnectServer {
         ? undefined
         : this.resourceRoutes.get(request.params.uri)?.namespace;
       const resourceRefusal = resourceNamespace ? this.serverPolicyRefusal(resourceNamespace) : null;
-      if (resourceRefusal) return { contents: [{ uri: request.params.uri, text: resourceRefusal }] };
+      // The refusal is an ERROR, not a resource whose body happens to read like
+      // one (#230): a success-shaped result would land in the client as
+      // indistinguishable-from-real upstream content. tools/call marks the same
+      // refusal isError; these throw the MCP error the JSON-RPC error response
+      // carries (the SDK sends a thrown handler error's `code`/`message`
+      // verbatim). InvalidRequest, not InvalidParams: the params are valid --
+      // the broker refuses to route the request at all.
+      if (resourceRefusal) throw new ProtocolError(ProtocolErrorCode.InvalidRequest, resourceRefusal);
       return (await routeResourceRead(
         request.params.uri,
         this.resourceRoutes,
@@ -2180,9 +2188,9 @@ export class ConnectServer {
       await this.ready;
       const promptNamespace = this.promptRoutes.get(request.params.name)?.namespace;
       const promptRefusal = promptNamespace ? this.serverPolicyRefusal(promptNamespace) : null;
-      if (promptRefusal) {
-        return { messages: [{ role: "user", content: { type: "text", text: promptRefusal } }] };
-      }
+      // Error, not a user-role message the client would read as conversation
+      // content (#230) -- same reasoning as resources/read above.
+      if (promptRefusal) throw new ProtocolError(ProtocolErrorCode.InvalidRequest, promptRefusal);
       return (await routePromptGet(
         request.params.name,
         request.params.arguments as Record<string, string> | undefined,
@@ -3271,15 +3279,14 @@ export class ConnectServer {
       resolvedConfig = await loadYawMcpConfig({ cwd: process.cwd() }).catch((err): ResolvedConfig => {
         const path = join(userConfigDir(), CONFIG_FILENAME);
         const message = `${path}: yaw-mcp could not load its config (${err instanceof Error ? err.message : String(err)}). No MCP server will start until this is fixed: check that the file and your project's .yaw-mcp/ directory are readable, restart your MCP client, and run \`yaw-mcp doctor\` to confirm.`;
-        // policyWarnings carries the same message because the loader always
-        // folds each policyErrors message into it (config-loader's
-        // `policyWarnings.push(...policyErrors.map(...))`); keep that invariant.
+        // policyWarnings stays clear of policyErrors messages (the loader's
+        // invariant since #230): the refusal surfaces print the error directly,
+        // so a folded copy would print twice.
         return {
           projectConfigDir: null,
           loadedFiles: [],
           warnings: [message],
           policyErrors: [{ path, message }],
-          policyWarnings: [message],
         };
       });
       // The loader's soft problems (unknown keys, wrong-typed values, retired
@@ -6022,24 +6029,17 @@ export class ConnectServer {
     if (!refusal) return null;
     const text = this.spawnGateRefusalText(refusal, purpose);
     // A misspelled policy key enforces nothing, so a refusal may not be the one
-    // the user meant to write. Say so on every spawn-gate refusal (the
-    // connected-path serverPolicyRefusal and noServersEnabledText do not carry
-    // this Note). Only a policy-invalid refusal already carries the
-    // policyErrors messages in `text`, so only there are the folded copies
-    // skipped; any other kind (a "disabled" verdict is decided BEFORE the
-    // policy-file check) keeps them, or a broken policy file would go unnamed.
-    const policyWarnings =
-      refusal.kind === "policy-invalid" ? this.genuinePolicyWarnings() : (this.profile?.policyWarnings ?? []);
-    return policyWarnings.length > 0 ? `${text} Note: ${policyWarnings.join(" ")}` : text;
-  }
-
-  /** policyWarnings minus the policyErrors messages config-loader folds into
-   *  it: what remains is a genuine warning (e.g. an unknown key). For surfaces
-   *  that already print the policyErrors themselves, so the broken file's
-   *  message does not print twice. */
-  private genuinePolicyWarnings(): string[] {
-    const errorMessages = new Set((this.profile?.policyErrors ?? []).map((e) => e.message));
-    return (this.profile?.policyWarnings ?? []).filter((w) => !errorMessages.has(w));
+    // the user meant to write: policyWarnings rides the Note on every kind. A
+    // broken policy file is named on every kind too -- the disabled/profile/
+    // compliance sentences never print the policyErrors themselves -- by
+    // reading policyErrors DIRECTLY here (#230): the loader no longer folds
+    // those messages into policyWarnings, and the policy-invalid text already
+    // prints them via policyErrorText, so only the other kinds add them.
+    const notes = [
+      ...(refusal.kind === "policy-invalid" ? [] : (this.profile?.policyErrors ?? []).map((e) => e.message)),
+      ...(this.profile?.policyWarnings ?? []),
+    ];
+    return notes.length > 0 ? `${text} Note: ${notes.join(" ")}` : text;
   }
 
   private spawnGateRefusalText(
@@ -8853,11 +8853,10 @@ export class ConnectServer {
         lines.push(`Profile: ${this.profile.path}`);
       }
       for (const e of this.profile.policyErrors ?? []) lines.push(`  POLICY ERROR: ${e.message}`);
-      // config-loader folds each policyErrors message INTO policyWarnings for
-      // the refusal surfaces, so iterating both arrays here would print a
-      // broken policy file's message twice. Skip what POLICY ERROR already
-      // showed; what remains is a genuine warning (e.g. an unknown key).
-      for (const w of this.genuinePolicyWarnings()) lines.push(`  POLICY WARNING: ${w}`);
+      // policyWarnings is unknown-keys only (config-loader stopped folding the
+      // policyErrors messages in -- #230), so printing both arrays here shows
+      // each problem exactly once.
+      for (const w of this.profile.policyWarnings ?? []) lines.push(`  POLICY WARNING: ${w}`);
       if (this.profile.servers) lines.push(`  allow: ${this.profile.servers.join(", ") || "(nothing)"}`);
       if (this.profile.blocked?.length) lines.push(`  block: ${this.profile.blocked.join(", ")}`);
       // `block:` is the RAW list, but the gate enforces the identity-EXPANDED
@@ -8875,13 +8874,16 @@ export class ConnectServer {
       // wrong reason, so the identity line stays out; the POLICY ERROR line
       // above already names the file to fix.
       const extraBlocked = enforced
-        ? servers
-            .filter((s) => s.isActive && !profileAllows(enforced, s.namespace))
-            .map((s) => s.namespace)
-            // identityBlockOf returns null for a namespace the RAW profile
-            // already refuses (its profileAllows guard), which covers a raw
-            // `blocked` entry -- no separate rawBlocked check needed.
-            .filter((ns) => identityBlockOf(profile, servers, ns) !== null)
+        ? [
+            ...identityBlocksOf(
+              profile,
+              servers,
+              servers.filter((s) => s.isActive && !profileAllows(enforced, s.namespace)).map((s) => s.namespace),
+            ).keys(),
+          ]
+            // identityBlocksOf maps only namespaces the RAW profile still allows
+            // (its profileAllows guard), which covers a raw `blocked` entry -- no
+            // separate rawBlocked check needed.
             .sort()
         : [];
       if (extraBlocked.length > 0) lines.push(`  also blocked via identity: ${extraBlocked.join(", ")}`);
