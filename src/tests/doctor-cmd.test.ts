@@ -53,7 +53,6 @@ import { STATE_FILENAME, STATE_SCHEMA_VERSION } from "../persistence.js";
 import { REGISTRY_CACHE_FILENAME } from "../registry-cache.js";
 import { runSecrets, vaultSchemaBehind } from "../secrets-cmd.js";
 import {
-  createEmptyVault,
   createVaultV3,
   isUnlocked,
   loadVault,
@@ -4729,7 +4728,7 @@ describe("runDoctor — SECRET VAULT", () => {
     // A real vault, not the writeVault fixture: its fake entries decrypt
     // under no key, so it can only ever demonstrate the "does NOT" line.
     const file = join(synthHome, ".yaw-mcp", "secrets.json");
-    await saveVault(file, await createEmptyVault("the-real-passphrase-xyz"));
+    await saveVault(file, (await createVaultV3("the-real-passphrase-xyz", { recovery: false })).vault);
 
     const right = captureOut();
     const ok = await runDoctor({
@@ -4773,7 +4772,7 @@ describe("runDoctor — SECRET VAULT", () => {
     // to delete, not send the user to a `reset` that would move an intact
     // vault aside, nor to a `rotate` that refuses it.
     const pass = "the-real-passphrase-xyz";
-    const empty = await createEmptyVault(pass);
+    const empty = (await createVaultV3(pass, { recovery: false })).vault;
     const key = await unlock(empty, pass);
     const vault = setSecret(empty, key, "gh", "ghp_value");
     lock();
@@ -4858,7 +4857,7 @@ describe("runDoctor — SECRET VAULT", () => {
     // No kdf loadVault accepts fails to derive here, so the failure is
     // injected at the one call doctor makes.
     const file = join(synthHome, ".yaw-mcp", "secrets.json");
-    await saveVault(file, await createEmptyVault("the-real-passphrase-xyz"));
+    await saveVault(file, (await createVaultV3("the-real-passphrase-xyz", { recovery: false })).vault);
     const vaultModule = await import("../secrets-vault.js");
     const spy = vi
       .spyOn(vaultModule, "checkVaultPassphrase")
@@ -4902,7 +4901,7 @@ describe("runDoctor — SECRET VAULT", () => {
 
   it("carries passphraseUnlocks in --json: true, false, or null with no passphrase", async () => {
     const file = join(synthHome, ".yaw-mcp", "secrets.json");
-    await saveVault(file, await createEmptyVault("the-real-passphrase-xyz"));
+    await saveVault(file, (await createVaultV3("the-real-passphrase-xyz", { recovery: false })).vault);
     const vaultBlock = async (env: Record<string, string>): Promise<Record<string, unknown>> => {
       const cap = captureOut();
       const r = await runDoctor({
@@ -7085,7 +7084,7 @@ describe("collectVaultStatus -- locks only what doctor itself unlocked", () => {
     // the vault and then ran doctor in the same process must not find its key
     // gone; doctor's check hits the cache and leaves it.
     const pass = "the-real-passphrase-xyz";
-    const vault = await createEmptyVault(pass);
+    const vault = (await createVaultV3(pass, { recovery: false })).vault;
     await saveVault(join(synthHome, ".yaw-mcp", "secrets.json"), vault);
     try {
       (await unlock(vault, pass)).fill(0);
@@ -7122,7 +7121,7 @@ describe("collectVaultStatus -- locks only what doctor itself unlocked", () => {
 
 describe("SECRET VAULT -- Windows permissions line", () => {
   it("names the files that rely on the inherited DACL on --os windows, and only there", async () => {
-    await saveVault(join(synthHome, ".yaw-mcp", "secrets.json"), await createEmptyVault("p"));
+    await saveVault(join(synthHome, ".yaw-mcp", "secrets.json"), (await createVaultV3("p", { recovery: false })).vault);
     const win = captureOut();
     await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "windows", out: win.out, skipRegistryCheck: true });
     expect(win.text()).toContain(

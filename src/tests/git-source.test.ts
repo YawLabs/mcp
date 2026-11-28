@@ -53,7 +53,7 @@ import { parseAddArgs } from "../local-add-cmd.js";
 import { resolveBinAbsolute } from "../oam-spawn.js";
 import { gitRoot } from "../paths.js";
 import {
-  createEmptyVault,
+  createVaultV3,
   isUnlocked,
   lock,
   saveVault,
@@ -1088,7 +1088,7 @@ describe("prepareGit", () => {
       else process.env.YAW_MCP_VAULT_PASSPHRASE = saved;
     });
     async function seedVault(entries: Record<string, string>): Promise<void> {
-      let vault = await createEmptyVault(PASS);
+      let vault = (await createVaultV3(PASS, { recovery: false })).vault;
       const key = await unlock(vault, PASS);
       for (const [n, v] of Object.entries(entries)) vault = setSecret(vault, key, n, v);
       lock();

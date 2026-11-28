@@ -615,14 +615,6 @@ export async function loadYawMcpConfig(opts: LoadConfigOptions = {}): Promise<Re
   if (global) loadedFiles.push(global);
 
   const policyWarnings = loadedFiles.flatMap((f) => (f.unknownKeysWarning ? [f.unknownKeysWarning] : []));
-  // ...and the BROKEN-policy messages too (the policyProblem ones: wrong-typed
-  // servers/blocked/blockedTools, unreadable/invalid JSON file). They already
-  // reach `warnings` and `policyErrors` (which refuses every spawn), but a
-  // refusal only NAMED the file -- while an unknown key got its own
-  // policyWarnings line. policyWarnings is display-only (isAllowed and
-  // effectiveProfile never read it), so repeating a message here costs no
-  // enforcement and gives each refusal the key-level message to show.
-  policyWarnings.push(...policyErrors.map((e) => e.message));
 
   return {
     servers: pickServers(loadedFiles, warnings),
@@ -664,9 +656,11 @@ export interface Profile {
   blockedToolsPaths?: string[];
   /** Broken policy files. While present, every server is refused. */
   policyErrors?: PolicyError[];
-  /** Broken-policy messages and unknown top-level keys
+  /** Unknown top-level keys and wrong-typed values that are not policy lists
    *  (ResolvedConfig.policyWarnings): shown, never enforced, and never a
-   *  reason to refuse on their own. */
+   *  reason to refuse on their own. Broken-policy messages do NOT fold in here
+   *  -- they already reach `warnings` and `policyErrors`, and every refusal
+   *  surface prints those directly (#230). */
   policyWarnings?: string[];
 }
 

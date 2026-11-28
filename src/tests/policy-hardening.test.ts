@@ -589,18 +589,31 @@ describe("the broker applies the policy on every path to an upstream", () => {
     expect(getPrompt).toHaveBeenCalledTimes(1);
   });
 
-  it("refuses resources/read and prompts/get on a blocked server", async () => {
+  it("refuses resources/read and prompts/get on a blocked server with an MCP error", async () => {
+    // The refusal is a JSON-RPC error, not success-shaped content (#230): a
+    // refused resource must not read as a resource whose body is the refusal,
+    // and a refused prompt must not land in the conversation as a user message.
+    // ProtocolError is what the SDK turns into the error response, carrying the
+    // code and the refusal text verbatim.
     priv.profile = { path: "/cfg/config.json", blocked: ["ssh2"] };
-    expect(JSON.stringify(await read())).toContain("not allowed by the project profile");
-    expect(JSON.stringify(await prompt())).toContain("not allowed by the project profile");
+    await expect(read()).rejects.toMatchObject({
+      name: "ProtocolError",
+      code: -32600, // ProtocolErrorCode.InvalidRequest
+      message: expect.stringContaining("not allowed by the project profile"),
+    });
+    await expect(prompt()).rejects.toMatchObject({
+      name: "ProtocolError",
+      code: -32600,
+      message: expect.stringContaining("not allowed by the project profile"),
+    });
     expect(readResource).not.toHaveBeenCalled();
     expect(getPrompt).not.toHaveBeenCalled();
   });
 
   it("refuses them for a server blocked through its identity", async () => {
     priv.profile = { path: "/cfg/config.json", blocked: ["ssh"] };
-    await read();
-    await prompt();
+    await expect(read()).rejects.toBeInstanceOf(Error);
+    await expect(prompt()).rejects.toBeInstanceOf(Error);
     expect(readResource).not.toHaveBeenCalled();
     expect(getPrompt).not.toHaveBeenCalled();
   });
@@ -645,7 +658,10 @@ describe("the broker applies the policy on every path to an upstream", () => {
     const activate = await priv.handleToolCall("mcp_connect_activate", { server: "ssh" });
     expect(activate.isError).toBe(true);
     expect(activate.content[0].text).toContain(message);
-    expect(JSON.stringify(await read())).toContain(message);
+    await expect(read()).rejects.toMatchObject({
+      name: "ProtocolError",
+      message: expect.stringContaining(message),
+    });
   });
 
   it("shows an empty allow-list in health instead of hiding it", () => {
@@ -722,24 +738,21 @@ describe("the broker applies the policy on every path to an upstream", () => {
   });
 
   it("prints a broken policy file's message once, not again as a warning", () => {
-    // config-loader folds each policyErrors message into policyWarnings for
-    // the refusal surfaces; health prints both arrays, so without the dedupe
-    // the same message appears as POLICY ERROR and again as POLICY WARNING.
+    // config-loader keeps policyWarnings unknown-keys-only (#230) -- the two
+    // arrays are disjoint -- so health printing both shows each problem once.
+    // The fold-era shape (the error message also in policyWarnings) is what a
+    // hand-built profile could still carry; health dedupes nothing now and the
+    // production loader never produces it.
     const message = "/cfg/config.json: invalid JSON at line 1. Fix it.";
-    priv.profile = {
-      path: "/cfg/config.json",
-      policyErrors: [{ path: "/cfg/config.json", message }],
-      // What the fold produces:
-      policyWarnings: [message],
-    };
+    priv.profile = { path: "/cfg/config.json", policyErrors: [{ path: "/cfg/config.json", message }] };
     const text = priv.handleHealth().content[0].text;
     expect(text).toContain(`POLICY ERROR: ${message}`);
     expect(text).not.toContain(`POLICY WARNING: ${message}`);
-    // A genuine warning (never an error) still prints.
+    // A genuine warning (never an error) still prints alongside.
     priv.profile = {
       path: "/cfg/config.json",
       policyErrors: [{ path: "/cfg/config.json", message }],
-      policyWarnings: [message, "/cfg/config.json: unknown key 'blokced' ignored"],
+      policyWarnings: ["/cfg/config.json: unknown key 'blokced' ignored"],
     };
     expect(priv.handleHealth().content[0].text).toContain(
       "POLICY WARNING: /cfg/config.json: unknown key 'blokced' ignored",
@@ -755,11 +768,10 @@ describe("the broker applies the policy on every path to an upstream", () => {
     expect(activate.content[0].text).toContain(warning);
   });
 
-  it("dedupes the refusal Note against the policy-invalid text, keeping genuine warnings", async () => {
-    // config-loader folds policyErrors into policyWarnings; the refusal's text
-    // already prints each error via policyErrorText, so the Note must drop any
-    // warning that duplicates an error message -- or the file's message prints
-    // twice -- while a warning that is only a warning (an unknown key) stays.
+  it("keeps genuine warnings in the refusal Note, with no fold to dedupe", async () => {
+    // Since #230 the loader keeps policyWarnings unknown-keys-only; the Note
+    // carries the array as-is. A policy-invalid refusal's own text prints the
+    // policyErrors, and the two never overlap.
     const msgA = "/cfg/config.json: invalid JSON at line 1. Fix it.";
     const msgB = "/cfg/config.json: 'servers' must be an array of non-empty strings";
     priv.profile = {
@@ -768,16 +780,13 @@ describe("the broker applies the policy on every path to an upstream", () => {
         { path: "/cfg/config.json", message: msgA },
         { path: "/cfg/config.json", message: msgB },
       ],
-      policyWarnings: [msgA, "/cfg/config.json: unknown key 'blokced' ignored"],
+      policyWarnings: ["/cfg/config.json: unknown key 'blokced' ignored"],
     };
     const activate = await priv.handleToolCall("mcp_connect_activate", { server: "ssh" });
     expect(activate.isError).toBe(true);
     const text = activate.content[0].text;
     expect(text).toContain(msgB);
     expect(text.indexOf(msgB)).toBe(text.lastIndexOf(msgB));
-    // Deduped: the Note drops msgA -- but the error text itself still names it
-    // once via policyErrorText, so count occurrences rather than assert absent.
-    expect(text.split(msgA).length - 1).toBe(1);
     expect(text).toContain("unknown key 'blokced' ignored");
   });
 });

@@ -28,7 +28,6 @@ import {
 } from "../secrets-crypto.js";
 import {
   checkVaultPassphrase,
-  createEmptyVault,
   createVaultV3,
   FIRST_BOUND_SCHEMA_VERSION,
   getSecret,
@@ -170,8 +169,8 @@ describe("createVaultV3: the on-disk shape", () => {
     expect(getSecret(loaded as VaultFile, dek, "github")).toBe("ghp_x");
   });
 
-  it("createEmptyVault is createVaultV3 without a recovery slot", async () => {
-    const vault = await createEmptyVault("reset-pass");
+  it("createVaultV3 without recovery: the slot-less vault a rotate-without-recovery produces", async () => {
+    const vault = (await createVaultV3("reset-pass", { recovery: false })).vault;
     expect(isV3Vault(vault)).toBe(true);
     expect(recoveryStatus(vault).state).toBe("none");
     await expect(unlock(vault, "something-else")).rejects.toThrow(VAULT_WRONG_PASSPHRASE_ERROR);
@@ -731,13 +730,13 @@ describe("every re-key leaves the old passphrase, old code and old backup unable
     await assertCutOff(vault, "p", code, dek, next.vault, "p");
   });
 
-  it("rotateVault (the deprecated wrapper) re-keys too and drops the recovery slot", async () => {
-    const { rotateVault } = await import("../secrets-vault.js");
+  it("rekeyVault with recovery: false re-keys and drops the recovery slot (the plain-rotate shape)", async () => {
     const { vault, code } = await v3With("p", { github: "ghp_1" }, true);
     const dek = await unlock(vault, "p");
-    const next = await rotateVault(vault, dek, "q");
-    expect(recoveryStatus(next).state).toBe("none");
-    await assertCutOff(vault, "p", code, dek, next, "q");
+    const next = await rekeyVault(vault, dek, "q", { recovery: false });
+    expect(next.recoveryCode).toBeUndefined();
+    expect(recoveryStatus(next.vault).state).toBe("none");
+    await assertCutOff(vault, "p", code, dek, next.vault, "q");
   });
 
   it("aborts with the operation's name on a corrupt entry, input untouched", async () => {

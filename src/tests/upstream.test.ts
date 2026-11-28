@@ -235,7 +235,7 @@ vi.mock("../oam-spawn.js", async (importOriginal) => {
     // pre-existing test still spawns byte-for-byte whatever its fixture says;
     // the wiring test below mocks a rewrite to observe it, and its paired
     // negative case asserts the passthrough held.
-    npxUnderNode: vi.fn((command: string, args: string[]) => ({ command, args })),
+    npxUnderNode: vi.fn((command: string, args: string[]) => ({ command, args })), // opts (the child env) ignored: passthrough
   };
 });
 
@@ -2605,7 +2605,7 @@ describe("connectToUpstream oam boot-probe fallback", () => {
   // spawn in this file.
   describe("npxUnderNode respawn wiring", () => {
     beforeEach(() => {
-      vi.mocked(npxUnderNode).mockImplementation((command, args) =>
+      vi.mocked(npxUnderNode).mockImplementation((command, args: string[]) =>
         command === "npx" ? { command: "C:\\nodejs\\node.exe", args: ["C:\\npx-cli.js", ...args] } : { command, args },
       );
     });
@@ -2636,7 +2636,11 @@ describe("connectToUpstream oam boot-probe fallback", () => {
       const connection = await connectToUpstream(config);
 
       expect(connection.status).toBe("connected");
-      expect(vi.mocked(npxUnderNode)).toHaveBeenCalledWith("npx", ["-y", "@yawlabs/fetch-mcp@latest"]);
+      expect(vi.mocked(npxUnderNode)).toHaveBeenCalledWith(
+        "npx",
+        ["-y", "@yawlabs/fetch-mcp@latest"],
+        expect.objectContaining({ env: expect.objectContaining({}) }),
+      );
       expect(_sdkBehavior.stdioConstructions[1]?.command).toBe("C:\\nodejs\\node.exe");
       expect(_sdkBehavior.stdioConstructions[1]?.args).toEqual(["C:\\npx-cli.js", "-y", "@yawlabs/fetch-mcp@latest"]);
     });
@@ -2655,7 +2659,11 @@ describe("connectToUpstream oam boot-probe fallback", () => {
       return connects === 1 ? Promise.reject(new Error("oam crashed on boot")) : Promise.resolve();
     };
     await connectToUpstream(makeLocalConfig({ runtime: "oam", command: "npx", args: ["-y", "x"] }));
-    expect(vi.mocked(npxUnderNode)).toHaveBeenCalledWith("npx", ["-y", "x"]);
+    expect(vi.mocked(npxUnderNode)).toHaveBeenCalledWith(
+      "npx",
+      ["-y", "x"],
+      expect.objectContaining({ env: expect.objectContaining({}) }),
+    );
     expect(_sdkBehavior.stdioConstructions.map((c) => c.command)).toEqual(["/usr/bin/oam", "npx"]);
 
     vi.mocked(npxUnderNode).mockClear();
@@ -2667,7 +2675,7 @@ describe("connectToUpstream oam boot-probe fallback", () => {
     await expect(
       connectToUpstream(makeLocalConfig({ runtime: "oam", command: "uvx", args: ["some-pkg"] })),
     ).rejects.toBeInstanceOf(ActivationError);
-    expect(vi.mocked(npxUnderNode)).toHaveBeenCalledWith("uvx", ["some-pkg"]);
+    expect(vi.mocked(npxUnderNode)).toHaveBeenCalledWith("uvx", ["some-pkg"], expect.anything());
     expect(_sdkBehavior.stdioConstructions.at(-1)?.command).toBe("uvx");
   });
 

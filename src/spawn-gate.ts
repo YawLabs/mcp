@@ -183,6 +183,28 @@ export function identityBlockOf(
 }
 
 /**
+ * identityBlockOf for a whole server list, in ONE pass: the identity map is
+ * computed once instead of once per namespace (health's "also blocked via
+ * identity" line used to re-derive it for every active server, #230).
+ * Semantics per namespace are exactly identityBlockOf's; null means the raw
+ * profile refuses it outright, so no identity clause applies.
+ */
+export function identityBlocksOf(
+  profile: Profile,
+  servers: readonly UpstreamServerConfig[],
+  namespaces: readonly string[],
+): Map<string, string> {
+  const blocks = identityBlocks(profile, identify(servers));
+  const out = new Map<string, string>();
+  for (const namespace of namespaces) {
+    const matched = blocks.get(namespace);
+    if (!matched || !profileAllows(profile, namespace)) continue;
+    out.set(namespace, displayIdentity(matched));
+  }
+  return out;
+}
+
+/**
  * The profile the gates enforce: the configured lists plus what they imply for
  * the servers configured right now.
  *

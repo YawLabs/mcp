@@ -459,20 +459,20 @@ describe("loadYawMcpConfig — non-string blocked entries (fix F1, blocked field
     expect(isAllowed(r, "anything")).toBe(false);
   });
 
-  it("a policyProblem message reaches policyWarnings as well as warnings", async () => {
-    // A refusal used to name only the FILE, while an unknown key got its own
-    // policyWarnings line -- so a reader could not tell WHICH key was broken
-    // from the refusal / health text. policyWarnings is display-only
-    // (isAllowed ignores it), so this is a repeat, not a second enforcement.
+  it("a policyProblem message stays OUT of policyWarnings (it is already an error)", async () => {
+    // The old fold (each policyErrors message copied into policyWarnings) made
+    // every refusal surface print the broken file's message twice unless it
+    // deduped (#230). The loader now keeps the two arrays disjoint: the error
+    // reaches `warnings` and `policyErrors`, which the refusal surfaces print
+    // directly; policyWarnings is unknown-keys only.
     writeConfigRaw(synthHome, CONFIG_FILENAME, JSON.stringify({ blocked: ["slack", 42] }));
     const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
     const message = r.policyErrors?.[0]?.message;
     expect(message).toBeDefined();
-    expect(r.policyWarnings).toContain(message);
-    // This file has no unknown key, so policyWarnings is exactly that message.
-    expect(r.policyWarnings).toHaveLength(1);
-    expect(toProfile(r)?.policyWarnings).toContain(message);
-    // Still a policy ERROR: the warning addition never softened the refusal.
+    expect(r.warnings).toContain(message);
+    expect(r.policyWarnings).toBeUndefined();
+    expect(toProfile(r)?.policyWarnings).toBeUndefined();
+    // Still a policy ERROR: removing the fold never softened the refusal.
     expect(r.policyErrors).toHaveLength(1);
     expect(isAllowed(r, "slack")).toBe(false);
   });

@@ -2288,12 +2288,15 @@ async function connectToUpstreamOnce(
       // WORKAROUND, not a feature: DROP this when oam's spawn honors
       // windowsVerbatimArguments -- the comment above names the bug to remove
       // it for. It is a no-op off Windows, under a node-hosted broker, and for
-      // every non-npx launch (uv/uvx/docker/python, oam, managed node), so no
-      // other server's spawn changes. npxUnderNode returns the launch
-      // unchanged whenever it cannot complete the rewrite (no node.exe on
-      // PATH, no npx-cli.js beside it), so the failure mode is exactly the
-      // pre-rewrite one.
-      resolved = npxUnderNode(resolved.command, resolved.args);
+      // Every non-npx launch (uv/uvx/docker/python, oam, managed node), so no
+      // other server's spawn changes. The CHILD's merged env is passed (#230):
+      // the node the rewrite resolves must be the one npx itself would have
+      // found on the env the spawn actually receives, and a server env that
+      // overrides PATH selects its own node here the same way. npxUnderNode
+      // returns the launch unchanged whenever it cannot complete the rewrite
+      // (no node.exe on that PATH, no npx-cli.js beside it), so the failure
+      // mode is exactly the pre-rewrite one.
+      resolved = npxUnderNode(resolved.command, resolved.args, { env: mergeChildEnv(parentEnv, serverEnv) });
     } catch (err) {
       if (err instanceof ActivationError) throw err;
       const message = err instanceof Error ? err.message : String(err);

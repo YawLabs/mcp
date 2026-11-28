@@ -17,7 +17,6 @@ import {
 import {
   checkVaultPassphrase,
   collectMalformedSecretRefs,
-  createEmptyVault,
   createVaultV3,
   getSecret,
   hasSecretRefs,
@@ -28,9 +27,9 @@ import {
   MALFORMED_REF_MARKER,
   MALFORMED_REF_MAX_CHARS,
   newVault,
+  rekeyVault,
   removeSecret,
   resolveSecretRefs,
-  rotateVault,
   SECRET_NAME_RE,
   SECRET_REF_RE,
   SECRETS_SCHEMA_VERSION,
@@ -474,7 +473,7 @@ describe("SECRET_REF_RE is exported and matches ${secret:NAME}", () => {
   });
 });
 
-describe("rotateVault", () => {
+describe("rekeyVault (recovery: false -- the plain rotate shape)", () => {
   it("re-encrypts every entry: old passphrase fails post-rotate, new one decrypts", async () => {
     let vault = newVault();
     const oldKey = await unlock(vault, "old-passphrase");
@@ -485,7 +484,7 @@ describe("rotateVault", () => {
     // Sanity: old key decrypts pre-rotate.
     expect(getSecret(vault, oldKey, "github")).toBe("ghp_abc");
 
-    const rotated = await rotateVault(vault, oldKey, "new-passphrase");
+    const rotated = (await rekeyVault(vault, oldKey, "new-passphrase", { recovery: false })).vault;
 
     // Salt changed -> fresh derivation lineage.
     expect(rotated.salt).not.toBe(oldSalt);
@@ -523,7 +522,9 @@ describe("rotateVault", () => {
     };
     const snapshot = JSON.stringify(corrupted);
 
-    await expect(rotateVault(corrupted, oldKey, "new-passphrase")).rejects.toThrow(/failed to decrypt/i);
+    await expect(rekeyVault(corrupted, oldKey, "new-passphrase", { recovery: false })).rejects.toThrow(
+      /failed to decrypt/i,
+    );
     // The input vault object is not mutated by the abort.
     expect(JSON.stringify(corrupted)).toBe(snapshot);
   });
@@ -544,7 +545,7 @@ describe("rotateVault", () => {
       },
     };
 
-    const err = await rotateVault(corrupted, oldKey, "new-passphrase").catch((e: unknown) => e);
+    const err = await rekeyVault(corrupted, oldKey, "new-passphrase", { recovery: false }).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(Error);
     const msg = (err as Error).message;
     expect(msg).toMatch(/entry "github" failed to decrypt/);
@@ -568,7 +569,7 @@ describe("rotateVault", () => {
       },
     };
 
-    const err = await rotateVault(checkless, oldKey, "new-passphrase").catch((e: unknown) => e);
+    const err = await rekeyVault(checkless, oldKey, "new-passphrase", { recovery: false }).catch((e: unknown) => e);
     expect((err as Error).message).toBe(
       'rotate aborted: entry "github" failed to decrypt under the current passphrase',
     );
@@ -582,7 +583,9 @@ describe("rotateVault", () => {
 
     // Derive a DIFFERENT key (wrong passphrase) against the same salt.
     const wrongKey = await deriveKey("not-the-passphrase", Buffer.from(vault.salt, "base64"));
-    await expect(rotateVault(vault, wrongKey, "new-passphrase")).rejects.toThrow(/current passphrase is wrong/i);
+    await expect(rekeyVault(vault, wrongKey, "new-passphrase", { recovery: false })).rejects.toThrow(
+      /current passphrase is wrong/i,
+    );
     expect(JSON.stringify(vault)).toBe(snapshot);
   });
 
@@ -601,7 +604,7 @@ describe("rotateVault", () => {
     vault = setSecret(vault, oldKey, "github", "ghp_abc");
     expect(listKeys(vault)).toEqual(["__proto__", "github"]);
 
-    const rotated = await rotateVault(vault, oldKey, "new-passphrase");
+    const rotated = (await rekeyVault(vault, oldKey, "new-passphrase", { recovery: false })).vault;
 
     expect(listKeys(rotated)).toContain("__proto__");
     lock();
@@ -628,7 +631,7 @@ describe("rotateVault", () => {
     };
     lock();
 
-    const rotated = await rotateVault(legacy, oldKey, "new-passphrase");
+    const rotated = (await rekeyVault(legacy, oldKey, "new-passphrase", { recovery: false })).vault;
 
     expect(rotated.version).toBe(SECRETS_SCHEMA_VERSION);
     // v3 records the cost factor in the passphrase slot, never at the top.
@@ -1163,7 +1166,7 @@ describe("secrets-vault: the check marker is compared, not merely decrypted", ()
     vault = setSecret(vault, key, "github", "ghp_abc");
     // Decrypts cleanly under the right key, but is not the expected constant.
     // verifyKey used to accept on "it decrypted" alone, so this vault
-    // unlocked while rotateVault -- which compares -- refused it.
+    // unlocked while rekeyVault -- which compares -- refused it.
     const wrongMarker: VaultFile = {
       ...vault,
       check: encryptEntry("some-other-plaintext", key, VAULT_CHECK_AAD),
@@ -1368,18 +1371,18 @@ describe("checkVaultPassphrase", () => {
   });
 });
 
-describe("newVault and createEmptyVault: only the second verifies passphrases", () => {
-  it("newVault carries no marker (any passphrase opens it); createEmptyVault's marker pins the one it was given", async () => {
+describe("newVault and createVaultV3({recovery:false}): only the second verifies passphrases", () => {
+  it("newVault carries no marker (any passphrase opens it); a fresh v3 vault's marker pins the one it was given", async () => {
     const bare = newVault();
     expect(bare.check).toBeUndefined();
     await expect(unlock(bare, "anything")).resolves.toBeInstanceOf(Buffer);
     lock();
 
-    const stamped = await createEmptyVault("chosen-at-reset");
+    const stamped = (await createVaultV3("chosen-at-reset", { recovery: false })).vault;
     expect(stamped.entries).toEqual({});
     expect(stamped.version).toBe(SECRETS_SCHEMA_VERSION);
     // A v3 vault: the cost factor lives in the passphrase slot, and there is
-    // no recovery slot (createEmptyVault is createVaultV3 without one).
+    // no recovery slot (recovery was explicitly declined).
     expect(stamped.keyslots?.passphrase.kdf).toEqual(DEFAULT_KDF);
     expect(stamped.keyslots?.recovery).toBeUndefined();
     expect(stamped.check).toBeDefined();
@@ -1726,7 +1729,7 @@ describe("unlock + setSecret: an empty, marker-less vault is re-keyed under the 
   });
 });
 
-describe("rotateVault: a derivation failure still clears the plaintext map", () => {
+describe("rekeyVault: a derivation failure still clears the plaintext map", () => {
   it("clears it when deriveKey throws for the new key", async () => {
     let vault = newVault();
     const key = await unlock(vault, "hunter2");
@@ -1735,7 +1738,7 @@ describe("rotateVault: a derivation failure still clears the plaintext map", () 
     // validates its params) after every entry has been decrypted.
     setDefaultKdfForTesting({ N: 3, r: 8, p: 1 });
     const clear = vi.spyOn(Map.prototype, "clear");
-    await expect(rotateVault(vault, key, "new-pass")).rejects.toThrow(/invalid kdf parameters/);
+    await expect(rekeyVault(vault, key, "new-pass", { recovery: false })).rejects.toThrow(/invalid kdf parameters/);
     expect(clear).toHaveBeenCalled();
   });
 });
