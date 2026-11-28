@@ -2644,6 +2644,36 @@ describe("connectToUpstream oam boot-probe fallback", () => {
       expect(_sdkBehavior.stdioConstructions[1]?.command).toBe("C:\\nodejs\\node.exe");
       expect(_sdkBehavior.stdioConstructions[1]?.args).toEqual(["C:\\npx-cli.js", "-y", "@yawlabs/fetch-mcp@latest"]);
     });
+
+    it("passes the CHILD's MERGED env -- server PATH wins -- not process.env (#230)", async () => {
+      // The #30 root-cause fix lives in this one argument: a server whose env
+      // overrides PATH selects its own node in the rewrite only if the env
+      // npxUnderNode resolves against is mergeChildEnv(parentEnv, serverEnv).
+      // The earlier assertion only checked "some env object arrived" -- an
+      // accidental revert to `process.env` (the pre-#230 shape) passed every
+      // wiring test. The server's PATH value must be IN what the mock received,
+      // spelled the way mergeChildEnv emits it on this host.
+      vi.mocked(resolveOamSpawn).mockResolvedValue({ command: "/usr/bin/oam", args: ["run", "/e.js"] });
+      _sdkBehavior.clientConnect = () => Promise.reject(new Error("oam crashed on boot"));
+      const serverPath = "C:\\server\\node18";
+      const config = makeLocalConfig({
+        runtime: "oam",
+        command: "npx",
+        args: ["-y", "x"],
+        env: { PATH: serverPath, SERVER_ONLY: "yes" },
+      });
+
+      await expect(connectToUpstream(config)).rejects.toBeInstanceOf(ActivationError);
+
+      const call = vi.mocked(npxUnderNode).mock.calls.find((c) => c[0] === "npx");
+      expect(call, "npxUnderNode was called for the npx launch").toBeDefined();
+      const env = call?.[2]?.env as Record<string, string> | undefined;
+      expect(env).toBeDefined();
+      // The child's PATH (mergeChildEnv's uppercase emission on win32, the
+      // server's spelling elsewhere) -- not the broker process's PATH.
+      expect(env?.PATH ?? env?.Path).toBe(serverPath);
+      expect(env?.SERVER_ONLY).toBe("yes");
+    });
   });
 
   it("leaves every other spawn byte-identical through the npxUnderNode call (default passthrough)", async () => {

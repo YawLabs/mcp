@@ -1183,6 +1183,53 @@ describe("npxUnderNode", () => {
     }
   });
 
+  it("one memo entry per PATH whatever spelling the key arrives under (Path/PATH fold)", () => {
+    // Windows delivers the variable as `Path`, mergeChildEnv emits `PATH`, and
+    // a hand-built env could carry either (or lowercase). npxMemoKey folds the
+    // spellings to one, so a broker started with `Path` and a server merged to
+    // `PATH` share ONE memo entry -- the fold's whole point. The observable
+    // difference is NOT the rewrite result (every spelling walks the same dirs
+    // and finds the same node); it is the memo hit. Seed with one spelling,
+    // remove node.exe from disk, re-call with ANOTHER spelling: a hit answers
+    // the rewrite naming the now-deleted node (revalidation checks only the
+    // cli); a missed fold (two entries) makes the second spelling re-walk,
+    // find no node.exe, and return bare npx. Windows host: real existsSync.
+    const fx = nodeInstall();
+    try {
+      // Seed under the `PATH` spelling (mergeChildEnv's emission).
+      expect(callAsOamBroker(dirname(fx.nodeBin), "npx", npxArgs)).toEqual({
+        command: winNormalize(fx.nodeBin, "win32"),
+        args: [winNormalize(fx.cli, "win32"), ...npxArgs],
+      });
+      rmSync(fx.nodeBin);
+      // Same PATH under the `Path` spelling: must read as the SAME memo key.
+      const realEnv = process.env;
+      const platformDesc = Object.getOwnPropertyDescriptor(process, "platform");
+      const execPathDesc = Object.getOwnPropertyDescriptor(process, "execPath");
+      try {
+        Object.defineProperty(process, "platform", { value: "win32", configurable: true, writable: true });
+        Object.defineProperty(process, "execPath", { value: oamExec, configurable: true, writable: true });
+        const env = {
+          ...realEnv,
+          Path: dirname(fx.nodeBin),
+          PATH: undefined,
+          path: undefined,
+          PATHEXT: ".com;.exe",
+        } as NodeJS.ProcessEnv;
+        expect(npxUnderNode("npx", npxArgs, { env })).toEqual({
+          command: winNormalize(fx.nodeBin, "win32"),
+          args: [winNormalize(fx.cli, "win32"), ...npxArgs],
+        });
+      } finally {
+        process.env = realEnv;
+        if (platformDesc) Object.defineProperty(process, "platform", platformDesc);
+        if (execPathDesc) Object.defineProperty(process, "execPath", execPathDesc);
+      }
+    } finally {
+      fx.cleanup();
+    }
+  });
+
   it("leaves an ABSOLUTE npx path untouched: it pinned its own install", () => {
     // nodeLaunchKind is a basename match, but the gate must not rewrite an npx
     // at an absolute path (#230): `C:\tools\node18\npx.cmd` deliberately selects

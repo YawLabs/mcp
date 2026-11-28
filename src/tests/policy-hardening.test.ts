@@ -662,6 +662,12 @@ describe("the broker applies the policy on every path to an upstream", () => {
       name: "ProtocolError",
       message: expect.stringContaining(message),
     });
+    // The prompts/get twin of the resources/read assertion above: both
+    // handlers throw the policy-invalid refusal as an MCP error (#230).
+    await expect(prompt()).rejects.toMatchObject({
+      name: "ProtocolError",
+      message: expect.stringContaining(message),
+    });
   });
 
   it("shows an empty allow-list in health instead of hiding it", () => {
@@ -723,6 +729,29 @@ describe("the broker applies the policy on every path to an upstream", () => {
     priv.profile = { path: "/cfg/config.json", servers: ["ssh", "ssh2"], blocked: ["ssh"] };
     priv.config = { servers: [SSH, SSH2], configVersion: "" };
     expect(priv.handleHealth().content[0].text).toContain("also blocked via identity: ssh2");
+  });
+
+  it("an explicit identity entry reaches the health line, keyed by namespace", () => {
+    // A `command:` blocked entry matches every server launching that command;
+    // the health line must list the MATCHED NAMESPACE (srv2 -- which never
+    // appears in `block:`, the raw list) for the explicit-entry form too, and
+    // list only namespaces: the line prints the map's keys, so the exact-launch
+    // identity's JSON arguments (which can hold a credential) never reach it.
+    // The exact-launch redaction contract itself is pinned where the display
+    // actually prints -- spawnGateVerdict's refusal identity ("never prints
+    // the arguments of an exact launch", above).
+    priv.profile = {
+      path: "/cfg/config.json",
+      servers: ["ssh", "ssh2", "srv", "srv2"],
+      blocked: ["srv"],
+    };
+    const srv = local("srv", "srv", ["--token", "supersecret-token-value"]);
+    const srv2 = local("srv2", "srv", ["--token", "supersecret-token-value"]);
+    priv.config = { servers: [SSH, SSH2, srv, srv2], configVersion: "" };
+    const text = priv.handleHealth().content[0].text;
+    expect(text).toContain("block: srv");
+    expect(text).toContain("also blocked via identity: srv2");
+    expect(text).not.toContain("supersecret-token-value");
   });
 
   it("does not blame identity for a namespace the raw allow-list also excludes", () => {
