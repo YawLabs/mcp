@@ -103,12 +103,13 @@ export interface ResolvedConfig {
   loadedFiles: LoadedConfigFile[];
   /** Soft problems that don't fail loading. Surface in `yaw-mcp doctor`. */
   warnings: string[];
-  /** Broken-policy messages (one per `policyErrors` entry) plus unknown
-   *  top-level keys, one per file that has them. A subset of `warnings`,
-   *  repeated where the policy is shown (`mcp_connect_health`, activation
-   *  refusals) so a refusal carries the file's own KEY-level message and not
-   *  just its path. Never a reason to refuse AGAIN: a broken file already
-   *  refuses through `policyErrors`, an unknown key may be a newer release's. */
+  /** Unknown top-level keys, one per file that has them. A subset of
+   *  `warnings`, repeated where the policy is shown (`mcp_connect_health`,
+   *  activation refusals) so a reader can tell an ignored key from a real
+   *  policy. Never a reason to refuse: an unknown key may be a newer
+   *  release's. Broken-policy messages do NOT fold in here (#230) -- they
+   *  already reach `warnings` and `policyErrors`, which every refusal surface
+   *  prints directly. */
   policyWarnings?: string[];
 }
 

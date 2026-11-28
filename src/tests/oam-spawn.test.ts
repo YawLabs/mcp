@@ -1060,15 +1060,19 @@ describe("npxUnderNode", () => {
       // Call 1 takes the fresh-resolution branch (the beforeEach reset the
       // memo) and seeds it with the fixture's node.exe + npx-cli.js.
       expect(callAsOamBroker(fixtureDir, "npx", npxArgs)).toEqual(rewritten);
-      // The memo is keyed by the env's PATH (#230), so call 2 keeps the SAME
-      // PATH and proves the hit differently: remove the cli from disk, call
-      // again, restore. A fresh walk over this PATH would stat the SAME files
-      // and come back rewritten either way, but a memo hit costs one
-      // existsSync (the revalidation) and no PATH walk -- and the neighbouring
-      // "drops a memo hit" test pins the revalidation itself. What pins the
-      // hit HERE is the memo test that follows: "memoizes PER PATH", whose
-      // second fixture with a DIFFERENT PATH resolves to B, not A.
+      // THE memo proof (review of #231): the memo is keyed by the env's PATH,
+      // so call 2 keeps the SAME PATH -- but node.exe is removed from disk
+      // first. The revalidation checks ONLY the memo entry's cli (one
+      // existsSync), which still exists, so a memo HIT answers the rewrite; a
+      // FRESH walk over this PATH now finds no node.exe and answers bare npx.
+      // Call 2 returning the rewrite therefore means the memo answered without
+      // re-walking -- the exact property the title names, and the thing a
+      // dropped memo write would break (call 2 would resolve fresh: bare npx,
+      // RED; mutation-checked 2026-11-23).
+      rmSync(fx.nodeBin);
       expect(callAsOamBroker(fixtureDir, "npx", npxArgs)).toEqual(rewritten);
+      // The hit was still REVALIDATED, not trusted blindly: the "drops a memo
+      // hit" test below continues this fixture's story with the cli removed.
     } finally {
       fx.cleanup();
     }
